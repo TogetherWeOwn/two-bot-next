@@ -5,6 +5,8 @@ use twilight_model::gateway::payload::incoming::{
 };
 use two_bot_discord::MemPipeline;
 
+#[path = "voice_access_role_slot_scope_tests.rs"]
+mod access_role_slot_scope;
 #[path = "voice_actor_init_jitter_adoption_tests.rs"]
 mod init_jitter_adoption;
 #[path = "voice_actor_init_recovery_tests.rs"]
@@ -23,9 +25,12 @@ impl RoomPersistence for Arc<Store> {
     async fn save_access_controls(
         &self,
         guild: u64,
+        expected: &AccessControls,
         controls: &AccessControls,
     ) -> Result<(), StoreError> {
-        self.as_ref().save_access_controls(guild, controls).await
+        self.as_ref()
+            .save_access_controls(guild, expected, controls)
+            .await
     }
     async fn logging_settings(&self, guild: u64) -> Result<LoggingSettings, StoreError> {
         self.as_ref().logging_settings(guild).await

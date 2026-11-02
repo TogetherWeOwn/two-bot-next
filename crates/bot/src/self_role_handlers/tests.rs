@@ -9,6 +9,7 @@ use twilight_model::{
     application::interaction::message_component::MessageComponentInteractionData, id::Id,
 };
 use two_bot_core::self_roles::{self_role_custom_id, SelfRoleOption};
+use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
 
 pub(crate) const GUILD: u64 = 100_000_000_000_000_001;
 const USER: u64 = 100_000_000_000_000_002;
@@ -117,6 +118,116 @@ fn service(mode: PanelMode) -> SelfRoleService {
         &[GUILD.to_string()].into_iter().collect(),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn admission_terminal_rejection_never_reports_unresolved() {
+    let service = service(PanelMode::Select);
+    let panel = &gates(PanelMode::Select).panels[0];
+    for code in ["unsafe_live_roles", "disallowed_role_permission", "unknown"] {
+        let result = service
+            .handle_admission(Ok(Admission::Rejected(code)), panel, "fixture-event")
+            .await;
+        assert_eq!(result, SelfRoleResult::Rejected, "code={code}");
+        for color in [false, true] {
+            let reply = result.reply(color);
+            assert_eq!(reply, "This role selection could not be applied. Try again later, or contact a server admin to check this panel.");
+            assert!(!reply.contains("unresolved"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn admission_unavailable_evidence_never_reports_terminal_rejection() {
+    let service = service(PanelMode::Select);
+    let panel = &gates(PanelMode::Select).panels[0];
+    for error in [
+        RuntimeError::InvalidSnapshot,
+        RuntimeError::Store(StoreErrorKind::Database),
+        RuntimeError::Store(StoreErrorKind::Timeout),
+    ] {
+        let result = service
+            .handle_admission(Err(error), panel, "fixture-event")
+            .await;
+        assert_eq!(result, SelfRoleResult::Pending);
+        for color in [false, true] {
+            let reply = result.reply(color);
+            assert_eq!(reply, "This role selection is unresolved; no successful change has been confirmed. Please wait a moment and try again; if it keeps failing, contact a server admin.");
+            assert!(!reply.contains("could not be applied"));
+        }
+    }
+}
+
+/// A valid stored catalogue with a distinct panel id, proving the live row
+/// wins over (rather than merges into) the boot catalogue.
+fn live_catalogue() -> serde_json::Value {
+    json!([{
+        "id": "live-games",
+        "channelId": "111111111111111111",
+        "messageId": "555555555555555555",
+        "mode": "button",
+        "options": [{
+            "key": "chess",
+            "label": "Chess",
+            "roleId": "222222222222222222",
+            "permissions": "0"
+        }]
+    }])
+}
+
+#[test]
+fn live_panels_resolve_store_first_with_boot_fallback() {
+    let boot = gates(PanelMode::Button).panels;
+    assert_eq!(boot.len(), 1);
+    assert_eq!(boot[0].id, "games");
+    let guild = GUILD.to_string();
+    // No snapshot (poller parked or pre-first-poll) reads boot.
+    assert_eq!(live_panels_with(&guild, &boot, None), boot);
+    let (mut writer, live) = live_channel();
+    assert_eq!(live_panels_with(&guild, &boot, Some(&live)), boot);
+    // Every publish moves the revision: the channel only republishes on
+    // moved marks, so a repeated revision would read back stale.
+    let mut revision = 0;
+    let mut publish = |rows: Vec<SettingRow>| {
+        revision += 1;
+        writer.publish(&SettingsSnapshot { revision, rows })
+    };
+    let row = |guild: &str, value: serde_json::Value| SettingRow {
+        guild_id: guild.to_owned(),
+        key: PANELS_KEY.to_owned(),
+        value,
+        version: 1,
+    };
+    // A stored catalogue wins over the boot one.
+    publish(vec![row(&guild, live_catalogue())]);
+    let resolved = live_panels_with(&guild, &boot, Some(&live));
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].id, "live-games");
+    // A stored empty array resolves to no panels (live disable).
+    publish(vec![row(&guild, json!([]))]);
+    assert!(live_panels_with(&guild, &boot, Some(&live)).is_empty());
+    // Unparsable rows fall back to boot: a bypassed write guard must not
+    // blank live pickers.
+    for stored in [json!("not-json"), json!({"panels": []}), json!(7)] {
+        publish(vec![row(&guild, stored.clone())]);
+        assert_eq!(
+            live_panels_with(&guild, &boot, Some(&live)),
+            boot,
+            "{stored} must fall back to boot"
+        );
+    }
+    // Another guild's row never leaks across.
+    publish(vec![row("other-guild", live_catalogue())]);
+    assert_eq!(live_panels_with(&guild, &boot, Some(&live)), boot);
+    // Deleting the row hands the catalogue back to boot.
+    publish(vec![]);
+    assert_eq!(live_panels_with(&guild, &boot, Some(&live)), boot);
+}
+
+#[tokio::test]
+async fn recover_panels_empty_sweeps_nothing() {
+    let service = service(PanelMode::Button);
+    assert_eq!(service.recover_panels(&[]).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -437,12 +548,23 @@ fn every_result_reply_pins_its_exact_text_in_both_color_modes() {
         );
         assert_eq!(
             SelfRoleResult::Rejected.reply(color),
-            "This role selection could not be applied.",
+            "This role selection could not be applied. Try again later, or contact a server admin to check this panel.",
             "color={color}"
         );
+        for refusal in [
+            SafeRefusal::MissingManageRoles,
+            SafeRefusal::MissingRole,
+            SafeRefusal::RoleHierarchy,
+        ] {
+            assert_eq!(
+                SelfRoleResult::Refused(refusal).reply(color),
+                refusal.reply(),
+                "color={color}"
+            );
+        }
         assert_eq!(
             SelfRoleResult::Pending.reply(color),
-            "This role selection is unresolved; no successful change has been confirmed.",
+            "This role selection is unresolved; no successful change has been confirmed. Please wait a moment and try again; if it keeps failing, contact a server admin.",
             "color={color}"
         );
     }

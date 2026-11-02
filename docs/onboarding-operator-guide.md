@@ -80,6 +80,35 @@ anchor-welcome and session channel ids in `FORWARDED_DISCORD_IDS`
 (`wrangler/src/container-env.ts`). Adding a Worker var alone does not
 configure the container (see [runbook.md](runbook.md#logs-and-keepalive)).
 
+## Private welcome preview
+
+Run `/welcome-preview` in the configured server with **Manage Server**. It is
+always discoverable, even when welcome delivery is off, and takes no options.
+The response is private and starts with **Preview — not a delivery**, the mode,
+and fixture identity. It renders the current welcome body and picker through
+the same renderer as a newcomer join, with the current stored channel overrides
+and deployment mode. It does not edit configuration or send a test welcome.
+
+The fixture is the fixed synthetic, roleless newcomer `765432109876543210`.
+Its display name is never resolved or rendered; its mention is inert because the
+response disables all mentions. No real member (including the invoker) is fetched.
+There are no role grants, channel posts, prompt/funnel records, invite reads,
+voice moves or audit-store writes. Preview menus are visual samples only; their
+submissions must not run the live picker. Use the ordinary newcomer menu for
+real selections.
+
+A dry-run legacy/anchor preview explains the skip; session mode still renders,
+matching its live dry-run behavior. A missing landing slot shows an explicit
+marker instead of a blank response. Invalid or unavailable settings return a
+private retry message without echoing stored values. Fix configuration through
+the existing admin path, then try again. An unconfirmed initial acknowledgement
+is never retried.
+
+This is a **configuration preview**, not a permission probe: it does not fetch
+channels, check current bot posting permissions or prove that a configured
+channel still exists. Use [preflight](preflight.md) for those checks. No live
+Discord or staging/production database test is needed to preview rendering.
+
 ## Prompt decisions
 
 `decide_prompt` (`crates/core/src/onboarding.rs:157`) runs in legacy check
@@ -222,7 +251,7 @@ member data into evidence.
 | `gateway onboarding job invalid` (warn) | Worker-built job failed to serialize. | Record the revision; do not restart to clear it. Escalate with the log line if it repeats. |
 | Silent skip: bot / still-pending / already-prompted; gated join with no later gate-clear | `decide_prompt` / `welcome_trigger` working as designed. | No action. Gated members prompt when `pending` flips true → false. |
 | Silent skip: welcome/goodbye simply absent, nothing logged | No postable destination (none configured or bot lacks View/Send/Embed), or dry run (legacy/anchor welcome, any goodbye). `welcome()`/`goodbye` return `Ok(())` with no log line (`crates/bot/src/onboarding.rs:490,506,425`); the `no_landing_channel` / `no_goodbye_channel` / `dry_run` reason strings live only in core `adjudicate_*` effects, never in logs — do not grep for them. | Check the mode's channel config and the bot's effective channel access via preflight. Dry run needs no action; session welcomes still post. |
-| `command runtime parked; onboarding runtime disabled` (warn, `crates/bot/src/main.rs:535`) | The command runtime failed to build, so onboarding is off. Causes include invalid feature gates, invalid moderation gates, invalid send admission, REST executor build failure, or ticket runtime init failure (`crates/bot/src/command_runtime.rs:412,424,458,465,483`). | Read the `... command runtime disabled` warn logged just before — it carries the reason — and fix that cause; onboarding resumes with the runtime. |
+| `command runtime parked; onboarding runtime disabled` (warn, `crates/bot/src/main.rs:535`) | The command runtime failed to build, so onboarding is off. Causes include invalid feature gates, invalid moderation gates, invalid send admission, REST executor build failure, or ticket runtime init failure (`crates/bot/src/command_runtime.rs:425,437,471,478,496`). | Read the `... command runtime disabled` warn logged just before — it carries the reason — and fix that cause; onboarding resumes with the runtime. |
 | Picker reply `No channel is available to you right now.` with saved roles | All picks unavailable (hub also dark). | Check channel visibility/overwrites; roles are correctly kept. |
 | Rising `degraded` in `channel_routed` rows | Primaries dark, members routed to the hub fallback. | Open or re-expose the real rooms; the count is the signal. |
 

@@ -172,6 +172,51 @@ class DriftTests(unittest.TestCase):
         with self.assertRaisesRegex(manifests.Refusal, "unsupported.*curl"):
             self.check(mutated)
 
+    def test_copy_without_destination_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .", "COPY foo\nCOPY . .", 1)
+        with self.assertRaisesRegex(
+                manifests.Refusal, "COPY needs sources and destination"):
+            self.check(mutated)
+
+    def test_empty_run_segment_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .",
+            "RUN mkdir -p src && && cargo fetch --locked\nCOPY . .", 1)
+        with self.assertRaisesRegex(manifests.Refusal, "empty segment"):
+            self.check(mutated)
+
+    def test_bare_mkdir_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .", "RUN mkdir -p\nCOPY . .", 1)
+        with self.assertRaisesRegex(manifests.Refusal, "unsupported.*mkdir"):
+            self.check(mutated)
+
+    def test_short_echo_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .", "RUN echo hi\nCOPY . .", 1)
+        with self.assertRaisesRegex(manifests.Refusal, "unsupported.*echo"):
+            self.check(mutated)
+
+    def test_long_echo_fails_closed(self):
+        # The trailing word is silently ignored without the arity pin.
+        mutated = self.docker.replace(
+            "COPY . .", "RUN echo a > b c\nCOPY . .", 1)
+        with self.assertRaisesRegex(manifests.Refusal, "unsupported.*echo"):
+            self.check(mutated)
+
+    def test_misquoted_run_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .", "RUN echo 'unterminated\nCOPY . .", 1)
+        with self.assertRaisesRegex(manifests.Refusal, "malformed quoting"):
+            self.check(mutated)
+
+    def test_misquoted_copy_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .", "COPY 'unterminated ./\nCOPY . .", 1)
+        with self.assertRaisesRegex(manifests.Refusal, "malformed quoting"):
+            self.check(mutated)
+
 
 class ReplayTests(unittest.TestCase):
     """Synthetic roots: the replay itself fails closed without the pin."""
@@ -213,10 +258,25 @@ class ReplayTests(unittest.TestCase):
             dest.mkdir()
             self.assertFalse(manifests.reconstruct(docker, root, dest))
 
+    def test_copy_without_destination_fails_replay_closed(self):
+        docker = SYNTHETIC_DOCKER.replace(
+            "COPY . .", "COPY foo\nCOPY . .", 1)
+        with tempfile.TemporaryDirectory(prefix="manifest-fixture-") as tmp:
+            root = make_synthetic_root(tmp)
+            dest = Path(tmp) / "layer"
+            dest.mkdir()
+            with self.assertRaisesRegex(
+                    manifests.Refusal, "COPY needs sources and destination"):
+                manifests.reconstruct(docker, root, dest)
+
 
 class WorkflowSurfaceTests(unittest.TestCase):
     def test_fixtures_run_in_ci(self):
         self.assertIn("test_check_docker_manifests.py", CHECK_YML.read_text())
+
+
+# Keep the protected replay acceptance battery on the existing CI entrypoint.
+from test_docker_replay_intake_acceptance import DockerReplayConfinementAcceptanceTests
 
 
 if __name__ == "__main__":

@@ -17,6 +17,9 @@
 
 #![cfg(test)]
 
+#[path = "self_role_refusal_acceptance_tests.rs"]
+mod refusal_acceptance;
+
 use super::*;
 use crate::discord_test_common::{MockRest, RestRequest, ScriptedResponse};
 use crate::self_role_handlers::SelfRoleService;
@@ -1582,7 +1585,7 @@ async fn live_hierarchy_validation(pool: PgPool) -> TestResult {
     let panel = catalogue(PanelMode::Button, false, "hierarchy-at-admission");
     assert!(matches!(
         fx.runtime.prepare(&click("hier-1", "alpha"), &panel).await,
-        Ok(Admission::Rejected("unsafe_live_roles"))
+        Ok(Admission::Rejected("role_hierarchy"))
     ));
     assert!(fx.new_mutations().is_empty());
     fx.assert_held(&[ROLE_B, UNRELATED]);

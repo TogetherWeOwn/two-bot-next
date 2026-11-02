@@ -9,6 +9,10 @@
 //! actual PUT body and the final registry contain it exactly once, and the
 //! boot emits exactly one PUT (READY/RESUMED republishes nothing).
 //!
+//! A pending registry-resync marker is the one reconnect-time exception: with
+//! the marker set, READY/RESUMED republishes the full set once through the
+//! same production route and clears the marker.
+//!
 //! F5: an RSVP lookup holds the shared durable lane briefly while a custom
 //! slash command is received. The custom defer retries provably pre-wire
 //! Blocked contention inside the receipt-relative budget: exactly one
@@ -17,10 +21,19 @@
 use super::*;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use twilight_model::gateway::event::Event;
+use twilight_model::gateway::payload::incoming::Ready;
+use twilight_model::guild::UnavailableGuild;
+use twilight_model::id::Id;
+use twilight_model::oauth::{ApplicationFlags, PartialApplication};
+use twilight_model::user::CurrentUser;
 use two_bot_core::{
     send_admission::{PgSendAdmission, SendAdmission},
     ClassifierConfig, InteractionRouter, RouterGates,
@@ -493,4 +506,176 @@ async fn mixed_rsvp_custom_command_survives_brief_lane_contention() {
     tokio::time::timeout(Duration::from_secs(30), db.close())
         .await
         .expect("test schema teardown deadline");
+}
+
+/// Governed command runtime without the shard: the gateway routes reconnects
+/// to `dispatch_remaining` exactly when the ordered runtime exists, so driving
+/// that entrypoint directly pins the production reconnect path.
+async fn resync_commands(
+    db: &TestDb,
+    rest: &MockRest,
+    token: &str,
+) -> Arc<crate::command_runtime::CommandRuntime> {
+    ensure_crypto_provider();
+    let admission: Arc<dyn SendAdmission> =
+        Arc::new(PgSendAdmission::new(db.pool.clone(), token).unwrap());
+    let commands = crate::command_runtime::CommandRuntime::new(
+        db.pool.clone(),
+        ActionExecutor::with_admission(token.into(), Some(rest.origin()), admission).unwrap(),
+        crate::command_runtime::router_with_commands(gates()),
+        GUILD.parse().unwrap(),
+        true,
+    );
+    commands
+        .initialize_custom_commands(
+            GatewayCommandConfig::from_map_for_activation(2222, &vars(), true).unwrap(),
+        )
+        .await
+        .expect("custom-command bootstrap");
+    commands
+}
+
+fn registry_puts(rest: &MockRest) -> Vec<crate::discord_test_common::RestRequest> {
+    rest.requests()
+        .into_iter()
+        .filter(|request| {
+            request.method == "PUT"
+                && request.path == "/api/v10/applications/1111/guilds/2222/commands"
+        })
+        .collect()
+}
+
+async fn wait_put_count(rest: &MockRest, count: usize) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if registry_puts(rest).len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("registry PUT deadline");
+}
+
+async fn pending_markers(db: &TestDb) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM automation_command_registry_resync")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+}
+
+fn ready_event() -> Event {
+    Event::Ready(Ready {
+        application: PartialApplication {
+            flags: ApplicationFlags::empty(),
+            id: Id::new(1111),
+        },
+        guilds: vec![UnavailableGuild {
+            id: Id::new(2222),
+            unavailable: true,
+        }],
+        resume_gateway_url: "wss://gateway.discord.gg".to_owned(),
+        session_id: "test-session".to_owned(),
+        shard: None,
+        user: CurrentUser {
+            accent_color: None,
+            avatar: None,
+            banner: None,
+            bot: true,
+            discriminator: 0,
+            email: None,
+            flags: None,
+            global_name: None,
+            id: Id::new(1111),
+            locale: None,
+            mfa_enabled: false,
+            name: "two-bot".to_owned(),
+            premium_type: None,
+            public_flags: None,
+            verified: None,
+        },
+        version: 10,
+    })
+}
+
+/// Boot publishes once, then a failed management publish leaves its durable
+/// marker (that failure-to-marker half is pinned by the resync acceptance
+/// suite; the trigger under test reads only the marker row).
+async fn boot_then_pending_marker(
+    db: &TestDb,
+    rest: &MockRest,
+    token: &str,
+) -> Arc<crate::command_runtime::CommandRuntime> {
+    let commands = resync_commands(db, rest, token).await;
+    commands
+        .publish_registry_checked(Some(1111))
+        .await
+        .expect("boot publish");
+    assert_eq!(registry_puts(rest).len(), 1, "boot emits exactly one PUT");
+    two_bot_core::custom_command_store::mark_registry_resync_pending(
+        &db.pool,
+        GUILD,
+        &two_bot_core::now_iso(),
+    )
+    .await
+    .expect("seed pending marker");
+    commands
+}
+
+async fn assert_one_retry_then_clear(db: &TestDb, rest: &MockRest) {
+    wait_put_count(rest, 2).await;
+    // Let any duplicate publish land before pinning the count.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let puts = registry_puts(rest);
+    assert_eq!(puts.len(), 2, "one reconnect retry, no duplicate");
+    assert_merged_registry(&puts[1].body);
+    assert_eq!(
+        pending_markers(db).await,
+        0,
+        "confirmed retry clears the marker"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn resumed_republishes_full_set_when_registry_resync_pending() {
+    let db = TestDb::new().await;
+    seed_faq(&db).await;
+    let rest = composition_rest(Arc::new(AtomicBool::new(false)), Duration::ZERO).await;
+    let commands = boot_then_pending_marker(&db, &rest, "mock-token-resync-resumed").await;
+    // Governed production route: the gateway calls dispatch_remaining on
+    // reconnect whenever the ordered runtime exists.
+    commands.dispatch_remaining(&Event::Resumed);
+    assert_one_retry_then_clear(&db, &rest).await;
+    rest.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn ready_republishes_full_set_when_registry_resync_pending() {
+    let db = TestDb::new().await;
+    seed_faq(&db).await;
+    let rest = composition_rest(Arc::new(AtomicBool::new(false)), Duration::ZERO).await;
+    let commands = boot_then_pending_marker(&db, &rest, "mock-token-resync-ready").await;
+    commands.dispatch_remaining(&ready_event());
+    assert_one_retry_then_clear(&db, &rest).await;
+    rest.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn standalone_resumed_republishes_when_registry_resync_pending() {
+    let db = TestDb::new().await;
+    seed_faq(&db).await;
+    let rest = composition_rest(Arc::new(AtomicBool::new(false)), Duration::ZERO).await;
+    let commands = boot_then_pending_marker(&db, &rest, "mock-token-resync-standalone").await;
+    // Standalone fallback route: already-synced RESUMED republishes only
+    // because the pending marker overrides the no-op.
+    commands.dispatch(&Event::Resumed);
+    assert_one_retry_then_clear(&db, &rest).await;
+    rest.shutdown().await;
+    db.close().await;
 }

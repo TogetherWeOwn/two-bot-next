@@ -1,15 +1,19 @@
 //! Onboarding orchestration; S3 retains ownership of join/gate/leave facts.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use sqlx::PgPool;
-use twilight_model::application::interaction::Interaction;
+use twilight_model::application::interaction::application_command::CommandOptionValue;
+use twilight_model::application::interaction::{Interaction, InteractionData};
 use twilight_model::gateway::event::Event;
 use two_bot_core::onboarding::*;
 use two_bot_core::onboarding_store::*;
 use two_bot_core::settings::SettingsCache;
-use two_bot_core::{ComponentHandler, ComponentOutcome, InteractionRouter, RouterGates};
+use two_bot_core::{
+    ComponentHandler, ComponentOutcome, HandlerId, InteractionRouter, RouterGates, SlashOutcome,
+};
 use two_bot_cutover::settings::SettingsStore;
 use two_bot_discord::onboarding_config::OnboardingConfig;
 use two_bot_discord::onboarding_messages::{defer_ephemeral, picker_components};
@@ -17,6 +21,10 @@ use two_bot_discord::onboarding_permissions::MemberAccess;
 use two_bot_discord::{route_interaction, ActionExecutor, RoutedInteraction};
 
 use crate::gateway::GatewayPipeline;
+
+#[path = "welcome_preview.rs"]
+mod welcome_preview;
+pub(crate) use welcome_preview::{is_preview_control, owns_welcome_preview};
 
 const CONFIG_KEYS: &[&str] = &[
     "DISCORD_GUILD_ID",
@@ -28,6 +36,17 @@ const CONFIG_KEYS: &[&str] = &[
     "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID",
     "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID",
 ];
+
+/// Discord permission bits for preview manageability. Administrator still
+/// respects hierarchy for roles; it only satisfies the permission half.
+const PREVIEW_MANAGE_ROLES: u64 = 1 << 28;
+const PREVIEW_ADMINISTRATOR: u64 = 1 << 3;
+
+const PREVIEW_TOO_MANY_REPLY: &str = "Preview — roles not changed. That proposal has too many choices (limit 10). Nothing was changed. Please open /reopen games again and choose up to 10.";
+const PREVIEW_UNKNOWN_REPLY: &str = "Preview — roles not changed. I couldn't recognize some of those choices (unknown or no longer available). Nothing was changed. Please open /reopen games again and choose from the current menu.";
+const PREVIEW_UNAVAILABLE_REPLY: &str = "Preview — roles not changed. I couldn't load your current roles right now (unavailable). Nothing was changed. Please open /reopen games again and retry.";
+const PREVIEW_CATALOG_CHANGED_REPLY: &str = "Preview — roles not changed. One of those game roles is no longer available (the catalog changed). Nothing was changed. Please open /reopen games again and choose from the current menu.";
+const PREVIEW_DISALLOWED_REPLY: &str = "Preview — roles not changed. I can't apply one of those roles (missing Manage Roles permission or hierarchy). Nothing was changed. Please ask a server admin, then open /reopen games again.";
 
 /// Values own pre-pipeline state: cache updates/removals cannot erase the
 /// pending transition or joined-at used by the asynchronous feature worker.
@@ -276,7 +295,7 @@ impl OnboardingRuntime {
     async fn config(&self) -> Result<OnboardingConfig, RuntimeError> {
         let snapshot = tokio::time::timeout(
             Duration::from_millis(1500),
-            SettingsStore::new(&self.pool).load_snapshot(),
+            SettingsStore::new(&self.pool).load_guild_snapshot(&self.guild_id.to_string()),
         )
         .await
         .map_err(|_| RuntimeError::Settings)?
@@ -344,9 +363,9 @@ impl OnboardingRuntime {
                     member_id: Some(member.user.id.get()),
                 })
             }
-            Event::InteractionCreate(interaction) if self.accepts_interaction(&interaction.0) => {
-                Some(OnboardingJob::Interaction(Box::new(interaction.0.clone())))
-            }
+            Event::InteractionCreate(interaction) => self
+                .resolve_interaction(&interaction.0)
+                .map(|resolved| OnboardingJob::Interaction(Box::new(resolved.into_owned()))),
             _ => None,
         }
     }
@@ -354,7 +373,30 @@ impl OnboardingRuntime {
     /// Ingress eligibility uses only immutable identity and the shared router,
     /// never settings SQL. Stale/disabled mode submissions get an honest edit
     /// after defer; hot configuration cannot delay the initial acknowledgement.
+    /// The `/reopen` self-service slash rides the same capture so a member
+    /// whose welcome is lost can open a fresh menu through the same
+    /// defer-first pipeline as the picker components, as does the admin
+    /// `/welcome-preview` rendering (including its private refusal, which
+    /// must defer before any authorization guidance).
+    #[cfg(test)]
     pub fn accepts_interaction(&self, interaction: &Interaction) -> bool {
+        self.resolve_interaction(interaction).is_some()
+    }
+
+    /// Use the executor's confirmed slash identity before taking ownership, and
+    /// retain the canonical payload for ingress and post-commit processing.
+    /// Component payloads pass through the shared resolver unchanged.
+    /// Unresolvable slashes stay silent here exactly like shared dispatch, so
+    /// both consumers agree on who owns a slash even when the payload name is
+    /// stale.
+    pub(crate) fn resolve_interaction<'a>(
+        &self,
+        interaction: &'a Interaction,
+    ) -> Option<Cow<'a, Interaction>> {
+        let interaction = self
+            .executor
+            .command_identities()
+            .resolve_interaction(interaction)?;
         let router = InteractionRouter::new(RouterGates {
             configured_guild: Some(self.guild_id),
             scorecard: false,
@@ -368,20 +410,38 @@ impl OnboardingRuntime {
             onboarding_picker: true,
             session_picker: true,
         });
-        interaction
+        let eligible = interaction
             .member
             .as_ref()
             .and_then(|member| member.user.as_ref())
             .is_some_and(|user| !user.bot)
-            && matches!(
-                route_interaction(&router, interaction, None),
-                RoutedInteraction::Component {
-                    outcome: ComponentOutcome::Handled {
-                        handler: ComponentHandler::GamePicker | ComponentHandler::SessionPicker
-                    },
-                    ..
-                }
-            )
+            && (if owns_welcome_preview(&interaction) {
+                // Refusals belong here too: defer before private authorization
+                // guidance, but never read settings for a non-admin.
+                !matches!(
+                    route_interaction(&router, &interaction, None),
+                    RoutedInteraction::Slash {
+                        outcome: two_bot_core::SlashOutcome::Ignore,
+                        ..
+                    } | RoutedInteraction::Ignore
+                )
+            } else {
+                matches!(
+                    route_interaction(&router, &interaction, None),
+                    RoutedInteraction::Component {
+                        outcome: ComponentOutcome::Handled {
+                            handler: ComponentHandler::GamePicker | ComponentHandler::SessionPicker
+                        },
+                        ..
+                    } | RoutedInteraction::Slash {
+                        outcome: SlashOutcome::Handled {
+                            handler: HandlerId::Reopen
+                        },
+                        ..
+                    }
+                )
+            });
+        eligible.then_some(interaction)
     }
 
     pub async fn acknowledge(
@@ -409,6 +469,27 @@ impl OnboardingRuntime {
         &self,
         interaction: &Interaction,
     ) -> Result<(), RuntimeError> {
+        if owns_welcome_preview(interaction) {
+            return self
+                .preview_guidance(
+                    interaction,
+                    "I couldn't confirm this preview. Please try again. No delivery was attempted.",
+                )
+                .await;
+        }
+        // A no-effect game preview never claims uncertain applied changes.
+        if matches!(
+            interaction.data.as_ref(),
+            Some(InteractionData::MessageComponent(data))
+                if data.custom_id == GAME_PREVIEW_SELECT_ID
+        ) {
+            return self
+                .reply(
+                    interaction,
+                    "Preview — roles not changed. I couldn't confirm this preview. No roles were changed. Please open the menu and try again.",
+                )
+                .await;
+        }
         self.reply(
             interaction,
             "I couldn't confirm this interaction. Your selection may already have been processed, so I won't apply it again. Please open the menu and try again.",
@@ -421,6 +502,16 @@ impl OnboardingRuntime {
         interaction: &Interaction,
         now_ms: i64,
     ) -> Result<(), RuntimeError> {
+        let Some(interaction) = self.resolve_interaction(interaction) else {
+            return Ok(());
+        };
+        let interaction = interaction.as_ref();
+        if owns_welcome_preview(interaction) {
+            return self.welcome_preview(interaction, now_ms).await;
+        }
+        if welcome_preview::is_preview_control(interaction) {
+            return self.reply(interaction, "This menu is a preview, not a delivery. No selection was applied. Use the newcomer menu for real selections.").await;
+        }
         let occurred_at = two_bot_core::funnel::format_iso_millis(now_ms);
         // Configuration/settings failures are inside the post-defer boundary.
         // A successful error edit is terminal, with no role or success writes.
@@ -441,9 +532,9 @@ impl OnboardingRuntime {
 
     pub async fn handle(&self, job: OnboardingJob, now_ms: i64) -> Result<(), RuntimeError> {
         if let OnboardingJob::Interaction(interaction) = job {
-            if !self.accepts_interaction(&interaction) {
+            let Some(interaction) = self.resolve_interaction(&interaction) else {
                 return Ok(());
-            }
+            };
             return if self
                 .acknowledge(&interaction, tokio::time::Instant::now())
                 .await
@@ -672,11 +763,24 @@ impl OnboardingRuntime {
             onboarding_picker: config.gates.mode != OnboardingMode::Session,
             session_picker: config.gates.mode == OnboardingMode::Session,
         });
+        let routed = route_interaction(&router, interaction, None);
+        if matches!(
+            routed,
+            RoutedInteraction::Slash {
+                outcome: SlashOutcome::Handled {
+                    handler: HandlerId::Reopen
+                },
+                ..
+            }
+        ) {
+            return self.reopen_menu(config, interaction).await;
+        }
         let RoutedInteraction::Component {
+            custom_id,
             values,
             outcome: ComponentOutcome::Handled { handler },
             ..
-        } = route_interaction(&router, interaction, None)
+        } = routed
         else {
             return self
                 .reply(interaction, "This menu is no longer enabled. No selection was applied. Please open the current menu and try again.")
@@ -697,6 +801,15 @@ impl OnboardingRuntime {
         };
         if user.bot {
             return Ok(());
+        }
+        // Preview is a separate no-effect route on the same handler: it
+        // re-reads current roles/catalog, never writes, and never shares the
+        // apply error boundary (no retract, no "may already have changed").
+        if custom_id == GAME_PREVIEW_SELECT_ID {
+            let keys: Vec<_> = values.iter().map(String::as_str).collect();
+            return self
+                .preview_game_selection(config, interaction, &keys, user.id.get())
+                .await;
         }
         // The caller has confirmed ingress defer and committed the delivery
         // receipt. Never issue a second initial callback from a feature worker.
@@ -744,6 +857,101 @@ impl OnboardingRuntime {
             return self.reply(interaction, content).await;
         }
         Ok(())
+    }
+
+    /// Open a fresh self-only picker menu for a `/reopen` slash invocation.
+    ///
+    /// Read-only: the menu is built from the member's CURRENT roles and the
+    /// CURRENT configured picks through the existing `picker_components`
+    /// renderer, and opening it performs zero role, channel, funnel, invite
+    /// or voice effects. The menu's own select feeds the existing component
+    /// handler, so a later selection keeps its authorization, dry-run,
+    /// replay and role semantics — this is a menu opener, never a second
+    /// mutation writer. Disabled kinds, malformed invocations and failed
+    /// lookups get exactly one private guidance edit, never a menu and
+    /// never a success claim.
+    async fn reopen_menu(
+        &self,
+        config: &OnboardingConfig,
+        interaction: &Interaction,
+    ) -> Result<(), RuntimeError> {
+        let Some(user) = interaction
+            .member
+            .as_ref()
+            .and_then(|member| member.user.as_ref())
+        else {
+            return Ok(());
+        };
+        if user.bot {
+            return Ok(());
+        }
+        let Some(kind) = reopen_kind(interaction) else {
+            return self
+                .reply(
+                    interaction,
+                    "I couldn't tell which picker to open. No selection was applied. Use /reopen again and choose `games` or `session`, then try again.",
+                )
+                .await;
+        };
+        // Mirror the component gates: the games menu lives where the game
+        // picker is live (legacy/anchor), the session menu where the session
+        // picker is live (session mode). The router cannot see the kind
+        // option, so this check runs here, after the defer.
+        let live = match kind {
+            PickerKind::Games => game_picker_allowed(config.gates.mode),
+            PickerKind::Session => config.gates.mode == OnboardingMode::Session,
+        };
+        if !live {
+            let label = match kind {
+                PickerKind::Games => "games",
+                PickerKind::Session => "session",
+            };
+            return self
+                .reply(
+                    interaction,
+                    &format!(
+                        "The {label} picker isn't enabled right now. No selection was applied. Please try again once it is enabled."
+                    ),
+                )
+                .await;
+        }
+        // Games defaults reflect the member's current roles, so every open
+        // re-reads them — a stale snapshot from an earlier open must not
+        // leak into a later one. A failed lookup guides privately instead
+        // of failing the job: the defer is already confirmed, so the member
+        // is owed exactly one finished edit, not a retried job.
+        let member_roles: Vec<String> = match kind {
+            PickerKind::Games => {
+                match MemberAccess::load(&self.executor, config.guild_id, user.id.get()).await {
+                    Ok(Some(access)) => access.role_ids,
+                    Ok(None) | Err(_) => {
+                        return self
+                            .reply(
+                                interaction,
+                                "I couldn't load your current roles. No selection was applied. Please open the menu and try again.",
+                            )
+                            .await;
+                    }
+                }
+            }
+            PickerKind::Session => Vec::new(),
+        };
+        let role_refs: Vec<&str> = member_roles.iter().map(String::as_str).collect();
+        let session_picks: &[SessionPick] = match kind {
+            PickerKind::Games => &[],
+            PickerKind::Session => &config.session_picks,
+        };
+        let components = picker_components(Some(kind), &role_refs, session_picks);
+        let caption = match kind {
+            PickerKind::Games => {
+                "Here's your games picker — only you can see this menu. Choosing in the Apply game roles menu updates your roles right away: unselected catalog game roles are removed, and selecting nothing clears the catalog game roles you hold. The preview menu is preview only, with no role changes."
+            }
+            PickerKind::Session => {
+                "Here's your session picker — only you can see this menu. Choose what to do, then submit."
+            }
+        };
+        self.reply_with_menu(interaction, caption, &components)
+            .await
     }
 
     async fn process_selection(
@@ -931,6 +1139,177 @@ impl OnboardingRuntime {
         Ok(())
     }
 
+    /// Preview proposed game-role changes without applying them.
+    ///
+    /// Read-only: re-reads the member's CURRENT roles and the CURRENT role
+    /// catalog, reuses the pure [`adjudicate_game_select`] policy with
+    /// `dry_run=false` (dry-run effects are empty, not a diff), and computes
+    /// actual additions by set difference (normal `add_role_ids` includes
+    /// already-held roles). Unknown-only input never implies clearing;
+    /// malformed, disallowed or unavailable evidence gets actionable private
+    /// guidance. Performs zero role, funnel, audit, ticket or public effects;
+    /// a later apply re-validates everything separately.
+    async fn preview_game_selection(
+        &self,
+        config: &OnboardingConfig,
+        interaction: &Interaction,
+        keys: &[&str],
+        member_id: u64,
+    ) -> Result<(), RuntimeError> {
+        // Forged UI bypass: the menu caps at the full catalog, Discord at 25.
+        if keys.len() > GAME_PICKS.len() {
+            return self.reply(interaction, PREVIEW_TOO_MANY_REPLY).await;
+        }
+        // Deduplicate: normal policy counts each grant once, never twice.
+        let mut seen = HashSet::new();
+        let mut proposed: Vec<&str> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if seen.insert(*key) {
+                proposed.push(*key);
+            }
+        }
+        // Only stable current game keys. Empty is a deliberate clear preview;
+        // unknown, platform, raw-role or forged input is guidance, never a diff.
+        if proposed
+            .iter()
+            .any(|key| !GAME_PICKS.iter().any(|pick| pick.key == *key))
+        {
+            return self.reply(interaction, PREVIEW_UNKNOWN_REPLY).await;
+        }
+        // Fresh member roles; unreadable evidence is unavailable, never empty.
+        let held: Vec<String> =
+            match MemberAccess::load(&self.executor, config.guild_id, member_id).await {
+                Ok(Some(access)) => access.role_ids,
+                Ok(None) | Err(_) => {
+                    return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+                }
+            };
+        let held_refs: Vec<&str> = held.iter().map(String::as_str).collect();
+        // Fresh catalog for existence and manageability.
+        let roles_value = match self
+            .executor
+            .get_json_checked(&format!("/guilds/{}/roles", config.guild_id))
+            .await
+        {
+            Ok(Some(value)) => value,
+            Ok(None) | Err(_) => {
+                return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+            }
+        };
+        let Some(roles) = roles_value.as_array() else {
+            return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+        };
+        let mut catalog: HashMap<&str, (bool, i64)> = HashMap::with_capacity(roles.len());
+        for role in roles {
+            let (Some(id), Some(managed), Some(position)) = (
+                role.get("id").and_then(serde_json::Value::as_str),
+                role.get("managed").and_then(serde_json::Value::as_bool),
+                role.get("position").and_then(serde_json::Value::as_i64),
+            ) else {
+                return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+            };
+            catalog.insert(id, (managed, position));
+        }
+        // Proposed roles must still exist.
+        let proposed_roles: Vec<&str> = proposed
+            .iter()
+            .filter_map(|key| {
+                GAME_PICKS
+                    .iter()
+                    .find(|pick| pick.key == *key)
+                    .map(|pick| pick.role_id)
+            })
+            .collect();
+        if proposed_roles
+            .iter()
+            .any(|role| !catalog.contains_key(*role))
+        {
+            return self.reply(interaction, PREVIEW_CATALOG_CHANGED_REPLY).await;
+        }
+        // Pure policy for removals; additions by set difference.
+        let Some(outcome) = adjudicate_game_select(
+            config.gates.mode,
+            &proposed,
+            &held_refs,
+            &|_| false,
+            config.guild_id,
+            false,
+        ) else {
+            return self
+                .reply(
+                    interaction,
+                    "The games preview isn't enabled right now. No selection was applied. Please try again once it is enabled.",
+                )
+                .await;
+        };
+        let held_set: HashSet<&str> = held_refs.iter().copied().collect();
+        let selected_set: HashSet<&str> =
+            outcome.routed.role_ids.iter().map(String::as_str).collect();
+        let game_roles: HashSet<&str> = GAME_PICKS.iter().map(|pick| pick.role_id).collect();
+        let mut additions: Vec<&str> = outcome
+            .routed
+            .role_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|role| !held_set.contains(role))
+            .collect();
+        let mut removals: Vec<&str> = outcome.remove_role_ids.iter().map(String::as_str).collect();
+        let mut unchanged: Vec<&str> = held_set
+            .intersection(&game_roles)
+            .copied()
+            .filter(|role| selected_set.contains(role))
+            .collect();
+        // Stable catalog order for every list.
+        let order = |role: &str| {
+            GAME_PICKS
+                .iter()
+                .position(|pick| pick.role_id == role)
+                .unwrap_or(usize::MAX)
+        };
+        additions.sort_by_key(|role| order(role));
+        removals.sort_by_key(|role| order(role));
+        unchanged.sort_by_key(|role| order(role));
+        // Manageability: adding and removing both need Manage Roles (or
+        // Administrator) plus an unmanaged target below the bot.
+        let bot = match MemberAccess::load(&self.executor, config.guild_id, self.bot_id).await {
+            Ok(Some(access)) => access,
+            Ok(None) | Err(_) => {
+                return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+            }
+        };
+        if bot.permissions() & (PREVIEW_MANAGE_ROLES | PREVIEW_ADMINISTRATOR) == 0 {
+            return self.reply(interaction, PREVIEW_DISALLOWED_REPLY).await;
+        }
+        let mut highest: Option<i64> = None;
+        for role_id in &bot.role_ids {
+            match catalog.get(role_id.as_str()) {
+                Some((_, position)) => {
+                    highest = Some(highest.map_or(*position, |high| high.max(*position)));
+                }
+                None => {
+                    return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+                }
+            }
+        }
+        let Some(highest) = highest else {
+            return self.reply(interaction, PREVIEW_UNAVAILABLE_REPLY).await;
+        };
+        for role in additions.iter().chain(removals.iter()) {
+            match catalog.get(*role) {
+                Some((managed, position)) => {
+                    if *managed || *position >= highest {
+                        return self.reply(interaction, PREVIEW_DISALLOWED_REPLY).await;
+                    }
+                }
+                None => {
+                    return self.reply(interaction, PREVIEW_CATALOG_CHANGED_REPLY).await;
+                }
+            }
+        }
+        let output = render_game_preview(&additions, &removals, &unchanged);
+        self.reply(interaction, &output).await
+    }
+
     /// Finish a game-picker role loop that failed partway with some roles
     /// already flipped. With nothing applied this is the legacy total failure
     /// (generic role reply, nothing recorded). Otherwise the applied grants
@@ -991,6 +1370,42 @@ impl OnboardingRuntime {
         .map_err(|_| RuntimeError::Discord)?
         .map_err(|_| RuntimeError::Discord)
     }
+
+    async fn reply_with_menu(
+        &self,
+        interaction: &Interaction,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+    ) -> Result<(), RuntimeError> {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.executor
+                .edit_interaction_response_with_components_and_blocked_retry(
+                    interaction.application_id.get(),
+                    &interaction.token,
+                    content,
+                    components,
+                ),
+        )
+        .await
+        .map_err(|_| RuntimeError::Discord)?
+        .map_err(|_| RuntimeError::Discord)
+    }
+}
+
+/// Extract the `kind` option of a `/reopen` slash invocation. `None` covers
+/// a missing option, a non-string value and an unknown kind: all three get
+/// the same private guidance naming both valid choices.
+fn reopen_kind(interaction: &Interaction) -> Option<PickerKind> {
+    let InteractionData::ApplicationCommand(data) = interaction.data.as_ref()? else {
+        return None;
+    };
+    let value = data.options.iter().find(|option| option.name == "kind")?;
+    match &value.value {
+        CommandOptionValue::String(kind) if kind == "games" => Some(PickerKind::Games),
+        CommandOptionValue::String(kind) if kind == "session" => Some(PickerKind::Session),
+        _ => None,
+    }
 }
 
 /// Where-and-when for one game-picker submission, threaded to the
@@ -1034,6 +1449,42 @@ fn game_partial_failure_reply(applied: &[String], pending: &[String]) -> String 
         applied.join(", "),
         pending.join(", ")
     )
+}
+
+/// Member-facing preview diff: header plus Additions/Removals/Unchanged.
+/// Labels only, never raw input or ids; empty lists say None explicitly.
+/// Bounded to Discord's 2000-char ceiling with an explicit truncation note.
+fn render_game_preview(additions: &[&str], removals: &[&str], unchanged: &[&str]) -> String {
+    fn labels(roles: &[&str]) -> Vec<&'static str> {
+        roles
+            .iter()
+            .filter_map(|role| {
+                GAME_PICKS
+                    .iter()
+                    .find(|pick| pick.role_id == *role)
+                    .map(|pick| pick.label)
+            })
+            .collect()
+    }
+    fn section(heading: &str, labels: &[&'static str]) -> String {
+        if labels.is_empty() {
+            format!("**{heading}**\nNone")
+        } else {
+            format!("**{heading}**\n{}", labels.join("\n"))
+        }
+    }
+    let output = format!(
+        "Preview — roles not changed. Nothing was changed. To apply these choices, use the games picker above or open /reopen games again.\n\n{}\n\n{}\n\n{}",
+        section("Additions", &labels(additions)),
+        section("Removals", &labels(removals)),
+        section("Unchanged", &labels(unchanged)),
+    );
+    if output.chars().count() <= 2000 {
+        output
+    } else {
+        let kept: String = output.chars().take(1969).collect();
+        format!("{kept}\n…(preview truncated for display.)")
+    }
 }
 
 #[cfg(test)]

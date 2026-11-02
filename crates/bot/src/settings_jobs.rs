@@ -295,8 +295,20 @@ fn log_applied(report: &RefreshReport) {
 }
 
 #[cfg(test)]
+#[path = "settings_consumer_wiring_tests.rs"]
+mod consumer_wiring_tests;
+
+#[cfg(test)]
 #[path = "settings_jobs_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "settings_trio_live_log_acceptance_tests.rs"]
+mod trio_live_log_acceptance_tests;
+
+#[cfg(test)]
+#[path = "settings_community_live_log_acceptance_tests.rs"]
+mod community_live_log_acceptance_tests;
 
 #[cfg(test)]
 mod ops_log_tests {

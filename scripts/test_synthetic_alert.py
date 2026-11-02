@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.error
 import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -18,8 +19,6 @@ _REAL_URLOPEN = urllib.request.urlopen
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 alert = importlib.import_module("synthetic_alert")
 history = importlib.import_module("synthetic_alert_history")
-
-HOOK = "https://discord.com/api/webhooks/123456789012345678/synthetic-token-not-a-secret"
 
 EVIDENCE = {
     "origin": "https://two-bot-next-staging.example.workers.dev",
@@ -37,10 +36,15 @@ EVIDENCE = {
 
 class SyntheticAlertTests(unittest.TestCase):
     def setUp(self):
-        guard = mock.patch.object(alert.urllib.request, "urlopen",
+        guard = mock.patch.object(urllib.request, "urlopen",
                                   side_effect=AssertionError("network access in a unit test"))
         guard.start()
         self.addCleanup(guard.stop)
+        # Decide fixtures model a clean issue tracker; the reconcile read has
+        # its own test below.
+        self.reconcile = mock.patch.object(alert, "open_issue_without_incident", return_value=False)
+        self.reconcile.start()
+        self.addCleanup(mock.patch.stopall)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
@@ -48,8 +52,7 @@ class SyntheticAlertTests(unittest.TestCase):
         Path(self.evidence).write_text(json.dumps(EVIDENCE))
 
     def base_env(self):
-        return {"SYNTHETIC_ALERT_WEBHOOK_URL": HOOK,
-                "RUN_ID": "999", "GITHUB_RUN_ID": "999", "GITHUB_TOKEN": "test-token",
+        return {"RUN_ID": "999", "GITHUB_RUN_ID": "999", "GITHUB_TOKEN": "test-token",
                 "PROBE_OUTCOME": "failure", "FORCE_FAIL": "true",
                 "GIT_SHA": "deadbeef",
                 "GITHUB_SERVER_URL": "https://github.com",
@@ -484,29 +487,16 @@ class SyntheticAlertTests(unittest.TestCase):
             with self.assertRaisesRegex(history.HistoryError, "IncompleteRead"):
                 history._get("/repos/owner/repo/actions/workflows/x/runs", "t")
 
-    def test_non_discord_destination_refuses_before_any_request(self):
-        with self.assertRaisesRegex(alert.AlertError, "not a Discord webhook"):
-            alert.post("https://example.com/hook", "content")
-
-    def test_http_error_reports_status_only(self):
-        import urllib.error
-        opener = mock.Mock()
-        opener.open.side_effect = urllib.error.HTTPError(
-            HOOK, 400, "bad", {}, None)
-        with mock.patch.object(alert.urllib.request, "build_opener", return_value=opener):
-            with self.assertRaisesRegex(alert.AlertError, "status 400"):
-                alert.post(HOOK, "content")
-
-    def test_missing_webhook_secret_fails_without_a_request(self):
+    def test_missing_token_fails_closed_without_a_request(self):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, {"PROBE_OUTCOME": "failure"}, clear=True), \
                 redirect_stdout(out), redirect_stderr(err), \
                 mock.patch.object(alert, "previous_probe_outcomes", return_value=[("failure", "success")]), \
-                mock.patch.object(alert.urllib.request, "build_opener") as opener:
+                mock.patch.object(urllib.request, "build_opener") as opener:
             code = alert.main(["--env", "staging", "--evidence", self.evidence])
         self.assertEqual(code, 1)
         opener.assert_not_called()
-        self.assertIn("not set", err.getvalue())
+        self.assertIn("incident sink context is missing", err.getvalue())
 
     def test_missing_probe_sample_and_non_transition_do_not_post(self):
         # A skipped probe is zero samples: fail closed (exit 1) with no post,
@@ -552,11 +542,13 @@ class SyntheticAlertTests(unittest.TestCase):
         post.assert_called_once()
         self.assertIn("sending failure alert without history", err.getvalue())
 
-    def test_delivers_once_with_allowed_mentions_off(self):
-        seen = {}
+    def fake_github(self, open_issues=(), status=None):
+        """An opener standing in for api.github.com; records every request."""
+        calls = []
 
         class FakeResponse:
-            status = 204
+            def __init__(self, payload):
+                self.payload = payload
 
             def __enter__(self):
                 return self
@@ -565,51 +557,96 @@ class SyntheticAlertTests(unittest.TestCase):
                 return False
 
             def read(self, _n):
-                return b""
+                return json.dumps(self.payload).encode()
 
         def fake(request, timeout=None):
-            seen["url"] = request.full_url
-            seen["body"] = json.loads(request.data.decode())
-            seen["timeout"] = timeout
-            return FakeResponse()
+            body = json.loads(request.data.decode()) if request.data else None
+            calls.append((request.get_method(), request.full_url, body))
+            if status is not None:
+                raise urllib.error.HTTPError(request.full_url, status, "bad", {}, None)
+            if request.get_method() == "GET":
+                return FakeResponse(list(open_issues))
+            if request.full_url.endswith("/issues"):
+                return FakeResponse({"number": 41})
+            return FakeResponse({})
 
-        out, err = io.StringIO(), io.StringIO()
         opener = mock.Mock()
         opener.open.side_effect = fake
+        return opener, calls
+
+    def test_alert_opens_one_labelled_issue_and_recovery_closes_it(self):
+        opener, calls = self.fake_github()
+        out, err = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, self.base_env(), clear=True), \
                 redirect_stdout(out), redirect_stderr(err), \
                 mock.patch.object(alert, "previous_probe_outcomes", return_value=[]), \
-                mock.patch.object(alert.urllib.request, "build_opener", return_value=opener):
+                mock.patch.object(urllib.request, "build_opener", return_value=opener):
             code = alert.main(["--env", "staging", "--evidence", self.evidence])
         self.assertEqual(code, 0)
-        self.assertEqual(seen["url"], HOOK)
-        self.assertIn("two-bot-next ALERT", seen["body"]["content"])
-        self.assertEqual(seen["body"]["allowed_mentions"], {"parse": [], "replied_user": False})
-        self.assertNotIn(HOOK, out.getvalue() + err.getvalue())
+        # The final GET re-reads the list to catch a concurrent duplicate.
+        self.assertEqual([call[0] for call in calls], ["GET", "POST", "GET"])
+        self.assertIn("labels=incident", calls[0][1])
+        created = calls[1][2]
+        self.assertTrue(calls[1][1].endswith("/repos/TogetherWeOwn/two-bot-next/issues"))
+        self.assertEqual(created["labels"], ["incident"])
+        self.assertEqual(created["title"], "synthetic-user-flow:staging is failing")
+        self.assertIn("two-bot-next ALERT synthetic-user-flow:staging", created["body"])
+        self.assertIn("<!-- incident-key: synthetic-user-flow:staging -->", created["body"])
+        self.assertIn("opened #41", err.getvalue())
+        self.assertNotIn("test-token", out.getvalue() + err.getvalue())
+        # A repeat ALERT while the issue is open comments instead of opening
+        # a second one; RECOVERY comments then closes that same issue.
+        open_issue = {"number": 41, "body": created["body"]}
+        for event, methods in (("alert", ["GET", "POST"]), ("recovery", ["GET", "POST", "PATCH"])):
+            opener, calls = self.fake_github([{"number": 7, "body": "unrelated"}, open_issue])
+            with self.subTest(event=event), mock.patch.dict(os.environ, self.base_env(), clear=True), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
+                    mock.patch.object(urllib.request, "build_opener", return_value=opener):
+                code = alert.post_event(self.base_env(), "staging", self.evidence, event)
+            self.assertEqual(code, 0)
+            self.assertEqual([call[0] for call in calls], methods)
+            self.assertTrue(calls[1][1].endswith("/issues/41/comments"))
+            if event == "recovery":
+                self.assertTrue(calls[2][1].endswith("/issues/41"))
+                self.assertEqual(calls[2][2], {"state": "closed", "state_reason": "completed"})
 
-    def test_non_2xx_fails(self):
-        class FakeResponse:
-            status = 500
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self, _n):
-                return b""
-
+    def test_unwritable_issue_fails_closed_with_status_only(self):
+        opener, _calls = self.fake_github(status=403)
         err = io.StringIO()
-        opener = mock.Mock()
-        opener.open.return_value = FakeResponse()
         with mock.patch.dict(os.environ, self.base_env(), clear=True), \
                 redirect_stdout(io.StringIO()), redirect_stderr(err), \
                 mock.patch.object(alert, "previous_probe_outcomes", return_value=[]), \
-                mock.patch.object(alert.urllib.request, "build_opener", return_value=opener):
+                mock.patch.object(urllib.request, "build_opener", return_value=opener):
             code = alert.main(["--env", "prod", "--evidence", self.evidence])
         self.assertEqual(code, 1)
-        self.assertIn("status 500", err.getvalue())
+        self.assertIn("status 403", err.getvalue())
+        self.assertNotIn("test-token", err.getvalue())
+
+    def test_healthy_known_closed_history_closes_an_orphan_issue(self):
+        # A force_fail dispatch is not scheduled history: its issue would
+        # never see a recovery transition, so a healthy decide closes it.
+        env = {**self.base_env(), "PROBE_OUTCOME": "success", "FORCE_FAIL": "false"}
+        self.reconcile.stop()
+        for found, expected in ((None, None), (12, "recovery")):
+            with self.subTest(found=found), redirect_stderr(io.StringIO()), \
+                    mock.patch.object(alert, "previous_probe_outcomes", return_value=[]), \
+                    mock.patch.object(alert.incident_issue, "find_open", return_value=found):
+                self.assertEqual(alert.decide_event(env, "staging"), expected)
+        # An unreadable issue list never turns a healthy run red.
+        err = io.StringIO()
+        with redirect_stderr(err), \
+                mock.patch.object(alert, "previous_probe_outcomes", return_value=[]), \
+                mock.patch.object(alert.incident_issue, "find_open",
+                                  side_effect=alert.incident_issue.IncidentError("incident issue GET failed (transport)")):
+            self.assertIsNone(alert.decide_event(env, "staging"))
+        self.assertIn("not reconciled", err.getvalue())
+        # Only a closed, known history reconciles; an open incident decides as before.
+        with mock.patch.object(alert, "previous_probe_outcomes",
+                               return_value=[("failure", "success"), ("failure", "skipped")]), \
+                mock.patch.object(alert.incident_issue, "find_open",
+                                  side_effect=AssertionError("must not reconcile")):
+            self.assertEqual(alert.decide_event(env, "staging"), "recovery")
+        self.reconcile.start()
 
     def test_deeply_nested_history_body_is_unknown_history_not_a_crash(self):
         # A response far under the size cap can still nest past the JSON
@@ -660,7 +697,7 @@ class SyntheticAlertTests(unittest.TestCase):
             code = alert.post_event(self.base_env(), "staging", path, "alert")
         self.assertEqual(code, 0)
         post.assert_called_once()
-        self.assertIn("unknown", post.call_args.args[1])
+        self.assertIn("unknown", post.call_args.args[3])
         self.assertNotIn("Traceback", out.getvalue() + err.getvalue())
 
 
@@ -690,9 +727,14 @@ class MalformedHistoryAcceptanceTests(unittest.TestCase):
                 "external transport or posting is forbidden in decide-only fixtures"))
             guard.start()
             self.addCleanup(guard.stop)
+        # No incident issue is open in these fixtures (reconcile is tested
+        # with SyntheticAlertTests).
+        reconcile = mock.patch.object(alert, "open_issue_without_incident", return_value=False)
+        reconcile.start()
+        self.addCleanup(reconcile.stop)
 
     def env(self, current="failure"):
-        # No webhook or real credential is needed to decide an event.
+        # No real credential is needed to decide an event.
         return {"GITHUB_TOKEN": "offline-test-value", "GITHUB_REPOSITORY": "owner/repo",
                 "GITHUB_RUN_ID": "999", "RUN_ID": "999", "FORCE_FAIL": "false",
                 "PROBE_OUTCOME": current, "GITHUB_OUTPUT": str(self.output)}

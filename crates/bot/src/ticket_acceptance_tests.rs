@@ -175,6 +175,12 @@ async fn creation_receipt_mock(
 #[path = "ticket_receipt_retry_tests.rs"]
 mod receipt_retry_tests;
 
+#[path = "ticket_open_retry_acceptance_tests.rs"]
+mod open_retry_acceptance_tests;
+
+#[path = "ticket_open_retry_store_tests.rs"]
+mod open_retry_store_tests;
+
 fn history(id: u64) -> Value {
     json!({"id":id.to_string(),"timestamp":two_bot_core::funnel::format_iso_millis(id as i64),
         "author":{"id":"500","username":"member","discriminator":"0"},
@@ -1185,9 +1191,12 @@ async fn ticket_copy_success_confirmation_claim_and_close_are_pinned() {
     db.close().await;
 }
 
-// Pins the three open-refusal literals through the real reserve path. Each
-// refusal still fetches the category first, so the script holds three
-// category documents: one per refused open.
+// Pins the open-refusal replies through the real reserve path: the duplicate
+// names its usable Open channel, creating without a channel keeps recovery
+// guidance, and cooldown names a bounded next-try time (the bare "please
+// wait" literal was replaced by the open-explanation outcome). Each refusal
+// still fetches the category first, so the script holds three category
+// documents: one per refused open.
 #[tokio::test]
 #[ignore = "requires agent-testdb or CI service container"]
 async fn ticket_copy_duplicate_and_cooldown_refusals_are_pinned() {
@@ -1279,7 +1288,24 @@ async fn ticket_copy_duplicate_and_cooldown_refusals_are_pinned() {
         Ok(reply) => reply,
         Err(error) => panic!("cooldown refusal is Ok: {}", error.reply()),
     };
-    assert_eq!(cooldown, "Please wait before opening another ticket.");
+    let cooldown_lower = cooldown.to_lowercase();
+    assert!(
+        cooldown_lower.contains("try") || cooldown_lower.contains("retry"),
+        "cooldown says when to try next: {cooldown}"
+    );
+    assert!(
+        cooldown_lower.contains("next"),
+        "cooldown words it as the next time to try: {cooldown}"
+    );
+    assert!(
+        !cooldown_lower.contains("reserv") && !cooldown_lower.contains("guarantee"),
+        "a next-try hint is not a reservation or guarantee: {cooldown}"
+    );
+    let expected_seconds = ((now + 300_000 + 999) / 1000) as u64;
+    assert!(
+        cooldown.contains(&format!("<t:{expected_seconds}:")),
+        "next-eligible is last creation + cooldown: {cooldown}"
+    );
     assert_eq!(mock.requests().len(), 3);
     mock.shutdown().await;
     db.close().await;

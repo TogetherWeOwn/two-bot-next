@@ -106,7 +106,7 @@ def new_row(row_id=NEW_ROLLOUT):
 def deploy_records():
     return [
         {
-            "type": "wrangler-session", "version": 1, "wrangler_version": "4.151.0",
+            "type": "wrangler-session", "version": 1, "wrangler_version": "4.152.0",
             "command_line_args": ["deploy", "--config", "staging-deploy.json",
                                   "--env", "staging"],
         },

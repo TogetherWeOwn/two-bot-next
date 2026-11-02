@@ -43,6 +43,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use two_bot_core::join_risk_store::{JoinRiskClaim, JoinRiskStore};
+use two_bot_core::metrics::{self, JoinQueueDropReason};
 use two_bot_core::onboarding::MentionPolicy;
 use two_bot_core::raid::{
     JoinRiskInput, JoinRiskPolicy, DEFAULT_JOIN_RISK_THRESHOLD, DEFAULT_JOIN_RISK_WINDOW_SECONDS,
@@ -242,11 +243,11 @@ impl StoreSettings {
         // Bound to a local so the timeout future is dropped before the borrows
         // above end (edition-2021 tail-expression temporaries).
         let loaded = tokio::time::timeout(SETTINGS_READ_MAX, async {
-            let (revision, rows) = store.poll_marks().await?;
+            let (revision, rows) = store.poll_guild_marks(&self.guild_id).await?;
             if stale.is_some_and(|cache| !cache.needs_refresh(revision, rows)) {
                 return Ok::<_, sqlx::Error>(None);
             }
-            let snapshot = store.load_snapshot().await?;
+            let snapshot = store.load_guild_snapshot(&self.guild_id).await?;
             Ok(Some(SettingsCache::load(&snapshot)))
         })
         .await;
@@ -293,6 +294,7 @@ impl SettingsSource for StoreSettings {
                     !matches!(&self.last, Some(Err(previous)) if previous.key() == refusal.key());
                 if changed {
                     error!(
+                        error_class = "join_risk_tuning_refused",
                         key = refusal.key(),
                         "join_risk_tuning_refused: present-but-unusable tuning; scoring disabled"
                     );
@@ -371,7 +373,10 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
                         .await
                         .is_err()
                     {
-                        error!("join_risk_failed: observation panicked");
+                        error!(
+                            error_class = "join_risk_failed",
+                            "join_risk_failed: observation panicked"
+                        );
                     }
                     self.shutdown.note_finished();
                 }
@@ -407,7 +412,10 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         ) {
             Ok(policy) => policy,
             Err(_) => {
-                error!("join_risk_policy_rejected: live tuning unusable");
+                error!(
+                    error_class = "join_risk_policy_rejected",
+                    "join_risk_policy_rejected: live tuning unusable"
+                );
                 return;
             }
         };
@@ -417,7 +425,11 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         let Some(created_at_ms) =
             snowflake_to_date_ms(&join.member_id.to_string()).map(|ms| ms as i64)
         else {
-            error!(member_id = join.member_id, "join_risk_no_account_age");
+            error!(
+                error_class = "join_risk_no_account_age",
+                member_id = join.member_id,
+                "join_risk_no_account_age"
+            );
             return;
         };
         let input = JoinRiskInput {
@@ -438,7 +450,10 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         {
             Ok(claim) => claim,
             Err(_) => {
-                error!("join_risk_store_failed: claim not recorded");
+                error!(
+                    error_class = "join_risk_store_failed",
+                    "join_risk_store_failed: claim not recorded"
+                );
                 return;
             }
         };
@@ -453,6 +468,7 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         };
         // Always log first. If the post fails the evidence still exists.
         error!(
+            error_class = "join_risk_evidence",
             member_id = %evidence.observation.member_id,
             score = evidence.score,
             join_count,
@@ -469,7 +485,10 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
         // The shared executor always sends empty allowed mentions; refuse a
         // proposal that asks for anything else rather than widen that boundary.
         if message.mentions != MentionPolicy::None {
-            error!(channel, "join_risk_refused: mention policy is not empty");
+            error!(
+                error_class = "join_risk_refused",
+                channel, "join_risk_refused: mention policy is not empty"
+            );
             return;
         }
         match self
@@ -483,10 +502,14 @@ impl<S: SettingsSource> JoinRiskWorker<S> {
                 "join_risk_posted"
             ),
             Delivery::Undeliverable => error!(
+                error_class = "join_risk_undeliverable",
                 channel,
                 "join_risk_undeliverable: channel missing, not text, or bot lacks View/Send"
             ),
-            Delivery::Failed => error!(channel, "join_risk_post_failed"),
+            Delivery::Failed => error!(
+                error_class = "join_risk_post_failed",
+                channel, "join_risk_post_failed"
+            ),
         }
     }
 }
@@ -522,11 +545,20 @@ impl JoinObserver for JoinRiskRuntime {
     fn observe_join(&self, join: JoinObservation) {
         match self.joins.try_send(join) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(join)) => warn!(
-                member_id = join.member_id,
-                "join-risk queue full; join not scored"
-            ),
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(join)) => {
+                metrics::global().join_risk_dropped_join(JoinQueueDropReason::QueueFull);
+                warn!(
+                    member_id = join.member_id,
+                    "join-risk queue full; join not scored"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics::global().join_risk_dropped_join(JoinQueueDropReason::QueueClosed);
+                error!(
+                    error_class = "join_risk_queue_closed",
+                    "join-risk queue closed; join not scored"
+                );
+            }
         }
     }
 }

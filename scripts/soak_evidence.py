@@ -60,6 +60,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -159,6 +160,28 @@ def _unique_object(pairs):
 # it is refused up front with an explicit stack instead of recursing.
 MAX_RECORD_DEPTH = 100
 
+# Strings are skipped whole, so brackets inside them never count. An
+# unterminated string runs to the end, which keeps the scan linear.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
+
+
+def _json_depth_exceeds(text, limit):
+    """Lexical nesting pre-scan, run before json.loads.
+
+    The decoder's own RecursionError is no longer a reliable bound: newer
+    CPython sizes it from the real C stack and decodes 10,000 levels.
+    """
+    depth = 0
+    for match in JSON_TOKEN.finditer(text):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif token in "]}":
+            depth -= 1
+    return False
+
 
 def _too_deeply_nested(record, limit=MAX_RECORD_DEPTH):
     """Iterative depth check; True when nesting exceeds limit."""
@@ -237,14 +260,15 @@ def summarize(lines):
         line = raw.strip()
         if not line:
             continue
+        if _json_depth_exceeds(line, MAX_RECORD_DEPTH):
+            note_unknown(None, None,
+                         f"malformed line {lineno}: too deeply nested")
+            continue
         try:
             record = json.loads(line, object_pairs_hook=_unique_object)
         except RecursionError:
-            # Decoder-level backstop: a line deeper than the C decoder's
-            # own stack raises here before _too_deeply_nested ever sees
-            # it. Pinned by
-            # test_decoder_recursion_overflow_becomes_unknown_then_continues;
-            # do not drop this branch as redundant.
+            # Decoder-level backstop behind the lexical pre-scan above, for
+            # any decoder whose stack is smaller than MAX_RECORD_DEPTH.
             note_unknown(None, None,
                          f"malformed line {lineno}: too deeply nested")
             continue

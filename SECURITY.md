@@ -23,7 +23,8 @@ rotate keys, encrypt memory, or provide zeroization.
 The audited holders are `Config` (Discord token/database URL), `SigningKey`
 and `KeyRing` (internal-action HMAC keys/decoy), the moderation-audit secret
 loader, `S3Target`, `SignedRequest` (Authorization headers),
-`GuildConfigDiscordApi`, and `HyperTransport` (also nested in `ActionExecutor`).
+`GuildConfigDiscordApi`, `AssistantConfig` (endpoint URL and bound API key),
+and `HyperTransport` (also nested in `ActionExecutor`).
 Ownership capabilities in `AuditClaim` and `ChannelClaimTicket` are redacted too.
 `AuthDecision` already formats only body field counts, never OAuth payloads.
 No production webhook client currently exists; new webhook URLs must use

@@ -10,12 +10,15 @@ python3 scripts/cargo_cache.py run -- test -p two-bot-core --test settings_catal
 
 CI runs it with the other integration targets (`cargo test --workspace --test '*'`).
 
-The suite never names a key: every key under test comes from
+The suite names one key: every key under test comes from
 `SETTING_CLASSES`, `HOT_WIRED`, or `ENV_ONLY_KEY_PREFIXES`, plus two
-unlisted probes built without key literals. The file carries no `TWO_*`
-string literals, so the container-env drift scanner
+unlisted probes built without key literals, plus the single
+`TWO_SELF_ROLE_PANELS` probe value (the catalogue takes only a JSON array,
+so the universal `1` probe cannot address it). That name is already
+classified, so the container-env drift scanner
 (`wrangler/test/container-env.test.ts`) keeps passing without
-reclassification. Loader defaults come from empty-map calls only.
+reclassification. Loader defaults come from empty-map calls only. Per-key
+value shapes themselves are pinned by the live-keys acceptance, not here.
 
 ## Acceptance matrix
 

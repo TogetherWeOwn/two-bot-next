@@ -38,6 +38,7 @@ fn huge() -> String {
 fn assistant_valid_map_byte_identical() {
     let config = AssistantConfig::from_map(&map(&[
         ("TWO_ASSISTANT_ENDPOINT", VALID_ENDPOINT),
+        ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
         ("TWO_ASSISTANT_MODEL", "model-x"),
     ]));
     let Some(config) = config else {
@@ -55,6 +56,7 @@ fn assistant_valid_map_trims_surrounding_whitespace() {
             "  https://assistant.example.test  ",
         ),
         ("TWO_ASSISTANT_MODEL", "  model-y\t"),
+        ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
     ]));
     let Some(config) = config else {
         panic!("trimmed valid map must enable the assistant");
@@ -95,7 +97,10 @@ fn assistant_non_http_or_scheme_only_endpoints_disabled() {
         "[]",
     ] {
         assert_eq!(
-            AssistantConfig::from_map(&map(&[("TWO_ASSISTANT_ENDPOINT", endpoint)])),
+            AssistantConfig::from_map(&map(&[
+                ("TWO_ASSISTANT_ENDPOINT", endpoint),
+                ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
+            ])),
             None,
             "endpoint {endpoint:?} must stay disabled"
         );
@@ -114,7 +119,10 @@ fn assistant_control_characters_in_endpoint_disabled() {
         "https://assistant.example.test/\u{1b}[0m",
     ] {
         assert_eq!(
-            AssistantConfig::from_map(&map(&[("TWO_ASSISTANT_ENDPOINT", endpoint)])),
+            AssistantConfig::from_map(&map(&[
+                ("TWO_ASSISTANT_ENDPOINT", endpoint),
+                ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
+            ])),
             None,
             "control characters must disable, never redirect"
         );
@@ -123,26 +131,73 @@ fn assistant_control_characters_in_endpoint_disabled() {
 
 #[test]
 fn assistant_endpoint_length_boundary_in_chars() {
-    let pad = MAX_ENDPOINT_CHARS - "https://".len();
-    let at_bound = format!("https://{}", "a".repeat(pad));
+    // Pad a path, not a hostname: a huge Unicode label hits the IDNA
+    // parser's Punycode bound before it can exercise the endpoint char bound.
+    let prefix = format!("{VALID_ENDPOINT}/");
+    let pad = MAX_ENDPOINT_CHARS - prefix.chars().count();
+    let at_bound = format!("{prefix}{}", "a".repeat(pad));
     assert_eq!(at_bound.chars().count(), MAX_ENDPOINT_CHARS);
+    assert!(url::Url::parse(&at_bound).is_ok());
     assert!(
-        AssistantConfig::from_map(&map(&[("TWO_ASSISTANT_ENDPOINT", &at_bound)])).is_some(),
+        AssistantConfig::from_map(&map(&[
+            ("TWO_ASSISTANT_ENDPOINT", &at_bound),
+            ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
+        ]))
+        .is_some(),
         "endpoint exactly at MAX_ENDPOINT_CHARS must be accepted"
     );
-    let over_bound = format!("{at_bound}a");
     assert_eq!(
-        AssistantConfig::from_map(&map(&[("TWO_ASSISTANT_ENDPOINT", &over_bound)])),
+        AssistantConfig::from_map(&map(&[
+            ("TWO_ASSISTANT_ENDPOINT", &at_bound),
+            ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
+        ]))
+        .expect("ASCII endpoint at the char bound enables")
+        .endpoint(),
+        at_bound
+    );
+    let over_bound = format!("{at_bound}a");
+    assert_eq!(over_bound.chars().count(), MAX_ENDPOINT_CHARS + 1);
+    assert!(url::Url::parse(&over_bound).is_ok());
+    assert_eq!(
+        AssistantConfig::from_map(&map(&[
+            ("TWO_ASSISTANT_ENDPOINT", &over_bound),
+            ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
+        ])),
         None,
         "endpoint one char over the bound must be refused, not truncated"
     );
     // The bound is in characters, not bytes.
-    let multibyte = format!("https://{}", "é".repeat(pad));
+    let multibyte = format!("{prefix}{}", "é".repeat(pad));
     assert_eq!(multibyte.chars().count(), MAX_ENDPOINT_CHARS);
     assert!(multibyte.len() > MAX_ENDPOINT_CHARS);
+    assert!(url::Url::parse(&multibyte).is_ok());
     assert!(
-        AssistantConfig::from_map(&map(&[("TWO_ASSISTANT_ENDPOINT", &multibyte)])).is_some(),
+        AssistantConfig::from_map(&map(&[
+            ("TWO_ASSISTANT_ENDPOINT", &multibyte),
+            ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
+        ]))
+        .is_some(),
         "multibyte endpoint at the char bound must be accepted"
+    );
+    assert_eq!(
+        AssistantConfig::from_map(&map(&[
+            ("TWO_ASSISTANT_ENDPOINT", &multibyte),
+            ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
+        ]))
+        .expect("multibyte endpoint at the char bound enables")
+        .endpoint(),
+        multibyte
+    );
+    let multibyte_over_bound = format!("{multibyte}é");
+    assert_eq!(multibyte_over_bound.chars().count(), MAX_ENDPOINT_CHARS + 1);
+    assert!(url::Url::parse(&multibyte_over_bound).is_ok());
+    assert_eq!(
+        AssistantConfig::from_map(&map(&[
+            ("TWO_ASSISTANT_ENDPOINT", &multibyte_over_bound),
+            ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
+        ])),
+        None,
+        "multibyte endpoint one char over the bound must be refused, not truncated"
     );
 }
 
@@ -150,7 +205,10 @@ fn assistant_endpoint_length_boundary_in_chars() {
 fn assistant_huge_endpoint_disabled() {
     let big = format!("https://{}", huge());
     assert_eq!(
-        AssistantConfig::from_map(&map(&[("TWO_ASSISTANT_ENDPOINT", &big)])),
+        AssistantConfig::from_map(&map(&[
+            ("TWO_ASSISTANT_ENDPOINT", &big),
+            ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
+        ])),
         None
     );
 }
@@ -160,6 +218,7 @@ fn assistant_huge_model_never_gates_and_stays_bounded_by_input() {
     let big_model = huge();
     let config = AssistantConfig::from_map(&map(&[
         ("TWO_ASSISTANT_ENDPOINT", VALID_ENDPOINT),
+        ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
         ("TWO_ASSISTANT_MODEL", &big_model),
     ]));
     let Some(config) = config else {
@@ -173,6 +232,7 @@ fn assistant_huge_model_never_gates_and_stays_bounded_by_input() {
 fn assistant_unknown_keys_ignored() {
     let base = map(&[
         ("TWO_ASSISTANT_ENDPOINT", VALID_ENDPOINT),
+        ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
         ("TWO_ASSISTANT_MODEL", "model-x"),
     ]);
     let mut noisy = base.clone();
@@ -197,18 +257,18 @@ fn assistant_unknown_keys_ignored() {
 
 #[test]
 fn assistant_debug_never_renders_supplied_values() {
-    // TA-04: endpoint URLs (which may carry userinfo credentials) and model
-    // strings are supplied values; formatting the parsed config must not
-    // render them (log/debug output is how configs get printed).
+    // TA-04: even an endpoint path may carry credentials. Userinfo is now
+    // refused by TA-02; use an admitted path/model to exercise Debug itself.
     let config = AssistantConfig::from_map(&map(&[
         (
             "TWO_ASSISTANT_ENDPOINT",
-            &format!("https://user:{MARKER}@assistant.example.test/v1"),
+            &format!("https://assistant.example.test/{MARKER}/v1"),
         ),
         ("TWO_ASSISTANT_MODEL", MARKER),
+        ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
     ]));
     let Some(config) = config else {
-        panic!("endpoint with userinfo is still an https endpoint");
+        panic!("path sentinel with a bound credential must enable the assistant");
     };
     for rendered in [format!("{config:?}"), format!("{config:#?}")] {
         assert!(
@@ -508,6 +568,7 @@ fn large_map_of_unknown_keys_changes_no_outcome() {
     // blow-up beyond the input).
     let mut big = map(&[
         ("TWO_ASSISTANT_ENDPOINT", VALID_ENDPOINT),
+        ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
         ("TWO_MODERATION", "1"),
         ("TWO_OWEN_USER_ID", VALID_OWEN),
         ("TWO_AUTOMATIONS", "1"),
@@ -518,6 +579,7 @@ fn large_map_of_unknown_keys_changes_no_outcome() {
     }
     let small = map(&[
         ("TWO_ASSISTANT_ENDPOINT", VALID_ENDPOINT),
+        ("TWO_ASSISTANT_API_KEY", "fixture-assistant-credential"),
         ("TWO_MODERATION", "1"),
         ("TWO_OWEN_USER_ID", VALID_OWEN),
         ("TWO_AUTOMATIONS", "1"),

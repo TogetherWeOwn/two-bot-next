@@ -10,7 +10,7 @@ Fail-closed rules, each pinned by scripts/test_staging_rollback_drill.py:
 - The rollback is one Cloudflare deployment POST that never sends `force`, so a
   target whose secrets changed since it was deployed is refused instead of
   being auto-confirmed (Wrangler's non-interactive prompt answers yes).
-- `code_update_strategy` is `immediate`. Wrangler 4.151's default is `deferred`
+- `code_update_strategy` is `immediate`. Wrangler 4.152's default is `deferred`
   with a 300 s maximum delay, which would keep the old Durable Object code
   running for up to five minutes and make any time-to-ready figure meaningless.
 - A 401/403 from ownership control or Cloudflare stops the run. The restore leg
@@ -123,7 +123,7 @@ class DrillClient(rollout.Client):
             # the HTTP status and integer error codes.
             codes = []
             try:
-                envelope = json.loads(error.read(rollout.MAX_BODY),
+                envelope = rollout._loads_bounded(error.read(rollout.MAX_BODY),
                                         object_pairs_hook=_reject_duplicate_keys)
                 codes = [str(item["code"]) for item in envelope.get("errors", [])
                          if isinstance(item, dict) and type(item.get("code")) is int][:4]
@@ -364,7 +364,7 @@ def ownership_control(token, url, actor, root=None, expected_deployment=None):
                 raise GateError("ownership_auth_failed")
             raise GateError("ownership_control_failed", match.group(0) if match else None)
         try:
-            state = json.loads(result.stdout, object_pairs_hook=_reject_duplicate_keys)
+            state = rollout._loads_bounded(result.stdout, object_pairs_hook=_reject_duplicate_keys)
         except (ValueError, RecursionError):
             raise GateError("ownership_control_invalid_response") from None
         return rollout.mapping(state)

@@ -12,7 +12,7 @@ use crate::discord_test_common::{MockRest, ScriptedResponse};
 
 const EVENT: &str = "1546451670500642999";
 
-fn interaction(sequence: u64, status: &str) -> Value {
+pub(super) fn interaction(sequence: u64, status: &str) -> Value {
     json!({"op":0,"s":sequence,"t":"INTERACTION_CREATE","d":{
         "application_id":"1111", "authorizing_integration_owners":{"0":GUILD},
         "id":sequence.to_string(), "token":format!("mock-rsvp-{sequence}"),
@@ -91,7 +91,7 @@ async fn spawn_with_shutdown(
     ))
 }
 
-async fn connect(
+pub(super) async fn connect(
     db: &TestDb,
     rest: &MockRest,
 ) -> (
@@ -101,10 +101,24 @@ async fn connect(
     connect_with_shutdown(db, rest, None).await
 }
 
-async fn connect_with_shutdown(
+pub(super) async fn connect_with_shutdown(
     db: &TestDb,
     rest: &MockRest,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> (
+    JoinHandle<Result<(), sqlx::Error>>,
+    tokio_websockets::WebSocketStream<tokio::net::TcpStream>,
+) {
+    connect_with_shutdown_and_heartbeat(db, rest, shutdown, 45_000).await
+}
+
+/// A long drain test must not mistake an unserviced mock heartbeat for a
+/// product failure. Ordinary fixtures retain their original HELLO interval.
+pub(super) async fn connect_with_shutdown_and_heartbeat(
+    db: &TestDb,
+    rest: &MockRest,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    heartbeat_interval: u64,
 ) -> (
     JoinHandle<Result<(), sqlx::Error>>,
     tokio_websockets::WebSocketStream<tokio::net::TcpStream>,
@@ -115,7 +129,7 @@ async fn connect_with_shutdown(
     let (socket, _) = listener.accept().await.unwrap();
     let (_, mut ws) = ServerBuilder::new().accept(socket).await.unwrap();
     ws.send(Message::text(
-        json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string(),
+        json!({"op":10,"d":{"heartbeat_interval":heartbeat_interval}}).to_string(),
     ))
     .await
     .unwrap();
@@ -241,7 +255,7 @@ async fn connect_governed(
 /// lane stays occupied until the hold elapses. Sets `seen` the moment the held
 /// read arrives, so the test can send the next command into certain occupancy.
 /// Later reads pass through immediately.
-async fn lane_holding_rest(seen: Arc<AtomicBool>, hold: Duration) -> MockRest {
+pub(super) async fn lane_holding_rest(seen: Arc<AtomicBool>, hold: Duration) -> MockRest {
     let held = Arc::new(AtomicBool::new(false));
     MockRest::with_responder(move |request| {
         // RA-01 live-membership gate precedes the live-event read: echo the
@@ -315,7 +329,7 @@ enum CheckpointFailure {
 /// Read one counter series from the process-global metrics exposition.
 /// Global counters are monotonic and shared with parallel tests, so callers
 /// assert `after >= before + expected`, never an exact value.
-fn global_series(prefix: &str) -> u64 {
+pub(super) fn global_series(prefix: &str) -> u64 {
     two_bot_core::metrics::global()
         .render(None)
         .lines()
@@ -537,7 +551,10 @@ async fn queued_commands(
     assert_eq!(requests.len(), 14);
     for (token, content) in [
         ("mock-rsvp-2", "RSVP saved: going."),
-        ("mock-rsvp-3", "RSVP saved: interested."),
+        (
+            "mock-rsvp-3",
+            "RSVP saved: interested (changed from going).",
+        ),
     ] {
         let edits: Vec<_> = requests
             .iter()
@@ -840,7 +857,7 @@ async fn receipt_callback_waits_out_brief_lane_occupancy() {
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&edits[1].body).unwrap()["content"],
-        "RSVP saved: interested."
+        "RSVP saved: interested (changed from going)."
     );
     let status: String = tokio::time::timeout(
         Duration::from_secs(60),

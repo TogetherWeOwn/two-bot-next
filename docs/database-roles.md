@@ -48,7 +48,11 @@ both through `DUMP_TABLES` (`crates/core/src/backup/dump_file.rs`, via
 `dump.rs`; a runtime-group login cannot read them, so the nightly dump would
 abort), and the go.two.gg `REDIRECT_DB` connector reads `invite_campaigns`
 (`wrangler/src/redirect-store.ts`, unbound today with a snapshot fallback).
-Each of those readers needs its own reviewed identity. The plan transfers both
+Each of those readers needs its own reviewed identity. The reviewed backup
+identity also needs `SELECT` on the SQLx ledger (`_sqlx_migrations`) when it
+exists, because the dump records the applied cutover migrations in the
+manifest (see `docs/backup.md`); no group here gains that grant for backup —
+runtime stays unable to read the ledger. The plan transfers both
 tables to the migrator and grants the migrator ALL with no runtime or reader
 grant; the verifier requires migrator ownership/privileges and rejects any
 runtime/reader access, including TOAST-storage ownership drift.
@@ -99,6 +103,14 @@ with no reader yet). Secrets are hash-only; `issued_by` is operator
 attribution retained by the erasure allowlist. The table carries no member
 column, so there is nothing to erase and no reader grant beyond the app
 pool.
+
+The giveaway tables (`giveaways`, `giveaway_entries`, `giveaway_draws`) are
+ordinary `table` kind for the same reason: the giveaway store creates,
+enters, leases and draws through the app pool. Unlike the tables above they
+do carry member columns (`created_by`, `user_id`, `winner_ids`, and the
+`single:<id>` replaced-winner id inside `reroll_kind`), so member erasure
+and guild purge cover all three tables in the reviewed erasure plan; there
+is no reader grant beyond the app pool.
 
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's

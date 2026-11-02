@@ -49,8 +49,8 @@
 //!    `moderation.ban/tempban/lockdown/unlock`, `role.assign` (privilege
 //!    grant, deliberately admin), `announcement.post`, `settings.set` and
 //!    `automations.import`. Higher scope implies lower for reads only;
-//!    writes need the listed scope or admin. Later slices extend the map
-//!    with new verbs; only strings that can never be verbs (typos, empty,
+//!    writes need exactly the listed scope, never an implied tier. Later
+//!    slices extend the map with new verbs; only strings that can never be verbs (typos, empty,
 //!    case/whitespace variants) are pinned to no scope here.
 //! 3. `authorize` and `assert_allowed` keep their signatures and their
 //!    HMAC/flag behavior: the scope/token step is additive and runs after
@@ -326,17 +326,57 @@ fn every_tier_allows_read_verbs() {
 }
 
 #[test]
-fn moderate_and_admin_allow_moderate_verbs() {
-    for scope in [SCOPE_MODERATE, SCOPE_ADMIN] {
-        for verb in [
-            "moderation.warn",
-            "moderation.kick",
-            "guild.add_member",
-            "event.cancel",
-        ] {
-            assert!(
-                InternalFlags::admin_scope_allows(&[scope], verb),
-                "{scope} must allow the moderate verb {verb}"
+fn only_explicit_moderate_allows_moderate_verbs() {
+    for verb in [
+        "moderation.warn",
+        "moderation.kick",
+        "guild.add_member",
+        "event.cancel",
+    ] {
+        assert!(
+            InternalFlags::admin_scope_allows(&[SCOPE_MODERATE], verb),
+            "explicit moderate must allow {verb}"
+        );
+        assert!(
+            !InternalFlags::admin_scope_allows(&[SCOPE_ADMIN], verb),
+            "A2: admin alone must not imply the moderate write {verb}"
+        );
+    }
+}
+
+#[test]
+fn exact_write_scope_matrix_and_read_implication_cover_every_existing_verb() {
+    // Literal expectations from A2, not computed using the production map.
+    let cases: &[(&[&str], [bool; 3])] = &[
+        (&[], [false, false, false]),
+        (&[SCOPE_READ], [true, false, false]),
+        (&[SCOPE_MODERATE], [true, true, false]),
+        (&[SCOPE_ADMIN], [true, false, true]),
+        (&[SCOPE_READ, SCOPE_ADMIN], [true, false, true]),
+        (&[SCOPE_MODERATE, SCOPE_ADMIN], [true, true, true]),
+        (
+            &[SCOPE_READ, SCOPE_MODERATE, SCOPE_ADMIN],
+            [true, true, true],
+        ),
+        (&["ADMIN", "moderate "], [false, false, false]),
+    ];
+    for &(scopes, expected) in cases {
+        for (verb, required) in V0_SCOPE_MAP {
+            let column = match required {
+                SCOPE_READ => 0,
+                SCOPE_MODERATE => 1,
+                SCOPE_ADMIN => 2,
+                _ => panic!("invalid acceptance scope literal"),
+            };
+            assert_eq!(
+                InternalFlags::admin_scope_allows(scopes, verb),
+                expected[column],
+                "{scopes:?} on {verb}: reads imply, writes require explicit scope"
+            );
+            assert_eq!(
+                live_token_allows(scopes, verb, GUILD),
+                expected[column],
+                "token predicate must preserve exact scope on {verb}"
             );
         }
     }
@@ -1009,8 +1049,8 @@ mod registry_db {
     async fn insert_live_token(pool: &sqlx::PgPool, token_id: &str) {
         sqlx::query(
             "INSERT INTO admin_api_tokens
-             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ($1, $2, '{read}', '{326474832151838730}',
+             (holder_id, holder_kind, token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ('fixture-holder', 'human', $1, $2, '{read}', '{326474832151838730}',
                      'fixture holder', 'fixture operator', $3::timestamptz, $4::timestamptz)",
         )
         .bind(token_id)
@@ -1046,6 +1086,14 @@ mod registry_db {
         }
         for column in super::TABLE_COLUMNS {
             assert!(by_name.contains_key(column), "missing column {column}");
+        }
+        for column in ["holder_id", "holder_kind"] {
+            assert!(
+                by_name.contains_key(column),
+                "forward repair must add {column}"
+            );
+            assert_eq!(by_name[column].0, "text", "holder authority is TEXT");
+            assert_eq!(by_name[column].1, "NO", "holder authority is NOT NULL");
         }
         assert_eq!(by_name["token_id"].0, "text");
         assert_eq!(by_name["secret_hash"].0, "text");
@@ -1158,8 +1206,8 @@ mod registry_db {
         };
         let err = sqlx::query(
             "INSERT INTO admin_api_tokens
-             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ('adm_2000000000000000', $1, '{read,superuser}', '{1}', 'h', 'o', $2::timestamptz, $3::timestamptz)",
+             (holder_id, holder_kind, token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ('fixture-holder', 'human', 'adm_2000000000000000', $1, '{read,superuser}', '{1}', 'h', 'o', $2::timestamptz, $3::timestamptz)",
         )
         .bind(TEST_HASH)
         .bind(ISSUED)
@@ -1170,8 +1218,8 @@ mod registry_db {
         assert_sqlstate(&err, "23514", "scope CHECK");
         sqlx::query(
             "INSERT INTO admin_api_tokens
-             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ('adm_2000000000000001', $1, '{}', '{1}', 'h', 'o', $2::timestamptz, $3::timestamptz)",
+             (holder_id, holder_kind, token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ('fixture-holder', 'human', 'adm_2000000000000001', $1, '{}', '{1}', 'h', 'o', $2::timestamptz, $3::timestamptz)",
         )
         .bind(TEST_HASH)
         .bind(ISSUED)
@@ -1188,8 +1236,8 @@ mod registry_db {
         };
         let err = sqlx::query(
             "INSERT INTO admin_api_tokens
-             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ('adm_2100000000000000', $1, '{read}', '{}', 'h', 'o', $2::timestamptz, $3::timestamptz)",
+             (holder_id, holder_kind, token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ('fixture-holder', 'human', 'adm_2100000000000000', $1, '{read}', '{}', 'h', 'o', $2::timestamptz, $3::timestamptz)",
         )
         .bind(TEST_HASH)
         .bind(ISSUED)
@@ -1200,8 +1248,8 @@ mod registry_db {
         assert_sqlstate(&err, "23514", "guild CHECK");
         let err = sqlx::query(
             "INSERT INTO admin_api_tokens
-             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ('adm_2100000000000001', $1, '{read}', NULL, 'h', 'o', $2::timestamptz, $3::timestamptz)",
+             (holder_id, holder_kind, token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ('fixture-holder', 'human', 'adm_2100000000000001', $1, '{read}', NULL, 'h', 'o', $2::timestamptz, $3::timestamptz)",
         )
         .bind(TEST_HASH)
         .bind(ISSUED)
@@ -1223,8 +1271,8 @@ mod registry_db {
         ] {
             let err = sqlx::query(
                 "INSERT INTO admin_api_tokens
-                 (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-                 VALUES ($1, $2, '{read}', '{1}', 'h', 'o', $3::timestamptz, $4::timestamptz)",
+                 (holder_id, holder_kind, token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+                 VALUES ('fixture-holder', 'human', $1, $2, '{read}', '{1}', 'h', 'o', $3::timestamptz, $4::timestamptz)",
             )
             .bind(token_id)
             .bind(TEST_HASH)
@@ -1237,8 +1285,8 @@ mod registry_db {
         }
         let err = sqlx::query(
             "INSERT INTO admin_api_tokens
-             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ('adm_2200000000000002', $1, '{read}', '{1}', 'h', 'o', $2::timestamptz, NULL)",
+             (holder_id, holder_kind, token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ('fixture-holder', 'human', 'adm_2200000000000002', $1, '{read}', '{1}', 'h', 'o', $2::timestamptz, NULL)",
         )
         .bind(TEST_HASH)
         .bind(ISSUED)
@@ -1256,8 +1304,8 @@ mod registry_db {
         insert_live_token(db.pool(), TEST_TOKEN).await;
         let err = sqlx::query(
             "INSERT INTO admin_api_tokens
-             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ($1, $2, '{admin}', '{2}', 'other', 'other', $3::timestamptz, $4::timestamptz)",
+             (holder_id, holder_kind, token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ('fixture-holder', 'human', $1, $2, '{admin}', '{2}', 'other', 'other', $3::timestamptz, $4::timestamptz)",
         )
         .bind(TEST_TOKEN)
         .bind(TEST_HASH)
@@ -1281,7 +1329,7 @@ mod registry_db {
                 token_id, secret_hash,
                 array_to_string(scopes, ','),
                 array_to_string(guild_ids, ','),
-                label, issued_by,
+                label, issued_by, holder_id, holder_kind,
                 issued_at::text, expires_at::text,
                 revoked_at::text, last_used_at::text
              ])
@@ -1291,7 +1339,11 @@ mod registry_db {
         .fetch_all(db.pool())
         .await
         .expect("read every cell as text");
-        assert_eq!(cells.len(), 10, "all ten columns scanned");
+        assert_eq!(
+            cells.len(),
+            12,
+            "all twelve columns including holder authority scanned"
+        );
         let secret = std::str::from_utf8(super::FIXTURE_SECRET).expect("printable fixture");
         for cell in &cells {
             assert!(
@@ -1330,7 +1382,16 @@ mod registry_db {
             .await
             .expect("re-apply restores the table");
         assert!(table_exists(db.pool()).await, "re-apply must restore");
-        insert_live_token(db.pool(), TEST_TOKEN).await;
+        // Historical DDL stays independently usable; it intentionally lacks
+        // the holder columns introduced by the separate forward repair.
+        sqlx::query(LEGACY_INSERT_PLAIN)
+            .bind(TEST_TOKEN)
+            .bind(TEST_HASH)
+            .bind(ISSUED)
+            .bind(EXPIRES)
+            .execute(db.pool())
+            .await
+            .expect("historical registry inserts after rollback");
     }
 
     // -----------------------------------------------------------------------
@@ -1350,15 +1411,19 @@ mod registry_db {
     /// Literal INSERT shapes (sqlx 0.9 only accepts `&'static str`, so the two
     /// NULL-guild array shapes are literals, never interpolated): every
     /// timestamp bind carries `::timestamptz` like the rest of this module.
-    const INSERT_PLAIN: &str = "INSERT INTO admin_api_tokens
+    // Used only when explicitly probing the immutable historical base DDL.
+    const LEGACY_INSERT_PLAIN: &str = "INSERT INTO admin_api_tokens
              (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
              VALUES ($1, $2, '{read}', '{1}', 'h', 'o', $3::timestamptz, $4::timestamptz)";
+    const INSERT_PLAIN: &str = "INSERT INTO admin_api_tokens
+             (holder_id, holder_kind, token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ('fixture-holder', 'human', $1, $2, '{read}', '{1}', 'h', 'o', $3::timestamptz, $4::timestamptz)";
     const INSERT_NULL_GUILD: &str = "INSERT INTO admin_api_tokens
-             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ($1, $2, '{read}', ARRAY[NULL]::bigint[], 'h', 'o', $3::timestamptz, $4::timestamptz)";
+             (holder_id, holder_kind, token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ('fixture-holder', 'human', $1, $2, '{read}', ARRAY[NULL]::bigint[], 'h', 'o', $3::timestamptz, $4::timestamptz)";
     const INSERT_PARTIAL_NULL_GUILD: &str = "INSERT INTO admin_api_tokens
-             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
-             VALUES ($1, $2, '{read}', ARRAY[1,NULL]::bigint[], 'h', 'o', $3::timestamptz, $4::timestamptz)";
+             (holder_id, holder_kind, token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ('fixture-holder', 'human', $1, $2, '{read}', ARRAY[1,NULL]::bigint[], 'h', 'o', $3::timestamptz, $4::timestamptz)";
 
     #[tokio::test]
     async fn secret_hash_shape_rejects_malformed_hashes() {
@@ -1447,6 +1512,14 @@ mod registry_db {
 
     #[tokio::test]
     async fn store_migration_applies_standalone_with_same_guards() {
+        // These local fixtures target ONLY shipped 0457, not the latest schema.
+        const INSERT_PLAIN: &str = LEGACY_INSERT_PLAIN;
+        const INSERT_NULL_GUILD: &str = "INSERT INTO admin_api_tokens
+             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ($1, $2, '{read}', ARRAY[NULL]::bigint[], 'h', 'o', $3::timestamptz, $4::timestamptz)";
+        const INSERT_PARTIAL_NULL_GUILD: &str = "INSERT INTO admin_api_tokens
+             (token_id, secret_hash, scopes, guild_ids, label, issued_by, issued_at, expires_at)
+             VALUES ($1, $2, '{read}', ARRAY[1,NULL]::bigint[], 'h', 'o', $3::timestamptz, $4::timestamptz)";
         let Some(db) = connect("store-standalone").await else {
             return;
         };

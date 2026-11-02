@@ -637,7 +637,11 @@ async fn cmd_restore(args: &[String]) -> i32 {
                     table.name,
                     table.count,
                     got,
-                    if got == table.count { "ok" } else { "MISMATCH" }
+                    if got == report.expected_count(&table.name) {
+                        "ok"
+                    } else {
+                        "MISMATCH"
+                    }
                 );
             }
             for (table, count) in &report.initialized_tables {
@@ -652,6 +656,14 @@ async fn cmd_restore(args: &[String]) -> i32 {
                 eprintln!(
                     "restore: {} imported expiries quarantined (including accepted snapshots); moderation must remain off until authoritative reconciliation",
                     report.quarantined_unbans
+                );
+            }
+            if report.translated_voice_command_roles > 0
+                || report.translated_voice_command_role_members > 0
+            {
+                eprintln!(
+                    "restore: replayed the 0469 translation for {} legacy voice command restriction(s) into voice_access_controls.command_roles ({} guild row(s) added; unknown command names dropped); legacy voice_command_roles tables emptied",
+                    report.translated_voice_command_roles, report.voice_access_controls_added
                 );
             }
             for (table, cols) in &report.dropped_columns {
@@ -711,6 +723,14 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
         .any(|table| table.name == "moderation_member_bans")
     {
         eprintln!("restore: old v3 has no member-ban ownership; apply does not infer acceptance; keep moderation off pending reconciliation");
+    }
+    if !contents.manifest.applied_cutover(469)
+        && contents.manifest.tables.iter().any(|table| {
+            (table.name == "voice_command_roles" || table.name == "voice_command_role_members")
+                && table.count > 0
+        })
+    {
+        eprintln!("restore: apply replays the 0469 translation, moving legacy voice command restrictions into voice_access_controls.command_roles (unknown command names dropped) and emptying the legacy voice_command_roles tables");
     }
     println!(
         "restore: migrations in dump: {}",
@@ -2058,15 +2078,10 @@ mod tests {
         }
     }
 
-    /// Serialises the fixture write-and-spawn window of the bounded
-    /// upload-helper tests. `write_upload_fixture` leaves the script open
-    /// for writing while a sibling test on another thread forks; the forked
-    /// child inherits the write fd until its own exec, so exec of the fresh
-    /// script fails with ETXTBSY and the helper reports a spurious
-    /// `SpawnFailed`. Holding this guard from the fixture write through
-    /// `run_upload_command` keeps those windows disjoint. The mutex is
-    /// async-aware (`tokio::sync`) so holding the guard across `.await` is
-    /// allowed and does not block the executor.
+    /// Serialises the bounded upload-helper fixtures. Other suites can
+    /// still fork while a script is open for writing, so these tests run
+    /// scripts through `/bin/sh` rather than exec the freshly written file:
+    /// an inherited write fd must not cause a spurious ETXTBSY spawn failure.
     #[cfg(unix)]
     static UPLOAD_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -2094,6 +2109,13 @@ mod tests {
             UPLOAD_SECRET_MARKER.to_owned(),
             file.to_owned(),
         ]
+    }
+
+    #[cfg(unix)]
+    fn upload_fixture_argv(helper: &std::path::Path, file: &str) -> Vec<String> {
+        let mut args = vec![helper.to_string_lossy().into_owned()];
+        args.extend(secret_argv(file));
+        args
     }
 
     #[test]
@@ -2151,8 +2173,8 @@ mod tests {
             "#!/bin/sh\necho fixture-remote-output-marker\nexit 0\n",
         );
         let outcome = super::run_upload_command(
-            &helper.to_string_lossy(),
-            &secret_argv("archive.ndjson.gz"),
+            "/bin/sh",
+            &upload_fixture_argv(&helper, "archive.ndjson.gz"),
             std::time::Duration::from_secs(30),
         )
         .await;
@@ -2180,9 +2202,14 @@ mod tests {
             "upload-fail.sh",
             "#!/bin/sh\necho fixture-remote-output-marker\nexit 3\n",
         );
+        // Model a writable fd inherited by an unrelated concurrent child.
+        let _writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&helper)
+            .unwrap();
         let outcome = super::run_upload_command(
-            &helper.to_string_lossy(),
-            &secret_argv("archive.ndjson.gz"),
+            "/bin/sh",
+            &upload_fixture_argv(&helper, "archive.ndjson.gz"),
             std::time::Duration::from_secs(30),
         )
         .await;
@@ -2273,8 +2300,8 @@ mod tests {
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             super::run_upload_command(
-                &helper.to_string_lossy(),
-                &secret_argv("archive.ndjson.gz"),
+                "/bin/sh",
+                &upload_fixture_argv(&helper, "archive.ndjson.gz"),
                 std::time::Duration::from_millis(300),
             ),
         )

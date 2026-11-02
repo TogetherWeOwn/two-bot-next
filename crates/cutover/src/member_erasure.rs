@@ -86,6 +86,7 @@ pub fn is_identity_column(column: &str) -> bool {
                 | "assignee_id"
                 | "opener_id"
                 | "requester_id"
+                | "holder_id"
         )
 }
 
@@ -366,6 +367,11 @@ mod tests {
             assert!(!entry.reason.trim().is_empty());
             assert!(exceptions.insert((entry.table, entry.column)));
         }
+    }
+
+    #[test]
+    fn holder_id_is_an_identity_candidate() {
+        assert!(is_identity_column("holder_id"));
     }
 
     #[test]

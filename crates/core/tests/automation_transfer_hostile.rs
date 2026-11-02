@@ -243,16 +243,13 @@ fn entry_problems_are_counted_never_fatal() {
 #[test]
 fn oversized_entry_lists_fail_bounded() {
     let max = max_import_entries();
-    assert!(
-        max > 0 && max < 100,
-        "budget leaves room under the guild cap"
-    );
+    assert_eq!(max, 100, "the envelope cap is the guild command ceiling");
     let entry =
         |i: usize| json!({"name": format!("bulk-{i:04}"), "description": "Bulk", "template": "t"});
-    // Exactly the budget parses; one more refuses with the exact count.
+    // Exactly the cap parses; one more refuses with the exact count.
     let fitting: Vec<Value> = (0..max).map(entry).collect();
     let parsed = parse_import_document(&json!({"version": 1, "commands": fitting}), max)
-        .expect("exactly the budget fits");
+        .expect("exactly the cap fits");
     assert_eq!(parsed.entries.len() + parsed.invalid_entries, max);
     let overflowing: Vec<Value> = (0..max + 1).map(entry).collect();
     assert_eq!(
@@ -267,8 +264,10 @@ fn oversized_entry_lists_fail_bounded() {
         parse_import_document(&json!([{"command": "faq", "response": "a"}]), 0),
         Err(ImportParseError::TooManyEntries { count: 1, max: 0 })
     );
-    // The budget is the guild command ceiling minus reservations.
-    assert_eq!(max, max_custom_commands(reserved_command_names().len()));
+    // The envelope never derives from reservations: the per-guild budget is
+    // enforced in planning, where stored rows are known (no-growth re-imports
+    // of rows saved under an older budget must reach it).
+    assert!(max > max_custom_commands(reserved_command_names().len()));
 }
 
 #[test]

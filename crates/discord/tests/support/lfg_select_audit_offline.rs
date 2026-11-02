@@ -213,6 +213,86 @@ pub fn query_scalar(sql: &str) -> Query {
     query(sql)
 }
 
+pub enum SweepBind {
+    Text(String),
+    Timestamp(time::OffsetDateTime),
+    Limit(i64),
+}
+impl From<&str> for SweepBind {
+    fn from(value: &str) -> Self {
+        Self::Text(value.into())
+    }
+}
+impl From<time::OffsetDateTime> for SweepBind {
+    fn from(value: time::OffsetDateTime) -> Self {
+        Self::Timestamp(value)
+    }
+}
+impl From<i64> for SweepBind {
+    fn from(value: i64) -> Self {
+        Self::Limit(value)
+    }
+}
+
+pub struct SweepQuery {
+    sql: String,
+    binds: Vec<SweepBind>,
+}
+pub fn query_as(sql: &str) -> SweepQuery {
+    SweepQuery {
+        sql: sql.into(),
+        binds: Vec::new(),
+    }
+}
+impl SweepQuery {
+    pub fn bind(mut self, value: impl Into<SweepBind>) -> Self {
+        self.binds.push(value.into());
+        self
+    }
+
+    pub async fn fetch_all(self, pool: &PgPool) -> Result<Vec<(String,)>, Error> {
+        assert_eq!(
+            self.sql.split_whitespace().collect::<Vec<_>>().join(" "),
+            "SELECT id FROM lfg_posts WHERE guild_id = $1 AND status = 'open' AND (starts_at <= $2 OR (message_id IS NULL AND created_at <= $3)) ORDER BY created_at, id LIMIT $4",
+            "unsupported offline row query"
+        );
+        let [SweepBind::Text(guild), SweepBind::Timestamp(expired), SweepBind::Timestamp(orphan), SweepBind::Limit(limit)] =
+            self.binds.as_slice()
+        else {
+            panic!("offline lifecycle scan requires guild, two timestamps and limit")
+        };
+        let mut state = pool.0.lock().expect("fixture state");
+        state.trace.push("sql.lifecycle_candidates");
+        if state.closed {
+            return Err(Error);
+        }
+        let timestamp = |at: &str| {
+            time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+                .expect("fixture timestamp")
+        };
+        let mut rows: Vec<_> = state
+            .posts
+            .iter()
+            .filter(|post| {
+                post.guild_id == *guild
+                    && post.status == LfgStatus::Open
+                    && (timestamp(&post.starts_at) <= *expired
+                        || (post.message_id.is_none() && timestamp(&post.created_at) <= *orphan))
+            })
+            .collect();
+        rows.sort_by(|left, right| {
+            timestamp(&left.created_at)
+                .cmp(&timestamp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(rows
+            .into_iter()
+            .take(usize::try_from(*limit).expect("nonnegative fixture scan limit"))
+            .map(|post| (post.id.clone(),))
+            .collect())
+    }
+}
+
 impl Query {
     pub fn bind(mut self, value: impl ToString) -> Self {
         self.binds.push(value.to_string());
@@ -234,6 +314,22 @@ impl Query {
             .trace
             .push("sql.lock");
         Ok(())
+    }
+
+    pub async fn fetch_one<'a>(self, executor: impl Executor<'a>) -> Result<bool, Error> {
+        assert_eq!(
+            self.sql, "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))",
+            "unsupported offline scalar query"
+        );
+        assert_eq!(self.binds.len(), 1, "runtime lock must have one bound key");
+        let connection = executor.connection();
+        let mut state = connection.0 .0.lock().expect("fixture state");
+        state.trace.push("sql.try_lock");
+        if state.closed {
+            return Err(Error);
+        }
+        // Fixtures execute sequentially; the transaction owns the only lock.
+        Ok(true)
     }
 
     pub async fn fetch_optional(self, pool: &PgPool) -> Result<Option<String>, Error> {
@@ -291,6 +387,25 @@ impl Query {
 pub mod lfg_store {
     use super::*;
     use crate::automation_quota::QuotaWriteError;
+    pub use crate::real_core::lfg_store::LfgSeatEditOutcome;
+
+    // Seat persistence and its atomic audit belong to the database acceptance
+    // slice. Compile against the real outcome type, but never invent success.
+    pub async fn increase_lfg_seats(
+        pool: &PgPool,
+        _guild_id: &str,
+        _id: &str,
+        _role_key: &str,
+        _seats: u8,
+        _audit: &RsvpAudit,
+    ) -> Result<LfgSeatEditOutcome, Error> {
+        pool.0
+            .lock()
+            .expect("fixture state")
+            .trace
+            .push("store.increase_seats");
+        Err(Error)
+    }
 
     pub async fn get_lfg(pool: &PgPool, guild: &str, id: &str) -> Result<Option<LfgPost>, Error> {
         let mut state = pool.0.lock().expect("fixture state");
@@ -402,6 +517,56 @@ pub mod lfg_store {
         post.closed_at = Some(at.into());
         Ok(true)
     }
+    // Close-message repair is outside this signup/audit acceptance slice.
+    // Reuse its production state type, but fail loudly if a test reaches I/O.
+    pub use crate::real_core::lfg_store::CloseRefreshState;
+
+    pub async fn get_lfg_close_refresh(
+        _pool: &PgPool,
+        _guild_id: &str,
+        _id: &str,
+    ) -> Result<Option<CloseRefreshState>, Error> {
+        panic!("close repair is outside this offline acceptance slice")
+    }
+
+    pub async fn clear_lfg_close_refresh(
+        _pool: &PgPool,
+        _guild_id: &str,
+        _id: &str,
+    ) -> Result<(), Error> {
+        panic!("close repair is outside this offline acceptance slice")
+    }
+
+    pub async fn defer_lfg_close_refresh(
+        _pool: &PgPool,
+        _guild_id: &str,
+        _id: &str,
+        _attempts: i32,
+        _next_at: time::OffsetDateTime,
+    ) -> Result<(), Error> {
+        panic!("close repair is outside this offline acceptance slice")
+    }
+
+    // The included service also compiles its metadata-edit branch. Keep that
+    // store boundary explicit without pretending this signup/audit double tests it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum LfgEditOutcome {
+        Missing,
+        Closed,
+        Unchanged { starts_at: String },
+        Updated { starts_at: String },
+    }
+
+    pub async fn edit_lfg_metadata(
+        _pool: &PgPool,
+        _guild_id: &str,
+        _id: &str,
+        _title: Option<&str>,
+        _starts_at: Option<&str>,
+    ) -> Result<LfgEditOutcome, Error> {
+        panic!("metadata edit is outside this offline acceptance slice")
+    }
+
     // Create/nonce recovery is deliberately outside this acceptance slice.
     // Fail loudly if a test accidentally invokes it instead of silently faking it.
     pub async fn put_lfg(
@@ -423,6 +588,46 @@ pub mod lfg_store {
     pub async fn delete_lfg(_pool: &PgPool, _guild: &str, _id: &str) -> Result<bool, Error> {
         panic!("create is outside this offline acceptance slice")
     }
+}
+
+#[tokio::test]
+async fn unmodeled_seat_edit_reports_database_failure_without_side_effects() {
+    use crate::subject::{LfgError, LfgInteractions, LfgRequest};
+
+    let pool = PgPool::fixture();
+    pool.seed_post("post-a", "1");
+    pool.seed_signup("post-a", "2", "tank");
+    let before = pool.snapshot();
+    let executor = ActionExecutor::default();
+    let service = LfgInteractions::new(pool.clone());
+    let result = service
+        .execute(
+            &executor,
+            LfgRequest::EditSeats {
+                post_id: "post-a".into(),
+                role_key: "tank".into(),
+                seats: 3,
+            },
+            "1",
+            "5",
+            100,
+            99,
+        )
+        .await;
+
+    assert!(matches!(result, Err(LfgError::Database(_))));
+    assert_eq!(
+        pool.snapshot(),
+        before,
+        "unmodeled edit changed saved state"
+    );
+    assert_eq!(pool.audit_attempts(), 0);
+    assert!(executor.edits().is_empty());
+    assert_eq!(
+        pool.trace(),
+        ["sql.begin", "sql.lock", "store.increase_seats"],
+        "the service must reach the explicit fail-closed boundary"
+    );
 }
 
 pub mod rsvp_store {
@@ -486,6 +691,15 @@ impl ActionExecutor {
             return Err(DiscordError::Unavailable("offline refresh fault".into()));
         }
         Ok(())
+    }
+    pub async fn edit_message_for_close_refresh(
+        &self,
+        _channel: &str,
+        _message: &str,
+        _content: &str,
+        _components: &[Value],
+    ) -> crate::CloseRefreshEdit {
+        panic!("close repair is outside this offline acceptance slice")
     }
     pub async fn recover_message_by_nonce(
         &self,

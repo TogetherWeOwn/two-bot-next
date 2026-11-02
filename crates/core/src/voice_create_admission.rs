@@ -294,6 +294,30 @@ pub fn decide_admission(
     request: &AdmissionRequest<'_>,
     now_secs: i64,
 ) -> Result<AdmissionDecision, AdmissionError> {
+    let cutoff = now_secs.saturating_sub(CREATE_BURST_WINDOW_SECS);
+    let mut mine = 0u32;
+    let mut total = 0u32;
+    for reservation in request.accepted_reservations {
+        if reservation.created_at_secs > cutoff {
+            total = total.saturating_add(1);
+            if reservation.user_id == request.user_id {
+                mine = mine.saturating_add(1);
+            }
+        }
+    }
+    decide_admission_counts(config, request, now_secs, mine, total)
+}
+
+/// Store-backed equivalent with exact in-window aggregate counts. A capped
+/// guild history cannot supply the user's count: older user reservations may
+/// fall outside its newest prefix. All refusal precedence stays shared here.
+pub fn decide_admission_counts(
+    config: &CreateAdmissionConfig,
+    request: &AdmissionRequest<'_>,
+    now_secs: i64,
+    mine: u32,
+    total: u32,
+) -> Result<AdmissionDecision, AdmissionError> {
     if request.user_id == 0 {
         return Err(AdmissionError::InvalidUserId);
     }
@@ -315,17 +339,6 @@ pub fn decide_admission(
         return Ok(AdmissionDecision::Deny {
             reason: RefusalReason::Cooldown,
         });
-    }
-    let cutoff = now_secs.saturating_sub(CREATE_BURST_WINDOW_SECS);
-    let mut mine = 0u32;
-    let mut total = 0u32;
-    for reservation in request.accepted_reservations {
-        if reservation.created_at_secs > cutoff {
-            total = total.saturating_add(1);
-            if reservation.user_id == request.user_id {
-                mine = mine.saturating_add(1);
-            }
-        }
     }
     if mine >= CREATE_BURST_PER_USER {
         return Ok(AdmissionDecision::Deny {

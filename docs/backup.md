@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v13 dump format with v3/v4/v5/v6/v7/v8/v9/v10/v11/v12 read compatibility,
+`two-bot` `main @ d5d11793`): v15 dump format with v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -102,17 +102,18 @@ upload command; argv and child output never echoed):
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v13** (including durable voice-create reservations, the retention
+write **v15** (including durable voice-create reservations, the retention
 queues, the seasonal XP projection, the event store: voice capture plus
 presence capture plus member-capture deltas plus message/reaction capture
 plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
 invite/scheduled-event capture, the stream go-live ledger, guild game-activity
 aggregates, the assistant monthly-cap ledger, the scheduled-event
 epoch-claim guard, the scheduled-event delete tombstones and the admin API
-token registry and event voice pair); the reader also accepts
+token registry, event voice pair, three starboard tables and three giveaway tables); the reader also accepts
 frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**, pre-seasonal **v6**,
 pre-stream-ledger **v7**, pre-guild-counters **v8**, pre-epoch-claim **v9**,
-pre-tombstone **v10**, pre-registry **v11** and pre-event-voice **v12**.
+pre-tombstone **v10**, pre-registry **v11**, pre-event-voice **v12** and
+pre-starboard **v13** and pre-giveaways **v14**.
 Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
@@ -121,7 +122,11 @@ standalone settings allocator, `{table, column, lastValue, isCalled, increment}`
 read from the sequence itself. Rows cannot show values that were handed out
 and then deleted; the marks can. Sequences are not MVCC, so a mark is the
 position when the dump read it, at or beyond every value in the snapshot. The
-dump role needs `SELECT` on those sequences. Values are stored in Postgres text-output
+dump role needs `SELECT` on those sequences. It also needs `SELECT` on the
+cutover migration ledger (`_sqlx_migrations`) when that table exists: the
+manifest records the applied cutover migrations as restore's evidence for the
+0469 replay gate, and an existing ledger the dump role cannot read refuses the
+dump rather than recording it as absent. Values are stored in Postgres text-output
 form with a `$n::type` cast on restore — faithful for every owned type
 without per-type decoding. `column_types` is additive to the legacy envelope.
 Port-written row cells are strings/nulls. Frozen legacy v3 dumps have no
@@ -145,10 +150,10 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9, v10, v11, v12 and v13)
+### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14 and v15)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **101 durable tables from the
+inventory for both dump and restore. It includes **104 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
@@ -171,37 +176,49 @@ aggregates (`game_activity_guild_aggregates`: 0441/0442), the assistant
 monthly-cap ledger (`assistant_monthly_builds`: 0446/0447), the
 scheduled-event epoch-claim guard (`scheduled_events_claim`: 0450/0451) and
 its delete tombstones (`scheduled_events_tombstone`: 0452/0453) and the
-admin API token registry (`admin_api_tokens`: 0456/0457) and the event
-voice pair (`event_voice_channels`, `event_voice_presence`: 0455).
+admin API token registry (`admin_api_tokens`: 0456/0457, named-holder and
+90-day lifetime repair 0464/0463), the event voice pair
+(`event_voice_channels`, `event_voice_presence`: 0455), plus starboard
+configuration, distinct starrers and post state (`starboard_config`,
+`starboard_starrers`, `starboard_posts`: 0458/0459), plus giveaway definitions,
+entries and draw rounds (`giveaways`, `giveaway_entries`, `giveaway_draws`: 0460/0461).
+The [registry contract](admin-registry.md) adds no table or archive version:
+new v15 dumps discover `holder_id` / `holder_kind` dynamically. Populated
+pre-holder archives refuse transactionally on the required authority columns
+instead of inventing holders; older readable archives that omit the table
+retain their versioned clearing behavior.
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 101 table entries. A missing current table refuses a dump/restore: migrate
+has 107 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 Each readable version requires its historical inventory and waives only
 versioned additions introduced later:
 
 | Version | Tables it may omit |
 | --- | --- |
-| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (guild counters), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair) |
-| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES` (event voice pair) |
-| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES` (event voice pair) |
-| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES` (event voice pair) |
-| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES` (event voice pair) |
-| v9 | `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`: `scheduled_events_claim`, `scheduled_events_tombstone`, `admin_api_tokens`, `V13_ADDED_TABLES` (event voice pair) |
-| v10 | `V11_ADDED_TABLES`, `V12_ADDED_TABLES`: `scheduled_events_tombstone`, `admin_api_tokens`, `V13_ADDED_TABLES` (event voice pair) |
-| v11 | `V12_ADDED_TABLES`: `admin_api_tokens`, `V13_ADDED_TABLES` (event voice pair) |
-| v12 | `V13_ADDED_TABLES`: `event_voice_channels`, `event_voice_presence` |
-| v13 | None: the full current inventory is required |
+| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (game-activity aggregates and assistant monthly-cap ledger), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
+| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
+| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
+| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
+| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
+| v9 | `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
+| v10 | `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
+| v11 | `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
+| v12 | `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
+| v13 | `V14_ADDED_TABLES`: `starboard_config`, `starboard_starrers`, `starboard_posts`, `V15_ADDED_TABLES` (giveaway tables) |
+| v14 | `V15_ADDED_TABLES`: `giveaways`, `giveaway_entries`, `giveaway_draws` |
+| v15 | None: the full current inventory is required |
 
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
-is unchanged from before these additions; older v4–v12 archives need not
-invent entries for the v9 guild counters, the v10 epoch-claim guard, the
-v11 delete tombstones, the v12 token registry or the v13 event voice pair.
+is unchanged from before these additions. Each version may omit only the later
+additions listed in its row above. In particular, only v4–v8 may omit the v9
+`game_activity_guild_aggregates` and `assistant_monthly_builds` tables; v9 and
+later require both. The separate `guild_counters` table is never waived.
 Restoring an older archive clears
 destination rows for every omitted later table instead of retaining unrelated
-target state. In particular, restoring v8 without guild counters clears both
-counters; it cannot recover assistant usage that predates its persistence.
+target state. Restoring v8 without the two v9 tables clears their destination
+rows; it cannot recover assistant usage that predates its persistence.
 Restoring v9 without the claim guard clears the guard, the tombstones and
 the registry and event voice pair; the mirror re-fences on the next winning fetch. Restoring a
 claim-only v10 clears the tombstones, registry and event voice pair while keeping the
@@ -210,9 +227,14 @@ be re-issued, since secrets are shown once and cannot be re-derived. Use a
 v12 recovery point to preserve the monthly cap, both mirror fences and the
 issued tokens. Restoring v12 without the event voice pair clears both
 tables; the next tick re-claims open instances, but archived presence spans
-are lost. Use a v13 recovery point to preserve claims and spans. Current
-v13 archives must include the monthly cap, both mirror-fence tables, the
-registry and event voice pair, so routine restores retain their archived state. Tombstone `deleted_at` cells must be real dates in
+are lost. Use a v13 recovery point to preserve claims and spans. Use v14 to
+preserve starboard settings, starrers and post records too. Restoring a pre-v14
+archive clears those three tables, so the board is off until configured again.
+Restoring v14 clears giveaway definitions, entries and draw rounds while
+preserving starboard, event voice and issued tokens. Use v15 to preserve giveaways.
+Current v15 archives must include the monthly cap, both mirror-fence tables,
+the registry, event voice pair, starboard and giveaway tables, so routine restores
+retain their archived state. Tombstone `deleted_at` cells must be real dates in
 exact `YYYY-MM-DDTHH:MM:SS.sssZ` form: inspection refuses missing, null,
 non-string or noncanonical values before restore opens a write transaction.
 Rollback-delta import enforces the same rule during parsing and revalidates the
@@ -222,11 +244,13 @@ An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.
 
-Three application tables are excluded, each with its reason inline in
+Four application tables are excluded, each with its reason inline in
 `EXCLUDED_TABLES`: `xp_cooldowns` (short-lived award throttles; restore clears
 target cooldowns), `discord_send_admission` (per-credential lane state that a
-recovered process re-learns) and `gateway_onboarding_jobs` (a restart-recovery
-queue bound to a gateway session). The store chain's `rollback_journal` and
+recovered process re-learns), `gateway_onboarding_jobs` (a restart-recovery
+queue bound to a gateway session) and `automation_command_registry_resync`
+(the pending registry-publication marker; a recovered process republishes
+the complete custom-command set on boot regardless). The store chain's `rollback_journal` and
 `rollback_watermarks` are excluded too: the journal is append-only
 cutover evidence (the `PgFunnelStore` funnel append and the production
 gateway batch writer in `crates/cutover/src/gateway_session.rs` journal each
@@ -333,6 +357,32 @@ snapshot **and preserved destination history**, proves the actual remote
 outcomes/order, and records expiry dispositions before any activation. Consumer
 shutdown alone is not remote reconciliation. No automatic release or
 destructive in-place override is provided by this slice.
+
+### Pre-0469 voice command restrictions
+
+Backups taken before migration 0469 can hold per-command voice restrictions
+only in the legacy `voice_command_roles` / `voice_command_role_members`
+tables. The command gate reads only `voice_access_controls.command_roles`,
+so after loading the rows restore replays the 0469 translation over them —
+same recognised-command filter (unknown legacy command names are dropped)
+and same merge rule (a command already restricted in
+`voice_access_controls` keeps its enforced role list) — then empties the
+legacy tables so the move happens once. The row-count check expects the
+legacy tables empty and any inserted `voice_access_controls` guild rows on
+top of the manifest count; the CLI names the translation in both dry-run
+and apply output.
+
+The replay runs only for archives whose recorded cutover migrations
+(`cutoverMigrations` in the manifest, written from the source's
+`_sqlx_migrations` ledger) prove the source had **not** applied 0469.
+After 0469, `/import` mirrors restrictions into both stores but `/access`
+updates only the gate's, so a post-0469 archive can hold a legacy row for
+a restriction an admin has since lifted; those archives restore both
+voice stores verbatim and the lifted restriction stays lifted. Archives
+written before the evidence field existed carry no proof either way and
+replay fail-closed; the restore report and CLI name the translated counts,
+so check them after restoring such an archive taken shortly after 0469
+shipped and re-lift anything the translation reinstated.
 
 ### Migration-backed regression suite
 
@@ -476,7 +526,8 @@ bounded-helper contract from the nightly backup above: a hung helper is
 terminated and reaped (direct child only), the run fails, and both files
 stay on disk. The snapshot + drift report land in
 `TWO_GUILD_CONFIG_BACKUP_DIR` (default `./guild-config-backups`;
-`crates/bot/src/backup_cli.rs:1067`, usage at `:200`).
+`cmd_guild_config_snapshot` in `crates/bot/src/backup_cli.rs`; usage in
+`print_server_usage` in the same file).
 
 Both guild-config commands first read `CREDENTIALS_DIRECTORY/discord_staging_token`
 (the service's `LoadCredential` contract). Only an absent credential/no configured

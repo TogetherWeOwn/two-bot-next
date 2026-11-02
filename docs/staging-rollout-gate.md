@@ -92,7 +92,7 @@ the receipt identically to the live path and exits 0.
    successfully. Every Wrangler invocation appends its own `wrangler-session`
    record, and `wrangler-action` runs `wrangler --version` before deploying, so
    the file holds several sessions. Require at least one session, all pinned to
-   4.151.0 with record version 1, exactly one `deploy` invocation and every other
+   4.152.0 with record version 1, exactly one `deploy` invocation and every other
    session exactly `--version` or `-v`, and exactly one staging deploy record
    with the expected Worker name, fresh timestamp and concrete Worker version.
    The `receipt` step runs this check **before** `deployment-takeover`, so
@@ -305,8 +305,8 @@ must pass the actual staging job; production cutover remains separately gated.
 
 Pinned source contracts:
 
-- [ApplicationRollout](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.151.0/packages/containers-shared/src/client/models/ApplicationRollout.ts)
-- [RolloutsService](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.151.0/packages/containers-shared/src/client/services/RolloutsService.ts)
-- [Wrangler image build/push](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.151.0/packages/containers-shared/src/build.ts)
-- [Structured output](https://github.com/cloudflare/workers-sdk/blob/wrangler%404.151.0/packages/workers-utils/src/output.ts)
+- [ApplicationRollout](https://github.com/cloudflare/workers-sdk/blob/dfd962fc07f61a3fbdd748d6bf073a49651efa75/packages/containers-shared/src/client/models/ApplicationRollout.ts)
+- [RolloutsService](https://github.com/cloudflare/workers-sdk/blob/dfd962fc07f61a3fbdd748d6bf073a49651efa75/packages/containers-shared/src/client/services/RolloutsService.ts)
+- [Wrangler image build/push](https://github.com/cloudflare/workers-sdk/blob/dfd962fc07f61a3fbdd748d6bf073a49651efa75/packages/containers-shared/src/build.ts)
+- [Structured output](https://github.com/cloudflare/workers-sdk/blob/dfd962fc07f61a3fbdd748d6bf073a49651efa75/packages/workers-utils/src/output.ts)
 - [Worker version metadata](https://developers.cloudflare.com/workers/runtime-apis/bindings/version-metadata/)

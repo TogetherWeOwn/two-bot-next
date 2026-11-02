@@ -241,6 +241,224 @@ class CardAndInternalRefs(unittest.TestCase):
         self.assertIn(("error", "Internal reference"), levels(f))
 
 
+FULL_ATTESTATION = """
+## Attestation
+
+risk_tier: T0
+
+### Claims
+
+- C1: rollback refuses an unqualified DELETE
+
+### Tests
+
+- C1 | test=scripts/test_rollback.py::test_refuses_bare_delete | failed_before=not-run | proof=python3 scripts/test_rollback.py 5 OK
+
+### High-risk checklist
+
+- [x] D1: no secret sinks; redacted evidence only
+- [x] D2: no auth paths changed
+- [x] D3: no migrations shipped
+- [x] D4: bounded inputs and caps
+- [x] D5: no concurrency hazard
+- [x] D6: pinned actions only
+- [x] D7: failures propagate honestly
+- [x] D8: malformed shapes covered
+"""
+
+
+class AttestationFloor(unittest.TestCase):
+    T0_FILES = ".github/workflows/deploy-production.yml"
+
+    def test_t0_path_without_attestation_fails(self):
+        f = ps.evaluate(env(BODY=GOOD_BODY, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_t0_path_with_full_attestation_passes(self):
+        f = ps.evaluate(env(BODY=GOOD_BODY + FULL_ATTESTATION, CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
+    def test_t1_path_without_attestation_passes(self):
+        body = GOOD_BODY
+        for changed in ("src/main.rs\ndocs/guide.md", ""):
+            self.assertEqual([], ps.evaluate(env(BODY=body, CHANGED_FILES=changed)))
+
+    def test_leftover_placeholders_fail(self):
+        base = GOOD_BODY + FULL_ATTESTATION
+        bodies = [
+            base.replace("- [x] D1: no secret sinks; redacted evidence only",
+                         "- [x] D1: <secret sinks, redaction and log/artifact exposure>"),
+            base.replace("risk_tier: T0", "risk_tier: <T0|T1|T2>"),
+            base.replace("- C1: rollback refuses an unqualified DELETE",
+                         "- C1: <behavior guaranteed by this change>"),
+        ]
+        for body in bodies:
+            f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+            self.assertIn(("error", "Attestation"), levels(f), body[-200:])
+
+    def test_missing_claims_or_tests_fails(self):
+        base = GOOD_BODY + FULL_ATTESTATION
+        no_claims = base.replace("### Claims\n\n- C1: rollback refuses an unqualified DELETE\n",
+                                 "### Claims\n\n")
+        f = ps.evaluate(env(BODY=no_claims, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+        no_tests = base.replace(
+            "### Tests\n\n- C1 | test=scripts/test_rollback.py::test_refuses_bare_delete | "
+            "failed_before=not-run | proof=python3 scripts/test_rollback.py 5 OK\n",
+            "### Tests\n\n")
+        f = ps.evaluate(env(BODY=no_tests, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_code_spans_generics_and_autolinks_are_not_placeholders(self):
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- [x] D8: malformed shapes covered",
+            "- [x] D8: malformed `Vec<u8>` payloads rejected, see <https://example.com/spec>")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
+    def test_bare_template_tokens_fail(self):
+        # A contributor can replace the path while leaving <test_name> intact;
+        # bare template tokens are placeholders even without a separator.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "test=scripts/test_rollback.py::test_refuses_bare_delete",
+            "test=scripts/test_rollback.py::<test_name>")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_backticked_placeholders_fail(self):
+        # Wrapping a template placeholder in inline code does not hide it.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- [x] D8: malformed shapes covered",
+            "- [x] D8: `<malformed shapes, Unicode, parsing and host validation>`")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_spaced_generics_are_not_placeholders(self):
+        # `Result<T, E>` is evidence: every blank sits right after a comma,
+        # which template placeholders never do.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- [x] D8: malformed shapes covered",
+            "- [x] D8: malformed payloads rejected, `Result<T, E>` handled")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
+    def test_comma_separated_proof_values_fail(self):
+        # `proof=<command, result>` is an unfilled proof value, not a generic:
+        # the `<` stands alone instead of glued to a type name.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "proof=python3 scripts/test_rollback.py 5 OK",
+            "proof=<command, result>")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_standalone_generic_lists_fail(self):
+        # A comma-blank list only reads as a generic when glued to a type
+        # name; a bare `<T, E>` in prose is still placeholder-shaped.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- [x] D8: malformed shapes covered",
+            "- [x] D8: malformed payloads rejected, over <T, E> handled")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_unfenced_generics_are_not_placeholders(self):
+        # Option<T> outside code spans is evidence: the `<` is glued to an
+        # identifier, which bare template tokens never are.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- [x] D8: malformed shapes covered",
+            "- [x] D8: malformed payloads rejected, Option<T> handled")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
+    def test_turbofish_generics_are_not_placeholders(self):
+        # `Ok::<_, sqlx::Error>` is Rust turbofish evidence, not a
+        # placeholder: `::<` after a type name reads as a generic list.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- [x] D8: malformed shapes covered",
+            "- [x] D8: error path covered, `Ok::<_, sqlx::Error>(())` asserted")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
+    def test_single_colon_lists_still_fail(self):
+        # Only `::` reads as turbofish: `note:<a, b>` keeps the `<` standing
+        # alone, so it is still placeholder-shaped.
+        body = GOOD_BODY + FULL_ATTESTATION.replace(
+            "proof=python3 scripts/test_rollback.py 5 OK",
+            "proof=note:<a, b>")
+        f = ps.evaluate(env(BODY=body, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_claims_need_c_numbers_and_tests_need_mappings(self):
+        # Prose without a C-number is not a claim; prose without a
+        # test=/proof=/failed_before= marker is not a test mapping.
+        prose_claims = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- C1: rollback refuses an unqualified DELETE",
+            "- rollback refuses bad deletes, trust me")
+        f = ps.evaluate(env(BODY=prose_claims, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+        prose_tests = GOOD_BODY + FULL_ATTESTATION.replace(
+            "- C1 | test=scripts/test_rollback.py::test_refuses_bare_delete | "
+            "failed_before=not-run | proof=python3 scripts/test_rollback.py 5 OK",
+            "- ran the rollback suite and it looked good")
+        f = ps.evaluate(env(BODY=prose_tests, CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_generated_exemption_needs_a_bot_author(self):
+        # A human branch wearing the release-please-- prefix still hits the gate.
+        f = ps.evaluate(env(BODY=GOOD_BODY, HEAD_REF="release-please--branches--main",
+                            CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+        # Automation-authored release PRs stay exempt.
+        f = ps.evaluate(env(BODY=GOOD_BODY, AUTHOR="release-please[bot]",
+                            HEAD_REF="release-please--branches--main",
+                            CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
+    def test_dependency_bot_t0_path_still_needs_attestation(self):
+        f = ps.evaluate(env(BODY=GOOD_BODY, AUTHOR="dependabot[bot]",
+                            TITLE="chore(deps): bump x",
+                            CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+        f = ps.evaluate(env(BODY=GOOD_BODY + FULL_ATTESTATION, AUTHOR="dependabot[bot]",
+                            TITLE="chore(deps): bump x",
+                            CHANGED_FILES=self.T0_FILES))
+        self.assertEqual([], f)
+
+    def test_rename_from_a_t0_path_counts(self):
+        # Renames carry both paths; the old T0 path keeps the floor at T0.
+        # Deleting a T0 file is still T0.
+        for changed in ("scripts/renamed.py\ncrates/cutover/src/parse.rs",
+                        "migrations/0001_init.sql"):
+            f = ps.evaluate(env(BODY=GOOD_BODY, CHANGED_FILES=changed))
+            self.assertIn(("error", "Attestation"), levels(f), changed)
+
+    def test_t0_gate_is_an_error_in_warn_mode(self):
+        f = ps.evaluate(env(BODY=GOOD_BODY, CHANGED_FILES=self.T0_FILES,
+                            PR_STANDARDS_MODE="warn"))
+        self.assertIn(("error", "Attestation"), levels(f))
+
+    def test_understated_tier_fails_and_higher_tier_is_fine(self):
+        base = GOOD_BODY + FULL_ATTESTATION
+        f = ps.evaluate(env(BODY=base.replace("risk_tier: T0", "risk_tier: T1"),
+                            CHANGED_FILES=self.T0_FILES))
+        self.assertIn(("error", "Attestation"), levels(f))
+        # Declaring T0 on a T1 path is allowed.
+        self.assertEqual([], ps.evaluate(env(BODY=base, CHANGED_FILES="src/main.rs")))
+
+    def test_t0_path_matching_follows_the_template(self):
+        t0 = ("migrations/0001.sql", "sql/web_v1.sql", "db/schema.sql",
+              "src/auth.rs", "crates/core/src/session_controller.rs",
+              "crates/cutover/src/parse.rs", ".github/workflows/deploy-production.yml",
+              "wrangler.toml", "config/wrangler.production.json",
+              "migrations/notes.md")
+        for path in t0:
+            self.assertTrue(ps.is_t0_path(path), path)
+        not_t0 = ("src/main.rs", "src/authors.py", "crates/discord/src/voices.rs",
+                  "src/roleplay.ts", "docs/auth-guide.md", "docs/wrangler.md",
+                  ".github/workflows/check.yml", "README.md")
+        for path in not_t0:
+            self.assertFalse(ps.is_t0_path(path), path)
+
+
 class Push(unittest.TestCase):
     def commits(self, *msgs):
         return json.dumps([{"id": f"{i:040x}", "message": m} for i, m in enumerate(msgs)])

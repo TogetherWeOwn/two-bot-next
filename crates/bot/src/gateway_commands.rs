@@ -152,7 +152,8 @@ impl GatewayCommands {
             .and_then(Id::new_checked)
             .expect("test command config has a valid guild");
         Self {
-            runtime: CustomCommandRuntime::new(pool, router, executor, 1111),
+            runtime: CustomCommandRuntime::new(pool, router, executor, 1111)
+                .with_text_commands(config.text_commands),
             application_id: 1111,
             guild_id,
             guild_name: RwLock::new("Test guild".to_owned()),
@@ -207,7 +208,8 @@ impl GatewayCommands {
             );
             sqlx::Error::InvalidArgument("gateway guild context unavailable".into())
         })?;
-        let runtime = CustomCommandRuntime::new(pool, router, executor, application_id);
+        let runtime = CustomCommandRuntime::new(pool, router, executor, application_id)
+            .with_text_commands(config.text_commands);
         Ok(Self {
             runtime,
             application_id,

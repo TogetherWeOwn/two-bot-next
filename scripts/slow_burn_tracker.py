@@ -33,6 +33,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -74,6 +75,35 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_JSON_BYTES = 1024 * 1024
 
 
+# Strings are skipped whole, so brackets inside them never count. An
+# unterminated string runs to the end, which keeps the scan linear.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
+# CPython's old default recursion limit, which bounded the C JSON decoder.
+MAX_JSON_DEPTH = 1000
+
+
+def _loads_bounded(raw, **kwargs):
+    """json.loads with a lexical nesting bound that raises RecursionError.
+
+    Newer CPython sizes the decoder's recursion guard from the real C stack
+    and decodes 10,000 levels, so the bound no longer depends on the
+    interpreter: existing RecursionError refusals keep working unchanged.
+    """
+    # Decode bytes exactly as json.loads would, then scan and parse that text.
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
+    depth = 0
+    for match in JSON_TOKEN.finditer(raw):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise RecursionError("JSON nesting exceeds the decoder bound")
+        elif token in "]}":
+            depth -= 1
+    return json.loads(raw, **kwargs)
+
+
 def _load_cache_json(path):
     """Read a bounded cache; missing, oversized or malformed data rebuilds."""
     try:
@@ -81,7 +111,7 @@ def _load_cache_json(path):
             raw = stream.read(MAX_JSON_BYTES + 1)
         if len(raw) > MAX_JSON_BYTES:
             return None
-        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+        return _loads_bounded(raw, object_pairs_hook=_reject_duplicate_keys)
     except (OSError, ValueError, UnicodeError, RecursionError):
         return None
 
@@ -91,7 +121,7 @@ def _intake_json(raw, message):
     try:
         if len(raw.encode("utf-8") if isinstance(raw, str) else raw) > MAX_JSON_BYTES:
             raise TrackError(message)
-        return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+        return _loads_bounded(raw, object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, UnicodeError, RecursionError):
         raise TrackError(message) from None
 
@@ -330,6 +360,32 @@ def gh(args, repo, token_env):
     return completed.stdout
 
 
+def gh_with_body(args, body, repo, token_env):
+    """Run one `gh issue` command whose `--body-file` lives in private scratch.
+
+    The body file never touches the working directory, so a run (or a test)
+    from a checkout leaves the tree clean.
+    """
+    try:
+        scratch = tempfile.TemporaryDirectory(prefix="slow-burn-gh-body-")
+    except OSError:
+        raise TrackError("issue reconcile failed: body scratch I/O failed")
+    try:
+        body_path = Path(scratch.name) / "body.md"
+        try:
+            body_path.write_text(body, encoding="utf-8")
+        except OSError:
+            raise TrackError("issue reconcile failed: body scratch I/O failed")
+        return gh(args + ["--body-file", str(body_path)], repo, token_env)
+    finally:
+        try:
+            scratch.cleanup()
+        except OSError:
+            # gh may already have accepted the write; a leftover scratch
+            # directory must not turn that into a failure with no receipt.
+            pass
+
+
 def open_tracking_issues(repo, token, label, prefix):
     try:
         raw = gh(["list", "--state", "open", "--label", label,
@@ -416,11 +472,9 @@ def reconcile(*, repo, token, label, prefix, origin, run_url, now,
             if dry_run:
                 print(f"dry-run: would create issue {title!r} with label {label!r}")
                 return "would-create", None
-            body_path = Path("tracker-issue-body.md")
-            body_path.write_text(
-                issue_body(origin, run_url, now, fast_also), encoding="utf-8")
-            out = gh(["create", "--title", title, "--body-file", str(body_path),
-                      "--label", label], repo, token)
+            out = gh_with_body(["create", "--title", title, "--label", label],
+                               issue_body(origin, run_url, now, fast_also),
+                               repo, token)
             match = re.search(r"/issues/(\d+)\s*$", out.strip())
             number = int(match.group(1)) if match else None
             return "created", number
@@ -431,13 +485,10 @@ def reconcile(*, repo, token, label, prefix, origin, run_url, now,
         if dry_run:
             print(f"dry-run: would refresh comment on issue #{number}")
             return "would-refresh", number
-        comment_path = Path("tracker-refresh-body.md")
-        comment_path.write_text(refresh_comment(run_url), encoding="utf-8")
-        gh(["comment", str(number), "--body-file", str(comment_path)], repo, token)
-        body_path = Path("tracker-issue-body.md")
-        body_path.write_text(
-            with_marker(issue.get("body") or "", now), encoding="utf-8")
-        gh(["edit", str(number), "--body-file", str(body_path)], repo, token)
+        gh_with_body(["comment", str(number)], refresh_comment(run_url),
+                     repo, token)
+        gh_with_body(["edit", str(number)],
+                     with_marker(issue.get("body") or "", now), repo, token)
         return "refreshed", number
     if not tracked:
         return "none-open", None
@@ -446,9 +497,7 @@ def reconcile(*, repo, token, label, prefix, origin, run_url, now,
     if dry_run:
         print(f"dry-run: would resolve and close issue #{number}")
         return "would-close", number
-    comment_path = Path("tracker-resolve-body.md")
-    comment_path.write_text(resolve_comment(run_url), encoding="utf-8")
-    gh(["comment", str(number), "--body-file", str(comment_path)], repo, token)
+    gh_with_body(["comment", str(number)], resolve_comment(run_url), repo, token)
     gh(["close", str(number), "--reason", "completed"], repo, token)
     return "closed", number
 
@@ -546,11 +595,15 @@ def main(argv=None, env=None):
         return 1
 
     exposition_path = Path(args.exposition_out)
-    ring_path = Path("slow-burn-ring-prev.json")
-    ring_path.write_text(json.dumps(ring) + "\n", encoding="utf-8")
     try:
-        verdict = run_driver(args.node, args.driver, exposition_path, ring_path, now)
-    except TrackError as error:
+        with tempfile.TemporaryDirectory(
+                prefix="slow-burn-ring-", dir=exposition_path.resolve().parent) as scratch:
+            ring_path = Path(scratch) / "prev.json"
+            ring_path.write_text(json.dumps(ring) + "\n", encoding="utf-8")
+            verdict = run_driver(args.node, args.driver, exposition_path, ring_path, now)
+    except (TrackError, OSError) as error:
+        if isinstance(error, OSError):
+            error = TrackError("burn evaluation failed: ring scratch I/O failed")
         print(f"::error::{error}")
         Path(args.evidence_out).write_text(json.dumps(evidence, indent=2) + "\n",
                                            encoding="utf-8")

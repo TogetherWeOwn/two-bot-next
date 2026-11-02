@@ -60,7 +60,7 @@ fn has_framework_marker(source: &str) -> bool {
 }
 
 /// Emitter sources read at compile time so the suite is fully offline.
-const EMITTER_SOURCES: [(&str, &str); 10] = [
+const EMITTER_SOURCES: [(&str, &str); 11] = [
     ("website_jobs.rs", include_str!("website_jobs.rs")),
     ("settings_jobs.rs", include_str!("settings_jobs.rs")),
     ("community_jobs.rs", include_str!("community_jobs.rs")),
@@ -72,13 +72,14 @@ const EMITTER_SOURCES: [(&str, &str); 10] = [
         include_str!("self_role_handlers.rs"),
     ),
     ("feed_jobs.rs", include_str!("feed_jobs.rs")),
+    ("lfg_jobs.rs", include_str!("lfg_jobs.rs")),
     ("automod_gateway.rs", include_str!("automod_gateway.rs")),
     ("gateway_metrics.rs", include_str!("gateway_metrics.rs")),
 ];
 
 /// Every scrape job with a supervised emitter, paired with the file that
 /// schedules it. The file must name the job and keep the framework marker.
-const LIVE_JOB_EMITTERS: [(&str, &str); 13] = [
+const LIVE_JOB_EMITTERS: [(&str, &str); 14] = [
     ("counter", "website_jobs.rs"),
     ("rank", "website_jobs.rs"),
     ("scheduled_events", "website_jobs.rs"),
@@ -92,12 +93,14 @@ const LIVE_JOB_EMITTERS: [(&str, &str); 13] = [
     ("member_unban_sweep", "member_runtime.rs"),
     ("self_role_recovery", "self_role_handlers.rs"),
     ("automod_expiry", "automod_gateway.rs"),
+    ("lfg_sweep", "lfg_jobs.rs"),
 ];
 
 /// Every `website_jobs.rs` call that schedules a live job. Naming the job in
 /// its defining file is not enough: a registration that stops being called
 /// must fail here even while the name still appears elsewhere.
-const REGISTER_CALLS: [&str; 8] = [
+const REGISTER_CALLS: [&str; 9] = [
+    "crate::lfg_jobs::register(",
     "crate::settings_jobs::job(",
     "scheduled_jobs::register(",
     "community_jobs::register(",
@@ -361,12 +364,12 @@ fn every_scrape_job_has_a_live_emitter_or_parked_reason() {
             "website_jobs.rs no longer registers via {sink}; a job that stops reaching `registered` must fail here"
         );
     }
-    // The feed and audit arms share the `registered.push(job)` shape: both
-    // must stay, so dropping either one fails here.
+    // Feed, audit and LFG share this sink; the LFG call-to-sink adjacency
+    // is also pinned separately below so one cannot mask another's removal.
     let push_job_sinks = website_code.matches("registered.push(job)").count();
     assert!(
-        push_job_sinks >= 2,
-        "website_jobs.rs lost a `registered.push(job)` arm (feed/audit); found {push_job_sinks}, need 2"
+        push_job_sinks >= 3,
+        "website_jobs.rs lost a `registered.push(job)` arm (feed/audit/LFG); found {push_job_sinks}, need 3"
     );
     let community_rows = compacted(&code_text(source_by_name("community_jobs.rs")));
     for row in COMMUNITY_TABLE_ROWS {
@@ -400,6 +403,38 @@ fn every_scrape_job_has_a_live_emitter_or_parked_reason() {
         assert!(
             source.contains(&quoted),
             "bypass emitter {file} no longer names {job}"
+        );
+    }
+}
+
+#[test]
+fn lfg_boot_registration_reaches_the_supervisor_and_readiness() {
+    let website = compacted(&code_text(source_by_name("website_jobs.rs")));
+    assert!(
+        website.contains(
+            "ifletSome(job)=crate::lfg_jobs::register(context.clone(),&activation){registered.push(job);}else{parked.push(crate::lfg_jobs::NAME);}"
+        ),
+        "LFG must reach the supervisor when enabled and stay explicitly parked otherwise"
+    );
+    assert!(
+        website.contains(".chain([crate::lfg_jobs::NAME])"),
+        "readiness must include LFG even when parked"
+    );
+    let main = compacted(&code_text(include_str!("main.rs")));
+    assert!(main.contains("modlfg_jobs;"), "LFG module must be compiled");
+    let lfg = compacted(&code_text(source_by_name("lfg_jobs.rs")));
+    assert!(
+        lfg.contains("timeout:Duration::from_secs(120)"),
+        "LFG's bounded attempt timeout belongs to the existing supervisor"
+    );
+    for bypass in [
+        "tokio::spawn(",
+        "tokio::time::interval(",
+        "tokio::time::sleep(",
+    ] {
+        assert!(
+            !lfg.contains(bypass),
+            "LFG must not privately schedule via {bypass}"
         );
     }
 }

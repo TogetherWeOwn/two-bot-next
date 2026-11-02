@@ -54,6 +54,7 @@ async fn ballot_delivery_binding_reports_unavailable_or_closed_actor() {
         GuildActor {
             live: LiveGuild::new(GUILD),
             tx,
+            backpressure: ActorInboxBackpressure::default(),
         },
     );
     assert!(runtime.kick_message(GUILD, VOTE, MESSAGE));
@@ -62,6 +63,260 @@ async fn ballot_delivery_binding_reports_unavailable_or_closed_actor() {
     );
     drop(rx);
     assert!(!runtime.kick_message(GUILD, VOTE, MESSAGE));
+}
+
+/// Hold a real actor's receiver without draining it so gate occupancy is
+/// synchronous and independent of scheduler timing.
+fn held_ballot_actor() -> (
+    VoiceRuntime<Store, Http>,
+    GuildActor,
+    mpsc::UnboundedReceiver<ActorCommand>,
+) {
+    let runtime = test_runtime(Trace::default());
+    let (tx, rx) = mpsc::unbounded_channel();
+    runtime.actors.lock().unwrap().insert(
+        GUILD,
+        GuildActor {
+            live: LiveGuild::new(GUILD),
+            tx,
+            backpressure: ActorInboxBackpressure::default(),
+        },
+    );
+    let actor = runtime.ensure_actor(GUILD).expect("registered actor");
+    (runtime, actor, rx)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ballot_delivery_full_inbox_refuses_runtime_binding_once_per_drop() {
+    // Mutation: sending KickMessage directly on tx bypasses the gate and
+    // reports success, despite retaining another fire-and-forget entry.
+    let (runtime, actor, rx) = held_ballot_actor();
+    for member in 0..VOICE_ACTOR_INBOX_CAP {
+        assert!(actor.try_send_command(ActorCommand::Display {
+            member_id: MEMBER + member as u64,
+            display: "fixture".to_owned(),
+        }));
+    }
+    assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+    assert_eq!(rx.len(), VOICE_ACTOR_INBOX_CAP);
+    assert_eq!(actor.inbox_overflow_dropped(), 0);
+    for refusal in 1..=3 {
+        assert!(
+            !runtime.kick_message(GUILD, VOTE, MESSAGE),
+            "a callback message reference has no reply to preserve and must refuse at capacity"
+        );
+        assert_eq!(actor.inbox_overflow_dropped(), refusal);
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+        assert_eq!(rx.len(), VOICE_ACTOR_INBOX_CAP, "refusal sends nothing");
+    }
+    runtime.remove_guild(GUILD);
+}
+
+#[tokio::test]
+async fn ballot_delivery_under_cap_reaches_worker_without_a_reply_or_callback_token() {
+    let (runtime, actor, mut rx) = held_ballot_actor();
+    assert!(runtime.kick_message(GUILD, VOTE, MESSAGE));
+    assert_eq!(actor.inbox_depth(), 1);
+    assert_eq!(actor.inbox_overflow_dropped(), 0);
+    let command = rx.recv().await.expect("accepted binding");
+    // Exhaustive fields: this state message retains only the public reference,
+    // not an interaction, callback token or reply sender.
+    let ActorCommand::KickMessage { vote_id, message } = command else {
+        panic!("accepted binding must reach the actor as KickMessage")
+    };
+    assert_eq!(vote_id, VOTE);
+    assert_eq!(message, MESSAGE);
+    let command = ActorCommand::KickMessage { vote_id, message };
+    actor.backpressure.release_for(&command);
+    assert_eq!(actor.inbox_depth(), 0);
+    let (mut worker, trace) = setup().await;
+    apply_command(&mut worker, command, 0, &actor.backpressure);
+    worker.kick_refresh(VOTE_KICK_TTL_MS);
+    assert!(worker.dispatch_one(VOTE_KICK_TTL_MS + 1).await);
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["edit_prompt:900:901:Vote expired with too few Yes votes.:1"]
+    );
+    assert!(!worker.dispatch_one(VOTE_KICK_TTL_MS + 2).await);
+    runtime.remove_guild(GUILD);
+}
+
+#[tokio::test]
+async fn ballot_delivery_under_cap_survives_initialization_backoff_and_failure_purge() {
+    // Mutation: classifying this fire-and-forget reference as reply-bearing
+    // drops it during initialization, leaving no message to settle later.
+    let (runtime, actor, mut rx) = held_ballot_actor();
+    assert!(runtime.kick_message(GUILD, VOTE, MESSAGE));
+    let command = rx.recv().await.expect("accepted binding");
+    actor.backpressure.release_for(&command);
+    let mut buffered = VecDeque::new();
+    buffer_init_command(&mut buffered, command);
+    assert_eq!(buffered.len(), 1, "binding must wait for initialization");
+    purge_unanswerable_buffered(&mut buffered);
+    assert_eq!(buffered.len(), 1, "binding has no reply sender to purge");
+    let (mut worker, trace) = setup().await;
+    apply_command(
+        &mut worker,
+        buffered.pop_front().expect("retained binding"),
+        0,
+        &actor.backpressure,
+    );
+    worker.kick_refresh(VOTE_KICK_TTL_MS);
+    assert!(worker.dispatch_one(VOTE_KICK_TTL_MS + 1).await);
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["edit_prompt:900:901:Vote expired with too few Yes votes.:1"]
+    );
+    assert_eq!(actor.inbox_depth(), 0);
+    assert_eq!(actor.inbox_overflow_dropped(), 0);
+    runtime.remove_guild(GUILD);
+}
+
+#[tokio::test]
+async fn ballot_delivery_closed_actor_is_not_an_overflow() {
+    let (runtime, actor, rx) = held_ballot_actor();
+    drop(rx);
+    assert!(!runtime.kick_message(GUILD, VOTE, MESSAGE));
+    assert_eq!(actor.inbox_depth(), 0, "failed send releases its slot");
+    assert_eq!(actor.inbox_overflow_dropped(), 0);
+    runtime.remove_guild(GUILD);
+}
+
+#[test]
+fn ballot_delivery_overflow_metrics_count_refusal_sources_only() {
+    // The production sources use the process registry. Run this one test in
+    // its own process so exact deltas cannot be supplied by parallel tests.
+    const CHILD: &str = "TWO_TEST_VOICE_OVERFLOW_METRICS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let module = module_path!().split_once("::").expect("test module").1;
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                &format!("{module}::ballot_delivery_overflow_metrics_count_refusal_sources_only"),
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated overflow source test");
+        assert!(
+            output.status.success(),
+            "isolated source test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the exact filter must execute the source test, not zero tests"
+        );
+        return;
+    }
+    fn counter(name: &str) -> u64 {
+        let text = metrics::global().render(None);
+        let prefix = format!("{name} ");
+        text.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .expect("refusal source counter must be rendered without labels")
+            .parse()
+            .expect("integer counter sample")
+    }
+    const INBOX: &str = "two_bot_voice_inbox_overflow_dropped_total";
+    const QUEUE: &str = "two_bot_voice_queue_overflow_dropped_total";
+    assert_eq!(counter(INBOX), 0);
+    assert_eq!(counter(QUEUE), 0);
+    let (runtime, actor, mut rx) = held_ballot_actor();
+    assert!(runtime.kick_message(GUILD, VOTE, MESSAGE));
+    let command = rx.try_recv().expect("healthy binding");
+    actor.backpressure.release_for(&command);
+    assert_eq!(counter(INBOX), 0, "accepted binding is not overflow");
+    drop(rx);
+    assert!(!runtime.kick_message(GUILD, VOTE, MESSAGE));
+    assert_eq!(actor.inbox_depth(), 0);
+    assert_eq!(counter(INBOX), 0, "closed receiver is not overflow");
+    runtime.remove_guild(GUILD);
+
+    let (runtime, actor, rx) = held_ballot_actor();
+    for member in 0..VOICE_ACTOR_INBOX_CAP {
+        assert!(actor.try_send_command(ActorCommand::Display {
+            member_id: MEMBER + member as u64,
+            display: "fixture".to_owned(),
+        }));
+    }
+    assert_eq!(counter(INBOX), 0, "accepted sends do not count");
+    for refusal in 1..=3 {
+        assert!(!runtime.kick_message(GUILD, VOTE, MESSAGE));
+        assert_eq!(actor.inbox_overflow_dropped(), refusal);
+        assert_eq!(counter(INBOX), refusal, "one sample per acquire refusal");
+        assert_eq!(counter(QUEUE), 0, "inbox refusals leave queue count alone");
+        assert_eq!(actor.inbox_depth(), VOICE_ACTOR_INBOX_CAP);
+        assert_eq!(rx.len(), VOICE_ACTOR_INBOX_CAP);
+    }
+    runtime.remove_guild(GUILD);
+
+    let queue = ActionQueue::new();
+    let rename_id = queue.try_enqueue(
+        GUILD,
+        RoomAction::RenameRoom {
+            channel_id: ROOM,
+            name: "before".to_owned(),
+        },
+    );
+    let respace_id = queue.try_enqueue(
+        GUILD,
+        RoomAction::RespaceChannels {
+            room_channel_id: ROOM,
+        },
+    );
+    assert!(rename_id.is_some());
+    assert!(respace_id.is_some());
+    for index in 2..two_bot_core::voice_rooms::MAX_QUEUE_PENDING_PER_GUILD {
+        assert!(queue
+            .try_enqueue(
+                GUILD,
+                RoomAction::DeleteRoom {
+                    channel_id: 10_000 + index as u64
+                }
+            )
+            .is_some());
+    }
+    assert_eq!(counter(QUEUE), 0, "accepted enqueues do not count");
+    assert_eq!(
+        queue.try_enqueue(
+            GUILD,
+            RoomAction::RenameRoom {
+                channel_id: ROOM,
+                name: "latest".to_owned()
+            }
+        ),
+        rename_id
+    );
+    assert_eq!(
+        queue.try_enqueue(
+            GUILD,
+            RoomAction::RespaceChannels {
+                room_channel_id: ROOM
+            }
+        ),
+        respace_id
+    );
+    assert_eq!(counter(QUEUE), 0, "coalescing at capacity is not refusal");
+    for refusal in 1..=3 {
+        assert_eq!(
+            queue.try_enqueue(
+                GUILD,
+                RoomAction::DeleteRoom {
+                    channel_id: 20_000 + refusal
+                }
+            ),
+            None
+        );
+        assert_eq!(queue.overflow_dropped(), refusal);
+        assert_eq!(
+            counter(QUEUE),
+            refusal,
+            "one sample per try_enqueue refusal"
+        );
+        assert_eq!(counter(INBOX), 3, "queue refusals leave inbox count alone");
+    }
 }
 
 struct CaptureReplies {

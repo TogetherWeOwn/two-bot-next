@@ -1281,7 +1281,7 @@ async fn failed_refresh_patch_keeps_saved_signup_and_audit_with_warning_and_no_p
     // The existing saved-state warning is returned unchanged.
     assert_eq!(
         last_reply(&mock),
-        "LFG joined. Message refresh failed; the saved state is unchanged."
+        "LFG joined. Message refresh failed; the saved result above still applies."
     );
     // Saved signup plus exactly one audit, visible from an independent pool.
     let fresh = db.fresh_pool().await;
@@ -1380,6 +1380,9 @@ async fn direct_replay_retries_refresh_without_duplicating_signup_audit_or_resur
     fresh.close().await;
     db.cleanup().await;
 }
+
+#[path = "support/lfg_preview_acceptance.rs"]
+mod preview_acceptance;
 
 // Real PostgreSQL counterparts to the offline acceptance suite. New cases use
 // the guarded disposable-database fixture and run in the normal db test lane.

@@ -7,8 +7,12 @@ use crate::test_clock::{
 use serde_json::json;
 use std::{
     io,
-    sync::{atomic::AtomicU64, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
+use two_bot_core::send_admission::{AdmissionFuture, AdmissionPermit};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -704,6 +708,87 @@ async fn missing_authentication_is_local_no_effect() {
         ExecutionOutcome::NoEffect(Refusal::LocalConfiguration)
     );
     assert_eq!(mock.count(), 0);
+}
+
+/// Refuses every admission, so a test can see whether the lane was consulted.
+#[derive(Debug)]
+struct BlockedLane {
+    key: TokenKey,
+    calls: AtomicU64,
+}
+
+impl BlockedLane {
+    fn for_token(token: &str) -> Arc<Self> {
+        Arc::new(Self {
+            key: TokenKey::for_bot_token(token).unwrap(),
+            calls: AtomicU64::new(0),
+        })
+    }
+}
+
+impl SendAdmission for BlockedLane {
+    fn token_key(&self) -> &TokenKey {
+        &self.key
+    }
+
+    fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(AdmissionError::Blocked) })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn non_loopback_origin_never_sends_without_admission() {
+    let mock = MockDiscord::start(Reply::success()).await;
+    let mut executor = mock.executor(keys());
+    // TEST-NET-1: non-loopback, and never reachable if the guard regresses.
+    executor.api_origin = "http://192.0.2.1:9".to_owned();
+    assert_eq!(
+        run_once(&executor, &announcement("ok")).await,
+        ExecutionOutcome::NoEffect(Refusal::LocalConfiguration)
+    );
+
+    // With a lane bound, the same origin must ask it first and honour a refusal.
+    let lane = BlockedLane::for_token("unused-fixture");
+    executor.admission = Some(lane.clone());
+    assert_eq!(
+        run_once(&executor, &announcement("ok")).await,
+        ExecutionOutcome::NoEffect(Refusal::SendAdmissionBlocked)
+    );
+    assert_eq!(lane.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(mock.count(), 0);
+}
+
+#[tokio::test]
+async fn announcement_admission_binds_only_its_own_token_lane() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = |token: Option<&str>| {
+        let builder = TwilightClient::builder();
+        Arc::new(match token {
+            Some(token) => builder.token(token.to_owned()).build(),
+            None => builder.build(),
+        })
+    };
+    let bind = |twilight, lane: Arc<BlockedLane>| {
+        AnnouncementExecutor::with_admission(twilight, keys(), CooldownGovernor::new(), lane)
+    };
+
+    let own = bind(
+        client(Some("lane-fixture")),
+        BlockedLane::for_token("lane-fixture"),
+    );
+    assert!(own.is_ok_and(|executor| executor.admission.is_some()));
+    assert!(matches!(
+        bind(
+            client(Some("lane-fixture")),
+            BlockedLane::for_token("other-fixture")
+        ),
+        Err(AdmissionError::Configuration)
+    ));
+    assert!(matches!(
+        bind(client(None), BlockedLane::for_token("lane-fixture")),
+        Err(AdmissionError::Configuration)
+    ));
 }
 
 #[derive(Clone)]

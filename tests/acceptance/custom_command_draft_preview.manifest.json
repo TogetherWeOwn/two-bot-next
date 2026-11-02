@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Independent tests-only proposed-response preview handoff; never merge the deliberately red tests alone.",
+  "baseCommit": "0b8f8c6427859a606c4be710224dc68649fabe00",
+  "branch": "test/custom-command-draft-preview",
+  "protectedFiles": [
+    {
+      "path": "crates/discord/tests/support/custom_command_draft_acceptance.rs",
+      "sha256": "adeab40fa1c42b3773217937d2507303f1a59357b3b04b2cae76d05b8ec8f1df",
+      "tests": 14
+    }
+  ],
+  "registration": {
+    "path": "crates/discord/tests/custom_command_inspect_acceptance.rs",
+    "module": "draft_acceptance",
+    "productionBehaviorChanged": false,
+    "authorCorrection": "The pre-existing registry test now expects optional exclusive name/draft inputs and a bounded draft string. Its prior three-option/required-name assertions contradict this intentionally extended surface. Other saved workflow controls are unchanged; the entire host file is not protected."
+  },
+  "commands": {
+    "databaseFree": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test custom_command_inspect_acceptance draft_acceptance:: -- --skip draft_db_ --nocapture --test-threads=1",
+    "registry": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test custom_command_inspect_acceptance inspect_is_a_guild_only_management_command_with_three_bounded_views -- --nocapture",
+    "runtimeAndSavedControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test custom_command_inspect_acceptance -- --nocapture --test-threads=1",
+    "existingMutationControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test custom_command_runtime -- --include-ignored --test-threads=1"
+  },
+  "database": {
+    "requiredFor": "Two draft_db_ cases and the existing saved/persistence controls, not the other twelve new cases.",
+    "environment": "TWO_TEST_DATABASE_URL",
+    "guard": "two_bot_testsupport::TestDatabase; disposable agent-testdb or guarded CI service only",
+    "missingEnvironment": "Database-dependent tests fail explicitly; no silent skip.",
+    "ciRoute": "The existing check.yml integration target selection compiles/runs custom_command_inspect_acceptance with feature db and guarded disposable Postgres. The support module is part of that target, not an orphan target."
+  },
+  "contract": {
+    "input": "Existing /command-inspect: draft:<string> alone defaults to draft preview; explicit view:preview is equivalent. Exactly one of name/draft. Reject forged types, duplicate fields, unknown options, absent input and over-bound arguments before storage.",
+    "render": "Four existing placeholders only, invocation context, single-pass replacement, literal malformed/capitalized braces and nested allowed keys preserve baseline semantics. Sample arguments never interpolate. Unknown/args placeholders and expanded overflow privately refuse with a correction; no command execution or extra HTTP lookup.",
+    "response": "Trusted first line: Draft preview — not saved or published. Same body escaping as saved preview, empty allowed_mentions, no mutation controls, one private callback with optional one original-response edit. Total <=2000 UTF-16 units; framing-only truncation must be explicit, raw expansion overflow is not partial success.",
+    "effects": "Bound SQL socket catches attempted stored-command reads, writes, audits, trigger matching or execution claims even if errors are swallowed. Full REST transcript excludes publication/channel/DM/follow-up traffic. Repeated/closed-pool previews work. Real DB snapshots preserve disabled and foreign rows and all audits; first subsequent prefix delivers, replay/actor cooldown retain their original behavior.",
+    "controls": "Unchanged staff/automation/foreign-scope refusals plus saved summary/template/preview, ordinary invocation/edit/disable tests remain the controls. A saved lookup outage still produces the original availability reply; a draft does not depend on storage."
+  },
+  "handoff": "Builder incorporates this exact branch commit and manifest. Never edit the protected file. Return test corrections to its author. Builder owns implementation, help/reference, full GREEN, independent exact-head review and automatic squash merge. Test-author execution evidence is recorded separately; this manifest does not claim a compile or behavior RED."
+}

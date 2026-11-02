@@ -17,11 +17,14 @@ fn stalled_runtime() -> (
     let live = LiveGuild::new(GUILD);
     live.publish(command_snapshot());
     let (tx, rx) = mpsc::unbounded_channel();
-    runtime
-        .actors
-        .lock()
-        .unwrap()
-        .insert(GUILD, GuildActor { live, tx });
+    runtime.actors.lock().unwrap().insert(
+        GUILD,
+        GuildActor {
+            live,
+            tx,
+            backpressure: ActorInboxBackpressure::default(),
+        },
+    );
     (runtime, rx)
 }
 

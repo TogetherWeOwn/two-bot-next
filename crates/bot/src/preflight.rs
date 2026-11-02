@@ -351,6 +351,20 @@ async fn read_discord<T: serde::de::DeserializeOwned>(
     check: &'static str,
     request: Result<Request, twilight_http::Error>,
 ) -> Result<T, Check> {
+    let response = read_discord_response(transport, check, request).await?;
+    serde_json::from_slice(&response.body)
+        .map_err(|_| Check::fail(check, "invalid Discord response"))
+}
+
+// Keep admission, timeout and status handling out of the seven typed decoders
+// so each response type does not instantiate the same transport state machine.
+// Preserve that poll boundary when release LTO optimizes the typed callers.
+#[inline(never)]
+async fn read_discord_response(
+    transport: &HyperTransport,
+    check: &'static str,
+    request: Result<Request, twilight_http::Error>,
+) -> Result<two_bot_discord::RawResponse, Check> {
     let request =
         request.map_err(|_| Check::fail(check, "Discord request invalid (checks stopped)"))?;
     // Absolute deadline covers admission, headers and body, so a stalled GET
@@ -371,8 +385,7 @@ async fn read_discord<T: serde::de::DeserializeOwned>(
             format!("Discord HTTP {} (checks stopped)", response.status),
         ));
     }
-    serde_json::from_slice(&response.body)
-        .map_err(|_| Check::fail(check, "invalid Discord response"))
+    Ok(response)
 }
 
 /// Privileged-intent rows: a requested intent the portal has not granted
@@ -984,6 +997,94 @@ mod tests {
         assert!(
             targets.roles.is_empty() && targets.channels.is_empty() && targets.level_roles_known
         );
+    }
+
+    #[tokio::test]
+    async fn discord_read_preserves_typed_decoding_and_redacted_failures() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use twilight_http::routing::Route;
+
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        struct Identity {
+            id: String,
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for (case, status, body, expected) in [
+            (0, 200, r#"{"id":"42"}"#, None),
+            (1, 200, r#"{"id":42}"#, Some("invalid Discord response")),
+            (
+                2,
+                200,
+                "malformed-fixture-body",
+                Some("invalid Discord response"),
+            ),
+            (
+                3,
+                403,
+                "private-fixture-body",
+                Some("Discord HTTP 403 (checks stopped)"),
+            ),
+            (
+                4,
+                429,
+                "private-fixture-body",
+                Some("Discord HTTP 429 (checks stopped)"),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fixture");
+            let origin = format!("http://{}", listener.local_addr().expect("fixture address"));
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept fixture request");
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).await.expect("read fixture request");
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                assert!(request.starts_with(b"GET /api/v10/users/@me "));
+                let response = format!(
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write fixture response");
+            });
+            let transport = HyperTransport::with_proxy(
+                format!("fixture-preflight-decode-{case}"),
+                Some(origin),
+            )
+            .expect("loopback transport");
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_discord::<Identity>(
+                    &transport,
+                    "identity check",
+                    Ok(Request::from_route(&Route::GetCurrentUser)),
+                ),
+            )
+            .await
+            .expect("fixture read must finish without retries");
+            match expected {
+                None => assert_eq!(
+                    result.unwrap_or_else(|error| panic!("{}", error.detail)),
+                    Identity { id: "42".into() }
+                ),
+                Some(detail) => {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.check, "identity check");
+                    assert!(matches!(error.status, Status::Fail));
+                    assert_eq!(error.detail, detail);
+                    assert!(!error.detail.contains("fixture"));
+                }
+            }
+            server.await.expect("fixture server");
+        }
     }
 
     /// A preflight read whose headers never arrive must fail at the 30 s

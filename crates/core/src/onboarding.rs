@@ -23,6 +23,11 @@ use std::collections::{HashMap, HashSet};
 /// Game picker select-menu custom id. Static: the panel outlives every restart
 /// (legacy `GAME_SELECT_ID`).
 pub const GAME_SELECT_ID: &str = "two:onboarding:games";
+/// Self-only proposed-choice preview select. Static like the apply route, but
+/// a distinct no-effect submission: preview never writes roles, funnel rows,
+/// audits, tickets or public messages. The `/reopen games` menu renders this
+/// alongside the apply select; a later apply re-reads current roles.
+pub const GAME_PREVIEW_SELECT_ID: &str = "two:onboarding:games:preview";
 /// Session picker select-menu custom id (legacy `SESSION_SELECT_ID`).
 pub const SESSION_SELECT_ID: &str = "two:onboarding:session";
 
@@ -2423,7 +2428,10 @@ mod tests {
     #[test]
     fn select_ids_are_static_and_distinct() {
         assert_eq!(GAME_SELECT_ID, "two:onboarding:games");
+        assert_eq!(GAME_PREVIEW_SELECT_ID, "two:onboarding:games:preview");
         assert_eq!(SESSION_SELECT_ID, "two:onboarding:session");
         assert_ne!(GAME_SELECT_ID, SESSION_SELECT_ID);
+        assert_ne!(GAME_SELECT_ID, GAME_PREVIEW_SELECT_ID);
+        assert_ne!(GAME_PREVIEW_SELECT_ID, SESSION_SELECT_ID);
     }
 }

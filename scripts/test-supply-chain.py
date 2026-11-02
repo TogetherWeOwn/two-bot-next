@@ -11,6 +11,8 @@ import tomllib
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -130,10 +132,22 @@ class SupplyChainTests(unittest.TestCase):
 
     def test_release_verifies_source_and_tag_commit_before_upload(self):
         release = (ROOT / ".github/workflows/release.yml").read_text()
-        attach = release.split("  attach-sbom:", 1)[1]
-        self.assertIn("EXPECTED_SHA: ${{ needs.sbom-target.outputs.ref }}", attach)
-        verification = attach.index("python3 scripts/release-sbom-target.py --verify-source sbom/source-sha.txt")
-        self.assertLess(verification, attach.index('gh release upload "$RELEASE_TAG"'))
+        verify, attach = release.split("  verify-sbom:", 1)[1].split("  attach-sbom:", 1)
+        self.assertIn("contents: read", verify)
+        self.assertIn("EXPECTED_SHA: ${{ needs.sbom-target.outputs.ref }}", verify)
+        verification = release.index("python3 scripts/release-sbom-target.py --verify-source sbom/source-sha.txt")
+        self.assertLess(verification, release.index('gh release upload "$RELEASE_TAG"'))
+        # The write job depends on the read-only verification job and runs no
+        # repository script itself: only the upload spends the write token.
+        self.assertIn("needs: [sbom-target, verify-sbom]", attach)
+        self.assertIn("needs.verify-sbom.result == 'success'", attach)
+        self.assertIn("contents: write", attach)
+        self.assertNotIn("scripts/release-sbom-target.py", attach)
+        self.assertNotIn("actions/checkout", attach)
+        # The upload re-resolves the tag inline (`gh api`, no repository
+        # script) so a tag moved after verification receives nothing.
+        tag_check = attach.index("git/ref/tags/")
+        self.assertLess(tag_check, attach.index('gh release upload "$RELEASE_TAG"'))
 
     def test_dry_run_cannot_publish_even_with_tag(self):
         self.assertEqual(selector.select_target("true", "v0.2.1", SHA), {"ref": SHA, "tag": ""})
@@ -304,6 +318,25 @@ class SupplyChainTests(unittest.TestCase):
             routed = "'[\"ubuntu-latest\"]'"
             self.assertNotIn("ubuntu-latest", code.replace(routed, ""), str(path))
 
+    def test_every_trivy_invocation_uses_the_official_database_source(self):
+        supply = yaml.load((ROOT / ".github/workflows/sbom.yml").read_text(), Loader=yaml.BaseLoader)
+        invocations = []
+        for job_name, job in supply["jobs"].items():
+            for step in job.get("steps", []):
+                if not step.get("uses", "").startswith("aquasecurity/trivy-action@"):
+                    continue
+                # Actions resolves env from workflow to job to step. One job
+                # declaration must cover all four scans; a step may not undo it.
+                env = {**supply.get("env", {}), **job.get("env", {}), **step.get("env", {})}
+                invocations.append((job_name, step["name"], env.get("TRIVY_DB_REPOSITORY")))
+                # Preserve the existing scanner, fresh DB and vulnerability gates.
+                self.assertEqual(step["with"]["version"], "v0.69.3")
+        self.assertEqual(len(invocations), 4, "both inventories and both vulnerability gates are covered")
+        for job_name, name, repository in invocations:
+            with self.subTest(job=job_name, step=name):
+                self.assertEqual(repository, "ghcr.io/aquasecurity/trivy-db:2",
+                                 "each Trivy invocation must select the official GHCR DB, not the default mirror")
+
     def test_no_shared_caches(self):
         # The reusable workflow can run in default-branch context against an
         # arbitrary inputs.ref (release dispatch), so no cross-run cache may
@@ -418,7 +451,7 @@ class SupplyChainTests(unittest.TestCase):
         self.assertIn("uses: ./.github/workflows/sbom.yml", check)
         self.assertIn("uses: ./.github/workflows/sbom.yml", release)
         self.assertNotIn("uses: ./.github/workflows/supply-chain.yml", check + release)
-        self.assertIn("inputs.dry_run == true || inputs.release_tag != ''", release)
+        self.assertIn("inputs.dry_run == true || (inputs.release_tag != '' && github.ref == 'refs/heads/main')", release)
         self.assertIn("needs.sbom-target.outputs.tag != ''", release)
         self.assertIn("needs.release-sbom.result == 'success'", release)
         self.assertNotIn("needs.tag.outputs.released", release)

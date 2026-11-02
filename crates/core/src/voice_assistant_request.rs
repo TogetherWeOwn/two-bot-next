@@ -395,6 +395,8 @@ pub enum ReplyError {
     WrongShape { at: &'static str },
     #[error("assistant message content is not JSON")]
     ContentNotJson,
+    #[error("reply contains a duplicate JSON object key")]
+    DuplicateKeys,
     #[error("reply contains no suggestions")]
     NoSuggestions,
     #[error("reply contains {count} suggestions, over the limit of {max}", max = MAX_SUGGESTIONS)]
@@ -432,6 +434,9 @@ pub fn parse_reply_each(body: &[u8]) -> Result<Vec<Result<Suggestion, TemplateIs
         return Err(ReplyError::Oversize { len: body.len() });
     }
     let envelope: Value = serde_json::from_slice(body).map_err(|_| ReplyError::NotJson)?;
+    // Second pass over bytes that already parsed: syntax and nesting depth
+    // are proven, so the only refusal left is a repeated key.
+    crate::duplicate_keys::reject_duplicate_keys(body).map_err(|_| ReplyError::DuplicateKeys)?;
     let Some(object) = envelope.as_object() else {
         return Err(ReplyError::WrongShape { at: "body" });
     };
@@ -455,8 +460,12 @@ pub fn parse_reply_each(body: &[u8]) -> Result<Vec<Result<Suggestion, TemplateIs
         .ok_or(ReplyError::WrongShape {
             at: "choices[0].message.content",
         })?;
-    let content: Value =
-        serde_json::from_str(strip_code_fence(content)).map_err(|_| ReplyError::ContentNotJson)?;
+    let fenced = strip_code_fence(content);
+    let content: Value = serde_json::from_str(fenced).map_err(|_| ReplyError::ContentNotJson)?;
+    // Same uniqueness pass over the suggestion document: both documents and
+    // both entry points share the one fixed refusal.
+    crate::duplicate_keys::reject_duplicate_keys(fenced.as_bytes())
+        .map_err(|_| ReplyError::DuplicateKeys)?;
     let suggestions = content
         .get("suggestions")
         .and_then(Value::as_array)

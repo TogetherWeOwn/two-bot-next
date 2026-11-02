@@ -32,6 +32,13 @@ pub struct MemberAccess {
 }
 
 impl MemberAccess {
+    /// Unioned guild permissions for role-manageability checks. The preview
+    /// path uses this to refuse unmanageable proposals without writing.
+    #[must_use]
+    pub fn permissions(&self) -> u64 {
+        self.permissions
+    }
+
     fn from_json(
         guild_id: u64,
         user_id: u64,

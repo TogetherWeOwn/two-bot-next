@@ -44,6 +44,8 @@ time = { workspace = true, optional = true }
 
 # Local Discord doubles and measurement drivers only; none ship in release.
 [dev-dependencies]
+# Enable loopback-only timeout injection for this crate's integration tests.
+two-bot-discord = { version = "0.4.0", path = ".", features = ["test-support"] }
 axum = { workspace = true }
 anyhow = { workspace = true }
 two-bot-cutover = { version = "0.4.0", path = "../cutover" }

@@ -10,8 +10,8 @@
 //! used. The real domain plans (`two_bot_core::channel_moderation`), audit row
 //! shape (`ChannelAuditRow`), router (`InteractionRouter`), and Discord
 //! boundary types (`ChannelCall`, `ChannelCallOutcome`, `DiscordError`) are
-//! re-exported unchanged; only `ChannelClaim`/`ChannelClaimTicket` are
-//! test-local, because the real ticket fields are private.
+//! re-exported unchanged; `ChannelClaim`/`ChannelClaimTicket` and `PurgeSample`
+//! are test-local, because the real ticket fields and sample type are private.
 //!
 //! Expected states: missing-channel and missing-member refusals each write one
 //! bound `refused` row; an in-flight retry after an uncertain mutation adds a
@@ -32,6 +32,19 @@ pub use two_bot_discord::{
     route_interaction, ChannelCall, ChannelCallOutcome, DiscordError, EveryoneOverwrite,
     RoutedInteraction,
 };
+
+/// Merged preview surface for the included `subject`: the core planner
+/// names (`two_bot_core::lockdown_preview`, via `extern crate self`) and the
+/// discord render/pending names (`crate::lockdown_preview`) share one root
+/// name, so both import lists in `channel_moderation.rs` resolve here. The
+/// two modules have no overlapping item names.
+pub mod lockdown_preview {
+    pub use real_core::lockdown_preview::{plan_preview, PreviewError, PreviewSnapshot};
+    pub use two_bot_discord::lockdown_preview::{
+        cancel_custom_id, confirm_custom_id, preview_audit_metadata, render_preview, PendingEntry,
+        PendingFull, PendingStore, RateLimiter, PREVIEW_TTL_SECS,
+    };
+}
 
 // --- offline sqlx boundary -------------------------------------------------
 
@@ -294,6 +307,21 @@ impl ChannelModerationStore {
         Ok(())
     }
 
+    /// Insert-or-nothing mirror of the production `try_record_audit`
+    /// (`ON CONFLICT (request_id) DO NOTHING`): the preview arms only when
+    /// exactly one row is created, so a redelivered retry reports `false`.
+    pub async fn try_record_audit(&self, row: &ChannelAuditRow) -> Result<bool, Error> {
+        let mut state = self.state.lock().expect("offline store");
+        if state.closed {
+            return Err(Error::closed());
+        }
+        if state.audits.iter().any(|r| r.request_id == row.request_id) {
+            return Ok(false);
+        }
+        state.audits.push(row.clone());
+        Ok(true)
+    }
+
     pub async fn finish(
         &self,
         ticket: &ChannelClaimTicket,
@@ -357,6 +385,13 @@ impl ChannelModerationStore {
         Ok(state.lockdowns.get(channel_id).cloned())
     }
 
+    pub async fn get_lockdown_details(
+        &self,
+        _record: &LockdownRecord,
+    ) -> Result<Option<(String, Option<String>)>, Error> {
+        panic!("lockdown metadata reads are outside this offline acceptance slice")
+    }
+
     pub async fn record_lockdown(
         &self,
         channel_id: &str,
@@ -398,6 +433,16 @@ impl ChannelModerationStore {
 }
 
 // --- offline transport boundary --------------------------------------------
+
+/// Shape-only mirror of the executor's crate-private purge sample. Read paths
+/// must compile with the included source but must never run in this harness.
+pub(crate) struct PurgeSample {
+    pub ids: Vec<twilight_model::id::Id<twilight_model::id::marker::MessageMarker>>,
+    pub listed: usize,
+    pub pinned: usize,
+    pub own_bot: usize,
+    pub system: usize,
+}
 
 #[derive(Debug, Default)]
 struct Transport {
@@ -451,6 +496,55 @@ impl ActionExecutor {
         _content: &str,
     ) -> Result<(), DiscordError> {
         Ok(())
+    }
+
+    pub async fn edit_interaction_response_without_mention_neutralization_with_blocked_retry(
+        &self,
+        _application_id: u64,
+        _interaction_token: &str,
+        _content: &str,
+    ) -> Result<(), DiscordError> {
+        panic!("read-command replies are outside this offline acceptance slice")
+    }
+
+    pub async fn edit_interaction_response_with_components_and_blocked_retry(
+        &self,
+        _application_id: u64,
+        _interaction_token: &str,
+        _content: &str,
+        _components: &[twilight_model::channel::message::Component],
+    ) -> Result<(), DiscordError> {
+        panic!("preview renders are outside this offline acceptance slice")
+    }
+
+    pub async fn read_preview_channel(
+        &self,
+        _channel_id: &str,
+        _guild_id: &str,
+    ) -> Result<two_bot_discord::executor::PreviewChannel, DiscordError> {
+        panic!("lockdown preview reads are outside this offline acceptance slice")
+    }
+
+    pub async fn read_preview_roles(
+        &self,
+        _guild_id: &str,
+    ) -> Result<Vec<real_core::lockdown_preview::RoleSnapshot>, DiscordError> {
+        panic!("lockdown preview reads are outside this offline acceptance slice")
+    }
+
+    pub async fn fetch_channel_document(
+        &self,
+        _channel_id: &str,
+    ) -> Result<serde_json::Value, DiscordError> {
+        panic!("channel document reads are outside this offline acceptance slice")
+    }
+
+    pub(crate) async fn sample_purge_messages(
+        &self,
+        _channel_id: &str,
+        _count: u64,
+    ) -> Result<PurgeSample, DiscordError> {
+        panic!("purge sample reads are outside this offline acceptance slice")
     }
 
     pub async fn execute_channel(

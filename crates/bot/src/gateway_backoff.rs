@@ -70,14 +70,19 @@ pub(crate) fn jitter_stream(seed: u64, attempt: u32) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Await a non-growing 500 ms–1 s spread before polling Twilight again.
+/// Calculate the non-growing 500 ms–1 s spread before polling Twilight again.
 ///
 /// Twilight already backs off its connection attempts. The attempt index only
 /// varies the deterministic draw: it never grows the delay or exhausts a budget.
-/// Returns the requested wait after the timer completes, for bounded logging.
+/// This decision needs no timer; [`wait_reconnect_spread`] owns the wait.
+#[must_use]
+fn reconnect_spread(seed: u64, attempt: u32) -> Duration {
+    Duration::from_millis(500) + Duration::from_nanos(jitter_stream(seed, attempt) % 500_000_001)
+}
+
+/// Await the reconnect spread and return the requested wait for bounded logging.
 pub async fn wait_reconnect_spread(seed: u64, attempt: u32) -> Duration {
-    let delay = Duration::from_millis(500)
-        + Duration::from_nanos(jitter_stream(seed, attempt) % 500_000_001);
+    let delay = reconnect_spread(seed, attempt);
     tokio::time::sleep(delay).await;
     delay
 }
@@ -154,5 +159,40 @@ mod schedule_tests {
                 .map(|attempt| reconnect_delay(&policy, attempt))
                 .collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod spread_tests {
+    use super::{reconnect_spread, Duration, DEFAULT_SEED};
+
+    #[test]
+    fn spread_preserves_seeded_draws() {
+        for (seed, attempt, nanos) in [
+            (0, 0, 570_190_767),
+            (1, 0, 798_389_749),
+            (0, 1, 773_782_688),
+            (DEFAULT_SEED, 2, 961_319_763),
+            (u64::MAX, u32::MAX, 621_681_999),
+        ] {
+            assert_eq!(
+                reconnect_spread(seed, attempt),
+                Duration::from_nanos(nanos),
+                "seed {seed}, attempt {attempt}"
+            );
+        }
+    }
+
+    #[test]
+    fn spread_stays_bounded_through_and_past_the_supervised_budget() {
+        for attempt in [0, 1, 2, 5, 9, 10, 11, 100, u32::MAX] {
+            for seed in [0, 1, 42, u64::MAX] {
+                let delay = reconnect_spread(seed, attempt);
+                assert!(
+                    (Duration::from_millis(500)..=Duration::from_secs(1)).contains(&delay),
+                    "seed {seed}, attempt {attempt}: {delay:?} outside [500 ms, 1 s]"
+                );
+            }
+        }
     }
 }

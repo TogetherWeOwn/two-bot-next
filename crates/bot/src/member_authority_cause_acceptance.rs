@@ -341,6 +341,19 @@ async fn assert_refused(
     );
 }
 
+/// Well-formed tempban/timeout vehicle: strict decode requires
+/// `duration_seconds`, so the option rides along and the refusal below proves
+/// the pinned fault caused it, never a malformed vehicle.
+fn timed_cause_slash(verb: &str) -> Interaction {
+    let mut interaction = member_slash(verb);
+    let Some(InteractionData::ApplicationCommand(data)) = &mut interaction.data else {
+        panic!("command fixture")
+    };
+    data.options
+        .push(option("duration_seconds", CommandOptionValue::Integer(60)));
+    interaction
+}
+
 #[tokio::test]
 #[ignore = "requires disposable agent-testdb and loopback mock REST"]
 async fn authority_refusal_logs_discord_403_cause() {
@@ -373,7 +386,7 @@ async fn authority_refusal_logs_transport_cause() {
     assert_refused(
         db.pool(),
         &rest,
-        &member_slash("tempban"),
+        &timed_cause_slash("tempban"),
         ModerationAction::TempBan,
         "tempban",
         "transport",
@@ -481,7 +494,7 @@ async fn authority_refusal_logs_unknown_bot_cause() {
     assert_refused(
         db.pool(),
         &rest,
-        &member_slash("timeout"),
+        &timed_cause_slash("timeout"),
         ModerationAction::Timeout,
         "timeout",
         "unknown_bot",

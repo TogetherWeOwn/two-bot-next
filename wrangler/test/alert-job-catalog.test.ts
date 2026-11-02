@@ -25,6 +25,7 @@ const feedJobsRs = read("crates/bot/src/feed_jobs.rs");
 const selfRoleHandlersRs = read("crates/bot/src/self_role_handlers.rs");
 const memberRuntimeRs = read("crates/bot/src/member_runtime.rs");
 const automodGatewayRs = read("crates/bot/src/automod_gateway.rs");
+const lfgJobsRs = read("crates/bot/src/lfg_jobs.rs");
 const metricsMd = read("docs/metrics.md");
 
 /** Labels with no fixed Worker cadence. `invite_snapshot`, `other`,
@@ -111,6 +112,12 @@ function rustCadenceSeconds(): Map<string, number> {
     assert.ok(!out.has(name), `${name} registered twice`);
     out.set(name, ms / 1000);
   }
+  // LFG uses a fixed supervised cadence rather than a Kind/_INTERVAL_MS table.
+  const lfgCadence = /const CADENCE: Duration = Duration::from_secs\((\d+)\);/.exec(lfgJobsRs);
+  assert.ok(lfgCadence, "lfg_jobs.rs: fixed CADENCE not found");
+  assert.match(lfgJobsRs, /Job\s*\{\s*name:\s*NAME,\s*cadence:\s*CADENCE,/);
+  assert.ok(!out.has("lfg_sweep"), "lfg_sweep registered twice");
+  out.set("lfg_sweep", Number(lfgCadence[1]));
   return out;
 }
 
@@ -196,6 +203,7 @@ const REGISTERED = [...new Set([
   ...directJobNames(selfRoleHandlersRs, "self_role_handlers.rs"),
   ...directJobNames(memberRuntimeRs, "member_runtime.rs"),
   ...directJobNames(automodGatewayRs, "automod_gateway.rs"),
+  ...directJobNames(lfgJobsRs, "lfg_jobs.rs"),
 ])];
 const real: Catalog = { jobs: JOBS, registered: REGISTERED, rust: RUST, worker: JOB_INTERVAL_SECONDS, ticker: TICKER_COVERED, exempt: UNKNOWN_STALE_JOBS };
 
@@ -203,13 +211,14 @@ test("parses the full Rust job allowlist and every registered cadence", () => {
   assert.deepEqual(JOBS, [
     "invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events",
     "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages",
-    "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other",
+    "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "lfg_sweep", "other",
   ]);
   // Rust *_INTERVAL_MS / 1000: community_snapshots.rs:45,47, scheduled_events.rs:26,
   // presence.rs:36, community.rs:61, inactivity.rs:27.
   assert.deepEqual(Object.fromEntries(RUST), {
     counter: 60, rank: 600, scheduled_events: 600,
     presence_probe: 3600, community_scorecard: 60, inactivity: 3600,
+    lfg_sweep: 60,
   });
 });
 
@@ -227,7 +236,7 @@ test("feed and self-role producers retain their real cadence and explicit unknow
 });
 
 test("unban sweep and automod expiry producers retain their real cadence and explicit unknown-stale entries", () => {
-  assert.deepEqual(REGISTERED, ["feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry"]);
+  assert.deepEqual(REGISTERED, ["feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "lfg_sweep"]);
   assert.match(memberRuntimeRs, /UNBAN_SWEEP_INTERVAL_SECONDS/);
   assert.match(memberRuntimeRs, /Job\s*\{\s*name:\s*NAMES\[0\],\s*cadence,/);
   assert.match(automodGatewayRs, /const EXPIRY_CADENCE: Duration = Duration::from_secs\(60\);/);
@@ -239,8 +248,20 @@ test("unban sweep and automod expiry producers retain their real cadence and exp
   }
 });
 
+test("LFG sweep retains its fixed 60 s cadence without falling back to unknown-stale coverage", () => {
+  assert.deepEqual(directJobNames(lfgJobsRs, "lfg_jobs.rs"), ["lfg_sweep"]);
+  assert.equal(RUST.get("lfg_sweep"), 60);
+  assert.equal(JOB_INTERVAL_SECONDS.lfg_sweep, 60);
+  assert.ok(!TICKER_STALE_JOBS.includes("lfg_sweep"));
+  assert.ok(!UNKNOWN_STALE_JOBS.has("lfg_sweep"));
+  assert.ok(!UNKNOWN_STALE_EXCLUDED.includes("lfg_sweep"));
+  assert.deepEqual(catalogGaps({ ...real, worker: { ...JOB_INTERVAL_SECONDS, lfg_sweep: 61 } }), [
+    "lfg_sweep: JOB_INTERVAL_SECONDS 61s != Rust 60s",
+  ]);
+});
+
 test("a registered direct producer absent from JOBS fails the catalog", () => {
-  for (const [source, file] of [[feedJobsRs, "feed_jobs.rs"], [selfRoleHandlersRs, "self_role_handlers.rs"], [memberRuntimeRs, "member_runtime.rs"], [automodGatewayRs, "automod_gateway.rs"]]) {
+  for (const [source, file] of [[feedJobsRs, "feed_jobs.rs"], [selfRoleHandlersRs, "self_role_handlers.rs"], [memberRuntimeRs, "member_runtime.rs"], [automodGatewayRs, "automod_gateway.rs"], [lfgJobsRs, "lfg_jobs.rs"]]) {
     const mutated = source + '\nfn fixture() -> Job { Job { name: "fake_producer", cadence: Duration::from_secs(30), } }';
     const registered = directJobNames(mutated, file!);
     assert.ok(registered.includes("fake_producer"), "fixture did not inject a registered producer");

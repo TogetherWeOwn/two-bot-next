@@ -113,7 +113,7 @@ STAGING_WORKER_URL=https://two-bot-next-staging.<sub>.workers.dev \
 Offline fixtures cover the same assertion logic with no network access:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_staging_redirect_smoke.py -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_redirect_smoke*.py' -v
 ```
 
 CI runs them in the worker job beside the rollout provenance suite.

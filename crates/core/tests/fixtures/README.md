@@ -73,8 +73,8 @@ before checking the HMAC (the old fake accepted a self-consistent wrong order).
 
 `authz_matrix.json` is the role x route x expected-outcome table behind
 `crates/core/tests/authz_matrix.rs`. Ten named roles carry literal Discord
-permission bits (not the production constants) and each of the 29 retained
-builtin slash commands lists the roles it admits and the refusal everyone else
+permission bits (not the production constants). Each retained builtin slash
+command lists the roles it admits and the refusal everyone else
 gets, checked through `InteractionRouter::route_slash` with every feature gate
 on. `context_cases` pin the configured-guild fence and unresolved permission
 bits; `moderation_policy` pins the `assert_moderation_allowed` refusal order.

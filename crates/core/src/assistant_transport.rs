@@ -361,6 +361,10 @@ mod tests {
                 "TWO_ASSISTANT_MODEL".to_string(),
                 "fixture-model".to_string(),
             ),
+            (
+                "TWO_ASSISTANT_API_KEY".to_string(),
+                "fixture-assistant-credential".to_string(),
+            ),
         ]))
     }
 
@@ -729,13 +733,15 @@ mod tests {
 
     #[test]
     fn debug_never_exposes_endpoint_or_bodies() {
-        let endpoint = "https://assistant.example.com/hunter2-path?token=hunter2";
+        // Config refuses query credentials; keep an admitted path sentinel
+        // and exercise query redaction on the raw request/response types too.
+        let endpoint = "https://assistant.example.com/hunter2-path";
         let validated = AssistantTransportConfig::from_assistant_config(
             &assistant_config(endpoint).expect("fixture endpoint must parse"),
         )
         .expect("fixture endpoint must enable the transport");
         let request = AssistantRequest {
-            url: endpoint.to_owned(),
+            url: format!("{endpoint}?token=hunter2"),
             host: validated.host().to_owned(),
             port: validated.port(),
             resolved_addresses: vec![public_v4()],
