@@ -580,6 +580,50 @@ class ColdAndLagServingTests(unittest.TestCase):
         self.assertIn("(awaiting_runtime_convergence)", result[1])
         self.assertEqual(result[3].runtime_calls, [])
 
+    def test_rollout_timeout_after_unaccepted_poll_names_wait(self):
+        # A control-plane read straddling the shared 600s deadline raises
+        # rollout_timeout after at least one unaccepted poll: the same
+        # expiry as the clean while-exit, so it takes the timeout verdict
+        # with the last wait class. No proof, no runtime probes.
+        reads = {"listing": 0}
+        routes = self.live_routes(converged_row(ROLL_ID, PROD_IMAGE))
+
+        def listing():
+            reads["listing"] += 1
+            if reads["listing"] == 1:
+                return []
+            raise base.GateError("rollout_timeout")
+
+        routes[f"/containers/applications/{APP_ID}/rollouts?limit=100"] = listing
+        result = self.attempt(routes=routes, preflight=True, url=None)
+        self.assert_refused(result)
+        code, message, proof, plane, _ = result
+        self.assertIn("; image did not converge (awaiting_rollout_listing)",
+                      message)
+        self.assertIsNone(proof)
+        self.assertEqual(plane.runtime_calls, [])
+
+    def test_non_timeout_gate_error_stays_bare_refusal(self):
+        # Every other GateError keeps the byte-identical bare refusal,
+        # even after an unaccepted poll set the wait class.
+        reads = {"listing": 0}
+        routes = self.live_routes(converged_row(ROLL_ID, PROD_IMAGE))
+
+        def listing():
+            reads["listing"] += 1
+            if reads["listing"] == 1:
+                return []
+            raise base.GateError("api_http_failure")
+
+        routes[f"/containers/applications/{APP_ID}/rollouts?limit=100"] = listing
+        result = self.attempt(routes=routes, preflight=True, url=None)
+        self.assert_refused(result)
+        code, message, proof, plane, _ = result
+        self.assertEqual(message.strip(),
+                         "serving: promoted production identity refused")
+        self.assertIsNone(proof)
+        self.assertEqual(plane.runtime_calls, [])
+
     def test_both_lag_shapes_need_two_exact_live_health_and_readyz_confirmations(self):
         for active, healthy in ((0, 1), (1, 0)):
             for dictionary in (False, True):
