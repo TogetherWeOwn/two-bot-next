@@ -66,6 +66,43 @@ impl<'a> SettingsStore<'a> {
         })
     }
 
+    /// Per-event read: the global revision and only this guild's rows from
+    /// one MVCC snapshot. Never loads another guild's settings. The supervisor
+    /// keeps using `load_snapshot` for its deliberately global cache.
+    pub async fn load_guild_snapshot(
+        &self,
+        guild_id: &str,
+    ) -> Result<SettingsSnapshot, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let revision = sqlx::query_scalar(
+            "SELECT revision FROM guild_settings_revision WHERE singleton = TRUE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let rows: Vec<(String, String, serde_json::Value, i64)> = sqlx::query_as(
+            "SELECT guild_id, key, value, version FROM guild_settings WHERE guild_id = $1",
+        )
+        .bind(guild_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(SettingsSnapshot {
+            revision,
+            rows: rows
+                .into_iter()
+                .map(|(guild_id, key, value, version)| SettingRow {
+                    guild_id,
+                    key,
+                    value,
+                    version,
+                })
+                .collect(),
+        })
+    }
+
     /// The cheap poll: commit-safe revision and row count in one snapshot.
     /// The revision also sees deletes, rollbacks do not advance it, and a
     /// late commit with a lower row version cannot hide behind a sequence max.
@@ -74,6 +111,18 @@ impl<'a> SettingsStore<'a> {
             "SELECT revision, (SELECT count(*) FROM guild_settings)
              FROM guild_settings_revision WHERE singleton = TRUE",
         )
+        .fetch_one(self.pool)
+        .await
+    }
+
+    /// Poll marks for a scoped cache; the count must cover the same guild as
+    /// `load_guild_snapshot`, not the supervisor's global row count.
+    pub async fn poll_guild_marks(&self, guild_id: &str) -> Result<(i64, i64), sqlx::Error> {
+        sqlx::query_as(
+            "SELECT revision, (SELECT count(*) FROM guild_settings WHERE guild_id = $1)
+             FROM guild_settings_revision WHERE singleton = TRUE",
+        )
+        .bind(guild_id)
         .fetch_one(self.pool)
         .await
     }
@@ -159,6 +208,37 @@ impl<'a> SettingsStore<'a> {
             return Err(SettingsWriteError::VersionConflict);
         }
 
+        // A retired catalogue must not strand admitted work. The shared
+        // revision lock orders this check with fresh self-role admission;
+        // active leases count too, not just work currently due for discovery.
+        let catalogue_changed = key == "TWO_SELF_ROLE_PANELS"
+            && match &validated.action {
+                WriteAction::Upsert(next) => {
+                    previous.as_ref().map(|(value, _)| value) != Some(next)
+                }
+                WriteAction::Delete => previous.is_some(),
+            };
+        if catalogue_changed {
+            let (unfinished,): (bool,) = sqlx::query_as(
+                "SELECT EXISTS (SELECT 1 FROM self_role_audit a WHERE guild_id=$1 AND (
+                 outcome='processing' OR exchange_pending
+                 OR (outcome='rejected' AND code='superseded_by_later_event' AND NOT repair_complete
+                     AND (added_role_ids <> '[]' OR removed_role_ids <> '[]'
+                          OR attempted_added_role_ids <> '[]' OR attempted_removed_role_ids <> '[]'
+                          OR compensated_added_role_ids <> '[]' OR compensated_removed_role_ids <> '[]'
+                          OR unresolved_added_role_ids <> '[]' OR unresolved_removed_role_ids <> '[]'))
+                 OR EXISTS (SELECT 1 FROM self_role_exchanges e WHERE e.event_id=a.event_id AND e.retired_at IS NULL)
+                 OR EXISTS (SELECT 1 FROM self_role_exchange_baselines b WHERE b.event_id=a.event_id AND b.legacy_pending)))",
+            )
+            .bind(guild_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if unfinished {
+                tx.rollback().await?;
+                return Err(SettingsWriteError::SelfRoleRecoveryPending);
+            }
+        }
+
         let version = match &validated.action {
             WriteAction::Delete => {
                 sqlx::query("DELETE FROM guild_settings WHERE guild_id = $1 AND key = $2")
@@ -213,6 +293,8 @@ impl<'a> SettingsStore<'a> {
 /// A settings write failure: refused before SQL vs database error.
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsWriteError {
+    #[error("self-role work must drain before changing TWO_SELF_ROLE_PANELS")]
+    SelfRoleRecoveryPending,
     #[error("settings version conflict")]
     VersionConflict,
     #[error("{0}")]

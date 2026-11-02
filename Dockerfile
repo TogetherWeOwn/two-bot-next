@@ -19,7 +19,8 @@ COPY crates/bot/Cargo.toml crates/bot/
 COPY crates/cutover/Cargo.toml crates/cutover/
 COPY crates/store/Cargo.toml crates/store/
 COPY crates/testsupport/Cargo.toml crates/testsupport/
-RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutover/src crates/store/src crates/testsupport/src \
+COPY crates/voice-probe/Cargo.toml crates/voice-probe/
+RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutover/src crates/store/src crates/testsupport/src crates/voice-probe/src \
     && echo '' > src/lib.rs \
     && echo 'fn main(){}' > crates/bot/src/main.rs \
     && echo '' > crates/core/src/lib.rs \
@@ -27,6 +28,8 @@ RUN mkdir -p src crates/core/src crates/discord/src crates/bot/src crates/cutove
     && echo '' > crates/cutover/src/lib.rs \
     && echo '' > crates/store/src/lib.rs \
     && echo '' > crates/testsupport/src/lib.rs \
+    && echo '' > crates/voice-probe/src/lib.rs \
+    && echo 'fn main(){}' > crates/voice-probe/src/main.rs \
     && cargo fetch --locked
 
 # Real sources; the release profile (opt-level=z, lto, strip) targets the
@@ -35,17 +38,20 @@ COPY . .
 # Non-secret build provenance, compiled into readiness (not a runtime override).
 ARG BOT_BUILD_REVISION=unknown
 ARG BOT_BUILD_ID=unknown
+ARG BOT_DEPLOY_ID=unknown
 RUN cargo build --release --locked
 
 # The runtime base already ships Debian trust data (ca-certificates) and the
 # nonroot account (uid/gid 65532, home /home/nonroot); nothing is installed.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2 AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e AS runtime
 
 # Non-secret build provenance (main #137/#156), recorded as image labels.
 ARG BOT_BUILD_REVISION=unknown
 ARG BOT_BUILD_ID=unknown
+ARG BOT_DEPLOY_ID=unknown
 LABEL org.opencontainers.image.revision=$BOT_BUILD_REVISION \
-      com.togetherweown.build-id=$BOT_BUILD_ID
+      com.togetherweown.build-id=$BOT_BUILD_ID \
+      com.togetherweown.deploy-id=$BOT_DEPLOY_ID
 
 # Non-root user: the bot never needs container root.
 USER 65532:65532

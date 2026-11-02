@@ -618,7 +618,7 @@ fn limit_of(path: &str) -> Option<u64> {
 
 // (1a) Event-users pagination runs through the rate-limit client with max 100.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22951"]
 async fn event_users_paginate_through_rate_limit_client_with_max_100() {
     let mock = FakeRest::start(
         vec![
@@ -695,7 +695,7 @@ async fn event_users_paginate_through_rate_limit_client_with_max_100() {
 
 // (1b) Reaction-users pagination runs through the rate-limit client.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22951"]
 async fn reaction_users_paginate_through_rate_limit_client() {
     let mock = FakeRest::start(
         vec![
@@ -764,7 +764,7 @@ async fn reaction_users_paginate_through_rate_limit_client() {
 
 // (1c) Pins listing runs through the rate-limit client and persists metadata.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22951"]
 async fn pins_list_through_rate_limit_client_persists_metadata_only() {
     let mock = FakeRest::start(
         vec![
@@ -849,7 +849,7 @@ async fn pins_list_through_rate_limit_client_persists_metadata_only() {
 
 // (2) Blocklisted users are skipped for per-user rows; aggregates keep counting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22951"]
 async fn blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting() {
     // Fixture blocklist modelling the TOG-22850 opt-out: the builder must wire
     // this predicate to the real blocklist lookup. The aggregate (total seen)
@@ -944,7 +944,7 @@ async fn blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_count
 
 // (3) Persisted rows hold ids/timestamps/enums only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22951"]
 async fn persisted_rows_hold_ids_timestamps_enums_only() {
     let f = Fixture::new().await;
     put_event_user(&f.pool, USER_A).await;
@@ -1028,7 +1028,7 @@ async fn persisted_rows_hold_ids_timestamps_enums_only() {
 
 // (4) Resume continues from persisted cursors per family.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22951"]
 async fn resume_continues_from_persisted_cursors_per_family() {
     use two_bot_store::backfill_cursors::{get_backfill_cursor, put_backfill_cursor};
 

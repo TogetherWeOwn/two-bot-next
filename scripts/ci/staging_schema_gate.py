@@ -13,12 +13,16 @@ mismatched binding refuses before any plan runs, exactly as the manual plan
 does. DDL never runs here: drift is fixed by the manual `staging-migrate`
 apply dispatch, exactly as the drift message says.
 """
-import argparse
-import json
 import os
 import subprocess
 import sys
 from urllib.parse import urlparse
+
+from schema_gate_common import (
+    GateArgumentParser, I64_MAX, Refused, cli, pending_versions, require,
+    result, run_plan, validate_manifest, validate_source_sha, verified_pins,
+    write_manifest,
+)
 
 PLAN_URL_ENV = "TWO_BOT_STAGING_PLAN_DATABASE_URL"
 # Non-secret expected staging identity, wired in deploy-staging.yml from
@@ -35,30 +39,6 @@ GATE_REF = "deploy-staging-schema-gate"
 # strictly above 80% of the effective (non-superuser) ceiling warns,
 # never fails.
 CONNECTION_WARN_PCT = 80.0
-I64_MAX = 2**63 - 1
-
-
-class Refused(ValueError):
-    """A bounded, non-secret refusal; never include rejected input in errors."""
-
-
-def require(condition, message):
-    if not condition:
-        raise Refused(message)
-
-
-def unique_object(pairs):
-    """object_pairs_hook refusing repeats instead of last-wins.
-
-    The json decoder calls this for every object at any depth, after
-    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
-    refusal is a fixed string: it names no key, value or path.
-    """
-    result = {}
-    for key, value in pairs:
-        require(key not in result, "plan manifest has duplicate fields")
-        result[key] = value
-    return result
 
 
 def pins_from_url(url):
@@ -146,17 +126,6 @@ def verify_binding(url, expected_host, expected_database, expected_branch):
     return host_pin, db_pin, branch_pin
 
 
-def pending_versions(manifest, key="pending_before"):
-    """Return the strictly-ascending pending list; refuse malformed manifests."""
-    require(isinstance(manifest, dict), "plan manifest is not an object")
-    pending = manifest.get(key)
-    require(isinstance(pending, list), "pending versions are invalid")
-    require(all(type(v) is int and 0 < v <= I64_MAX for v in pending),
-            "pending version is outside the positive i64 range")
-    require(pending == sorted(set(pending)), "pending versions are not strictly ascending")
-    return pending
-
-
 def drift_message(pending, source_sha, store_pending=()):
     """Fail-closed deploy refusal naming the drift and its manual fix."""
     versions = ",".join(str(v) for v in pending)
@@ -198,15 +167,15 @@ def connection_warning(manifest):
         return None
     used = usage.get("used")
     maximum = usage.get("max_connections")
-    if isinstance(used, bool) or not isinstance(used, int) or used < 0:
+    if type(used) is not int or not 0 <= used <= I64_MAX:
         return None
-    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
+    if type(maximum) is not int or not 0 < maximum <= I64_MAX:
         return None
     ceiling = usage.get("effective_max_connections")
     ceiling_label = "the non-superuser connection ceiling"
-    if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
+    if type(ceiling) is not int or not 0 < ceiling <= I64_MAX:
         reserved = usage.get("reserved_connections")
-        if isinstance(reserved, bool) or not isinstance(reserved, int):
+        if type(reserved) is not int or not 0 <= reserved <= I64_MAX:
             ceiling = maximum
             ceiling_label = "max_connections"
         else:
@@ -228,65 +197,45 @@ def run_gate(binary, source_sha, url, expected_host, expected_database, expected
     binary's own `verify_target` compares the secret with the pins, as the
     manual plan does.
     """
-    host, database, branch = verify_binding(url, expected_host, expected_database, expected_branch)
-    proc = subprocess.run(
+    validate_source_sha(source_sha)
+    host, database, branch = verified_pins(
+        verify_binding, url, expected_host, expected_database, expected_branch,
+    )
+    return run_plan(
         [binary, "--target", "staging", "--plan", "--source-sha", source_sha,
          "--staging-host", host, "--staging-database", database,
          "--staging-branch-id", branch,
          "--recovery-evidence-ref", GATE_REF, "--acl-plan-ref", GATE_REF],
-        capture_output=True, text=True, check=False, timeout=600,
+        run=subprocess.run,
     )
-    if proc.returncode != 0:
-        raise Refused(
-            f"staging-migrate plan refused the gate (exit {proc.returncode}): "
-            f"{proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else 'no detail'}"
-        )
-    try:
-        manifest = json.loads(proc.stdout.strip().splitlines()[-1],
-                              object_pairs_hook=unique_object)
-    except Refused:
-        raise
-    except (ValueError, IndexError, RecursionError):
-        # ValueError carries JSONDecodeError plus the int-digit cap; refuse all as non-JSON.
-        raise Refused("plan manifest is not valid JSON")
-    return manifest
 
 
 def main(argv=None, env=None, run=None):
-    parser = argparse.ArgumentParser(description="Fail closed on staging schema drift.")
+    parser = GateArgumentParser(description="Fail closed on staging schema drift.")
     parser.add_argument("--binary", required=True, help="built staging-migrate binary")
-    parser.add_argument("--source-sha", required=True, help="full 40-char deploy SHA")
+    parser.add_argument("--source-sha", required=True, help="canonical lowercase 40-hex deploy SHA")
     parser.add_argument("--manifest-out", default="staging-schema-gate-manifest.json")
     args = parser.parse_args(argv)
     env = os.environ if env is None else env
     run = run_gate if run is None else run
-    require(len(args.source_sha) == 40, "source SHA must be a full 40-char commit")
-    manifest = run(
-        args.binary,
-        args.source_sha,
-        env.get(PLAN_URL_ENV, ""),
-        env.get(EXPECTED_HOST_ENV, ""),
-        env.get(EXPECTED_DATABASE_ENV, ""),
-        env.get(EXPECTED_BRANCH_ENV, ""),
+    validate_source_sha(args.source_sha)
+    url = env.get(PLAN_URL_ENV, "")
+    pins = verified_pins(
+        verify_binding, url, env.get(EXPECTED_HOST_ENV, ""),
+        env.get(EXPECTED_DATABASE_ENV, ""), env.get(EXPECTED_BRANCH_ENV, ""),
     )
-    with open(args.manifest_out, "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, sort_keys=True)
-        handle.write("\n")
-    pending = pending_versions(manifest)
-    store_pending = pending_versions(manifest, "pending_store_before")
+    manifest = run(args.binary, args.source_sha, url, *pins)
+    pending, store_pending = validate_manifest(manifest, args.source_sha, "staging", pins)
+    write_manifest(args.manifest_out, manifest)
     warning = connection_warning(manifest)
     if warning is not None:
         print(warning)
     if pending or store_pending:
         print(drift_message(pending, args.source_sha, store_pending), file=sys.stderr)
-        return 1
+        return result("schema_drift")
     print(f"schema gate clean: no pending migrations on {args.source_sha}")
-    return 0
+    return result("schema_clean")
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except Refused as error:
-        print(f"staging-schema-gate refused: {error}", file=sys.stderr)
-        sys.exit(2)
+    sys.exit(cli(main))

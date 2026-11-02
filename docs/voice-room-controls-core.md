@@ -69,7 +69,7 @@ The join-request buttons are wired too: see
 `voice_commands()` (`crates/core/src/voice_rooms.rs:1646-1660`), merged into
 the publish set when the voice gate is on (`crates/core/src/router.rs:717-719`),
 and synced to the registry on ready
-(`crates/bot/src/command_runtime.rs:1009-1020`); the bitrate preference is not
+(`crates/bot/src/command_runtime.rs:1043-1065`); the bitrate preference is not
 wired. Re-checked at `86a6668a7`.
 
 ## Hermetic verification

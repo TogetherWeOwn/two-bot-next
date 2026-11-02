@@ -330,6 +330,19 @@ async fn measure(config: &Config, db: &TestDatabase, queries: &Queries) -> Resul
         rows >= (config.members * 2) as i64 && members == config.members as i64,
         "durable effects missing"
     );
+    // Verification is outside the measured query window. Refuse a report
+    // that silently measured journal failures or incomplete/duplicate evidence.
+    let (journal_rows, journaled_events): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(DISTINCT e.id)
+         FROM rollback_journal j JOIN events e ON j.row_identity = e.id::text
+         WHERE j.table_name = 'events' AND j.op = 'insert' AND j.pre_image IS NULL",
+    )
+    .fetch_one(db.pool())
+    .await?;
+    ensure!(
+        journal_rows == rows && journaled_events == rows,
+        "benchmark requires exactly one insert journal entry per durable event"
+    );
     let checkpoint = store.load().await?.context("checkpoint missing")?;
     ensure!(
         checkpoint.sequence == sequence,
@@ -355,6 +368,7 @@ async fn measure(config: &Config, db: &TestDatabase, queries: &Queries) -> Resul
             "measured_events":config.events(),"messages":messages,"voice_updates":voices,
             "sqlx_statements":statements,"begin_exchanges":config.events(),"commits":commits,
             "mock_rest_calls":rest_calls,"durable_events":rows,"durable_members":members,
+            "journal_rows":journal_rows,"journaled_events":journaled_events,
             "cached_members":pipeline.cache().stats().guild_members(Id::new(GUILD)),
             "cached_channels":pipeline.cache().stats().channels(),"checkpoint_sequence":sequence
         }
@@ -372,8 +386,16 @@ async fn main() -> Result<()> {
     let raw = std::env::var("TWO_TEST_DATABASE_URL")
         .context("explicit TWO_TEST_DATABASE_URL required; no fallback")?;
     let db = TestDatabase::create(&raw, &sqlx::migrate!("../cutover/migrations")).await?;
-    let measured =
-        tokio::time::timeout(Duration::from_secs(180), measure(&config, &db, &queries)).await;
+    let measured = tokio::time::timeout(Duration::from_secs(180), async {
+        // Production applies both chains. Without the store chain every
+        // journal write takes the savepoint failure path, not the measured
+        // success path. Keep setup inside the timeout and teardown on errors.
+        two_bot_store::migrate(db.pool())
+            .await
+            .context("store migrations required for benchmark journal coverage")?;
+        measure(&config, &db, &queries).await
+    })
+    .await;
     db.close()
         .await
         .context("verify disposable database teardown")?;

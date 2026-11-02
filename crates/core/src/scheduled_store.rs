@@ -17,8 +17,9 @@
 //! `retryScheduled`): `claim_due` leases due rows with a single atomic
 //! `UPDATE … RETURNING`, `SKIP LOCKED` letting parallel schedulers divide the
 //! queue without blocking. A claimed row's `next_run_at` is parked at the
-//! lease horizon so a restarted process sees it as not-due and posts exactly
-//! once. `complete_run` only writes when the claim token still matches — if
+//! lease horizon. Sending separately arms a durable uncertainty fence; a
+//! reclaimed armed occurrence is never POSTed again. `complete_run` only
+//! writes when the claim token still matches — if
 //! the definition changed or was cancelled mid-post the completion loses and
 //! the caller cleans up the orphan (legacy `stale_completion`).
 
@@ -46,6 +47,8 @@ pub struct ScheduledMessageRow {
     pub claim_token: Option<String>,
     pub claimed_at: Option<String>,
     pub occurrence_nonce: Option<String>,
+    /// Armed before POST; expiry/restart never proves the occurrence unsent.
+    pub delivery_uncertain: bool,
 }
 
 /// A scheduled-message definition write (legacy `putScheduled` input row).
@@ -103,7 +106,8 @@ pub async fn get_scheduled(
     sqlx::query_as::<_, ScheduledMessageRow>(
         "SELECT id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
                 last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
-                claim_token, claimed_at, occurrence_nonce
+                claim_token, claimed_at, occurrence_nonce,
+                COALESCE(delivery_uncertain, TRUE) AS delivery_uncertain
            FROM scheduled_messages WHERE guild_id = $1 AND id = $2",
     )
     .bind(guild_id)
@@ -164,7 +168,8 @@ pub async fn list_scheduled(
     sqlx::query_as::<_, ScheduledMessageRow>(
         "SELECT id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
                 last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
-                claim_token, claimed_at, occurrence_nonce
+                claim_token, claimed_at, occurrence_nonce,
+                COALESCE(delivery_uncertain, TRUE) AS delivery_uncertain
            FROM scheduled_messages WHERE guild_id = $1 ORDER BY next_run_at, id LIMIT $2",
     )
     .bind(guild_id)
@@ -198,7 +203,8 @@ pub async fn list_scheduled_window(
     sqlx::query_as::<_, ScheduledMessageRow>(
         "SELECT id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
                 last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
-                claim_token, claimed_at, occurrence_nonce
+                claim_token, claimed_at, occurrence_nonce,
+                COALESCE(delivery_uncertain, TRUE) AS delivery_uncertain
            FROM scheduled_messages WHERE guild_id = $1 ORDER BY next_run_at, id LIMIT $2 OFFSET $3",
     )
     .bind(guild_id)
@@ -213,11 +219,10 @@ pub async fn list_scheduled_window(
 /// another row instead of blocking. The ticker loops up to
 /// [`crate::scheduled::TICKER_BATCH_LIMIT`], supplying a fresh claim token and
 /// nonce on each call; a nonce must never be shared by distinct occurrences.
-/// The lease parks `next_run_at` at the horizon so a restarted process sees
-/// the row as not-due until the lease expires. A fresh claim takes the row's
-/// `occurrence_nonce` only when none is set — retries of an ambiguous post
-/// reuse the same nonce (legacy `COALESCE(occurrence_nonce, ?)`), so the
-/// execute-then-verify path stays idempotent across restarts.
+/// The lease parks `next_run_at` at the horizon. Reclaim preserves both the
+/// nonce and `delivery_uncertain`: expiry is not evidence of an unsent POST.
+/// Callers must obtain [`begin_scheduled_delivery`] before sending; an armed
+/// row may only be inspected/held, never blindly replayed.
 pub async fn claim_due(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -241,7 +246,8 @@ pub async fn claim_due(
             AND next_run_at <= $2
           RETURNING id, guild_id, channel_id, body, next_run_at, interval_seconds,
                     enabled, last_run_at, last_message_id, created_by, created_at,
-                    updated_by, updated_at, claim_token, claimed_at, occurrence_nonce",
+                    updated_by, updated_at, claim_token, claimed_at, occurrence_nonce,
+                    COALESCE(delivery_uncertain, TRUE) AS delivery_uncertain",
     )
     .bind(guild_id)
     .bind(now_iso)
@@ -252,10 +258,33 @@ pub async fn claim_due(
     .await
 }
 
-/// Re-queue a claimed occurrence after a retryable failure (legacy
-/// `retryScheduled`): only the claim holder rewrites the row, always clearing
-/// the claim. `preserve_nonce = true` keeps the occurrence nonce so the retry
-/// cannot double-post; the orphan-cleanup path passes `false`.
+/// Arm the durable uncertainty fence immediately before a single POST.
+/// A stale claim, explicit replacement, or already-armed occurrence authorizes
+/// no send. A lost response to this write must likewise authorize no send.
+/// NULL is deliberately not FALSE: an unreadable fence fails closed.
+pub async fn begin_scheduled_delivery(
+    pool: &Pool<Postgres>,
+    guild_id: &str,
+    id: &str,
+    claim_token: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE scheduled_messages SET delivery_uncertain = TRUE
+          WHERE guild_id = $1 AND id = $2 AND claim_token = $3
+            AND enabled AND delivery_uncertain = FALSE AND occurrence_nonce IS NOT NULL",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .bind(claim_token)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Re-queue a claimed occurrence: only the claim holder rewrites the row,
+/// always clearing the claim. `preserve_nonce = true` retains both identity and
+/// any uncertainty fence; it NEVER authorizes another POST of a fenced row.
+/// Pass `false` only after proven no effect or confirmed orphan cleanup.
 pub async fn retry_scheduled(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -267,7 +296,8 @@ pub async fn retry_scheduled(
     let result = sqlx::query(
         "UPDATE scheduled_messages
             SET next_run_at = $4, claim_token = NULL, claimed_at = NULL,
-                occurrence_nonce = CASE WHEN $5 THEN occurrence_nonce ELSE NULL END
+                occurrence_nonce = CASE WHEN $5 THEN occurrence_nonce ELSE NULL END,
+                delivery_uncertain = CASE WHEN $5 THEN delivery_uncertain ELSE FALSE END
           WHERE guild_id = $1 AND id = $2 AND claim_token = $3",
     )
     .bind(guild_id)
@@ -328,7 +358,8 @@ pub async fn put_scheduled(
            updated_at       = excluded.updated_at,
            claim_token      = NULL,
            claimed_at       = NULL,
-           occurrence_nonce = NULL
+           occurrence_nonce = NULL,
+           delivery_uncertain = FALSE
          WHERE scheduled_messages.guild_id = excluded.guild_id",
     )
     .bind(&row.id)
@@ -387,12 +418,14 @@ pub async fn complete_run(
            enabled          = CASE WHEN interval_seconds IS NULL THEN FALSE ELSE TRUE END,
            next_run_at      = $5,
            occurrence_nonce = NULL,
+           delivery_uncertain = FALSE,
            claim_token      = NULL,
            claimed_at       = NULL
          WHERE guild_id = $1 AND id = $2 AND claim_token = $6
          RETURNING id, guild_id, channel_id, body, next_run_at, interval_seconds,
                    enabled, last_run_at, last_message_id, created_by, created_at,
-                   updated_by, updated_at, claim_token, claimed_at, occurrence_nonce",
+                   updated_by, updated_at, claim_token, claimed_at, occurrence_nonce,
+                    COALESCE(delivery_uncertain, TRUE) AS delivery_uncertain",
     )
     .bind(guild_id)
     .bind(id)

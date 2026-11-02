@@ -65,6 +65,22 @@ Dispatch-worker failures use the same path: a failed leveling drain, a dropped i
 
 These changes prevent scheduler-induced loss at backlog/deadline and recoverable checkpoint-error boundaries, not process-crash exactly-once delivery. RSVP store effects and Discord acknowledgements are not atomic with the gateway checkpoint, and no durable interaction inbox is introduced. A failed final edit never retries the already-executed command.
 
+### Voice action queue: no enforced production pending cap
+
+`ActionQueue::try_enqueue` is an opt-in API for future sheddable producers. It
+refuses new work once a guild has 1,024 pending urgent + deferred actions, while
+allowing a newer rename or respace to overwrite its same-kind pending entry
+without allocating another slot or counting a refusal.
+
+**That limit is not a production queue-memory bound.** All current production
+producers still use the always-admit `enqueue` path to preserve accepted user
+commands and room lifecycle writes. The actor inbox gate limits inbound bursts,
+not cumulative production under a stalled drain. Wiring producers that can
+safely handle refusal is future work; do not assume queue depth stops at 1,024
+or that a zero overflow counter proves the drain is healthy. Inspect
+`two_bot_voice_queue_pending` and `two_bot_voice_queue_oldest_age_seconds`
+with the actor/REST stall signals when investigating accumulation.
+
 ## Force-fresh IDENTIFY (first production boot)
 
 The age policy alone RESUMEs any checkpoint up to 15 minutes old. The first production boot must IDENTIFY with RESUME disabled, so an operator arms a one-shot directive instead of relying on checkpoint age. The Worker forwards no feature flags, so an environment toggle cannot do this.
@@ -89,6 +105,26 @@ Then confirm the first READY: `/readyz` reports the gateway connected, and the d
 Exit codes: 0 ok, 1 database failure (including a database without migration 0321; the CLI never runs migrations), 2 usage or refusal. A mismatched or unset `GUILD_ID`, a missing `--reason`, an unknown flag, or the live guild without `--allow-live-guild` all refuse before connecting.
 
 Residual window: the directive is consumed when the boot read commits. If the process dies before the discard and READY are committed, a restart within 15 minutes could RESUME the old checkpoint. After every armed boot, run the dry run; if the directive is consumed but no new READY checkpoint was recorded, arm again before the next start.
+
+## Reconnect timing entry points
+
+`crates/bot/src/gateway_backoff.rs` separates the live receive loop's timing
+choice from its timer effect:
+
+- `reconnect_spread(seed, attempt)` calculates the deterministic, non-growing
+  500 ms–1 s spread with no timer, network or database access.
+- `wait_reconnect_spread(seed, attempt)` awaits that delay and returns the
+  requested duration for logging. The receive loop in `gateway.rs` uses this
+  wrapper; Twilight still owns connection backoff.
+- `reconnect_delay(policy, attempt)` is the separate, bounded exponential
+  schedule for the test-only supervised runner, not the live receive loop.
+
+Before changing this boundary, run the pure `gateway_backoff::spread_tests`
+unit tests and the existing `reconnect_spread_runtime_acceptance` and
+`reconnect_adoption_guard` integration targets through the bounded cache.
+Together they check seeded draws and extreme attempts, the actual awaited
+500 ms–1 s timer, and receive-loop adoption. Keep exact-head CI and independent
+review as gates; this seam does not enable broader automation or retry authority.
 
 ## Verification (test containers only)
 

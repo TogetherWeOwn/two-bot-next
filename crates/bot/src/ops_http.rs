@@ -266,10 +266,15 @@ struct Summary {
     gateway_failure: Option<GatewayFailure>,
     jobs: BTreeMap<String, JobStatus>,
     pool: Option<PoolGauges>,
+    /// Rejected duplicate `register_pool` calls since boot. Top-level (not
+    /// inside `pool`) so the zero state still renders `0` on unconfigured
+    /// boots where `pool` is `null`, never absent-vs-zero ambiguity.
+    duplicate_pool_registrations: u64,
     event_store: EventStoreRollup,
     backfill: BackfillSummary,
     build_revision: &'static str,
     build_id: &'static str,
+    deploy_id: &'static str,
 }
 
 fn no_store_json<T: serde::Serialize>(
@@ -331,10 +336,12 @@ async fn summary(
         gateway_failure: report.gateway_failure,
         jobs: report.jobs,
         pool,
+        duplicate_pool_registrations: crate::metrics_http::duplicate_registration_count(),
         event_store,
         backfill,
         build_revision: report.build_revision,
         build_id: report.build_id,
+        deploy_id: report.deploy_id,
     })
 }
 
@@ -875,6 +882,11 @@ mod tests {
         assert_eq!(json["gateway_state"], "unconfigured");
         assert!(json.get("gateway_failure").is_none());
         assert_eq!(json["pool"], serde_json::Value::Null);
+        // Presence only: the counter is process-global and other tests in
+        // this binary reject into it, so the exact value is not stable here.
+        // Exact values (1 after a reject, 0 on a fresh boot) are pinned by
+        // the isolated child-process acceptance tests.
+        assert!(json["duplicate_pool_registrations"].is_u64());
         assert_eq!(json["event_store"]["available"], false);
         assert_eq!(
             json["event_store"]["restorable_point"],
@@ -889,6 +901,10 @@ mod tests {
         assert_eq!(
             json["build_revision"],
             option_env!("BOT_BUILD_REVISION").unwrap_or("unknown")
+        );
+        assert_eq!(
+            json["deploy_id"],
+            option_env!("BOT_DEPLOY_ID").unwrap_or("unknown")
         );
     }
 

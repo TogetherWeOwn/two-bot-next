@@ -361,7 +361,8 @@ async fn level_up_crosses_threshold_and_plans_grants(
         &[],
         two_bot_core::leveling::level_role_writes_allowed(false),
         false,
-    );
+    )
+    .expect("one rung is under the cap");
     assert_eq!(plan.grant, vec!["400000000000000001".to_owned()]);
     assert!(plan.revoke.is_empty());
     // Bad timestamps are refused before any write.

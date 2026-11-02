@@ -20,17 +20,37 @@ LINK = re.compile(r"\[[^\]\n]*\]\(([^\s)]+)\)")
 BEGIN = "<!-- post-freeze-ledger:start -->"
 END = "<!-- post-freeze-ledger:end -->"
 
+# Bounded-subprocess policy (docs/bounded-subprocess-checks.md): every child
+# wait is finite so a stalled child fails closed here instead of hanging
+# until the external CI ceiling. Local Git reads answer in well under a
+# second; 30s bounds the stall without touching valid runs.
+GIT_TIMEOUT_SECONDS = 30
+
 
 class ParityError(ValueError):
     pass
 
 
 def git(repo, *args):
-    result = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True,
+            check=False, timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ParityError(
+            f"git {' '.join(args)} timeout after {GIT_TIMEOUT_SECONDS}s; "
+            "next: re-run the check; if the stall repeats, inspect the git "
+            "invocation and runner state") from error
+    except OSError as error:
+        raise ParityError(
+            f"git {' '.join(args)} spawn failed ({error}); "
+            "next: re-run the check on a runner with git installed") from error
     if result.returncode:
-        raise ParityError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+        raise ParityError(
+            f"git {' '.join(args)} failed with exit status "
+            f"{result.returncode}; next: verify the legacy clone and ref, "
+            "then re-run the check")
     return result.stdout.strip()
 
 

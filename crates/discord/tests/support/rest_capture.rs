@@ -7,9 +7,9 @@
 //! (the `CONSTRAINTS.md` floor fails any added `allow` attribute), so this
 //! module carries only the surface both acceptance binaries fully use:
 //! `MockRest::start`/`origin`/`requests`/`shutdown`,
-//! `ScriptedResponse::status` and the recorded request `body`. Every item,
-//! field and method here is live in both binaries; if you add one, use it
-//! in both or `clippy -D warnings` fails — that is intentional.
+//! `ScriptedResponse::status`/`json` and the recorded request `body`. Every
+//! item, field and method here is live in both binaries; if you add one, use
+//! it in both or `clippy -D warnings` fails — that is intentional.
 //!
 //! Wire behavior mirrors the REST side of `tests/common` for this surface:
 //! one HTTP/1.1 request per connection (`content-length` body, recorded in
@@ -35,12 +35,24 @@ use tokio::{
 #[derive(Debug, Clone)]
 pub struct ScriptedResponse {
     pub status: u16,
+    body: Vec<u8>,
 }
 
 impl ScriptedResponse {
     /// Bare status with an empty body.
     pub fn status(status: u16) -> Self {
-        Self { status }
+        Self {
+            status,
+            body: Vec::new(),
+        }
+    }
+
+    /// Status with a JSON body (the completion-edit mutation receipt).
+    pub fn json(status: u16, body: &str) -> Self {
+        Self {
+            status,
+            body: body.as_bytes().to_vec(),
+        }
     }
 }
 
@@ -165,11 +177,13 @@ async fn handle_rest(
         .push(RestRequest { body });
     let next = queue.lock().expect("queue").pop_front().unwrap_or(default);
     let head = format!(
-        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         next.status,
         reason_phrase(next.status),
+        next.body.len(),
     );
     let _ = stream.write_all(head.as_bytes()).await;
+    let _ = stream.write_all(&next.body).await;
 }
 
 /// Read one HTTP/1.1 request and return its `content-length` body. Returns

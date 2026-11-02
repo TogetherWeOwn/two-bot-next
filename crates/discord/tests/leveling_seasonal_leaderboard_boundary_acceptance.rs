@@ -156,7 +156,22 @@ async fn routed_leaderboard_selected_season_flips_at_the_quarter_boundary() {
         .await;
     db.seed(OTHER, 9_000, &[("2026-Q3", 20), ("2026-Q4", 900)])
         .await;
-    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let defer = || ScriptedResponse::status(204);
+    let edit = || ScriptedResponse::json(200, r#"{"id":"99"}"#);
+    let mock = MockRest::start(
+        vec![
+            defer(),
+            edit(),
+            defer(),
+            edit(),
+            defer(),
+            edit(),
+            defer(),
+            edit(),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
     let runtime = runtime(db.pool.clone(), &mock);
 
     for (at, expected_entries, expected_season) in [
@@ -178,14 +193,21 @@ async fn routed_leaderboard_selected_season_flips_at_the_quarter_boundary() {
             .await
             .unwrap());
         let requests = mock.requests();
-        assert_eq!(requests.len(), before + 1);
-        let body: Value = serde_json::from_slice(&requests[before].body).unwrap();
         assert_eq!(
-            body["data"]["content"],
+            requests.len(),
+            before + 2,
+            "one defer plus one completion edit"
+        );
+        let ack: Value = serde_json::from_slice(&requests[before].body).unwrap();
+        assert_eq!(ack["type"], 5, "leveling acknowledges with a defer");
+        assert_ne!(ack["data"]["flags"], 64, "leaderboard defers publicly");
+        let body: Value = serde_json::from_slice(&requests[before + 1].body).unwrap();
+        assert_eq!(
+            body["content"],
             leaderboard_reply_for_season(&expected_entries, expected_season).content,
             "at {at} the routed /leaderboard must serve season {expected_season} only"
         );
-        assert_eq!(body["data"]["allowed_mentions"]["parse"], json!([]));
+        assert_eq!(body["allowed_mentions"]["parse"], json!([]));
     }
 
     // The same seam at the boundary instant leaves /rank lifetime-based:
@@ -196,9 +218,17 @@ async fn routed_leaderboard_selected_season_flips_at_the_quarter_boundary() {
         .await
         .unwrap());
     let requests = mock.requests();
-    let body: Value = serde_json::from_slice(&requests[before].body).unwrap();
     assert_eq!(
-        body["data"]["content"],
+        requests.len(),
+        before + 2,
+        "one defer plus one completion edit"
+    );
+    let ack: Value = serde_json::from_slice(&requests[before].body).unwrap();
+    assert_eq!(ack["type"], 5, "leveling acknowledges with a defer");
+    assert_eq!(ack["data"]["flags"], 64, "/rank defers ephemerally");
+    let body: Value = serde_json::from_slice(&requests[before + 1].body).unwrap();
+    assert_eq!(
+        body["content"],
         rank_text("Global name", level_for_xp(100), Some(2), 2, 100),
         "/rank must stay lifetime-based at the season boundary"
     );

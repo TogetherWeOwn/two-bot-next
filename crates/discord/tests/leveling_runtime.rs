@@ -3,8 +3,13 @@
 #[allow(dead_code)]
 mod common;
 
+#[path = "support/deferred_capture_compat.rs"]
+mod deferred_capture_compat;
+use deferred_capture_compat::Healthy;
+
 use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use twilight_model::{application::interaction::Interaction, gateway::event::Event};
@@ -12,6 +17,7 @@ use two_bot_core::{
     leveling::{leaderboard_reply_for_season, rank_text, season_id_for_ms, LevelRoleReward},
     leveling_store as store, HandlerId, MemStore, OnboardingGates, OnboardingMode,
 };
+use two_bot_discord::leveling_runtime::LevelingRuntimeError;
 use two_bot_discord::{
     pipeline::MessageEligibility, ActionExecutor, LevelingRuntime, OrderedLevelingPipeline,
 };
@@ -114,7 +120,21 @@ impl TestDb {
 #[ignore = "requires approved agent-testdb or credential-free CI service"]
 async fn routed_rank_optional_member_and_fixed_public_top_ten_match_legacy() {
     let db = TestDb::new().await;
-    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let edit = || ScriptedResponse::json(200, json!({"id": "99"}));
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            edit(),
+            ScriptedResponse::status(204),
+            edit(),
+            ScriptedResponse::status(204),
+            edit(),
+            ScriptedResponse::status(204),
+            edit(),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
     let runtime = runtime(db.pool.clone(), &mock, OnboardingMode::Legacy);
     runtime
         .handle_interaction(&interaction("rank", false), HandlerId::Rank)
@@ -156,34 +176,60 @@ async fn routed_rank_optional_member_and_fixed_public_top_ten_match_legacy() {
         .await
         .unwrap());
     let requests = mock.requests();
-    assert_eq!(requests.len(), 4);
-    let body: Vec<Value> = requests
+    assert_eq!(
+        requests.len(),
+        8,
+        "one defer plus one completion edit per routed command"
+    );
+    let callbacks: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/callback"))
+        .collect();
+    let edits: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method == "PATCH" && r.path.ends_with("/messages/@original"))
+        .collect();
+    assert_eq!(callbacks.len(), 4, "one acknowledgement per command");
+    assert_eq!(edits.len(), 4, "one completion edit per command");
+    let defers: Vec<Value> = callbacks
         .iter()
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect();
-    assert_eq!(
-        body[0]["data"]["content"],
-        rank_text("Global name", 0, None, 0, 0)
+    for defer in &defers {
+        assert_eq!(defer["type"], 5, "leveling acknowledges with a defer");
+    }
+    assert_eq!(defers[0]["data"]["flags"], 64, "rank defers ephemerally");
+    assert_eq!(defers[1]["data"]["flags"], 64, "rank defers ephemerally");
+    assert_ne!(
+        defers[2]["data"]["flags"], 64,
+        "leaderboard defers publicly"
     );
-    assert_eq!(
-        body[1]["data"]["content"],
-        rank_text("username", 0, None, 0, 0)
+    assert_ne!(
+        defers[3]["data"]["flags"], 64,
+        "leaderboard defers publicly"
     );
-    assert_eq!(body[0]["data"]["flags"], 64);
+    let body: Vec<Value> = edits
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(body[0]["content"], rank_text("Global name", 0, None, 0, 0));
+    assert_eq!(body[1]["content"], rank_text("username", 0, None, 0, 0));
     assert_eq!(
-        body[2]["data"]["content"],
+        body[2]["content"],
         leaderboard_reply_for_season(&[], &season).content
     );
-    assert_eq!(body[3]["data"]["allowed_mentions"]["parse"], json!([]));
+    assert_eq!(body[3]["allowed_mentions"]["parse"], json!([]));
     assert_eq!(
-        body[3]["data"]["content"].as_str().unwrap().lines().count(),
-        11
+        body[3]["content"].as_str().unwrap().lines().count(),
+        11,
+        "no invented paging on the completed board"
     );
-    assert!(body[3]["data"]["flags"].is_null());
-    assert!(body[3]["data"]["components"].is_null());
-    assert!(requests
+    assert!(callbacks
         .iter()
         .all(|r| r.path.starts_with("/api/v10/interactions/7/")));
+    assert!(edits
+        .iter()
+        .all(|r| r.path == "/api/v10/webhooks/8/mock-callback/messages/@original"));
     mock.shutdown().await;
     db.close().await;
 }
@@ -270,6 +316,7 @@ async fn ordered_gateway_concurrent_sources_award_once_and_read_back_rewards() {
         true,
         false
     )
+    .unwrap()
     .grant
     .is_empty());
     mock.shutdown().await;
@@ -443,7 +490,14 @@ async fn gateway_reward_and_interaction_executor_errors_propagate() {
         .handle_at(&message(0), &at(0), MessageEligibility::default())
         .await
         .unwrap_err();
-    assert_eq!(error.to_string(), "leveling Discord operation failed");
+    // The held-roles read fails after the award committed: the error says so
+    // and carries the committed award.
+    assert_eq!(
+        error.to_string(),
+        "leveling role application failed after the XP award committed: role application Discord operation failed"
+    );
+    assert_eq!(error.committed_awards().len(), 1);
+    assert!(error.committed_awards()[0].leveled_up);
     let runtime = runtime(db.pool.clone(), &mock, OnboardingMode::Legacy);
     assert!(runtime
         .handle_interaction(&interaction("rank", false), HandlerId::Rank)
@@ -465,15 +519,17 @@ async fn gateway_reward_and_interaction_executor_errors_propagate() {
 async fn community_voice_fact_capture_round_trip() {
     let db = TestDb::new().await;
     let pipeline = OrderedLevelingPipeline::new(MemStore::new(), None);
-    pipeline.enable_community_facts(db.pool.clone());
+    pipeline.enable_community_facts(db.pool.clone()).healthy();
     const VOICE_CHANNEL: u64 = 300000000000000002;
 
     // Join: one start fact, and the durable session key travels with it.
-    let requests = pipeline.collect_at(
-        &voice(Some(VOICE_CHANNEL)),
-        &at(10),
-        MessageEligibility::default(),
-    );
+    let requests = pipeline
+        .collect_at(
+            &voice(Some(VOICE_CHANNEL)),
+            &at(10),
+            MessageEligibility::default(),
+        )
+        .healthy();
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
     let (session_key, metadata): (String, String) = sqlx::query_as(
@@ -497,18 +553,22 @@ async fn community_voice_fact_capture_round_trip() {
     );
 
     // Leave 330 s later: one measured end with honest duration math.
-    let requests = pipeline.collect_at(&voice(None), &at(340), MessageEligibility::default());
+    let requests = pipeline
+        .collect_at(&voice(None), &at(340), MessageEligibility::default())
+        .healthy();
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
 
     // Redelivered join at the original stamp reuses the same session key, so
     // the `voice-start:{session_key}` row dedupes to zero inserts (a
     // same-channel frame without a leave would never reach the sink at all).
-    let requests = pipeline.collect_at(
-        &voice(Some(VOICE_CHANNEL)),
-        &at(10),
-        MessageEligibility::default(),
-    );
+    let requests = pipeline
+        .collect_at(
+            &voice(Some(VOICE_CHANNEL)),
+            &at(10),
+            MessageEligibility::default(),
+        )
+        .healthy();
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 0);
     let row: (String, String, String) = sqlx::query_as(
@@ -544,10 +604,12 @@ async fn community_voice_fact_capture_round_trip() {
 async fn community_message_fact_capture_round_trip() {
     let db = TestDb::new().await;
     let pipeline = OrderedLevelingPipeline::new(MemStore::new(), None);
-    pipeline.enable_community_facts(db.pool.clone());
+    pipeline.enable_community_facts(db.pool.clone()).healthy();
 
     // Human message: one fact, and the classifier verdict travels with it.
-    let requests = pipeline.collect_at(&message(10), &at(10), MessageEligibility::default());
+    let requests = pipeline
+        .collect_at(&message(10), &at(10), MessageEligibility::default())
+        .healthy();
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
     let row: (String, String) =
@@ -561,7 +623,9 @@ async fn community_message_fact_capture_round_trip() {
     assert!(!row.1.contains("hello there"), "no message content stored");
 
     // Duplicate delivery: the same message id dedupes to zero inserts.
-    let requests = pipeline.collect_at(&message(10), &at(10), MessageEligibility::default());
+    let requests = pipeline
+        .collect_at(&message(10), &at(10), MessageEligibility::default())
+        .healthy();
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 0);
 
@@ -570,7 +634,9 @@ async fn community_message_fact_capture_round_trip() {
     if let Event::MessageCreate(m) = &mut bot {
         m.author.bot = true;
     }
-    let requests = pipeline.collect_at(&bot, &at(11), MessageEligibility::default());
+    let requests = pipeline
+        .collect_at(&bot, &at(11), MessageEligibility::default())
+        .healthy();
     assert!(requests.is_empty(), "bots never funnel-count");
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 1);
@@ -580,7 +646,9 @@ async fn community_message_fact_capture_round_trip() {
     if let Event::MessageCreate(m) = &mut dm {
         m.guild_id = None;
     }
-    let requests = pipeline.collect_at(&dm, &at(12), MessageEligibility::default());
+    let requests = pipeline
+        .collect_at(&dm, &at(12), MessageEligibility::default())
+        .healthy();
     pipeline.drain(requests).await.unwrap();
     assert_eq!(pipeline.drain_facts().await.unwrap(), 0);
 
@@ -654,7 +722,17 @@ fn foreign_voice(channel: Option<u64>) -> Event {
 #[ignore = "requires approved agent-testdb or credential-free CI service"]
 async fn foreign_guild_rank_and_leaderboard_leave_zero_rows_and_no_reply() {
     let db = TestDb::new().await;
-    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let edit = || ScriptedResponse::json(200, json!({"id": "99"}));
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            edit(),
+            ScriptedResponse::status(204),
+            edit(),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
     let runtime = runtime(db.pool.clone(), &mock, OnboardingMode::Legacy);
 
     // Foreign-guild /rank (self and targeted) and /leaderboard, plus a
@@ -702,7 +780,11 @@ async fn foreign_guild_rank_and_leaderboard_leave_zero_rows_and_no_reply() {
         .handle_interaction(&interaction("leaderboard", false), HandlerId::Leaderboard)
         .await
         .unwrap());
-    assert_eq!(mock.requests().len(), 2);
+    assert_eq!(
+        mock.requests().len(),
+        4,
+        "one defer plus one completion edit per own-guild command"
+    );
     assert_eq!(leveling_row_counts(&db.pool, GUILD).await, (0, 0));
     assert_eq!(total_leveling_rows(&db.pool).await, (0, 0));
     mock.shutdown().await;
@@ -1095,4 +1177,37 @@ async fn unavailable_content_keeps_unavailable_not_known_short_behavior() {
     );
     mock.shutdown().await;
     db.close().await;
+}
+
+// Hermetic double-failure precedence (no database: the refused loopback pool
+// fails the read at once, like the bot crate's immediate-error acceptance).
+// The acknowledged store error is the root cause the caller must log, so it
+// propagates even when the best-effort completion edit fails alongside it.
+#[tokio::test]
+async fn acknowledged_store_failure_reports_the_store_error_when_the_completion_edit_fails() {
+    let pool = PgPoolOptions::new()
+        .min_connections(0)
+        .max_connections(1)
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool");
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204), ScriptedResponse::status(500)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool, &mock, OnboardingMode::Legacy);
+    let error = runtime
+        .handle_interaction(&interaction("rank", false), HandlerId::Rank)
+        .await
+        .expect_err("the double failure still reports");
+    assert!(
+        matches!(error, LevelingRuntimeError::Store(_)),
+        "the store error wins over the failed completion edit, got {error:?}"
+    );
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "one defer plus one completion-edit attempt"
+    );
+    mock.shutdown().await;
 }

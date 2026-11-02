@@ -84,6 +84,38 @@ has no Debug implementation. Callback, edit, deletion and followup operations
 use the existing ActionExecutor's unpaced interaction lane, not moderation
 pacing or retry loops.
 
+### Stale-control ownership and fallthrough
+
+`CommandRuntime::on_interaction` answers exactly one expired-control reply
+(type 4, ephemeral, `EXPIRED_COMPONENT_REPLY`) for genuinely unowned,
+in-scope controls, and stays silent everywhere else:
+
+- Router-`Unknown` components and modal submits in the configured guild are
+  unowned and get the reply. Foreign/missing guilds route `Ignore` and stay
+  silent, as do known ids on disabled surfaces (the router yields `Ignore`
+  while the surface gate is off).
+- Stale self-role references — a `two:self-role:` id that parses but names
+  a removed panel, a replaced source message (in any channel), or a removed
+  option — get the reply with zero role/store mutation. Malformed ids and
+  shapes stay silent.
+- Voice-owned controls belong to the voice sink, which answers each exactly
+  once: the runtime stays silent and never double-acknowledges. Ownership is
+  `voice_claims_custom_id`, shared with the sink: bare `two:voice:` ids that
+  parse, runtime join buttons with the 32-hex worker-epoch suffix, and
+  `votekick:<vote>:yes|no` ballots. A `two:voice:`-prefixed id that fails
+  `parse_voice_custom_id` is unowned (a prefix alone never claims ownership)
+  and gets the reply.
+- Router-claimed controls on live surfaces (onboarding pickers, tickets)
+  stay silent even with no service attached: recognized but unserved is not
+  stale.
+- Bot authors stay silent, and foreign applications stay silent once boot
+  arms the application fence. Slash behavior is untouched: unknown names
+  keep `UNKNOWN_COMMAND_REPLY`.
+
+Pinned by `crates/bot/src/stale_control_expired_reply_acceptance_tests.rs`
+(9 stale-reply cases, 12 silence/ownership controls) driving
+`CommandRuntime::on_interaction` against a loopback mock.
+
 ## Legacy source parity
 
 Read against `TogetherWeOwn/two-bot` main on 2026-09-30:

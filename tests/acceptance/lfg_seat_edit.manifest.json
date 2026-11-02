@@ -1,0 +1,60 @@
+{
+  "schema": "two-bot.acceptance.v1",
+  "title": "Increase one existing LFG role's absolute seats without replacing signups",
+  "baseline_sha": "0b8f8c6427859a606c4be710224dc68649fabe00",
+  "branch": "test/lfg-seat-edit-acceptance",
+  "protected_files": [
+    {
+      "path": "crates/core/tests/lfg_seat_edit_catalog_acceptance.rs",
+      "sha256": "eb6f85b5632c67fa907274ad4b85c33ca97a9c7aec62302d636961dcaaebd2b0",
+      "tests": 2
+    },
+    {
+      "path": "crates/discord/tests/lfg_seat_edit_acceptance.rs",
+      "sha256": "995058d6c885d2f9a9bb6c4f045f521feba2c9fdcb82f8002dc8d3a91eba24d3",
+      "tests": 17
+    }
+  ],
+  "wire_contract": {
+    "command": "lfg-edit",
+    "id": "existing post ID, string, required",
+    "role": "existing lfg_roles.role_key, string, optional; required together with seats",
+    "seats": "absolute total, integer 1..99, optional; required together with role",
+    "equal": "no domain/tuple/audit write or channel refresh; private unchanged receipt",
+    "lower": "refuse, including a stale lower target after another increase",
+    "authority": "Manage Events on each new interaction; do not cache prior authority or broaden it"
+  },
+  "commands": {
+    "catalog": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test lfg_seat_edit_catalog_acceptance -- --nocapture",
+    "runtime": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test lfg_seat_edit_acceptance -- --test-threads=1 --nocapture",
+    "metadata_controls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test lfg_edit_acceptance -- --test-threads=1 --nocapture",
+    "signup_controls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test lfg_select_audit_acceptance -- --test-threads=1 --nocapture",
+    "references": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs",
+    "hosted_runtime": "cargo test -p two-bot-discord --features db --locked --test lfg_seat_edit_acceptance --test lfg_edit_acceptance --test lfg_select_audit_acceptance -- --test-threads=1 --nocapture"
+  },
+  "unchanged_controls": [
+    {"path": "crates/discord/tests/lfg_edit_acceptance.rs", "sha256": "402dbc7413232d92fdacddd2c0d9d14e2d0e7dc642b83c44ff981f50d5d812c2"},
+    {"path": "crates/discord/tests/lfg_interactions.rs", "sha256": "db80804ff7a7073bb244726acb846225ec4e763285314f4766dcaa366d192f23"},
+    {"path": "crates/discord/tests/lfg_select_audit_acceptance.rs", "sha256": "6b9499569b84bd13ef7ad7e7a21874e56d526d1be06c3bec078c363a5aa26d1b"},
+    {"path": "crates/core/tests/reference_docs.rs", "sha256": "ad15f29ab24a13e61f5b6c7471bc30c53eef842b4b233bce2d285ff75ffdff8d"},
+    {"path": "crates/core/tests/support/registry_parity.rs", "sha256": "2d22317ecb74072b0dc41e9181c0bd65002958b9a95bbb94aefae8718094e82b"}
+  ],
+  "coverage": [
+    "real router/store/executor: increase, equal and same/fresh-interaction replay, 99 ceiling and usable new seat",
+    "invalid input with a valid metadata field: shrink, 0/-1/100, absent/label/hostile role, missing paired option, wrong type, identical/conflicting duplicates, unknown option and role replacement",
+    "whole SQL rows and tuple identities: preserve posts/signups and unrelated roles; one bounded truthful audit per saved increase",
+    "private mention-safe acknowledgements/refusals; one PATCH to the original message; honest saved-state/refresh-failure recovery copy",
+    "independent runtimes/pools and gated refresh: signup, close, metadata, stale lower target; actual pg_locks wait witnesses",
+    "separate store advisory plus post row lock: recheck a newer capacity or closure committed while the editor waits",
+    "existing Manage Events, announcements and configured-guild fences; a successful prior edit does not authorize a later unprivileged interaction",
+    "published strict integer bounds, stable role selector and definition-driven help"
+  ],
+  "known_catalog_reconciliation": [
+    "crates/discord/tests/lfg_edit_acceptance.rs:282-321 encodes exactly three string metadata options. It is unchanged here; arrange explicit author-controlled reconciliation, not a Builder edit to this protected corpus.",
+    "crates/core/tests/support/registry_parity.rs:314-330 encodes the old metadata-only wire snapshot. Update the feature's expected catalog through its authorized test owner and regenerate references in the combined PR."
+  ],
+  "ci_caveat": "The ordinary workspace integration step enables only two-bot-core/db. That alone runs zero cases from the new discord db-gated target. Require explicit two-bot-discord/db or the existing all-features nightly no-fail-fast sweep, with a nonzero 17-case runtime receipt.",
+  "evidence": "Exact head, actual execution output and final handoff disposition are recorded separately. At creation, local bounded Cargo admission refused exit 75; no behavioral RED or Rust/control pass is claimed by this manifest.",
+  "ownership": "Test Author owns corrections. Builder incorporates the final exact head in their own isolated branch and must not edit the two protected test files. This deliberately failing-first tests-only branch is not an implementation PR and must not be merged alone.",
+  "safety": "TestDatabase with guarded disposable bootstrap, unique database and explicit teardown; loopback Discord only. No source, migrations, workflow changes, fallback implementation, waived gate, live Discord or production/staging database. Fresh authority is exercised through each authoritative interaction payload, not a fabricated live REST permission lookup."
+}

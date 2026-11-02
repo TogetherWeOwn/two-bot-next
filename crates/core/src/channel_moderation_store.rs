@@ -66,6 +66,9 @@ pub struct ChannelModerationStore {
 pub const DB_POOL_MAX_DEFAULT: u32 = 5;
 /// Legacy statement timeout (`statementTimeoutMillis ?? 15_000`).
 pub const STATEMENT_TIMEOUT_MS: u64 = 15_000;
+/// Acquire bound for the moderation pool open: a hung database refuses within
+/// 10 s instead of hanging on the 30 s SQLx default (statement-leg parity).
+pub const ACQUIRE_TIMEOUT_SECS: u64 = 10;
 
 /// Read the one TLS policy setting; an unset value is `Required`.
 fn tls_policy_from_env() -> Result<crate::database_tls::TlsPolicy, sqlx::Error> {
@@ -118,6 +121,7 @@ impl ChannelModerationStore {
         options = options.options([("statement_timeout", format!("{}ms", STATEMENT_TIMEOUT_MS))]);
         let pool = PgPoolOptions::new()
             .max_connections(pool_max)
+            .acquire_timeout(std::time::Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
             .connect_with(options)
             .await
             .map_err(|_| sqlx::Error::InvalidArgument("database connection failed".to_owned()))?;
@@ -212,6 +216,50 @@ impl ChannelModerationStore {
             reason: row.get("reason"),
             recovery_generation: row.get("recovery_generation"),
         }))
+    }
+
+    /// Read display metadata for the same recovery snapshot. A setter is known
+    /// only when a successful lockdown audit matches the saved time and reason;
+    /// an older cycle or a refused attempt is not attribution for this record.
+    pub async fn get_lockdown_details(
+        &self,
+        record: &LockdownRecord,
+    ) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
+        let locked_at: Option<String> = sqlx::query_scalar(
+            "SELECT locked_at FROM moderation_lockdowns
+              WHERE channel_id = $1 AND guild_id = $2
+                AND recovery_generation = $3 AND reason = $4",
+        )
+        .bind(&record.channel_id)
+        .bind(&record.guild_id)
+        .bind(&record.recovery_generation)
+        .bind(&record.reason)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(locked_at) = locked_at else {
+            return Ok(None);
+        };
+        if time::OffsetDateTime::parse(&locked_at, &time::format_description::well_known::Rfc3339)
+            .is_err()
+        {
+            return Ok(Some((locked_at, None)));
+        }
+        // Let Postgres normalize the validated RFC3339 timestamp: the TEXT seed
+        // retains nanoseconds while timestamptz audit rows round to microseconds.
+        let actor = sqlx::query_scalar(
+            "SELECT actor_id FROM moderation_audit
+              WHERE guild_id = $1 AND channel_id = $2
+                AND action = 'moderation.lockdown' AND outcome = 'locked_down'
+                AND reason = $3 AND created_at = $4::text::timestamptz
+              ORDER BY created_at DESC, request_id DESC LIMIT 1",
+        )
+        .bind(&record.guild_id)
+        .bind(&record.channel_id)
+        .bind(&record.reason)
+        .bind(&locked_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(Some((locked_at, actor)))
     }
 
     /// Delete recovery state only after Discord accepted the exact
@@ -635,6 +683,34 @@ impl ChannelModerationStore {
     /// write failure (legacy `recordAudit`).
     pub async fn record_audit(&self, row: &ChannelAuditRow) -> Result<(), sqlx::Error> {
         Self::record_audit_on(&mut *self.pool.acquire().await?, row).await
+    }
+
+    /// Insert-or-nothing variant for the lockdown preview
+    /// (`docs/lockdown-preview-spec.md` section 6): the preview renders and
+    /// arms only when exactly one row is created. An error **or** zero rows
+    /// (a redelivered interaction retry under the same `request_id`) refuses
+    /// the whole preview with no render and no pending entry.
+    pub async fn try_record_audit(&self, row: &ChannelAuditRow) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT INTO moderation_audit
+               (request_id, guild_id, actor_id, action, target_id, channel_id, reason,
+                outcome, idempotency_key, metadata_json, created_at)
+             VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10::text::timestamptz)
+             ON CONFLICT (request_id) DO NOTHING",
+        )
+        .bind(&row.request_id)
+        .bind(&row.guild_id)
+        .bind(&row.actor_id)
+        .bind(&row.action)
+        .bind(&row.channel_id)
+        .bind(&row.reason)
+        .bind(&row.outcome)
+        .bind(&row.idempotency_key)
+        .bind(&row.metadata_json)
+        .bind(&row.created_at)
+        .execute(&mut *self.pool.acquire().await?)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn record_audit_on(
@@ -1715,3 +1791,7 @@ mod tests {
         store.cleanup().await;
     }
 }
+
+#[cfg(test)]
+#[path = "channel_moderation_pool_timeout_acceptance_tests.rs"]
+mod pool_timeout_acceptance_tests;

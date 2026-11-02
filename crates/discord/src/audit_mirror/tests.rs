@@ -1,15 +1,11 @@
 // Keep the real adapter/transport in these unit tests: cfg(test) exposes only
 // committed admissions, not the lane mutex or configurable production intervals.
-#[allow(dead_code)]
-#[path = "../../tests/common/mod.rs"]
-mod common;
-
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
-use common::{MockRest, ScriptedResponse};
+use crate::test_wire::{MockRest, ScriptedResponse};
 use tokio::{sync::mpsc, time::Instant};
 use two_bot_core::audit::delivery_nonce;
 use two_bot_core::audit_mirror::AuditMirror;

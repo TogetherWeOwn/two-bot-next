@@ -12,19 +12,17 @@ use twilight_model::{
     application::interaction::{
         application_command::CommandOptionValue, Interaction, InteractionData,
     },
-    channel::message::{AllowedMentions, MessageFlags},
     gateway::event::Event,
-    http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
     classify,
     community_store::{
-        member_join_fact, member_join_metadata, message_fact, record_fact, rules_accepted_fact,
+        member_join_fact, member_join_metadata, message_fact, rules_accepted_fact,
         voice_ended_fact, voice_started_fact, CommunityStoreError, FactWrite, MessageFactInput,
     },
     leveling::{
-        leaderboard_reply_for_season, plan_reward_roles, rank_reply, season_id_for_ms, XpAward,
-        LEADERBOARD_DEFAULT_LIMIT,
+        leaderboard_reply_for_season, plan_reward_roles, rank_reply, season_id_for_ms,
+        RewardPlanError, XpAward, LEADERBOARD_DEFAULT_LIMIT,
     },
     leveling_store::{self, LevelingStoreError},
     ClassifierConfig, ClassifyInput, FactsSink, FunnelHandlers, FunnelStore, HandlerId,
@@ -39,6 +37,17 @@ use crate::{
     PipelineSnapshots, SettingsChannelClassifier,
 };
 
+/// Stable reason codes for poisoned deferred capture buffers. These literals
+/// are the supervised-failure contract: error Displays, the gateway failure
+/// line and `docs/deferred-capture-poison.md` all carry them verbatim, and
+/// the poison acceptance suite pins them. Never rename one without updating
+/// all three.
+pub const DEFERRED_LEVELING_POISONED: &str = "deferred_leveling_poisoned";
+pub const DEFERRED_COMMUNITY_FACTS_POISONED: &str = "deferred_community_facts_poisoned";
+/// Next action for either poisoned buffer: supervisor restart inspection
+/// under the existing machine contract. The buffer never heals in place.
+pub const SUPERVISOR_RESTART_INSPECTION: &str = "supervisor_restart_inspection";
+
 /// Failures propagate to the gateway supervisor; Display never includes SQL
 /// connection details, Discord tokens, response bodies or member content.
 #[derive(Debug, thiserror::Error)]
@@ -49,6 +58,74 @@ pub enum LevelingRuntimeError {
     Discord(#[from] DiscordError),
     #[error("invalid leveling interaction")]
     InvalidInteraction,
+    /// The award committed but applying its level-up roles failed. The XP and
+    /// the computed level-up are durable; `awards` carries them so the caller
+    /// never reports the level-up as failed.
+    #[error("leveling role application failed after the XP award committed: {cause}")]
+    RoleApplication {
+        cause: RoleApplicationError,
+        awards: Vec<XpAward>,
+    },
+    /// The deferred leveling buffer mutex is poisoned: a previous holder
+    /// panicked, so the buffered award requests are untrusted and stay
+    /// queued. Never healed in place; the supervisor restarts under the
+    /// existing contract. Carries no committed awards.
+    #[error("deferred leveling buffer poisoned (deferred_leveling_poisoned); next action: supervisor_restart_inspection")]
+    LevelingPoisoned,
+    /// The deferred community-facts buffer mutex is poisoned, observed while
+    /// collecting a dispatch: capture already latched its loss, so the owner
+    /// refuses before any award work. Same never-heal recovery contract as
+    /// the leveling poison refusal.
+    #[error("deferred community facts buffer poisoned (deferred_community_facts_poisoned); next action: supervisor_restart_inspection")]
+    CommunityFactsPoisoned,
+}
+
+impl LevelingRuntimeError {
+    /// Awards committed before the error. Only a role-application failure
+    /// carries any; every other error returns an empty slice.
+    #[must_use]
+    pub fn committed_awards(&self) -> &[XpAward] {
+        match self {
+            Self::RoleApplication { awards, .. } => awards,
+            _ => &[],
+        }
+    }
+
+    /// Put awards committed earlier in the same drain ahead of the ones this
+    /// error already carries; non-role errors are unchanged.
+    fn with_prior_awards(mut self, mut prior: Vec<XpAward>) -> Self {
+        if let Self::RoleApplication { awards, .. } = &mut self {
+            prior.append(awards);
+            *awards = prior;
+        }
+        self
+    }
+}
+
+/// Why a committed level-up's role application failed. Display carries role
+/// ids and fixed refusal evidence only: no SQL, tokens or response bodies.
+#[derive(Debug, thiserror::Error)]
+pub enum RoleApplicationError {
+    #[error("role rewards could not be read")]
+    Store(#[from] LevelingStoreError),
+    /// A read or a pre-mutation refusal: no role was written.
+    #[error("role application Discord operation failed")]
+    Discord(#[from] DiscordError),
+    /// The plan hit the per-list role-write cap: no role was written.
+    #[error(transparent)]
+    Plan(#[from] RewardPlanError),
+    /// The first refused write aborted the rest. Earlier roles stay applied.
+    #[error(
+        "role {role_id} refused: {reason} ({} applied, {} skipped)",
+        applied.len(),
+        skipped.len()
+    )]
+    Refused {
+        role_id: String,
+        reason: String,
+        applied: Vec<String>,
+        skipped: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -102,7 +179,16 @@ impl DeferredLeveling {
         channel_id: u64,
         shape: two_bot_core::MessageShape,
     ) -> LevelOutcome {
-        self.0.lock().expect("leveling buffer").push(AwardRequest {
+        // The hook is infallible, so a poisoned buffer latches: report no
+        // threshold crossing here and let the owning collection/drain refuse
+        // with the typed poison error instead of panicking.
+        let Ok(mut pending) = self.0.lock() else {
+            return LevelOutcome {
+                leveled_up: false,
+                level: 0,
+            };
+        };
+        pending.push(AwardRequest {
             guild_id,
             member_id,
             channel_id,
@@ -126,7 +212,14 @@ impl DeferredLeveling {
         channel_id: u64,
         duration: Option<u64>,
     ) -> LevelOutcome {
-        self.0.lock().expect("leveling buffer").push(AwardRequest {
+        // Same latch as `push_message`: never panic on a poisoned buffer.
+        let Ok(mut pending) = self.0.lock() else {
+            return LevelOutcome {
+                leveled_up: false,
+                level: 0,
+            };
+        };
+        pending.push(AwardRequest {
             guild_id,
             member_id,
             channel_id,
@@ -142,8 +235,26 @@ impl DeferredLeveling {
         }
     }
 
-    fn take(&self) -> Vec<AwardRequest> {
-        std::mem::take(&mut *self.0.lock().expect("leveling buffer"))
+    fn take(&self) -> Result<Vec<AwardRequest>, LevelingRuntimeError> {
+        // Never `into_inner` a poisoned buffer and never report its
+        // untrusted contents as an empty success: refuse typed.
+        let mut pending = self
+            .0
+            .lock()
+            .map_err(|_| LevelingRuntimeError::LevelingPoisoned)?;
+        Ok(std::mem::take(&mut *pending))
+    }
+
+    /// Refuse when the buffer mutex is poisoned without touching the
+    /// untrusted contents. Drains call this before any store or Discord
+    /// work, so even an empty batch on a damaged buffer is a typed
+    /// refusal, never an `Ok` success.
+    fn check_healthy(&self) -> Result<(), LevelingRuntimeError> {
+        if self.0.is_poisoned() {
+            Err(LevelingRuntimeError::LevelingPoisoned)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -153,6 +264,23 @@ impl DeferredLeveling {
 pub enum CommunityFactsError {
     #[error("community facts store operation failed")]
     Store(#[from] CommunityStoreError),
+    /// The community-facts buffer mutex is poisoned: a previous holder
+    /// panicked, so every buffered family is untrusted and stays queued.
+    /// Never healed, cleared or partially drained; distinct from a normal
+    /// empty or disabled drain. The supervisor restarts under the existing
+    /// contract.
+    #[error("deferred community facts buffer poisoned (deferred_community_facts_poisoned); next action: supervisor_restart_inspection")]
+    Poisoned,
+}
+
+impl CommunityFactsError {
+    /// True only for the poisoned-buffer refusal, so the gateway holds the
+    /// cursor on poison while ordinary store failures keep their
+    /// warn-and-continue precedent.
+    #[must_use]
+    pub fn is_poison(&self) -> bool {
+        matches!(self, Self::Poisoned)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -162,6 +290,81 @@ struct CommunityFactsState {
     pending: Vec<FactWrite>,
     rules: Vec<RulesAcceptedWrite>,
     joins: Vec<MemberJoinWrite>,
+    /// Capture was armed at least once. A never-armed buffer is disabled
+    /// capture (its drain discards, like `NoopFacts`); once armed, a drain
+    /// with no pool retains every queued fact instead of discarding it.
+    capture_armed: bool,
+    /// Cumulative oldest-first evictions from bounded drain requeues, one
+    /// counter per family, in (pending, rules, joins) order.
+    dropped_pending: u64,
+    dropped_rules: u64,
+    dropped_joins: u64,
+}
+
+/// Per-family cap for facts requeued by a failed or cancelled drain. It
+/// mirrors the game-activity requeue precedent's 8,192 bound: past the cap
+/// the oldest facts are evicted and counted, never silently dropped and
+/// never at another family's expense.
+const MAX_QUEUED_FACTS_PER_FAMILY: usize = 8_192;
+
+/// Put `unwritten` facts back ahead of the facts already in `queue`
+/// (arrivals captured while the drain was writing), evicting the oldest
+/// past [`MAX_QUEUED_FACTS_PER_FAMILY`] and counting every eviction in
+/// `dropped`. Exactly at the cap nothing is evicted.
+fn requeue_family<T>(queue: &mut Vec<T>, mut unwritten: Vec<T>, dropped: &mut u64) {
+    unwritten.append(queue);
+    let overflow = unwritten.len().saturating_sub(MAX_QUEUED_FACTS_PER_FAMILY);
+    if overflow > 0 {
+        unwritten.drain(..overflow);
+        *dropped += overflow as u64;
+    }
+    *queue = unwritten;
+}
+
+/// The batch one drain took from the buffer, with per-family counts of the
+/// writes the store acknowledged. Dropping the guard while `complete` is
+/// false — the store error path and a caller timeout dropping the drain
+/// future alike — requeues exactly the unacknowledged suffix of each
+/// family, so acknowledged facts (including `Ok(false)` duplicates) are
+/// never recorded twice. Never panics and never holds the buffer mutex
+/// over an await; a poisoned buffer keeps its latch and the suffix with it.
+struct DrainRequeue {
+    state: Arc<Mutex<CommunityFactsState>>,
+    pending: Vec<FactWrite>,
+    rules: Vec<RulesAcceptedWrite>,
+    joins: Vec<MemberJoinWrite>,
+    pending_done: usize,
+    rules_done: usize,
+    joins_done: usize,
+    complete: bool,
+}
+
+impl Drop for DrainRequeue {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        // The mutex guard derefs as one place, so the counters travel out
+        // and back instead of borrowing each queue and its counter in the
+        // same call.
+        let mut dropped = (
+            state.dropped_pending,
+            state.dropped_rules,
+            state.dropped_joins,
+        );
+        let pending = self.pending.split_off(self.pending_done);
+        requeue_family(&mut state.pending, pending, &mut dropped.0);
+        let rules = self.rules.split_off(self.rules_done);
+        requeue_family(&mut state.rules, rules, &mut dropped.1);
+        let joins = self.joins.split_off(self.joins_done);
+        requeue_family(&mut state.joins, joins, &mut dropped.2);
+        state.dropped_pending = dropped.0;
+        state.dropped_rules = dropped.1;
+        state.dropped_joins = dropped.2;
+    }
 }
 
 /// One buffered gate-clearing: owned inputs for a later async
@@ -205,11 +408,21 @@ pub struct MemberJoinWrite {
 /// Voice and message facts classify at record time and are dropped while
 /// unarmed (no pool), so a staging-gated rollout captures exactly while it
 /// scores. Gate-clearings and joins buffer raw even while unarmed — they are
-/// tiny, classified at drain with the same boot config, and the unarmed drain
-/// drops them — so funnel replay tests can assert the buffer without a
-/// database. Either way, disabled (no pool) persists nothing, exactly like
-/// [`two_bot_core::NoopFacts`]. A move's end+start pair buffers two rows for
+/// tiny, classified at drain with the same boot config — so funnel replay
+/// tests can assert the buffer without a database. A never-armed (disabled)
+/// drain drops them, persisting nothing, exactly like
+/// [`two_bot_core::NoopFacts`]; once capture has been armed, a drain with no
+/// pool retains them instead. A move's end+start pair buffers two rows for
 /// one frame.
+///
+/// Loss window: once armed, a failed or cancelled (caller-timeout) drain
+/// requeues every unwritten fact ahead of newer arrivals, so a transient
+/// store outage loses nothing; the queues are memory-only, so facts still
+/// buffered at process exit, or behind a poisoned mutex, are lost, and a
+/// requeue past 8,192 facts in one family evicts that family's oldest
+/// facts, counted by [`DeferredCommunityFacts::dropped_counts`]. A write the
+/// store committed but never acknowledged is retried on the next drain and
+/// deduped by its idempotency key.
 #[derive(Debug, Clone, Default)]
 pub struct DeferredCommunityFacts(Arc<Mutex<CommunityFactsState>>);
 
@@ -223,139 +436,210 @@ impl DeferredCommunityFacts {
     /// Arm Postgres capture with the scorecard classifier resolved once from
     /// the process environment. Called once at boot when
     /// `TWO_COMMUNITY_SCORECARD=1`; tests call it with their fixture pool.
-    pub fn enable(&self, pool: PgPool) {
-        self.enable_with_config(pool, ClassifierConfig::from_env());
+    /// A poisoned buffer refuses typed and keeps its previous config.
+    pub fn enable(&self, pool: PgPool) -> Result<(), CommunityFactsError> {
+        self.enable_with_config(pool, ClassifierConfig::from_env())
     }
 
     /// Arm Postgres capture with an explicit classifier config, so the
     /// caller can seed the channel classifier from the same config and
-    /// the two never disagree.
-    pub fn enable_with_config(&self, pool: PgPool, config: ClassifierConfig) {
-        let mut state = self.0.lock().expect("community facts lock");
+    /// the two never disagree. A poisoned buffer refuses typed: the config
+    /// is not applied, and the owning drain refuses instead of panicking.
+    pub fn enable_with_config(
+        &self,
+        pool: PgPool,
+        config: ClassifierConfig,
+    ) -> Result<(), CommunityFactsError> {
+        let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
         state.pool = Some(pool);
         state.config = config;
+        state.capture_armed = true;
+        Ok(())
     }
 
     /// Replace the classifier config used at record/drain time. Paired
     /// with the channel classifier refresh in
-    /// [`OrderedLevelingPipeline::refresh_classifier_config`].
-    pub fn refresh_config(&self, config: ClassifierConfig) {
-        let mut state = self.0.lock().expect("community facts lock");
+    /// [`OrderedLevelingPipeline::refresh_classifier_config`]. A poisoned
+    /// buffer refuses typed like [`Self::enable_with_config`].
+    pub fn refresh_config(&self, config: ClassifierConfig) -> Result<(), CommunityFactsError> {
+        let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
         if state.config != config {
             state.config = config;
+        }
+        Ok(())
+    }
+
+    /// Refuse when the buffer mutex is poisoned without touching the
+    /// untrusted families. Collectors call this after the funnel so a
+    /// latched capture loss reaches the owner before any award work.
+    fn check_healthy(&self) -> Result<(), CommunityFactsError> {
+        if self.0.is_poisoned() {
+            Err(CommunityFactsError::Poisoned)
+        } else {
+            Ok(())
         }
     }
 
     /// Take every buffered gate-clearing, leaving that buffer empty. Order is
     /// arrival order; gate-clear facts are order-insensitive (once per member).
-    /// Rules only — joins have their own [`Self::take_joins`].
-    pub fn take(&self) -> Vec<RulesAcceptedWrite> {
-        std::mem::take(&mut self.0.lock().expect("community facts lock").rules)
+    /// Rules only — joins have their own [`Self::take_joins`]. A poisoned
+    /// buffer refuses typed and keeps its untrusted contents queued.
+    pub fn take(&self) -> Result<Vec<RulesAcceptedWrite>, CommunityFactsError> {
+        let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
+        Ok(std::mem::take(&mut state.rules))
     }
 
     /// Take every buffered gateway join, leaving that buffer empty. Order is
     /// arrival order; join facts are order-insensitive (one per join burst).
-    pub fn take_joins(&self) -> Vec<MemberJoinWrite> {
-        std::mem::take(&mut self.0.lock().expect("community facts lock").joins)
+    /// A poisoned buffer refuses typed and keeps its untrusted contents queued.
+    pub fn take_joins(&self) -> Result<Vec<MemberJoinWrite>, CommunityFactsError> {
+        let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
+        Ok(std::mem::take(&mut state.joins))
     }
 
     /// Take every buffered fact write (`message_created`,
     /// `voice_session_started` / `voice_session_ended`), leaving that
-    /// buffer empty. Order is arrival order.
-    pub fn take_pending(&self) -> Vec<FactWrite> {
-        std::mem::take(&mut self.0.lock().expect("community facts lock").pending)
+    /// buffer empty. Order is arrival order. A poisoned buffer refuses
+    /// typed and keeps its untrusted contents queued.
+    pub fn take_pending(&self) -> Result<Vec<FactWrite>, CommunityFactsError> {
+        let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
+        Ok(std::mem::take(&mut state.pending))
     }
 
-    /// Buffered gate-clearing count (tests, health). Rules only.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.lock().expect("community facts lock").rules.len()
+    /// Buffered gate-clearing count (tests, health). Rules only. A poisoned
+    /// buffer refuses typed, never a false zero.
+    pub fn len(&self) -> Result<usize, CommunityFactsError> {
+        let state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
+        Ok(state.rules.len())
     }
 
-    /// Whether the gate-clearing buffer holds no writes. Rules only.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// Whether the gate-clearing buffer holds no writes. Rules only. A
+    /// poisoned buffer refuses typed, never a false healthy read.
+    pub fn is_empty(&self) -> Result<bool, CommunityFactsError> {
+        Ok(self.len()? == 0)
     }
 
-    /// Buffered gateway-join count (tests, health).
-    #[must_use]
-    pub fn joins_len(&self) -> usize {
-        self.0.lock().expect("community facts lock").joins.len()
+    /// Buffered gateway-join count (tests, health). A poisoned buffer
+    /// refuses typed, never a false zero.
+    pub fn joins_len(&self) -> Result<usize, CommunityFactsError> {
+        let state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
+        Ok(state.joins.len())
+    }
+
+    /// Cumulative facts evicted by bounded drain requeues, in (pending,
+    /// rules, joins) order. Successful and empty drains never reset the
+    /// counters. A poisoned buffer refuses typed, never a false zero.
+    pub fn dropped_counts(&self) -> Result<(u64, u64, u64), CommunityFactsError> {
+        let state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
+        Ok((
+            state.dropped_pending,
+            state.dropped_rules,
+            state.dropped_joins,
+        ))
     }
 
     /// Persist every buffered fact. Returns the inserted count; a duplicate
-    /// delivery returns `false` from the store and is not counted twice.
+    /// delivery returns `false` from the store and is not counted twice. A
+    /// poisoned buffer refuses typed before any store work and keeps every
+    /// family queued: never a partial batch, never a false zero.
+    ///
+    /// On the first store error — or when the caller drops this future, as
+    /// the gateway checkpoint deadline does — every fact the store has not
+    /// acknowledged, across all three families, returns to the front of its
+    /// queue ahead of arrivals captured meanwhile (bounded per family,
+    /// evictions counted by [`Self::dropped_counts`]), so the next drain
+    /// retries exactly the unwritten suffix and never re-records an
+    /// acknowledged write. With no pool, a
+    /// never-armed buffer discards its raw gate-clearings and joins like
+    /// disabled capture always has, while an armed buffer keeps every
+    /// queued fact for a later drain; both return zero.
     pub async fn drain(&self) -> Result<usize, CommunityFactsError> {
-        let (pool, config, pending, rules, joins) = {
-            let mut state = self.0.lock().expect("community facts lock");
-            (
-                state.pool.clone(),
-                state.config.clone(),
-                std::mem::take(&mut state.pending),
-                std::mem::take(&mut state.rules),
-                std::mem::take(&mut state.joins),
-            )
-        };
-        let Some(pool) = pool else {
-            return Ok(0);
+        let (pool, config, mut guard) = {
+            let mut state = self.0.lock().map_err(|_| CommunityFactsError::Poisoned)?;
+            let Some(pool) = state.pool.clone() else {
+                if !state.capture_armed {
+                    state.pending.clear();
+                    state.rules.clear();
+                    state.joins.clear();
+                }
+                return Ok(0);
+            };
+            let guard = DrainRequeue {
+                state: Arc::clone(&self.0),
+                pending: std::mem::take(&mut state.pending),
+                rules: std::mem::take(&mut state.rules),
+                joins: std::mem::take(&mut state.joins),
+                pending_done: 0,
+                rules_done: 0,
+                joins_done: 0,
+                complete: false,
+            };
+            (pool, state.config.clone(), guard)
         };
         let mut inserted = 0;
-        for write in &pending {
+        for write in &guard.pending {
             if record_fact(&pool, write).await? {
                 inserted += 1;
             }
+            guard.pending_done += 1;
         }
-        for write in &rules {
-            let input = ClassifyInput {
-                guild_id: write.guild_id.to_string(),
-                actor_id: write.member_id.to_string(),
-                is_bot: write.is_bot,
-                webhook_id: None,
-                is_staff_automation: false,
-                is_raid: false,
-                is_staging: false,
-                is_test: false,
+        for write in &guard.rules {
+            let fact = {
+                let input = ClassifyInput {
+                    guild_id: write.guild_id.to_string(),
+                    actor_id: write.member_id.to_string(),
+                    is_bot: write.is_bot,
+                    webhook_id: None,
+                    is_staff_automation: false,
+                    is_raid: false,
+                    is_staging: false,
+                    is_test: false,
+                };
+                let verdict = classify(&config, &input);
+                rules_accepted_fact(
+                    &input.guild_id,
+                    &input,
+                    &write.occurred_at,
+                    &write.source_event_id,
+                    &write.source,
+                    verdict,
+                    None,
+                )
             };
-            let verdict = classify(&config, &input);
-            let fact = rules_accepted_fact(
-                &input.guild_id,
-                &input,
-                &write.occurred_at,
-                &write.source_event_id,
-                &write.source,
-                verdict,
-                None,
-            );
             if record_fact(&pool, &fact).await? {
                 inserted += 1;
             }
+            guard.rules_done += 1;
         }
-        for write in &joins {
-            let input = ClassifyInput {
-                guild_id: write.guild_id.to_string(),
-                actor_id: write.member_id.to_string(),
-                is_bot: write.is_bot,
-                webhook_id: None,
-                is_staff_automation: false,
-                is_raid: false,
-                is_staging: false,
-                is_test: false,
+        for write in &guard.joins {
+            let fact = {
+                let input = ClassifyInput {
+                    guild_id: write.guild_id.to_string(),
+                    actor_id: write.member_id.to_string(),
+                    is_bot: write.is_bot,
+                    webhook_id: None,
+                    is_staff_automation: false,
+                    is_raid: false,
+                    is_staging: false,
+                    is_test: false,
+                };
+                let verdict = classify(&config, &input);
+                member_join_fact(
+                    &input.guild_id,
+                    &input,
+                    &write.occurred_at,
+                    &write.source_event_id,
+                    &write.source,
+                    verdict,
+                    member_join_metadata(write.inviter_id),
+                )
             };
-            let verdict = classify(&config, &input);
-            let fact = member_join_fact(
-                &input.guild_id,
-                &input,
-                &write.occurred_at,
-                &write.source_event_id,
-                &write.source,
-                verdict,
-                member_join_metadata(write.inviter_id),
-            );
             if record_fact(&pool, &fact).await? {
                 inserted += 1;
             }
+            guard.joins_done += 1;
         }
+        guard.complete = true;
         Ok(inserted)
     }
 }
@@ -381,39 +665,42 @@ fn voice_classify(
 }
 
 impl FactsSink for DeferredCommunityFacts {
+    // The sink is infallible, so every callback latches on a poisoned
+    // buffer: drop the one fact without panicking and let the owning
+    // collection/drain refuse typed. Nothing here claims accepted work.
     fn record_member_join(&self, fact: MemberJoinFact<'_>) {
-        self.0
-            .lock()
-            .expect("community facts lock")
-            .joins
-            .push(MemberJoinWrite {
-                guild_id: fact.guild_id,
-                member_id: fact.member_id,
-                is_bot: fact.is_bot,
-                occurred_at: fact.occurred_at.to_owned(),
-                source_event_id: fact.source_event_id.to_owned(),
-                source: fact.source.to_owned(),
-                inviter_id: fact.inviter_id,
-            });
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        state.joins.push(MemberJoinWrite {
+            guild_id: fact.guild_id,
+            member_id: fact.member_id,
+            is_bot: fact.is_bot,
+            occurred_at: fact.occurred_at.to_owned(),
+            source_event_id: fact.source_event_id.to_owned(),
+            source: fact.source.to_owned(),
+            inviter_id: fact.inviter_id,
+        });
     }
 
     fn record_rules_accepted(&self, fact: RulesAcceptedFact<'_>) {
-        self.0
-            .lock()
-            .expect("community facts lock")
-            .rules
-            .push(RulesAcceptedWrite {
-                guild_id: fact.guild_id,
-                member_id: fact.member_id,
-                is_bot: fact.is_bot,
-                occurred_at: fact.occurred_at.to_owned(),
-                source_event_id: fact.source_event_id.clone(),
-                source: fact.source.to_owned(),
-            });
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        state.rules.push(RulesAcceptedWrite {
+            guild_id: fact.guild_id,
+            member_id: fact.member_id,
+            is_bot: fact.is_bot,
+            occurred_at: fact.occurred_at.to_owned(),
+            source_event_id: fact.source_event_id.clone(),
+            source: fact.source.to_owned(),
+        });
     }
 
     fn record_message(&self, fact: MessageFact<'_>) {
-        let mut state = self.0.lock().expect("community facts lock");
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
         if state.pool.is_none() {
             return;
         }
@@ -447,7 +734,11 @@ impl FactsSink for DeferredCommunityFacts {
     }
 
     fn record_voice_started(&self, fact: VoiceStartedFact<'_>) -> Option<String> {
-        let mut state = self.0.lock().expect("community facts lock");
+        // Latch like the other callbacks, and never fabricate a session
+        // key the drain cannot persist: poisoned means `None`.
+        let Ok(mut state) = self.0.lock() else {
+            return None;
+        };
         state.pool.as_ref()?;
         // Bots are classified and captured here; the funnel gate in
         // `on_voice_join` already keeps them out of the XP/activity counts,
@@ -469,7 +760,9 @@ impl FactsSink for DeferredCommunityFacts {
     }
 
     fn record_voice_ended(&self, fact: VoiceEndedFact<'_>) {
-        let mut state = self.0.lock().expect("community facts lock");
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
         if state.pool.is_none() {
             return;
         }
@@ -490,6 +783,26 @@ impl FactsSink for DeferredCommunityFacts {
             verdict,
         ));
     }
+}
+
+/// Sanitized completion for an acknowledged `/rank` store failure: bounded,
+/// actionable, leaking no store detail. Mirrors the repo's "; try again."
+/// recovery convention; the store error still propagates for the caller's log.
+const RANK_UNAVAILABLE_REPLY: &str = "Rank is unavailable right now; try again.";
+/// Sanitized completion for an acknowledged `/leaderboard` store failure:
+/// same shape as [`RANK_UNAVAILABLE_REPLY`].
+const LEADERBOARD_UNAVAILABLE_REPLY: &str = "Leaderboard is unavailable right now; try again.";
+
+/// Validated store read awaiting its acknowledgement: built from the
+/// interaction alone (no store touch) so the defer can precede the read.
+enum PendingRead {
+    Rank {
+        member_id: String,
+        display_name: String,
+    },
+    Leaderboard {
+        season: String,
+    },
 }
 
 /// Award/reply slice of the shared command runtime; no private router or client.
@@ -552,19 +865,45 @@ impl LevelingRuntime {
             && !self.onboarding.dry_run
             && two_bot_core::onboarding::level_role_writes_allowed(self.onboarding.mode)
         {
-            let rewards = leveling_store::role_rewards(&self.pool, &guild).await?;
-            if !rewards.is_empty() {
-                let held = self
-                    .executor
-                    .member_role_ids(request.guild_id, request.member_id)
-                    .await?;
-                let plan = plan_reward_roles(result.level, &rewards, &held, true, false);
-                self.executor
-                    .execute_reward_roles(request.guild_id, request.member_id, &plan, None)
-                    .await?;
-            }
+            self.apply_level_roles(&request, &guild, result.level)
+                .await
+                .map_err(|cause| LevelingRuntimeError::RoleApplication {
+                    cause,
+                    awards: vec![result],
+                })?;
         }
         Ok(Some(result))
+    }
+
+    /// Plan and apply the level-up roles after the award committed.
+    async fn apply_level_roles(
+        &self,
+        request: &AwardRequest,
+        guild: &str,
+        level: u64,
+    ) -> Result<(), RoleApplicationError> {
+        let rewards = leveling_store::role_rewards(&self.pool, guild).await?;
+        if rewards.is_empty() {
+            return Ok(());
+        }
+        let held = self
+            .executor
+            .member_role_ids(request.guild_id, request.member_id)
+            .await?;
+        let plan = plan_reward_roles(level, &rewards, &held, true, false)?;
+        let (applied, failed, skipped) = self
+            .executor
+            .execute_reward_roles(request.guild_id, request.member_id, &plan, None)
+            .await?;
+        match failed {
+            None => Ok(()),
+            Some((role_id, reason)) => Err(RoleApplicationError::Refused {
+                role_id,
+                reason,
+                applied,
+                skipped,
+            }),
+        }
     }
 
     /// Execute only the shared router's accepted leveling handler. The guild
@@ -584,6 +923,17 @@ impl LevelingRuntime {
     /// fallback. `/rank` stays lifetime-based at every instant. Shaped like
     /// the pipeline's existing `handle_at` ISO-millis convention; the season
     /// convention itself is unchanged.
+    ///
+    /// Defer-then-edit lifecycle: the initial acknowledgement (ephemeral for
+    /// rank, public for leaderboard) precedes either store read, so a slow
+    /// database cannot exhaust Discord's initial-response deadline. A failed
+    /// or uncertain acknowledgement returns here with zero store reads and no
+    /// further sends — only provably pre-wire Blocked contention is retried
+    /// inside the executor, and that retry cannot double-acknowledge. A
+    /// successful acknowledgement is completed by exactly one original-response
+    /// edit: the rendered reply on success, one sanitized actionable
+    /// unavailable reply on store failure (the store error still propagates
+    /// so the caller logs the real cause). Never a second initial callback.
     pub async fn handle_interaction_at(
         &self,
         interaction: &Interaction,
@@ -600,7 +950,10 @@ impl LevelingRuntime {
             .ok_or(LevelingRuntimeError::InvalidInteraction)?
             .get()
             .to_string();
-        let response = match handler {
+        // Pure validation before the acknowledgement: resolving the rank
+        // target and the leaderboard season touches no store.
+        let ephemeral = matches!(handler, HandlerId::Rank);
+        let read = match handler {
             HandlerId::Rank => {
                 let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref()
                 else {
@@ -619,37 +972,16 @@ impl LevelingRuntime {
                         .or(interaction.user.as_ref())
                 }
                 .ok_or(LevelingRuntimeError::InvalidInteraction)?;
-                let profile =
-                    leveling_store::profile(&self.pool, &guild, &user.id.get().to_string()).await?;
-                let reply = rank_reply(&profile, user.global_name.as_deref().unwrap_or(&user.name));
-                InteractionResponse {
-                    kind: InteractionResponseType::ChannelMessageWithSource,
-                    data: Some(InteractionResponseData {
-                        content: Some(reply.content),
-                        flags: Some(MessageFlags::EPHEMERAL),
-                        ..Default::default()
-                    }),
+                PendingRead::Rank {
+                    member_id: user.id.get().to_string(),
+                    display_name: user.global_name.as_deref().unwrap_or(&user.name).to_owned(),
                 }
             }
             HandlerId::Leaderboard => {
                 let at_ms = two_bot_core::parse_iso_millis(at)
                     .ok_or(LevelingRuntimeError::InvalidInteraction)?;
-                let season = season_id_for_ms(at_ms);
-                let entries = leveling_store::seasonal_leaderboard(
-                    &self.pool,
-                    &guild,
-                    &season,
-                    LEADERBOARD_DEFAULT_LIMIT,
-                )
-                .await?;
-                let reply = leaderboard_reply_for_season(&entries, &season);
-                InteractionResponse {
-                    kind: InteractionResponseType::ChannelMessageWithSource,
-                    data: Some(InteractionResponseData {
-                        content: Some(reply.content),
-                        allowed_mentions: Some(AllowedMentions::default()),
-                        ..Default::default()
-                    }),
+                PendingRead::Leaderboard {
+                    season: season_id_for_ms(at_ms),
                 }
             }
             _ => unreachable!(),
@@ -658,10 +990,59 @@ impl LevelingRuntime {
             .answer_interaction_with_blocked_retry(
                 interaction.id.get(),
                 &interaction.token,
-                &response,
+                &super::interactions::deferred_response(ephemeral),
             )
             .await?;
-        Ok(true)
+        let content = match read {
+            PendingRead::Rank {
+                member_id,
+                display_name,
+            } => leveling_store::profile(&self.pool, &guild, &member_id)
+                .await
+                .map(|profile| rank_reply(&profile, &display_name).content),
+            PendingRead::Leaderboard { season } => leveling_store::seasonal_leaderboard(
+                &self.pool,
+                &guild,
+                &season,
+                LEADERBOARD_DEFAULT_LIMIT,
+            )
+            .await
+            .map(|entries| leaderboard_reply_for_season(&entries, &season).content),
+        };
+        let application_id = interaction.application_id.get();
+        match content {
+            Ok(content) => {
+                self.executor
+                    .edit_interaction_response_with_blocked_retry(
+                        application_id,
+                        &interaction.token,
+                        &content,
+                    )
+                    .await?;
+                Ok(true)
+            }
+            Err(store) => {
+                let unavailable = if ephemeral {
+                    RANK_UNAVAILABLE_REPLY
+                } else {
+                    LEADERBOARD_UNAVAILABLE_REPLY
+                };
+                // Best-effort completion: attempt the edit, then report the
+                // store failure regardless. The store error is the root cause
+                // the caller must log; a simultaneous edit failure must not
+                // hide it (same precedence as the channel slice's
+                // Persistence-over-Edit return).
+                let _edit = self
+                    .executor
+                    .edit_interaction_response_with_blocked_retry(
+                        application_id,
+                        &interaction.token,
+                        unavailable,
+                    )
+                    .await;
+                Err(LevelingRuntimeError::Store(store))
+            }
+        }
     }
 }
 
@@ -751,21 +1132,30 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
 
     /// Arm Postgres community-facts capture for all live streams. Called once at boot when `TWO_COMMUNITY_SCORECARD=1`; without
     /// it the sink drops every fact, exactly like the previous no-op seam.
-    pub fn enable_community_facts(&self, pool: PgPool) {
+    /// A poisoned facts buffer refuses typed and the classifier keeps its
+    /// previous config, so the two still agree.
+    pub fn enable_community_facts(&self, pool: PgPool) -> Result<(), CommunityFactsError> {
         // One config load seeds both the facts sink and the channel
         // classifier, so classification at record time and the stamped
         // channel class always read the same sets.
         let config = ClassifierConfig::from_env();
-        self.facts.enable_with_config(pool, config.clone());
+        self.facts.enable_with_config(pool, config.clone())?;
         self.classifier.refresh(config);
+        Ok(())
     }
 
     /// Refresh the classifier config live (settings poll): the channel
     /// classifier and the facts sink swap together, so a stored channel
     /// set reclassifies without a restart and the two never disagree.
-    pub fn refresh_classifier_config(&self, config: ClassifierConfig) {
-        self.facts.refresh_config(config.clone());
+    /// A poisoned facts buffer refuses typed before the classifier swaps,
+    /// so a failed refresh changes neither side.
+    pub fn refresh_classifier_config(
+        &self,
+        config: ClassifierConfig,
+    ) -> Result<(), CommunityFactsError> {
+        self.facts.refresh_config(config.clone())?;
         self.classifier.refresh(config);
+        Ok(())
     }
 
     /// Persist buffered community facts without holding the async
@@ -798,16 +1188,22 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
 
     /// Drain deferred XP awards without holding the async dispatch lock.
     /// The caller owns ordering (the serial checkpoint writer); this only
-    /// preserves the funnel-before-award sequence per dispatch.
+    /// preserves the funnel-before-award sequence per dispatch. A fault
+    /// after collection refuses before any store or Discord work, so even
+    /// an empty batch on a poisoned buffer is a typed refusal, never an
+    /// `Ok` success.
     pub async fn drain(
         &self,
         requests: Vec<AwardRequest>,
     ) -> Result<Vec<XpAward>, LevelingRuntimeError> {
+        self.pending.check_healthy()?;
         let mut results = Vec::with_capacity(requests.len());
         if let Some(runtime) = &self.runtime {
             for request in requests {
-                if let Some(award) = runtime.award(request).await? {
-                    results.push(award);
+                match runtime.award(request).await {
+                    Ok(Some(award)) => results.push(award),
+                    Ok(None) => {}
+                    Err(error) => return Err(error.with_prior_awards(results)),
                 }
             }
         }
@@ -830,42 +1226,300 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         eligibility: MessageEligibility,
     ) -> Result<Vec<XpAward>, LevelingRuntimeError> {
         let _dispatch = self.dispatch.lock().await;
-        let requests = self.collect_at(event, at, eligibility);
+        let requests = self.collect_at(event, at, eligibility)?;
         self.drain(requests).await
     }
 
     /// Drive one event through the funnel and return its deferred award
     /// requests for the caller to drain. Separated so the blocking
-    /// checkpoint writer can funnel synchronously, then await awards.
+    /// checkpoint writer can funnel synchronously, then await awards. A
+    /// poisoned leveling buffer refuses typed instead of an empty batch,
+    /// and a poisoned facts buffer — whose sink latched during the funnel
+    /// above — refuses before any award work is claimed.
     pub fn collect_at(
         &self,
         event: &Event,
         at: &str,
         eligibility: MessageEligibility,
-    ) -> Vec<AwardRequest> {
+    ) -> Result<Vec<AwardRequest>, LevelingRuntimeError> {
         self.pipeline
             .handle_at_with_eligibility(event, at, eligibility);
+        self.check_facts_healthy()?;
         self.pending.take()
     }
 
     /// [`Self::collect_at`] under the automod decision: the disposition and the
     /// replay clock reach the funnel in one call, never `collect_at` as well.
     /// `CaptureOnly` and `None` queue no award, so XP stays once per message.
+    /// Poisoned buffers refuse typed even when no award is due: no
+    /// disposition bypasses the failure.
     pub fn collect_at_with_message_disposition(
         &self,
         event: &Event,
         at: &str,
         disposition: FunnelDisposition,
-    ) -> Vec<AwardRequest> {
+    ) -> Result<Vec<AwardRequest>, LevelingRuntimeError> {
         self.pipeline
             .handle_at_with_message_disposition(event, at, disposition);
+        self.check_facts_healthy()?;
         self.pending.take()
+    }
+
+    /// Surface a latched facts-buffer failure under the leveling owner.
+    /// `check_healthy` fails only with the poison refusal, so the mapping
+    /// is exact.
+    fn check_facts_healthy(&self) -> Result<(), LevelingRuntimeError> {
+        self.facts
+            .check_healthy()
+            .map_err(|_| LevelingRuntimeError::CommunityFactsPoisoned)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, http::Method, http::Response, http::Uri, Router};
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+
+    struct RoleRest {
+        executor: Arc<ActionExecutor>,
+        requests: Arc<Mutex<Vec<(Method, String)>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for RoleRest {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl RoleRest {
+        async fn start(script: Vec<(u16, Value)>) -> Self {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let script = Arc::new(Mutex::new(VecDeque::from(script)));
+            let recorded = Arc::clone(&requests);
+            let app = Router::new().fallback(move |method: Method, uri: Uri| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((method, uri.path().to_owned()));
+                let (status, body) = script
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or((500, Value::Null));
+                async move {
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(if status == 204 {
+                            Body::empty()
+                        } else {
+                            Body::from(body.to_string())
+                        })
+                        .unwrap()
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let executor = Arc::new(
+                ActionExecutor::with_proxy("mock-only-token".into(), Some(origin)).unwrap(),
+            );
+            Self {
+                executor,
+                requests,
+                task,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_role_refusal_preserves_prior_committed_awards_in_order() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            eprintln!("SKIP drain award preservation: TWO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let db = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create disposable test database");
+        for (member, xp) in [(200_u64, 99_i64), (201, 250)] {
+            sqlx::query("INSERT INTO member_levels (guild_id,member_id,xp,imported_xp,updated_at) VALUES ('100',$1,$2,$2,NOW())")
+                .bind(member.to_string())
+                .bind(xp)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        leveling_store::replace_role_rewards(
+            db.pool(),
+            "100",
+            &[two_bot_core::leveling::LevelRoleReward {
+                level: 1,
+                role_id: "555555555555555555".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let rest = RoleRest::start(vec![
+            (200, json!({"roles": []})),
+            (204, Value::Null),
+            (200, json!({"roles": []})),
+            (
+                403,
+                json!({"code": 50013, "message": "Missing Permissions"}),
+            ),
+        ])
+        .await;
+        let runtime = LevelingRuntime::new(
+            db.pool().clone(),
+            Arc::clone(&rest.executor),
+            100,
+            two_bot_core::OnboardingGates {
+                mode: two_bot_core::OnboardingMode::Legacy,
+                dry_run: false,
+            },
+        );
+        let pipeline = OrderedLevelingPipeline::new(two_bot_core::MemStore::new(), Some(runtime));
+        let requests = [200, 201]
+            .into_iter()
+            .map(|member_id| AwardRequest {
+                guild_id: 100,
+                member_id,
+                channel_id: 300,
+                at: "2026-08-15T00:00:00.000Z".into(),
+                duration: None,
+                content_length: Some(30),
+                has_embed_or_attachment: false,
+            })
+            .collect();
+        let result = pipeline.drain(requests).await;
+        let persisted: Vec<(String, i64)> =
+            sqlx::query_as("SELECT member_id,xp FROM member_levels ORDER BY member_id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        db.close().await.expect("drop disposable test database");
+
+        let error = result.expect_err("second member's role write must be refused");
+        assert_eq!(
+            error.committed_awards(),
+            &[
+                XpAward {
+                    awarded: 15,
+                    total_xp: 114,
+                    level: 1,
+                    previous_level: 0,
+                    leveled_up: true
+                },
+                XpAward {
+                    awarded: 15,
+                    total_xp: 265,
+                    level: 2,
+                    previous_level: 1,
+                    leveled_up: true
+                },
+            ]
+        );
+        assert!(matches!(error, LevelingRuntimeError::RoleApplication {
+            cause: RoleApplicationError::Refused { role_id, reason, applied, skipped }, ..
+        } if role_id == "555555555555555555" && reason.contains("403") && applied.is_empty() && skipped.is_empty()));
+        assert_eq!(persisted, vec![("200".into(), 114), ("201".into(), 265)]);
+        assert_eq!(
+            *rest.requests.lock().unwrap(),
+            vec![
+                (Method::GET, "/api/v10/guilds/100/members/200".into()),
+                (
+                    Method::PUT,
+                    "/api/v10/guilds/100/members/200/roles/555555555555555555".into()
+                ),
+                (Method::GET, "/api/v10/guilds/100/members/201".into()),
+                (
+                    Method::PUT,
+                    "/api/v10/guilds/100/members/201/roles/555555555555555555".into()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_revoke_refusal_reports_exact_roles_after_successful_grants() {
+        use crate::executor::StagingRevokeFence;
+        use two_bot_core::leveling::RewardRolePlan;
+
+        const GUILD: u64 = 1545644954272137297;
+        const PRODUCTION: u64 = 326474832151838730;
+        let rest = RoleRest::start(vec![
+            (200, json!({"id": "4444"})),
+            (200, json!({"roles": ["8888"]})),
+            (
+                200,
+                json!([
+                    {"id": GUILD.to_string(), "permissions": "0", "position": 0, "managed": false},
+                    {"id": "8888", "permissions": "268435456", "position": 10, "managed": false},
+                    {"id": "6666", "permissions": "0", "position": 1, "managed": false},
+                    {"id": "7777", "permissions": "0", "position": 2, "managed": false},
+                ]),
+            ),
+            (204, Value::Null),
+            (204, Value::Null),
+            (
+                403,
+                json!({"code": 50013, "message": "Missing Permissions"}),
+            ),
+        ])
+        .await;
+        let plan = RewardRolePlan {
+            grant: vec!["5555".into(), "5556".into()],
+            revoke: vec!["6666".into(), "7777".into()],
+            grant_reason: "TWO leveling: reached level 1".into(),
+            revoke_reason: Some("TWO leveling: below level thresholds at level 1".into()),
+        };
+        let (applied, failed, skipped) = rest
+            .executor
+            .execute_reward_roles(
+                GUILD,
+                3333,
+                &plan,
+                Some(StagingRevokeFence::new(GUILD, PRODUCTION).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied, vec!["5555", "5556"]);
+        assert_eq!(
+            failed,
+            Some((
+                "6666".into(),
+                "discord refused the request: Discord refused the request with 403".into()
+            ))
+        );
+        assert_eq!(skipped, vec!["7777"]);
+        assert_eq!(
+            *rest.requests.lock().unwrap(),
+            vec![
+                (Method::GET, "/api/v10/users/@me".into()),
+                (Method::GET, format!("/api/v10/guilds/{GUILD}/members/4444")),
+                (Method::GET, format!("/api/v10/guilds/{GUILD}/roles")),
+                (
+                    Method::PUT,
+                    format!("/api/v10/guilds/{GUILD}/members/3333/roles/5555")
+                ),
+                (
+                    Method::PUT,
+                    format!("/api/v10/guilds/{GUILD}/members/3333/roles/5556")
+                ),
+                (
+                    Method::DELETE,
+                    format!("/api/v10/guilds/{GUILD}/members/3333/roles/6666")
+                ),
+            ]
+        );
+    }
 
     fn gate<'a>(
         member_id: Snowflake,
@@ -900,7 +1554,9 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect(),
         );
-        pipeline.refresh_classifier_config(config);
+        pipeline
+            .refresh_classifier_config(config)
+            .expect("healthy config swap");
 
         assert_eq!(pipeline.classifier.classify(HUMAN), ChannelClass::Human);
         let state = pipeline.facts.0.lock().expect("community facts lock");
@@ -920,7 +1576,9 @@ mod tests {
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
         );
-        buffer.enable_with_config(pool, config);
+        buffer
+            .enable_with_config(pool, config)
+            .expect("healthy arming");
         let state = buffer.0.lock().expect("community facts lock");
         assert!(state.pool.is_some());
         assert_eq!(state.config.version, "community-v7");
@@ -929,18 +1587,18 @@ mod tests {
     #[test]
     fn rules_take_returns_arrival_order_and_empties() {
         let buffer = DeferredCommunityFacts::new();
-        assert!(buffer.is_empty());
+        assert!(buffer.is_empty().expect("healthy health read"));
         buffer.record_rules_accepted(gate(1, "2026-09-20T12:00:00.000Z", "gateway"));
         buffer.record_rules_accepted(gate(2, "2026-09-20T12:01:00.000Z", "backfill:member_list"));
-        assert_eq!(buffer.len(), 2);
-        let writes = buffer.take();
+        assert_eq!(buffer.len().expect("healthy count"), 2);
+        let writes = buffer.take().expect("healthy rules take");
         assert_eq!(
             writes.iter().map(|w| w.member_id).collect::<Vec<_>>(),
             vec![1, 2]
         );
         assert_eq!(writes[1].source, "backfill:member_list");
-        assert!(buffer.is_empty());
-        assert!(buffer.take().is_empty());
+        assert!(buffer.is_empty().expect("healthy emptied read"));
+        assert!(buffer.take().expect("healthy empty take").is_empty());
     }
 
     fn join<'a>(
@@ -984,15 +1642,18 @@ mod tests {
             source: "invite:abc",
             inviter_id: Some(9),
         });
-        assert_eq!(buffer.joins_len(), 2);
-        let writes = buffer.take_joins();
+        assert_eq!(buffer.joins_len().expect("healthy join count"), 2);
+        let writes = buffer.take_joins().expect("healthy joins take");
         assert_eq!(writes[0].source, "invite:abc");
         assert_eq!(writes[0].inviter_id, Some(9));
         assert_eq!(writes[0].source_event_id, "100:1:2026-09-20T12:00:00.000Z");
         assert!(!writes[0].is_bot);
         assert!(writes[1].is_bot, "bot joins buffer for capture");
-        assert_eq!(buffer.joins_len(), 0);
-        assert!(buffer.take_joins().is_empty());
+        assert_eq!(buffer.joins_len().expect("healthy emptied joins"), 0);
+        assert!(buffer
+            .take_joins()
+            .expect("healthy empty joins take")
+            .is_empty());
     }
 
     #[test]
@@ -1042,11 +1703,81 @@ mod tests {
             started_at: None,
             duration_seconds: None,
         });
-        assert_eq!(buffer.len(), 1, "the gate-clearing buffers unarmed");
         assert_eq!(
-            buffer.joins_len(),
+            buffer.len().expect("healthy count"),
+            1,
+            "the gate-clearing buffers unarmed"
+        );
+        assert_eq!(
+            buffer.joins_len().expect("healthy join count"),
             1,
             "the gateway join buffers unarmed alongside it"
         );
     }
+
+    #[test]
+    fn requeue_family_prepends_caps_and_counts_evictions() {
+        // Unwritten work goes ahead of arrivals; exactly at the cap
+        // nothing is evicted and the counter stays put.
+        let mut queue: Vec<u64> = (0..(MAX_QUEUED_FACTS_PER_FAMILY as u64 - 2)).collect();
+        let mut dropped = 0;
+        requeue_family(&mut queue, vec![20_001, 20_002], &mut dropped);
+        assert_eq!(queue.len(), MAX_QUEUED_FACTS_PER_FAMILY);
+        assert_eq!(queue[..2], [20_001, 20_002]);
+        assert_eq!(dropped, 0);
+
+        // Past the cap the oldest (the requeued prefix) is evicted and
+        // every eviction is counted cumulatively.
+        let mut queue: Vec<u64> = (0..MAX_QUEUED_FACTS_PER_FAMILY as u64).collect();
+        requeue_family(&mut queue, vec![20_001, 20_002], &mut dropped);
+        assert_eq!(queue.len(), MAX_QUEUED_FACTS_PER_FAMILY);
+        assert_eq!(queue[0], 0);
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn poison_displays_carry_the_stable_reason_and_action() {
+        // The reason-code constants, the gateway failure line and the
+        // recovery doc all carry these literals verbatim; a rename must
+        // update every surface together.
+        for (text, reason) in [
+            (
+                LevelingRuntimeError::LevelingPoisoned.to_string(),
+                DEFERRED_LEVELING_POISONED,
+            ),
+            (
+                LevelingRuntimeError::CommunityFactsPoisoned.to_string(),
+                DEFERRED_COMMUNITY_FACTS_POISONED,
+            ),
+            (
+                CommunityFactsError::Poisoned.to_string(),
+                DEFERRED_COMMUNITY_FACTS_POISONED,
+            ),
+        ] {
+            assert!(text.contains(reason), "missing reason: {text}");
+            assert!(
+                text.contains(SUPERVISOR_RESTART_INSPECTION),
+                "missing next action: {text}"
+            );
+            assert!(text.len() <= 256, "diagnostic must stay bounded");
+        }
+        assert!(CommunityFactsError::Poisoned.is_poison());
+    }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/deferred_capture_poison.rs"]
+mod deferred_capture_poison_acceptance;
+
+#[cfg(feature = "test-support")]
+#[path = "../tests/support/deferred_worker_poison.rs"]
+pub mod deferred_worker_poison;
+
+#[cfg(test)]
+#[path = "../tests/support/community_facts_requeue.rs"]
+mod community_facts_requeue_acceptance;
+
+#[cfg(test)]
+use community_facts_requeue_acceptance::record_fact;
+#[cfg(not(test))]
+use two_bot_core::community_store::record_fact;

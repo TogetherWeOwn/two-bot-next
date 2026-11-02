@@ -19,7 +19,10 @@ use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 use two_bot_core::leveling::{level_for_xp, MAX_STORED_XP};
 
-use crate::{is_snowflake, CutoverDb};
+use crate::{
+    intake_cap::{truncation_receipt, MAX_KEPT_PROBLEMS},
+    is_snowflake, CutoverDb,
+};
 
 /// Manifest version (legacy `MANIFEST_VERSION`).
 pub const MANIFEST_VERSION: u32 = 1;
@@ -130,6 +133,14 @@ pub struct Mee6ExportError {
     pub problems: Vec<String>,
 }
 
+/// Maximum players accepted from one MEE6 export: 50,000, matching the
+/// cutover per-table row cap
+/// ([`crate::rollback_delta::MAX_EXPORT_ROWS_PER_TABLE`]). The 8 MiB file cap
+/// admits at most ~220,000 minimal rows, so anything past this bound is a
+/// hostile or unreviewable export, refused before the plan/apply path
+/// allocates per-row state.
+pub const MAX_MEE6_PLAYERS: usize = 50_000;
+
 /// SHA-256 hex of bytes already in hand.
 #[must_use]
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -147,28 +158,41 @@ fn as_u64(v: &serde_json::Value) -> Option<u64> {
 /// `{players:[...]}`; each player needs `id`/`user_id` and `xp` within
 /// [`MAX_STORED_XP`]. An optional `level` must agree with the MEE6 curve for
 /// that XP.
+///
+/// Intake bounds: more than [`MAX_MEE6_PLAYERS`] valid players refuses with
+/// a bound refusal before any plan/apply allocation, and accumulated
+/// problems truncate after [`MAX_KEPT_PROBLEMS`] with a receipt preserving
+/// the total, so a hostile export fails closed without OOM.
 pub fn parse_mee6_export(text: &str) -> Result<Vec<Mee6ImportRow>, Mee6ExportError> {
     let parsed: serde_json::Value = serde_json::from_str(text).map_err(|e| Mee6ExportError {
         problems: vec![format!("file is not valid JSON: {e}")],
     })?;
-    let players = if let Some(arr) = parsed.as_array() {
-        arr.clone()
+    let players: &Vec<serde_json::Value> = if let Some(arr) = parsed.as_array() {
+        arr
     } else if let Some(arr) = parsed.get("players").and_then(|p| p.as_array()) {
-        arr.clone()
+        arr
     } else {
         return Err(Mee6ExportError {
             problems: vec!["export must be an array or an object with a players array".to_owned()],
         });
     };
 
-    let mut problems = Vec::new();
-    let mut rows = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    let mut problem_total: usize = 0;
+    let mut rows: Vec<Mee6ImportRow> = Vec::new();
+    let mut valid_total: usize = 0;
+    let mut report = |problem: String| {
+        problem_total += 1;
+        if problems.len() < MAX_KEPT_PROBLEMS {
+            problems.push(problem);
+        }
+    };
     for (index, raw) in players.iter().enumerate() {
         let at = format!("row {}", index + 1);
         let obj = match raw.as_object() {
             Some(o) => o,
             None => {
-                problems.push(format!("{at} is not an object"));
+                report(format!("{at} is not an object"));
                 continue;
             }
         };
@@ -178,22 +202,22 @@ pub fn parse_mee6_export(text: &str) -> Result<Vec<Mee6ImportRow>, Mee6ExportErr
             .and_then(|v| v.as_str())
             .map(str::to_owned);
         let Some(member_id) = member_id else {
-            problems.push(format!("{at} has no id or user_id"));
+            report(format!("{at} has no id or user_id"));
             continue;
         };
         if !is_snowflake(&member_id) {
-            problems.push(format!(
+            report(format!(
                 "{at} has an invalid Discord member id: {member_id}"
             ));
             continue;
         }
         let xp = obj.get("xp").and_then(as_u64);
         let Some(xp) = xp else {
-            problems.push(format!("{at} has invalid xp"));
+            report(format!("{at} has invalid xp"));
             continue;
         };
         if xp > MAX_STORED_XP {
-            problems.push(format!(
+            report(format!(
                 "{at} xp must be an integer between 0 and {MAX_STORED_XP}"
             ));
             continue;
@@ -203,27 +227,40 @@ pub fn parse_mee6_export(text: &str) -> Result<Vec<Mee6ImportRow>, Mee6ExportErr
             Some(v) => match as_u64(v) {
                 Some(l) => Some(l),
                 None => {
-                    problems.push(format!("{at} has invalid level"));
+                    report(format!("{at} has invalid level"));
                     continue;
                 }
             },
         };
         if let Some(l) = level {
             if level_for_xp(xp) != l {
-                problems.push(format!(
+                report(format!(
                     "{at} states level {l} but {xp} XP is level {}",
                     level_for_xp(xp)
                 ));
                 continue;
             }
         }
-        rows.push(Mee6ImportRow {
-            member_id,
-            xp,
-            level,
+        valid_total += 1;
+        if rows.len() <= MAX_MEE6_PLAYERS {
+            rows.push(Mee6ImportRow {
+                member_id,
+                xp,
+                level,
+            });
+        }
+    }
+    if valid_total > MAX_MEE6_PLAYERS {
+        return Err(Mee6ExportError {
+            problems: vec![format!(
+                "MEE6 export exceeds the {MAX_MEE6_PLAYERS}-player limit: {valid_total} players submitted"
+            )],
         });
     }
-    if !problems.is_empty() {
+    if problem_total > 0 {
+        if problem_total > problems.len() {
+            problems.push(truncation_receipt(problem_total));
+        }
         return Err(Mee6ExportError { problems });
     }
     Ok(rows)
@@ -780,6 +817,62 @@ mod tests {
                 format!("row 4 xp must be an integer between 0 and {MAX_STORED_XP}"),
             ]
         );
+    }
+
+    #[test]
+    fn parse_refuses_more_than_max_players_with_a_bound() {
+        let mut export = String::from("[");
+        for index in 0..=MAX_MEE6_PLAYERS {
+            if index > 0 {
+                export.push(',');
+            }
+            export.push_str(&format!(
+                "{{\"id\":\"{}\",\"xp\":1}}",
+                100_000_000_000_000_000u64 + index as u64
+            ));
+        }
+        export.push(']');
+        let err = parse_mee6_export(&export).unwrap_err();
+        assert_eq!(err.problems.len(), 1);
+        let message = err.to_string();
+        assert!(message.contains("exceeds"), "{message}");
+        assert!(message.contains("player"), "{message}");
+    }
+
+    #[test]
+    fn parse_admits_exactly_max_players() {
+        let mut export = String::from("[");
+        for index in 0..MAX_MEE6_PLAYERS {
+            if index > 0 {
+                export.push(',');
+            }
+            export.push_str(&format!(
+                "{{\"id\":\"{}\",\"xp\":1}}",
+                100_000_000_000_000_000u64 + index as u64
+            ));
+        }
+        export.push(']');
+        let rows = parse_mee6_export(&export).unwrap();
+        assert_eq!(rows.len(), MAX_MEE6_PLAYERS);
+    }
+
+    #[test]
+    fn parse_truncates_problems_with_a_count_receipt() {
+        let mut export = String::from("[0");
+        export.push_str(&",0".repeat(MAX_KEPT_PROBLEMS + 50));
+        export.push(']');
+        let err = parse_mee6_export(&export).unwrap_err();
+        assert_eq!(err.problems.len(), MAX_KEPT_PROBLEMS + 1);
+        let receipt = err.problems.last().unwrap();
+        assert!(receipt.contains("more"), "{receipt}");
+        assert!(receipt.contains("151"), "{receipt}");
+    }
+
+    #[test]
+    fn parse_names_a_non_numeric_level() {
+        let err = parse_mee6_export(r#"[{"id":"100000000000000001","xp":100,"level":"high"}]"#)
+            .unwrap_err();
+        assert_eq!(err.problems, ["row 1 has invalid level"]);
     }
 
     #[test]

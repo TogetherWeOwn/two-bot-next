@@ -11,7 +11,9 @@ use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
 use sqlx::{Pool, Postgres};
 use twilight_model::application::interaction::Interaction;
-use two_bot_core::{ClassifierConfig, InteractionRouter, RouterGates};
+use two_bot_core::{
+    ClassifierConfig, InteractionRouter, RouterGates, ANNOUNCEMENTS_DISABLED_REPLY,
+};
 use two_bot_discord::{
     interactions::InteractionRuntime, rsvp::handle_rsvp_interaction, ActionExecutor,
 };
@@ -22,6 +24,21 @@ const EVENT: &str = "1546451670500642999";
 const USER: &str = "1546451670500642888";
 const OTHER: &str = "1546451670500642777";
 const MANAGE_EVENTS: u64 = 1 << 33;
+
+#[path = "support/rsvp_personal_totals.rs"]
+mod saved_response_acceptance;
+
+#[path = "support/rsvp_event_links.rs"]
+mod event_link_acceptance;
+
+#[path = "support/event_link_id_controls.rs"]
+mod event_link_id_controls;
+
+#[path = "support/rsvp_saved_response_kinds.rs"]
+mod saved_response_kinds;
+
+#[path = "support/rsvp_link_receipts.rs"]
+mod link_receipts;
 
 fn router() -> InteractionRouter {
     InteractionRouter::new(RouterGates {
@@ -283,7 +300,18 @@ fn assert_reply(mock: &MockRest, content: &str, deferred: bool) {
             last.path,
             "/api/v10/webhooks/1111/mock-rsvp-token/messages/@original"
         );
-        assert_eq!(body["content"], content);
+        if content.starts_with("RSVP saved:") {
+            // Event-link confirmations may append the stable numeric identity.
+            // Keep the existing status sentence and every refusal oracle intact;
+            // the protected link tests independently require the event identity.
+            let actual = body["content"].as_str().expect("RSVP confirmation");
+            assert!(
+                actual == content || (actual.starts_with(content) && actual.contains(EVENT)),
+                "expected the saved status, optionally followed by event identity: {actual}"
+            );
+        } else {
+            assert_eq!(body["content"], content);
+        }
         // Executor defaults continue to suppress mentions on deferred edits.
         assert_eq!(body["allowed_mentions"]["parse"], json!([]));
     } else {
@@ -351,12 +379,20 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
         ScriptedResponse::status(500),
     )
     .await;
-    for (i, status) in ["going", "interested", "declined", "declined"]
+    // First saves the legacy sentence; rewrites distinguish changed vs repeat.
+    let expected = [
+        "RSVP saved: going.",
+        "RSVP saved: interested (changed from going).",
+        "RSVP saved: declined (changed from interested).",
+        "RSVP saved: declined (saved again; time updated).",
+    ];
+    for (i, (status, want)) in ["going", "interested", "declined", "declined"]
         .iter()
+        .zip(expected)
         .enumerate()
     {
         run(fixture.pool(), &mock, &rsvp(100 + i as u64, status)).await;
-        assert_reply(&mock, &format!("RSVP saved: {status}."), true);
+        assert_reply(&mock, want, true);
         let stored: String = sqlx::query_scalar(
             "SELECT status FROM event_rsvps WHERE guild_id=$1 AND event_id=$2 AND user_id=$3",
         )
@@ -368,6 +404,15 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
         .unwrap();
         assert_eq!(&stored, status);
     }
+    let saved_epoch: i64 = sqlx::query_scalar(
+        "SELECT floor(extract(epoch FROM responded_at))::bigint FROM event_rsvps WHERE guild_id=$1 AND event_id=$2 AND user_id=$3",
+    )
+    .bind(GUILD)
+    .bind(EVENT)
+    .bind(USER)
+    .fetch_one(fixture.pool())
+    .await
+    .unwrap();
     run(
         fixture.pool(),
         &mock,
@@ -379,7 +424,11 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
         ),
     )
     .await;
-    assert_reply(&mock, "Going: 0\nInterested: 0\nDeclined: 1", true);
+    assert_reply(
+        &mock,
+        &format!("Stored RSVPs for event `{EVENT}`\nGoing: 0\nInterested: 0\nDeclined: 1\nYour saved response: Declined\nSaved: <t:{saved_epoch}:f>\nHistorical saved responses; live event availability is not checked."),
+        true,
+    );
     assert_eq!(counts(fixture.pool()).await, (1, 4, 0));
     let audits: Vec<(String, String, String, String)> = sqlx::query_as(
         "SELECT actor_id, action, target_key, outcome FROM announcements_audit_log ORDER BY id",
@@ -574,7 +623,7 @@ async fn totals_remain_readable_without_live_event_access() {
             event_id: EVENT.into(),
             user_id: USER.into(),
             status: two_bot_core::RsvpStatus::Going,
-            responded_at: two_bot_core::now_iso(),
+            responded_at: "2020-01-02T03:04:05.000Z".into(),
         },
     )
     .await
@@ -603,7 +652,11 @@ async fn totals_remain_readable_without_live_event_access() {
             ),
         )
         .await;
-        assert_reply(&mock, "Going: 1\nInterested: 0\nDeclined: 0", true);
+        assert_reply(
+            &mock,
+            &format!("Stored RSVPs for event `{EVENT}`\nGoing: 1\nInterested: 0\nDeclined: 0\nYour saved response: Going\nSaved: <t:1577934245:f>\nHistorical saved responses; live event availability is not checked."),
+            true,
+        );
         assert_eq!(mock.requests().len(), 2);
         assert!(mock.requests().iter().all(|r| r.method != "GET"));
         assert_eq!(counts(fixture.pool()).await, (1, 0, 0));
@@ -762,7 +815,8 @@ async fn host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof() 
         &attendance(402, MANAGE_EVENTS, OTHER, &occ),
     )
     .await;
-    assert_eq!(counts(fixture.pool()).await, (0, 0, 2));
+    // Two recorded check-ins: two facts, two audit rows; the duplicate wrote neither.
+    assert_eq!(counts(fixture.pool()).await, (0, 2, 2));
     let rows: Vec<(String, String, String, String, String, String, String)> = sqlx::query_as(
         "SELECT event_type, source_event_id, actor_id, source, classification, metadata, idempotency_key FROM community_facts ORDER BY id")
         .fetch_all(fixture.pool()).await.unwrap();
@@ -830,7 +884,8 @@ async fn host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof() 
     assert_eq!(gets[12].path, guild_member_path(USER));
     assert_eq!(gets[13].path, scheduled_event_path(EVENT));
     assert_eq!(gets[14].path, guild_member_path(USER));
-    assert_eq!(counts(fixture.pool()).await, (0, 0, 3));
+    // The labeled repeat is a third recorded check-in: three facts, three audit rows.
+    assert_eq!(counts(fixture.pool()).await, (0, 3, 3));
     fixture.close().await;
     mock.shutdown().await;
 }
@@ -1235,7 +1290,8 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
         .handle(&attendance(601, MANAGE_EVENTS, USER, &occ))
         .await
         .is_err());
-    assert_eq!(counts(fixture.pool()).await, (1, 1, 1));
+    // The committed check-in leaves its fact and its audit row behind the failed edit.
+    assert_eq!(counts(fixture.pool()).await, (1, 2, 1));
     assert_eq!(mock.requests().len(), 13);
     assert!(runtime
         .handle(&attendance(602, MANAGE_EVENTS, USER, &occ))
@@ -1246,7 +1302,8 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
         &two_bot_core::checkin_duplicate_text(USER, &occ),
         true,
     );
-    assert_eq!(counts(fixture.pool()).await, (1, 1, 1));
+    // The duplicate adds no fact and no audit row.
+    assert_eq!(counts(fixture.pool()).await, (1, 2, 1));
     fixture.close().await;
     mock.shutdown().await;
 }
@@ -1428,6 +1485,74 @@ async fn checkin_mid_write_target_departure_is_compensated_and_refused() {
     fixture.close().await;
 }
 
+/// RA-03 ownership: when this attempt's audit id dedupes, the audit row
+/// belongs to the earlier attempt, so mid-write compensation removes the
+/// fact but keeps the pre-existing row. An unconditional audit delete fails
+/// here: the survivor count drops to zero.
+#[tokio::test]
+async fn checkin_deduped_audit_row_survives_mid_write_compensation() {
+    let _window = DIAGNOSTIC_WINDOW.lock().await;
+    let mark = log_mark();
+    let Some(fixture) = pool().await else {
+        return;
+    };
+    let occ = anchored("2026-09-30");
+    // A prior delivery of interaction 822 already wrote its audit row: the
+    // acting host is the actor, the on-behalf target in the target key.
+    sqlx::query(
+        "INSERT INTO announcements_audit_log \
+         (id, guild_id, actor_id, action, target_key, outcome, created_at) \
+         VALUES ('checkin:822', $1, $2, 'event.checkin', $3, 'recorded', now())",
+    )
+    .bind(GUILD)
+    .bind(USER)
+    .bind(format!("{occ}:{OTHER}"))
+    .execute(fixture.pool())
+    .await
+    .unwrap();
+    assert_eq!(counts(fixture.pool()).await, (0, 1, 0));
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            event(1),
+            member(USER),
+            member_get(OTHER, None),
+            // Post-write fence: the anchor is still live, the target now gone.
+            event(1),
+            ScriptedResponse::status(404),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    run(
+        fixture.pool(),
+        &mock,
+        &attendance(822, MANAGE_EVENTS, OTHER, &occ),
+    )
+    .await;
+    assert_reply(&mock, "That member is no longer in this server.", true);
+    assert_eq!(mock.requests().len(), 7);
+    // The refused fact is gone; the earlier attempt's audit row survives.
+    assert_eq!(counts(fixture.pool()).await, (0, 1, 0));
+    let audits: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT id, actor_id, target_key FROM announcements_audit_log")
+            .fetch_all(fixture.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        audits,
+        [(
+            "checkin:822".to_owned(),
+            Some(USER.to_owned()),
+            Some(format!("{occ}:{OTHER}")),
+        )]
+    );
+    assert!(compensation_failures_since(mark).is_empty());
+    mock.shutdown().await;
+    fixture.close().await;
+}
+
 /// RA-03 compensation failure: when the compensating delete itself fails, the
 /// user still gets only the refusal, the attempt's rows remain, and exactly one
 /// bounded diagnostic names the failed write. The fault is a trigger that
@@ -1512,11 +1637,59 @@ async fn failed_compensation_keeps_refusal_and_emits_one_diagnostic() {
     .await;
     assert_reply(&mock, "That member is no longer in this server.", true);
     assert_eq!(mock.requests().len(), 7);
-    // The failed compensation kept this attempt's attendance fact.
-    assert_eq!(counts(checkin_db.pool()).await, (0, 0, 1));
+    // The failed compensation kept this attempt's attendance fact and its audit row.
+    assert_eq!(counts(checkin_db.pool()).await, (0, 1, 1));
     assert_single_failure(compensation_failures_since(mark), "checkin");
     mock.shutdown().await;
     checkin_db.close().await;
+}
+
+/// RA-03 compensation atomicity: when the audit delete fails, the fact
+/// delete rolls back with it — both rows remain and the refusal still
+/// carries exactly one diagnostic. A non-transactional compensation fails
+/// here: the fact is gone while its audit row stays.
+#[tokio::test]
+async fn failed_audit_delete_rolls_back_checkin_compensation() {
+    let _window = DIAGNOSTIC_WINDOW.lock().await;
+    let Some(fixture) = pool().await else {
+        return;
+    };
+    sqlx::query("CREATE FUNCTION injected_compensation_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected compensation fault'; END $$")
+        .execute(fixture.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fault_checkin_audit_delete BEFORE DELETE ON announcements_audit_log FOR EACH STATEMENT EXECUTE FUNCTION injected_compensation_fault()")
+        .execute(fixture.pool())
+        .await
+        .unwrap();
+    let occ = anchored("2026-09-30");
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),
+            event(1),
+            member(USER),
+            member_get(OTHER, None),
+            event(1),
+            ScriptedResponse::status(404),
+            ScriptedResponse::json(200, json!({"id": "99"})),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let mark = log_mark();
+    run(
+        fixture.pool(),
+        &mock,
+        &attendance(823, MANAGE_EVENTS, OTHER, &occ),
+    )
+    .await;
+    assert_reply(&mock, "That member is no longer in this server.", true);
+    assert_eq!(mock.requests().len(), 7);
+    // The failed compensation kept this attempt's attendance fact and its audit row.
+    assert_eq!(counts(fixture.pool()).await, (0, 1, 1));
+    assert_single_failure(compensation_failures_since(mark), "checkin");
+    mock.shutdown().await;
+    fixture.close().await;
 }
 
 /// RA-03: store failures fail closed — a refused commit is reported as a
@@ -1790,5 +1963,315 @@ async fn mismatched_application_identity_is_refused_before_any_callback_or_store
     assert!(mock.requests().is_empty());
     assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
     fixture.close().await;
+    mock.shutdown().await;
+}
+
+// ── `is_rsvp_candidate` / `prepare` parity ───────────────────────────────────
+// The gateway admits RSVP backpressure slots from `is_rsvp_candidate` before
+// `prepare` runs. Every row below pins the literal candidate bit, then proves
+// the parity contract in both directions: a non-candidate prepares to
+// `ignored` (no callback, no deferred slot), and any deferred completion
+// implies the candidate bit was set. `prepare` never touches the store, so
+// these tests run on a lazy unroutable pool plus the scripted loopback REST
+// double: no database, no Discord.
+
+/// `prepare` never reaches the store, so a lazy pool that can never connect
+/// is sufficient: any store touch would fail loudly instead of mutating.
+fn candidate_runtime(mock: &MockRest) -> InteractionRuntime {
+    candidate_runtime_with_router(router(), mock)
+}
+
+fn candidate_runtime_with_router(router: InteractionRouter, mock: &MockRest) -> InteractionRuntime {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool never connects");
+    InteractionRuntime::with_router(router, pool, executor(mock), 0, ClassifierConfig::default())
+}
+
+/// Slash-shaped interaction whose registration identity cannot resolve: the
+/// invoked command claims a registration guild that differs from the
+/// invocation guild, so `slash_name` (and therefore `resolve_interaction`)
+/// returns `None` even though the wire name reads `rsvp`.
+fn identity_mismatched_rsvp(id: u64) -> Interaction {
+    serde_json::from_value(json!({
+        "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
+        "id": id.to_string(), "token": "mock-rsvp-token", "type": 2,
+        "version": 1, "guild_id": GUILD,
+        "member": {"permissions": "0", "roles": [],
+            "deaf": false, "mute": false, "flags": 0,
+            "user": {"id": USER, "username": "invoker", "discriminator": "0"}},
+        "data": {"id": "4444", "name": "rsvp", "type": 1, "guild_id": "9999888877776666",
+            "options": [
+                {"name": "event-id", "type": 3, "value": EVENT},
+                {"name": "status", "type": 3, "value": "going"}
+            ]}
+    }))
+    .expect("wire interaction")
+}
+
+/// Message-component interaction (button/select traffic), which the RSVP path
+/// never owns: `resolve_interaction` passes it through, but it is not slash.
+fn component_interaction(id: u64) -> Interaction {
+    serde_json::from_value(json!({
+        "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
+        "id": id.to_string(), "token": "mock-rsvp-token", "type": 3,
+        "version": 1, "guild_id": GUILD,
+        "member": {"permissions": "0", "roles": [],
+            "deaf": false, "mute": false, "flags": 0,
+            "user": {"id": USER, "username": "invoker", "discriminator": "0"}},
+        "data": {"custom_id": "two:game-picker:valorant", "component_type": 3, "values": []}
+    }))
+    .expect("wire interaction")
+}
+
+#[tokio::test]
+async fn rsvp_candidate_parity_accepted_rsvp_defers() {
+    // Regression: the gateway admits an RSVP slot for this interaction, so
+    // `prepare` must produce the matching deferred completion. Admitting the
+    // slot but preparing to `ignored` would leak the permit; deferring without
+    // the candidate bit would consume a slot that was never admitted.
+    const EXPECTED_CANDIDATE: bool = true;
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = candidate_runtime(&mock);
+    let interaction = rsvp(9101, "going");
+    let candidate = runtime.is_rsvp_candidate(&interaction);
+    assert_eq!(
+        candidate, EXPECTED_CANDIDATE,
+        "accepted RSVP is a candidate"
+    );
+    let prepared = runtime
+        .prepare(interaction)
+        .await
+        .expect("prepare accepted RSVP");
+    let shown = format!("{prepared:?}");
+    assert!(
+        shown.contains("handled: true"),
+        "accepted RSVP is handled: {shown}"
+    );
+    assert!(
+        shown.contains("deferred: Some("),
+        "accepted RSVP holds a deferred completion: {shown}"
+    );
+    assert!(
+        candidate,
+        "deferred completion implies the candidate bit: {shown}"
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1, "one deferred ack: {requests:?}");
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(
+        requests[0].path,
+        "/api/v10/interactions/9101/mock-rsvp-token/callback"
+    );
+    let ack: Value = serde_json::from_slice(&requests[0].body).expect("ack parses");
+    assert_eq!(ack["type"], 5, "deferred ack, not an inline reply");
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn rsvp_candidate_parity_rsvp_refusal_answers_without_deferring() {
+    // Regression: a refused RSVP is still an RSVP-path interaction (the
+    // candidate bit stays set), but the refusal is answered inline, so no
+    // deferred slot may be consumed. Counting this row as a deferred slot
+    // would stall the queue on a completion that never arrives; preparing to
+    // `ignored` instead would drop the denial silently.
+    const EXPECTED_CANDIDATE: bool = true;
+    let refused_router = InteractionRouter::new(RouterGates {
+        configured_guild: Some(GUILD.parse().expect("guild snowflake")),
+        scorecard: true,
+        automations: false,
+        announcements: false,
+        moderation: false,
+        voice: false,
+        voice_assistant: false,
+        tickets: false,
+        self_roles: false,
+        onboarding_picker: false,
+        session_picker: false,
+    });
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = candidate_runtime_with_router(refused_router, &mock);
+    let interaction = rsvp(9102, "going");
+    let candidate = runtime.is_rsvp_candidate(&interaction);
+    assert_eq!(candidate, EXPECTED_CANDIDATE, "refused RSVP is a candidate");
+    let prepared = runtime
+        .prepare(interaction)
+        .await
+        .expect("prepare refused RSVP");
+    let shown = format!("{prepared:?}");
+    assert!(
+        shown.contains("handled: true"),
+        "refusal is answered: {shown}"
+    );
+    assert!(
+        shown.contains("deferred: None"),
+        "refusal holds no deferred completion: {shown}"
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1, "one inline refusal: {requests:?}");
+    let refusal: Value = serde_json::from_slice(&requests[0].body).expect("refusal parses");
+    assert_eq!(refusal["type"], 4, "inline reply, not a deferred ack");
+    assert_eq!(refusal["data"]["flags"], 64, "refusal stays ephemeral");
+    assert_eq!(refusal["data"]["content"], ANNOUNCEMENTS_DISABLED_REPLY);
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn rsvp_candidate_parity_foreign_application_is_ignored() {
+    // Regression: an interaction from another application must neither take
+    // an RSVP slot nor emit a callback to a foreign token. The candidate bit
+    // is the fence; `prepare` proving `ignored` (silence on the wire) is the
+    // matching half.
+    const EXPECTED_CANDIDATE: bool = false;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let runtime = candidate_runtime(&mock);
+    runtime.set_application_id(1111);
+    let mut foreign = rsvp(9103, "going");
+    foreign.application_id = twilight_model::id::Id::new(9999);
+    let candidate = runtime.is_rsvp_candidate(&foreign);
+    assert_eq!(
+        candidate, EXPECTED_CANDIDATE,
+        "foreign app is never a candidate"
+    );
+    let prepared = runtime
+        .prepare(foreign)
+        .await
+        .expect("prepare foreign interaction");
+    let shown = format!("{prepared:?}");
+    assert!(
+        shown.contains("handled: false") && shown.contains("deferred: None"),
+        "non-candidate prepares to ignored: {shown}"
+    );
+    assert!(
+        !runtime
+            .complete(prepared)
+            .await
+            .expect("ignored completion"),
+        "non-candidate remains unhandled without store or callback work"
+    );
+    assert!(
+        mock.requests().is_empty(),
+        "ignored interaction sends no callback"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn rsvp_candidate_parity_unknown_command_identity_is_ignored() {
+    // Regression: the admission fence is registration identity, not the wire
+    // name string. An `rsvp`-named payload whose command identity cannot
+    // resolve (stale client cache, recreated command id) must not consume a
+    // slot, even though the name alone looks like RSVP traffic.
+    const EXPECTED_CANDIDATE: bool = false;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let runtime = candidate_runtime(&mock);
+    let interaction = identity_mismatched_rsvp(9104);
+    let candidate = runtime.is_rsvp_candidate(&interaction);
+    assert_eq!(
+        candidate, EXPECTED_CANDIDATE,
+        "unresolvable identity is never a candidate"
+    );
+    let prepared = runtime
+        .prepare(interaction)
+        .await
+        .expect("prepare unresolvable interaction");
+    let shown = format!("{prepared:?}");
+    assert!(
+        shown.contains("handled: false") && shown.contains("deferred: None"),
+        "non-candidate prepares to ignored: {shown}"
+    );
+    assert!(
+        !runtime
+            .complete(prepared)
+            .await
+            .expect("ignored completion"),
+        "non-candidate remains unhandled without store or callback work"
+    );
+    assert!(
+        mock.requests().is_empty(),
+        "ignored interaction sends no callback"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn rsvp_candidate_parity_non_rsvp_slash_is_ignored() {
+    // Regression: the bulk of gateway traffic is non-RSVP slash commands.
+    // Admitting any of them to the RSVP queue would starve genuine RSVPs and
+    // pollute the refusal accounting with interactions another path owns.
+    const EXPECTED_CANDIDATE: bool = false;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let runtime = candidate_runtime(&mock);
+    let interaction = slash(9105, "rank", 0, json!([]));
+    let candidate = runtime.is_rsvp_candidate(&interaction);
+    assert_eq!(
+        candidate, EXPECTED_CANDIDATE,
+        "non-RSVP slash is never a candidate"
+    );
+    let prepared = runtime
+        .prepare(interaction)
+        .await
+        .expect("prepare non-RSVP slash");
+    let shown = format!("{prepared:?}");
+    assert!(
+        shown.contains("handled: false") && shown.contains("deferred: None"),
+        "non-candidate prepares to ignored: {shown}"
+    );
+    assert!(
+        !runtime
+            .complete(prepared)
+            .await
+            .expect("ignored completion"),
+        "non-candidate remains unhandled without store or callback work"
+    );
+    assert!(
+        mock.requests().is_empty(),
+        "ignored interaction sends no callback"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn rsvp_candidate_parity_component_is_ignored() {
+    // Regression: button/select traffic is heavy and never RSVP-owned. The
+    // RSVP path only understands slash, so components must fence out at the
+    // candidate bit and stay silent through `prepare`.
+    const EXPECTED_CANDIDATE: bool = false;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let runtime = candidate_runtime(&mock);
+    let interaction = component_interaction(9106);
+    let candidate = runtime.is_rsvp_candidate(&interaction);
+    assert_eq!(
+        candidate, EXPECTED_CANDIDATE,
+        "components are never candidates"
+    );
+    let prepared = runtime
+        .prepare(interaction)
+        .await
+        .expect("prepare component");
+    let shown = format!("{prepared:?}");
+    assert!(
+        shown.contains("handled: false") && shown.contains("deferred: None"),
+        "non-candidate prepares to ignored: {shown}"
+    );
+    assert!(
+        !runtime
+            .complete(prepared)
+            .await
+            .expect("ignored completion"),
+        "non-candidate remains unhandled without store or callback work"
+    );
+    assert!(
+        mock.requests().is_empty(),
+        "ignored interaction sends no callback"
+    );
     mock.shutdown().await;
 }

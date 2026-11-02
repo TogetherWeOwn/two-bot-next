@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "title": "Cutover probe bounded redacted verdict acceptance",
+  "delivery": "protected tests only; deliberately RED, do not open or merge a standalone failing PR",
+  "base_sha": "1f939869073cb0ced2e5d03b85e1177a8c85175d",
+  "public_branch": "test/cutover-redacted-verdicts",
+  "protected_files": [
+    {
+      "path": "scripts/test_qa_cutover_verdict_acceptance.py",
+      "sha256": "1ace18c35f503a7633fd642d94bbaf9ed890fb04d0441fb234ac35e3a3ffe38d"
+    }
+  ],
+  "run": "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_qa_cutover_verdict_acceptance.py' -v",
+  "dependencies": "Python standard library only; main(fetch_fn=...) doubles and offline urllib opener double; socket creation prohibited",
+  "observed_baseline": {
+    "test_methods": 29,
+    "passing_methods": 9,
+    "failing_methods": 20,
+    "failure_assertions_including_subtests": 68,
+    "unhandled_test_errors": 0,
+    "skips": 0,
+    "classification": "behavioral RED, not a compile/cache/infrastructure refusal",
+    "existing_qa_cutover_suite": "98/98 offline tests pass; the one existing loopback HTTP-server test is explicitly excluded, not claimed passing"
+  },
+  "machine_contract": {
+    "flag": "--json (output-only; listed in --help)",
+    "stdout": "Exactly one JSON object with verdict, next_action, checks; stderr empty for ordinary probe verdicts",
+    "verdict": "PASS or FAIL; exit 0 or 1 respectively",
+    "checks": "Nonempty array; unique id, verdict, code, next_action on every check",
+    "normal_check_ids": ["liveness", "readiness-shape", "gateway-state", "jobs-map", "fence-watch"],
+    "origin_refusal_id": "Builder chooses a stable check ID; it need not fabricate remote check results before origin admission",
+    "codes": "Builder chooses bounded lowercase fixed-vocabulary codes; repeated equivalent failures with different secret sentinels must retain the same IDs/codes/next actions",
+    "next_action": "Nonempty string at report and check level, at most 256 characters, no untrusted reflection",
+    "output_bound": "At most 16384 UTF-8 bytes total stdout plus stderr for tested inputs",
+    "failure_attestation": "Failed JSON verdict must not claim result=pass; failed runs must neither create nor overwrite --evidence",
+    "success_attestation": "Existing separate --evidence file remains result=pass with five source-cited checks; JSON output is not that file"
+  },
+  "coverage": [
+    "Reject credential-bearing wrong-scheme, bad-port and malformed-bracket combinations before fetching; no raw or truncated credential reflection",
+    "Reject hostless and unusable-port origins; preserve HTTP, IPv6, explicit usable ports and trailing-slash normalization",
+    "Treat in-cap depth-2000 JSON on both routes and malformed remote structures as failed checks without escaping exceptions",
+    "Validate build_revision/build_id against the shared supported canonical SHA/run-attempt shapes or exact unknown/unknown pair, not arbitrary strings",
+    "Redact malformed build fields, unknown job names, arbitrary error classes and top-level fence error/reason fields, including controls and token-shaped input",
+    "Bound output with 400 unknown jobs; retain unknown-job ungraded semantics instead of inventing cadence rules",
+    "Ignore arbitrary extra fields in successful output and evidence; retain seven supported error classes and null",
+    "Preserve clean ready, truthful parked, --expect-ready, duplicate-key refusal, body cap, GET-only transport and no redirects",
+    "Discoverable machine output, repeated stable codes, JSON ready/parked/malformed round trips and success-only evidence"
+  ],
+  "builder_handoff": [
+    "Consume the immutable published acceptance head; keep the protected file byte-identical. Acceptance corrections return to the test author.",
+    "Implement only the paired probe behavior; update docs/runbook.md:61-70 (the short probe guide) and unprotected offline tests in the combined passing PR.",
+    "Existing unprotected fixtures use noncanonical r/b and abc123/42 identities and one expects raw unknown-job names. Update those fixtures/expectations to supported identities and redacted counts without weakening parked, cadence or success-attestation policy.",
+    "Keep body cap, timeout, duplicate-key rejection, no redirects, GET-only and readiness policy; no live invocation, new credential source, endpoint, production-affecting flag or deployment.",
+    "No product code or guide changes were made by the test author. Full required CI, independent review and controller auto-merge belong to the Builder's combined passing PR."
+  ],
+  "skills_used": ["paperclip", "paperclip-superpowers-adapter", "test-driven-development", "verification-before-completion"]
+}

@@ -1,10 +1,12 @@
-//! HTTP surface: liveness `/health`, readiness `/readyz`.
+//! HTTP surface: liveness `/health`, readiness `/readyz`, identity `/version`.
 //!
 //! The Container supervisor polls these; the DO keepalive (wrangler/)
 //! forwards them so an idle container still renews its activity timeout.
 //! `/health` is always 200 when the process answers. `/readyz` is 200 only
 //! when every component reports ready, else 503 with the per-component
-//! breakdown — never a bare error string.
+//! breakdown — never a bare error string. `/version` is always 200 with the
+//! stamped build identity, so a deploy records what it serves without
+//! judging readiness.
 
 use std::sync::{atomic::AtomicBool, Arc};
 
@@ -124,6 +126,7 @@ pub(crate) fn router_with_guard(
         .route("/health", get(health))
         .route("/healthz", get(health))
         .route("/readyz", get(readyz))
+        .route("/version", get(version))
         // Backfill progress reads the same TWO_INTERNAL_KEYS ring as the
         // internal-action receiver, over its own path-bound signature. Merged
         // before `with_state` (unlike the stateless metrics route below): the
@@ -175,10 +178,11 @@ pub(crate) fn router_with_guard(
 /// Routes the public listener serves; the only paths a span may record.
 /// Keep in sync with `router_with_guard`, `metrics_http::router_with_guard`
 /// `ops_backfill::router` and `ops_http::router_with_state`.
-const TRACED_PATHS: [&str; 9] = [
+const TRACED_PATHS: [&str; 10] = [
     "/health",
     "/healthz",
     "/readyz",
+    "/version",
     "/metrics",
     "/ops/summary",
     "/ops/gateway",
@@ -241,6 +245,7 @@ pub(crate) struct ReadinessReport {
     pub(crate) gateway_failure: Option<GatewayFailure>,
     pub(crate) build_revision: &'static str,
     pub(crate) build_id: &'static str,
+    pub(crate) deploy_id: &'static str,
 }
 
 /// Shared readiness computation for `/readyz` and the read-only `/ops`
@@ -274,6 +279,7 @@ pub(crate) async fn readiness(
             gateway_failure: state.failure.get(),
             build_revision: option_env!("BOT_BUILD_REVISION").unwrap_or("unknown"),
             build_id: option_env!("BOT_BUILD_ID").unwrap_or("unknown"),
+            deploy_id: option_env!("BOT_DEPLOY_ID").unwrap_or("unknown"),
         },
     )
 }
@@ -287,6 +293,24 @@ async fn readyz(
 ) -> (StatusCode, Json<ReadinessReport>) {
     let (code, report) = readiness(&state, &jobs, guard.snapshot().token_invalid).await;
     (code, Json(report))
+}
+
+/// Stamped build identity, always 200: deploy records read what serves
+/// without judging readiness. Field names match the deploy record (`sha` is
+/// the full commit, the same value `/readyz` calls `build_revision`).
+#[derive(serde::Serialize)]
+pub(crate) struct VersionReport {
+    pub(crate) deploy_id: &'static str,
+    pub(crate) sha: &'static str,
+    pub(crate) build_id: &'static str,
+}
+
+async fn version() -> Json<VersionReport> {
+    Json(VersionReport {
+        deploy_id: option_env!("BOT_DEPLOY_ID").unwrap_or("unknown"),
+        sha: option_env!("BOT_BUILD_REVISION").unwrap_or("unknown"),
+        build_id: option_env!("BOT_BUILD_ID").unwrap_or("unknown"),
+    })
 }
 
 /// The staging drill injection reports the real `gateway` component down:
@@ -558,6 +582,7 @@ mod tests {
             ("/health", "/health"),
             ("/healthz", "/healthz"),
             ("/readyz", "/readyz"),
+            ("/version", "/version"),
             ("/metrics", "/metrics"),
             ("/ops/summary", "/ops/summary"),
             ("/ops/gateway", "/ops/gateway"),
@@ -565,6 +590,7 @@ mod tests {
             ("/ops/backfill/progress", "/ops/backfill/progress"),
             ("/ops/summary?token=fixture-query-secret", "/ops/summary"),
             ("/readyz?token=fixture-query-secret", "/readyz"),
+            ("/version?token=fixture-query-secret", "/version"),
             ("/health?key=fixture-query-secret", "/health"),
             ("/api/webhooks/1/fixture-webhook-token", "[REDACTED]"),
             ("/api/WebHooks/1/fixture-webhook-token", "[REDACTED]"),
@@ -607,13 +633,14 @@ mod tests {
             "fixture-header-secret",
             "fixture-encoded-token",
         ];
-        let cases: [(&str, StatusCode); 16] = [
+        let cases: [(&str, StatusCode); 17] = [
             (
                 "/readyz?token=fixture-query-secret",
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             ("/health?key=fixture-query-secret", StatusCode::OK),
             ("/healthz", StatusCode::OK),
+            ("/version?token=fixture-query-secret", StatusCode::OK),
             // Private EventSub callback: the public listener 404s and the
             // span carries the marker, never the path.
             ("/hooks/twitch", StatusCode::NOT_FOUND),
@@ -687,13 +714,22 @@ mod tests {
         );
         assert!(text.contains("span request"), "http trace span missing");
         assert!(text.contains("http.request.method=GET"), "method missing");
-        for known in ["/health", "/healthz", "/readyz", "/metrics", "/ops/summary"] {
+        for known in [
+            "/health",
+            "/healthz",
+            "/readyz",
+            "/version",
+            "/metrics",
+            "/ops/summary",
+        ] {
             assert!(
                 text.lines().any(|line| {
                     line.split_whitespace()
                         .any(|field| field == format!("http.request.path={known}"))
                 }),
-                "known route missing"
+                // Naming the expected route is safe: it comes from this
+                // static list, never from the captured trace data.
+                "known route missing: {known}"
             );
         }
         let spans = text
@@ -809,6 +845,10 @@ mod tests {
                 option_env!("BOT_BUILD_ID").unwrap_or("unknown")
             );
             assert_eq!(
+                json["deploy_id"],
+                option_env!("BOT_DEPLOY_ID").unwrap_or("unknown")
+            );
+            assert_eq!(
                 json["components"][1],
                 serde_json::json!(["gateway", gateway.status()])
             );
@@ -831,6 +871,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn version_reports_the_stamped_identity_without_judging_readiness() {
+        // Unconfigured gateway, no database: /readyz would be 503, but the
+        // identity endpoint still answers what this build is.
+        let response = router(state(GatewayState::Unconfigured))
+            .oneshot(
+                Request::builder()
+                    .uri("/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["deploy_id"],
+            option_env!("BOT_DEPLOY_ID").unwrap_or("unknown")
+        );
+        assert_eq!(
+            json["sha"],
+            option_env!("BOT_BUILD_REVISION").unwrap_or("unknown")
+        );
+        assert_eq!(
+            json["build_id"],
+            option_env!("BOT_BUILD_ID").unwrap_or("unknown")
+        );
     }
 
     #[tokio::test]

@@ -15,15 +15,17 @@
 
 use two_bot_cutover::cli::{open_db, require_guild, Args};
 use two_bot_cutover::{
-    is_snowflake, parse_mee6_role_rewards, parse_roles_snapshot, plan_reward_role_import,
-    role_rewards,
+    is_snowflake, over_cap_message, parse_mee6_role_rewards, parse_roles_snapshot,
+    plan_reward_role_import, read_string_capped, role_rewards, IntakeReadError,
 };
 
 fn usage() -> ! {
     eprintln!(
         "Usage: levels-import-rewards-probe --guild <snowflake> --file <export.json>\n           --roles <roles.json> --bot-id <snowflake> [--owner-id <snowflake>]\n           [--report <path>] [--require-all-mapped] [--no-db] [--allow-live-guild]\n\
          \nReads the role_rewards section of a MEE6 export and reports which rewards map onto\n\
-         roles the bot can actually grant in the target guild. Writes nothing, ever."
+         roles the bot can actually grant in the target guild. Writes nothing, ever.\n\
+         Intake caps: neither file may exceed 8 MiB (exit 1, before any parse) and the\n\
+         export must carry at most 50,000 rewards; problems truncate after 100 with a receipt."
     );
     std::process::exit(2);
 }
@@ -53,9 +55,13 @@ async fn main() {
     let file_path = required(&args, "file");
     let roles_path = required(&args, "roles");
 
-    let export_text = match std::fs::read_to_string(&file_path) {
+    let export_text = match read_string_capped(&file_path) {
         Ok(t) => t,
-        Err(e) => {
+        Err(IntakeReadError::OverCap) => {
+            eprintln!("{}", over_cap_message("MEE6 export"));
+            std::process::exit(1);
+        }
+        Err(IntakeReadError::Unreadable(e)) => {
             eprintln!("cannot read {file_path}: {e}");
             std::process::exit(2);
         }
@@ -67,9 +73,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let roles_text = match std::fs::read_to_string(&roles_path) {
+    let roles_text = match read_string_capped(&roles_path) {
         Ok(t) => t,
-        Err(e) => {
+        Err(IntakeReadError::OverCap) => {
+            eprintln!("{}", over_cap_message("roles snapshot"));
+            std::process::exit(1);
+        }
+        Err(IntakeReadError::Unreadable(e)) => {
             eprintln!("cannot read {roles_path}: {e}");
             std::process::exit(2);
         }

@@ -1,6 +1,38 @@
 #![cfg(test)]
 //! Builder-owned live settings, boot refusal and no-effect regression tests.
 
+use crate::hotpath_settings_test_support as hotpath_scope;
+
+// Independently catches a global snapshot on cold refresh and a global poll
+// count on warm refresh, through the actual runtime (not a store-only call).
+#[tokio::test]
+async fn containment_worker_hotpath_settings_reads_are_guild_scoped() {
+    use hotpath_scope::queries::Queries;
+    let key = "TWO_ANTI_NUKE_HEAT_THRESHOLD";
+    let db = hotpath_scope::database(key).await;
+    let mut source = StoreSettings::new(db.pool().clone(), 22, vars(&[(key, "7")]));
+    source.max_age = Duration::ZERO;
+    let (cold, reads) = Queries::capture(source.try_current()).await;
+    assert_eq!(cold.unwrap().heat_threshold, 3);
+    hotpath_scope::assert_reads(&reads, Some(2), true);
+    let (warm, reads) = Queries::capture(source.try_current()).await;
+    assert_eq!(warm.unwrap().heat_threshold, 3);
+    hotpath_scope::assert_reads(&reads, None, true);
+    let store = SettingsStore::new(db.pool());
+    store
+        .set("22", key, Some(serde_json::json!(5)), "fixture")
+        .await
+        .unwrap();
+    let (changed, reads) = Queries::capture(source.try_current()).await;
+    assert_eq!(changed.unwrap().heat_threshold, 5);
+    hotpath_scope::assert_reads(&reads, Some(2), true);
+    store.set("22", key, None, "fixture").await.unwrap();
+    let (fallback, reads) = Queries::capture(source.try_current()).await;
+    assert_eq!(fallback.unwrap().heat_threshold, 7);
+    hotpath_scope::assert_reads(&reads, Some(1), true);
+    db.close().await.unwrap();
+}
+
 use super::*;
 use crate::tuning_test_support as support;
 use support::{closed_pool, snapshot, vars, Capture, GUILD, SENTINEL};
@@ -198,6 +230,7 @@ async fn refused_worker_does_not_claim_alert_or_remove_roles() {
                     bot_user_id: "999".into(),
                     armed,
                     entries,
+                    shutdown: Arc::new(crate::raid_runtime::WorkerShutdown::default()),
                 };
                 let entry = AuditLogObservation {
                     guild_id: GUILD,
@@ -280,7 +313,14 @@ async fn malformed_cold_lists_refuse_boot_before_identity_or_effects() {
                 AntiNukeFences::from_vars(&input, guild).armed,
                 "positive arming control"
             );
-            assert!(start_from_vars(closed_pool().await, executor, guild, &input).is_none());
+            assert!(start_from_vars(
+                closed_pool().await,
+                executor,
+                guild,
+                &input,
+                tokio::sync::watch::channel(false).1
+            )
+            .is_none());
             support::assert_no_discord(&trap);
         }
         // Disabled fences stay disabled; malformed lists grant no activation.
@@ -289,7 +329,8 @@ async fn malformed_cold_lists_refuse_boot_before_identity_or_effects() {
             closed_pool().await,
             executor,
             guild,
-            &vars(&[(TRUSTED_KEY, SENTINEL)])
+            &vars(&[(TRUSTED_KEY, SENTINEL)]),
+            tokio::sync::watch::channel(false).1
         )
         .is_none());
         support::assert_no_discord(&trap);
@@ -313,4 +354,60 @@ async fn malformed_cold_lists_refuse_boot_before_identity_or_effects() {
         .iter()
         .all(|record| record.fields["message"].contains("containment_tuning_refused")));
     assert!(!format!("{records:?}").contains(SENTINEL));
+}
+
+#[tokio::test]
+async fn production_vars_constructor_defaults_to_dry_run_and_joins_with_live_observer() {
+    if support::isolated_log_test() {
+        return;
+    }
+    let logs = Capture::default();
+    async {
+        let guild = two_bot_cutover::STAGING_GUILD_ID
+            .parse()
+            .expect("staging fence ID");
+        let (executor, mock) = support::containment_identity().await;
+        let (shutdown, stopping) = tokio::sync::watch::channel(false);
+        // No explicit dry-run override: the production default must install
+        // observation without arming role removals. Only startup identity
+        // GETs can run; no events are queued for DB-dependent processing.
+        let (observer, mut supervisor) = start_from_vars(
+            closed_pool().await,
+            executor,
+            guild,
+            &vars(&[("TWO_ANTI_NUKE", "1")]),
+            stopping,
+        )
+        .expect("enabled default dry-run installs a supervised observer");
+        assert!(futures_util::poll!(&mut supervisor).is_pending());
+        shutdown.send(true).expect("service shutdown");
+        tokio::time::timeout(Duration::from_secs(5), supervisor)
+            .await
+            .expect("constructor must propagate shutdown without sender-drop")
+            .expect("constructor supervisor joins cleanly");
+        let weak = Arc::downgrade(&observer);
+        drop(observer);
+        assert!(
+            weak.upgrade().is_none(),
+            "joined supervisor releases observer"
+        );
+        support::assert_only_containment_identity(mock).await;
+    }
+    .with_subscriber(logs.subscriber())
+    .await;
+    let fences: Vec<_> = logs
+        .records()
+        .into_iter()
+        .filter(|record| {
+            record
+                .fields
+                .get("message")
+                .is_some_and(|message| message.contains("containment_fences"))
+        })
+        .collect();
+    assert_eq!(fences.len(), 1, "constructor reports its actual boot fence");
+    assert_eq!(
+        fences[0].fields["armed"], "false",
+        "default is safe dry-run"
+    );
 }

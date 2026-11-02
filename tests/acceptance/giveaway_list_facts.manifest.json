@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected tests-only handoff for complete private active-giveaway lists with honest saved destinations and deadlines",
+  "sourceBaseline": "92d85042527b756062bfc9e19c8d77aed0cee0b3",
+  "baseCommit": "5db6ecccd7c67202ecea6d76f9ae65ceab2e3654",
+  "branch": "test/giveaway-list-facts-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/bot/src/giveaway_list_facts_acceptance_tests.rs",
+      "sha256": "37d70774d4dea54fa80b2fc541d529aebbac3fbcc3923ee19e06508862c4573c",
+      "tests": 9
+    }
+  ],
+  "registration": {
+    "path": "crates/bot/src/command_runtime_tests.rs",
+    "change": "Only the two-line path/module registration for giveaway_list_facts_acceptance_tests is added. Preserve all existing tests and registrations; do not replace this shared file with an older copy."
+  },
+  "commands": {
+    "acceptance": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot giveaway_list_facts_acceptance_tests:: -- --nocapture --test-threads=1",
+    "existingGiveawayControls": "TWO_GATEWAY_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/agent_test python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot giveaway_create_entry_acceptance_tests:: -- --include-ignored --nocapture --test-threads=1",
+    "references": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs --test registry_golden",
+    "workspace": "python3 scripts/cargo_cache.py run -- test --workspace --locked",
+    "format": "cargo fmt --all -- --check",
+    "floor": "python3 scripts/ci/check-floor-guard.py --base-ref 5db6ecccd7c67202ecea6d76f9ae65ceab2e3654",
+    "inventory": "python3 scripts/ci/check-test-inventory.py",
+    "verifyHashes": "python3 -c 'import hashlib,json,pathlib; m=json.loads(pathlib.Path(\"tests/acceptance/giveaway_list_facts.manifest.json\").read_text()); checks={f[\"path\"]: hashlib.sha256(pathlib.Path(f[\"path\"]).read_bytes()).hexdigest()==f[\"sha256\"] for f in m[\"protectedFiles\"]}; print(json.dumps(checks,sort_keys=True)); assert all(checks.values())'"
+  },
+  "database": {
+    "environment": "TWO_TEST_DATABASE_URL",
+    "localValue": "postgres://agent_test:@agent-testdb:5432/two_bot_test_local",
+    "fixture": "two_bot_testsupport::TestDatabase with cutover migrations; explicit close drops only the owned disposable database",
+    "missingEnvironment": "Fails explicitly; no ignored or silently skipped new acceptance cases",
+    "ciRoute": "check.yml workspace lib/bins step already supplies the guarded test bootstrap; the module is a child of command_runtime_tests",
+    "safety": "Disposable test database and loopback Discord boundary double only; no application credentials, staging, production or live Discord"
+  },
+  "testMatrix": [
+    {"test": "recorded_open_row_exposes_saved_destination_message_and_local_deadline", "baselineExpected": "RED", "contract": "Stable ID, unchanged short prize, saved destination, exact recorded message link, running state, localized stored deadline and saved-not-observed wording"},
+    {"test": "pending_message_is_explicit_and_never_fabricates_a_message_link", "baselineExpected": "RED", "contract": "Saved destination survives an unconfirmed message; explicit unknown/pending state and no fabricated message link; a channel-only destination link is allowed"},
+    {"test": "omitted_destination_detail_is_explicit_not_an_empty_list_or_invented_link", "baselineExpected": "RED", "contract": "Missing saved display detail remains distinguishable from an empty list and does not fabricate a link"},
+    {"test": "paused_row_has_no_live_deadline_countdown", "baselineExpected": "RED", "contract": "Explicit paused and saved-state wording, destination retained, no relative timestamp or running-countdown claim"},
+    {"test": "ten_hostile_unicode_prizes_keep_every_id_and_complete_facts_reachable", "baselineExpected": "RED", "contract": "Ten 64-byte IDs and valid long astral/mention/backtick/newline prizes, mixed recorded/pending and paused/open rows, foreign-guild sentinel, bounded complete replies, explicit prize elision, whole-row facts and no silent quota loss"},
+    {"test": "empty_control_is_private_read_only_and_distinct_from_unavailable", "baselineExpected": "PASS", "contract": "Foreign-only fixture is honestly empty, never disclosed or unavailable"},
+    {"test": "unavailable_control_never_masquerades_as_empty_or_leaks_storage_details", "baselineExpected": "PASS", "contract": "Real local SQL read-name failure yields safe unavailable response, no empty success, details or mutations"},
+    {"test": "authority_and_activation_controls_refuse_without_disclosure_or_effects", "baselineExpected": "PASS", "contract": "Denied/missing staff permissions and disabled feature preserve private refusals; absent/foreign guild preserve the existing silent Ignore fence; no stored-detail disclosure or effects"},
+    {"test": "repeated_list_control_never_spends_entry_budget_or_changes_saved_state", "baselineExpected": "PASS", "contract": "Twelve same-actor lists leave saved state unchanged and preserve the actual subsequent entry consumer's budget"}
+  ],
+  "sharedOracles": [
+    "Real CommandRuntime dispatch, router, SQL persistence and reply executor; only Discord transport is doubled.",
+    "Every captured list effect is its own private interaction callback, completion or explicit bounded private continuation; no channel/message REST reads, public sends or other effects.",
+    "Each complete visible reply is at most 2000 UTF-16 units, valid Unicode and mention-suppressed. At most three automatically returned messages; multi-message continuation must be explicit. Each giveaway is one complete row.",
+    "Full definitions/entries/draws/automation-audit snapshots preserve every field including nonce, claim, pause and scheduling timestamps. Nontransactional statement-trigger witnesses detect even rolled-back, restored or failed write attempts.",
+    "Prizes and IDs intentionally do not contain the state words asserted by their single-row oracle. Expectations are literal fixture facts, not derived by production renderers."
+  ],
+  "handoff": [
+    "Expected statuses are a test matrix, not execution evidence. Cache refusal and compilation failures are not behavior-specific RED. Observed output and immutable head are recorded in the issue handoff report.",
+    "Consume the published exact commit in the implementation task's isolated workspace without switching or repointing its harness branch. Preserve the protected file byte-for-byte and verify this manifest. Test corrections belong to the Test Author.",
+    "Do not merge deliberately failing tests alone. The implementation owner supplies combined exact-head GREEN, independent review and squash auto-merge.",
+    "Existing create/entry, delivery cleanup, inspect/preview, lifecycle decoder and audit work remain untouched. The only shared-file change is additive test module registration.",
+    "No eligibility, winner policy, quotas, new commands, activation, deployment, production testing, migrations or scheduler/claim/nonce/audit behavior change is authorized by this fixture."
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "supported_protocol_versions": ["2025-06-18", "2025-03-26"],
+  "initialize_result": {
+    "protocolVersion": "2025-06-18",
+    "capabilities": {"tools": {}},
+    "serverInfo": {"name": "two-bot-next-mcp", "version": "0.1.0"}
+  },
+  "tools_result": {
+    "tools": [
+      {
+        "name": "get_status",
+        "description": "Bot status (container /health, read-only)",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+      },
+      {
+        "name": "get_gateway",
+        "description": "Gateway connection state excerpt from /readyz (read-only)",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+      },
+      {
+        "name": "get_backfill_progress",
+        "description": "Backfill jobs excerpt from /readyz (phase 1: implemented=false; no backfill JSON API yet)",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+      },
+      {
+        "name": "get_config",
+        "description": "Redacted non-secret Worker config snapshot (read-only, never secrets)",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+      },
+      {
+        "name": "get_audit",
+        "description": "Bounded redacted audit excerpt from /ops/audit (read-only, newest 50 rows)",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+      }
+    ]
+  }
+}

@@ -20,7 +20,8 @@ PINNED_SECTIONS = (
     (PROD_DOC, "## 48-hour watch log"),
 )
 
-EXPECTED_FLAGS = ("--checkpoint", "--expected-sha", "--expected-build-id", "--production-url")
+EXPECTED_FLAGS = ("--checkpoint", "--expected-sha", "--expected-build-id", "--production-url",
+                    "--format")
 EXPECTED_CHECKPOINTS = ("+15m", "+1h", "+6h", "+24h", "+48h")
 FLAG_RE = re.compile(r"--[a-z0-9][a-z0-9-]*")
 ARG_RE = re.compile(r'add_argument\(\s*"(--[^"]+)"')
@@ -99,12 +100,12 @@ class WatchCheckpointDocConformanceTests(unittest.TestCase):
                                 "both operator docs must pin an invocation block")
         code_flags = script_flags()
         self.assertEqual(tuple(code_flags), EXPECTED_FLAGS,
-                         "script argparse must keep exactly the four documented flags")
+                         "script argparse must keep exactly the five documented flags")
         for doc_name, block in blocks:
             with self.subTest(doc=doc_name):
                 doc_flags = flags_in_order(block)
                 self.assertEqual(tuple(doc_flags), EXPECTED_FLAGS,
-                                 f"{doc_name} invocation must list the four flags "
+                                 f"{doc_name} invocation must list the five flags "
                                  "in argparse order")
                 check_invocation(doc_flags, code_flags)
 

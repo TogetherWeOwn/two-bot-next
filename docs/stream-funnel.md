@@ -217,9 +217,9 @@ four values.
   401, never a 500.
 - Echoes `Delivery::Challenge` as `200 text/plain`; acknowledges
   `Revocation`, `Ignored` and deterministic classification
-  errors (`WrongSubscription`, `InvalidBody`) as `200 {"ok":true}` so Twitch
-  does not retry what will never succeed. A verified `Notification` is
-  acknowledged the same way while no delivery dependencies are injected;
+  errors (`WrongSubscription`, `InvalidBody`, `DuplicateKeys`) as `200 {"ok":true}`
+  so Twitch does not retry what will never succeed. A verified `Notification`
+  is acknowledged the same way while no delivery dependencies are injected;
   with them, it runs `deliver_go_live` and answers its disposition (200, or
   a retryable 503 after a transient ledger/send failure).
 - Answers `400` for a malformed challenge, `401` for a missing or mismatched
@@ -245,7 +245,7 @@ four values.
   absent and rotation stays disarmed. The delivery gate and its channel/invite
   inputs travel on their own explicit lines inside that forward, only while
   `TWO_EVENTSUB_DELIVERY` is exactly `"1"`.
-  `scripts/check-env-bindings.py` rejects any `TWO_EVENTSUB*` or
+  `wrangler/scripts/check-env-bindings.py` rejects any `TWO_EVENTSUB*` or
   `TWO_TWITCH_*` var in `wrangler.toml`.
 
 ## Helix client with app-token refresh

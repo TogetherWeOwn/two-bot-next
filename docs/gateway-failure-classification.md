@@ -58,8 +58,8 @@ fails, or `token_invalid` is latched (`server.rs`, `readiness_report` and
 `with_token_state`). So `container_unready_alert` observes every sustained
 outage of those three components, whatever else also fires. The classifier
 column names the rule that owns the cause. Where another rule owns the cause,
-the unready streak is a registered companion in §4 (O2, O6, O7); where nothing
-else can see the mode, it is the classifier (F5, F6, F7, F10).
+the unready streak is a registered companion in §4 (O2, O6, O7, O8); where nothing
+else can see the mode, it is the classifier (F5, F6, F10).
 
 | # | Failure mode | Exactly one classifier | Why this one |
 |---|--------------|------------------------|--------------|
@@ -69,7 +69,7 @@ else can see the mode, it is the classifier (F5, F6, F7, F10).
 | F4 | Checkpoint commit failure, `stage="commit"` (durable store write failed) | `gateway_checkpoint_failures` | Same rule as F3 by construction (summed counters). First response differs (correlate DB-error/pool alerts — a `commit` failure next to them points at the database), but the classifier is one. |
 | F5 | Gateway parked: prerequisites missing, shard never runs (`Unconfigured`→down) | `container_unready_alert` (readiness observer) | No counter ever baselines, so no metrics rule can fire; the unready streak is the only signal. First sample is baseline-only by design. |
 | F6 | Gateway `Armed` since boot with the post-connect handshake stalled and no error on record (no HELLO/READY yet, no disconnect growth; rare) | `container_unready_alert` | Same as F5: no disconnect growth, so F1 stays silent and no counter rule has a window to baseline. A first-boot connect that fails is F1, not F6: it goes through `transport_disconnected` and grows the disconnect counter like any reconnect. A `checkpoint_io` wait is not persistent either: it is bounded to `CHECKPOINT_IO_MAX` (5 s) and its timeout is fatal (F3/F4/F10/F11). |
-| F7 | Bot-token refusal latched (`token_invalid`→down, fatal until restart) | `container_unready_alert` (readiness observer) | The latch forces `/readyz` to 503 until restart (`with_token_state`), so the unready streak pages about 10 samples in, as for F5. Auth rejection is neither transport loss nor a gap, so no metrics rule applies: `two_bot_rest_guard_token_invalid` is exposed but no rule in `alert-rules.ts` consumes it. |
+| F7 | Bot-token refusal latched (`token_invalid`→down, fatal until restart) | `rest_token_invalid` (metrics rule; `container_unready_alert` follows) | The latch forces `/readyz` to 503 until restart (`with_token_state`), and the metrics rule pages on the first valid latched sample with the credential-death attribution; the unready streak still pages about 10 samples in as the liveness companion, as for F5. |
 | F8 | Database unreachable/down (`database`→down while gateway stays up) | `db_errors` / `db_pool_saturated` (DB rules, not gateway rules) | The `database` component is independent of the `gateway` component by contract. A `commit`-stage checkpoint failure coinciding with DB alerts is triaged as a database incident. A sustained outage also fails the 2 s ping in `/readyz` with the gateway still `Connected`, so `container_unready_alert` follows the DB rules about 10 samples in (O7). |
 | F9 | Dispatch-lane saturation / per-member fairness refusal | `dispatch_drops:<lane>` (ticket) | Local admission pressure only. Must never be read as gateway loss; the rule text says so. |
 | F10 | Startup init failures before the shard runs (`store_unavailable`, `gateway_pool_connect_failed`, `checkpoint_load_failed`, `onboarding_gates_invalid`, `onboarding_init_failed`, `custom_commands_init_failed`, `milestones_load_failed`, `automod_config_invalid`, `automod_executor_failed`, `raid_executor_failed`) | `container_unready_alert` (readiness observer) | All ten are fatal before any session exists: the process serves `gateway_failure` for 15 s, then exits. No metrics baseline exists, so no counter rule fires. The `gateway_failure` class names the cause; the unready streak pages the liveness. DB-adjacent members of this set (`gateway_pool_connect_failed`, `checkpoint_load_failed`) triage against DB alerts but do not fire gateway rules. |
@@ -143,12 +143,11 @@ intended signal, not a defect. No threshold or logic change follows.
 | O5 | F4 (`commit`) + DB-error/pool alerts on a database outage | Both fire, but ownership is explicit: the combination points at the database, and the fix belongs to the DB path, not the gateway. No suppression either way — the coincidence is itself the diagnosis. |
 | O6 | F1 + `container_unready_alert` on a transport loss that never recovers | Every loss sets the gateway `Armed` (`transport_disconnected`), so `/readyz` is 503 until a RESUMED or fresh READY restores `Connected`. F1 pages at about 3 samples with "did it come back"; the unready streak confirms the outage at about 10 samples. The same streak is separately the classifier for the handshake-stalled `Armed` case with no disconnect growth (F6). Different latencies, and the unready alert needs no counter baseline. No suppression either way. |
 | O7 | F8 DB rules + `container_unready_alert` on a sustained database outage | The 2 s database ping is part of `/readyz`, so a database outage turns readiness 503 even while the gateway stays `Connected`. The DB rules name the cause; the unready streak observes the lost readiness about 10 samples in, the same split as O2. |
+| O8 | F7 `rest_token_invalid` + `container_unready_alert` on a latched bot token | The metrics rule pages on the first valid latched sample with the credential-death attribution; the unready streak confirms the liveness loss about 10 samples in, the same cause-plus-observer split as O2/O6. |
 
 Rejected (not an overlap): `dispatch_drops` never joins any combination
-above as gateway evidence; `token_invalid` (F7) has no metrics rule by
-design and is owned by the unready streak alone, so it is a classifier and
-not an overlap; startup classes (F10) stay metrics-silent because there is
-no baseline to compare against.
+above as gateway evidence; startup classes (F10) stay metrics-silent because
+there is no baseline to compare against.
 
 ## 5. Reviewer approval
 

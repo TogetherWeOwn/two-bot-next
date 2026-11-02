@@ -8,7 +8,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 const NEW: &str = "2026-02-02T00:00:00Z";
 
-fn row(code: &str, uses: i64) -> CounterRow {
+fn row(code: &str, uses: u64) -> CounterRow {
     CounterRow {
         code: code.to_owned(),
         uses,

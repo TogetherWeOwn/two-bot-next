@@ -116,6 +116,19 @@ test("hostile settings-map typo keys stay test-only and never reach the Containe
   assert.deepEqual(containerEnv(env), { LISTEN_ADDR: "0.0.0.0:8080" });
 });
 
+test("restore-drill inputs stay host-only and never reach the Container", () => {
+  const env = {
+    TWO_RESTORE_DRILL_BOOTSTRAP_URL: "synthetic-bootstrap-value",
+    TWO_RESTORE_DRILL_EVIDENCE_DIR: "/synthetic/drill-evidence",
+    TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S: "172800",
+  };
+  for (const name of Object.keys(env)) {
+    assert.match(NOT_FORWARDED[name] ?? "", /host backup\/restore timer input/, name);
+  }
+  assert.deepEqual(forwardedFlagVars(env), {});
+  assert.deepEqual(containerEnv(env), { LISTEN_ADDR: "0.0.0.0:8080" });
+});
+
 test("the existing 4 Container vars are unchanged and cannot be overridden", () => {
   const base = {
     DISCORD_TOKEN: "synthetic-discord-token",

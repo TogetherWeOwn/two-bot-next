@@ -5,7 +5,7 @@ Display/Debug chain can carry connection URLs and statement detail, and
 several store wrappers embed one (`feed store database error: {0}`).
 `crates/bot/src/db_log.rs` classifies every in-scope failure to a fixed
 token; this lint rejects new `error = %err`-style sites (and the `%error`
-shorthand) in the four converted files so the next failure log reaches for
+shorthand) in the five converted files so the next failure log reaches for
 a helper instead of formatting the error.
 
 It is a name-based tripwire, not a proof: it matches the field and variable
@@ -28,6 +28,7 @@ SCOPED_FILES = [
     "crates/bot/src/schedule_runtime.rs",
     "crates/bot/src/scheduled_jobs.rs",
     "crates/bot/src/main.rs",
+    "crates/bot/src/moderation_recent_command.rs",
 ]
 
 # `error = %err`, `error=%error`, `error = ?err` — any raw error value in the
@@ -105,6 +106,10 @@ class DbErrorLintTests(unittest.TestCase):
                 "discord_class",
             ],
             "crates/bot/src/scheduled_jobs.rs": ["db_class"],
+            "crates/bot/src/moderation_recent_command.rs": [
+                "db_class",
+                "discord_class",
+            ],
         }
         for rel, helpers in expectations.items():
             source = (ROOT / rel).read_text()

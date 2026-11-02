@@ -1,5 +1,10 @@
 //! Real shard + runtime composition, with only loopback Discord traffic and
 //! the parent's guarded, isolated TestDb. All database tests are opt-in.
+#[path = "feed_list_pages_acceptance.rs"]
+mod feed_list_pages_acceptance;
+#[path = "help_detail_snapshot_acceptance.rs"]
+mod help_detail_snapshot_acceptance;
+
 use super::*;
 
 use std::collections::HashMap;
@@ -479,7 +484,9 @@ async fn help_tracks_confirmed_ready_add_and_remove_publications() {
     gateway.stop().await;
     rest.shutdown().await;
     drop(runtime);
+    let detail = help_detail_snapshot_acceptance::capture(&db).await;
     db.close().await;
+    detail.assert_expected();
 }
 
 #[tokio::test]

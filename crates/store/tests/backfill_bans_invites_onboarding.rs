@@ -444,7 +444,7 @@ async fn apply_ban_page(
 // family path — then blocklisted users skip per-user rows while aggregates
 // keep counting them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22952"]
 async fn bans_fetch_applies_blocklist_and_counts_everyone() {
     let page = serde_json::json!([
         ban_entry("111111111111111111", "spam"),
@@ -513,7 +513,7 @@ async fn bans_fetch_applies_blocklist_and_counts_everyone() {
 // (1+3) Invite metadata through the observed client persists as
 // ids/timestamps/counts only: codes, snowflakes, uses caps and stamps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22952"]
 async fn invite_rows_hold_metadata_only() {
     let invites = serde_json::json!([
         {"code": "abc123", "uses": 7, "max_uses": 10, "created_at": "2026-09-01T10:00:00.000Z",
@@ -601,7 +601,7 @@ async fn invite_rows_hold_metadata_only() {
 // only: prompt ids, prompt types, toggles and option counts — never prompt
 // titles, descriptions or response text (privacy tripwire).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22952"]
 async fn onboarding_rows_hold_ids_enums_metadata_only() {
     let onboarding = serde_json::json!({
         "guild_id": GUILD,
@@ -733,7 +733,7 @@ async fn onboarding_rows_hold_ids_enums_metadata_only() {
 // the bans page after the restart starts from the persisted after-cursor
 // (never from zero) and re-ingesting never duplicates per-user rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22952"]
 async fn bans_invites_onboarding_resume_continues_from_persisted_cursors() {
     let bans_p1 = serde_json::json!([
         ban_entry("111111111111111111", "spam"),

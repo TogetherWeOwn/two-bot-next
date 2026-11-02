@@ -6,6 +6,9 @@
 #[allow(dead_code)]
 mod common;
 
+#[path = "support/invalid_saved_templates_acceptance.rs"]
+mod invalid_saved_templates_acceptance;
+
 use std::sync::Arc;
 
 use common::{MockRest, ScriptedResponse};
@@ -1077,7 +1080,7 @@ async fn manage_save_remove_absent_replies_are_pinned() {
 #[tokio::test]
 #[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn manage_registry_publish_failure_suffix_is_pinned() {
-    const SUFFIX: &str = "Registry publication failed; the command picker is not yet synchronized.";
+    const SUFFIX: &str = "Registry publication failed; the command picker is not yet synchronized. Synchronization is pending and will resync automatically on the next publication; no further action is needed.";
     let pool = test_pool().await;
     let mock = MockRest::start(
         vec![

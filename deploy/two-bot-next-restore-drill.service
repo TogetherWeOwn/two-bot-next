@@ -23,9 +23,13 @@
 [Unit]
 Description=Prove the two-bot-next backups can actually be restored
 After=two-bot-next-backup.service
+OnFailure=two-bot-next-failure@%n.service
 
 [Service]
 Type=oneshot
+# Provision + migrate + restore into the scratch database; a hung drill is
+# killed after 2 hours (retained evidence stays, a later drill starts fresh).
+TimeoutStartSec=2h
 User=twobot
 Group=twobot
 WorkingDirectory=/opt/two-bot-next
@@ -34,12 +38,36 @@ EnvironmentFile=/etc/two-bot-next/restore-drill.env
 StateDirectory=two-bot-next-restore-drills
 StateDirectoryMode=0700
 Environment=TWO_RESTORE_DRILL_EVIDENCE_DIR=/var/lib/two-bot-next-restore-drills
+# Newest archive must be younger than this (48 h: one missed nightly run).
+Environment=TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S=172800
 ReadWritePaths=/var/lib/two-bot-next-restore-drills
 
-# Newest backup in the directory. `set -o pipefail` so an empty directory fails
-# the unit rather than running a restore against an empty path.
+# Newest backup in the directory, refused BEFORE any database is provisioned
+# when it is missing, unreadable, or older than TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S
+# (set above; a silently stopped nightly backup must not pass against an old file).
+# It prints one JSON verdict {"verdict","code","archive_age_s"} and a refusal
+# also prints the next action to stderr and exits 1. Codes: archive_fresh,
+# archive_stale, archive_missing, archive_unreadable, archive_from_future,
+# max_age_invalid. Read-only: no archive name, path or secret is printed.
+# systemd parses this line: `%%` is a literal `%`, `\\` a literal `\`, and
+# `${` would be substituted, so the script never uses it. `set -o pipefail` so
+# an empty directory refuses rather than running a restore against an empty path.
 ExecStart=/usr/bin/bash -o pipefail -c '\
-  latest=$(ls -1t /var/backups/two-bot-next/two-funnel-*.ndjson.gz | head -1); \
+  emit() { printf "{\\"verdict\\":\\"%%s\\",\\"code\\":\\"%%s\\",\\"archive_age_s\\":%%s}\\n" "$1" "$2" "$3"; }; \
+  refuse() { emit refuse "$1" "$2"; echo "drill: refused: $3" >&2; exit 1; }; \
+  max=$TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S; \
+  case $max in \
+    ""|*[!0-9]*|0*|[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) \
+      refuse max_age_invalid null "set TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S to a positive whole number of seconds without leading zeros, at most 9 digits" ;; \
+  esac; \
+  latest=$(ls -1t /var/backups/two-bot-next/two-funnel-*.ndjson.gz 2>/dev/null | head -1) || true; \
+  [ -n "$latest" ] || refuse archive_missing null "no two-funnel archive exists; run the nightly backup service and check its journal before the drill"; \
+  mtime=$(stat -c %%Y "$latest") || refuse archive_unreadable null "the newest archive cannot be inspected; check the backup directory permissions"; \
+  head -c 1 "$latest" >/dev/null 2>&1 || refuse archive_unreadable null "the newest archive cannot be read; check the backup directory permissions and file ownership"; \
+  age=$(( $(date +%%s) - mtime )); \
+  [ "$age" -ge 0 ] || refuse archive_from_future "$age" "the newest archive is dated in the future; check the host clock and the backup directory"; \
+  [ "$age" -le "$((10#$max))" ] || refuse archive_stale "$age" "the newest archive is older than the limit, so the nightly backup has stopped; fix it (journalctl -u two-bot-next-backup) and take a fresh backup, then start the drill again"; \
+  emit pass archive_fresh "$age"; \
   echo "drill: restoring $latest into a NEW migrated scratch database"; \
   exec /opt/two-bot-next/two-bot restore-drill "$latest" --confirm-scratch'
 

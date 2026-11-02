@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "suite": "ops-dashboard browser polling lifecycle",
+  "baseline": "1f939869073cb0ced2e5d03b85e1177a8c85175d",
+  "publication_ref": "test/ops-dashboard-lifecycle-acceptance",
+  "delivery": "Intentionally RED tests-only handoff; do not merge this branch or open a failing test-only PR. Consume the immutable handoff commit in the combined implementation PR.",
+  "protected_files": [
+    {
+      "path": "wrangler/test/ops-dashboard-lifecycle-acceptance.test.ts",
+      "sha256": "3c7c6ef6e2dd7d87365d1e6a7968624c0a4a50aadeb3af0921e3222ab4e1a923"
+    },
+    {
+      "path": "wrangler/test/ops-dashboard-lifecycle-harness.ts",
+      "sha256": "fc50b4e1f010958f7fb5d214509f0540749dae7a70eab7feb31de330a19956af"
+    },
+    {
+      "path": "wrangler/test/ops-dashboard-lifecycle-browser.ts",
+      "sha256": "7f160a28e39d8629220d411dbbd03b698f349a0debe78441f0aaa090a7130ac1"
+    }
+  ],
+  "ownership": "Acceptance author owns corrections to the listed tests and harnesses. Implementation consumers must not edit or weaken them. Existing protected acceptance files are unchanged.",
+  "registration": "wrangler/package.json npm test already discovers test/*.test.ts; the new suite imports its harness. The browser fixture generator is run explicitly.",
+  "contract": {
+    "whole_poll_and_freshness_outer_bound_ms": 60000,
+    "deadline_policy": "Choose and document a fixed shorter budget/TTL within the outer bound; response headers must not restart the poll budget.",
+    "max_outstanding_transport": 2,
+    "concurrency_policy": "Two permits the existing protected two-request ordering controls. Superseded work must be aborted before outstanding work grows further; disconnect/reconnect abort old work immediately.",
+    "clock": "A fixed epoch and manually delivered repeating interval callbacks; advance() executes one-shot deadline/expiry timers chronologically. Withholding interval delivery isolates observation expiry from network errors.",
+    "late_completion": "Both abort-honouring and non-cooperative fetch/body promises are exercised; timeout and connection fencing must remain authoritative.",
+    "visible_state": "Expired/disconnected observations lose bare READY and success styling; show explicit unavailable/stale state, actionable copy and the prior observation time. A valid later report returns to fresh readiness.",
+    "preserved_controls": ["GET-only summary access", "access headers", "credential non-persistence and no logging", "HTML escaping", "report validation", "exact strict CSP hashes", "generation and sequence ordering"]
+  },
+  "verification": [
+    {
+      "command": "node --import ./wrangler/test/cloudflare-loader.mjs --test wrangler/test/ops-dashboard-lifecycle-acceptance.test.ts",
+      "observed": "19 tests: 4 passing controls, 15 intended behavioral failures; no compile or infrastructure refusal"
+    },
+    {
+      "command": "node --import ./wrangler/test/cloudflare-loader.mjs --test wrangler/test/ops-dashboard*.test.ts",
+      "observed": "96 tests: 81 pass, the same 15 new behavioral failures; existing dashboard suites remain green"
+    },
+    {
+      "command": "npm --prefix wrangler run typecheck",
+      "observed": "PASS"
+    },
+    {
+      "command": "npm --prefix wrangler test",
+      "observed": "2432 tests: 2417 pass, the same 15 new behavioral failures; zero skipped/cancelled and no other failures"
+    },
+    {
+      "command": "python3 scripts/ci/check-floor-guard.py --base-ref HEAD; python3 scripts/ci/check-test-inventory.py; git diff --check",
+      "observed": "PASS"
+    },
+    {
+      "command": "node --import ./wrangler/test/cloudflare-loader.mjs wrangler/test/ops-dashboard-lifecycle-browser.ts <run-scratch>/dashboard-lifecycle.html",
+      "observed": "Generated an offline fixture from the real Worker HTML, with its original inline script unchanged. Opened in Chromium through Playwright: 5/11 controls pass, 6 lifecycle checks fail. Hung headers and Disconnect both retain green READY (computed color rgb(0, 170, 0)); late success can still publish after the missing timeout. Real DOM recovery, obsolete-generation fencing and credential clearing/non-persistence controls pass. No network endpoint was contacted."
+    }
+  ],
+  "not_run": ["Rust compile/tests (no Rust changes)", "remote PR CI/review (no PR for a deliberately red handoff)", "production/staging/live Discord or database tests"],
+  "implementation_follow_through": "The combined passing PR also needs concise on-call guidance for deadline, freshness expiry, last-observed time and reconnect/retry. Guidance is not changed in this tests-only handoff.",
+  "skills_used": ["paperclip", "paperclip-superpowers-adapter", "test-driven-development", "verification-before-completion"]
+}

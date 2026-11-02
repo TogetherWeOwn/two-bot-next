@@ -91,6 +91,79 @@ pub fn assert_no_discord(listener: &std::net::TcpListener) {
     assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
 }
 
+/// Containment verifies both identities before it can enter its inbox loop.
+/// Serve only those GETs; any effect or other REST route fails the fixture.
+pub async fn containment_identity() -> (
+    two_bot_discord::ActionExecutor,
+    tokio::task::JoinHandle<Vec<String>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // This module is also built by the library tests, where the binary's
+    // Discord double is not available. Reuse the loopback-only trap above.
+    let (executor, listener) = no_discord();
+    let listener = tokio::net::TcpListener::from_std(listener).expect("identity listener");
+    let server = tokio::spawn(async move {
+        let mut routes = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.expect("identity connection");
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut chunk = [0; 1024];
+                let size = stream.read(&mut chunk).await.expect("identity request");
+                assert!(size > 0, "complete identity headers required");
+                request.extend_from_slice(&chunk[..size]);
+                assert!(request.len() <= 8192, "bounded fixture headers");
+            }
+            let route = std::str::from_utf8(&request)
+                .expect("HTTP fixture headers")
+                .lines()
+                .next()
+                .expect("HTTP request line")
+                .to_owned();
+            let body = match route.as_str() {
+                "GET /api/v10/applications/@me HTTP/1.1" => Some(serde_json::json!({
+                    "id": two_bot_core::backup::guild_config::STAGING_BOT_APPLICATION_ID,
+                })),
+                "GET /api/v10/users/@me HTTP/1.1" => Some(serde_json::json!({
+                    "id": "999", "bot": true, "username": "offline-bot",
+                })),
+                _ => None,
+            }
+            .expect("containment constructor must perform identity GETs only")
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("identity response");
+            stream.shutdown().await.expect("close identity connection");
+            routes.push(route);
+        }
+        routes
+    });
+    (executor, server)
+}
+
+pub async fn assert_only_containment_identity(server: tokio::task::JoinHandle<Vec<String>>) {
+    let mut routes = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("identity fixture completes")
+        .expect("identity fixture accepts only safe GETs");
+    routes.sort_unstable();
+    assert_eq!(
+        routes,
+        [
+            "GET /api/v10/applications/@me HTTP/1.1",
+            "GET /api/v10/users/@me HTTP/1.1",
+        ],
+        "startup identities are verified without moderation effects"
+    );
+}
+
 #[derive(Clone, Debug)]
 pub struct Record {
     pub level: Level,

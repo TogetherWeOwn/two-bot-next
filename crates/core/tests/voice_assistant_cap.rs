@@ -392,6 +392,32 @@ fn request_shape_rejects_bad_templates() {
     );
 }
 
+/// Every cap is inclusive and counts characters, not bytes: a two-byte `é`
+/// at exactly the limit must still pass.
+#[test]
+fn request_shape_accepts_every_field_at_its_exact_cap() {
+    let prompt = "é".repeat(2000);
+    let name = "é".repeat(4096);
+    let status = "é".repeat(4096);
+    let label = "é".repeat(100);
+    let locale = "a".repeat(35);
+    let full: Vec<AssistantTemplate<'_>> = (1..=128u64)
+        .map(|channel_id| AssistantTemplate {
+            channel_id,
+            name_template: &name,
+            status_template: Some(&status),
+        })
+        .collect();
+    assert_eq!(
+        validate_request_shape(&AssistantRequest {
+            no_game_label: &label,
+            locale: &locale,
+            ..valid_request(&prompt, &full)
+        }),
+        Ok(())
+    );
+}
+
 // ---- Property tests ----
 
 proptest! {

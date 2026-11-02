@@ -799,7 +799,7 @@ mod tests {
     /// back verbatim while untouched families stay null. Every other test
     /// runs database-None and only exercises the empty baseline.
     #[tokio::test]
-    #[ignore = "requires guarded agent-testdb; CI runs explicitly"]
+    #[ignore = "requires guarded agent-testdb; ignored-db-runtime runs explicitly"]
     async fn configured_database_reports_seeded_family_frontier() {
         let url =
             std::env::var("TWO_TEST_DATABASE_URL").expect("explicit guarded test URL required");

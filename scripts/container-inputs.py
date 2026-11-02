@@ -30,6 +30,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Bounded-subprocess policy (docs/bounded-subprocess-checks.md): every child
+# wait is finite so a stalled child fails closed here instead of hanging
+# until the external CI ceiling. Local Git diffs answer in well under a
+# second; 30s bounds the stall without touching valid runs.
+GIT_TIMEOUT_SECONDS = 30
+
+
+class ContainerInputsError(RuntimeError):
+    """The change diff timed out or never spawned; the build cannot skip."""
+
 # Exact repo-relative files that can change the runtime image.
 EXACT_IMAGE_INPUTS = frozenset({
     "Dockerfile",
@@ -162,11 +172,24 @@ def changed_files(base_ref, head_ref, root=ROOT):
     --no-renames: with rename detection ``git mv src/x.rs docs/x.md`` lists
     only the new path, and an image input would be classified as docs.
     """
-    output = subprocess.run(
-        ["git", "-C", str(root), "diff", "--name-only", "--no-renames",
-         f"{base_ref}..{head_ref}"],
-        capture_output=True, text=True, check=True,
-    )
+    try:
+        output = subprocess.run(
+            ["git", "-C", str(root), "diff", "--name-only", "--no-renames",
+             f"{base_ref}..{head_ref}"],
+            capture_output=True, text=True, check=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ContainerInputsError(
+            f"container-inputs: git diff timeout after "
+            f"{GIT_TIMEOUT_SECONDS}s; next: re-run the selector; if the "
+            "stall repeats, inspect the git invocation and runner "
+            "state") from error
+    except OSError as error:
+        raise ContainerInputsError(
+            "container-inputs: git diff spawn failed "
+            f"({error}); next: re-run the selector on a runner with git "
+            "installed") from error
     return [line for line in output.stdout.splitlines() if line.strip()]
 
 
@@ -180,7 +203,12 @@ def main(argv=None):
     except subprocess.CalledProcessError as exc:
         # Undecidable diff (shallow clone, missing ref): fail closed.
         print(f"container-inputs: git diff failed ({exc.returncode}); "
-              "selecting a full build", flush=True)
+              "selecting a full build; next: verify the refs exist and "
+              "re-run the selector", flush=True)
+        return 2
+    except ContainerInputsError as exc:
+        # Undecidable diff (stalled or unspawnable git): fail closed.
+        print(f"{exc}; selecting a full build", flush=True)
         return 2
     print("true" if needs_image_build(changed) else "false")
     return 0

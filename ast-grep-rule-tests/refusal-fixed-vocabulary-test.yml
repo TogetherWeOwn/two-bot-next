@@ -13,6 +13,7 @@ invalid:
   - 'raise Refused(f"plan database port {port} is refused")'
   - 'raise Refused(f"the binding port {parsed.port} is refused")'
   - 'raise Refused(f"psql said: {done.stderr}")'
+  - 'raise Refused(f"plan refused the gate: {proc.stderr}")'
   - 'raise ReadFailed(f"row bytes: {output}")'
   - 'raise Refused(f"bad value {value} for key")'
   - 'raise Refused(f"bad binding {url}")'

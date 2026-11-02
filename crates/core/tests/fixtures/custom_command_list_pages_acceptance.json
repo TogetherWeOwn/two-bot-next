@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "feature": "custom-command-list-bounded-pages",
+  "handoff_branch": "test/custom-command-list-pages-acceptance",
+  "baseline_sha": "1f939869073cb0ced2e5d03b85e1177a8c85175d",
+  "protected_files": [
+    {
+      "path": "crates/core/tests/custom_command_list_pages_acceptance.rs",
+      "sha256": "6427045f128cc316167a711f1709967c0f022c4bf5b8e8f47e0a6ee045e5651a"
+    },
+    {
+      "path": "crates/bot/src/custom_command_list_pages_acceptance.rs",
+      "sha256": "42c8f0f8b94c94e59104ff4edd02efc691aabdcf14ee600b8f0b730ade182235"
+    }
+  ],
+  "registration": {
+    "path": "crates/bot/src/command_runtime_tests.rs",
+    "change": "Register custom_command_list_pages_acceptance as a child test module; leave existing tests unchanged."
+  },
+  "contract": {
+    "selection": "Optional Discord Integer page, minimum 1; omitted page is byte-identical to explicit page 1.",
+    "metadata": "Nonempty replies contain Page N of M; every nonfinal page names /command-list page:NEXT. No required page-size choice.",
+    "rows": "Complete /name (or !trigger) — on|off lines, in ascending name order, exactly once across all pages; slash-only and disabled commands remain visible.",
+    "limit": "The entire response, including page metadata and navigation, is at most 2000 UTF-16 units.",
+    "empty": "No custom commands defined. stays byte-identical for omitted page and page 1; page 2 refuses.",
+    "refusal": "Invalid types, duplicate page, zero, negative, integer extremes and out-of-range pages produce an ephemeral refusal of at most 300 UTF-16 units naming page, /command-list and a valid starting page/range; never echo malformed input or silently serve rows.",
+    "invariants": "Existing ManageGuild/feature/application/guild fences, disabled-only discovery, mention suppression, one acknowledgement plus at most one completion, no command/timestamp/audit mutation, no registry publication on list.",
+    "renderer_compatibility": "Keep format_command_list(&[StoredCommand]) callable for page one. Later-page implementation API is unconstrained; gateway tests use actual packet options.",
+    "unicode_fixture": "Astral names are defensive pure-renderer inputs only, not a claim that non-ASCII command names are legal. Gateway fixtures use 49 legal 32-character names and 33-character triggers."
+  },
+  "verification_commands": [
+    "cargo fmt --all -- --check",
+    "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test custom_command_list_pages_acceptance -- --nocapture",
+    "TWO_TEST_DATABASE_URL=<approved-disposable-bootstrap> python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot custom_list_acceptance -- --nocapture --test-threads=1",
+    "python3 scripts/ci/check-floor-guard.py --base-ref HEAD",
+    "python3 scripts/ci/check-test-inventory.py"
+  ],
+  "observed_evidence": {
+    "core": "Compiled and executed: 1 passed (empty compatibility), 4 behaviorally failed (missing page option, small-set metadata, maximal legal partial row, astral partial row). Exit 101. A final repeat after formatting was refused by the pool (exit 75); no second behavioral run is claimed.",
+    "gateway": "No behavioral execution observed. Initial pool refusal exit 75; one admitted build failed with E0599 on pre-existing production_router, intentional_registration_exceptions and PanelClaim::offline_fixture calls although their public definitions exist in this checkout. Two fingerprint-isolated retries were refused with no idle, below-budget slot (exit 75). These are compile/cache/infrastructure outcomes, not pagination RED.",
+    "not_run": "Full workspace suite, clippy, required CI and independent review. No live Discord, deploy, database migration against an application database, quota change or implementation edits."
+  },
+  "builder_handoff": "Consume this branch at the immutable commit recorded on the handoff card. Do not edit the protected files or weaken assertions; acceptance fixes stay with the test author. Implement the renderer, actual command option/decoder/runtime and concise public guide in one combined passing PR. Do not merge a deliberately red test-only PR. Verify protected file hashes, run focused tests and all exact-head required checks, then use the normal independent-review/controller merge path."
+}

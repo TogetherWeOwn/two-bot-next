@@ -13,6 +13,7 @@ use sqlx::PgPool;
 use two_bot_core::automation_transfer::{max_import_entries, parse_import_document, ImportOutcome};
 use two_bot_core::custom_command_service::{self as service, ImportServiceError};
 use two_bot_core::custom_command_store as store;
+use two_bot_core::custom_commands::{max_custom_commands, reserved_command_names};
 use two_bot_testsupport::TestDatabase;
 
 const CREATOR: &str = "900000000000000102";
@@ -243,7 +244,8 @@ async fn capacity_refusal_rolls_back_earlier_update_and_every_occurrence_audit()
     seed(db.pool(), &initial).await;
     let mut commands = vec![cases::command("seed", "Changed", Some("!changed"))];
     commands.extend(
-        (0..max_import_entries() - 1).map(|i| cases::command(&format!("fresh-{i}"), "T", None)),
+        (0..max_custom_commands(reserved_command_names().len()) - 1)
+            .map(|i| cases::command(&format!("fresh-{i}"), "T", None)),
     );
     let result = service::import(
         db.pool(),
@@ -292,7 +294,7 @@ async fn capacity_refusal_rolls_back_earlier_update_and_every_occurrence_audit()
 async fn capacity_boundary_convergence_keeps_one_row_and_one_audit_per_accepted_occurrence() {
     let db = database().await;
     seed(db.pool(), &[cases::row("seed", "S", None, false)]).await;
-    let max = max_import_entries();
+    let max = max_custom_commands(reserved_command_names().len());
     let mut commands: Vec<_> = (0..max - 1)
         .map(|i| cases::command(&format!("fresh-{i}"), "T", None))
         .collect();

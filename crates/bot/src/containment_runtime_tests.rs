@@ -4,6 +4,12 @@
 #[path = "containment_tuning_refusal_acceptance_tests.rs"]
 mod tuning_refusal_acceptance;
 
+// Protected fail-open acceptance lives in its own file: a dropped
+// quarantine outcome must surface as outcome-unknown with a metric. The
+// implementation change must not edit the protected file.
+#[path = "fail_open_containment_acceptance_tests.rs"]
+mod fail_open_containment_acceptance;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

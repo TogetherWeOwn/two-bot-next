@@ -1664,3 +1664,53 @@ async fn submit_syncs_differing_original_creator_name_so_a_later_join_keeps_it()
     worker.refresh_template_names(1);
     assert_eq!(worker.desired_names[&ROOM], "Ben's den");
 }
+
+async fn lost_name_worker_reply(drop_reply: bool) {
+    let (runtime, mut rx) = stalled_worker_runtime();
+    let interaction = voice_interaction_as(Some(command_data("name", vec![])), None, OWNER);
+    let names = directory();
+    let call = name_capture_full(&runtime, &interaction, &names);
+    tokio::pin!(call);
+    let command = tokio::select! {
+        command = rx.recv() => command.expect("accepted name command"),
+        _ = &mut call => panic!("name handler did not reach its worker boundary"),
+    };
+    assert!(matches!(command, ActorCommand::Name { .. }));
+    // Keep the inbox live in both cases; only the accepted reply is lost.
+    let held = if drop_reply {
+        drop(command);
+        None
+    } else {
+        Some(command)
+    };
+    let (owned, response) = bounded_sibling_wait(&mut call).await;
+    assert!(owned);
+    assert_sibling_worker_lost_reply(&response.expect("one name failure reply"));
+    drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_name_worker_reply_returns_honest_user_copy() {
+    lost_name_worker_reply(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_name_worker_reply_returns_honest_user_copy() {
+    lost_name_worker_reply(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn name_wait_is_bounded_with_a_live_unanswered_inbox() {
+    let (runtime, _rx) = stalled_worker_runtime();
+    let command = NameCommand {
+        actor_id: MEMBER,
+        is_admin: false,
+        request: restore(),
+        settings: NameSettings::default(),
+        directory: directory(),
+        policy: policy(&[]),
+    };
+    assert!(bounded_sibling_wait(runtime.run_name(GUILD, command))
+        .await
+        .is_none());
+}

@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "suite": "ops-dashboard browser harness compatibility",
+  "baseline": "332e2236b4c26aaa9630631d03797bc8367e54f1",
+  "publication_ref": "test/dashboard-browser-compatibility",
+  "delivery": "Tests-only compatibility delta for the combined lifecycle implementation. Do not merge this delta alone: lifecycle expectations and the candidate page-byte pin are intentionally RED against the baseline. Shared-workspace consumers already have the commit; otherwise cherry-pick only this delta, not implementation history.",
+  "protected_files": [
+    {
+      "path": "wrangler/test/ops-dashboard.test.ts",
+      "before_sha256": "5190fd7e56a9bbc304444789c9fdbfcb3a50e75d516c8f7336da0b9d0e5d4178",
+      "sha256": "0e97440dbbebe389f703c49ce82881325c1c7682ccbdd6c07e5322d1e4472d6b",
+      "changes": ["Supply AbortController, clearTimeout and unref one-shot timers", "Re-pin whole-page SHA to independently fetched candidate HTML; retain strict CSP, script/style hashes, security headers and all behavioral assertions"]
+    },
+    {
+      "path": "wrangler/test/ops-dashboard-malformed-acceptance.test.ts",
+      "before_sha256": "7859aee07b87ed8d57bf020052172b78fd13a7619906fbd224567a672e6e2113",
+      "sha256": "246cfccf95057448c3b2cbf77f3d745bf313993b430d88eeba8c5ca898ec1d8e",
+      "changes": ["Supply AbortController, clearTimeout and unref one-shot timers; assertions unchanged"]
+    },
+    {
+      "path": "wrangler/test/ops-dashboard-intake-caps-acceptance.test.ts",
+      "before_sha256": "5d7bcb8e67108f5b7d74faebacbf702652df7f8f33204bcb37f01dfe21ec66fc",
+      "sha256": "31d1decc4e8b00a1ed35ff6cb97b4c2d651c91d7f3b8ede701d2141e25bcdd8e",
+      "changes": ["Supply AbortController, clearTimeout and unref one-shot timers; assertions unchanged"]
+    },
+    {
+      "path": "wrangler/test/ops-dashboard-stale-poll.test.ts",
+      "before_sha256": "08b9eb8dae8f77e2032720fc4a7c1d808bf5be402f8f2533226a5ada59e9c99a",
+      "sha256": "75312695ce325c3ad7f3010e3502615b8ebe4febb69e6642430c9aaa336181de",
+      "changes": ["Unref existing one-shot timers", "Require visible nonfresh disconnected panel and cancellation, retaining late-result snapshot equality", "Replace superseded-request intermediate render with cancellation and snapshot fencing", "Keep a separate sequential completion control asserting both reports render in order; preserve all other generation/order controls"]
+    },
+    {
+      "path": "wrangler/test/ops-dashboard-fetch-failure.test.ts",
+      "before_sha256": "5c77de6eb95a3858a5bfa403c02af76133acf64832ed01834fdb335381201037",
+      "sha256": "ff0cfcd7de26c3feacf900aea503f931508de77691566863dcbd37c24671eb08",
+      "changes": ["Unref existing one-shot timers", "Replace pending-reconnect disconnected wording pin with explicit nonfresh panel, cancellation and active replacement checks; retain obsolete-rejection snapshot equality and recovery, and every other fetch-failure control"]
+    }
+  ],
+  "ownership": "Acceptance author owns corrections to the listed tests. Implementation consumers must not edit or weaken them. This delta changes no implementation or new lifecycle assertion.",
+  "unchanged_lifecycle_files": [
+    {"path": "wrangler/test/ops-dashboard-lifecycle-acceptance.test.ts", "sha256": "3c7c6ef6e2dd7d87365d1e6a7968624c0a4a50aadeb3af0921e3222ab4e1a923"},
+    {"path": "wrangler/test/ops-dashboard-lifecycle-harness.ts", "sha256": "fc50b4e1f010958f7fb5d214509f0540749dae7a70eab7feb31de330a19956af"},
+    {"path": "wrangler/test/ops-dashboard-lifecycle-browser.ts", "sha256": "7f160a28e39d8629220d411dbbd03b698f349a0debe78441f0aaa090a7130ac1"},
+    {"path": "wrangler/test/ops-dashboard-lifecycle-acceptance.manifest.json", "sha256": "d21df9fa208f4182785a5b292a479d40622dc5f9a32ba1b954840b39cdb221b4"}
+  ],
+  "page_pin": {
+    "before_sha256": "3436cd503436829a3ceb93ddbebc6174f156714ce997a8c2e302aeebc892f638",
+    "sha256": "2651b00c52e19eba4acbd611a97f083a17f9ed836fe1b37b8d64d585179b33b7",
+    "verification": "SHA-256 calculated independently from Worker.fetch synthetic /ops/dashboard response, without reading implementation diffs. Exact CSP assertions retained, not relaxed.",
+    "candidate_source_sha256": "9f55bec00673c62933bf0b774d725eebb937adb74b3373cce3da50246e01488c"
+  },
+  "harness_audit": "The five listed VM harnesses now supply the required browser globals. The only additional dashboard VM uses ops-dashboard-lifecycle-harness.ts, which already supplies AbortController and manually advanced timeout/interval maps. Its browser fixture shares those fake timers. No real timer handles there need unref; neither file changed.",
+  "verification": [
+    {"configuration": "Baseline source plus original lifecycle acceptance, before compatibility edits", "command": "node --import ./wrangler/test/cloudflare-loader.mjs --test wrangler/test/ops-dashboard*.test.ts", "observed": "96 tests: 81 pass / 15 intended lifecycle failures"},
+    {"configuration": "Baseline source plus compatibility edits, retaining baseline page pin temporarily for the control comparison", "command": "node --import ./wrangler/test/cloudflare-loader.mjs --test --test-reporter=tap wrangler/test/ops-dashboard*.test.ts", "observed": "97 tests: 79 pass / 18 intended lifecycle failures (15 original plus three revised lifecycle expectations); new sequential completion control passes"},
+    {"configuration": "Same baseline control comparison", "command": "npm --prefix wrangler test", "observed": "2433 tests: 2415 pass / the same 18 failures; zero skipped or cancelled"},
+    {"configuration": "Baseline source plus exact final compatibility files, including candidate page pin", "command": "npm --prefix wrangler test", "observed": "2433 tests: 2414 pass / 19 fail: the same 18 lifecycle failures plus the intentional old-page versus new-page whole-HTML SHA mismatch; no other failures, zero skipped or cancelled"},
+    {"configuration": "Builder candidate source plus exact final compatibility files", "command": "node --import ./wrangler/test/cloudflare-loader.mjs --test --test-reporter=tap wrangler/test/ops-dashboard*.test.ts", "observed": "97/97 PASS; zero skipped or cancelled"},
+    {"configuration": "Builder candidate source plus exact final compatibility files", "command": "npm --prefix wrangler test", "observed": "2433/2433 PASS; zero skipped or cancelled"},
+    {"configuration": "Baseline and Builder candidate", "command": "npm --prefix wrangler run typecheck", "observed": "PASS on both"},
+    {"configuration": "Combined workspace", "command": "python3 scripts/ci/check-floor-guard.py --base-ref HEAD; python3 scripts/ci/check-test-inventory.py; git diff --check", "observed": "PASS"}
+  ],
+  "baseline_failures_added_by_compatibility": [
+    "an obsolete-generation rejection cannot pre-empt a visibly nonfresh reconnect poll: baseline has an empty panel",
+    "stale success after Disconnect cannot populate a never-rendered page: baseline has an empty panel",
+    "a superseded poll cannot render while its replacement is pending: baseline supplies no AbortSignal/cancellation",
+    "/ops/dashboard: CSP authorizes only the unchanged page's inline blocks: exact final candidate HTML pin intentionally differs from baseline HTML"
+  ],
+  "not_run": ["Remote PR CI/review (owned by the combined implementation PR)", "Rust builds/tests (test-only TypeScript delta)", "Production/staging, live Discord, databases or deployment", "Browser screenshots in this compatibility run"],
+  "skills_used": ["paperclip", "paperclip-superpowers-adapter", "test-driven-development", "verification-before-completion"]
+}

@@ -70,7 +70,7 @@ client below.
   request; it is not the bootstrap error (`crates/core/src/send_admission/postgres.rs:110-139`).
 - 5xx backs off at 500 × 2^attempt ms and gives up as retry-exhausted
   (`rest.rs:270`, `rest.rs:306`, `rest.rs:478`;
-  `backoff_duration` at `rest.rs:701-703`, base `BACKOFF_BASE_MS` in
+  `backoff_duration` at `rest.rs:707-709`, base `BACKOFF_BASE_MS` in
   `action_outcomes.rs:184`). Total budget is 5 tries per call
   (`MAX_HTTP_TRIES` in `action_outcomes.rs:188`).
 - 403/404 on a page read as `Unreadable`, not an abort (`rest.rs:266`):
@@ -202,8 +202,8 @@ Safety rails, verified in code:
 
 - Live-guild fence runs before any database or file opens: the
   production guild refuses without bare `--allow-live-guild`
-  (`backfill.rs:35-43,79`; `backfill_messages.rs:56-62`;
-  `capture.rs:36-40`; dedupe `validate_options` with `--guild`
+  (`backfill.rs:37-45,90`; `backfill_messages.rs:67-78`;
+  `capture.rs:40-55`; dedupe `validate_options` with `--guild`
   snowflake check). Exit 2, `Refusing live guild`, no connection
   attempt. Staging runs always name the staging guild id from the
   approved deployment record; never substitute production.
@@ -211,23 +211,30 @@ Safety rails, verified in code:
   values (`--apply=false`), duplicates, and unknown options
   (`dedupe_events.rs:45-58`); `--guild <snowflake>` is required (`55`).
   The shared parser likewise refuses `--apply` with `--dry-run`
-  (`cli.rs:115-117`) and valued safety opt-ins (`cli.rs:89-113`).
+  (`cli.rs:162-164`) and valued safety opt-ins (`cli.rs:128-149`).
 - Migration behavior differs by binary: `backfill`,
   `backfill-messages` and `capture` open the DB with migrations enabled
   (`open_db(&args, false)` — `false` = do not skip;
-  `backfill.rs:96`, `backfill_messages.rs:71`, `capture.rs:63`;
+  `backfill.rs:107`, `backfill_messages.rs:87`, `capture.rs:76`;
   `connect` applies unless skipped, `db.rs:25-31`; `open_db`,
-  `cli.rs:180-197`). `dedupe-events` is maintenance-only and never
+  `cli.rs:260-273`). `dedupe-events` is maintenance-only and never
   migrates (`open_db(&args, true)`). A dry run against a schema behind
   the binary may therefore apply migrations on the history CLIs — run
   the reviewed staging migration path first, never a bare CLI as a
   migrator.
-- `--max-pages` bounds each channel walk (`backfill` default 25,
-  `backfill.rs:64-67`; `backfill-messages` default 60,
-  `backfill_messages.rs:30-33`). Hitting the cap prints `INCOMPLETE`
-  with a 4× re-run suggestion (`backfill.rs:464-470`,
-  `backfill_messages.rs:311-318`); a capped scan is a lower bound, not
-  a complete result.
+- `--max-pages` accepts integers in `1..=10000` and bounds each channel walk
+  (`backfill` default 25, `backfill.rs:75-78`; `backfill-messages` default 60,
+  `backfill_messages.rs:42-45`). Hitting the cap prints `INCOMPLETE` with a
+  saturating 4× re-run suggestion clamped to 10000 (`backfill.rs:475-481`,
+  `backfill_messages.rs:326-332`); a capped scan is a lower bound, not a
+  complete result. At 10000, review scan scope rather than increasing the cap.
+- `capture` and `backfill-messages` reject noncanonical `DISCORD_GUILD_ID`
+  before the live fence. A supplied message `--since` must be valid RFC3339;
+  malformed values never silently remove the time bound. Shared CLI parsing
+  rejects `TWO_DB_POOL_MAX` outside `1..=32` (absent defaults to 5) before
+  admission, file or database I/O, including rollback import plan output.
+  These fixed refusals exit 2, name `code=` and `next_action=`, and never echo
+  rejected values. See [input preflight](cutover.md#cutover-cli-input-preflight).
 
 Staging-name-only recipe (no secrets, no live run performed for this
 doc; Operator cards own execution and bindings):
@@ -268,7 +275,7 @@ reporting are unchanged.
 
 A re-run report ends with a `scan completion` line plus one `INCOMPLETE`
 line per interrupted channel (`ScanReport::render`, `cli.rs:38-55`).
-The vocabulary is fixed (`ScanCompletion`, `rest.rs:722-752`):
+The vocabulary is fixed (`ScanCompletion`, `rest.rs:751-783`):
 
 | Token | Meaning | Complete? |
 |---|---|---|
@@ -303,7 +310,7 @@ Burst triage:
   concluding the intent is off. This is not proof of an empty guild or a
   complete roster.
 - Archived-thread discovery has its own budget
-  (`DEFAULT_ARCHIVED_THREAD_PAGES = 10`, `rest.rs:769`); early stops are
+  (`DEFAULT_ARCHIVED_THREAD_PAGES = 10`, `rest.rs:798`); early stops are
   reported per forum (`backfill_messages.rs:319-325`), not silently
   complete.
 - Route-level anchors: progress-route 503 means the database is

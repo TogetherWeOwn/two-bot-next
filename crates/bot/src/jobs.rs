@@ -68,6 +68,40 @@ pub fn statuses(names: &[&str], parked: bool) -> SharedStatus {
     ))
 }
 
+/// A supervised job whose name has no status entry. Fixed vocabulary naming
+/// the job, so a registration mismatch reads as one greppable line instead of
+/// a supervisor-task panic. Constructed only on the cold error path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnregisteredJob {
+    pub name: &'static str,
+}
+
+impl std::fmt::Display for UnregisteredJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unregistered job: {}", self.name)
+    }
+}
+
+impl std::error::Error for UnregisteredJob {}
+
+/// Every job name must resolve to a status entry before any task spawns. The
+/// first missing name wins; the healthy path is unchanged. [`supervise`] and
+/// [`crate::website_jobs::serve_jobs`] both call this at spawn time, which is
+/// what makes the status lookups in [`record_completion`], the dispatch tick
+/// and the unpark loop unreachable on a missing entry: the status map is
+/// created once at boot and entries are never removed at runtime.
+pub fn check_registered(
+    jobs: &[Job],
+    statuses: &BTreeMap<String, JobStatus>,
+) -> Result<(), UnregisteredJob> {
+    for job in jobs {
+        if !statuses.contains_key(job.name) {
+            return Err(UnregisteredJob { name: job.name });
+        }
+    }
+    Ok(())
+}
+
 /// Bounded startup offset in [0, min(cadence, 5 seconds)]. The caller samples
 /// once per job, so all later deadlines keep that phase, without cadence drift.
 pub fn startup_jitter(cadence: Duration, sample: u64) -> Duration {
@@ -75,7 +109,19 @@ pub fn startup_jitter(cadence: Duration, sample: u64) -> Duration {
     Duration::from_millis(sample % (bound + 1))
 }
 
-pub async fn supervise(jobs: Vec<Job>, status: SharedStatus, shutdown: watch::Receiver<bool>) {
+pub async fn supervise(
+    jobs: Vec<Job>,
+    status: SharedStatus,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), UnregisteredJob> {
+    // Fail fast before any task spawns: a name mismatch is a registration bug,
+    // not a runtime outcome, and must never surface as a supervisor-task panic.
+    // The guard is scoped: the read lock must be released before tasks spawn,
+    // or their first status write would block on it forever.
+    {
+        let statuses = status.read().await;
+        check_registered(&jobs, &statuses)?;
+    }
     let mut tasks = JoinSet::new();
     for job in jobs {
         assert!(!job.cadence.is_zero(), "job cadence must be nonzero");
@@ -87,6 +133,7 @@ pub async fn supervise(jobs: Vec<Job>, status: SharedStatus, shutdown: watch::Re
         ));
     }
     while tasks.join_next().await.is_some() {}
+    Ok(())
 }
 
 async fn stopped(shutdown: &mut watch::Receiver<bool>) {
@@ -115,7 +162,11 @@ async fn record_completion(
     result: Result<(), ErrorClass>,
 ) {
     let mut statuses = status.write().await;
-    let current = statuses.get_mut(name).expect("registered job");
+    // Spawn-time validation (`check_registered`, called by `supervise`) proves
+    // every supervised name resolves, and entries are never removed at runtime.
+    let Some(current) = statuses.get_mut(name) else {
+        unreachable!("supervise validated every job name at spawn: {name}");
+    };
     current.running = false;
     match result {
         Ok(()) => {
@@ -218,7 +269,12 @@ async fn run_job(
                 };
                 // Cancellation may have arrived while the lock became available.
                 if *shutdown.borrow() || shutdown.has_changed().is_err() { break; }
-                let current = statuses.get_mut(job.name).expect("registered job");
+                // Spawn-time validation (`check_registered`, called by
+                // `supervise`) proves every supervised name resolves, and
+                // entries are never removed at runtime.
+                let Some(current) = statuses.get_mut(job.name) else {
+                    unreachable!("supervise validated every job name at spawn: {}", job.name);
+                };
                 current.last_start = Some(timestamp());
                 current.running = true;
                 drop(statuses);

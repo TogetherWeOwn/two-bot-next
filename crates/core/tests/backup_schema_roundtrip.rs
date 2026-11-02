@@ -22,7 +22,115 @@ use two_bot_core::backup::dump_file::{
     DumpTableInfo, SequenceMark, DESTINATION_OWNED_COLUMNS, DUMP_TABLES, DUMP_VERSION,
     EXCLUDED_TABLES, OPTIONAL_LEGACY_TABLES,
 };
+use two_bot_core::voice_access::{
+    may_use_command, AccessControls, AccessDecision, AccessDenyReason, AccessMember,
+};
 use two_bot_testsupport::TestDatabase;
+
+// Frozen released v13: the voice pair and token registry, before starboard.
+const FROZEN_V13_TABLES: [&str; 101] = [
+    "events",
+    "members",
+    "invite_snapshots",
+    "operational_audit_log",
+    "moderation_warnings",
+    "moderation_scheduled_unbans",
+    "moderation_audit",
+    "moderation_lockdowns",
+    "moderation_idempotency",
+    "containment_events",
+    "containment_incidents",
+    "join_risk_flags",
+    "automation_commands",
+    "scheduled_messages",
+    "sticky_messages",
+    "automation_audit_log",
+    "tickets",
+    "ticket_transcripts",
+    "automod_violations",
+    "automod_processed_messages",
+    "self_role_audit",
+    "self_role_panel_claims",
+    "self_role_exchanges",
+    "self_role_exchange_baselines",
+    "automod_delivery_claims",
+    "gateway_boot_directives",
+    "member_erasure_audit",
+    "privacy_opt_outs",
+    "guild_analytics_settings",
+    "privacy_opt_out_audit",
+    "game_activity_guild_aggregates",
+    "assistant_monthly_builds",
+    "member_levels",
+    "member_season_xp",
+    "xp_awards",
+    "level_role_rewards",
+    "level_import_runs",
+    "event_rsvps",
+    "announcements_audit_log",
+    "community_facts",
+    "lfg_posts",
+    "lfg_roles",
+    "lfg_signups",
+    "feed_relays",
+    "feed_deliveries",
+    "web_contract_meta",
+    "guild_counters",
+    "rank_ladder",
+    "rank_snapshots",
+    "member_ranks",
+    "scheduled_events",
+    "scheduled_events_claim",
+    "scheduled_events_tombstone",
+    "event_voice_channels",
+    "event_voice_presence",
+    "counter_snapshots",
+    "member_exclusions",
+    "presence_probe",
+    "community_stream_heartbeats",
+    "community_scorecard_runs",
+    "community_scorecard_alerts",
+    "community_scorecard_attempts",
+    "gateway_sessions",
+    "guild_settings_revision",
+    "guild_settings",
+    "guild_settings_audit",
+    "admin_api_tokens",
+    "audit_kill_switch",
+    "internal_nonces",
+    "internal_clock_high_water",
+    "internal_idempotency",
+    "internal_action_log",
+    "internal_discord_events",
+    "internal_event_keys",
+    "stream_live_claims",
+    "moderation_channel_executions",
+    "moderation_member_bans",
+    "invite_campaigns",
+    "voice_creators",
+    "voice_rooms",
+    "voice_room_blocks",
+    "voice_join_grants",
+    "voice_owner_grants",
+    "voice_text_companions",
+    "voice_access_controls",
+    "voice_logging_settings",
+    "voice_channel_templates",
+    "voice_game_aliases",
+    "voice_random_lists",
+    "voice_random_list_choices",
+    "voice_logging",
+    "voice_logging_mention_members",
+    "voice_logging_mention_roles",
+    "voice_guild_settings",
+    "voice_command_roles",
+    "voice_command_role_members",
+    "voice_vote_kick_audit",
+    "voice_create_reservations",
+    "retention_guild_purge_queue",
+    "retention_deletion_requests",
+    "event_store",
+];
 
 async fn database() -> Option<TestDatabase> {
     let url = match std::env::var("TWO_TEST_DATABASE_URL") {
@@ -124,6 +232,31 @@ async fn seed(pool: &PgPool) {
     .execute(pool)
     .await
     .unwrap();
+}
+
+/// Simulate a backup source that had not applied 0469. The seed's legacy
+/// voice rows are the pre-0469 shape, so the dump must record pre-0469
+/// migration evidence; with 0469 recorded, restore (correctly) treats the
+/// archive as post-0469 and restores both voice stores verbatim instead of
+/// replaying the translation.
+async fn forget_voice_authority_migration(pool: &PgPool) {
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version >= 469")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// The `voice_access_controls` columns the 0469 replay must not touch, by
+/// guild. Only `command_roles` is translated (plus inserted guild rows),
+/// so these round-trip exactly for every pre-existing guild.
+async fn voice_control_fields(pool: &PgPool) -> Vec<(String, bool, Option<String>)> {
+    sqlx::query_as(
+        "SELECT guild_id, room_creation_enabled, required_role_id \
+         FROM voice_access_controls ORDER BY guild_id COLLATE \"C\"",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -697,6 +830,27 @@ async fn dirty_target(pool: &PgPool) {
     ).execute(pool).await.unwrap();
 }
 
+fn store_inventory_command() -> Command {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/store_table_inventory.py");
+    let mut command = Command::new("python3");
+    command.env("PYTHONDONTWRITEBYTECODE", "1").arg(script);
+    command
+}
+
+#[test]
+fn store_inventory_parser_negative_controls_run_without_database() {
+    let output = store_inventory_command()
+        .arg("--self-test")
+        .output()
+        .expect("run actual store inventory controls");
+    assert!(
+        output.status.success(),
+        "store inventory controls failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn migrated_tables_are_explicitly_classified_and_catalog_fks_are_parent_first() {
     let Some(db) = database().await else {
@@ -735,48 +889,36 @@ async fn migrated_tables_are_explicitly_classified_and_catalog_fks_are_parent_fi
             "migrated table {table} is neither DUMP_TABLES nor EXCLUDED_TABLES"
         );
     }
-    // The store chain (crates/store/migrations) shares the database (the
-    // operator applies both chains) but this guard migrates only the cutover
-    // chain. A pure text scan is enough, with no second database migration:
-    // every store-chain CREATE TABLE must be classified, so a new store
-    // table without a DUMP/EXCLUDED decision fails CI instead of silently
-    // leaving the backup.
+    // Both chains share the backup. Inventory every persistent store CREATE,
+    // plus the explicit quoted, same-file CREATE/DROP authority reference.
+    // The helper is not a persistent exclusion. Its runtime success/refusal
+    // cleanup is independently covered by admin_registry_repair_acceptance.
     let store_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../store/migrations");
-    let mut store_entries: Vec<_> = std::fs::read_dir(&store_dir)
-        .expect("store migrations directory")
-        .map(|entry| entry.expect("migration entry").path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
+    let output = store_inventory_command()
+        .arg(store_dir)
+        .args(DUMP_TABLES.iter().chain(EXCLUDED_TABLES.iter()).copied())
+        .output()
+        .expect("run store inventory");
+    assert!(
+        output.status.success(),
+        "store inventory failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let inventory: Value = serde_json::from_slice(&output.stdout).expect("store inventory JSON");
+    assert_eq!(
+        inventory["transaction_local"],
+        json!([{
+            "migration": "0463_admin_api_token_authority.sql",
+            "table": "admin_api_token_authority_contract"
+        }]),
+        "explicit reference accounting must not disappear or expand"
+    );
+    let store_tables: BTreeSet<String> = inventory["tables"]
+        .as_array()
+        .expect("persistent store tables")
+        .iter()
+        .map(|table| table.as_str().expect("table name").to_owned())
         .collect();
-    store_entries.sort();
-    assert!(!store_entries.is_empty(), "no store migrations found");
-    let mut store_tables = BTreeSet::new();
-    for path in &store_entries {
-        let sql = std::fs::read_to_string(path).expect("migration file readable");
-        for line in sql.lines() {
-            // Real DDL only: no store migration carries CREATE TABLE in a
-            // comment, and every statement names its bare table on the same
-            // line (verified: no qualified or quoted names in this directory).
-            let trimmed = line.trim_start();
-            let rest = match trimmed
-                .strip_prefix("CREATE TABLE IF NOT EXISTS")
-                .or_else(|| trimmed.strip_prefix("CREATE TABLE"))
-            {
-                Some(rest) => rest,
-                None => continue,
-            };
-            let name: String = rest
-                .trim_start()
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            assert!(
-                !name.is_empty(),
-                "unparsable CREATE TABLE in {}",
-                path.display()
-            );
-            store_tables.insert(name);
-        }
-    }
     assert!(
         store_tables.contains("rollback_journal") && store_tables.contains("rollback_watermarks"),
         "store-chain scan must see the journal tables: {store_tables:?}"
@@ -879,6 +1021,8 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     };
     let pool = db.pool();
     seed(pool).await;
+    forget_voice_authority_migration(pool).await;
+    let control_fields_before = voice_control_fields(pool).await;
     let tables = covered_tables(pool).await;
     let before = snapshot(pool, &tables).await;
     let ledgers = vec![
@@ -895,6 +1039,10 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     assert_eq!(
         manifest.schema_migrations,
         vec!["legacy-ledger-diagnostic", "target-ledger"]
+    );
+    assert!(
+        !manifest.cutover_migrations.is_empty() && !manifest.applied_cutover(469),
+        "the simulated pre-0469 source records pre-0469 cutover evidence"
     );
     let contents = inspect(&original).unwrap();
     assert_archive_matches(&contents, &before);
@@ -931,7 +1079,145 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         report.quarantined_unbans, 0,
         "terminal expiries stay terminal"
     );
-    assert_eq!(snapshot(pool, &tables).await, before);
+    // The seed's legacy voice_command_roles rows are the pre-0469 shape:
+    // restore replays the 0469 translation instead of round-tripping them
+    // into tables nothing reads. Every other table matches the archive
+    // exactly; the three voice tables get the translated state asserted
+    // below, and that state is the baseline for the restores that follow.
+    assert_eq!(report.translated_voice_command_roles, 4);
+    assert_eq!(report.translated_voice_command_role_members, 3);
+    assert_eq!(report.voice_access_controls_added, 1);
+    let command_roles: Vec<(String, String)> = sqlx::query_as(
+        "SELECT guild_id, command_roles::text FROM voice_access_controls \
+         ORDER BY guild_id COLLATE \"C\"",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let command_roles: Vec<(String, Value)> = command_roles
+        .into_iter()
+        .map(|(guild, roles)| (guild, serde_json::from_str(&roles).unwrap()))
+        .collect();
+    assert_eq!(
+        command_roles,
+        vec![
+            (
+                "100000000000000001".to_owned(),
+                // 'kick' keeps the enforced list over the legacy one,
+                // 'limit' moves across empty, 'notavoicecommand' is dropped,
+                // 'template' was only ever in the enforced store.
+                json!({"kick": ["100000000000000041", "100000000000000042"],
+                       "limit": [], "template": []}),
+            ),
+            ("100000000000000002".to_owned(), json!({})),
+            (
+                "100000000000000003".to_owned(),
+                json!({"private": ["100000000000000044"]}),
+            ),
+        ],
+        "0469 replay merges legacy restrictions into the enforced store"
+    );
+    let inserted_defaults: (bool, Option<String>) = sqlx::query_as(
+        "SELECT room_creation_enabled, required_role_id FROM voice_access_controls \
+         WHERE guild_id = '100000000000000003'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        inserted_defaults,
+        (true, None),
+        "a guild inserted by the translation takes the column defaults"
+    );
+    // Only command_roles is translated: every pre-existing guild's creation
+    // switch and required role round-trip exactly.
+    let control_fields_after: Vec<_> = voice_control_fields(pool)
+        .await
+        .into_iter()
+        .filter(|(guild, _, _)| control_fields_before.iter().any(|(g, _, _)| g == guild))
+        .collect();
+    assert_eq!(
+        control_fields_after, control_fields_before,
+        "the replay leaves pre-existing guilds' non-translated controls untouched"
+    );
+    // The translated restrictions are what the command gate enforces: decode
+    // the restored rows into gate controls and evaluate a non-admin member.
+    let gate_controls = |guild: &str| AccessControls {
+        room_creation_enabled: true,
+        required_role: None,
+        command_roles: command_roles
+            .iter()
+            .find(|(g, _)| g == guild)
+            .unwrap()
+            .1
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(command, ids)| {
+                (
+                    command.clone(),
+                    ids.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|id| id.as_str().unwrap().parse::<u64>().unwrap())
+                        .collect(),
+                )
+            })
+            .collect(),
+    };
+    let roleless = AccessMember {
+        is_admin: false,
+        roles: Vec::new(),
+    };
+    assert_eq!(
+        may_use_command(&gate_controls("100000000000000003"), &roleless, "private"),
+        AccessDecision::Deny(AccessDenyReason::CommandRestricted),
+        "the legacy-only restriction is enforced after restore"
+    );
+    assert_eq!(
+        may_use_command(
+            &gate_controls("100000000000000003"),
+            &AccessMember {
+                is_admin: false,
+                roles: vec![100_000_000_000_000_044],
+            },
+            "private",
+        ),
+        AccessDecision::Allow,
+        "the translated member role still admits its holders"
+    );
+    assert_eq!(
+        may_use_command(&gate_controls("100000000000000001"), &roleless, "limit"),
+        AccessDecision::Deny(AccessDenyReason::CommandRestricted),
+        "a legacy restriction with no member roles denies every non-admin"
+    );
+    for legacy in ["voice_command_roles", "voice_command_role_members"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(legacy)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "the replay empties legacy {legacy}");
+    }
+    let restored_snapshot = snapshot(pool, &tables).await;
+    for (table, expected) in &before {
+        if [
+            "voice_access_controls",
+            "voice_command_roles",
+            "voice_command_role_members",
+        ]
+        .contains(&table.as_str())
+        {
+            continue;
+        }
+        assert_eq!(
+            &restored_snapshot[table], expected,
+            "{table} round-trips exactly"
+        );
+    }
+    let before = restored_snapshot;
     assert_fresh_cas_tokens(pool, cas_before).await;
     assert_eq!(triggers(pool).await, guard_before);
     assert_eq!(snapshot(pool, &ledgers).await, ledger_before);
@@ -973,6 +1259,9 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
             .await
             .expect("restore must ignore manifest and row block order");
         assert!(report.ok);
+        assert_eq!(report.translated_voice_command_roles, 4);
+        assert_eq!(report.translated_voice_command_role_members, 3);
+        assert_eq!(report.voice_access_controls_added, 1);
         assert!(report.dropped_columns.is_empty());
         assert!(report.initialized_tables.is_empty());
         assert_eq!(
@@ -1020,6 +1309,100 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     ] {
         assert_sqlstate(&sqlx::query(audited(statement.to_owned())).execute(pool).await.unwrap_err(), "23505");
     }
+    target.close().await.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn post_0469_archive_restores_voice_stores_verbatim() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    // The post-0469 import -> unrestrict shape: /import mirrored a 'kick'
+    // restriction into the legacy tables, then /access unrestrict removed
+    // it from the gate's store only. The gate's empty map is authoritative;
+    // the legacy row is a stale backout mirror that restore must not
+    // resurrect. The ledger still records 0469, unlike the pre-0469 seed.
+    sqlx::raw_sql(
+        "INSERT INTO voice_access_controls (guild_id, room_creation_enabled, required_role_id, \
+             command_roles) \
+         VALUES ('100000000000000001', FALSE, '100000000000000040', '{}'::jsonb); \
+         INSERT INTO voice_command_roles (guild_id, command) \
+         VALUES ('100000000000000001', 'kick'); \
+         INSERT INTO voice_command_role_members (guild_id, command, role_id) \
+         VALUES ('100000000000000001', 'kick', '100000000000000043');",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let directory = ArchiveDirectory::new();
+    let path = directory.path("post-0469.ndjson.gz");
+    let manifest = dump(pool, &path).await.unwrap();
+    assert!(
+        manifest.applied_cutover(469),
+        "a migrated source records that 0469 was applied"
+    );
+
+    let target = database().await.expect("test bootstrap already configured");
+    let pool = target.pool();
+    let report = restore(pool, &path).await.unwrap();
+    assert!(report.ok);
+    assert_eq!(report.translated_voice_command_roles, 0);
+    assert_eq!(report.translated_voice_command_role_members, 0);
+    assert_eq!(report.voice_access_controls_added, 0);
+    // Both stores restore verbatim: the lifted restriction stays lifted and
+    // the backout mirror survives untouched.
+    let controls: (bool, Option<String>, String) = sqlx::query_as(
+        "SELECT room_creation_enabled, required_role_id, command_roles::text \
+         FROM voice_access_controls WHERE guild_id = '100000000000000001'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(!controls.0, "creation switch round-trips");
+    assert_eq!(controls.1.as_deref(), Some("100000000000000040"));
+    let parsed: BTreeMap<String, Vec<String>> = serde_json::from_str(&controls.2).unwrap();
+    assert!(
+        parsed.is_empty(),
+        "the lifted kick restriction is not resurrected from the mirror: {parsed:?}"
+    );
+    let gate = AccessControls {
+        room_creation_enabled: controls.0,
+        required_role: controls.1.as_deref().map(|id| id.parse().unwrap()),
+        command_roles: parsed
+            .into_iter()
+            .map(|(command, ids)| (command, ids.iter().map(|id| id.parse().unwrap()).collect()))
+            .collect(),
+    };
+    assert_eq!(
+        may_use_command(
+            &gate,
+            &AccessMember {
+                is_admin: false,
+                // Holds the guild-wide required role but not the lifted
+                // restriction's old role.
+                roles: vec![100_000_000_000_000_040],
+            },
+            "kick",
+        ),
+        AccessDecision::Allow,
+        "a member without the old role can use the lifted command after restore"
+    );
+    let mirror: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.command, m.role_id FROM voice_command_roles c \
+         JOIN voice_command_role_members m \
+           ON m.guild_id = c.guild_id AND m.command = c.command \
+         WHERE c.guild_id = '100000000000000001'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        mirror,
+        vec![("kick".to_owned(), "100000000000000043".to_owned())],
+        "the legacy backout mirror restores verbatim"
+    );
     target.close().await.unwrap();
     db.close().await.unwrap();
 }
@@ -1461,11 +1844,25 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v10-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 10);
-    for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
+    assert_eq!(old.manifest.version, 15);
+    for name in [
+        "game_activity_guild_aggregates",
+        "assistant_monthly_builds",
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         old.manifest.tables.retain(|table| table.name != name);
@@ -1478,13 +1875,41 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     assert_eq!(inspected.manifest.version, 8);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["game_activity_guild_aggregates", "assistant_monthly_builds"]
+        [
+            "game_activity_guild_aggregates",
+            "assistant_monthly_builds",
+            "scheduled_events_claim",
+            "scheduled_events_tombstone",
+            "event_voice_channels",
+            "event_voice_presence",
+            "admin_api_tokens",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws"
+        ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
+    for name in [
+        "game_activity_guild_aggregates",
+        "assistant_monthly_builds",
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(name)
@@ -1510,18 +1935,27 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v10-source.ndjson.gz");
+    let current_path = directory.path("v15-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 10);
-    let rows = old.buffers.remove("scheduled_events_claim").unwrap();
-    assert!(
-        !rows.is_empty(),
-        "fixture must populate newer scheduled_events_claim"
-    );
-    old.manifest
-        .tables
-        .retain(|table| table.name != "scheduled_events_claim");
+    assert_eq!(old.manifest.version, 15);
+    for name in [
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
     old.manifest.version = 9;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-epoch-claim-v9.ndjson.gz");
@@ -1530,22 +1964,673 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     assert_eq!(inspected.manifest.version, 9);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["scheduled_events_claim"]
+        [
+            "scheduled_events_claim",
+            "scheduled_events_tombstone",
+            "event_voice_channels",
+            "event_voice_presence",
+            "admin_api_tokens",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws"
+        ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    let count: i64 = sqlx::query_scalar(audited(format!(
-        "SELECT COUNT(*) FROM {}",
-        identifier("scheduled_events_claim")
-    )))
-    .fetch_one(pool)
-    .await
-    .unwrap();
+    for name in [
+        "scheduled_events_claim",
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v9 restore clears newer {name} target rows");
+    }
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v10_archive_restores_and_clears_newer_tombstone() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v15-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 15);
+    // Frozen claim-only v10 shape: the merged v10 writer carried the
+    // epoch-claim guard but predates the delete tombstones, token registry
+    // event voice pair and starboard tables.
+    for name in [
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
+    old.manifest.version = 10;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-tombstone-v10.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v10 archive remains readable");
+    assert_eq!(inspected.manifest.version, 10);
     assert_eq!(
-        count, 0,
-        "v9 restore clears newer scheduled_events_claim target rows"
+        inspected.manifest.missing_tables(),
+        [
+            "scheduled_events_tombstone",
+            "event_voice_channels",
+            "event_voice_presence",
+            "admin_api_tokens",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws"
+        ]
+    );
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    for name in [
+        "scheduled_events_tombstone",
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v10 restore clears newer {name} target rows");
+    }
+    let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_claim")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        claims > 0,
+        "the v10 epoch-claim guard is restored, not discarded"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v11_archive_restores_and_clears_newer_registry() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v15-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 15);
+    // Frozen tombstone-only v11 shape: the merged v11 writer carried the
+    // delete tombstones but predates the token registry event voice pair and starboard tables.
+    for name in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
+    old.manifest.version = 11;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-registry-v11.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v11 archive remains readable");
+    assert_eq!(inspected.manifest.version, 11);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        [
+            "event_voice_channels",
+            "event_voice_presence",
+            "admin_api_tokens",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws"
+        ]
+    );
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    for name in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "admin_api_tokens",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v11 restore clears newer {name} target rows");
+    }
+    let tombstones: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_tombstone")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        tombstones > 0,
+        "the v11 delete tombstones are restored, not discarded"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v12_archive_restores_and_clears_newer_event_voice() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v15-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 15);
+    for table in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
+        let rows = old.buffers.remove(table).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {table}");
+        old.manifest.tables.retain(|info| info.name != table);
+    }
+    old.manifest.version = 12;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-event-voice-v12.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v12 archive remains readable");
+    assert_eq!(inspected.manifest.version, 12);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        [
+            "event_voice_channels",
+            "event_voice_presence",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws"
+        ]
+    );
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    for table in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(table)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v12 restore clears newer {table} target rows");
+    }
+    let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_api_tokens")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        tokens > 0,
+        "the v12 token registry is restored, not discarded"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v15-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 15);
+    // Frozen registry-present v12 shape: the released writer carried the
+    // token registry but predates the event voice pair and starboard tables.
+    for name in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
+    let registry_tables = vec!["admin_api_tokens".to_owned()];
+    let registry_before = snapshot(pool, &registry_tables).await;
+    assert!(
+        !registry_before["admin_api_tokens"].rows.is_empty(),
+        "v12 contains issued tokens"
+    );
+    old.manifest.version = 12;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-starboard-v12.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v12 archive remains readable");
+    assert_eq!(inspected.manifest.version, 12);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        [
+            "event_voice_channels",
+            "event_voice_presence",
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws"
+        ]
+    );
+    assert_eq!(
+        inspected.manifest.tables.len(),
+        99,
+        "frozen released v12 coverage"
+    );
+    assert!(inspected
+        .manifest
+        .tables
+        .iter()
+        .any(|table| table.name == "admin_api_tokens" && table.count > 0));
+    sqlx::query("UPDATE admin_api_tokens SET label = 'destination-only registry label'")
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_ne!(snapshot(pool, &registry_tables).await, registry_before);
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    assert_eq!(
+        snapshot(pool, &registry_tables).await,
+        registry_before,
+        "v12 restores the archived registry instead of clearing or retaining destination tokens"
+    );
+    for name in [
+        "event_voice_channels",
+        "event_voice_presence",
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v12 restore clears newer {name} target rows");
+    }
+    let tombstones: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_events_tombstone")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        tombstones > 0,
+        "the v12 delete tombstones are restored, not discarded"
+    );
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let restored_tables = vec![
+        "event_voice_channels".to_owned(),
+        "event_voice_presence".to_owned(),
+        "admin_api_tokens".to_owned(),
+    ];
+    let archived = snapshot(pool, &restored_tables).await;
+    for name in &restored_tables {
+        assert!(
+            !archived[name].rows.is_empty(),
+            "v13 fixture must contain {name}"
+        );
+    }
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v15-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 15);
+    for name in [
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
+        assert!(
+            !old.buffers.remove(name).unwrap().is_empty(),
+            "destination must start with starboard {name} rows"
+        );
+    }
+    // Literal released inventory, not today's prefix or a version-waiver array.
+    old.manifest
+        .tables
+        .retain(|table| FROZEN_V13_TABLES.contains(&table.name.as_str()));
+    assert_eq!(
+        old.manifest
+            .tables
+            .iter()
+            .map(|table| table.name.as_str())
+            .collect::<Vec<_>>(),
+        FROZEN_V13_TABLES
+    );
+    old.manifest.version = 13;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("frozen-pre-starboard-v13.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("released v13 voice-and-registry archive inspects");
+    assert_eq!(inspected.manifest.version, 13);
+    assert_eq!(inspected.manifest.tables.len(), 101);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        [
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws"
+        ]
+    );
+    for name in &restored_tables {
+        assert!(
+            inspected
+                .manifest
+                .tables
+                .iter()
+                .any(|table| table.name == *name && table.count > 0),
+            "v13 archived nonempty {name}"
+        );
+    }
+    // Remove both voice tables and change the registry in the destination. A
+    // no-op restore or blanket clearing of later tables cannot satisfy equality.
+    sqlx::query("DELETE FROM event_voice_presence")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM event_voice_channels")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE admin_api_tokens SET label = 'destination-only registry label'")
+        .execute(pool)
+        .await
+        .unwrap();
+    let dirty = snapshot(pool, &restored_tables).await;
+    for name in &restored_tables {
+        assert_ne!(
+            dirty[name], archived[name],
+            "destination must differ for {name}"
+        );
+    }
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    assert_eq!(
+        snapshot(pool, &restored_tables).await,
+        archived,
+        "v13 restores archived voice rows and issued tokens, not destination data"
+    );
+    for name in [
+        "starboard_config",
+        "starboard_starrers",
+        "starboard_posts",
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+    ] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v13 restore clears newer {name} destination rows");
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v14_archive_restores_and_clears_newer_giveaways() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let preserved = vec![
+        "starboard_config".to_owned(),
+        "starboard_starrers".to_owned(),
+        "starboard_posts".to_owned(),
+        "event_voice_channels".to_owned(),
+        "event_voice_presence".to_owned(),
+        "admin_api_tokens".to_owned(),
+    ];
+    let archived = snapshot(pool, &preserved).await;
+    for name in &preserved {
+        assert!(
+            !archived[name].rows.is_empty(),
+            "v14 fixture must populate {name}"
+        );
+    }
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v15-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 15);
+    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+        let rows = old.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        old.manifest.tables.retain(|table| table.name != name);
+    }
+    assert_eq!(old.manifest.tables.len(), 104, "released v14 inventory");
+    assert_eq!(&DUMP_TABLES[..101], FROZEN_V13_TABLES.as_slice());
+    assert_eq!(
+        &DUMP_TABLES[101..104],
+        ["starboard_config", "starboard_starrers", "starboard_posts"]
+    );
+    old.manifest.version = 14;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-giveaways-v14.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("pre-change v14 archive remains readable");
+    assert_eq!(inspected.manifest.version, 14);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        ["giveaways", "giveaway_entries", "giveaway_draws"]
+    );
+    sqlx::query("DELETE FROM starboard_starrers")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM starboard_posts")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM starboard_config")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM event_voice_presence")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM event_voice_channels")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE admin_api_tokens SET label = 'destination-only registry label'")
+        .execute(pool)
+        .await
+        .unwrap();
+    let dirty = snapshot(pool, &preserved).await;
+    for name in &preserved {
+        assert_ne!(
+            dirty[name], archived[name],
+            "dirty destination must differ for {name}"
+        );
+    }
+    // This test deliberately replaces a reused isolated rehearsal target.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    assert_eq!(
+        snapshot(pool, &preserved).await,
+        archived,
+        "v14 restores starboard, voice and registry data"
+    );
+    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "v14 restore clears newer {name} target rows");
+    }
+    for name in ["event_voice_channels", "event_voice_presence"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(count > 0, "the v14 {name} rows are restored, not discarded");
+    }
+    let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_api_tokens")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(
+        tokens > 0,
+        "the v12 token registry is restored, not discarded"
     );
     let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
         .fetch_one(pool)
@@ -1761,6 +2846,23 @@ fn shipped_drill_script(archives: &Path, binary: &Path) -> String {
         .strip_prefix("/usr/bin/bash -o pipefail -c '")
         .and_then(|rest| rest.strip_suffix('\''))
         .expect("drill runs one single-quoted bash -o pipefail script");
+    // systemd also unquotes C escapes in the word and turns `%%` into `%`.
+    let mut unescaped = String::new();
+    let mut chars = script.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek().copied()) {
+            ('\\', Some(next @ ('\\' | '"'))) => {
+                unescaped.push(next);
+                chars.next();
+            }
+            ('%', Some('%')) => {
+                unescaped.push('%');
+                chars.next();
+            }
+            _ => unescaped.push(c),
+        }
+    }
+    let script = unescaped.as_str();
     for shipped in ["/var/backups/two-bot-next/", "/opt/two-bot-next/two-bot "] {
         assert_eq!(script.matches(shipped).count(), 1, "{shipped} in {script}");
     }
@@ -1862,6 +2964,8 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     };
     let source = db.pool();
     seed(source).await;
+    forget_voice_authority_migration(source).await;
+    let control_fields_before = voice_control_fields(source).await;
     let tables = covered_tables(source).await;
     let before = snapshot(source, &tables).await;
     let version = schema_version(source).await;
@@ -1908,6 +3012,10 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     let contents = inspect(archive).unwrap();
     assert_archive_matches(&contents, &before);
     assert_eq!(contents.manifest.events_sequence, 107);
+    assert!(
+        !contents.manifest.applied_cutover(469),
+        "the shipped backup records the simulated pre-0469 source evidence"
+    );
 
     // Each run allocates a NEW migrated scratch database and retains its
     // evidence, as the drill unit does. Nothing restores into a reused target.
@@ -1927,7 +3035,9 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
                     "TWO_RESTORE_DRILL_BOOTSTRAP_URL",
                     "postgres://agent_test:@agent-testdb:5432/postgres",
                 )
-                .env("TWO_RESTORE_DRILL_EVIDENCE_DIR", &evidence_root),
+                .env("TWO_RESTORE_DRILL_EVIDENCE_DIR", &evidence_root)
+                // The unit's own `Environment=` bound; the archive is seconds old.
+                .env("TWO_RESTORE_DRILL_MAX_ARCHIVE_AGE_S", "172800"),
             &format!("restore drill, month {month}"),
         );
         let dir = assert_drill_verified(&drill, archive);
@@ -1992,6 +3102,21 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
             json!(false),
             "month {month}: ban ownership evidence present"
         );
+        assert_eq!(
+            receipt["translated_voice_command_roles"],
+            json!(4),
+            "month {month}: legacy restrictions translated"
+        );
+        assert_eq!(
+            receipt["translated_voice_command_role_members"],
+            json!(3),
+            "month {month}: legacy restriction members translated"
+        );
+        assert_eq!(
+            receipt["voice_access_controls_added"],
+            json!(1),
+            "month {month}: translation inserted one guild controls row"
+        );
         assert!(
             receipt["restored"].as_object().is_some(),
             "month {month}: receipt reports per-table restored counts"
@@ -2022,7 +3147,69 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
                 }
             }
         }
-        assert_eq!(after, expected, "month {month}: every archived row");
+        assert_eq!(
+            after["voice_command_roles"].rows.len(),
+            0,
+            "month {month}: the 0469 replay empties the legacy tables"
+        );
+        assert_eq!(after["voice_command_role_members"].rows.len(), 0);
+        let controls_before = before["voice_access_controls"].rows.len();
+        assert_eq!(
+            after["voice_access_controls"].rows.len(),
+            controls_before + 1,
+            "month {month}: the 0469 replay adds the legacy-only guild"
+        );
+        let command_roles: Vec<(String, String)> = sqlx::query_as(
+            "SELECT guild_id, command_roles::text FROM voice_access_controls \
+             ORDER BY guild_id COLLATE \"C\"",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let command_roles: Vec<(String, Value)> = command_roles
+            .into_iter()
+            .map(|(guild, roles)| (guild, serde_json::from_str(&roles).unwrap()))
+            .collect();
+        assert_eq!(
+            command_roles,
+            vec![
+                (
+                    "100000000000000001".to_owned(),
+                    json!({"kick": ["100000000000000041", "100000000000000042"],
+                           "limit": [], "template": []}),
+                ),
+                ("100000000000000002".to_owned(), json!({})),
+                (
+                    "100000000000000003".to_owned(),
+                    json!({"private": ["100000000000000044"]}),
+                ),
+            ],
+            "month {month}: the 0469 replay merges legacy restrictions"
+        );
+        let control_fields_after: Vec<_> = voice_control_fields(&pool)
+            .await
+            .into_iter()
+            .filter(|(guild, _, _)| control_fields_before.iter().any(|(g, _, _)| g == guild))
+            .collect();
+        assert_eq!(
+            control_fields_after, control_fields_before,
+            "month {month}: pre-existing guilds' non-translated controls round-trip"
+        );
+        for (table, expected_table) in &expected {
+            if [
+                "voice_access_controls",
+                "voice_command_roles",
+                "voice_command_role_members",
+            ]
+            .contains(&table.as_str())
+            {
+                continue;
+            }
+            assert_eq!(
+                &after[table], expected_table,
+                "month {month}: every archived row in {table}"
+            );
+        }
         assert_fresh_cas_tokens(&pool, cas_before).await;
         assert_eq!(
             triggers(&pool).await,
@@ -2093,5 +3280,86 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
             .unwrap();
     }
     admin.close().await;
+    db.close().await.unwrap();
+}
+
+async fn scheduled_pending(pool: &PgPool) -> (Option<String>, Option<String>, bool) {
+    sqlx::query_as(
+        "SELECT claim_token, occurrence_nonce, delivery_uncertain
+           FROM scheduled_messages WHERE id = $1",
+    )
+    .bind("pending")
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn restore_refences_pre_0142_pending_scheduled_rows() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    // A live pending occurrence as a pre-0142 writer left it: claimed with a
+    // nonce while the fence column did not exist yet.
+    sqlx::query(
+        "INSERT INTO scheduled_messages
+           (id, guild_id, channel_id, body, next_run_at, interval_seconds, enabled,
+            last_run_at, last_message_id, created_by, created_at, updated_by, updated_at,
+            claim_token, claimed_at, occurrence_nonce, delivery_uncertain)
+         VALUES ('pending', 'guild', 'channel', 'synthetic body', '2026-10-02T00:00:00Z',
+                 60, TRUE, NULL, NULL, 'actor', '2026-10-01T00:00:00Z', 'actor',
+                 '2026-10-01T00:00:00Z', 'synthetic-claim', '2026-10-01T00:00:00Z',
+                 'synthetic-nonce', FALSE)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let directory = ArchiveDirectory::new();
+    let fresh = directory.path("scheduled.ndjson.gz");
+    dump(pool, &fresh).await.unwrap();
+
+    // A current archive restores the recorded fence faithfully.
+    let report = restore(pool, &fresh).await.unwrap();
+    assert!(report.ok);
+    let (claim, nonce, fenced) = scheduled_pending(pool).await;
+    assert_eq!(claim.as_deref(), Some("synthetic-claim"));
+    assert_eq!(nonce.as_deref(), Some("synthetic-nonce"));
+    assert!(!fenced, "a recorded clear fence restores faithfully");
+
+    // Strip the fence column the way a pre-0142 writer never wrote it: the
+    // manifest entry (with its parallel type) and every row cell go together.
+    let mut old = copy_contents(&inspect(&fresh).unwrap());
+    let table = old
+        .manifest
+        .tables
+        .iter_mut()
+        .find(|table| table.name == "scheduled_messages")
+        .expect("scheduled table in manifest");
+    let at = table
+        .columns
+        .iter()
+        .position(|column| column == "delivery_uncertain")
+        .expect("fence column in fresh dump");
+    table.columns.remove(at);
+    if !table.column_types.is_empty() {
+        table.column_types.remove(at);
+    }
+    for row in old
+        .buffers
+        .get_mut("scheduled_messages")
+        .expect("scheduled rows")
+    {
+        row.remove("delivery_uncertain");
+    }
+    let archive = directory.path("scheduled-pre0142.ndjson.gz");
+    write_archive(&archive, &old);
+
+    let report = restore(pool, &archive).await.unwrap();
+    assert!(report.ok);
+    let (claim, nonce, fenced) = scheduled_pending(pool).await;
+    assert_eq!(claim.as_deref(), Some("synthetic-claim"));
+    assert_eq!(nonce.as_deref(), Some("synthetic-nonce"));
+    assert!(fenced, "an old archive never proves the occurrence unsent");
     db.close().await.unwrap();
 }

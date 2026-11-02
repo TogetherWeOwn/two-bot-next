@@ -12,7 +12,7 @@ use sqlx::PgPool;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CounterRow {
     pub code: String,
-    pub uses: i64,
+    pub uses: u64,
     pub inviter_id: Option<String>,
     pub channel_id: Option<String>,
 }
@@ -44,6 +44,14 @@ pub async fn store_counters(
             .collect();
     let mut seen: HashSet<&str> = HashSet::new();
     for row in rows {
+        let uses = two_bot_core::invites::saturate_invite_uses(row.uses);
+        if uses != row.uses {
+            tracing::warn!(
+                guild_id = %guild_id,
+                code = %row.code,
+                "invite uses saturated at i32::MAX",
+            );
+        }
         seen.insert(row.code.as_str());
         let inviter = row
             .inviter_id
@@ -58,7 +66,8 @@ pub async fn store_counters(
         )
         .bind(guild_id)
         .bind(&row.code)
-        .bind(row.uses)
+        // Clamped to INTEGER above; this cast cannot truncate.
+        .bind(uses as i32)
         .bind(inviter)
         .bind(&row.channel_id)
         .bind(captured_at)

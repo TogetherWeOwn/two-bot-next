@@ -24,6 +24,34 @@ pub enum VoiceSessionDelta {
     },
 }
 
+/// Identity minted once at ingress and retained when a delivery is retried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionDelivery {
+    pub event_id: String,
+    pub event_order: String,
+}
+
+/// Emoji identity, independent of a custom emoji's mutable display name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReactionEmoji {
+    Unicode(String),
+    Custom(Snowflake),
+}
+
+/// IDs and filter inputs only; no message content is retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionEvent {
+    pub guild_id: Option<Snowflake>,
+    pub channel_id: Snowflake,
+    pub message_id: Snowflake,
+    pub user_id: Snowflake,
+    pub message_author_id: Option<Snowflake>,
+    pub member_is_bot: Option<bool>,
+    pub emoji: ReactionEmoji,
+    pub burst: bool,
+    pub delivery: ReactionDelivery,
+}
+
 /// Domain event: the framework-free unit the bot reasons about.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoreEvent {
@@ -47,10 +75,19 @@ pub enum CoreEvent {
         author_id: Snowflake,
         author_is_bot: bool,
     },
+    ReactionAdded(ReactionEvent),
+    ReactionRemoved(ReactionEvent),
+    MessageDeleted {
+        guild_id: Option<Snowflake>,
+        channel_id: Snowflake,
+        message_id: Snowflake,
+    },
     /// Catch-all for subscribed events not yet modelled (keeps the adapter
     /// total while S3+ grows coverage slice by slice). Owned so events can
     /// round-trip through serde (DB-backed session resume, S3+).
-    Unmodelled { kind: String },
+    Unmodelled {
+        kind: String,
+    },
 }
 
 impl CoreEvent {
@@ -61,8 +98,24 @@ impl CoreEvent {
             Self::MemberJoined { guild_id, .. }
             | Self::MemberLeft { guild_id, .. }
             | Self::VoiceStateChanged { guild_id, .. } => Some(*guild_id),
-            Self::MessageCreated { guild_id, .. } => *guild_id,
+            Self::MessageCreated { guild_id, .. } | Self::MessageDeleted { guild_id, .. } => {
+                *guild_id
+            }
+            Self::ReactionAdded(reaction) | Self::ReactionRemoved(reaction) => reaction.guild_id,
             Self::Unmodelled { .. } => None,
+        }
+    }
+
+    /// Delivery key for reaction consumers. Retry the same event with this
+    /// original pair, never mint another identity for detached work.
+    #[must_use]
+    pub fn starboard_delivery_key(&self) -> Option<(String, String)> {
+        match self {
+            Self::ReactionAdded(reaction) | Self::ReactionRemoved(reaction) => Some((
+                reaction.delivery.event_id.clone(),
+                reaction.delivery.event_order.clone(),
+            )),
+            _ => None,
         }
     }
 }

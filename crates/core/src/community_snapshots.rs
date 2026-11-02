@@ -273,9 +273,9 @@ pub fn match_rank_roles(roles: &[(String, String)]) -> Option<Vec<RankRole>> {
     Some(out)
 }
 
-/// One missing lower rung to restore (rank self-heal plan entry): the member
-/// already holds a higher rank, so granting this lower rung never escalates
-/// anyone — it only completes the cumulative ladder.
+/// One missing lower rung in the supplied roster observation. It completes
+/// a cumulative ladder only while that member still holds a higher rank:
+/// callers must revalidate current member eligibility before applying it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankHeal {
     pub member_id: String,

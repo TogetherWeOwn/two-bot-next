@@ -87,8 +87,10 @@ library code with no Discord dependency and can start immediately.
   still there. It also lets a member claim a room whose owner has left.
 - `/transfer member`: hands the room to a member who is in it. The recipient also
   becomes the original creator.
-- Owner-only commands refuse everyone else. Guild admins may use owner commands
-  in any tracked room; channel-scoped grants never provide that override.
+- Owner-only commands refuse everyone else, and guild admins act on their own
+  tracked room first: only `/transfer` from an admin with no tracked room of
+  their own falls back to the recipient's tracked room. Channel-scoped grants
+  never provide that override.
 - Succession, reclaim and transfer persist a room-scoped recipient journal before
   issuing any owner grant. The overwrite rewrite removes owner-grant bits from
   all recorded former recipients and installs the current owner's grant; unrelated

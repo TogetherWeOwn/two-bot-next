@@ -1,9 +1,16 @@
 //! Loopback-only tests of the actual Twilight request builders and transport.
 
+#[path = "voice_ballot_message_http_tests.rs"]
+mod ballot_message;
+
 #[path = "voice_creation_receipt_acceptance_tests.rs"]
 mod creation_receipt_acceptance;
 #[path = "voice_creation_receipt_edge_tests.rs"]
 mod creation_receipt_edges;
+#[path = "voice_global_jitter_adoption_tests.rs"]
+mod global_jitter_adoption;
+#[path = "voice_import_review_transport_acceptance_tests.rs"]
+mod import_review_transport_acceptance;
 
 use super::*;
 use axum::{

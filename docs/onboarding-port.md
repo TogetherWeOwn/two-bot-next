@@ -81,8 +81,13 @@ this slice.
    flow or claim deployment parity.
 5. Dispatch `two:onboarding:games` only outside session mode, and
    `two:onboarding:session` in session mode. Defer ephemerally. Execute game
-   add/remove-to-match effects; on role failure use `PICKER_ROLE_FAILURE_REPLY`
-   and write no successful selection/routing rows. On success, re-run
+   add/remove-to-match effects. If the first role write fails, use
+   `PICKER_ROLE_FAILURE_REPLY` and write no rows. If a later write fails after
+   earlier grants landed, commit one `game_roles_selected` row naming only the
+   applied grants (no `channel_routed`; a suppressed member persists nothing)
+   and reply with `game_partial_failure_reply`, which names applied vs pending
+   picks; the member's retry is a fresh whole-answer submission that converges.
+   On success, re-run
    `plan_game_selection` with **post-grant** visibility, then build the
    final linked reply with `game_picker_reply` before recording routing. `GamePickerOutcome.reply/routed`
    are provisional at the pre-write point, not an authoritative post-grant
@@ -106,6 +111,13 @@ The prompt guard prevents normal concurrent/redelivered successful sends; it is
 **not exactly-once across a process crash between Discord acceptance and the
 Postgres commit**. That cross-system ambiguity is inherited from legacy's
 send-then-record ordering. Do not record a failed send as success to hide it.
+
+The guard lasts one stay: a processed goodbye (any mode, including dry run,
+and whether or not a goodbye message is posted) deletes the member's
+`onboarding_prompted` row before anything public is posted, so a rejoin is
+welcomed again. A clear that fails retries before the goodbye post; the next
+welcome re-runs the full suppression gate, so an opted-out member is never
+re-welcomed.
 
 ## Runtime wiring checkpoint
 
@@ -201,12 +213,17 @@ partial role writes cannot safely be reconstructed from its gateway sequence.
 Interrupted receipt counts are operational evidence, not successful responses.
 Within a live process, uncertain callbacks attempt an error edit without role
 replay; post-defer errors/timeouts get one bounded honest error edit. A delivered
-error reply is terminal and writes no successful selection/routing rows.
+error reply is terminal. Success rows are committed before the reply is sent,
+so the reply only ever describes committed state; if the reply (or the
+processing deadline) then fails, those rows are retracted by their per-submission
+idempotency keys before the error edit, so a selection the member was told
+failed is never counted. The one deliberate exception is the partial game-role
+failure above, whose delivered reply describes the committed partial row.
 
 Anchor `onboarding_prompted` and `channel_routed` now commit together under the
 PromptGuard. Game selection/routing and session routing success rows are staged
-inside their processing transaction, which rolls back when the final response
-fails. Discord acceptance versus database commit remains a cross-system
+inside their processing transaction and committed before the final response; a
+failed final response retracts them (`retract_picker_rows`). Discord acceptance versus database commit remains a cross-system
 ambiguity: neither the queue nor these transactions claims exactly-once sends
 across a crash in that window. Session goodbyes are at-least-once across such a
 crash; the legacy welcome marker suppresses retries after its successful commit.

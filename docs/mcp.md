@@ -161,3 +161,37 @@ registered until that lands.
 
 No dashboard or admin UI duplication: MCP reuses the same container read
 APIs and never adds UI.
+
+### Proof admission contract (offline-verifiable)
+
+`scripts/staging_mcp_proveout.py` admits the original bounded response, not
+its redacted display. Duplicate decoded JSON keys at any depth fail with
+`JSON_DUPLICATE_KEY`, even when values match or names use different escapes.
+Recording keeps bounded redacted text, never a last-key-wins dictionary.
+
+The initialize request offers `2025-06-18`; either shipped string version
+(`2025-06-18` or `2025-03-26`) may negotiate. Missing, non-string, unknown or
+refused negotiation fails with `PROTOCOL_UNSUPPORTED`. Tool discovery must
+advertise exactly the five unique names above, each with the shipped
+`inputSchema`: `type: "object"`, empty `properties`, and literal boolean
+`additionalProperties: false`. Missing or incompatible schemas fail with
+`TOOL_SCHEMA_INVALID`. An optional empty `required` list and nonasserting
+metadata/unused definitions remain compatible; unknown schema constraints
+are refused rather than interpreted by a generic schema engine.
+
+All authenticated replies retain JSON-RPC 2.0, exact request-ID and exclusive
+result/error framing checks. Tool-content compatibility (including empty
+lists), the audit excerpt bounds, explicit fence corroboration, body/depth
+caps, bearer redaction, exact staging URL and redirect refusal are unchanged.
+Failures retain the probe's stage ID, a fixed reason code and bounded `next:`
+action; exit 1 agrees with artifact `proof_disposition: "failed"`. Exit 0
+requires no failures and `"proved"`; preflight refusal exits 2 without sending.
+A recorded response alone is not proof, and offline checks are not live or
+installed acceptance.
+
+Run the entire offline proof family (synthetic responses; no live service or
+credentials, with localhost-only transport controls):
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_staging_mcp_proveout*.py' -v
+```

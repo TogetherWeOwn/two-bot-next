@@ -19,6 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import staging_voice_synthetic as synth  # noqa: E402
+import test_staging_voice_synthetic_owned_room_acceptance as owned
 
 ME, CREATOR, ROOM, OTHER, CAT = "900", synth.STAGING_CREATOR_ID, "5001", "5002", "4000"
 OWNER_ALLOW = str(synth.OWNER_BITS | (1 << 21))
@@ -94,6 +95,43 @@ class EvaluateTest(unittest.TestCase):
         wrong = [obs()["channels"][0], dict(obs()["channels"][1], position=17), dict(human, position=18),
                  obs()["channels"][2]]
         self.assertEqual(verdicts(obs(channels_before=before, channels=wrong))["position"], "FAIL")
+
+    def test_a_predecessor_swept_mid_run_does_not_fail_position(self):
+        # The empty-room sweep deleted the snapshotted predecessor between the
+        # before/after channel reads: the room directly below the creator is
+        # correctly placed, and the detail names the swept predecessor.
+        human = {"id": "5003", "parent_id": CAT, "type": 2, "position": 17,
+                 "permission_overwrites": [{"id": "111", "type": 1, "allow": OWNER_ALLOW}]}
+        before = [obs()["channels"][0], human, obs()["channels"][2]]
+        after = [obs()["channels"][0], obs()["channels"][1], obs()["channels"][2]]
+        result = synth.evaluate(obs(channels_before=before, channels=after))
+        position = next(c for c in result if c["check"] == "position")
+        self.assertEqual(position["verdict"], "PASS")
+        self.assertIn("swept since the snapshot: ['5003']", position["detail"])
+
+    def test_only_surviving_predecessors_anchor_the_slot(self):
+        # Of two snapshotted predecessors one is swept mid-run: the room must
+        # follow the survivor, not the ghost and not the creator.
+        swept = {"id": "5003", "parent_id": CAT, "type": 2, "position": 17,
+                 "permission_overwrites": [{"id": "111", "type": 1, "allow": OWNER_ALLOW}]}
+        stayed = {"id": "5005", "parent_id": CAT, "type": 2, "position": 18,
+                  "permission_overwrites": [{"id": "113", "type": 1, "allow": OWNER_ALLOW}]}
+        before = [obs()["channels"][0], swept, stayed, obs()["channels"][2]]
+        good = [obs()["channels"][0], dict(stayed, position=17),
+                dict(obs()["channels"][1], position=18), obs()["channels"][2]]
+        self.assertEqual(verdicts(obs(channels_before=before, channels=good))["position"], "PASS")
+        bad = [obs()["channels"][0], dict(obs()["channels"][1], position=17),
+               dict(stayed, position=18), obs()["channels"][2]]
+        self.assertEqual(verdicts(obs(channels_before=before, channels=bad))["position"], "FAIL")
+
+    def test_a_swept_predecessor_does_not_excuse_a_misplaced_room(self):
+        # The predecessor is gone but the room landed after an unrelated
+        # channel instead of below the creator: still a misplacement.
+        human = {"id": "5003", "parent_id": CAT, "type": 2, "position": 17,
+                 "permission_overwrites": [{"id": "111", "type": 1, "allow": OWNER_ALLOW}]}
+        before = [obs()["channels"][0], human, obs()["channels"][2]]
+        after = [obs()["channels"][0], obs()["channels"][2], dict(obs()["channels"][1], position=70)]
+        self.assertEqual(verdicts(obs(channels_before=before, channels=after))["position"], "FAIL")
 
     def test_a_fixed_channel_after_the_creator_is_not_part_of_its_block(self):
         fixed = {"id": "5004", "parent_id": CAT, "type": 2, "position": 20,
@@ -1209,6 +1247,80 @@ class HelloIntervalTest(unittest.TestCase):
         with self.assertRaises(synth.GatewayShapeError) as ctx:
             self.session_with_interval(600001)
         self.assertEqual(str(ctx.exception), self.HELLO_MSG)
+
+
+class OwnedRoomRegressionTest(unittest.TestCase):
+    """Additional regressions; the paired protected acceptance stays immutable."""
+
+    def run_case(self, batches, *, creator_name=owned.ORIGINAL_NAME,
+                 patch_plan=None):
+        rooms = {owned.OWN: owned.room_state(owned.OWN),
+                 owned.REJOIN: owned.room_state(owned.REJOIN, position=18)}
+        before = [owned.creator_state(owned.TEMP_NAME)]
+        fake = owned.make_fake(
+            rooms=rooms, before=before, after=before + list(rooms.values()),
+            creator_name=creator_name, patch_plan=patch_plan)
+        session = owned.FakeSession(batches)
+        result = owned.run_with_fakes([], session, fake)
+        self.assertTrue(session.closed)
+        return result, fake
+
+    def test_cleanup_2xx_with_unchanged_limit_requires_manual_restore(self):
+        batches = [
+            [owned.GUILD_CREATE],
+            [owned.channel_create(owned.OWN), owned.voice_update(owned.OWN)],
+            [], [], [],
+        ]
+        (code, _, _, evidence), fake = self.run_case(
+            batches, creator_name=owned.RESIDUE_NAME, patch_plan=[
+                ("apply_then_raise", ConnectionError("lost probe response")),
+                ("status", 204),
+            ])
+        self.assertEqual(code, 1)
+        self.assertEqual(evidence["room_id"], owned.OWN)
+        self.assertEqual(owned.verdicts(evidence)["limit"], "FAIL")
+        text = owned.detail(evidence, "limit")
+        for snippet in (owned.LIMIT_UNCERTAIN, owned.OWN,
+                        str(owned.INITIAL_LIMIT), "restore", "manually"):
+            self.assertIn(snippet, text)
+        self.assertNotIn("re-run", text)
+        self.assertEqual(fake.patches, owned.room_round_trip())
+        self.assertEqual(fake.rooms[owned.OWN]["user_limit"], owned.PROBED_LIMIT)
+        self.assertLessEqual(fake.gets_to(owned.OWN), 8)
+
+    def test_rejoin_create_after_move_is_collected_during_delete_wait(self):
+        batches = [
+            [owned.GUILD_CREATE],
+            [owned.channel_create(owned.OWN), owned.voice_update(owned.OWN)],
+            [owned.status_update(owned.OWN)],
+            [owned.voice_update(owned.REJOIN)],
+            [owned.channel_create(owned.REJOIN), owned.channel_delete(owned.OWN),
+             owned.channel_delete(owned.REJOIN)],
+        ]
+        (code, _, _, evidence), fake = self.run_case(batches)
+        self.assertEqual(code, 0)
+        self.assertEqual(evidence["room_id"], owned.OWN)
+        # The JSON evidence exposes the correlated subject in the detail.
+        self.assertIn(owned.REJOIN, owned.detail(evidence, "rejoin"))
+        self.assertEqual(owned.verdicts(evidence)["rejoin"], "PASS")
+        self.assertEqual(owned.verdicts(evidence)["delete"], "PASS")
+        self.assertEqual(fake.patches, [owned.rename_cycle()[0]]
+                         + owned.room_round_trip() + [owned.rename_cycle()[1]])
+
+    def test_wrong_category_create_refuses_before_any_patch(self):
+        batches = [
+            [owned.GUILD_CREATE],
+            [owned.channel_create(owned.OWN, parent_id="other"),
+             owned.voice_update(owned.OWN)],
+            [], [], [],
+        ]
+        (code, _, _, evidence), fake = self.run_case(
+            batches, creator_name=owned.RESIDUE_NAME)
+        self.assertEqual(code, 1)
+        self.assertIsNone(evidence["room_id"])
+        self.assertEqual(owned.verdicts(evidence)["create"], "FAIL")
+        self.assertEqual(fake.patches, [])
+        self.assertEqual(fake.gets_to(owned.OWN), 0)
 
 
 if __name__ == "__main__":

@@ -26,8 +26,9 @@ name: slow-burn-tracker
 # five-minute read out of the staging deployment history; the environment's
 # main-only branch policy and any reviewer or wait timer still apply.
 # STAGING_WORKER_URL is the existing repo variable. Without either binding
-# the run warns and exits green: an unconfigured tracker must not read as a
-# clean bill of burn health. Issue writes use the job GITHUB_TOKEN
+# the run fails closed with an error naming the unset binding: an
+# unconfigured tracker must not read as a clean bill of burn health. Issue
+# writes use the job GITHUB_TOKEN
 # (contents:read plus issues:write).
 #
 # Proof: dispatch with fixture fire (or clear) to run the now-anchored burn

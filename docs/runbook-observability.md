@@ -110,7 +110,9 @@ deployment/schema/ACL issue for the authorized Operator,
 not something to repair with a production query or restart.
 
 Every alert message and alert log line carries the container build revision and
-a log-query link; a crash-loop or unhandled exception surfaces as a sustained
+a log-query link (`Build: <sha>` + `Logs: <url>` via `alertContextSuffix`,
+`wrangler/src/alert-rules.ts:311-320`; `unknown` when the `/readyz` probe
+failed); a crash-loop or unhandled exception surfaces as a sustained
 `/readyz` red, which alerts after the readiness threshold below.
 
 If `/readyz` remains red, the Worker/DO readiness transition alerts after its
@@ -120,6 +122,43 @@ existing firing state and does not count as recovery. See the detailed rule
 definitions and their alert-response sections in
 [the operations runbook](runbook.md#metrics-alerts) and
 [metrics reference](metrics.md#off-container-scrape-and-alert-rules).
+
+## Raid and join-risk queue drops
+
+`two_bot_raid_dropped_joins_total{reason}` and
+`two_bot_join_risk_dropped_joins_total{reason}` count each join the respective
+observer could not enqueue. The only reasons are `queue_full` and
+`queue_closed`; all four series render zero before the first drop and reset
+on process restart. Queue saturation still drops without waiting and logs a
+warning. A closed queue additionally logs ERROR with `error_class` equal to
+`raid_queue_closed` or `join_risk_queue_closed`. It means the receiver is gone,
+not merely busy; correlate the same build's worker lifecycle and
+`raid_watch_failed` / `join_risk_failed` logs before considering a repair.
+
+The gateway has already recorded the join before calling these observers: a
+drop means missing raid observation or risk scoring, not lost gateway
+persistence. Compare counters across scrapes of the same process and inspect
+the corresponding Container log window. Existing raid and join-risk ERROR
+sites carry a fixed `error_class` matching their message stem, including
+`raid_alert` and `join_risk_evidence` (log-first evidence, not proof a post
+failed). Tuning refusals still log ERROR only on state changes. Record bounded
+classes, timestamps and build revision, not member IDs or raw error details.
+No new alert rule, retry, tuning or delivery change is introduced. Do not
+replay joins to repair a missed alert; configuration and restart actions keep
+their existing gates. See [raid delivery boundaries](raid-port.md).
+
+## Ticket lifecycle signals
+
+When a ticket vanishes or a member is stuck on Creating, start with the
+`ticket_lifecycle` container lines (one per retire, abandon, purge and
+successful staff-button claim/close executed through the button path, with
+`ticket_id`, `prior_status` and a fixed-vocabulary `cause`) and the
+`two_bot_ticket_lifecycle_total{event,outcome}` counter, then the
+`ticket recovery deferred` / `ticket action incomplete` warns, which cite
+the action, ticket and status. The series, labels and causes are listed in
+[ticket-lifecycle-observability.md](ticket-lifecycle-observability.md). No
+alert rule consumes this family yet; read the samples directly from the
+container exposition.
 
 ## Voice boot-setting refusal
 
@@ -197,9 +236,6 @@ ids: they join to themselves, not to an inbound request.
 These are deliberate, visible limits of the current implementation; do not
 claim them as shipped acceptance:
 
-- Worker/DO alert log lines and Discord messages do not yet consistently carry
-  the Container Git SHA and a direct log-query URL. Use the build/deploy
-  correlation procedure above.
 - Worker/DO request-span and dispatch lines (`internal_actions_ingress`,
   `eventsub_ingress`) carry `release` (the container Git SHA, deploy-stamped
   on the Worker edge and probe-read on the DO relay, `"unknown"` when neither
@@ -245,9 +281,10 @@ claim them as shipped acceptance:
   the `production` job against live production `/ops/metrics` (evidence
   `production-error-rate-gate.json`), failing the stage into the same
   auto-rollback; live enforcement needs the `PRODUCTION_METRICS_SCRAPE_TOKEN`
-  secret, else a recorded skip. Production has no rehearsal path: its guard
-  refuses `inject_error_rate_spike` (failure injection runs on staging only,
-  after the 10-20 20:54Z forced production drill).
+  secret, else a recorded skip. Production has no drill input, guard binding
+  or rehearsal flag. The [daily staging proof](production-deploy.md#daily-staging-proof)
+  exercises automatic rollback on staging only; its independent freshness
+  watcher alerts when the scheduled proof fails or goes missing.
 - The shared central gradual-promotion action promotes 5-50-100% with
   per-stage health gates and automatic rollback to the recorded pre-promote
   version. The caller contract is implemented (`bin/smoke.mjs`, contract-tested
@@ -260,6 +297,35 @@ claim them as shipped acceptance:
   before any Cloudflare call until its isolated synthetic fixture lands, and
   production has no gradual caller. Do not treat the existing gated readiness
   check plus manual rollback as proof of a gradual traffic rollout here.
+
+## Promotion gate failure codes
+
+The promotion error-rate gate (`wrangler/scripts/promotion-error-gate.mjs`)
+fences its scrape destination to the configured staging/production Worker
+origins and fails closed with a stable code, a fixed next action and a JSON
+error receipt (`verdict: "error"`) when it cannot judge. The closed code
+vocabulary:
+
+- `usage_error` — bad flags; check the gate flags with `--help` and retry. Exit 2.
+- `invalid_metrics_origin` — `--metrics-url` is not a bare `https://` Worker
+  origin from the configured identities; fix the origin and retry. Exit 2.
+- `invalid_timeout` — `--scrape-timeout-seconds` is not a finite positive
+  value within the supported timer range; fix the value and retry. Exit 2.
+- `redirect_refused` — the scrape refused a redirect; the bearer is never
+  followed across redirects. Verify direct `/ops/metrics` and retry. Exit 1.
+- `auth_failed` — the Worker refused the scrape credentials (401/403);
+  verify the token is current and retry. Exit 1.
+- `transport_failed` — the scrape transport failed after 3 attempts; verify
+  the Worker is reachable and retry. Exit 1.
+- `decode_failed` — the exposition could not be decoded; verify valid output
+  at `/ops/metrics` and retry. Exit 1.
+
+Receipts and console text never carry remote bodies, URL credentials, the
+bearer or exception messages. Offline rehearsal (no network, no token):
+
+```sh
+node wrangler/scripts/promotion-error-gate.mjs --metrics-url https://two-bot-next-staging.5150.workers.dev --evidence /tmp/gate-evidence.json --rehearsal-firing '[]'
+```
 
 For the full health, metrics, and rollback procedures, see the
 [operations runbook](runbook.md), [metrics reference](metrics.md), and

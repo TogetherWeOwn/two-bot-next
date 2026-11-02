@@ -118,50 +118,50 @@ class DriftTests(unittest.TestCase):
             line for line in self.docker.splitlines()
             if line != "COPY crates/store/Cargo.toml crates/store/")
         self.assertNotEqual(mutated, self.docker)
-        with self.assertRaisesRegex(AssertionError, "crates/store/Cargo.toml"):
+        with self.assertRaisesRegex(manifests.Refusal, "crates/store/Cargo.toml"):
             self.check(mutated)
 
     def test_extra_input_fails_closed(self):
         mutated = self.docker.replace(
             "COPY . .", "COPY extra-fixture.txt ./\nCOPY . .", 1)
-        with self.assertRaisesRegex(AssertionError, "extra-fixture.txt"):
+        with self.assertRaisesRegex(manifests.Refusal, "extra-fixture.txt"):
             self.check(mutated)
 
     def test_add_instruction_fails_closed(self):
         mutated = self.docker.replace(
             "COPY . .", "ADD rust-toolchain.toml ./\nCOPY . .", 1)
-        with self.assertRaisesRegex(AssertionError, "ADD"):
+        with self.assertRaisesRegex(manifests.Refusal, "ADD"):
             self.check(mutated)
 
     def test_lowercase_copy_fails_closed(self):
         mutated = self.docker.replace(
             "COPY . .", "copy rust-toolchain.toml ./\nCOPY . .", 1)
-        with self.assertRaisesRegex(AssertionError, "uppercase COPY"):
+        with self.assertRaisesRegex(manifests.Refusal, "uppercase COPY"):
             self.check(mutated)
 
     def test_unexpected_workdir_fails_closed(self):
         mutated = self.docker.replace(
             "COPY . .", "WORKDIR /app/sub\nCOPY . .", 1)
-        with self.assertRaisesRegex(AssertionError, "WORKDIR"):
+        with self.assertRaisesRegex(manifests.Refusal, "WORKDIR"):
             self.check(mutated)
 
     def test_preamble_copy_fails_closed(self):
         mutated = self.docker.replace(
             "WORKDIR /app", "COPY preamble-fixture.txt ./\nWORKDIR /app", 1)
         self.assertNotEqual(mutated, self.docker)
-        with self.assertRaisesRegex(AssertionError, "preamble"):
+        with self.assertRaisesRegex(manifests.Refusal, "preamble"):
             self.check(mutated)
 
     def test_preamble_add_fails_closed(self):
         mutated = self.docker.replace(
             "WORKDIR /app", "ADD preamble-fixture.txt ./\nWORKDIR /app", 1)
-        with self.assertRaisesRegex(AssertionError, "unsupported"):
+        with self.assertRaisesRegex(manifests.Refusal, "unsupported"):
             self.check(mutated)
 
     def test_preamble_run_fails_closed(self):
         mutated = self.docker.replace(
             "WORKDIR /app", "RUN echo preamble > preamble.txt\nWORKDIR /app", 1)
-        with self.assertRaisesRegex(AssertionError, "preamble"):
+        with self.assertRaisesRegex(manifests.Refusal, "preamble"):
             self.check(mutated)
 
     def test_unsupported_command_fails_closed(self):
@@ -169,7 +169,52 @@ class DriftTests(unittest.TestCase):
             "COPY . .",
             "RUN curl -fsSL https://example.invalid/setup.sh | sh\nCOPY . .",
             1)
-        with self.assertRaisesRegex(AssertionError, "unsupported.*curl"):
+        with self.assertRaisesRegex(manifests.Refusal, "unsupported.*curl"):
+            self.check(mutated)
+
+    def test_copy_without_destination_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .", "COPY foo\nCOPY . .", 1)
+        with self.assertRaisesRegex(
+                manifests.Refusal, "COPY needs sources and destination"):
+            self.check(mutated)
+
+    def test_empty_run_segment_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .",
+            "RUN mkdir -p src && && cargo fetch --locked\nCOPY . .", 1)
+        with self.assertRaisesRegex(manifests.Refusal, "empty segment"):
+            self.check(mutated)
+
+    def test_bare_mkdir_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .", "RUN mkdir -p\nCOPY . .", 1)
+        with self.assertRaisesRegex(manifests.Refusal, "unsupported.*mkdir"):
+            self.check(mutated)
+
+    def test_short_echo_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .", "RUN echo hi\nCOPY . .", 1)
+        with self.assertRaisesRegex(manifests.Refusal, "unsupported.*echo"):
+            self.check(mutated)
+
+    def test_long_echo_fails_closed(self):
+        # The trailing word is silently ignored without the arity pin.
+        mutated = self.docker.replace(
+            "COPY . .", "RUN echo a > b c\nCOPY . .", 1)
+        with self.assertRaisesRegex(manifests.Refusal, "unsupported.*echo"):
+            self.check(mutated)
+
+    def test_misquoted_run_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .", "RUN echo 'unterminated\nCOPY . .", 1)
+        with self.assertRaisesRegex(manifests.Refusal, "malformed quoting"):
+            self.check(mutated)
+
+    def test_misquoted_copy_fails_closed(self):
+        mutated = self.docker.replace(
+            "COPY . .", "COPY 'unterminated ./\nCOPY . .", 1)
+        with self.assertRaisesRegex(manifests.Refusal, "malformed quoting"):
             self.check(mutated)
 
 
@@ -202,7 +247,7 @@ class ReplayTests(unittest.TestCase):
             dest = Path(tmp) / "layer"
             dest.mkdir()
             self.assertTrue(manifests.reconstruct(docker, root, dest))
-            with self.assertRaisesRegex(AssertionError, "crates/a"):
+            with self.assertRaisesRegex(manifests.Refusal, "crates/a"):
                 manifests.validate_layer(dest)
 
     def test_layer_without_fetch_is_not_checked(self):
@@ -213,10 +258,25 @@ class ReplayTests(unittest.TestCase):
             dest.mkdir()
             self.assertFalse(manifests.reconstruct(docker, root, dest))
 
+    def test_copy_without_destination_fails_replay_closed(self):
+        docker = SYNTHETIC_DOCKER.replace(
+            "COPY . .", "COPY foo\nCOPY . .", 1)
+        with tempfile.TemporaryDirectory(prefix="manifest-fixture-") as tmp:
+            root = make_synthetic_root(tmp)
+            dest = Path(tmp) / "layer"
+            dest.mkdir()
+            with self.assertRaisesRegex(
+                    manifests.Refusal, "COPY needs sources and destination"):
+                manifests.reconstruct(docker, root, dest)
+
 
 class WorkflowSurfaceTests(unittest.TestCase):
     def test_fixtures_run_in_ci(self):
         self.assertIn("test_check_docker_manifests.py", CHECK_YML.read_text())
+
+
+# Keep the protected replay acceptance battery on the existing CI entrypoint.
+from test_docker_replay_intake_acceptance import DockerReplayConfinementAcceptanceTests
 
 
 if __name__ == "__main__":

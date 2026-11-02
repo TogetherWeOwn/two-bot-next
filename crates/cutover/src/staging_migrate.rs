@@ -37,6 +37,8 @@ use sqlx::{
 };
 use two_bot_core::database_tls::{self, TlsPolicy};
 
+use crate::intake_cap::{read_bytes_capped, IntakeReadError, INTAKE_CAP_LABEL};
+
 /// Fixed binding names; each value is a secret and is never echoed.
 /// Plan reads only the RO binding; apply reads only the migrator binding.
 /// Staging keeps its names; production reads only its own pair.
@@ -471,12 +473,22 @@ pub fn check_plan_provenance(
              downloaded staging-migrate-manifest.json",
         );
     }
-    let bytes = std::fs::read(path).map_err(|_| {
-        RunError::Refused(format!(
-            "cannot read the manifest the workflow fetched from producing plan_run_id {run_id} \
-             at {path}; plan_run_id verification is impossible, refusing"
-        ))
-    })?;
+    let bytes = match read_bytes_capped(path) {
+        Ok(bytes) => bytes,
+        Err(IntakeReadError::OverCap) => {
+            return refuse(format!(
+                "the manifest the workflow fetched from producing plan_run_id {run_id} \
+                 at {path} exceeds {INTAKE_CAP_LABEL}; plan_manifest_sha256 provenance is \
+                 unprovable, refusing"
+            ));
+        }
+        Err(IntakeReadError::Unreadable(_)) => {
+            return refuse(format!(
+                "cannot read the manifest the workflow fetched from producing plan_run_id {run_id} \
+                 at {path}; plan_run_id verification is impossible, refusing"
+            ));
+        }
+    };
     let artifact: Value = serde_json::from_slice(&bytes).map_err(|_| {
         RunError::Refused(format!(
             "the manifest fetched from producing plan_run_id {run_id} at {path} is not valid \

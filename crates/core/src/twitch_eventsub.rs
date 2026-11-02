@@ -84,6 +84,8 @@ pub enum EventSubError {
     StaleTimestamp,
     #[error("Body is not a valid EventSub message.")]
     InvalidBody,
+    #[error("Body contains a duplicate JSON object key.")]
+    DuplicateKeys,
     #[error("Message is not for the stream.online v1 subscription.")]
     WrongSubscription,
     #[error("Verification challenge is invalid.")]
@@ -94,6 +96,30 @@ pub enum EventSubError {
     InvalidBroadcasterId,
     #[error("Too many broadcasters.")]
     TooManyBroadcasters,
+}
+
+/// Bounded metric/log label for an [`EventSubError`] variant. Total over the
+/// enum: a future variant fails compilation here until the
+/// vocabulary grows with it, so labels can never silently collapse through
+/// `bounded_index`. Every label is a member of
+/// [`crate::metrics::EVENTSUB_DELIVERY_KINDS`]; unknown strings still
+/// collapse to the trailing `other`.
+pub fn eventsub_error_label(error: &EventSubError) -> &'static str {
+    match error {
+        EventSubError::InvalidSecret => "invalid_secret",
+        EventSubError::InvalidHeader => "invalid_header",
+        EventSubError::BodyTooLarge => "body_too_large",
+        EventSubError::BadSignature => "bad_signature",
+        EventSubError::InvalidTimestamp => "invalid_timestamp",
+        EventSubError::StaleTimestamp => "stale_timestamp",
+        EventSubError::InvalidBody => "invalid_body",
+        EventSubError::DuplicateKeys => "duplicate_keys",
+        EventSubError::WrongSubscription => "wrong_subscription",
+        EventSubError::InvalidChallenge => "invalid_challenge",
+        EventSubError::InvalidCallback => "invalid_callback",
+        EventSubError::InvalidBroadcasterId => "invalid_broadcaster_id",
+        EventSubError::TooManyBroadcasters => "too_many_broadcasters",
+    }
 }
 
 /// The EventSub signing secret handed to Twitch at subscription creation.
@@ -267,8 +293,12 @@ pub fn classify(message_type: &str, body: &[u8]) -> Result<Delivery, EventSubErr
     }
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| EventSubError::InvalidBody)?;
+    // Second pass over bytes that already parsed: syntax and nesting depth
+    // are proven, so the only refusal left is a repeated key.
+    crate::duplicate_keys::reject_duplicate_keys(body).map_err(|_| EventSubError::DuplicateKeys)?;
     let subscription = value
         .get("subscription")
+        .filter(|subscription| subscription.is_object())
         .ok_or(EventSubError::InvalidBody)?;
     if !subscription_is_stream_online(subscription) {
         return Err(EventSubError::WrongSubscription);
@@ -596,6 +626,35 @@ mod tests {
     const TS: &str = "2025-10-09T08:53:20.123456789Z";
     const ID: &str = "e76c6bd4-55c9-4987-8304-da1588d8988b";
     const INVITE: &str = "https://discord.gg/example";
+
+    #[test]
+    fn eventsub_error_labels_are_distinct_vocab_members() {
+        let errors = [
+            EventSubError::InvalidSecret,
+            EventSubError::InvalidHeader,
+            EventSubError::BodyTooLarge,
+            EventSubError::BadSignature,
+            EventSubError::InvalidTimestamp,
+            EventSubError::StaleTimestamp,
+            EventSubError::InvalidBody,
+            EventSubError::DuplicateKeys,
+            EventSubError::WrongSubscription,
+            EventSubError::InvalidChallenge,
+            EventSubError::InvalidCallback,
+            EventSubError::InvalidBroadcasterId,
+            EventSubError::TooManyBroadcasters,
+        ];
+        let mut labels: Vec<&str> = errors.iter().map(eventsub_error_label).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), errors.len(), "labels: {labels:?}");
+        for label in &labels {
+            assert!(
+                crate::metrics::EVENTSUB_DELIVERY_KINDS.contains(label),
+                "{label} must be a bounded delivery kind"
+            );
+        }
+    }
 
     fn test_secret() -> WebhookSecret {
         let timestamp = SystemTime::now()

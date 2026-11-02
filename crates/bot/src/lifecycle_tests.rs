@@ -808,3 +808,31 @@ async fn supervisor_still_exits_with_an_error_after_a_lingering_failure() {
     assert!(result.is_err(), "the process must still exit nonzero");
     assert_eq!(*state.gateway.read().await, GatewayState::Draining);
 }
+
+#[tokio::test]
+async fn serve_jobs_fails_fast_on_an_unregistered_name() {
+    let job = crate::jobs::Job {
+        name: "ghost",
+        cadence: Duration::from_secs(1),
+        cadence_source: None,
+        startup_jitter: Duration::ZERO,
+        timeout: Duration::from_secs(30),
+        action: Arc::new(|| Box::pin(async { Ok(()) })),
+    };
+    let status = crate::jobs::statuses(&["good"], false);
+    let (shutdown, stopping) = watch::channel(false);
+    // Never-resolving HTTP: the registration check must fire before any drain.
+    let http = std::future::pending::<std::io::Result<()>>();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::website_jobs::serve_jobs(vec![job], status, shutdown, http),
+    )
+    .await
+    .expect("registration fails fast, without draining HTTP")
+    .expect_err("an unregistered name fails at spawn");
+    assert_eq!(error.to_string(), "unregistered job: ghost");
+    assert!(
+        *stopping.borrow(),
+        "registration failure must latch shutdown before returning to the reconcile owner"
+    );
+}

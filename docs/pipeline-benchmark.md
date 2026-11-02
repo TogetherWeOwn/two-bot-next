@@ -39,9 +39,13 @@ python3 scripts/compare_pipeline_bench.py pipeline-benchmark.json
 The existing `two-bot-testsupport::TestDatabase` guard runs before connection:
 exact test hostname/port/user, explicit empty password, test DB prefix, no URL
 query/fragment or libpq environment overrides. No `DATABASE_URL` fallback exists.
-The driver creates and migrates a uniquely named disposable database and verifies
-its drop before emitting a success report. It never migrates/resets the bootstrap
-DB. On timeout/error the fixture still schedules cleanup; CI service teardown
+The driver creates a uniquely named disposable database, applies both the cutover
+and store migration chains (including the rollback journal), and verifies its drop
+before emitting a success report. After replay, outside the measured query window,
+it requires exactly one insert journal entry per durable event and reports both
+journal-row and distinct journaled-event counts. Missing schema or incomplete
+journal coverage fails rather than measuring the journal's best-effort failure
+path. It never migrates/resets the bootstrap DB. On timeout/error the fixture still schedules cleanup; CI service teardown
 is the final containment. No connection credentials are created or substituted.
 
 Default parameters (all integer-valued) are equivalent to:
@@ -120,6 +124,17 @@ Driver fixture/percentile/bounds tests and database guard tests run in CI job co
 cargo test -p two-bot-discord --example pipeline_bench --locked
 cargo test -p two-bot-testsupport --lib --locked
 ```
+
+The journaled baseline uses [run 39637827461](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39637827461)
+at source `8ea3f55f848472b6276162e4d1297bfec6fe2539`: 942 durable events,
+942 journal rows, 900 measured commits, and verified database drop. Measurement
+passed; the workflow failed the old 8.45-exchanges/event baseline comparison.
+The new report measures 13.685555555555556 exchanges/event and retains all
+metrics from that one run. Per-row savepoint/insert/watermark/release deliberately
+adds four statements per inserted row; it buys atomic best-effort journal evidence.
+This baseline refresh is part of the same reviewed change, not a deferred nightly
+repair. Tolerance and RSS limits are unchanged. See [the baseline record](b1-baseline.md#journaled-gateway-pipeline-baseline)
+for the measured budget and its limitations.
 
 Refresh a baseline only after inspecting the same-workload run evidence and
 independent review; never ratchet it upward just to turn a regression green.

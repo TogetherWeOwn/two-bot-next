@@ -86,9 +86,10 @@ class SingleCoreValidationTests(unittest.TestCase):
 
     def test_every_native_test_lane_carries_the_same_pin(self):
         # The opt-in flake validation must cover every lane that runs native
-        # test binaries: rust-tests and both database lanes, and nothing else.
+        # test binaries: rust-tests, coverage-shard and both database lanes,
+        # and nothing else.
         steps = pin_steps()
-        self.assertEqual(len(steps), 3)
+        self.assertEqual(len(steps), 4)
         self.assertEqual(len(set(steps)), 1, "the lanes' pin steps drifted apart")
 
     def test_missing_taskset_fails_instead_of_claiming_load_validation(self):

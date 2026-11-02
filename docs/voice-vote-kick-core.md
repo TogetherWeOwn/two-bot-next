@@ -94,6 +94,34 @@ before execution, and handle retries/failures. The one-shot decision is not a
 transactional delivery guarantee. No live kick or permission write is performed
 or verified by this component's tests.
 
+## Runtime ballot delivery
+
+The guild worker queues an in-place edit of the original public ballot when a
+vote expires, is cancelled, or passes on its timer. Both buttons are disabled.
+Interaction-driven updates still use the initial type-7 callback; active-ballot
+rendering and voting rules are unchanged.
+
+If a protected target or unavailable room prevents enforcement, or attempts
+exhaust with the outcome still unknown, the ballot corrects the removal promise
+with the reason and a moderator or no-action next step. Permission and Discord
+refusals also correct the promise; partial writes are not described as successful
+removal. The audit remains the record of the writes requested of Discord.
+
+Only channel/message IDs are retained from the initial callback's bounded GET,
+never its token. Button callbacks can supply the same immutable message binding.
+Queued edits render the latest outcome at dispatch, and a late callback schedules
+a correction again if it could have overwritten that outcome. An unavailable
+message reference completes quietly; a later binding can repair a settled ballot.
+Two warn lines name lost bindings: `voice ballot reference not queued: actor
+unavailable` (the guild actor was gone; fields `guild`, `vote_id`) and `voice
+ballot reference unavailable; not retried` (the bounded callback GET failed;
+fields `interaction_id`, `error`). Neither carries a token.
+Message edits retry idempotently with backoff for at most `QUEUE_MAX_ATTEMPTS`
+attempts, stop when the message is gone, and preserve the Discord 401 halt.
+Ballot state follows core eviction, with pending enforcement/edit work fenced
+until it drains. All of this is in-memory only: restart hydration and durable
+message delivery are not promised.
+
 ## Hermetic verification
 
 ```sh

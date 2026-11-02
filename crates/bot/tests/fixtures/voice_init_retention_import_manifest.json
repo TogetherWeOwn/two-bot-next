@@ -1,0 +1,65 @@
+{
+  "schema": "voice-init-retention-import/v1",
+  "source_base": "abc8dedea43d342c64fbf5e51ab934c65210e8b2",
+  "publication_base": "05de33f98001f6657ea8ab0b7fa0cd5931396b87",
+  "publication_note": "The assigned branch was preserved. Test assembly and Cargo attempts used a detached scratch worktree at source_base, without merging main. The publication branch is a blob handoff, not history to merge into the receiving branch. The immutable publication head is supplied by the handoff receipt.",
+  "import_mode": "replace only the listed protected file verbatim from the immutable publication head; do not merge or cherry-pick publication history",
+  "files": [
+    {
+      "path": "crates/bot/src/voice_control_plane_overflow_acceptance_tests.rs",
+      "bytes": 24797,
+      "sha256": "26b58c479f7e9429d9076d686d37b07d4d84791ad277e122668c6e9091c119b2",
+      "base_sha256": "ff1dfacdc432c47ad33cc44e07b2db2e11f04c7e9fad9cfcd2c632f9175d3522",
+      "additions_against_source_base": 180,
+      "deletions_against_source_base": 0,
+      "existing_controls_byte_identical_after_removing_additive_block": true
+    }
+  ],
+  "concatenation": {
+    "order": [
+      "crates/bot/src/voice_control_plane_overflow_acceptance_tests.rs"
+    ],
+    "method": "raw file bytes in listed order, with no separator; this provenance manifest is not an imported control",
+    "sha256": "26b58c479f7e9429d9076d686d37b07d4d84791ad277e122668c6e9091c119b2"
+  },
+  "controls": {
+    "new_tests": [
+      "keyed_init_retention_during_attempt_has_one_latest_entry_per_key",
+      "keyed_init_retention_during_backoff_has_one_latest_entry_per_key",
+      "keyed_init_retention_after_failed_attempt_has_one_latest_entry_per_key"
+    ],
+    "ordinary_command_counts": [4, 529],
+    "saved_keys": ["DisplaySeed", "NameSettings", "Access", "Creator(first channel)", "Creator(second channel)"],
+    "assertions": "At every revision before draining, exactly one entry per key and exact latest full payload; two independent creator keys; ordinary bound 512, total bound 517, oldest-ordinary eviction and complete surviving arrival/FIFO order. Failed attempts also enqueue a real reply, purge it, verify closure and inspect all retained state and ordinary order again."
+  },
+  "verification": {
+    "focused_command": "python3 scripts/cargo_cache.py run -- test -p two-bot --lib control_plane_overflow_acceptance -- --test-threads=1",
+    "focused_exit": 75,
+    "focused_output": "{\"finding\": \"refused\", \"reason\": \"no idle, below-budget slot; no per-worktree fallback\"}",
+    "focused_tests_executed": 0,
+    "wrong_target_disclosure": "An earlier --bin two-bot invocation exited 0 but ran zero matching tests (1871 filtered out). It is not passing evidence for these library tests.",
+    "format": "cargo fmt --all -- --check: exit 0",
+    "floor": "python3 scripts/ci/check-floor-guard.py --base-ref HEAD: exit 0 with the untracked protected payload included",
+    "inventory": "python3 scripts/ci/check-test-inventory.py: exit 0",
+    "runtime_path": "crates/bot/src/voice_rooms.rs",
+    "runtime_sha256_at_source_base_and_after_attempts": "f4d1cc7eed7aefeba3760d7f44ca77c5f61b4146675a2447270225b1ebf007aa",
+    "runtime_source_never_written": true,
+    "full_workspace_and_clippy": "not run; focused library test compilation was refused by bounded pool",
+    "external_services": "No database, staging, production or live Discord was used."
+  },
+  "mutation": {
+    "site": "crates/bot/src/voice_rooms.rs:7961 at source_base",
+    "edit": "delete only the first keyed let _ = buffered.remove(index); in buffer_attempt_command; leave ordinary eviction removal intact",
+    "attempt_method": "To preserve the test-only role boundary, temporarily append verbatim source-extracted buffer_attempt_command and buffer_init_command copies to the isolated test module, shadowing its glob imports; apply the one-line deletion only to that helper copy. Runtime source remains byte-identical.",
+    "attempt_helper_sha256": "1f0918155584db930e56cdb703ce8e3ba80ec8dae1a5f8a127f232b281030ae4",
+    "backoff_helper_sha256": "ac1da957dbcd5376c9c4708b586929a39d02cdcbb3408dcd7be60eec68c10cc2",
+    "mutant_helper_sha256": "7682f8d04fc8bc610bcaf62ff485a3f6897fa63dc4b87b7f2c72e4d359c0c261",
+    "mutant_cargo_exit": 75,
+    "restored_cargo_exit": 75,
+    "output_for_both_attempts": "{\"finding\": \"refused\", \"reason\": \"no idle, below-budget slot; no per-worktree fallback\"}",
+    "execution_proof": "unavailable: both mutant and restored invocations were refused before compilation; no executed RED or GREEN is claimed",
+    "static_prediction_only": "At revision 1, deleting keyed removal retains two DisplaySeed entries, so the new retained-cardinality assertion expects 1 and observes 2 before any apply/drain. NameSettings, Access and each creator key likewise retain duplicate old payloads. This prediction was not locally executed.",
+    "temporary_test_copy_removed_and_payload_bytes_restored": true,
+    "receiving_builder_action": "Run the focused library suite, exact single-site mutant and restored production suite through the bounded wrapper once admitted, then run combined checks and attest the immutable review head."
+  }
+}

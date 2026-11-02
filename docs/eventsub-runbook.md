@@ -80,8 +80,8 @@ Rules for the signing secret:
 - The value travels only inside `WebhookSecret` / `Secret`. Its `Debug` form
   renders `[REDACTED]`, and it leaves that wrapper only at the HMAC boundary
   and inside the create-subscription body, which is itself a `Secret`.
-  Source: `crates/core/src/twitch_eventsub.rs:99-125`,
-  `crates/core/src/twitch_eventsub.rs:436-455`.
+  Source: `crates/core/src/twitch_eventsub.rs:101-127`,
+  `crates/core/src/twitch_eventsub.rs:457-476`.
 - The handler never re-reads the environment: the secret is cloned into
   receiver state at bind time. Unarmed, a new value takes effect on container
   restart, not on secret edit alone. Armed (the Operator provisioned
@@ -161,7 +161,7 @@ proves the running container now holds the new secret. A `401` means it
 does not (ownership transfer incomplete, or the wrong secret value):
 stop, fix that, do not delete. A `503` means the refresh itself failed:
 stop and triage per the `503 unavailable` list below, do not delete.
-Source: `crates/core/src/twitch_eventsub.rs:142-149,169-197,277-288`,
+Source: `crates/core/src/twitch_eventsub.rs:142-159,171-199,282-292`,
 `crates/bot/src/eventsub_http.rs:518-534`,
 `wrangler/src/eventsub.ts:198-235`.
 
@@ -187,11 +187,11 @@ transferred, since the new Worker version forwards the new secret to a
 fresh container). Confirm agreement by watching for `notification
 acknowledged` or `challenge answered` lines after the reconciler's
 recreated subscription verifies, not by printing either value.
-Source: `crates/core/src/twitch_eventsub.rs:542-545` (deletes first; a
-duplicate create answers `409`), `:559-563` (healthy wanted subscriptions
-on our callback are kept without comparing secrets), `:481-488`
+Source: `crates/core/src/twitch_eventsub.rs:547-550` (deletes first; a
+duplicate create answers `409`), `:564-568` (healthy wanted subscriptions
+on our callback are kept without comparing secrets), `:486-493`
 (`ExistingSubscription` carries no secret),
-`crates/core/src/twitch_helix.rs:591-593` (a `409` create counts as
+`crates/core/src/twitch_helix.rs:595-597` (a `409` create counts as
 `AlreadyExists` only after a follow-up listing confirms a healthy
 subscription on our callback).
 
@@ -358,37 +358,42 @@ unauthenticated sender learns nothing about the clock:
    (`MAX_TIMESTAMP_SKEW_MS`), past or future.
 
 Source: `crates/core/src/twitch_eventsub.rs:51-53`,
-`crates/core/src/twitch_eventsub.rs:166-197`.
+`crates/core/src/twitch_eventsub.rs:168-199`.
 
 Classification after verification:
 
 - A well-formed challenge (nonempty, at most 256 printable ASCII characters)
   on a `stream.online` v1 subscription is echoed as the `200 text/plain`
   body with `Cache-Control: no-store`.
-  Source: `crates/core/src/twitch_eventsub.rs:245-272`,
+  Source: `crates/core/src/twitch_eventsub.rs:243-249,263-292`,
   `crates/bot/src/eventsub_http.rs:350-366`.
 - Only `stream.online` version `1` is accepted; any other subscription type
   or version is a deterministic `WrongSubscription` error.
-  Source: `crates/core/src/twitch_eventsub.rs:225-231`.
+  Source: `crates/core/src/twitch_eventsub.rs:243-249,275-280`.
 - An empty, oversized, or non-graphic challenge is `InvalidChallenge` and
   answers `400 malformed`, never an echo.
   Source: `crates/bot/src/eventsub_http.rs:412-425`.
 
 If the challenge echo never arrives at Twitch, check in order: the Worker
 route gate (both flags `1`?), the container bind (did startup refuse?), the
-secret agreement (401s in the logs?), a `200 delivery ignored` right after
-the subscription creation (the challenge was not echoed — delete and
-recreate the subscription, see below), and only then the callback URL shape
+secret agreement (401s in the logs?), a `200` with an `eventsub delivery
+classification failed` warn (`error_variant = "wrong_subscription"`,
+`"invalid_body"`, or `"duplicate_keys"`) right after the subscription creation (the challenge was
+not echoed — delete and recreate the subscription, see below), and only
+then the callback URL shape
 (plain `https`, no port, query, fragment, or userinfo; canonical form).
-Source: `crates/core/src/twitch_eventsub.rs:400-431`,
+Source: `crates/core/src/twitch_eventsub.rs:428-446`,
 `crates/bot/src/eventsub_http.rs:403-411`.
 
 ## Refusal matrix
 
 Container refusals use the same JSON envelope
 (`{"ok": false, "request_id", "error": {"code", "message": "request refused", "retryable"}}`)
-and log one scalar warn line (`event="eventsub_receiver"`, `status`,
-`error_class`). Worker-ingress refusals use the same envelope except the
+and log one sampled scalar warn line (`event="eventsub_receiver"`,
+`status`, `error_class`): the first warn, then every 64th process-wide, so
+hostile bursts count in counters, never per-request logs. Classify errors
+warn through the same sampler with an added bounded `error_variant`.
+Worker-ingress refusals use the same envelope except the
 404 below, which is plain-text `not found`, and log
 `event="eventsub_ingress"`. Retryable refusals are the container
 timeout/busy rows, the Worker 429 / 504 / 503 rows, and the container's
@@ -442,7 +447,7 @@ direct `containerFetch`, because the Worker answers those shapes first):
 | 413 | `payload_too_large` | false | Body over the 64 KiB cap, checked before verification. Genuine `stream.online` bodies are well under 2 KiB; treat 413 as a malformed or abusive sender. Source: `crates/bot/src/eventsub_http.rs:37,290-301`, `crates/core/src/twitch_eventsub.rs:49-51`. |
 | 415 | `unsupported_media_type` | false | Content type is not exactly `application/json` or `application/json; charset=utf-8` (case-insensitive); anything else, including another encoding, is refused. Source: `crates/bot/src/eventsub_http.rs:247-266`. |
 | 503 | `busy` / `upstream_timeout` | true | All 32 permits held (`busy`), or the whole request past the 20 s budget (`upstream_timeout`). Both mean the receiver is saturated or stalled, not that the delivery was bad; the sender retries. Check container saturation, not the secret. Source: `crates/bot/src/eventsub_http.rs:38-40,167-199`. |
-| 503 | `unavailable` | true | A future/unrecognized post-verification classification error, or — with rotation armed — a missing, malformed, unauthenticated, stale, replayed, or invalid secret refresh. Both fail closed without verifying against a stale snapshot; the classification case counts metric `kind="other"`, the refresh case never reaches verification or classification. This is distinct from Worker-ingress `unavailable` above. The refusal log uses the bounded error class `unavailable`, so it identifies neither a specific future variant nor a specific refresh cause: check Worker secret/version and reload-key agreement, not the secret value. Do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs:426-439`, `crates/core/src/eventsub_refresh.rs`. |
+| 503 | `unavailable` | true | A future/unrecognized post-verification classification error, or — with rotation armed — a missing, malformed, unauthenticated, stale, replayed, or invalid secret refresh. Both fail closed without verifying against a stale snapshot; the classification case counts its own variant metric label, the refresh case never reaches verification or classification. This is distinct from Worker-ingress `unavailable` above. The sampled classify warn carries the bounded `error_variant`, so the classification case names its variant; the refresh case identifies no specific cause: check Worker secret/version and reload-key agreement, not the secret value. Do not assume saturation or a Worker relay failure. Source: `crates/bot/src/eventsub_http.rs`, `crates/core/src/eventsub_refresh.rs`. |
 
 Verified deliveries that need no operator action answer `200`:
 
@@ -454,29 +459,35 @@ Verified deliveries that need no operator action answer `200`:
   re-subscription after a revocation is automatic, not manual and not
   immediate — and not bounded by one hour (see above).
 - Unknown message types, and known deterministic classification errors on
-  non-verification messages (`WrongSubscription`, `InvalidBody`):
-  acknowledged with 2xx so Twitch does not retry what will never succeed.
+  non-verification messages (`WrongSubscription`, `InvalidBody`,
+  `DuplicateKeys`): acknowledged with 2xx so Twitch does not retry what
+  will never succeed.
   Unknown/future `classify()` errors are not included: they return retryable
-  503 `unavailable` and count as metric `kind="other"` so an unrecognized
-  failure is not silently discarded or conflated with known ignored deliveries.
+  503 `unavailable` and count under their own variant metric label so an
+  unrecognized failure is not silently discarded or conflated with known
+  ignored deliveries.
   This carve-out excludes `webhook_callback_verification`: `classify()`
-  returns `WrongSubscription` / `InvalidBody` for a challenge with the wrong
-  type or version, or an unparsable signed body, and the handler still acks
-  `200 {"ok": true, "request_id"}` with only an info `delivery ignored` line without
-  echoing the challenge — so the subscription is never enabled. A `200
-  delivery ignored` immediately after a subscription creation means the
-  challenge was not echoed: delete and recreate the subscription.
+  returns `WrongSubscription` / `InvalidBody` / `DuplicateKeys` for a challenge
+  with the wrong type or version, an unparsable signed body, or a signed body
+  that repeats a key, and the handler still acks
+  `200 {"ok": true, "request_id"}` with only a sampled `eventsub delivery
+  classification failed` warn (`error_variant = "wrong_subscription"`,
+  `"invalid_body"`, or `"duplicate_keys"`) without echoing the challenge — so
+  the subscription is never enabled. A `200` with that warn immediately after
+  a subscription creation means the challenge was not echoed: delete and
+  recreate the subscription.
 
 Source: `crates/bot/src/eventsub_http.rs:350-411`.
 
 Log lines to expect (scalar fields only):
 
-- `eventsub delivery refused` (warn: `status`, `error_class`)
+- `eventsub delivery refused` (sampled warn: `status`, `error_class`)
+- `eventsub delivery classification failed` (sampled warn: `status`,
+  `error_class`, bounded `error_variant`, `message_type`); for unknown/future
+  classification errors expect `status = 503` and
+  `error_class = "unavailable"`, plus the variant metric increment
 - `challenge answered`, `notification acknowledged`, `revocation acknowledged`,
   `delivery ignored` (info: `status = 200`)
-- `eventsub delivery refused` (warn: `status`, bounded `error_class`); for
-  unknown/future classification errors expect `status = 503` and
-  `error_class = "unavailable"`, plus the `kind="other"` metric increment
 
 Source: `crates/bot/src/eventsub_http.rs:131-148,324-439`.
 

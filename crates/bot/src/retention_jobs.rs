@@ -230,6 +230,7 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                         deletions_deferred = report.deletions_deferred,
                         schema_gap_deferrals = report.schema_gap_deferrals,
                         deletions_overdue = report.deletions_overdue,
+                        pending_truncated = report.pending_truncated,
                         duration_ms = report.duration_ms,
                         "retention run committed; aggregate expiry failed",
                     );
@@ -238,7 +239,8 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                 let partial = report.guild_purges_failed > 0
                     || report.guild_purges_deferred > 0
                     || report.deletions_deferred > 0
-                    || report.deletions_overdue > 0;
+                    || report.deletions_overdue > 0
+                    || report.pending_truncated;
                 if partial {
                     tracing::warn!(
                         message = "retention_run",
@@ -256,6 +258,7 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                         deletions_deferred = report.deletions_deferred,
                         schema_gap_deferrals = report.schema_gap_deferrals,
                         deletions_overdue = report.deletions_overdue,
+                        pending_truncated = report.pending_truncated,
                         duration_ms = report.duration_ms,
                         "retention run completed with pending work",
                     );
@@ -276,6 +279,7 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                         deletions_deferred = report.deletions_deferred,
                         schema_gap_deferrals = report.schema_gap_deferrals,
                         deletions_overdue = report.deletions_overdue,
+                        pending_truncated = report.pending_truncated,
                         duration_ms = report.duration_ms,
                         "retention run completed",
                     );

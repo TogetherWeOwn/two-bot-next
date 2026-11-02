@@ -48,7 +48,7 @@ file). It is a deterministic squawk subset: standard library only, no
 database, no network. CI runs with `--strict`: `adding-required-field`,
 `creating-index`, `adding-check-constraint`, and `changing-column-type` findings
 fail the PR. `dropping-object` remains a warning because safe, coordinated
-removal still ends with a `DROP TABLE` or `DROP COLUMN`. The two documented
+removal still ends with a `DROP TABLE` or `DROP COLUMN`. The four documented
 transactional index exceptions below are matched by exact migration path and
 complete normalized statement. Omit `--strict` for a local advisory preview of
 all five rules.
@@ -80,21 +80,63 @@ Write migrations that stay silent:
 - Type change or drop: prefer an additive migration (new column, backfill,
   swap) and coordinate removal across deploys.
 
-Two exact `creating-index` findings are waived for the transactional event-store
-indexes in migrations 0444 and 0445. The waiver matches only each migration path
+Four exact `creating-index` findings are waived: the transactional event-store
+indexes in migrations 0444 and 0445, and the same-file new-table live-lookup
+indexes in migrations 0456 and 0457. The waiver matches only each migration path
 and the complete normalized `CREATE INDEX` statement; any changed statement,
-additional index in either file, or index in another migration remains subject to
-strict lint. This exception is documented beside the checker configuration and
-is grounded in the observed CI deadlock: `CREATE INDEX CONCURRENTLY` waits on
-open snapshots while parallel disposable-database test migrators wait on SQLx's
-advisory lock, producing PostgreSQL `40P01`. It does not relax any other
-migration check or the required lint gate.
+additional index in any of these files, or index in another migration remains
+subject to strict lint. This exception is documented beside the checker
+configuration and is grounded in the observed CI deadlock: `CREATE INDEX
+CONCURRENTLY` waits on open snapshots while parallel disposable-database test
+migrators wait on SQLx's advisory lock, producing PostgreSQL `40P01`, and it
+cannot run inside the migration transaction at all. The 0456/0457 tables are
+empty at first apply, and the `IF NOT EXISTS` re-apply no-ops both statements.
+It does not relax any other migration check or the required lint gate.
 
 The checker discovers `crates/*/migrations/*.sql` dynamically with
 `--migration-glob` and `--exclude` overrides and no hardcoded crate list,
 so the same script can be adopted 1:1 by a central reusable workflow called
 from every repo. The remaining org rollout follow-up is a central repo plus
 an org-ruleset required workflow; `--strict` is already enabled here.
+
+## Rollback compatibility at promotion
+
+A production rollback restores the previous Worker version and container
+image, never the schema. Before every production promotion,
+`scripts/rollback_target_preflight.py` (see
+[production-deploy.md](production-deploy.md#rollback-target-preflight))
+scans each migration added between the serving build's SHA and the
+candidate. A statement the serving build may not survive refuses the
+promotion: `DROP TABLE`/`COLUMN`/`TYPE`/`VIEW`/`SCHEMA`/`FUNCTION`/`SEQUENCE`,
+`RENAME`, `ALTER COLUMN ... TYPE`, `SET NOT NULL`, `DROP DEFAULT`,
+`TRUNCATE`, an unqualified `DELETE FROM` with no `WHERE`, `REVOKE`, and
+`ADD COLUMN ... NOT NULL` without a `DEFAULT`.
+`COLUMN` may be omitted, as PostgreSQL allows; any top-level `DROP` other than
+`DROP INDEX` refuses; statements inside `DO` and function bodies are checked
+too. Only a `WHERE` in the `DELETE`'s own scope counts: a `WHERE` in a
+preceding CTE, an outer query, or a `RETURNING` subquery does not waive it. Comments and string literals are lexed out first, so a `--` or `;` in a
+literal hides nothing; quoted identifiers (including schema-qualified ones
+like `"public"."members"`) and `E'...'` backslash escapes are handled the
+same way. A literal, comment or dollar-quoted body the lexer cannot close
+refuses as `unparseable_migration`: an unreadable migration never passes.
+`TRUNCATE` in a `CREATE TRIGGER ... BEFORE|AFTER|INSTEAD OF` event clause is
+not an executed truncate and does not refuse; the same holds for `DELETE`
+in a trigger event clause (it names the event, not a `DELETE FROM`). Dynamic SQL inside an
+`EXECUTE '...'` string is not visible to the scan: keep it out of migrations,
+or annotate the file. A rewritten or deleted migration always refuses.
+
+Ship expand first, contract later: the contract migration lands only after
+every build that still reads the old shape has left production. When a
+flagged statement is safe anyway (for example it drops a table no shipped
+build ever read), say why in the file, reviewed like any other line:
+
+```sql
+-- rollback-compatible: no build since 0412 reads guild_legacy_flags
+DROP TABLE IF EXISTS guild_legacy_flags;
+```
+
+The reason must be at least ten characters. The marker covers the whole
+file, so keep a reviewed contract migration in its own file.
 
 ## Existing migration changes
 

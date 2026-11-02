@@ -17,10 +17,10 @@
  * - Rendering, escaping, GET-only access to `/ops/summary`, and the
  *   in-order happy path are unchanged (passing controls).
  *
- * Assertions are snapshot-equality on the rendered status + summary, so
- * they do not depend on how the guard is implemented (a connection
- * generation / request-order check, an AbortController, or both). The
- * fake fetch honours `AbortSignal` so an aborting implementation sees
+ * Obsolete completions are checked by snapshot-equality on the rendered
+ * status + summary. Explicit cancellation checks also require superseded
+ * work to abort and disconnected/pending states to remain visibly nonfresh.
+ * The fake fetch honours `AbortSignal` so an aborting implementation sees
  * the same rejection a browser would deliver.
  *
  * Run: node --import ./test/cloudflare-loader.mjs --test test/ops-dashboard-stale-poll.test.ts
@@ -178,7 +178,7 @@ function makePage(script: string) {
     clearInterval: (id: number) => {
       intervals.delete(id);
     },
-    setTimeout,
+    setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms).unref(),
     clearTimeout,
     AbortController,
     localStorage: storage,
@@ -333,7 +333,10 @@ test("stale success after Disconnect cannot populate a never-rendered page", asy
   await page.clickDisconnect();
   const before = page.snapshot();
   assert.equal(before.status, "disconnected");
-  assert.equal(before.summary, "");
+  assert.match(before.summary, /disconnected|unavailable|stale/i, "disconnect must be visible");
+  assert.ok(!before.summary.includes(">READY<"), "disconnect is not fresh readiness");
+  assert.ok(!before.summary.includes('class="ok"'), "disconnect must remove success styling");
+  assert.equal(page.fetches[0]!.init?.signal?.aborted, true, "disconnect cancels the pending poll");
   page.fetches[0]!.resolve(jsonResponse(200, readyBody("stale-marker")));
   await flush();
   assert.deepEqual(page.snapshot(), before);
@@ -501,18 +504,42 @@ test("older late json() cannot overwrite a newer completed result", async () => 
   assert.deepEqual(page.snapshot(), beforeStale);
 });
 
-test("control: in-order completion still renders the newer result last", async () => {
+test("a superseded poll cannot render while its replacement is pending", async () => {
   const page = makePage(await dashboardScript());
   await page.clickConnect();
   await page.tick();
+  assert.equal(page.fetches.length, 2, "interval must start the replacement poll");
+  const beforeStale = page.snapshot();
+  assert.equal(page.fetches[0]!.init?.signal?.aborted, true, "supersession cancels old work");
+  assert.equal(page.fetches[1]!.init?.signal?.aborted, false, "replacement remains active");
   page.fetches[0]!.resolve(jsonResponse(200, readyBody("older-marker")));
   await flush();
-  assert.ok(page.snapshot().summary.includes("older-marker"));
+  assert.deepEqual(page.snapshot(), beforeStale, "older success cannot pre-empt its replacement");
+  assert.ok(!page.snapshot().summary.includes("older-marker"));
   page.fetches[1]!.resolve(jsonResponse(503, notReadyBody("newer-marker")));
   await flush();
   const snap = page.snapshot();
   assert.ok(snap.summary.includes("NOT READY"));
   assert.ok(snap.summary.includes("newer-marker"));
+  assert.ok(snap.status.startsWith("updated "));
+});
+
+test("control: sequential completed polls still render each result in order", async () => {
+  const page = makePage(await dashboardScript());
+  await page.clickConnect();
+  page.fetches[0]!.resolve(jsonResponse(200, readyBody("older-marker")));
+  await flush();
+  assert.ok(page.snapshot().summary.includes("older-marker"));
+  assert.ok(page.snapshot().summary.includes(">READY<"));
+  assert.ok(page.snapshot().status.startsWith("updated "));
+  await page.tick();
+  assert.equal(page.fetches.length, 2);
+  page.fetches[1]!.resolve(jsonResponse(503, notReadyBody("newer-marker")));
+  await flush();
+  const snap = page.snapshot();
+  assert.ok(snap.summary.includes("NOT READY"));
+  assert.ok(snap.summary.includes("newer-marker"));
+  assert.ok(!snap.summary.includes("older-marker"));
   assert.ok(snap.status.startsWith("updated "));
 });
 

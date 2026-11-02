@@ -1020,7 +1020,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
 
     /// Re-read the guild's naming settings every five minutes, or a minute
     /// after a failed read, so writers other than `/import` (the operator
-    /// CLI) reach automatic names and a transient error does not stick.
+    /// CLI) reach automatic names and a transient error does not stick. The
+    /// same snapshot refreshes the cached access controls: an out-of-process
+    /// writer cannot push `AccessChanged`, so its creation switch lands
+    /// here within the reload interval instead of waiting for a restart.
     pub(super) async fn reload_name_settings(&mut self, now_ms: u64) {
         let interval = if self.name_settings_loaded {
             NAME_SETTINGS_RELOAD_MS
@@ -1103,6 +1106,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 self.name_inputs = None;
             }
             self.update_name_settings(NameSettings::from_config(&config));
+            // An unparseable value keeps the cached controls rather than a
+            // half-built set; the snapshot came from the gate's own store,
+            // so this only fails on a hand-edited row.
+            if let Some(controls) = super::import_access_controls(&config) {
+                self.access = controls;
+            }
             self.name_settings_loaded = true;
         }
     }
@@ -1410,12 +1419,20 @@ where
     H: RoomWrites + Send + 'static,
 {
     /// Run one `/name` step through the guild actor. `None` when the guild
-    /// has no live actor yet or its inbox already drained.
-    async fn run_name(&self, guild: Snowflake, command: NameCommand) -> Option<NameReply> {
+    /// has no live actor yet, when its inbox already drained, or when no
+    /// answer arrived within `WORKER_ACK_WAIT`.
+    pub(super) async fn run_name(
+        &self,
+        guild: Snowflake,
+        command: NameCommand,
+    ) -> Option<NameReply> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor.tx.send(ActorCommand::Name { command, reply }).ok()?;
-        inbox.await.ok()
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
     }
 }
 
@@ -1492,6 +1509,7 @@ where
         policy: Arc::clone(&runtime.name_policy),
     };
     let response = match runtime.run_name(guild_id, command).await {
+        None if runtime.has_actor(guild_id) => ephemeral_response(WORKER_LOST_REPLY),
         None => ephemeral_response(NOT_WARM),
         Some(NameReply::Refused(text) | NameReply::Applied(text)) => ephemeral_response(&text),
         Some(NameReply::Panel { room_id, text }) => panel_response(room_id, &text),

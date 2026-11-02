@@ -16,7 +16,23 @@ a request is sent. No Gatus or third-party monitor is used.
 Each job writes one JSON evidence receipt (`synthetic-staging-<run>.json`,
 `synthetic-prod-<run>.json`, 14-day artifacts) and fails on any check FAIL
 or fence refusal. Production is passive: the prod job observes and alerts
-only, and never blocks a deploy.
+only, and never blocks a deploy. The production promotion reuses the same
+probe once as a baseline (see
+[production-deploy.md](production-deploy.md#regression-gate-against-production)):
+a journey failing on production lowers that baseline, it never blocks a deploy.
+
+### Promotion prerequisite
+
+The scheduled run is not the only check. Every `deploy-staging` run also runs
+the staging probe once, as the `user-flow-synthetic` job ("staging user-flow
+synthetic (exact SHA)"), right after its deploy and pinned with
+`--expected-sha` to the commit that run deployed. `certify-promotion` needs
+that job, and the `deploy-production` guard refuses a promotion unless the
+job of that exact name succeeded in the same staging run and attempt it
+promotes. A failed, skipped or missing synthetic leaves the commit staged but
+never promoted. This job has no incident-issue path: the five-minute
+scheduled run keeps alerting. Rollbacks and the live-SHA redeploy waive
+staging history, so they never read it.
 
 The production probe accepts only a stamped identity with a 40-character,
 lowercase hexadecimal `build_revision` and a `build_id` containing exactly two
@@ -31,9 +47,12 @@ does not gate or authorize a deploy.
 
 ## Failure alerts
 
-Two consecutive failed probes open one Discord ops-channel incident via
-`scripts/synthetic_alert.py`. Once that alert is delivered, further failed
-samples are suppressed until a successful probe posts one recovery message;
+Alerts go to the agents who can fix the outage, never to a chat channel.
+Two consecutive failed probes open one GitHub issue labelled `incident` per
+environment via `scripts/synthetic_alert.py` and the shared sink
+`scripts/incident_issue.py`. Once that alert is delivered, further failed
+samples are suppressed until a successful probe posts one recovery, which
+comments on and closes the issue;
 an undelivered alert is instead retried on later failed samples, and if none
 was delivered a late ALERT (with the `probe failed` fallback summary, linking
 that green run) posts on the first successful sample before any recovery.
@@ -104,32 +123,121 @@ passive as described above:
 two-bot-next ALERT synthetic-user-flow:<staging|prod>: <failing checks>. Runbook: <runbook URL> | build <revision> <build_id> (git <sha>) | logs <github run URL>
 ```
 
-`allowed_mentions` is off. The destination is Discord-only: any non-Discord
-webhook URL refuses before any request, and the URL itself is never printed.
-HTTP 301, 302, 303, 307, and 308 responses are refused; no redirect destination
-is contacted and no redirect retry occurs. A redirect is a failed delivery, not
-a successful alert. Errors expose only fixed safe classifications or HTTP status
-codes, never the webhook URL, token, or response body. Runs with no incident
-transition send nothing and need no webhook. When an alert or recovery transition
-is due, a missing webhook fails that step, so a silent notification path cannot
-read as delivered.
+### Incident issues
+
+`scripts/incident_issue.py` is the one alert sink for this workflow, the
+daily staging rollback proof and the daily digest:
+
+| Check | Incident key | Opened by | Closed by |
+| --- | --- | --- | --- |
+| Staging / prod synthetic | `synthetic-user-flow:<env>` | ALERT | RECOVERY (first healthy sample) |
+| Daily staging rollback proof | `staging-rollback-proof` | failed proof or watch | next passing watch |
+| Daily digest | `daily-digest` | owed digest not released | the agent who cuts the tag |
+
+The key lives in a hidden body marker (`<!-- incident-key: <key> -->`). An
+ALERT while that key's issue is open adds a comment instead of a second
+issue; RECOVERY comments, then closes it. If no issue is open (an agent
+already closed it), recovery is a no-op. A `force_fail` dispatch is not
+scheduled history, so a healthy scheduled sample that finds its key's issue
+still open decides RECOVERY and closes it.
+
+The lookup reads every page of open `incident` issues (100 per page, up to
+10 pages) and fails closed past that bound rather than miss the keyed issue
+and open a duplicate. Two runs that race to open the same key both re-read
+after creating; the one that is not the lowest number closes its issue as a
+duplicate and comments on the lowest. RECOVERY closes every open issue for
+its key, so a duplicate the race left behind closes too. Synthetic history from before this sink (post step
+`Alert the ops channel on incident transition`) counts a Discord alert as
+undelivered: an outage that only reached Discord re-alerts into an issue on
+its next failed probe. A healthy probe whose Discord post succeeded reads as
+closed, so a recovered Discord-era incident cannot mute the next outage.
+
+Authentication is the job-scoped `GITHUB_TOKEN` with `issues: write`; no
+secret or environment is needed. Requests go only to `api.github.com`;
+HTTP 301, 302, 303, 307, and 308 responses are refused and no redirect is
+followed. Responses are capped at 1 MiB and duplicate JSON keys are refused.
+Errors expose only fixed classifications or HTTP status codes, never the
+token or a response body. Runs with no incident transition write nothing.
+When an alert or recovery is due, a missing token or a failed write fails
+that step, so a silent notification path cannot read as delivered.
+
+Paperclip runs an hourly DevOps routine that lists open `incident` issues
+and creates one DevOps task per issue that has none yet, so a failure
+reaches an agent and the owner hears only when a decision is needed.
+
+### History admission and decision receipt
+
+History is admitted before sorting, constructing a jobs URL or replaying any
+checkpoint. Runs/jobs roots must be objects with object-array collections;
+steps must also be an object array. Run IDs and run numbers must be positive
+signed-64-bit integers, never booleans, floats or numeric strings. Events and
+job/step names must be nonempty strings. Optional job IDs and step numbers use
+the same integer rule. IDs and ordering numbers must be unique, including
+across run pages; later pages must contain older run numbers. Every row on a
+fetched page is validated, including unrelated/current runs and jobs, before
+a matching job is read or a checkpoint can stop reconstruction.
+
+When present, counts must be nonnegative signed-64-bit integers consistent
+with the page; a jobs count must match the entire single page (at most 100).
+A partial jobs page cannot prove a unique target. Missing optional counts,
+status and conclusion fields remain readable for older records, but do not
+prove delivery or a decided-none checkpoint. Present status must be completed;
+conclusions must be null or a supported Actions conclusion (`success`,
+`failure`, `neutral`, `cancelled`, `skipped`, `timed_out`, `action_required`,
+`stale`, `startup_failure`). Multiple matching target jobs or probe/decide/post
+steps are unknown history, even if their values agree. Cancelled/timed-out
+posts do not prove delivery; a skipped post proves a checkpoint only with the
+existing successful-decide and normally-finished-job conditions above.
+
+Malformed, ambiguous, incomplete or unsupported history raises a safe
+`HistoryError` with `code=history_unknown` and
+`next_action=inspect_workflow_history`, never raw remote values. Failed current
+probes still decide ALERT (exit 0); healthy probes emit no event and fail the
+decide step (exit 1), never a false recovery. No current probe sample also
+fails (exit 1), without reading history. The 15-run page size, 200-prior-run
+replay bound and 1 MiB response cap remain; pagination additionally stops after
+15 pages so filtered rows cannot evade that budget. Hitting the page budget
+without a checkpoint reports unknown, not an exhausted history.
+
+Optional `--decide-only --json` prints one bounded JSON object to stdout:
+`schema_version: 1`, stable `check_id: synthetic-user-flow:<env>`, bounded
+string `run_id` (decimal current ID or `unknown`), nullable `event`, boolean
+`history_known`, `code` and `next_action`. Known decisions use
+`decision_ready` / `none`; unknown history uses the values above; an absent
+probe uses `no_probe_sample` / `none` with `history_known` false, since no
+history was read. This receipt is a decision, not proof
+of delivery or exactly-once posting. `GITHUB_OUTPUT` still receives precisely
+`event=alert`, `event=recovery` or `event=`. Without that file, JSON mode moves
+the event line to stderr to keep stdout valid JSON. Without `--json`, text
+output is unchanged. JSON is refused with posting or dry-run modes (exit 2).
+No retry, alert threshold, transport policy or live workflow flag is changed.
+
+Offline verification (mocked history and issue boundaries, no GitHub calls):
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_synthetic_alert*.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_incident_issue.py' -v
+```
 
 ## Operator bindings
 
 - Repository variables `STAGING_WORKER_URL` and `PRODUCTION_WORKER_URL`:
   the staging and production Worker origins. `PRODUCTION_WORKER_URL` is the
   single source for deploy and passive synthetic checks; remove any production
-  Environment override of the same name. A missing variable skips that target
-  with a visible warning instead of producing recurring configuration failures.
-- Environment `synthetic-alerts`, secret `SYNTHETIC_ALERT_WEBHOOK_URL`: the
-  Discord webhook. Never paste it into a command, log, or report.
+  Environment override of the same name. A missing variable fails that job
+  with an error naming the unset variable, so a run with zero probe samples
+  never reads green; the decide step also fails closed on any skipped probe.
+- No alert secret. The `synthetic-alerts` environment and
+  `SYNTHETIC_ALERT_WEBHOOK_URL` are no longer read and can be deleted.
 
 ## Proving the path
 
 Dispatch the workflow from `main` with `force_fail: true`: the staging probe
 hits an unallowlisted origin and refuses before making a request. That fence
 refusal produces no evidence receipt; the upload step tolerates the missing
-file, and the alert posts with unknown build identity and the run link. This
+file, and the `synthetic-user-flow:staging` incident issue opens with unknown
+build identity and the run link. The next healthy scheduled run closes it,
+and the Paperclip routine creates a DevOps task for it in between. This
 proves the staging failure-to-alert path, not production alert delivery. Verify
 the production schedule from its own runs, and verify production alert delivery
 from an independently evidenced production failure and its matching alert.

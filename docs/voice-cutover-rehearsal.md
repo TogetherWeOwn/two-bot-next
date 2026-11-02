@@ -248,7 +248,7 @@ Re-check at `86a6668a7`: the 2026-10-04 registry observation above is history,
 not current state. The code wiring it waited on has since landed — the voice
 set is defined in `voice_commands()` (`crates/core/src/voice_rooms.rs:1292-1660`),
 merged when the voice gate is on (`crates/core/src/router.rs:717-719`), and
-synced on ready (`crates/bot/src/command_runtime.rs:1009-1020`). Re-read the
+synced on ready (`crates/bot/src/command_runtime.rs:1043-1065`). Re-read the
 staging guild registry before the next rehearsal instead of reusing the
 17-command snapshot.
 
@@ -295,9 +295,11 @@ so production voice stays an Operator-approved binding.
   the flip only after a post-apply plan shows no pending migrations.
 - **Check the custom-command count first.** The 100-command guild limit leaves
   room for 50 stored custom commands beside the published builtins, voice set
-  and `/templateassistant`. A guild that already stores more makes the gateway
-  registry sync refuse (`TotalLimit`) and the gateway task fail at boot, rather
-  than degrading; trim the extra rows before the flip.
+  and `/templateassistant`. A guild that already stores more still publishes
+  every builtin, but registry sync withholds the enabled custom commands past
+  the limit (last in name order) and logs
+  `custom_commands_withheld_over_guild_limit`; pause or trim the extra rows
+  before the flip so none drop off the picker.
 - **Permanent channels stay untouched.** `reconcile` iterates the rooms the
   store tracks and nothing else, so the guild's three permanent voice
   channels (`Lobby`, `Squad`, `Voice 1`) are never deleted: with zero tracked

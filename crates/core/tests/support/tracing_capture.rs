@@ -1,15 +1,49 @@
 //! Capture dependency diagnostics without relying on the application's filter.
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{span, Event, Metadata, Subscriber};
 
+#[derive(Default)]
+struct SpanState {
+    fields: String,
+    refs: usize,
+}
+
+#[derive(Default)]
+struct Inner {
+    text: Mutex<String>,
+    spans: Mutex<HashMap<u64, SpanState>>,
+    next_span: AtomicU64,
+}
+
 #[derive(Clone, Default)]
-pub struct Capture(Arc<Mutex<String>>);
+pub struct Capture(Arc<Inner>);
 
 impl Capture {
     pub fn text(&self) -> String {
-        self.0.lock().unwrap().clone()
+        self.0.text.lock().unwrap().clone()
     }
+}
+
+// Test-only attribution: a span carrying a `capture_case` field tags every
+// event emitted while it is entered with ` capture_case=<value>` on the same
+// line. Parallel tests sharing the one global capture can then keep only the
+// lines their own exercised unit produced, instead of scanning (or being
+// satisfied by) whatever sibling tests logged in the same byte window. Spans
+// without that field annotate nothing, so existing captures are unchanged.
+thread_local! {
+    static ENTERED_CASES: std::cell::RefCell<Vec<(u64, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn capture_case(fields: &str) -> Option<String> {
+    let rest = fields.split(" capture_case=").nth(1)?;
+    let rest = rest.strip_prefix('"').unwrap_or(rest);
+    let end = rest.find(['"', ' ']).unwrap_or(rest.len());
+    let case = &rest[..end];
+    (!case.is_empty()).then(|| case.to_owned())
 }
 
 /// One process-wide capture for log-hygiene tests in the same test binary.
@@ -51,17 +85,77 @@ impl Subscriber for Capture {
         Some(tracing::metadata::LevelFilter::DEBUG)
     }
 
-    fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
-        span::Id::from_u64(1)
+    fn new_span(&self, attrs: &span::Attributes<'_>) -> span::Id {
+        let id = self.0.next_span.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut fields = String::new();
+        attrs.record(&mut Fields(&mut fields));
+        self.0
+            .spans
+            .lock()
+            .unwrap()
+            .insert(id, SpanState { fields, refs: 1 });
+        span::Id::from_u64(id)
     }
 
-    fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+    fn record(&self, id: &span::Id, values: &span::Record<'_>) {
+        if let Some(state) = self.0.spans.lock().unwrap().get_mut(&id.into_u64()) {
+            let mut extra = String::new();
+            values.record(&mut Fields(&mut extra));
+            state.fields.push_str(&extra);
+        }
+    }
+
     fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
-    fn enter(&self, _: &span::Id) {}
-    fn exit(&self, _: &span::Id) {}
+
+    fn clone_span(&self, id: &span::Id) -> span::Id {
+        if let Some(state) = self.0.spans.lock().unwrap().get_mut(&id.into_u64()) {
+            state.refs += 1;
+        }
+        span::Id::from_u64(id.into_u64())
+    }
+
+    fn try_close(&self, id: span::Id) -> bool {
+        let mut spans = self.0.spans.lock().unwrap();
+        match spans.get_mut(&id.into_u64()) {
+            Some(state) if state.refs > 1 => {
+                state.refs -= 1;
+                false
+            }
+            Some(_) => {
+                spans.remove(&id.into_u64());
+                true
+            }
+            None => true,
+        }
+    }
+
+    fn enter(&self, id: &span::Id) {
+        let case = self
+            .0
+            .spans
+            .lock()
+            .unwrap()
+            .get(&id.into_u64())
+            .and_then(|state| capture_case(&state.fields));
+        if let Some(case) = case {
+            ENTERED_CASES.with(|entered| entered.borrow_mut().push((id.into_u64(), case)));
+        }
+    }
+
+    fn exit(&self, id: &span::Id) {
+        ENTERED_CASES.with(|entered| {
+            let mut entered = entered.borrow_mut();
+            if let Some(position) = entered
+                .iter()
+                .rposition(|(entered_id, _)| *entered_id == id.into_u64())
+            {
+                entered.remove(position);
+            }
+        });
+    }
 
     fn event(&self, event: &Event<'_>) {
-        let mut text = self.0.lock().unwrap();
+        let mut text = self.0.text.lock().unwrap();
         write!(
             text,
             "{} {}",
@@ -70,6 +164,11 @@ impl Subscriber for Capture {
         )
         .unwrap();
         event.record(&mut Fields(&mut text));
+        ENTERED_CASES.with(|entered| {
+            for (_, case) in entered.borrow().iter() {
+                write!(text, " capture_case={case}").unwrap();
+            }
+        });
         text.push('\n');
     }
 }

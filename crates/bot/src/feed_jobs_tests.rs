@@ -1,15 +1,35 @@
 use super::*;
 
+#[path = "feed_pause_resume_acceptance_tests.rs"]
+mod pause_resume_acceptance_tests;
+
+#[path = "feed_duplicate_acceptance_tests.rs"]
+mod duplicate_acceptance_tests;
+
+impl duplicate_acceptance_tests::ObserveAdd for store::FeedAddOutcome {
+    fn observe(&self, attempted: &FeedRelay) -> duplicate_acceptance_tests::AddObservation {
+        use duplicate_acceptance_tests::AddObservation;
+        match self {
+            Self::Created => AddObservation::Created(attempted.id.clone()),
+            Self::Existing { id, enabled } => AddObservation::Existing {
+                id: id.clone(),
+                enabled: *enabled,
+            },
+        }
+    }
+}
+
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures_util::stream;
 use serde_json::json;
-use two_bot_core::feeds::{plan_post, FeedKind};
+use two_bot_core::feeds::{feed_existing_text, plan_post, FeedKind};
 use two_bot_core::feeds_connector::{
     fetch_feed_with, FeedConnectError, FeedConnector, FeedResolver, FeedResponse, FetchOptions,
 };
 use two_bot_core::feeds_http::PublicRequest;
+use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
 use two_bot_testsupport::TestDatabase;
 
 use crate::{
@@ -433,7 +453,7 @@ async fn supervisor_applies_a_hot_reloaded_feed_interval_without_restart() {
         "increase defers the next run"
     );
     stop.send(true).unwrap();
-    task.await.unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -517,6 +537,87 @@ async fn identity_fence_registers_the_poller_only_where_announcements_are_permit
     }
 }
 
+#[test]
+fn live_announcements_gate_is_store_first_and_fail_closed() {
+    // No snapshot (poller parked or pre-first-poll) reads boot.
+    assert!(live_announcements_with(GUILD, true, None));
+    assert!(!live_announcements_with(GUILD, false, None));
+    let (mut writer, live) = live_channel();
+    assert!(live_announcements_with(GUILD, true, Some(&live)));
+    // Every publish moves the revision: the channel only republishes on
+    // moved marks, so a repeated revision would read back stale.
+    let mut revision = 0;
+    let mut publish = |rows: Vec<SettingRow>| {
+        revision += 1;
+        writer.publish(&SettingsSnapshot { revision, rows })
+    };
+    let row = |guild: &str, value: serde_json::Value| SettingRow {
+        guild_id: guild.to_owned(),
+        key: ANNOUNCEMENTS_KEY.to_owned(),
+        value,
+        version: 1,
+    };
+    // Stored rows win in both directions over the boot value.
+    for (stored, boot_on, expected) in [
+        (json!(false), true, false),
+        (json!(true), false, true),
+        (json!(0), true, false),
+        (json!(1), false, true),
+        (json!("0"), true, false),
+        (json!("1"), false, true),
+    ] {
+        publish(vec![row(GUILD, stored.clone())]);
+        assert_eq!(
+            live_announcements_with(GUILD, boot_on, Some(&live)),
+            expected,
+            "{stored} over boot {boot_on}"
+        );
+    }
+    // Anything else renders off, even over a boot-on deployment: a bypassed
+    // write guard must park the poller, never wedge it on.
+    for stored in [
+        json!("on"),
+        json!("true"),
+        json!(""),
+        json!(2),
+        json!({"on": true}),
+    ] {
+        publish(vec![row(GUILD, stored.clone())]);
+        assert!(
+            !live_announcements_with(GUILD, true, Some(&live)),
+            "{stored} must fail closed"
+        );
+    }
+    // Another guild's row never leaks across.
+    publish(vec![row("other-guild", json!(true))]);
+    assert!(live_announcements_with(GUILD, true, Some(&live)));
+    assert!(!live_announcements_with(GUILD, false, Some(&live)));
+    // Deleting the row hands the gate back to boot.
+    publish(vec![]);
+    assert!(live_announcements_with(GUILD, true, Some(&live)));
+    assert!(!live_announcements_with(GUILD, false, Some(&live)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn live_gate_off_skips_ticks_without_error() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let action: JobAction = Arc::new({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    });
+    let off = register_gated_with(60, action.clone(), GUILD.to_owned(), Arc::new(|| false))
+        .expect("gate shape still registers");
+    (off.action)().await.expect("skipped tick is not an error");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let on = register_gated_with(60, action.clone(), GUILD.to_owned(), Arc::new(|| true))
+        .expect("gate shape still registers");
+    (on.action)().await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 struct Active(Arc<AtomicUsize>);
 impl Drop for Active {
     fn drop(&mut self) {
@@ -560,7 +661,7 @@ async fn immediate_nonoverlap_and_supervisor_cancels_and_joins() {
     tokio::task::yield_now().await;
     assert_eq!(starts.load(Ordering::SeqCst), 1, "busy tick skipped");
     stop.send_replace(true);
-    owner.await.unwrap();
+    owner.await.unwrap().unwrap();
     assert_eq!(active.load(Ordering::SeqCst), 0, "active action joined");
     assert!(!status.read().await[NAME].running);
     tokio::time::advance(Duration::from_secs(600)).await;
@@ -643,7 +744,7 @@ async fn supervisor_timeout_finishes_schedule_and_later_tick_runs() {
     assert!(status.read().await[NAME].last_success.is_some());
     assert_eq!(status.read().await[NAME].consecutive_failures, 0);
     stop.send_replace(true);
-    owner.await.unwrap();
+    owner.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -2309,4 +2410,260 @@ async fn delivery_fence_lock_timeout_bounds_waiting_claim_and_removal() {
         rows_after_release.is_empty(),
         "timeout must leave the ledger unchanged"
     );
+}
+
+// Saved-relay recovery regressions, outside the protected duplicate suite.
+//
+// The protected suite pins behavior through valid saved IDs and
+// already-canonical store fixtures. These tests pin the two guards it
+// cannot see: the saved-ID renderer fallback and direct-store source
+// normalization. Removing either guard must fail a test here.
+
+fn recovery_add(
+    kind: &str,
+    source: &str,
+    channel: &str,
+) -> twilight_model::application::interaction::Interaction {
+    serde_json::from_value(json!({
+        "application_id":"1111", "authorizing_integration_owners":{"0":GUILD},
+        "id":"7007", "token":"synthetic-feed-recovery-token", "type":2,
+        "guild_id":GUILD, "channel_id":channel, "entitlements":[],
+        "member":{"user":{"id":"88","username":"fixture-admin","discriminator":"0", "bot":false,"mfa_enabled":false},
+                  "permissions":"32","roles":[],"deaf":false,"mute":false,"flags":0,"joined_at":null},
+        "data":{"id":"1","name":"feed-add","type":1,"options":[
+            {"name":"kind","type":3,"value":kind},
+            {"name":"source","type":3,"value":source}
+        ]}
+    }))
+    .expect("synthetic slash interaction")
+}
+
+async fn invoke_recovery_add(pool: &PgPool, kind: &str, source: &str, channel: &str) -> String {
+    let mock = MockRest::start(
+        vec![ScriptedResponse::status(204)],
+        ScriptedResponse::json(200, json!({"id":"9001"})),
+    )
+    .await;
+    let runtime = crate::command_runtime::CommandRuntime::new(
+        pool.clone(),
+        executor(&mock),
+        crate::command_runtime::router_with_commands(two_bot_core::RouterGates {
+            configured_guild: Some(2222),
+            scorecard: false,
+            automations: true,
+            announcements: true,
+            moderation: false,
+            voice: false,
+            voice_assistant: false,
+            tickets: false,
+            self_roles: false,
+            onboarding_picker: false,
+            session_picker: false,
+        }),
+        2222,
+        true,
+    );
+    runtime
+        .on_interaction(&recovery_add(kind, source, channel))
+        .await;
+    let requests = mock.requests();
+    mock.shutdown().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "only defer and completion, no channel post/read"
+    );
+    assert_eq!(requests[0].method, "POST");
+    assert!(requests[0].path.ends_with("/callback"));
+    let defer: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(defer["type"], 5);
+    assert_eq!(defer["data"]["flags"].as_u64().unwrap_or(0) & 64, 64);
+    assert_eq!(requests[1].method, "PATCH");
+    assert!(requests[1].path.ends_with("/messages/@original"));
+    let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+    let content = body["content"].as_str().unwrap().to_owned();
+    assert!(content.encode_utf16().count() <= 2000);
+    content
+}
+
+async fn recovery_snapshot(pool: &PgPool) -> serde_json::Value {
+    sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+          'relays', (SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY id), '[]'::jsonb) FROM feed_relays r),
+          'deliveries', (SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY feed_id, item_key), '[]'::jsonb) FROM feed_deliveries d))",
+    ).fetch_one(pool).await.expect("snapshot every relay and delivery column")
+}
+
+async fn feed_create_audit_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM announcements_audit_log WHERE action = 'feed.create'")
+        .fetch_one(pool)
+        .await
+        .expect("count creation audits")
+}
+
+#[test]
+fn existing_renderer_falls_back_for_malformed_saved_ids() {
+    const ENABLED_FALLBACK: &str = "A feed relay is already saved and enabled. No relay was created or changed. Use /feed-list to inspect saved relays.";
+    const PAUSED_FALLBACK: &str = "A feed relay is already saved and paused. No relay was created or changed. Use /feed-list to inspect saved relays.";
+    let mut malformed = [
+        "",
+        "bad`relay",
+        "bad\nrelay",
+        "bad relay",
+        "relay;drop",
+        "relay/check",
+        "relay✓",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    malformed.push("a".repeat(129));
+    for id in &malformed {
+        assert_eq!(
+            feed_existing_text(id, true),
+            ENABLED_FALLBACK,
+            "complete enabled fallback for malformed saved ID"
+        );
+        assert_eq!(
+            feed_existing_text(id, false),
+            PAUSED_FALLBACK,
+            "complete paused fallback for malformed saved ID"
+        );
+    }
+}
+
+#[test]
+fn existing_renderer_keeps_valid_ids_at_128_byte_boundary() {
+    let boundary = "a".repeat(128);
+    assert_eq!(
+        feed_existing_text(&boundary, true),
+        format!(
+            "Feed relay already saved: `{boundary}` is enabled. No relay was created or changed. \
+             Inspect with `/feed-inspect id:{boundary}` or use `/feed-pause id:{boundary}`."
+        )
+    );
+    assert_eq!(
+        feed_existing_text(&boundary, false),
+        format!(
+            "Feed relay already saved: `{boundary}` is paused. No relay was created or changed. \
+             Inspect with `/feed-inspect id:{boundary}` or use `/feed-resume id:{boundary}`."
+        )
+    );
+    // One literal pin so the fixed surrounding copy cannot drift with the test.
+    assert_eq!(
+        feed_existing_text("original-relay", true),
+        "Feed relay already saved: `original-relay` is enabled. No relay was created or changed. Inspect with `/feed-inspect id:original-relay` or use `/feed-pause id:original-relay`."
+    );
+}
+
+// A restored malformed saved ID must take the renderer fallback through the
+// real command path: no raw-ID interpolation, no relay or ledger write, and
+// no creation audit.
+#[tokio::test]
+async fn duplicate_command_against_malformed_saved_id_hides_raw_id_and_changes_nothing() {
+    const RAW_ID: &str = "bad`relay\nid";
+    const SOURCE: &str = "https://example.org/malformed-seed.xml";
+    let db = fixture().await;
+    let mut relay = feed("seed-placeholder");
+    relay.id = RAW_ID.to_owned();
+    relay.source = SOURCE.to_owned();
+    relay.enabled = true;
+    store::add_feed(db.pool(), &relay)
+        .await
+        .expect("seed malformed-ID relay");
+    let post = seed_pending(db.pool(), &relay, 0).await;
+    assert!(store::mark_delivered(
+        db.pool(),
+        GUILD,
+        &post,
+        "pending-seed-0",
+        "9001",
+        now_millis_for_test(),
+    )
+    .await
+    .unwrap());
+    seed_pending(db.pool(), &relay, 1).await;
+    store::mark_checked(db.pool(), GUILD, &relay.id, 123456)
+        .await
+        .unwrap();
+    let before = recovery_snapshot(db.pool()).await;
+    let reply = invoke_recovery_add(db.pool(), "rss", SOURCE, CHANNEL).await;
+    let after = recovery_snapshot(db.pool()).await;
+    let creates = feed_create_audit_count(db.pool()).await;
+    db.close().await.unwrap();
+    assert_eq!(
+        after, before,
+        "malformed saved ID must not touch relay or ledger"
+    );
+    assert_eq!(creates, 0, "duplicate is not a creation");
+    assert_eq!(
+        reply,
+        "A feed relay is already saved and enabled. No relay was created or changed. Use /feed-list to inspect saved relays."
+    );
+    assert!(
+        !reply.contains("bad`relay"),
+        "raw saved ID must stay out of the reply: {reply}"
+    );
+    assert!(
+        !reply.contains('`'),
+        "fallback carries no interpolated ID: {reply}"
+    );
+}
+
+// A bare YouTube channel ID inserted directly through the store must persist
+// its canonical feed URL, so the canonical URL (and a repeated bare ID) both
+// recover the original relay instead of creating a second one.
+#[tokio::test]
+async fn direct_store_add_normalizes_bare_youtube_id_before_persisting() {
+    const BARE: &str = "UCabcdefghijklmnopqrstuv";
+    let canonical = format!("https://www.youtube.com/feeds/videos.xml?channel_id={BARE}");
+    let db = fixture().await;
+    let mut raw = feed("yt-raw-seed");
+    raw.kind = FeedKind::Youtube;
+    raw.source = BARE.to_owned();
+    assert_eq!(
+        store::add_feed(db.pool(), &raw).await.unwrap(),
+        store::FeedAddOutcome::Created
+    );
+    let saved = store::list_feeds(db.pool(), GUILD, false).await.unwrap();
+    assert_eq!(saved.len(), 1, "one relay after raw-ID insert");
+    assert_eq!(saved[0].id, "yt-raw-seed");
+    assert_eq!(
+        saved[0].source, canonical,
+        "store persists the canonical URL, not the bare ID"
+    );
+    let before = recovery_snapshot(db.pool()).await;
+    let mut attempted = feed("yt-canonical-attempt");
+    attempted.kind = FeedKind::Youtube;
+    attempted.source = canonical.clone();
+    attempted.enabled = false;
+    assert_eq!(
+        store::add_feed(db.pool(), &attempted).await.unwrap(),
+        store::FeedAddOutcome::Existing {
+            id: "yt-raw-seed".to_owned(),
+            enabled: true
+        },
+        "canonical URL must recover the raw-seeded relay with saved state"
+    );
+    assert_eq!(
+        recovery_snapshot(db.pool()).await,
+        before,
+        "recovery must not update the relay or ledger"
+    );
+    let mut repeat = feed("yt-raw-repeat");
+    repeat.kind = FeedKind::Youtube;
+    repeat.source = BARE.to_owned();
+    assert_eq!(
+        store::add_feed(db.pool(), &repeat).await.unwrap(),
+        store::FeedAddOutcome::Existing {
+            id: "yt-raw-seed".to_owned(),
+            enabled: true
+        },
+        "repeated raw ID must hit the normalized conflict lookup"
+    );
+    let saved = store::list_feeds(db.pool(), GUILD, false).await.unwrap();
+    db.close().await.unwrap();
+    assert_eq!(saved.len(), 1, "all three adds address one relay");
+    assert_eq!(saved[0].source, canonical);
 }

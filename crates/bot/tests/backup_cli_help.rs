@@ -146,6 +146,11 @@ fn scratch_is_empty_ignores_stray_profraw_profiles() {
 #[test]
 fn extra_argument_to_backup_or_snapshot_exits_two_with_usage() {
     for subcommand in ["backup", "guild-config-snapshot"] {
+        let code = if subcommand == "backup" {
+            "backup_usage"
+        } else {
+            "snapshot_usage"
+        };
         let dir = Scratch::new();
         let output = two_bot(&dir, &[subcommand, "now"]).output().unwrap();
         let stderr = text(&output.stderr);
@@ -153,7 +158,7 @@ fn extra_argument_to_backup_or_snapshot_exits_two_with_usage() {
         assert!(output.stdout.is_empty());
         assert!(
             stderr.starts_with(&format!(
-                "{subcommand}: unexpected argument \"now\".\n{USAGE_HEAD}"
+                "{subcommand}: unexpected argument \"now\". code={code}\n{USAGE_HEAD}"
             )),
             "{subcommand}: {stderr}"
         );

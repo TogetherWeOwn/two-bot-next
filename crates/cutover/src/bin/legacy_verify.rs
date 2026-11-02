@@ -8,6 +8,7 @@ use sqlx::{postgres::PgConnectOptions, ConnectOptions, Connection, PgConnection}
 use two_bot_core::database_tls::{self, TlsPolicy};
 use two_bot_cutover::legacy_mapping::MappingSpec;
 use two_bot_cutover::legacy_verify::{verify, DEFAULT_SAMPLE_LIMIT, MAX_SAMPLE_LIMIT};
+use two_bot_cutover::{over_cap_message, read_string_capped, IntakeReadError};
 use url::Url;
 
 const USAGE: &str =
@@ -15,6 +16,7 @@ const USAGE: &str =
     [--group <name>]... [--sample-limit <0..1000>]\n\
     Prefer --source-url-env <variable> and --target-url-env <variable> to keep\n\
     credentials out of process arguments. Reports JSON to stdout; writes no data.\n\
+    Intake cap: the mapping file must not exceed 8 MiB (exit 2, before any connection).\n\
     Exit codes: 0 equal, 1 mismatch, 2 refusal/error. No migrations or apply mode.";
 
 struct Args {
@@ -137,8 +139,13 @@ fn connection_options(text: &str, tls: TlsPolicy) -> Result<PgConnectOptions, &'
 }
 
 async fn run(args: Args) -> Result<bool, String> {
-    let text = std::fs::read_to_string(&args.mapping)
-        .map_err(|_| "cannot read mapping file".to_owned())?;
+    let text = match read_string_capped(&args.mapping) {
+        Ok(text) => text,
+        Err(IntakeReadError::OverCap) => return Err(over_cap_message("mapping file")),
+        Err(IntakeReadError::Unreadable(_)) => {
+            return Err("cannot read mapping file".to_owned());
+        }
+    };
     let spec = MappingSpec::parse(&text).map_err(|e| e.to_string())?;
     spec.select(&args.groups).map_err(|e| e.to_string())?;
     // Validate BOTH endpoints before connecting. Stop on the first connection
@@ -320,6 +327,44 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.dir).ok();
         }
+    }
+
+    fn offline_args(mapping: &str) -> Args {
+        Args {
+            source: "postgres://operator:explicit@agent-testdb:5432/bot".to_owned(),
+            target: "postgres://operator:explicit@agent-testdb:5432/bot".to_owned(),
+            mapping: mapping.to_owned(),
+            groups: Vec::new(),
+            sample_limit: DEFAULT_SAMPLE_LIMIT,
+        }
+    }
+
+    fn scratch_mapping(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("legacy-verify-cap-{}-{tag}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("spec.json")
+    }
+
+    #[tokio::test]
+    async fn over_cap_mapping_refuses_before_any_connection() {
+        // Content never parses: the cap fires on byte length alone.
+        let path = scratch_mapping("over-cap");
+        std::fs::write(&path, vec![b' '; two_bot_cutover::INTAKE_CAP_BYTES + 1]).unwrap();
+        let err = run(offline_args(&path.to_string_lossy()))
+            .await
+            .unwrap_err();
+        assert!(err.contains("exceeds"), "{err}");
+        assert!(err.contains("mapping"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn missing_mapping_reports_cannot_read() {
+        let err = run(offline_args("/nonexistent-legacy-verify-mapping-spec.json"))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "cannot read mapping file");
     }
 
     #[test]

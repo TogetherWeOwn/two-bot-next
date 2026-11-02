@@ -3,8 +3,8 @@
 //! Pins the `/timeout` slice end to end without Discord, the network, or a
 //! database: the router permission gate and its denial copy, the
 //! policy/duration validation bounds, and the executor's Discord call plus
-//! audit-row shape (including the failure edges that must not write audit
-//! rows). Synthetic fixtures only: literal permission bits, synthetic
+//! audit-row shape (including the bound audit row each failure edge must
+//! write). Synthetic fixtures only: literal permission bits, synthetic
 //! snowflake ids, and an in-memory store/double.
 
 use two_bot_core::command_permissions::{command_permission, PolicyHook};
@@ -94,6 +94,28 @@ fn service(
     store: MemMemberStore,
 ) -> MemberModerationService<MockMemberDiscord, MemMemberStore, impl Fn() -> i64 + Send + Sync> {
     MemberModerationService::new(discord, store, policy(), || NOW_MS)
+}
+
+/// Pin a failure/incomplete audit row: bound to the actor, guild, target,
+/// action and idempotency key, under the `:<outcome>` suffixed request id
+/// that keeps it from masking the accepted row of a later retry.
+fn assert_bound_failure_audit(
+    row: &two_bot_core::member_moderation::AuditRow,
+    exec: &MemberExecution,
+    outcome: &str,
+    stage: &str,
+) {
+    assert_eq!(row.request_id, format!("{}:{outcome}", exec.request_id));
+    assert_eq!(row.outcome, outcome);
+    assert_eq!(row.action, exec.action.action_name());
+    assert_eq!(row.guild_id, GUILD);
+    assert_eq!(row.actor_id, ACTOR_ID);
+    assert_eq!(row.target_id.as_deref(), Some(TARGET_ID));
+    assert_eq!(row.idempotency_key, exec.idempotency_key);
+    let metadata: serde_json::Value =
+        serde_json::from_str(&row.metadata_json).expect("metadata is JSON");
+    assert_eq!(metadata["stage"], stage);
+    assert_eq!(metadata["request_id"], exec.request_id);
 }
 
 #[test]
@@ -477,21 +499,23 @@ async fn timeout_execute_emits_discord_call_and_audit_shape() {
 }
 
 #[tokio::test]
-async fn timeout_rejected_discord_writes_no_audit_and_releases_key() {
+async fn timeout_rejected_discord_audits_failure_and_releases_key() {
     let discord = MockMemberDiscord::new();
     let store = MemMemberStore::new();
     let svc = service(discord.clone(), store.clone());
 
     discord.fail_with("timeout", DiscordError::Rejected("unknown member".into()));
-    let err = svc
-        .execute(&execution("req-timeout-rejected"))
-        .await
-        .expect_err("must fail");
+    let exec = execution("req-timeout-rejected");
+    let err = svc.execute(&exec).await.expect_err("must fail");
     assert!(matches!(
         err,
         MemberError::Discord(DiscordError::Rejected(_))
     ));
-    assert!(store.audits().is_empty());
+    // The rejected attempt is audited as a bound `failed` row under a
+    // suffixed request id, so it can never mask the accepted retry's row.
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    assert_bound_failure_audit(&audits[0], &exec, "failed", "discord");
 
     discord.clear_failure("timeout");
     let res = svc
@@ -501,22 +525,31 @@ async fn timeout_rejected_discord_writes_no_audit_and_releases_key() {
     assert!(!res.replayed);
     assert_eq!(res.outcome, MemberOutcome::TimedOut);
     assert_eq!(discord.call_count("timeout"), 2);
-    assert_eq!(store.audits().len(), 1);
+    // The failed row survives the retry untouched and the accepted retry
+    // adds its own plain-request-id success row.
+    let audits = store.audits();
+    assert_eq!(audits.len(), 2);
+    assert_bound_failure_audit(&audits[0], &exec, "failed", "discord");
+    assert_eq!(audits[1].request_id, exec.request_id);
+    assert_eq!(audits[1].outcome, "timed_out");
+    assert_eq!(audits[1].action, "moderation.timeout");
 }
 
 #[tokio::test]
-async fn timeout_uncertain_failure_keeps_claim_without_audit() {
+async fn timeout_uncertain_failure_audits_once_and_keeps_claim() {
     let discord = MockMemberDiscord::new();
     let store = MemMemberStore::new();
     let svc = service(discord.clone(), store.clone());
 
     discord.fail_with("timeout", DiscordError::Timeout);
-    let err = svc
-        .execute(&execution("req-timeout-uncertain"))
-        .await
-        .expect_err("must fail");
+    let exec = execution("req-timeout-uncertain");
+    let err = svc.execute(&exec).await.expect_err("must fail");
     assert_eq!(err, MemberError::Discord(DiscordError::Timeout));
-    assert!(store.audits().is_empty());
+    // The uncertain attempt leaves one bound `in_progress` row; the claim
+    // stays fenced, so the retry refuses without a second row.
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1);
+    assert_bound_failure_audit(&audits[0], &exec, "in_progress", "discord");
 
     discord.clear_failure("timeout");
     let err = svc
@@ -525,5 +558,7 @@ async fn timeout_uncertain_failure_keeps_claim_without_audit() {
         .expect_err("claim stays uncertain");
     assert_eq!(err, MemberError::InFlight);
     assert_eq!(discord.call_count("timeout"), 1);
-    assert!(store.audits().is_empty());
+    let audits = store.audits();
+    assert_eq!(audits.len(), 1, "redelivery deduplicates the row");
+    assert_bound_failure_audit(&audits[0], &exec, "in_progress", "discord");
 }

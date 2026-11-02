@@ -87,10 +87,12 @@ jobs:
           persist-credentials: false
       # Fetch current RustSec data even when Cargo.lock has not changed.
       # cargo-deny reads the lockfile; no token-writing/reporting steps.
+      # `--workspace`: see the cargo-deny step in check.yml.
       - name: cargo deny check advisories
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories
+          arguments: --workspace --all-features
 
   sweep:
     name: nightly ignored tests and docs
@@ -100,7 +102,13 @@ jobs:
       contents: read
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sweep') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
-    timeout-minutes: 45
+    # The serial --include-ignored sweep outgrew 45 minutes: every scheduled
+    # run from 2026-10-24 on was cancelled mid-sweep, still passing tests. The
+    # once-a-day schedule and manual dispatch get 180 minutes; every other
+    # event keeps the 45-minute ceiling so a wiring change cannot hold a
+    # runner for hours. The allow-list form fails closed: a future trigger
+    # gets 45 minutes, not 180, until it is deliberately added here.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}
     # Match required CI isolation on the shared Docker host.
     container:
       image: rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
@@ -172,10 +180,36 @@ jobs:
       # used by TestDatabase suites. Skip only those tests here, then run ALL of
       # those suites below with their accepted URL.
       # The store suite reads its own TEST_DATABASE_URL and isolates per schema.
-      # regenerate_reference_docs is a manual regen: it rewrites docs/commands.md and
+      - name: Generate command reference before workspace compilation
+        run: python3 scripts/generate_command_reference.py
+
+      # regenerate_reference_docs is a manual regen: it rewrites docs/generated/commands.md and
       # docs/configuration.md in the checkout, so later tests would compare against
       # regenerated docs and hide drift. It is skipped here on purpose.
-      # No ignored suite is permanently excluded.
+      # Quarantine (TOG-34944): the 15 red backfill acceptance tests below run
+      # in NO lane — skipped here, in the check.yml coverage sweep and in the
+      # check.yml store lane — until their builders land. Each carries its
+      # tracking ref in its #[ignore] reason; test_workflows.py
+      # BACKFILL_QUARANTINE pins the set shrink-only (growth fails, a fix
+      # ratchets the pin) and pins all three skip sites.
+      # Audit-log family, tracked by TOG-22948:
+      # audit_log_pagination_limit_1_to_100_before_after_covers_45d_window
+      # audit_log_requests_ride_rate_limit_client_never_direct_rest
+      # audit_cursor_persists_per_window_and_resumes_mid_window
+      # audit_rows_hold_ids_timestamps_enums_only
+      # audit_429_retry_after_pauses_without_losing_place
+      # Event-users/reactions/pins family, tracked by TOG-22951:
+      # event_users_paginate_through_rate_limit_client_with_max_100
+      # reaction_users_paginate_through_rate_limit_client
+      # pins_list_through_rate_limit_client_persists_metadata_only
+      # blocklisted_users_skipped_for_per_user_rows_while_aggregates_keep_counting
+      # persisted_rows_hold_ids_timestamps_enums_only
+      # resume_continues_from_persisted_cursors_per_family
+      # Bans/invites/onboarding family, tracked by TOG-22952:
+      # bans_fetch_applies_blocklist_and_counts_everyone
+      # invite_rows_hold_metadata_only
+      # onboarding_rows_hold_ids_enums_metadata_only
+      # bans_invites_onboarding_resume_continues_from_persisted_cursors
       # --no-fail-fast: cargo otherwise stops at the first failing test binary and
       # hides every later failure, so one red target masked the rest of the sweep.
       - name: Full workspace sweep including ignored tests

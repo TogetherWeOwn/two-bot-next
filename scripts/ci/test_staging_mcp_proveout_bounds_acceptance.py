@@ -63,6 +63,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import staging_mcp_proveout as proveout
+from scripts.ci.test_staging_mcp_proveout import shipped_tools
 
 # 64 KiB, the strictest sibling cap (staging_probe, prod_passive_probe).
 # The Builder implements proveout.MAX_BODY_BYTES at exactly this value;
@@ -334,7 +335,7 @@ def valid_envelope(kind, rpc_id):
     if kind == "tools/list":
         return 200, headers, json.dumps({
             "jsonrpc": "2.0", "id": rpc_id,
-            "result": {"tools": [{"name": n} for n in proveout.EXPECTED_TOOLS]},
+            "result": {"tools": shipped_tools()},
         })
     if kind.startswith("tools/call "):
         return 200, headers, json.dumps({

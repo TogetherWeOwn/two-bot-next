@@ -552,7 +552,7 @@ async fn fetch_audit_entry_ids(pool: &Pool<Postgres>, guild_id: &str) -> Vec<Str
 // newer entries, out-of-range limits never reach the wire out of range, and
 // entries older than the window are dropped before storage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22948"]
 async fn audit_log_pagination_limit_1_to_100_before_after_covers_45d_window() {
     let mock = FakeAuditLog::start(vec![
         audit_page(vec![entry_1004(), entry_1003()]),
@@ -647,7 +647,7 @@ async fn audit_log_pagination_limit_1_to_100_before_after_covers_45d_window() {
 // admitted requests, and the guard accounts the run without high-cardinality
 // detail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL; also requires the audit-logs route on the rate-limit client (TOG-22948)"]
+#[ignore = "requires authorized TEST_DATABASE_URL; also requires the audit-logs route on the rate-limit client; quarantined red, tracked by TOG-22948"]
 async fn audit_log_requests_ride_rate_limit_client_never_direct_rest() {
     let mock = FakeAuditLog::start(vec![audit_page(vec![entry_1004()])]).await;
     let (exec, guard) = executor_for(&mock.origin);
@@ -684,7 +684,7 @@ async fn audit_log_requests_ride_rate_limit_client_never_direct_rest() {
 // persisted cursor mid-window, never by replaying the window from zero, and
 // an untouched family stays cursorless (never a zero/empty row).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22948"]
 async fn audit_cursor_persists_per_window_and_resumes_mid_window() {
     let mock = FakeAuditLog::start(vec![audit_page(vec![entry_1002()])]).await;
     let (exec, _) = executor_for(&mock.origin);
@@ -732,7 +732,7 @@ async fn audit_cursor_persists_per_window_and_resumes_mid_window() {
 // timestamps and enum fields only. The table carries exactly the six fence
 // columns, values round-trip, and no body/reason text reaches storage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22948"]
 async fn audit_rows_hold_ids_timestamps_enums_only() {
     let fixture = Fixture::new().await;
     // The source fixtures above carry `reason`/`options` body text; only the
@@ -824,7 +824,7 @@ async fn audit_rows_hold_ids_timestamps_enums_only() {
 // sent during the header wait, the retry reuses the same `before` cursor, and
 // every entry still lands in order with the cursor advanced past the pause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires authorized TEST_DATABASE_URL"]
+#[ignore = "requires authorized TEST_DATABASE_URL; quarantined red, tracked by TOG-22948"]
 async fn audit_429_retry_after_pauses_without_losing_place() {
     let mock = FakeAuditLog::start(vec![
         audit_page(vec![entry_1004(), entry_1003()]),

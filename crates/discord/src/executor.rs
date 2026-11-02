@@ -36,7 +36,9 @@
 //!   ping `@everyone`), via client-level
 //!   `default_allowed_mentions(AllowedMentions { parse: vec![], .. })`.
 
+mod lockdown_preview_reads;
 mod tickets;
+pub use lockdown_preview_reads::PreviewChannel;
 pub use tickets::{ChannelPresence, TicketChannelRequest, TicketMessage};
 
 use crate::ratelimit_guard::{process_guard, GuardError, RateLimitGuard};
@@ -93,6 +95,10 @@ pub const BOOT_BLOCKED_RETRY_SLEEP_MS: u64 = 250;
 /// Bound response-body collection, including the otherwise untimed GET/kick
 /// lanes, so a stalled global response cannot retain pending admission forever.
 pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
+/// Extra time for a governed read to settle storage after its wire deadline.
+/// This never extends the wire attempt or authorizes another request. If
+/// completion cannot be confirmed within the bound, admission stays occupied.
+const READ_SETTLEMENT_GRACE_MS: u64 = 1_000;
 /// Wire marker for a stalled response body: headers arrived but the body never
 /// completed within [`RESPONSE_BODY_TIMEOUT_MS`]. The executor seam maps this
 /// to [`DiscordError::Timeout`] (never `Unavailable`) so the publish wire
@@ -112,6 +118,39 @@ pub(crate) const HEADER_TIMEOUT_MESSAGE: &str = "read headers timed out";
 pub const MAX_AUDIT_REASON_CHARS: usize = 512;
 /// Legacy message ceiling asserted before sending.
 pub const MAX_MESSAGE_CHARS: usize = 2000;
+
+/// Outcome of applying a reward plan: the role ids written (grants first,
+/// then revokes, in plan order), the first refused role with its
+/// fixed-vocabulary refusal reason, and the role ids never attempted because
+/// the first refusal aborts the rest.
+pub type RewardRoleReport = (Vec<String>, Option<(String, String)>, Vec<String>);
+
+/// Fixed-vocabulary reason a role write failed. A confirmed Discord refusal
+/// keeps its status (`Discord refused the request with 403`); every other
+/// failure is its [`DiscordError::cause`] token, never transport detail.
+fn refusal_reason(error: &DiscordError) -> String {
+    match error {
+        DiscordError::Rejected(_) => error.to_string(),
+        other => other.cause().to_owned(),
+    }
+}
+
+/// The report for a plan whose write at `failed_index` (grants first, then
+/// revokes) was refused: everything after it was never attempted.
+fn refused_report(
+    plan: &two_bot_core::leveling::RewardRolePlan,
+    applied: Vec<String>,
+    failed_index: usize,
+    error: &DiscordError,
+) -> RewardRoleReport {
+    let mut writes = plan.grant.iter().chain(plan.revoke.iter()).cloned();
+    let failed = writes.nth(failed_index).unwrap_or_default();
+    (
+        applied,
+        Some((failed, refusal_reason(error))),
+        writes.collect(),
+    )
+}
 
 /// Discord failure modes (legacy `ModerationDiscord` `ActionError` codes).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -187,6 +226,16 @@ impl DiscordError {
     pub fn proves_no_effect(&self) -> bool {
         self.is_safe_pre_mutation() || matches!(self, Self::RateLimited)
     }
+}
+
+/// Outcome of [`ActionExecutor::edit_message_for_close_refresh`]: a confirmed
+/// edit, a definitively deleted message, or a retryable failure whose
+/// [`DiscordError::cause`] stays in fixed vocabulary for content-free logs.
+#[derive(Debug)]
+pub enum CloseRefreshEdit {
+    Edited,
+    UnknownMessage,
+    Retryable(DiscordError),
 }
 
 /// One moderation mutation the executor carries out (legacy
@@ -274,6 +323,10 @@ pub struct RawResponse {
     pub(crate) completion: Option<two_bot_core::send_admission::AdmissionPermit>,
 }
 
+type AdmittedSendFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(RawResponse, bool), DiscordError>> + Send + 'a>,
+>;
+
 impl std::fmt::Debug for RawResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RawResponse")
@@ -306,6 +359,14 @@ impl RawResponse {
     /// Call only for a definite effect/no-effect, after validating any required
     /// mutation receipt. A storage fault must not authorize effect replay.
     pub(crate) async fn complete(&mut self) {
+        if let Err(error) = self.complete_confirmed().await {
+            tracing::warn!(%error, "Discord send admission completion failed; lane held");
+        }
+    }
+
+    /// A durable delivery caller must observe completion failure, not turn an
+    /// accepted-but-unconfirmed exchange into clean success or permission to retry.
+    async fn complete_confirmed(&mut self) -> Result<(), DiscordError> {
         if let Some(permit) = self.completion.take() {
             let cooldown = (self.status == 429).then(|| {
                 two_bot_core::send_admission::cooldown_from_delays(
@@ -315,10 +376,11 @@ impl RawResponse {
                     self.body_retry_after_secs(),
                 )
             });
-            if let Err(error) = permit.complete(cooldown).await {
-                tracing::warn!(%error, "Discord send admission completion failed; lane held");
-            }
+            permit.complete(cooldown).await.map_err(|_| {
+                DiscordError::Unavailable("send admission completion unconfirmed".into())
+            })?;
         }
+        Ok(())
     }
 
     /// Body `retry_after` (seconds) when present and finite — wins over the
@@ -672,8 +734,48 @@ impl HyperTransport {
     /// `deadline` is the caller's absolute attempt instant: admission,
     /// headers and body together stay inside it. The unadmitted loopback path
     /// passes `None` (headers unbounded, body at the fixed
-    /// [`RESPONSE_BODY_TIMEOUT_MS`]).
+    /// [`RESPONSE_BODY_TIMEOUT_MS`]). Governed GETs own their bounded attempt
+    /// independently of the caller: cancelling a fetch must not abandon its
+    /// admission or 429 body accounting. No caller continuation or retry lives
+    /// in that owner. Mutations retain their cancellation/uncertainty fences.
     pub async fn send_request(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(RawResponse, bool), String> {
+        if self.admission.is_some() && request.method() == Method::Get {
+            let transport = self.clone();
+            let request = request.clone();
+            let deadline = deadline.unwrap_or_else(|| {
+                tokio::time::Instant::now() + Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS)
+            });
+            // The inner phase timers retain the original wire deadline. The
+            // later watchdog leaves time for their storage cleanup, but also
+            // bounds a stuck completion. Dropping the join handle detaches
+            // only this one read, never a retry loop or a mutation.
+            let owner = tokio::spawn(async move {
+                let settled_by = deadline + Duration::from_millis(READ_SETTLEMENT_GRACE_MS);
+                match tokio::time::timeout_at(
+                    settled_by,
+                    transport.send_request_inner(&request, Some(deadline)),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!("Discord read settlement timed out; lane held");
+                        Err("Discord read settlement timed out".to_owned())
+                    }
+                }
+            });
+            return owner
+                .await
+                .map_err(|_| "Discord read owner unavailable".to_owned())?;
+        }
+        self.send_request_inner(request, deadline).await
+    }
+
+    async fn send_request_inner(
         &self,
         request: &Request,
         deadline: Option<tokio::time::Instant>,
@@ -1242,30 +1344,36 @@ impl ActionExecutor {
             .await
     }
 
-    async fn send_admitted_for(
-        &self,
-        request: &Request,
+    // Erase the wire future at one non-inlined constructor, so the many REST
+    // wrappers share its poll/drop code instead of embedding the transport.
+    // Counting and the deadline stay lazy; cancellation still drops in place.
+    #[inline(never)]
+    fn send_admitted_for<'a>(
+        &'a self,
+        request: &'a Request,
         budget: Duration,
-    ) -> Result<(RawResponse, bool), DiscordError> {
-        self.count();
-        // The absolute attempt instant is fixed before durable admission, so
-        // the admit, the header wait and the body share the one deadline.
-        let deadline = tokio::time::Instant::now() + budget;
-        self.inner
-            .transport
-            .send_request(request, Some(deadline))
-            .await
-            .map_err(|detail| {
-                // A body that never completed inside the wire budget is
-                // "Discord did not answer in time" (legacy `upstream_timeout`).
-                // The stalled-header marker maps the same way: headers never
-                // arrived in time ([TOG-12562](/TOG/issues/TOG-12562)).
-                if detail == BODY_TIMEOUT_MESSAGE || detail == HEADER_TIMEOUT_MESSAGE {
-                    DiscordError::Timeout
-                } else {
-                    DiscordError::Unavailable(detail)
-                }
-            })
+    ) -> AdmittedSendFuture<'a> {
+        Box::pin(async move {
+            self.count();
+            // The absolute attempt instant is fixed before durable admission, so
+            // the admit, the header wait and the body share the one deadline.
+            let deadline = tokio::time::Instant::now() + budget;
+            self.inner
+                .transport
+                .send_request(request, Some(deadline))
+                .await
+                .map_err(|detail| {
+                    // A body that never completed inside the wire budget is
+                    // "Discord did not answer in time" (legacy `upstream_timeout`).
+                    // The stalled-header marker maps the same way: headers never
+                    // arrived in time.
+                    if detail == BODY_TIMEOUT_MESSAGE || detail == HEADER_TIMEOUT_MESSAGE {
+                        DiscordError::Timeout
+                    } else {
+                        DiscordError::Unavailable(detail)
+                    }
+                })
+        })
     }
 
     async fn send_paced(
@@ -1408,6 +1516,7 @@ impl ActionExecutor {
 
     /// One attempt bounded by `timeout`, borrowing the request so a caller can
     /// re-attempt it after a pre-wire refusal.
+    #[inline(never)]
     async fn call_once_raw_lane_for(
         &self,
         request: &Request,
@@ -1448,16 +1557,19 @@ impl ActionExecutor {
     }
 
     /// Apply the domain plan through the shared pacing/request factory. All
-    /// local validation and the entire revoke preflight precede any mutation;
-    /// Discord cannot promise atomicity if permissions change after preflight.
-    /// PUT/DELETE role endpoints are idempotent; errors are returned, not hidden.
+    /// local validation and the entire revoke preflight precede any mutation
+    /// and stay `Err`; Discord cannot promise atomicity if permissions change
+    /// after preflight. PUT/DELETE role endpoints are idempotent. Once writes
+    /// start, the first refusal aborts the rest (grants first, then revokes)
+    /// and returns the [`RewardRoleReport`] instead of an opaque error, so the
+    /// caller can tell applied roles from the refused one and the skipped tail.
     pub async fn execute_reward_roles(
         &self,
         guild_id: u64,
         member_id: u64,
         plan: &two_bot_core::leveling::RewardRolePlan,
         revoke_fence: Option<StagingRevokeFence>,
-    ) -> Result<(), DiscordError> {
+    ) -> Result<RewardRoleReport, DiscordError> {
         let guild = snowflake(&guild_id.to_string())?;
         let member = snowflake(&member_id.to_string())?;
         let grants: Vec<Id<RoleMarker>> = plan
@@ -1487,25 +1599,42 @@ impl ActionExecutor {
             self.preflight_reward_revokes(guild_id, &plan.revoke)
                 .await?;
         }
-        for role in grants {
+        let mut applied = Vec::with_capacity(grants.len() + revokes.len());
+        for (index, role) in grants.iter().enumerate() {
             let request = Self::request_of(
                 self.inner
                     .factory
-                    .add_guild_member_role(guild, member, role)
+                    .add_guild_member_role(guild, member, *role)
                     .reason(&grant_reason),
-            )?;
-            self.call_once_raw_paced(request, &[200, 204]).await?;
+            );
+            if let Err(error) = self.reward_role_write(request).await {
+                return Ok(refused_report(plan, applied, index, &error));
+            }
+            applied.push(plan.grant[index].clone());
         }
-        for role in revokes {
+        for (index, role) in revokes.iter().enumerate() {
             let request = Self::request_of(
                 self.inner
                     .factory
-                    .remove_guild_member_role(guild, member, role)
+                    .remove_guild_member_role(guild, member, *role)
                     .reason(revoke_reason.as_deref().expect("validated revoke reason")),
-            )?;
-            self.call_once_raw_paced(request, &[200, 204]).await?;
+            );
+            if let Err(error) = self.reward_role_write(request).await {
+                return Ok(refused_report(plan, applied, grants.len() + index, &error));
+            }
+            applied.push(plan.revoke[index].clone());
         }
-        Ok(())
+        Ok((applied, None, Vec::new()))
+    }
+
+    /// One paced role write; a request that failed to build is the failure.
+    async fn reward_role_write(
+        &self,
+        request: Result<Request, DiscordError>,
+    ) -> Result<(), DiscordError> {
+        self.call_once_raw_paced(request?, &[200, 204])
+            .await
+            .map(|_| ())
     }
 
     async fn preflight_reward_revokes(
@@ -1888,7 +2017,23 @@ impl ActionExecutor {
         Ok(self
             .get_json_observed_inner(path, false)
             .await?
-            .map(|(data, _)| data))
+            .map(|(data, _, _)| data))
+    }
+
+    /// Same paced read as [`Self::get_json`], plus the raw wire-body length in
+    /// bytes. The length is measured over the collected response bytes before
+    /// parsing, so JSON-insignificant bytes (whitespace, duplicate keys,
+    /// `\uXXXX` escapes) count exactly as Discord sent them — unlike a
+    /// re-serialized `Value`, which compacts them away. Callers enforcing a
+    /// wire-body cap use this instead of measuring the parsed value.
+    pub async fn get_json_with_body_len(
+        &self,
+        path: &str,
+    ) -> Result<Option<(serde_json::Value, usize)>, String> {
+        Ok(self
+            .get_json_observed_inner(path, false)
+            .await?
+            .map(|(data, _, body_len)| (data, body_len)))
     }
 
     /// Permission evidence must distinguish denied/absent (403/404) from an
@@ -1910,16 +2055,20 @@ impl ActionExecutor {
         &self,
         path: &str,
     ) -> Result<Option<(serde_json::Value, String)>, String> {
-        self.get_json_observed_inner(path, true).await
+        Ok(self
+            .get_json_observed_inner(path, true)
+            .await?
+            .map(|(data, observed_at, _)| (data, observed_at)))
     }
 
     /// Shared observed-read loop: `backfill_wait` selects the unclamped
-    /// backfill 429 wait; the general read keeps the 60 s clamp.
+    /// backfill 429 wait; the general read keeps the 60 s clamp. Returns the
+    /// parsed value, the request-start stamp, and the raw wire-body length.
     async fn get_json_observed_inner(
         &self,
         path: &str,
         backfill_wait: bool,
-    ) -> Result<Option<(serde_json::Value, String)>, String> {
+    ) -> Result<Option<(serde_json::Value, String, usize)>, String> {
         let route = raw_get_route(path)?;
         let mut attempt: u32 = 0;
         // A 429 proves the attempt reached Discord, so its sleep-then-retry
@@ -1965,7 +2114,7 @@ impl ActionExecutor {
                 200..=299 => {
                     return Ok(serde_json::from_slice(&res.body)
                         .ok()
-                        .map(|data| (data, observed_at)));
+                        .map(|data| (data, observed_at, res.body.len())));
                 }
                 429 => {
                     // Every 429 spends one read attempt, like 5xx/transport:
@@ -2518,6 +2667,16 @@ impl ActionExecutor {
         channel_id: &str,
         count: u64,
     ) -> Result<Vec<Id<MessageMarker>>, DiscordError> {
+        Ok(self.sample_purge_messages(channel_id, count).await?.ids)
+    }
+
+    /// The same newest-page sample as execution, retaining only bounded counts
+    /// and validated IDs for a private preview. Never carries message content.
+    pub(crate) async fn sample_purge_messages(
+        &self,
+        channel_id: &str,
+        count: u64,
+    ) -> Result<PurgeSample, DiscordError> {
         if !(1..=100).contains(&count) {
             return Err(DiscordError::Rejected(format!(
                 "purge out of range: {count}"
@@ -2549,11 +2708,33 @@ impl ActionExecutor {
         } else {
             None
         };
-        Ok(rows
-            .into_iter()
-            .filter(|(_, row)| !purge_protected(row, own_id.as_deref()))
-            .map(|(id, _)| id)
-            .collect())
+        Ok(PurgeSample {
+            listed: rows.len(),
+            pinned: rows
+                .iter()
+                .filter(|(_, row)| row["pinned"].as_bool() == Some(true))
+                .count(),
+            own_bot: rows
+                .iter()
+                .filter(|(_, row)| {
+                    own_id
+                        .as_deref()
+                        .is_some_and(|own| row["author"]["id"].as_str() == Some(own))
+                })
+                .count(),
+            system: rows
+                .iter()
+                .filter(|(_, row)| {
+                    row.get("type")
+                        .is_some_and(|kind| !matches!(kind.as_u64(), Some(0 | 19)))
+                })
+                .count(),
+            ids: rows
+                .into_iter()
+                .filter(|(_, row)| !purge_protected(row, own_id.as_deref()))
+                .map(|(id, _)| id)
+                .collect(),
+        })
     }
 
     /// Deletion phase. Messages Discord still bulk-deletes go in one bulk call;
@@ -2644,6 +2825,33 @@ impl ActionExecutor {
         message_id: &str,
         reason: &str,
     ) -> Result<(), DiscordError> {
+        let mut response = self
+            .delete_message_raw(channel_id, message_id, reason)
+            .await?;
+        response.complete().await;
+        Ok(())
+    }
+
+    /// Cleanup may authorize another delivery only when both the DELETE and
+    /// its admission completion are confirmed. Missing ids/refusals are errors.
+    pub async fn delete_message_confirmed(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reason: &str,
+    ) -> Result<(), DiscordError> {
+        let mut response = self
+            .delete_message_raw(channel_id, message_id, reason)
+            .await?;
+        response.complete_confirmed().await
+    }
+
+    async fn delete_message_raw(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reason: &str,
+    ) -> Result<RawResponse, DiscordError> {
         let channel: Id<ChannelMarker> = snowflake(channel_id)?;
         let message: Id<MessageMarker> = snowflake(message_id)?;
         let reason = audit_reason(reason)?;
@@ -2654,8 +2862,36 @@ impl ActionExecutor {
                 .reason(&reason),
         )?;
         // request_of maps pre-send build failures to Rejected (finding 7).
-        self.call_once(req, &[200, 204]).await?;
-        Ok(())
+        self.call_once_raw(req, &[200, 204]).await
+    }
+
+    /// Delete one message with a proven-absence receipt, for orphan rollback
+    /// that must distinguish "gone" from "unknown" (sticky re-post): `Ok(true)`
+    /// deleted, `Ok(false)` the message was already absent (Discord's 404
+    /// proves absence, so a retry is safe), `Err` the outcome is uncertain —
+    /// including rejections, which prove only that this delete did not land,
+    /// not that the orphan is gone. Retirement keeps best-effort
+    /// [`Self::delete_message`].
+    pub async fn delete_message_with_absence_receipt(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reason: &str,
+    ) -> Result<bool, DiscordError> {
+        let channel: Id<ChannelMarker> = snowflake(channel_id)?;
+        let message: Id<MessageMarker> = snowflake(message_id)?;
+        let reason = audit_reason(reason)?;
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .delete_message(channel, message)
+                .reason(&reason),
+        )?;
+        // request_of maps pre-send build failures to Rejected (finding 7).
+        let mut res = self.call_once_raw(req, &[200, 204, 404]).await?;
+        let deleted = res.status != 404;
+        res.complete().await;
+        Ok(deleted)
     }
 
     /// Post a message with mention suppression (legacy
@@ -2713,6 +2949,19 @@ impl ActionExecutor {
         .await
     }
 
+    /// Single-attempt durable delivery: a validated message id AND confirmed
+    /// admission completion are required. Any lost completion is uncertain.
+    /// Keep the occurrence nonce a string, including all-decimal/leading zeros.
+    pub async fn post_message_confirmed(
+        &self,
+        channel_id: &str,
+        content: &str,
+        nonce: &str,
+    ) -> Result<String, DiscordError> {
+        self.send_message_components(channel_id, content, Some(nonce.into()), None, false, true)
+            .await
+    }
+
     /// Post a rendered feature message through the shared request factory.
     pub async fn post_message_with_components(
         &self,
@@ -2727,6 +2976,7 @@ impl ActionExecutor {
             Some(nonce.into()),
             Some(components),
             false,
+            false,
         )
         .await
     }
@@ -2739,6 +2989,19 @@ impl ActionExecutor {
         content: &str,
         components: &[serde_json::Value],
     ) -> Result<(), DiscordError> {
+        let req = Self::update_message_request(channel_id, message_id, content, components)?;
+        self.call_once_raw_paced(req, &[200]).await?;
+        Ok(())
+    }
+
+    /// Shared PATCH builder for message edits: the same ceiling, snowflake,
+    /// body and route validation for refreshes and close-repair retries.
+    fn update_message_request(
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+        components: &[serde_json::Value],
+    ) -> Result<Request, DiscordError> {
         if utf16_len(content) > MAX_MESSAGE_CHARS {
             return Err(DiscordError::Rejected(
                 "message exceeds Discord's ceiling".into(),
@@ -2750,15 +3013,51 @@ impl ActionExecutor {
             "content": content, "components": components, "allowed_mentions": {"parse": []}
         }))
         .map_err(|e| DiscordError::Rejected(format!("build message body: {e}")))?;
-        let req = Request::builder(&Route::UpdateMessage {
+        Request::builder(&Route::UpdateMessage {
             channel_id: channel.get(),
             message_id: message.get(),
         })
         .body(body)
         .build()
-        .map_err(|e| DiscordError::Rejected(format!("build: {e}")))?;
-        self.call_once_raw_paced(req, &[200]).await?;
-        Ok(())
+        .map_err(|e| DiscordError::Rejected(format!("build: {e}")))
+    }
+
+    /// Retry one already-authorized close edit, distinguishing a definitively
+    /// deleted message from a retryable refusal. Unlike
+    /// [`Self::edit_message_with_components`], a 404 is accepted so its body
+    /// can prove (Discord code 10008) or refuse to prove that the message is
+    /// gone; the remote body never surfaces in the outcome.
+    pub async fn edit_message_for_close_refresh(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+        components: &[serde_json::Value],
+    ) -> CloseRefreshEdit {
+        let req = match Self::update_message_request(channel_id, message_id, content, components) {
+            Ok(req) => req,
+            Err(error) => return CloseRefreshEdit::Retryable(error),
+        };
+        match self.call_once_raw_paced(req, &[200, 404]).await {
+            Ok(mut res) if res.status == 200 => {
+                // Definite effect on an idempotent edit: the 200 is the full
+                // receipt, so release the lane for the next repair row.
+                res.complete().await;
+                CloseRefreshEdit::Edited
+            }
+            Ok(mut res) => {
+                let unknown = is_unknown_message_response(&res);
+                // A 404 already released on receipt; explicit for symmetry
+                // with reads that validate the body before completing.
+                res.complete().await;
+                if unknown {
+                    CloseRefreshEdit::UnknownMessage
+                } else {
+                    CloseRefreshEdit::Retryable(throw_for_status(&res))
+                }
+            }
+            Err(error) => CloseRefreshEdit::Retryable(error),
+        }
     }
 
     /// Bounded nonce reconciliation. An unreadable/denied history is NOT an empty history.
@@ -2880,7 +3179,7 @@ impl ActionExecutor {
         nonce: Option<serde_json::Value>,
         after_authorization: bool,
     ) -> Result<String, DiscordError> {
-        self.send_message_components(channel_id, content, nonce, None, after_authorization)
+        self.send_message_components(channel_id, content, nonce, None, after_authorization, false)
             .await
     }
 
@@ -2891,6 +3190,7 @@ impl ActionExecutor {
         nonce: Option<serde_json::Value>,
         components: Option<&[serde_json::Value]>,
         after_authorization: bool,
+        confirm_completion: bool,
     ) -> Result<String, DiscordError> {
         // Legacy ceiling is UTF-16 units (two-bot counts JS string length),
         // not scalar values: 1001 astral chars are 2002 units and must be
@@ -2945,7 +3245,11 @@ impl ActionExecutor {
             // before the durable lane reopens; an unreadable receipt is
             // uncertain, never an empty successful id.
             let id = mutation_receipt_id(&res.body)?;
-            res.complete().await;
+            if confirm_completion {
+                res.complete_confirmed().await?;
+            } else {
+                res.complete().await;
+            }
             id
         } else {
             // Feature posts with selects take the paced lane; the plain
@@ -2956,7 +3260,11 @@ impl ActionExecutor {
                 self.call_once_raw(req, &[200, 201]).await?
             };
             let id = mutation_receipt_id(&res.body)?;
-            res.complete().await;
+            if confirm_completion {
+                res.complete_confirmed().await?;
+            } else {
+                res.complete().await;
+            }
             id
         };
         Ok(message_id)
@@ -3126,14 +3434,14 @@ impl ActionExecutor {
                 content,
                 nonce,
             } => {
-                // `audit::delivery_nonce` mints `oa_...` strings that can never
-                // parse as u64 — carry them as string nonces with enforcement
-                // instead of rejecting them (finding 5). Numeric strings keep
-                // the numeric wire shape.
-                let value = nonce.as_deref().map(|s| match s.parse::<u64>() {
-                    Ok(n) => serde_json::Value::from(n),
-                    Err(_) => serde_json::Value::from(s),
-                });
+                // A string nonce keeps the string wire shape, including
+                // all-decimal values and leading zeroes: the nonce must
+                // round-trip through history verbatim so
+                // `recover_message_by_nonce` can match it (finding 5; cf.
+                // `post_message_with_nonce`, `post_message_confirmed`).
+                // Numeric wire shape stays available through the typed
+                // `post_message(Option<u64>)` path.
+                let value = nonce.as_deref().map(serde_json::Value::from);
                 Ok(ChannelCallOutcome::Posted {
                     message_id: self.send_message(channel_id, content, value, false).await?,
                 })
@@ -3209,9 +3517,28 @@ impl ActionExecutor {
         commands: &[twilight_model::application::command::Command],
         apply: bool,
     ) -> Result<(crate::command_registry::RegistryDiff, bool), DiscordError> {
+        self.sync_guild_commands_checked(application_id, guild_id, commands, apply, |_, _| Ok(()))
+            .await
+    }
+
+    /// Inspect the exact read snapshot and its diff before any PUT. A rejected
+    /// check leaves both Discord and the cached identity snapshot untouched.
+    /// This is not CAS: another writer can change Discord after this read.
+    pub async fn sync_guild_commands_checked(
+        &self,
+        application_id: u64,
+        guild_id: u64,
+        commands: &[twilight_model::application::command::Command],
+        apply: bool,
+        check: impl FnOnce(
+            &[twilight_model::application::command::Command],
+            &crate::command_registry::RegistryDiff,
+        ) -> Result<(), DiscordError>,
+    ) -> Result<(crate::command_registry::RegistryDiff, bool), DiscordError> {
         let current = self.guild_commands(application_id, guild_id).await?;
         let diff = crate::command_registry::diff_commands(&current, commands)
             .map_err(|_| DiscordError::Rejected("cannot canonicalize command registry".into()))?;
+        check(&current, &diff)?;
         let publish = apply && diff.current_hash != diff.compiled_hash;
         if publish {
             self.publish_guild_commands(application_id, guild_id, commands)
@@ -3660,9 +3987,39 @@ impl ActionExecutor {
         interaction_token: &str,
         content: &str,
     ) -> Result<(), DiscordError> {
+        self.edit_response_inner(application_id, interaction_token, content, true)
+            .await
+    }
+
+    /// Complete an acknowledged interaction without mention neutralization.
+    /// Only for ephemeral management views (saved responses or lockdown reasons) whose
+    /// mention safety comes from this edit's explicit empty `allowed_mentions`
+    /// — the admin must see the saved text exactly as stored. Every other
+    /// completion must keep using [`Self::edit_interaction_response`].
+    pub async fn edit_interaction_response_without_mention_neutralization(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), DiscordError> {
+        self.edit_response_inner(application_id, interaction_token, content, false)
+            .await
+    }
+
+    async fn edit_response_inner(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        neutralize_mentions: bool,
+    ) -> Result<(), DiscordError> {
         let application = Id::<ApplicationMarker>::new_checked(application_id)
             .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
-        let content = two_bot_core::message_safety::content(content);
+        let content = if neutralize_mentions {
+            two_bot_core::message_safety::content(content)
+        } else {
+            two_bot_core::message_safety::content_without_mention_neutralization(content)
+        };
         let mentions = AllowedMentions::default();
         let req = Self::request_of(
             self.inner
@@ -3674,6 +4031,60 @@ impl ActionExecutor {
         )?;
         let req = Self::explicit_mentions(req, &mentions)?;
         let mut res = self.call_once_raw(req, &[200]).await?;
+        mutation_receipt_id(&res.body)?;
+        res.complete().await;
+        Ok(())
+    }
+
+    /// Complete an acknowledged interaction by editing its original response,
+    /// replacing the message content and its components (a reopened picker
+    /// menu). Same single-attempt, unpaced, receipt-checked contract as
+    /// [`ActionExecutor::edit_interaction_response`]: a lost menu edit must
+    /// not repeat already-committed store effects, and the interaction token
+    /// never appears in a returned error. The original callback decides
+    /// ephemerality; edits retain it.
+    pub async fn edit_interaction_response_with_components(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+    ) -> Result<(), DiscordError> {
+        self.edit_interaction_response_with_components_with_timeout(
+            application_id,
+            interaction_token,
+            content,
+            components,
+            self.inner.moderation_timeout,
+        )
+        .await
+    }
+
+    async fn edit_interaction_response_with_components_with_timeout(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+        timeout: Duration,
+    ) -> Result<(), DiscordError> {
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
+        let content = two_bot_core::message_safety::content(content);
+        let mentions = AllowedMentions::default();
+        let req = Self::request_of(
+            self.inner
+                .factory
+                .interaction(application)
+                .update_response(interaction_token)
+                .content(Some(&content))
+                .components(Some(components))
+                .allowed_mentions(Some(&mentions)),
+        )?;
+        let req = Self::explicit_mentions(req, &mentions)?;
+        let mut res = self
+            .call_once_raw_lane_for(&req, &[200], None, timeout)
+            .await?;
         mutation_receipt_id(&res.body)?;
         res.complete().await;
         Ok(())
@@ -3693,6 +4104,50 @@ impl ActionExecutor {
         self.retry_admission_blocked(|_| async {
             self.edit_interaction_response(application_id, interaction_token, content)
                 .await
+        })
+        .await
+    }
+
+    /// [`ActionExecutor::edit_interaction_response_with_components`] with the
+    /// same bounded contention tolerance as
+    /// [`ActionExecutor::edit_interaction_response_with_blocked_retry`]:
+    /// re-attempts ONLY admission-Blocked failures that never reached the
+    /// wire, so retrying cannot repeat an accepted menu edit.
+    pub async fn edit_interaction_response_with_components_and_blocked_retry(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+        components: &[twilight_model::channel::message::Component],
+    ) -> Result<(), DiscordError> {
+        self.retry_admission_blocked(|timeout| {
+            self.edit_interaction_response_with_components_with_timeout(
+                application_id,
+                interaction_token,
+                content,
+                components,
+                timeout,
+            )
+        })
+        .await
+    }
+
+    /// [`Self::edit_interaction_response_without_mention_neutralization`] with
+    /// the same bounded contention tolerance as
+    /// [`Self::edit_interaction_response_with_blocked_retry`].
+    pub async fn edit_interaction_response_without_mention_neutralization_with_blocked_retry(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        content: &str,
+    ) -> Result<(), DiscordError> {
+        self.retry_admission_blocked(|_| async {
+            self.edit_interaction_response_without_mention_neutralization(
+                application_id,
+                interaction_token,
+                content,
+            )
+            .await
         })
         .await
     }
@@ -3871,6 +4326,21 @@ pub fn is_definitive_rejection(status: u16) -> bool {
     matches!(status, 400 | 401 | 403 | 404 | 405 | 413 | 415 | 422)
 }
 
+/// Discord JSON error code for a deleted message. Only this code — never a
+/// bare 404 — proves the message is gone and settles a close-repair retry.
+const DISCORD_CODE_UNKNOWN_MESSAGE: i64 = 10008;
+
+/// True only for a 404 whose JSON body carries [`DISCORD_CODE_UNKNOWN_MESSAGE`].
+/// Any other code, a non-numeric code or an unreadable body is not proof of
+/// absence, so the repair stays retryable. Never copies the remote body.
+fn is_unknown_message_response(res: &RawResponse) -> bool {
+    res.status == 404
+        && serde_json::from_slice::<serde_json::Value>(&res.body)
+            .ok()
+            .and_then(|body| body.get("code").and_then(serde_json::Value::as_i64))
+            == Some(DISCORD_CODE_UNKNOWN_MESSAGE)
+}
+
 /// Only documented no-effect rejections are retry-safe. An unexpected success,
 /// redirect, timeout status or other ambiguous response may follow a mutation.
 #[must_use]
@@ -3897,6 +4367,14 @@ impl IntoOther for DiscordError {
             other => other,
         }
     }
+}
+
+pub(crate) struct PurgeSample {
+    pub ids: Vec<Id<MessageMarker>>,
+    pub listed: usize,
+    pub pinned: usize,
+    pub own_bot: usize,
+    pub system: usize,
 }
 
 /// Messages `/purge` leaves alone: pinned ones, and this bot's own posts.
@@ -4220,6 +4698,104 @@ mod tests {
         ] {
             assert!(!error.is_admission_blocked(), "{error:?}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admitted_send_stays_lazy_and_cancellation_drops_its_admission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+
+        struct AdmissionDrop(Arc<AtomicUsize>);
+        impl Drop for AdmissionDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[derive(Debug)]
+        struct PendingAdmission {
+            key: TokenKey,
+            entered: Arc<AtomicUsize>,
+            dropped: Arc<AtomicUsize>,
+            started: Arc<tokio::sync::Notify>,
+        }
+        impl SendAdmission for PendingAdmission {
+            fn token_key(&self) -> &TokenKey {
+                &self.key
+            }
+
+            fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+                Box::pin(async move {
+                    let _drop = AdmissionDrop(self.dropped.clone());
+                    self.entered.fetch_add(1, Ordering::SeqCst);
+                    self.started.notify_one();
+                    std::future::pending().await
+                })
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let token = "fixture-lazy-send-token";
+        let executor = ActionExecutor::with_admission(
+            token.to_owned(),
+            Some("http://127.0.0.1:1".to_owned()),
+            Arc::new(PendingAdmission {
+                key: TokenKey::for_bot_token(token).expect("fixture token key"),
+                entered: entered.clone(),
+                dropped: dropped.clone(),
+                started: started.clone(),
+            }),
+        )
+        .expect("fixture executor");
+        let request = Request::from_route(&Route::GetCurrentUser);
+        let budget = Duration::from_millis(50);
+        let unpolled = executor.send_admitted_for(&request, budget);
+        drop(unpolled);
+        assert_eq!(executor.requests(), 0);
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+
+        let mut pending = Box::pin(executor.send_admitted_for(&request, budget));
+        // Construction must not start the deadline or durable admission.
+        tokio::time::advance(budget * 2).await;
+        assert_eq!(executor.requests(), 0);
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(executor.requests(), 1);
+        // A governed GET owns admission independently of its awaiting caller.
+        // Wait for the owner rather than requiring admission in the first poll.
+        tokio::time::timeout(budget, started.notified())
+            .await
+            .expect("governed read owner entered admission");
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(pending);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        tokio::time::advance(budget - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "caller cancellation must not abandon the admission before its deadline"
+        );
+        // The original attempt gets at most one extra second for settlement.
+        tokio::time::advance(Duration::from_millis(1) + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "pending admission must be dropped by the read settlement bound"
+        );
+        assert_eq!(entered.load(Ordering::SeqCst), 1, "no detached retry");
+        assert_eq!(executor.requests(), 1);
     }
 
     fn boot_executor() -> ActionExecutor {
@@ -4657,5 +5233,43 @@ mod tests {
         // Reason validation happens before any I/O: an empty reason is a
         // terminal Failed value with zero attempts, not a panic.
         assert!(audit_reason("").is_err());
+    }
+
+    #[test]
+    fn unknown_message_needs_404_with_code_10008() {
+        let coded = RawResponse {
+            status: 404,
+            retry_after_header: None,
+            body: br#"{"code": 10008, "message": "Unknown Message"}"#.to_vec(),
+            completion: None,
+        };
+        assert!(is_unknown_message_response(&coded));
+        let bodies: [&[u8]; 5] = [
+            br#"{"message": "REMOTE_BODY_SENTINEL"}"#,
+            br#"{"code": 50001, "message": "Missing Access"}"#,
+            br#"{"code": "10008"}"#,
+            b"not json",
+            b"",
+        ];
+        for body in bodies {
+            let unclassified = RawResponse {
+                status: 404,
+                retry_after_header: None,
+                body: body.to_vec(),
+                completion: None,
+            };
+            assert!(
+                !is_unknown_message_response(&unclassified),
+                "unclassified 404 stays retryable: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        let wrong_status = RawResponse {
+            status: 403,
+            retry_after_header: None,
+            body: br#"{"code": 10008}"#.to_vec(),
+            completion: None,
+        };
+        assert!(!is_unknown_message_response(&wrong_status));
     }
 }

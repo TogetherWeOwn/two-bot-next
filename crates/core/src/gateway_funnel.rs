@@ -82,7 +82,14 @@ impl GatewayFunnelBuffer {
 }
 
 impl FunnelStore for GatewayFunnelBuffer {
-    fn stage_invite_snapshot(&self, snapshot: InviteSnapshotWrite) {
+    fn stage_invite_snapshot(&self, mut snapshot: InviteSnapshotWrite) {
+        // Clamp before the counterpart match: the queued `StoreAll` tail this
+        // replaces was already clamped at ingest, so an unclamped staged copy
+        // would miss the match and write twice. Silent: the ingest warn above
+        // already named this code.
+        for state in &mut snapshot.states {
+            state.uses = crate::invites::saturate_invite_uses(state.uses);
+        }
         let mut pending = self.pending.lock().expect("funnel buffer");
         // The persistent tracker has just staged this same mutation through
         // InviteSnapshotStore. Replace only that matching tail with the receipt-
@@ -179,16 +186,31 @@ impl InviteSnapshotStore for GatewayFunnelBuffer {
     }
 
     fn store_all(&self, guild_id: Snowflake, states: &[InviteState]) {
+        // Discord counters are `u64`; the column is INTEGER. Clamp at ingest
+        // so the queued flush can never poison the dispatch transaction, and
+        // warn once per saturated code (identifiers only, never the counter).
+        let mut states = states.to_vec();
+        for state in &mut states {
+            let uses = crate::invites::saturate_invite_uses(state.uses);
+            if uses != state.uses {
+                tracing::warn!(
+                    guild_id = %guild_id,
+                    code = %state.code,
+                    "invite uses saturated at i32::MAX",
+                );
+                state.uses = uses;
+            }
+        }
         let mut snapshots = self.snapshots.lock().expect("snapshot buffer");
         let table = snapshots.entry(guild_id).or_default();
-        for state in states {
+        for state in &states {
             table.insert(state.code.clone(), state.clone());
         }
         self.pending
             .lock()
             .expect("funnel buffer")
             .snapshots
-            .push(SnapshotWrite::StoreAll(guild_id, states.to_vec()));
+            .push(SnapshotWrite::StoreAll(guild_id, states));
     }
 
     fn delete_missing(&self, guild_id: Snowflake, live_codes: &HashSet<String>) {
@@ -299,5 +321,46 @@ mod tests {
         assert_eq!(buffer.load(1)[0].code, "new");
         assert_eq!(buffer.take_batch().snapshots.len(), 1);
         assert!(buffer.take_batch().snapshots.is_empty());
+    }
+
+    #[test]
+    fn store_all_saturates_out_of_range_uses_and_staging_still_coalesces() {
+        let buffer = GatewayFunnelBuffer::default();
+        let invite = |code: &str, uses: u64| InviteState {
+            code: code.into(),
+            uses,
+            inviter_id: Some(9),
+            channel_id: Some(8),
+            max_uses: 0,
+            temporary: false,
+        };
+        buffer.store_all(1, &[invite("hot", u64::MAX)]);
+        assert_eq!(buffer.load(1)[0].uses, crate::invites::MAX_INVITE_USES);
+        // The staged full read carries the raw Discord counter; the buffer
+        // clamps it before the counterpart match so it still replaces the
+        // tracker tail instead of writing twice.
+        buffer.delete_missing(1, &HashSet::from(["hot".into()]));
+        buffer.stage_invite_snapshot(InviteSnapshotWrite {
+            guild_id: 1,
+            states: vec![invite("hot", u64::MAX)],
+            observed_at: "2026-10-21T00:00:00.000Z".into(),
+            replace_all: true,
+        });
+        let batch = buffer.take_batch();
+        assert!(
+            batch.snapshots.is_empty(),
+            "saturated full reads must not write twice"
+        );
+        assert_eq!(batch.invite_snapshots.len(), 1);
+        assert_eq!(
+            batch.invite_snapshots[0].states[0].uses,
+            crate::invites::MAX_INVITE_USES
+        );
+        // A lone seed queues the clamped counter for the flush.
+        buffer.store_all(2, &[invite("seed", u64::MAX)]);
+        let batch = buffer.take_batch();
+        assert!(matches!(batch.snapshots.as_slice(),
+            [SnapshotWrite::StoreAll(2, states)]
+            if states[0].uses == crate::invites::MAX_INVITE_USES));
     }
 }

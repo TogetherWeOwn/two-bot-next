@@ -9,8 +9,8 @@
 //! - policy/executor (`MemberModerationService::execute`): the verb-agnostic
 //!   member policy order (permission, target present, self-target, protection,
 //!   bot hierarchy, actor hierarchy), then the audit reason, each refusal
-//!   carrying its exact user-facing copy. A policy refusal records a denial
-//!   audit, never a warning or an idempotency claim.
+//!   carrying its exact user-facing copy. Policy and validation refusals
+//!   record denial audits, never a warning or an idempotency claim.
 //! - recording: a successful warn writes exactly one warning row and one
 //!   `moderation_audit` row shaped like the kick one (`moderation.warn` /
 //!   `warned`), and makes zero Discord calls. Warn is the one member verb
@@ -129,11 +129,25 @@ fn service_with(
     MemberModerationService::new(discord, store, policy(), || 1_700_000_000_000)
 }
 
-/// Nothing was recorded and Discord was never called.
-fn assert_untouched(discord: &MockMemberDiscord, store: &MemMemberStore) {
-    assert!(discord.calls().is_empty(), "warn never calls Discord");
-    assert!(store.warnings().is_empty(), "no warning row recorded");
-    assert!(store.audits().is_empty(), "no audit row recorded");
+/// Pin a bound `denied` audit row: the actor, guild, target, action and
+/// idempotency key of the refused request, under the `:denied` suffixed
+/// request id that keeps it from masking a later accepted row.
+fn assert_bound_denial_audit(
+    row: &two_bot_core::member_moderation::AuditRow,
+    exec: &MemberExecution,
+    stage: &str,
+) {
+    assert_eq!(row.request_id, format!("{}:denied", exec.request_id));
+    assert_eq!(row.outcome, "denied");
+    assert_eq!(row.action, exec.action.action_name());
+    assert_eq!(row.guild_id, GUILD_ID);
+    assert_eq!(row.actor_id, ACTOR_ID);
+    assert_eq!(row.target_id.as_deref(), Some(TARGET_ID));
+    assert_eq!(row.idempotency_key, exec.idempotency_key);
+    let metadata: serde_json::Value =
+        serde_json::from_str(&row.metadata_json).expect("metadata is JSON");
+    assert_eq!(metadata["stage"], stage);
+    assert_eq!(metadata["request_id"], exec.request_id);
 }
 
 #[test]
@@ -533,7 +547,7 @@ async fn warn_success_records_one_warning_and_one_audit_with_no_discord_call() {
 }
 
 #[tokio::test]
-async fn warn_blank_reason_is_refused_and_records_nothing() {
+async fn warn_blank_reason_is_refused_and_audits_denial_only() {
     let discord = MockMemberDiscord::new();
     let store = MemMemberStore::new();
     let svc = service_with(discord.clone(), store.clone());
@@ -551,7 +565,16 @@ async fn warn_blank_reason_is_refused_and_records_nothing() {
         );
         assert_eq!(err.to_string(), EMPTY_REASON_COPY);
     }
-    assert_untouched(&discord, &store);
+    // Each refusal is audited as its own bound `denied` row; nothing else
+    // is recorded and Discord is never called.
+    assert!(discord.calls().is_empty(), "warn never calls Discord");
+    assert!(store.warnings().is_empty(), "no warning row recorded");
+    let audits = store.audits();
+    assert_eq!(audits.len(), 4);
+    for (i, row) in audits.iter().enumerate() {
+        let exec = warn_execution_keyed(&format!("req-warn-blank-{i}"));
+        assert_bound_denial_audit(row, &exec, "validation");
+    }
 }
 
 #[tokio::test]
@@ -604,7 +627,11 @@ async fn warn_reason_is_trimmed_and_capped_at_512_utf16_units() {
             .expect_err("over-long reason must refuse");
         assert_eq!(err, MemberError::Reason(ReasonError::TooLong), "{label}");
         assert_eq!(err.to_string(), LONG_REASON_COPY, "{label}");
-        assert_untouched(&discord, &store);
+        assert!(discord.calls().is_empty(), "{label}");
+        assert!(store.warnings().is_empty(), "{label}");
+        let audits = store.audits();
+        assert_eq!(audits.len(), 1, "{label}");
+        assert_bound_denial_audit(&audits[0], &exec, "validation");
     }
 }
 
@@ -632,7 +659,8 @@ async fn warn_same_key_retry_replays_without_second_warning_or_audit() {
 #[tokio::test]
 async fn warn_same_key_with_different_reason_is_a_key_mismatch_not_a_second_warning() {
     // The request hash binds the (trimmed) reason: reusing a key for a
-    // different reason is a caller bug, named as such, and records nothing.
+    // different reason is a caller bug, named as such, and records only
+    // the denial.
     let discord = MockMemberDiscord::new();
     let store = MemMemberStore::new();
     let svc = service_with(discord.clone(), store.clone());
@@ -653,7 +681,13 @@ async fn warn_same_key_with_different_reason_is_a_key_mismatch_not_a_second_warn
     );
 
     assert_eq!(store.warnings().len(), 1);
-    assert_eq!(store.audits().len(), 1);
+    // The accepted warn keeps its plain row; the mismatch adds a bound
+    // `denied` row instead of a second warning.
+    let audits = store.audits();
+    assert_eq!(audits.len(), 2);
+    assert_eq!(audits[0].request_id, "req-warn");
+    assert_eq!(audits[0].outcome, "warned");
+    assert_bound_denial_audit(&audits[1], &other, "claim");
     assert!(discord.calls().is_empty());
 }
 

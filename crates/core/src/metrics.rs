@@ -5,7 +5,10 @@ use serde::Serialize;
 use std::{
     collections::HashMap,
     fmt::Write,
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        LockResult, Mutex, MutexGuard, OnceLock,
+    },
     time::Duration,
 };
 
@@ -125,6 +128,7 @@ pub const JOBS: &[&str] = &[
     "self_role_recovery",
     "member_unban_sweep",
     "automod_expiry",
+    "lfg_sweep",
     "other",
 ];
 pub const JOB_OUTCOMES: &[&str] = &["success", "failure"];
@@ -156,7 +160,7 @@ impl JobErrorClass {
     }
 }
 
-/// Complete error-class allowlist. With `JOBS`, this yields 112 fixed series.
+/// Complete error-class allowlist. With `JOBS`, this yields 119 fixed series.
 pub const JOB_ERROR_CLASSES: &[JobErrorClass] = &[
     JobErrorClass::Database,
     JobErrorClass::Rest,
@@ -208,6 +212,11 @@ pub const VOICE_DEAD_ACTIONS: &[&str] = &[
 /// (admit/extend/complete). Every other store reports `other` until its op
 /// joins this allowlist.
 pub const DB_ERROR_OPS: &[&str] = &["admission", "other"];
+/// Containment-store operations for
+/// `two_bot_containment_store_errors_total{op}`: a failed completion also
+/// surfaces as outcome-unknown in the staff alert, so the alert and the
+/// durable record never silently disagree. Unknown ops collapse to `other`.
+pub const CONTAINMENT_STORE_OPS: &[&str] = &["complete_incident", "other"];
 /// Terminal outcomes of one send-admission `admit()` decision:
 /// `admitted` on Ok, `blocked` on lane/cooldown refusal, `storage_error`
 /// when the admission SQL itself failed (also counted in
@@ -302,6 +311,20 @@ pub const VOICE_VOTE_KICK_OUTCOMES: &[&str] = &[
     "gave_up",
     "other",
 ];
+/// Event-voice tick outcomes for `two_bot_event_voice_tick_total{outcome}`:
+/// one observation per T-15 ticker tick that stays TBD, with the website
+/// reason (`EventVoiceTbdReason::as_str`), including backoff-skipped ticks.
+/// The ticker card extends this same series with its ready/create family.
+/// Unknown outcomes collapse to the trailing `other`, never to a dynamic
+/// label. No IDs, tokens or bodies are retained.
+pub const EVENT_VOICE_TICK_OUTCOMES: &[&str] = &[
+    "opens_soon",
+    "rate_limited",
+    "perm_denied",
+    "no_category",
+    "unavailable",
+    "other",
+];
 /// Moderation enforcement verbs for `two_bot_moderation_enforcements_total{verb,outcome}`
 /// (TOG-28482): exactly the nine `ModerationAction::command_name` verbs in
 /// legacy publish order. A test pins this list to
@@ -361,6 +384,39 @@ pub const DISPATCH_LANES: &[&str] = &[
 /// single checkpoint failure stops the worker, so there is no
 /// benign-singleton case.
 pub const CHECKPOINT_FAILURE_STAGES: &[&str] = &["pre_commit", "commit"];
+
+/// Fixed reasons a raid/join-risk observer could not enqueue a join.
+#[derive(Clone, Copy)]
+pub enum JoinQueueDropReason {
+    QueueFull,
+    QueueClosed,
+}
+
+const JOIN_QUEUE_DROP_REASONS: [(&str, JoinQueueDropReason); 2] = [
+    ("queue_full", JoinQueueDropReason::QueueFull),
+    ("queue_closed", JoinQueueDropReason::QueueClosed),
+];
+/// Drop-guard names for `two_bot_drop_poison_total{guard}`: the seven guards
+/// whose `Drop` bodies recover a poisoned lock instead of panicking (which
+/// would abort the process when the drop runs during unwinding).
+/// `command_dispatch_guard` stops the command task scope,
+/// `schedule_run` finishes a feed poll schedule, `user_slot` releases an
+/// interaction admission count, `in_flight_guard` releases a voice REST
+/// attempt slot, `ticket_supervisor` stops the ticket task scope,
+/// `response_accounting` retires a REST response's rate-limit entries, and
+/// `voice_connection_guard` disconnects the voice sink. Exactly these seven
+/// series exist; unknown guards collapse to the trailing
+/// `voice_connection_guard` slot only when the allowlist grows.
+/// Panic payloads are never labels.
+pub const DROP_POISON_GUARDS: &[&str] = &[
+    "command_dispatch_guard",
+    "schedule_run",
+    "user_slot",
+    "in_flight_guard",
+    "ticket_supervisor",
+    "response_accounting",
+    "voice_connection_guard",
+];
 /// Presence-capture outcomes for `two_bot_presence_capture_total{outcome}`
 /// (event-store S3): `inserted` for a first delivery that stored a row,
 /// `duplicate` for a same-key retry absorbed by the shared dedup key, and
@@ -439,15 +495,30 @@ pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
 /// `error` when the facts writer failed, `timeout` when the drain missed the
 /// dispatch deadline. Both warn and continue; `other` absorbs unknown reasons.
 pub const COMMUNITY_FACTS_DRAIN_REASONS: &[&str] = &["error", "timeout", "other"];
-/// Verified EventSub deliveries by bounded receiver classification. `other`
-/// captures unknown/future classification errors; no header, body, broadcaster,
-/// subscription, or secret data reaches the label.
-pub const EVENTSUB_DELIVERY_KINDS: [&str; 6] = [
+/// Verified EventSub deliveries by bounded receiver classification. The
+/// thirteen `EventSubError` snake_case labels record classify errors by
+/// variant ([`crate::twitch_eventsub::eventsub_error_label`]); `other` stays
+/// the trailing entry absorbing unknown/future strings. No header, body,
+/// broadcaster, subscription, or secret data reaches the label.
+pub const EVENTSUB_DELIVERY_KINDS: [&str; 19] = [
     "challenge",
     "notification",
     "revocation",
     "tampered",
     "ignored",
+    "invalid_secret",
+    "invalid_header",
+    "body_too_large",
+    "bad_signature",
+    "invalid_timestamp",
+    "stale_timestamp",
+    "invalid_body",
+    "duplicate_keys",
+    "wrong_subscription",
+    "invalid_challenge",
+    "invalid_callback",
+    "invalid_broadcaster_id",
+    "too_many_broadcasters",
     "other",
 ];
 /// Go-live post attempts by bounded outcome. The outcome vocabulary is fixed;
@@ -508,6 +579,40 @@ pub const EVENTSUB_RECONCILE_ERROR_CLASSES: &[&str] = &[
     "reconcile_failed",
     "other",
 ];
+/// Ticket lifecycle events for `two_bot_ticket_lifecycle_total{event,outcome}`:
+/// every retire, abandon, purge and successful staff-button claim/close
+/// executed through the button path counts once. The vocabulary is closed by
+/// the lifecycle observability contract (see
+/// `docs/ticket-lifecycle-observability.md`): every caller passes a member,
+/// so no collapse traffic lands in the trailing `close` slot and that row
+/// counts genuine close events only.
+pub const TICKET_LIFECYCLE_EVENTS: &[&str] = &["retire", "abandon", "purge", "claim", "close"];
+/// Terminal outcomes for `two_bot_ticket_lifecycle_total{event,outcome}`:
+/// the six success outcomes plus the shared `db_cause` vocabulary for
+/// storage failures (`crate::error_chain::db_cause`). Labels never carry
+/// member text, channel names, ticket ids or error strings. The trailing
+/// `query` slot is the collapse trapdoor, matching `db_cause` itself, which
+/// maps unrecognised failures to `query`.
+pub const TICKET_LIFECYCLE_OUTCOMES: &[&str] = &[
+    "retired",
+    "abandoned",
+    "already_gone",
+    "deleted",
+    "claimed",
+    "closed",
+    "unique_violation",
+    "foreign_key_violation",
+    "not_null_violation",
+    "check_violation",
+    "exclusion_violation",
+    "database",
+    "pool_timeout",
+    "pool_closed",
+    "worker_crashed",
+    "connection",
+    "row_not_found",
+    "query",
+];
 const BUCKETS_MICROS: &[u64] = &[
     1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000,
 ];
@@ -517,6 +622,34 @@ fn bounded_index(value: &str, allowed: &[&str]) -> usize {
         .iter()
         .position(|candidate| *candidate == value)
         .unwrap_or(allowed.len() - 1)
+}
+
+/// Lifecycle exposition renders per-event outcome subsets, not the full 5 x
+/// 18 cross product: 90 zero series would not fit the Worker scrape body cap
+/// (see `rest_guard_snapshot_is_fixed_size_label_free_and_finite`). Every
+/// event renders its success outcomes plus the `query` collapse trapdoor so
+/// collapsed traffic stays observable; purge additionally renders the full
+/// `db_cause` set because it is the only storage-failure emitter. Storage
+/// keeps the flat vocabulary, so every collapse still lands in-bounds;
+/// exposition just omits the pairs no emitter can produce. Every allowlisted
+/// value still renders at least once (pinned by
+/// `crates/core/tests/metrics_docs.rs`).
+fn lifecycle_series_rendered(event: &str, outcome: &str) -> bool {
+    // The `query` slot is the collapse trapdoor for unknown outcomes in
+    // every row; render it so collapse traffic stays observable.
+    if outcome == "query" {
+        return true;
+    }
+    match event {
+        "retire" => outcome == "retired",
+        "abandon" => matches!(outcome, "abandoned" | "already_gone"),
+        // Purge is the only storage-failure emitter: `deleted` plus the
+        // trailing `db_cause` classes (`TICKET_LIFECYCLE_OUTCOMES[6..]`).
+        "purge" => outcome == "deleted" || TICKET_LIFECYCLE_OUTCOMES[6..].contains(&outcome),
+        "claim" => outcome == "claimed",
+        "close" => outcome == "closed",
+        _ => false,
+    }
 }
 
 #[derive(Default)]
@@ -585,6 +718,7 @@ struct Values {
     resumes: u64,
     disconnects: u64,
     missed_events: u64,
+    rsvp_refused: u64,
     latency_micros: Option<u64>,
     handler: Histogram,
     voice_join_to_move: Histogram,
@@ -599,6 +733,9 @@ struct Values {
     voice_joins_received: u64,
     /// Actor-received creator joins refused before queueing, by reason.
     voice_join_refused: [u64; VOICE_JOIN_REFUSAL_REASONS.len()],
+    /// Refusals counted at admission, retained across actor/queue retirement.
+    voice_inbox_overflow_dropped: u64,
+    voice_queue_overflow_dropped: u64,
     /// Per-guild-actor stall contributions, keyed by an opaque
     /// process-local actor key that is never rendered, labelled or
     /// persisted. The public halt/queue series are aggregates over this
@@ -623,16 +760,34 @@ struct Values {
     voice_watchdog_stucks: u64,
     /// Halt-latch recoveries via credential re-probe.
     voice_halt_recoveries: u64,
+    /// Fair-scheduling bound: at most this many consecutive guild-actor
+    /// inbox turns before a ready dispatch, timer or maintenance branch
+    /// runs. Published by each actor at startup from its single source of
+    /// truth; 0 until the first actor publishes. Label-free gauge.
+    voice_actor_inbox_turn_bound: u64,
+    /// Guild-actor inbox commands processed, across all guild actors.
+    /// Compare with dispatch turns: inbox turns climbing while dispatch
+    /// turns stay flat means the actor is draining churn without
+    /// dispatching. Label-free counter.
+    voice_actor_inbox_turns: u64,
+    /// Guild-actor dispatch turns that ran, across all guild actors,
+    /// whether or not the turn progressed. Label-free counter.
+    voice_actor_dispatch_turns: u64,
     /// Live views republished by the not-ready-while-connected self-heal.
     voice_live_self_heals: u64,
     voice_vote_kick: [u64; VOICE_VOTE_KICK_OUTCOMES.len()],
+    event_voice_tick: [u64; EVENT_VOICE_TICK_OUTCOMES.len()],
     moderation_enforcements: [[u64; MODERATION_ENFORCEMENT_OUTCOMES.len()]; MODERATION_VERBS.len()],
     voice_names: [u64; VOICE_NAME_OUTCOMES.len()],
     db_errors: [u64; DB_ERROR_OPS.len()],
+    containment_store_errors: [u64; CONTAINMENT_STORE_OPS.len()],
     send_admissions: [u64; SEND_ADMISSION_OUTCOMES.len()],
     prefix_trigger_refused: [u64; PREFIX_TRIGGER_REFUSED_REASONS.len()],
     dispatch_drops: [u64; DISPATCH_LANES.len()],
+    raid_dropped_joins: [u64; JOIN_QUEUE_DROP_REASONS.len()],
+    join_risk_dropped_joins: [u64; JOIN_QUEUE_DROP_REASONS.len()],
     checkpoint_failures: [u64; CHECKPOINT_FAILURE_STAGES.len()],
+    gateway_drain_skips: u64,
     presence_capture: [u64; PRESENCE_CAPTURE_OUTCOMES.len()],
     feed_fetch: [u64; FEED_FETCH_OUTCOMES.len()],
     feed_fetch_errors: [u64; FEED_FETCH_ERROR_CLASSES.len()],
@@ -654,6 +809,11 @@ struct Values {
     /// process restart, so the runbook pairs it with the error log line. No
     /// guild id, SQLSTATE or error text ever becomes a label.
     retention_replay_needed: u64,
+    /// Ticket component interactions refused before spawning because the
+    /// runtime or the member was saturated. Label-free counter; resets on
+    /// process restart, so the runbook pairs it with the sampled saturation
+    /// log line. No member id, token or interaction id ever becomes a label.
+    ticket_component_drops: u64,
     /// Event-store consumer lag (S1): `received_at - event_time` spread in
     /// seconds for the newest observed capture row. Last writer wins; 0 when
     /// no row has been observed. Single label-free series — no message,
@@ -666,17 +826,39 @@ struct Values {
     eventsub_reconcile_passes: [u64; EVENTSUB_RECONCILE_OUTCOMES.len()],
     eventsub_reconcile_actions: [u64; EVENTSUB_RECONCILE_ACTIONS.len()],
     eventsub_reconcile_errors: [u64; EVENTSUB_RECONCILE_ERROR_CLASSES.len()],
+    ticket_lifecycle: [[u64; TICKET_LIFECYCLE_OUTCOMES.len()]; TICKET_LIFECYCLE_EVENTS.len()],
 }
 
 /// Storage is fixed-size, except the per-actor voice stall map, which is
 /// bounded by the live guild-actor set. Unknown labels collapse to
-/// `other`, including hostile input.
+/// `other`, including hostile input. Drop-poison counts live outside the
+/// `Values` mutex in per-instance atomics: recording from a `Drop` body
+/// must complete even while another thread holds (or poisoned) that mutex,
+/// and must never block behind a scrape or an unrelated writer.
 #[derive(Default)]
-pub struct Metrics(Mutex<Values>);
+pub struct Metrics(Mutex<Values>, [AtomicU64; DROP_POISON_GUARDS.len()]);
 
 pub fn global() -> &'static Metrics {
     static METRICS: OnceLock<Metrics> = OnceLock::new();
     METRICS.get_or_init(Metrics::default)
+}
+
+/// Recover a drop-guard lock acquisition: on poison, count one
+/// `two_bot_drop_poison_total{guard}`, log one fixed-vocabulary warn, and
+/// hand back the recovered guard so the drop still releases its state.
+/// Panicking inside `drop` aborts the process when the drop runs during
+/// unwinding; this helper is the only poison path a `Drop` body needs.
+/// `guard` must be a [`DROP_POISON_GUARDS`] member. Never panics and never
+/// takes another lock: recording is a lock-free atomic increment.
+pub fn recover_drop_poison<'a, T>(
+    result: LockResult<MutexGuard<'a, T>>,
+    guard: &str,
+) -> MutexGuard<'a, T> {
+    result.unwrap_or_else(|poisoned| {
+        global().drop_poison(guard);
+        tracing::warn!(guard, "drop guard recovered a poisoned lock");
+        poisoned.into_inner()
+    })
 }
 
 /// The recorded contribution for `actor`, fenced by generation: an older
@@ -841,6 +1023,38 @@ impl Metrics {
         values.missed_events = values.missed_events.saturating_add(count);
     }
 
+    /// One RSVP interaction refused at reception: the in-flight RSVP bound
+    /// (`RSVP_IN_FLIGHT_LIMIT`) was exhausted, so no prepare task spawned
+    /// and nothing entered the serial drain. The dispatch advances without
+    /// an RSVP completion instead of wedging the funnel or checkpoint.
+    pub fn gateway_rsvp_refused(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.rsvp_refused = values.rsvp_refused.saturating_add(1);
+    }
+
+    /// One fire-and-forget voice command refused by the actor inbox gate.
+    /// Accepted sends and closed-channel rollbacks do not count.
+    pub fn voice_inbox_overflow_dropped(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_inbox_overflow_dropped = values.voice_inbox_overflow_dropped.saturating_add(1);
+    }
+
+    /// One new voice action refused by opt-in `ActionQueue::try_enqueue`.
+    /// Coalescing and must-admit `enqueue` calls do not count.
+    pub fn voice_queue_overflow_dropped(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_queue_overflow_dropped = values.voice_queue_overflow_dropped.saturating_add(1);
+    }
+
     pub fn gateway_latency(&self, latency: Duration) {
         self.0
             .lock()
@@ -988,6 +1202,22 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.voice_vote_kick[bounded_index(outcome, VOICE_VOTE_KICK_OUTCOMES)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One event-voice tick that stayed TBD (host decision D4). Call once
+    /// per preflight that returns `Waiting`, including backoff-skipped
+    /// ticks, with the website reason (`EventVoiceTbdReason::as_str`).
+    /// `Ready` ticks record nothing here; the ticker card extends this same
+    /// series with its ready/create family. Unknown outcomes collapse to
+    /// `other`.
+    pub fn event_voice_tick(&self, outcome: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.event_voice_tick[bounded_index(outcome, EVENT_VOICE_TICK_OUTCOMES)];
         *counter = counter.saturating_add(1);
     }
 
@@ -1153,6 +1383,23 @@ impl Metrics {
         })
     }
 
+    /// One actor's recorded live-not-ready age in seconds, or `None` when
+    /// the actor has no recorded contribution. Test/diagnostic seam only:
+    /// the actor key is process-local and this lookup is never rendered,
+    /// labelled or persisted. Pins the watchdog sibling's not-ready
+    /// republication per actor, where the public maximum cannot.
+    #[doc(hidden)]
+    pub fn voice_actor_live_not_ready_secs(&self, actor: u64) -> Option<u64> {
+        let values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values
+            .voice_actors
+            .get(&actor)
+            .map(|entry| entry.live_not_ready_secs)
+    }
+
     /// Age of the oldest in-flight voice REST attempt in seconds; 0 idles it.
     /// Last writer wins.
     pub fn set_voice_rest_in_flight_age_secs(&self, age_secs: u64) {
@@ -1214,6 +1461,35 @@ impl Metrics {
         values.voice_halt_recoveries = values.voice_halt_recoveries.saturating_add(1);
     }
 
+    /// Publish the fair-scheduling bound: at most `bound` consecutive
+    /// guild-actor inbox turns before a ready dispatch, timer or
+    /// maintenance branch runs. Called once per actor at startup with the
+    /// actor's single source of truth; last writer wins.
+    pub fn set_voice_actor_inbox_turn_bound(&self, bound: u64) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .voice_actor_inbox_turn_bound = bound;
+    }
+
+    /// One guild-actor inbox command processed.
+    pub fn voice_actor_inbox_turn(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_actor_inbox_turns = values.voice_actor_inbox_turns.saturating_add(1);
+    }
+
+    /// One guild-actor dispatch turn that ran, whether or not it progressed.
+    pub fn voice_actor_dispatch_turn(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.voice_actor_dispatch_turns = values.voice_actor_dispatch_turns.saturating_add(1);
+    }
+
     /// One untracked creator-channel orphan needing manual deletion after
     /// failed `/create` compensation (TOG-13543). No channel ID is retained.
     pub fn voice_orphan(&self) {
@@ -1237,6 +1513,30 @@ impl Metrics {
         values.retention_replay_needed = values.retention_replay_needed.saturating_add(1);
     }
 
+    /// One auxiliary leveling drain skipped for a missing table or grant.
+    /// The checkpoint may advance without the failed awards. Label-free:
+    /// SQLSTATE, member ids and error text belong nowhere in labels.
+    pub fn gateway_drain_skip(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.gateway_drain_skips = values.gateway_drain_skips.saturating_add(1);
+    }
+
+    /// One ticket component interaction refused before spawning: the runtime
+    /// held `MAX_TICKET_COMPONENT_IN_FLIGHT` executions or the member held
+    /// the per-member cap. Call exactly once per refusal from the ticket
+    /// dispatch path; admitted work never calls this. Label-free counter;
+    /// no member id, token or interaction id ever becomes a label.
+    pub fn ticket_component_drop(&self) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        values.ticket_component_drops = values.ticket_component_drops.saturating_add(1);
+    }
+
     /// One storage-layer failure. Unknown `op` values collapse
     /// to `other`; no error text, query or identifier is retained.
     pub fn db_error(&self, op: &str) {
@@ -1245,6 +1545,18 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let counter = &mut values.db_errors[bounded_index(op, DB_ERROR_OPS)];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One containment-store failure. Unknown `op` values collapse
+    /// to `other`; no error text, query or identifier is retained.
+    pub fn containment_store_error(&self, op: &str) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter =
+            &mut values.containment_store_errors[bounded_index(op, CONTAINMENT_STORE_OPS)];
         *counter = counter.saturating_add(1);
     }
 
@@ -1289,6 +1601,28 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
+    /// One join dropped before raid observation because its worker queue was
+    /// full or closed. No member, guild or error text is retained.
+    pub fn raid_dropped_join(&self, reason: JoinQueueDropReason) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.raid_dropped_joins[reason as usize];
+        *counter = counter.saturating_add(1);
+    }
+
+    /// One join dropped before risk scoring because its worker queue was
+    /// full or closed. Successful enqueueing records nothing here.
+    pub fn join_risk_dropped_join(&self, reason: JoinQueueDropReason) {
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.join_risk_dropped_joins[reason as usize];
+        *counter = counter.saturating_add(1);
+    }
+
     /// One failed gateway checkpoint commit from `apply_dispatch`: `pre_commit`
     /// when the commit was skipped after a funnel/leveling/acknowledgement
     /// failure, `commit` when the durable store write itself failed. Call once
@@ -1303,6 +1637,20 @@ impl Metrics {
         let counter =
             &mut values.checkpoint_failures[bounded_index(stage, CHECKPOINT_FAILURE_STAGES)];
         *counter = counter.saturating_add(1);
+    }
+
+    /// One poisoned lock recovered by a drop guard instead of panicking
+    /// inside `drop` (which aborts the process during unwinding). Call once
+    /// per poisoned drop, with a [`DROP_POISON_GUARDS`] member. Unknown
+    /// guards collapse to `voice_connection_guard` only when the allowlist grows;
+    /// panic payloads are never labels. No IDs, tokens or bodies are
+    /// retained. Lock-free and saturating: safe to call from a `Drop` body
+    /// while any thread holds or poisoned the `Values` mutex.
+    pub fn drop_poison(&self, guard: &str) {
+        let counter = &self.1[bounded_index(guard, DROP_POISON_GUARDS)];
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            Some(count.saturating_add(1))
+        });
     }
 
     /// One signed website-action receiver execution (TOG-20119). Call exactly
@@ -1416,6 +1764,49 @@ impl Metrics {
         *counter = counter.saturating_add(1);
     }
 
+    /// One terminal ticket lifecycle event (see [`TICKET_LIFECYCLE_EVENTS`]
+    /// and [`TICKET_LIFECYCLE_OUTCOMES`]). Call once per retire, abandon,
+    /// and successful staff-button claim/close executed through the button
+    /// path, alongside the matching `ticket_lifecycle` log line; the purge
+    /// pass calls [`Self::ticket_lifecycle_n`] with its deleted count
+    /// instead. Unknown events/outcomes collapse to the trailing slots only
+    /// when the allowlists grow; today every caller passes a member. No
+    /// member text, channel name, ticket id or error string ever becomes a
+    /// label.
+    pub fn ticket_lifecycle(&self, event: &str, outcome: &str) {
+        self.ticket_lifecycle_n(event, outcome, 1);
+    }
+
+    /// Ticket lifecycle events counted with a pass-level multiplicity: the
+    /// purge pass reports its deleted count here (one sample per deleted
+    /// transcript body, not one per pass). Zero is a no-op. Unknown
+    /// events/outcomes collapse to the trailing slots only when the
+    /// allowlists grow. A normalized pair outside the rendered per-event
+    /// subset routes to that event's `query` trapdoor before incrementing,
+    /// so every call stays observable.
+    pub fn ticket_lifecycle_n(&self, event: &str, outcome: &str, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let event_index = bounded_index(event, TICKET_LIFECYCLE_EVENTS);
+        let mut outcome_index = bounded_index(outcome, TICKET_LIFECYCLE_OUTCOMES);
+        // Trapdoor: the exposition renders per-event outcome subsets, so a
+        // normalized pair outside them would vanish from the scrape. Route to
+        // this event's rendered `query` trapdoor instead, preserving the call.
+        if !lifecycle_series_rendered(
+            TICKET_LIFECYCLE_EVENTS[event_index],
+            TICKET_LIFECYCLE_OUTCOMES[outcome_index],
+        ) {
+            outcome_index = bounded_index("query", TICKET_LIFECYCLE_OUTCOMES);
+        }
+        let mut values = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counter = &mut values.ticket_lifecycle[event_index][outcome_index];
+        *counter = counter.saturating_add(count);
+    }
+
     /// Current audit mirror delivery-halt state (M4.48): `true` while the
     /// persistent kill switch is engaged, `false` once it is cleared. Call
     /// once per readable `audit_retry` sweep from the store's `delivery_halt`
@@ -1478,7 +1869,7 @@ impl Metrics {
             &mut out,
             "two_bot_process_incarnation",
             "gauge",
-            "Opaque process-lifetime identity in four exact unsigned 32-bit parts.",
+            "Process identity: four exact u32s.",
         );
         for (part, value) in incarnation.iter().enumerate() {
             writeln!(
@@ -1491,7 +1882,7 @@ impl Metrics {
             &mut out,
             "two_bot_gateway_events_total",
             "counter",
-            "Gateway events by bounded event type.",
+            "Events by type.",
         );
         for (name, count) in EVENTS.iter().zip(values.events) {
             writeln!(
@@ -1524,11 +1915,17 @@ impl Metrics {
             "counter",
             values.missed_events,
         );
+        scalar(
+            &mut out,
+            "two_bot_gateway_rsvp_refused_total",
+            "counter",
+            values.rsvp_refused,
+        );
         header(
             &mut out,
             "two_bot_presence_capture_total",
             "counter",
-            "Presence-update capture outcomes by bounded outcome; fixed three series.",
+            "Capture outcomes.",
         );
         for (outcome, count) in PRESENCE_CAPTURE_OUTCOMES
             .iter()
@@ -1544,7 +1941,7 @@ impl Metrics {
             &mut out,
             "two_bot_feed_fetches_total",
             "counter",
-            "Feed fetch attempts by bounded outcome; per-outcome, never per-feed.",
+            "Fetch attempts by outcome.",
         );
         for (outcome, count) in FEED_FETCH_OUTCOMES.iter().zip(values.feed_fetch) {
             writeln!(
@@ -1557,7 +1954,7 @@ impl Metrics {
             &mut out,
             "two_bot_feed_fetch_errors_total",
             "counter",
-            "Failed feed fetches by bounded error class; successes record nothing here.",
+            "Feed failures by class.",
         );
         for (error_class, count) in FEED_FETCH_ERROR_CLASSES
             .iter()
@@ -1573,7 +1970,7 @@ impl Metrics {
             &mut out,
             "two_bot_automod_decisions_total",
             "counter",
-            "Terminal automod inspection outcomes by bounded CompletionKind; fixed eight series.",
+            "Terminal inspections.",
         );
         for (outcome, count) in AUTOMOD_DECISION_OUTCOMES
             .iter()
@@ -1589,7 +1986,7 @@ impl Metrics {
             &mut out,
             "two_bot_gateway_latency_seconds",
             "gauge",
-            "Last heartbeat ACK latency; NaN until measured.",
+            "ACK latency; NaN until measured.",
         );
         match values.latency_micros {
             Some(micros) => writeln!(
@@ -1608,13 +2005,13 @@ impl Metrics {
         values.voice_join_to_move.render(
             &mut out,
             "two_bot_voice_join_to_move_seconds",
-            "Creator join gateway receipt to successful member move in seconds.",
+            "Creator-join receipt to move, seconds.",
         );
         header(
             &mut out,
             "two_bot_voice_join_occupancy_total",
             "counter",
-            "VOICE_STATE_UPDATE joins by humans already present in the target channel (7+ caps the tail).",
+            "Human joins by prior occupancy (7+ cap).",
         );
         for (bucket, count) in VOICE_JOIN_OCCUPANCY_BUCKETS
             .iter()
@@ -1630,7 +2027,7 @@ impl Metrics {
             &mut out,
             "two_bot_rest_requests_total",
             "counter",
-            "Adapter-visible REST attempts by route template and result, including retries.",
+            "REST attempts incl. retries by route/result.",
         );
         for (route, results) in REST_ROUTES.iter().zip(values.rest) {
             for (result, count) in RESULTS.iter().zip(results) {
@@ -1645,7 +2042,7 @@ impl Metrics {
             &mut out,
             "two_bot_job_runs_total",
             "counter",
-            "Completed job attempts by bounded job name and outcome.",
+            "Completed attempts by job/outcome.",
         );
         for (job, current) in JOBS.iter().zip(&values.jobs) {
             for (outcome, count) in JOB_OUTCOMES.iter().zip(current.runs) {
@@ -1660,7 +2057,7 @@ impl Metrics {
             &mut out,
             "two_bot_job_last_success_timestamp_seconds",
             "gauge",
-            "Unix time of last successful job completion; zero means never.",
+            "Last success Unix time; 0 if never.",
         );
         for (job, current) in JOBS.iter().zip(&values.jobs) {
             writeln!(
@@ -1674,7 +2071,7 @@ impl Metrics {
             &mut out,
             "two_bot_job_consecutive_failures",
             "gauge",
-            "Completed failures since the last success; resets on success.",
+            "Failure streak; success resets.",
         );
         for (job, current) in JOBS.iter().zip(&values.jobs) {
             writeln!(
@@ -1688,7 +2085,7 @@ impl Metrics {
             &mut out,
             "two_bot_job_last_error_class",
             "gauge",
-            "One-hot last failed-completion class by bounded job; zero before failure and after success.",
+            "One-hot last error; success clears.",
         );
         for (job, current) in JOBS.iter().zip(&values.jobs) {
             for class in JOB_ERROR_CLASSES {
@@ -1705,7 +2102,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_operations_total",
             "counter",
-            "Finished room lifecycle outcomes by bounded operation and outcome; retries are not outcomes.",
+            "Terminal room outcomes; no retries.",
         );
         for (op, outcomes) in VOICE_OPERATIONS.iter().zip(values.voice_ops) {
             for (outcome, count) in VOICE_OUTCOMES.iter().zip(outcomes) {
@@ -1720,7 +2117,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_reconcile_actions_total",
             "counter",
-            "Reconcile transitions and new enqueues by bounded action.",
+            "Reconcile transitions/new enqueues by action.",
         );
         for (action, count) in VOICE_RECONCILE_ACTIONS.iter().zip(values.voice_reconcile) {
             writeln!(
@@ -1733,7 +2130,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_dead_letters_total",
             "counter",
-            "Queue writes that exhausted QUEUE_MAX_ATTEMPTS by bounded family.",
+            "Queue writes exhausting QUEUE_MAX_ATTEMPTS.",
         );
         for (action, count) in VOICE_DEAD_ACTIONS.iter().zip(values.voice_dead) {
             writeln!(
@@ -1746,14 +2143,14 @@ impl Metrics {
             &mut out,
             "two_bot_voice_tracked_rooms",
             "gauge",
-            "Rooms tracked in memory; compare with live Discord channels for ghosts.",
+            "In-memory rooms; may include ghosts.",
         );
         writeln!(out, "two_bot_voice_tracked_rooms {}", values.voice_tracked).unwrap();
         header(
             &mut out,
             "two_bot_voice_compensation_pending",
             "gauge",
-            "Tracked rooms awaiting compensating delete after a failed write.",
+            "Rooms awaiting delete after failed write.",
         );
         writeln!(
             out,
@@ -1777,7 +2174,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_join_refused_total",
             "counter",
-            "Actor-received creator joins refused before queueing, by bounded reason.",
+            "Creator-join refusals before queueing.",
         );
         for (reason, count) in VOICE_JOIN_REFUSAL_REASONS
             .iter()
@@ -1789,6 +2186,18 @@ impl Metrics {
             )
             .unwrap();
         }
+        scalar(
+            &mut out,
+            "two_bot_voice_inbox_overflow_dropped_total",
+            "counter",
+            values.voice_inbox_overflow_dropped,
+        );
+        scalar(
+            &mut out,
+            "two_bot_voice_queue_overflow_dropped_total",
+            "counter",
+            values.voice_queue_overflow_dropped,
+        );
         // Aggregates over the current guild-actor set: any actor halted,
         // per-lane saturating sums, maximum oldest-pending age.
         let voice_halted = u64::from(values.voice_actors.values().any(|actor| actor.halted));
@@ -1806,14 +2215,14 @@ impl Metrics {
             &mut out,
             "two_bot_voice_worker_halted",
             "gauge",
-            "Guild-actor halt latch: 1 while any guild actor is halted (CredentialRefused halted join processing).",
+            "1 while any guild actor is halted.",
         );
         writeln!(out, "two_bot_voice_worker_halted {voice_halted}").unwrap();
         header(
             &mut out,
             "two_bot_voice_queue_pending",
             "gauge",
-            "Queued (not in-flight) voice actions by lane, summed across guild actors.",
+            "Queued voice actions by lane; all guilds.",
         );
         for (lane, count) in VOICE_QUEUE_LANES.iter().zip(voice_queue_pending) {
             writeln!(
@@ -1826,7 +2235,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_queue_oldest_age_seconds",
             "gauge",
-            "Age of the oldest queued voice action in seconds, maximum across guild actors; 0 when empty.",
+            "Max queued age, seconds; 0 if empty.",
         );
         writeln!(
             out,
@@ -1837,7 +2246,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_live_not_ready_seconds",
             "gauge",
-            "Seconds a guild live voice view has been not ready while the gateway is connected (creator joins are dropped meanwhile), maximum across guild actors; 0 when every view is ready or the gateway is down.",
+            "Max connected unready seconds; 0 if none.",
         );
         writeln!(
             out,
@@ -1854,7 +2263,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_rest_in_flight_age_seconds",
             "gauge",
-            "Age of the oldest in-flight voice REST attempt in seconds; 0 when idle.",
+            "Oldest REST age, seconds; 0 if idle.",
         );
         writeln!(
             out,
@@ -1866,7 +2275,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_creator_map_generation",
             "gauge",
-            "Last merged creator-map generation; 0 before the first merge.",
+            "Creator-map generation; 0 before first merge.",
         );
         writeln!(
             out,
@@ -1878,7 +2287,7 @@ impl Metrics {
             &mut out,
             "two_bot_voice_creator_map_age_seconds",
             "gauge",
-            "Seconds since the last successful creator-map merge; 0 when never merged.",
+            "Seconds since creator-map merge; 0 if never merged.",
         );
         writeln!(
             out,
@@ -1912,9 +2321,33 @@ impl Metrics {
         );
         header(
             &mut out,
+            "two_bot_voice_actor_inbox_turn_bound",
+            "gauge",
+            "Inbox turns before other ready work; 0 if unset.",
+        );
+        writeln!(
+            out,
+            "two_bot_voice_actor_inbox_turn_bound {}",
+            values.voice_actor_inbox_turn_bound
+        )
+        .unwrap();
+        scalar(
+            &mut out,
+            "two_bot_voice_actor_inbox_turns_total",
+            "counter",
+            values.voice_actor_inbox_turns,
+        );
+        scalar(
+            &mut out,
+            "two_bot_voice_actor_dispatch_turns_total",
+            "counter",
+            values.voice_actor_dispatch_turns,
+        );
+        header(
+            &mut out,
             "two_bot_voice_vote_kick_total",
             "counter",
-            "Vote-kick starts, refusals by refusal code and terminal enforcements by enforcement code; vote results are audit-only.",
+            "Vote-kick outcomes; votes audit-only.",
         );
         for (outcome, count) in VOICE_VOTE_KICK_OUTCOMES.iter().zip(values.voice_vote_kick) {
             writeln!(
@@ -1925,9 +2358,25 @@ impl Metrics {
         }
         header(
             &mut out,
+            "two_bot_event_voice_tick_total",
+            "counter",
+            "T-15 TBD ticks incl. backoff skips.",
+        );
+        for (outcome, count) in EVENT_VOICE_TICK_OUTCOMES
+            .iter()
+            .zip(values.event_voice_tick)
+        {
+            writeln!(
+                out,
+                "two_bot_event_voice_tick_total{{outcome=\"{outcome}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
             "two_bot_voice_names_total",
             "counter",
-            "Automatic room-name decisions: created with the template name, template renders by outcome, and queued renames sent or dropped at dispatch.",
+            "Name-template and rename outcomes.",
         );
         for (outcome, count) in VOICE_NAME_OUTCOMES.iter().zip(values.voice_names) {
             writeln!(
@@ -1940,16 +2389,32 @@ impl Metrics {
             &mut out,
             "two_bot_db_errors_total",
             "counter",
-            "Storage-layer failures by bounded operation; pool gauges are pressure, this is errors.",
+            "Storage failures by operation.",
         );
         for (op, count) in DB_ERROR_OPS.iter().zip(values.db_errors) {
             writeln!(out, "two_bot_db_errors_total{{op=\"{op}\"}} {count}").unwrap();
         }
         header(
             &mut out,
+            "two_bot_containment_store_errors_total",
+            "counter",
+            "Containment-store failures by operation.",
+        );
+        for (op, count) in CONTAINMENT_STORE_OPS
+            .iter()
+            .zip(values.containment_store_errors)
+        {
+            writeln!(
+                out,
+                "two_bot_containment_store_errors_total{{op=\"{op}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
             "two_bot_send_admissions_total",
             "counter",
-            "Send-admission admit() decisions by bounded terminal outcome.",
+            "Terminal admit() decisions by outcome.",
         );
         for (outcome, count) in SEND_ADMISSION_OUTCOMES.iter().zip(values.send_admissions) {
             writeln!(
@@ -1962,7 +2427,7 @@ impl Metrics {
             &mut out,
             "two_bot_gateway_prefix_trigger_refused_total",
             "counter",
-            "Prefix candidates refused by the automod verdict before any trigger lookup, by bounded reason.",
+            "Automod prefix refusals before lookup.",
         );
         for (reason, count) in PREFIX_TRIGGER_REFUSED_REASONS
             .iter()
@@ -1978,7 +2443,7 @@ impl Metrics {
             &mut out,
             "two_bot_dispatch_drops_total",
             "counter",
-            "Dispatch-lane saturation drops by bounded lane (reactions lane also counts per-member fairness refusals); logs sample one warn per 60 s per runtime.",
+            "Saturation/fairness drops by lane.",
         );
         for (lane, count) in DISPATCH_LANES.iter().zip(values.dispatch_drops) {
             writeln!(
@@ -1987,11 +2452,36 @@ impl Metrics {
             )
             .unwrap();
         }
+        for (name, counts) in [
+            (
+                "two_bot_raid_dropped_joins_total",
+                values.raid_dropped_joins,
+            ),
+            (
+                "two_bot_join_risk_dropped_joins_total",
+                values.join_risk_dropped_joins,
+            ),
+        ] {
+            header(
+                &mut out,
+                name,
+                "counter",
+                "Joins lost pre-observation; no retry.",
+            );
+            for (reason, index) in JOIN_QUEUE_DROP_REASONS {
+                writeln!(
+                    out,
+                    "{name}{{reason=\"{reason}\"}} {}",
+                    counts[index as usize]
+                )
+                .unwrap();
+            }
+        }
         header(
             &mut out,
             "two_bot_gateway_checkpoint_failures_total",
             "counter",
-            "Failed gateway checkpoint commits by bounded stage; every failure stops the dispatch worker.",
+            "Dispatch-stopping failures by stage.",
         );
         for (stage, count) in CHECKPOINT_FAILURE_STAGES
             .iter()
@@ -2005,9 +2495,26 @@ impl Metrics {
         }
         header(
             &mut out,
+            "two_bot_drop_poison_total",
+            "counter",
+            "Warned poisoned-lock recoveries by guard.",
+        );
+        let drop_poisons = self
+            .1
+            .each_ref()
+            .map(|counter| counter.load(Ordering::Relaxed));
+        for (guard, count) in DROP_POISON_GUARDS.iter().zip(drop_poisons) {
+            writeln!(
+                out,
+                "two_bot_drop_poison_total{{guard=\"{guard}\"}} {count}"
+            )
+            .unwrap();
+        }
+        header(
+            &mut out,
             "two_bot_internal_actions_total",
             "counter",
-            "Signed website-action receiver executions by bounded family and outcome; refusals share the warn-summary classes.",
+            "Signed action outcomes by family.",
         );
         for (family, outcomes) in INTERNAL_ACTION_FAMILIES.iter().zip(values.internal_actions) {
             for (outcome, count) in INTERNAL_ACTION_OUTCOMES.iter().zip(outcomes) {
@@ -2022,7 +2529,7 @@ impl Metrics {
             &mut out,
             "two_bot_moderation_enforcements_total",
             "counter",
-            "Moderation enforcement terminal outcomes by bounded verb and outcome; retries and rate-limit backoffs are not outcomes.",
+            "Terminal verbs; no retries/backoffs.",
         );
         for (verb, outcomes) in MODERATION_VERBS.iter().zip(values.moderation_enforcements) {
             for (outcome, count) in MODERATION_ENFORCEMENT_OUTCOMES.iter().zip(outcomes) {
@@ -2037,7 +2544,7 @@ impl Metrics {
             &mut out,
             "two_bot_community_facts_drain_failures_total",
             "counter",
-            "Community-facts drain failures by bounded reason; the worker warns and continues, so each failed dispatch counts once.",
+            "Failed dispatch drains by reason.",
         );
         for (reason, count) in COMMUNITY_FACTS_DRAIN_REASONS
             .iter()
@@ -2053,12 +2560,22 @@ impl Metrics {
             &mut out,
             "two_bot_audit_delivery_halt",
             "gauge",
-            "Audit mirror delivery halt; 1 while the persistent kill switch is engaged, 0 otherwise. Set once per readable audit_retry sweep; an unreadable halt keeps the last reported state.",
+            "Audit halt (1/0); read failure retains.",
         );
         writeln!(
             out,
             "two_bot_audit_delivery_halt {}",
             values.audit_delivery_halt
+        )
+        .unwrap();
+        // Empty HELP: main sits within 131 bytes of the scrape byte budget
+        // (`eventsub_classification_growth_fits_the_scrape_byte_budget`), and
+        // this counter's three lines must fit without relaxing that headroom.
+        header(&mut out, "two_bot_gateway_drain_skips_total", "counter", "");
+        writeln!(
+            out,
+            "two_bot_gateway_drain_skips_total {}",
+            values.gateway_drain_skips
         )
         .unwrap();
         scalar(
@@ -2067,11 +2584,17 @@ impl Metrics {
             "counter",
             values.retention_replay_needed,
         );
+        scalar(
+            &mut out,
+            "two_bot_ticket_component_drops_total",
+            "counter",
+            values.ticket_component_drops,
+        );
         header(
             &mut out,
             "two_bot_event_store_consumer_lag_seconds",
             "gauge",
-            "Event-store consumer lag in seconds (received_at minus event_time for the newest observed capture row); 0 when unobserved. Single label-free series.",
+            "Newest capture lag, seconds; 0 if unseen.",
         );
         writeln!(
             out,
@@ -2089,7 +2612,7 @@ impl Metrics {
             &mut out,
             "two_bot_eventsub_classified_total",
             "counter",
-            "EventSub deliveries by bounded receiver classification.",
+            "Receiver classifications.",
         );
         for (kind, count) in EVENTSUB_DELIVERY_KINDS
             .iter()
@@ -2105,7 +2628,7 @@ impl Metrics {
             &mut out,
             "two_bot_eventsub_posts_total",
             "counter",
-            "Go-live announcement post attempts by bounded outcome.",
+            "Go-live post attempts by outcome.",
         );
         for (outcome, count) in EVENTSUB_POST_OUTCOMES.iter().zip(values.eventsub_posts) {
             writeln!(
@@ -2118,7 +2641,7 @@ impl Metrics {
             &mut out,
             "two_bot_eventsub_reconcile_passes_total",
             "counter",
-            "EventSub reconcile passes by bounded outcome; alert when failed rises across scrapes.",
+            "Reconcile outcomes; alert on failure deltas.",
         );
         for (outcome, count) in EVENTSUB_RECONCILE_OUTCOMES
             .iter()
@@ -2134,7 +2657,7 @@ impl Metrics {
             &mut out,
             "two_bot_eventsub_reconcile_actions_total",
             "counter",
-            "Successful EventSub reconcile mutations by bounded action.",
+            "Successful reconcile mutations by action.",
         );
         for (action, count) in EVENTSUB_RECONCILE_ACTIONS
             .iter()
@@ -2150,7 +2673,7 @@ impl Metrics {
             &mut out,
             "two_bot_eventsub_reconcile_errors_total",
             "counter",
-            "EventSub reconcile failure sites by bounded log error_class; no response bytes in labels.",
+            "Failures by error_class.",
         );
         for (error_class, count) in EVENTSUB_RECONCILE_ERROR_CLASSES
             .iter()
@@ -2161,6 +2684,24 @@ impl Metrics {
                 "two_bot_eventsub_reconcile_errors_total{{error_class=\"{error_class}\"}} {count}"
             )
             .unwrap();
+        }
+        header(
+            &mut out,
+            "two_bot_ticket_lifecycle_total",
+            "counter",
+            "Terminal ticket outcomes; purge counts bodies.",
+        );
+        for (event, outcomes) in TICKET_LIFECYCLE_EVENTS.iter().zip(values.ticket_lifecycle) {
+            for (outcome, count) in TICKET_LIFECYCLE_OUTCOMES.iter().zip(outcomes) {
+                if !lifecycle_series_rendered(event, outcome) {
+                    continue;
+                }
+                writeln!(
+                    out,
+                    "two_bot_ticket_lifecycle_total{{event=\"{event}\",outcome=\"{outcome}\"}} {count}"
+                )
+                .unwrap();
+            }
         }
         for (name, count) in [
             (
@@ -2216,7 +2757,7 @@ impl Metrics {
             &mut out,
             "two_bot_rest_guard_global_pause_remaining_seconds",
             "gauge",
-            "Remaining global cooldown; pending response bodies may still hold admission at zero.",
+            "Cooldown seconds; pending bodies may block at zero.",
         );
         // Duration is nonnegative and its entire u64-seconds range is finite in f64.
         writeln!(
@@ -2259,9 +2800,13 @@ fn header(out: &mut String, name: &str, kind: &str, help: &str) {
 }
 
 fn scalar(out: &mut String, name: &str, kind: &str, value: u64) {
-    header(out, name, kind, "Process-local health metric.");
+    header(out, name, kind, "Local.");
     writeln!(out, "{name} {value}").unwrap();
 }
+
+#[cfg(test)]
+#[path = "metrics_drop_poison_acceptance_tests.rs"]
+mod drop_poison_acceptance_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2328,6 +2873,53 @@ mod tests {
     }
 
     #[test]
+    fn eventsub_classification_growth_fits_the_scrape_byte_budget() {
+        let metrics = Metrics::default();
+        let baseline = metrics.render(None);
+        {
+            let mut values = metrics.0.lock().unwrap();
+            values.eventsub_received = u64::MAX;
+            values.eventsub_classified.fill(u64::MAX);
+        }
+        let full = metrics.render_with_rest_guard(
+            Some((u32::MAX, usize::MAX, u32::MAX)),
+            RestGuardSnapshot {
+                invalid_requests_in_window: usize::MAX,
+                invalid_requests_total: u64::MAX,
+                rejected_requests_total: u64::MAX,
+                breaker_opens_total: u64::MAX,
+                breaker_closes_total: u64::MAX,
+                global_pauses_total: u64::MAX,
+                breaker_open: true,
+                token_invalid: true,
+                global_pause_remaining: Duration::MAX,
+                pending_global_responses: usize::MAX,
+            },
+        );
+        // Leave room for other counters to grow without relaxing any consumer's
+        // 64 KiB cap. This fixture saturates EventSub, pool and guard samples,
+        // not every process metric simultaneously.
+        assert!(
+            full.len() < 65_536 - 1_024,
+            "{} bytes leaves less than 1 KiB of scrape headroom",
+            full.len()
+        );
+        let series = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter(|line| !line.starts_with('#'))
+                .map(|line| line.rsplit_once(' ').unwrap().0.to_owned())
+                .collect()
+        };
+        assert_eq!(series(&full), series(&baseline));
+        for kind in EVENTSUB_DELIVERY_KINDS {
+            assert!(full.contains(&format!(
+                "two_bot_eventsub_classified_total{{kind=\"{kind}\"}} {}\n",
+                u64::MAX
+            )));
+        }
+    }
+
+    #[test]
     fn exposition_has_cumulative_histogram_and_unique_series() {
         let metrics = Metrics::default();
         metrics.handler_duration(Duration::from_millis(5));
@@ -2387,7 +2979,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_gateway_events_total{event=\"other\"} 10000\n"));
         assert!(
             text.contains("two_bot_rest_requests_total{route=\"other\",result=\"429\"} 10000\n")
@@ -2445,7 +3039,7 @@ mod tests {
                     count
                 );
             }
-            assert_eq!(JOBS.len(), 16);
+            assert_eq!(JOBS.len(), 17);
             assert!(!text.contains("unknown_job"));
         }
     }
@@ -2492,7 +3086,7 @@ mod tests {
                     count
                 );
             }
-            assert_eq!(JOBS.len(), 16);
+            assert_eq!(JOBS.len(), 17);
             assert!(!text.contains("unknown_job"));
         }
     }
@@ -2657,7 +3251,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -2765,7 +3361,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -2790,6 +3388,18 @@ mod tests {
             assert!(series.insert(key), "duplicate series: {key}");
             assert!(value.parse::<f64>().is_ok(), "bad sample: {line}");
         }
+    }
+
+    #[test]
+    fn containment_store_errors_stay_bounded() {
+        let metrics = Metrics::default();
+        metrics.containment_store_error("complete_incident");
+        metrics.containment_store_error("hostile\"\\\nlabel");
+        let text = metrics.render(None);
+        assert!(
+            text.contains("two_bot_containment_store_errors_total{op=\"complete_incident\"} 1\n")
+        );
+        assert!(text.contains("two_bot_containment_store_errors_total{op=\"other\"} 1\n"));
     }
 
     #[test]
@@ -2884,8 +3494,111 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_gateway_checkpoint_failures_total{stage=\"commit\"} 100\n"));
+    }
+
+    #[test]
+    fn drop_poisons_stay_bounded_and_count_per_guard() {
+        let metrics = Metrics::default();
+        metrics.drop_poison("command_dispatch_guard");
+        metrics.drop_poison("schedule_run");
+        metrics.drop_poison("user_slot");
+        metrics.drop_poison("in_flight_guard");
+        metrics.drop_poison("user_slot");
+        metrics.drop_poison("ticket_supervisor");
+        metrics.drop_poison("response_accounting");
+        metrics.drop_poison("response_accounting");
+        metrics.drop_poison("voice_connection_guard");
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"command_dispatch_guard\"} 1\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"schedule_run\"} 1\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"user_slot\"} 2\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"in_flight_guard\"} 1\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"ticket_supervisor\"} 1\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"response_accounting\"} 2\n"));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"voice_connection_guard\"} 1\n"));
+        // Fixed cardinality: exactly the allowlisted series render.
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_drop_poison_total{"))
+                .count(),
+            DROP_POISON_GUARDS.len()
+        );
+    }
+
+    fn global_drop_poison_count(guard: &str) -> u64 {
+        let prefix = format!("two_bot_drop_poison_total{{guard=\"{guard}\"}} ");
+        global()
+            .render(None)
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .and_then(|count| count.parse().ok())
+            .expect("allowlisted guard series renders")
+    }
+
+    #[test]
+    fn recover_drop_poison_counts_only_a_poisoned_lock() {
+        // Only this test touches the `schedule_run` series in the core lib
+        // test binary, so exact deltas on the process-global counter hold.
+        let lock = Mutex::new(7_u32);
+        let start = global_drop_poison_count("schedule_run");
+        {
+            let guard = recover_drop_poison(lock.lock(), "schedule_run");
+            assert_eq!(*guard, 7);
+        }
+        assert_eq!(global_drop_poison_count("schedule_run"), start);
+
+        let holder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = lock.lock().expect("uncontended");
+            std::panic::panic_any("poison the lock");
+        }));
+        assert!(holder.is_err());
+        assert!(lock.is_poisoned());
+        {
+            let mut guard = recover_drop_poison(lock.lock(), "schedule_run");
+            assert_eq!(*guard, 7);
+            *guard = 8;
+        }
+        assert_eq!(global_drop_poison_count("schedule_run"), start + 1);
+        // Poison is sticky: a second recovery counts again.
+        drop(recover_drop_poison(lock.lock(), "schedule_run"));
+        assert_eq!(global_drop_poison_count("schedule_run"), start + 2);
+    }
+
+    #[test]
+    fn drop_poison_counters_saturate_at_u64_max() {
+        // Seeds the atomic seam directly: no stable public API sets a
+        // counter, and acceptance must not bind to the storage layout.
+        let metrics = Metrics::default();
+        let slot = bounded_index("user_slot", DROP_POISON_GUARDS);
+        metrics.1[slot].store(u64::MAX - 1, Ordering::Relaxed);
+        metrics.drop_poison("user_slot");
+        metrics.drop_poison("user_slot");
+        metrics.drop_poison("user_slot");
+        let text = metrics.render(None);
+        assert!(text.contains(&format!(
+            "two_bot_drop_poison_total{{guard=\"user_slot\"}} {}\n",
+            u64::MAX
+        )));
+    }
+
+    #[test]
+    fn drop_poison_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.drop_poison(&hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
+        assert!(text.contains("two_bot_drop_poison_total{guard=\"voice_connection_guard\"} 100\n"));
     }
 
     #[test]
@@ -2959,7 +3672,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -3002,7 +3717,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -3036,7 +3753,9 @@ mod tests {
         assert!(
             text.contains("two_bot_community_facts_drain_failures_total{reason=\"other\"} 100\n")
         );
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
     }
 
     #[test]
@@ -3099,6 +3818,171 @@ mod tests {
         assert_eq!(series.len(), 1);
         let (_, value) = series[0].rsplit_once(' ').unwrap();
         assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
+    }
+
+    #[test]
+    fn gateway_drain_skips_counter_is_label_free_and_saturates() {
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_gateway_drain_skips_total counter\n"));
+        assert!(text.contains("two_bot_gateway_drain_skips_total 0\n"));
+        metrics.gateway_drain_skip();
+        metrics.gateway_drain_skip();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_gateway_drain_skips_total 2\n"));
+        assert!(!text.contains("two_bot_gateway_drain_skips_total{"));
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("two_bot_gateway_drain_skips_total "))
+                .count(),
+            1
+        );
+        metrics.0.lock().unwrap().gateway_drain_skips = u64::MAX;
+        metrics.gateway_drain_skip();
+        assert!(metrics
+            .render(None)
+            .contains(&format!("two_bot_gateway_drain_skips_total {}\n", u64::MAX)));
+    }
+
+    #[test]
+    fn ticket_component_drops_counter_is_label_free_and_zero_fresh() {
+        // Refused ticket components render as one label-free counter series —
+        // 0 on a fresh registry, +1 per refusal — so no member id, token or
+        // interaction id can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_ticket_component_drops_total counter\n"));
+        assert!(text.contains("two_bot_ticket_component_drops_total 0\n"));
+        metrics.ticket_component_drop();
+        metrics.ticket_component_drop();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_ticket_component_drops_total 2\n"));
+        assert!(!text.contains("two_bot_ticket_component_drops_total{"));
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_ticket_component_drops_total "))
+            .collect();
+        assert_eq!(series.len(), 1);
+        let (_, value) = series[0].rsplit_once(' ').unwrap();
+        assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
+    }
+
+    /// Adapter: today nothing counts voice overflow drops, so the adapter is
+    /// a no-op. After the Builder adds inherent
+    /// `Metrics::voice_inbox_overflow_dropped` /
+    /// `Metrics::voice_queue_overflow_dropped`, method resolution prefers the
+    /// inherent methods and the tests below exercise the real counters. This
+    /// is what makes RED behavioral: this file compiles today and the
+    /// assertions fail on the missing series.
+    trait VoiceOverflowCounters {
+        fn voice_inbox_overflow_dropped(&self) {}
+        fn voice_queue_overflow_dropped(&self) {}
+    }
+
+    impl VoiceOverflowCounters for Metrics {}
+
+    #[test]
+    fn voice_inbox_overflow_dropped_counter_is_label_free_and_zero_fresh() {
+        // Refused voice actor inbox sends render as one label-free counter
+        // series — 0 on a fresh registry, +1 per refused send — so no guild,
+        // member or channel label can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_inbox_overflow_dropped_total counter\n"));
+        assert!(text.contains("two_bot_voice_inbox_overflow_dropped_total 0\n"));
+        metrics.voice_inbox_overflow_dropped();
+        metrics.voice_inbox_overflow_dropped();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_inbox_overflow_dropped_total 2\n"));
+        assert!(!text.contains("two_bot_voice_inbox_overflow_dropped_total{"));
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_voice_inbox_overflow_dropped_total "))
+            .collect();
+        assert_eq!(series.len(), 1);
+        let (_, value) = series[0].rsplit_once(' ').unwrap();
+        assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
+    }
+
+    #[test]
+    fn voice_queue_overflow_dropped_counter_is_label_free_and_zero_fresh() {
+        // Refused voice action queue enqueues render as one label-free counter
+        // series — 0 on a fresh registry, +1 per refused enqueue — so no
+        // guild or channel label can reach exposition.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_queue_overflow_dropped_total counter\n"));
+        assert!(text.contains("two_bot_voice_queue_overflow_dropped_total 0\n"));
+        metrics.voice_queue_overflow_dropped();
+        metrics.voice_queue_overflow_dropped();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_queue_overflow_dropped_total 2\n"));
+        assert!(!text.contains("two_bot_voice_queue_overflow_dropped_total{"));
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_voice_queue_overflow_dropped_total "))
+            .collect();
+        assert_eq!(series.len(), 1);
+        let (_, value) = series[0].rsplit_once(' ').unwrap();
+        assert!(value.parse::<f64>().is_ok(), "bad sample: {}", series[0]);
+    }
+
+    #[test]
+    fn voice_overflow_dropped_counters_are_isolated_from_each_other() {
+        // The inbox and queue overflow meters count independently: bumping one
+        // never moves the other.
+        let metrics = Metrics::default();
+        metrics.voice_inbox_overflow_dropped();
+        metrics.voice_inbox_overflow_dropped();
+        metrics.voice_queue_overflow_dropped();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_inbox_overflow_dropped_total 2\n"));
+        assert!(text.contains("two_bot_voice_queue_overflow_dropped_total 1\n"));
+    }
+
+    #[test]
+    fn voice_overflow_legacy_adapter_path_stays_available() {
+        // Control pinning the legacy adapter path: qualified calls bypass any
+        // inherent overflow gate by design, so this passes both before and
+        // after the Builder adds inherent `voice_inbox_overflow_dropped` /
+        // `voice_queue_overflow_dropped`. It also keeps the adapter trait
+        // referenced once inherent methods shadow unqualified calls, avoiding
+        // never-used warnings under `-D warnings`.
+        let metrics = Metrics::default();
+        <Metrics as VoiceOverflowCounters>::voice_inbox_overflow_dropped(&metrics);
+        <Metrics as VoiceOverflowCounters>::voice_queue_overflow_dropped(&metrics);
+    }
+
+    #[test]
+    fn voice_actor_fair_scheduling_series_are_label_free() {
+        // The fair-scheduling diagnosis is one gauge (the bound) plus two
+        // counters (inbox turns vs dispatch turns), all label-free, so no
+        // guild, member or channel label can reach exposition. The bound
+        // reads 0 until the first actor publishes; the counters only move
+        // when their turn kind runs.
+        let metrics = Metrics::default();
+        let text = metrics.render(None);
+        assert!(text.contains("# TYPE two_bot_voice_actor_inbox_turn_bound gauge\n"));
+        assert!(text.contains("two_bot_voice_actor_inbox_turn_bound 0\n"));
+        assert!(text.contains("# TYPE two_bot_voice_actor_inbox_turns_total counter\n"));
+        assert!(text.contains("two_bot_voice_actor_inbox_turns_total 0\n"));
+        assert!(text.contains("# TYPE two_bot_voice_actor_dispatch_turns_total counter\n"));
+        assert!(text.contains("two_bot_voice_actor_dispatch_turns_total 0\n"));
+        metrics.set_voice_actor_inbox_turn_bound(32);
+        metrics.voice_actor_inbox_turn();
+        metrics.voice_actor_inbox_turn();
+        metrics.voice_actor_dispatch_turn();
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_actor_inbox_turn_bound 32\n"));
+        assert!(text.contains("two_bot_voice_actor_inbox_turns_total 2\n"));
+        assert!(text.contains("two_bot_voice_actor_dispatch_turns_total 1\n"));
+        assert!(!text.contains("two_bot_voice_actor_inbox_turn_bound{"));
+        assert!(!text.contains("two_bot_voice_actor_inbox_turns_total{"));
+        assert!(!text.contains("two_bot_voice_actor_dispatch_turns_total{"));
+        // Last writer wins for the gauge.
+        metrics.set_voice_actor_inbox_turn_bound(8);
+        let text = metrics.render(None);
+        assert!(text.contains("two_bot_voice_actor_inbox_turn_bound 8\n"));
     }
 
     #[test]
@@ -3197,6 +4081,9 @@ mod tests {
         assert!(text.contains("two_bot_voice_live_self_heal_total 0\n"));
         metrics.set_voice_actor_live_not_ready(1, 1, 0);
         metrics.set_voice_actor_live_not_ready(2, 1, 95);
+        assert_eq!(metrics.voice_actor_live_not_ready_secs(1), Some(0));
+        assert_eq!(metrics.voice_actor_live_not_ready_secs(2), Some(95));
+        assert_eq!(metrics.voice_actor_live_not_ready_secs(3), None);
         let text = metrics.render(None);
         assert!(text.contains("two_bot_voice_live_not_ready_seconds 95\n"));
         assert!(!text.contains("two_bot_voice_live_not_ready_seconds{"));
@@ -3312,12 +4199,114 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_eventsub_reconcile_passes_total{outcome=\"failed\"} 100\n"));
         assert!(text.contains("two_bot_eventsub_reconcile_actions_total{action=\"delete\"} 100\n"));
         assert!(
             text.contains("two_bot_eventsub_reconcile_errors_total{error_class=\"other\"} 100\n")
         );
+    }
+
+    #[test]
+    fn ticket_lifecycle_counts_once_per_event_and_by_deleted_count() {
+        let metrics = Metrics::default();
+        metrics.ticket_lifecycle("retire", "retired");
+        metrics.ticket_lifecycle("abandon", "already_gone");
+        metrics.ticket_lifecycle("claim", "claimed");
+        metrics.ticket_lifecycle("close", "closed");
+        metrics.ticket_lifecycle_n("purge", "deleted", 2);
+        metrics.ticket_lifecycle_n("purge", "deleted", 0);
+        metrics.ticket_lifecycle("purge", "pool_closed");
+        let text = metrics.render(None);
+        assert!(text
+            .contains("two_bot_ticket_lifecycle_total{event=\"retire\",outcome=\"retired\"} 1\n"));
+        assert!(text.contains(
+            "two_bot_ticket_lifecycle_total{event=\"abandon\",outcome=\"already_gone\"} 1\n"
+        ));
+        assert!(text
+            .contains("two_bot_ticket_lifecycle_total{event=\"claim\",outcome=\"claimed\"} 1\n"));
+        assert!(
+            text.contains("two_bot_ticket_lifecycle_total{event=\"close\",outcome=\"closed\"} 1\n")
+        );
+        assert!(text
+            .contains("two_bot_ticket_lifecycle_total{event=\"purge\",outcome=\"deleted\"} 2\n"));
+        assert!(text.contains(
+            "two_bot_ticket_lifecycle_total{event=\"purge\",outcome=\"pool_closed\"} 1\n"
+        ));
+        // Fixed cardinality: per-event render subsets (22 series), not the
+        // full 5 x 18 cross product, so exposition fits the Worker scrape
+        // body cap. Every event renders its success outcomes plus the
+        // `query` collapse trapdoor; purge adds the full `db_cause` set.
+        let series: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("two_bot_ticket_lifecycle_total{"))
+            .collect();
+        assert_eq!(series.len(), 22);
+        for (event, outcomes) in [
+            ("retire", vec!["retired", "query"]),
+            ("abandon", vec!["abandoned", "already_gone", "query"]),
+            (
+                "purge",
+                vec![
+                    "deleted",
+                    "unique_violation",
+                    "foreign_key_violation",
+                    "not_null_violation",
+                    "check_violation",
+                    "exclusion_violation",
+                    "database",
+                    "pool_timeout",
+                    "pool_closed",
+                    "worker_crashed",
+                    "connection",
+                    "row_not_found",
+                    "query",
+                ],
+            ),
+            ("claim", vec!["claimed", "query"]),
+            ("close", vec!["closed", "query"]),
+        ] {
+            let prefix = format!("two_bot_ticket_lifecycle_total{{event=\"{event}\",outcome=\"");
+            let rendered: Vec<_> = series
+                .iter()
+                .filter_map(|line| line.strip_prefix(prefix.as_str()))
+                .filter_map(|rest| rest.split_once('"').map(|(outcome, _)| outcome))
+                .collect();
+            assert_eq!(rendered, outcomes, "render subset for {event}");
+        }
+        assert_eq!(TICKET_LIFECYCLE_EVENTS.len(), 5);
+        assert_eq!(TICKET_LIFECYCLE_OUTCOMES.len(), 18);
+    }
+
+    #[test]
+    fn lifecycle_render_subsets_are_closed_world() {
+        // Unknown events never render, and known events render only their
+        // subset: a pair no emitter can produce stays out of exposition.
+        assert!(!lifecycle_series_rendered("evil", "retired"));
+        assert!(!lifecycle_series_rendered("retire", "evil"));
+        assert!(!lifecycle_series_rendered("retire", "deleted"));
+        assert!(!lifecycle_series_rendered("claim", "pool_closed"));
+        assert!(lifecycle_series_rendered("purge", "pool_closed"));
+        assert!(lifecycle_series_rendered("close", "query"));
+    }
+
+    #[test]
+    fn ticket_lifecycle_hostile_labels_collapse_without_new_series() {
+        let metrics = Metrics::default();
+        let before = metrics.render(None).lines().count();
+        for id in 0..100 {
+            let hostile = format!("{id}\"\\\nsecret=value");
+            metrics.ticket_lifecycle(&hostile, &hostile);
+        }
+        let text = metrics.render(None);
+        assert_eq!(text.lines().count(), before);
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
+        assert!(text
+            .contains("two_bot_ticket_lifecycle_total{event=\"close\",outcome=\"query\"} 100\n"));
     }
 
     #[test]
@@ -3349,23 +4338,32 @@ mod tests {
         let text = metrics.render(None);
         assert!(text.contains("two_bot_gateway_disconnects_total 0\n"));
         assert!(text.contains("two_bot_gateway_missed_events_total 0\n"));
+        assert!(text.contains("two_bot_gateway_rsvp_refused_total 0\n"));
         metrics.gateway_disconnect();
         metrics.gateway_missed_events(0);
         metrics.gateway_missed_events(3);
+        metrics.gateway_rsvp_refused();
         let text = metrics.render(None);
         assert!(text.contains("two_bot_gateway_disconnects_total 1\n"));
         assert!(text.contains("two_bot_gateway_missed_events_total 3\n"));
+        assert!(text.contains("two_bot_gateway_rsvp_refused_total 1\n"));
         {
             let mut values = metrics.0.lock().unwrap();
             values.disconnects = u64::MAX;
             values.missed_events = u64::MAX;
+            values.rsvp_refused = u64::MAX;
         }
         metrics.gateway_disconnect();
         metrics.gateway_missed_events(9);
+        metrics.gateway_rsvp_refused();
         let text = metrics.render(None);
         assert!(text.contains(&format!("two_bot_gateway_disconnects_total {}\n", u64::MAX)));
         assert!(text.contains(&format!(
             "two_bot_gateway_missed_events_total {}\n",
+            u64::MAX
+        )));
+        assert!(text.contains(&format!(
+            "two_bot_gateway_rsvp_refused_total {}\n",
             u64::MAX
         )));
     }
@@ -3459,7 +4457,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(text.contains("two_bot_feed_fetches_total{outcome=\"failure\"} 100\n"));
         assert!(text.contains("two_bot_feed_fetch_errors_total{error_class=\"other\"} 100\n"));
     }
@@ -3535,7 +4535,9 @@ mod tests {
         }
         let text = metrics.render(None);
         assert_eq!(text.lines().count(), before);
-        assert!(!text.contains("secret"));
+        // `invalid_secret` is a legitimate bounded kind: match the hostile
+        // `secret=value` injection marker, not the bare substring.
+        assert!(!text.contains("secret="));
         assert!(
             text.contains("two_bot_automod_decisions_total{outcome=\"sanction_refused\"} 100\n")
         );

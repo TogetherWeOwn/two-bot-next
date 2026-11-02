@@ -7,6 +7,10 @@
 //! `record_fact` with the per-join key, carrying its invite attribution; a
 //! redelivered burst dedupes to zero.
 
+#[path = "support/deferred_capture_compat.rs"]
+mod deferred_capture_compat;
+use deferred_capture_compat::Healthy;
+
 use std::str::FromStr;
 
 use sqlx::PgPool;
@@ -127,7 +131,7 @@ impl Fixture {
             .expect("create migrated test database; no credential fallback");
         let pool = db.pool().clone();
         let buffer = DeferredCommunityFacts::new();
-        buffer.enable(pool.clone());
+        buffer.enable(pool.clone()).healthy();
         let pipeline = Pipeline::new(
             MemStore::new(),
             Some(NoopLeveling),
@@ -146,7 +150,10 @@ impl Fixture {
     /// Drain the shared sink: returns the inserted count (a redelivered clear
     /// dedupes to zero through the once-per-member key).
     async fn drain(&self) -> usize {
-        assert!(!self.buffer.is_empty(), "gate-clear must buffer a fact");
+        assert!(
+            !self.buffer.is_empty().healthy(),
+            "gate-clear must buffer a fact"
+        );
         self.buffer.drain().await.expect("drain persists")
     }
 }
@@ -223,7 +230,11 @@ async fn member_join_drains_one_fact_and_dedupes_repeats() {
         &pending_join_event(MEMBER, "12:00:00"),
         "2026-09-20T12:10:00.000Z",
     );
-    assert_eq!(fx.buffer.joins_len(), 1, "join must buffer a fact");
+    assert_eq!(
+        fx.buffer.joins_len().healthy(),
+        1,
+        "join must buffer a fact"
+    );
     assert_eq!(fx.buffer.drain().await.expect("drain persists"), 1);
 
     let row: (String, String, String, String, String, String, Option<String>) = sqlx::query_as(
@@ -262,7 +273,11 @@ async fn member_join_drains_one_fact_and_dedupes_repeats() {
         &pending_join_event(MEMBER, "12:00:00"),
         "2026-09-20T12:10:00.000Z",
     );
-    assert_eq!(fx.buffer.joins_len(), 1, "the burst buffers, then loses");
+    assert_eq!(
+        fx.buffer.joins_len().healthy(),
+        1,
+        "the burst buffers, then loses"
+    );
     assert_eq!(fx.buffer.drain().await.expect("retry dedupes"), 0);
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM community_facts WHERE event_type='member_joined'")

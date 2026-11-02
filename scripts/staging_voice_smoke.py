@@ -111,8 +111,56 @@ WORKER_ALLOWED_COMPONENTS = frozenset({"process", "gateway", "database", "token_
 AWAITING_REGISTRATION = "awaiting voice command registration"
 
 
+# Strings are skipped whole, so brackets inside them never count. An
+# unterminated string runs to the end, which keeps the scan linear.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
+# CPython's old default recursion limit, which bounded the C JSON decoder.
+MAX_JSON_DEPTH = 1000
+
+
+def _loads_bounded(raw, **kwargs):
+    """json.loads with a lexical nesting bound that raises RecursionError.
+
+    Newer CPython sizes the decoder's recursion guard from the real C stack
+    and decodes 10,000 levels, so the bound no longer depends on the
+    interpreter: existing RecursionError refusals keep working unchanged.
+    """
+    # Decode bytes exactly as json.loads would, then scan and parse that text.
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
+    depth = 0
+    for match in JSON_TOKEN.finditer(raw):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise RecursionError("JSON nesting exceeds the decoder bound")
+        elif token in "]}":
+            depth -= 1
+    return json.loads(raw, **kwargs)
+
+
 class SmokeError(Exception):
     """A check's one-line failure reason (fixed vocabulary only)."""
+
+
+class DuplicateKeyError(ValueError):
+    """A JSON object repeats a key; the message never carries key/value data."""
+
+
+def _reject_duplicate_keys(pairs):
+    """object_pairs_hook refusing repeats instead of last-wins.
+
+    The json decoder calls this for every object at any depth, after
+    escape decoding, so {"a": 1, "\\u0061": 2} counts as a repeat. The
+    raised message is fixed vocabulary: it names no key, value or path.
+    """
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise DuplicateKeyError("duplicate JSON object key")
+        seen.add(key)
+    return dict(pairs)
 
 
 @dataclass(frozen=True)
@@ -233,7 +281,9 @@ def get_json(fetch_fn, url):
     if len(body) > BODY_CAP:
         raise SmokeError("interactions endpoint answered over the body cap")
     try:
-        return json.loads(body)
+        return _loads_bounded(body, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        raise SmokeError("interactions endpoint answered 200 with duplicate JSON object keys")
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise SmokeError("interactions endpoint answered 200 with invalid JSON")
 
@@ -379,7 +429,10 @@ def check_worker(origin):
     if len(body) > BODY_CAP:
         return [Result("worker-health", "fail", "GET /health answered over the body cap")], None
     try:
-        health = json.loads(body)
+        health = _loads_bounded(body, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        return [Result("worker-health", "fail",
+                       "GET /health carries duplicate JSON object keys")], None
     except (ValueError, UnicodeDecodeError, RecursionError):
         return [Result("worker-health", "fail", "GET /health answered without JSON")], None
     results = []
@@ -399,7 +452,11 @@ def check_worker(origin):
         results.append(Result("worker-readyz", "fail", "GET /readyz answered over the body cap"))
         return results, None
     try:
-        report = json.loads(body)
+        report = _loads_bounded(body, object_pairs_hook=_reject_duplicate_keys)
+    except DuplicateKeyError:
+        results.append(Result("worker-readyz", "fail",
+                              "GET /readyz carries duplicate JSON object keys"))
+        return results, None
     except (ValueError, UnicodeDecodeError, RecursionError):
         results.append(Result("worker-readyz", "fail", "GET /readyz answered without JSON"))
         return results, None

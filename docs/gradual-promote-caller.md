@@ -10,7 +10,7 @@ its gated cutover path (see `docs/production-deploy.md`).
 `bin/smoke.mjs` is the caller's health checker. The action invokes it as:
 
 ```sh
-node bin/smoke.mjs "https://$DOMAIN" [--allow-indexable] --version-override '<worker-name>="<lowercase-version-uuid>"'
+node bin/smoke.mjs "https://$DOMAIN" [--allow-indexable] [--json] --version-override '<worker-name>="<lowercase-version-uuid>"'
 ```
 
 - At the 5%, 50% and 100-override stages the override pins probes to the NEW
@@ -23,7 +23,26 @@ Each pass probes `GET /health` (200 JSON `{"status":"ok"}`) and `GET /readyz`
 (200 only when every component is ready; 503 otherwise). Under an override,
 the Worker-stamped `x-two-worker-version` header must equal the override
 UUID, so a silent fallback to the old version fails instead of passing on
-the wrong build. Both probes require `x-content-type-options: nosniff`.
+the wrong build. Without an override the live version must still be a present
+lowercase UUID. Both probes require `x-content-type-options: nosniff`.
+
+Each probe body is read incrementally and refused above 16 KiB of actual
+bytes (`MAX_PROBE_BYTES` in `bin/smoke.mjs`); Content-Length is never
+trusted, the unread tail is cancelled, and a refused body never counts as
+health evidence. One 5 s whole-request deadline bounds each fetch plus its
+body read. Remote header values and bodies never appear in diagnostics:
+mismatches carry fixed codes (`missing`, `mismatch`, `not_nosniff`,
+`bad_media`, `over_budget`, `probe_error`, ...) instead.
+
+`--json` logs exactly one `smoke.v1` object to stdout and nothing else, so
+promotion automation can parse it directly: `verdict` (`pass`/`fail`,
+matching the boolean result and exit 0/1), `reason_code` (`ok` iff pass,
+else `<route>_<check>_<code>`), `next_action` (`none` iff pass, else
+`check_service`, `check_edge`, `check_canary` or `retry_probe`), and `routes`
+with stable IDs `["health","readyz"]` plus per-route checks with stable
+`<route>.<name>` IDs (`status`, `security`, `version`, `media` on health,
+`budget`, `shape`). Default text output, the override contract and exit
+codes stay unchanged; probes stay GET-only with manual redirects.
 
 `--allow-indexable` is accepted for the apex contract and changes no
 assertion: this Worker serves no indexable HTML (health, readiness, ops and
@@ -48,7 +67,13 @@ promotion here additionally needs a Durable Object config without `exports`
 unsupported for gradual deployments) or a separate non-DO fixture Worker.
 
 Contract tests live in `wrangler/test/smoke-checker.test.ts` (loopback stub;
-no staging call, no secret).
+no staging call, no secret) with bounded-intake and JSON verdict coverage in
+`wrangler/test/smoke-bounded-intake-acceptance.test.ts`. Run the smoke
+fixtures from `wrangler/` with:
+
+```sh
+npm run test:smoke
+```
 
 ## Pinned caller
 
