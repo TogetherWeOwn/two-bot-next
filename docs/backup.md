@@ -122,7 +122,11 @@ standalone settings allocator, `{table, column, lastValue, isCalled, increment}`
 read from the sequence itself. Rows cannot show values that were handed out
 and then deleted; the marks can. Sequences are not MVCC, so a mark is the
 position when the dump read it, at or beyond every value in the snapshot. The
-dump role needs `SELECT` on those sequences. Values are stored in Postgres text-output
+dump role needs `SELECT` on those sequences. It also needs `SELECT` on the
+cutover migration ledger (`_sqlx_migrations`) when that table exists: the
+manifest records the applied cutover migrations as restore's evidence for the
+0469 replay gate, and an existing ledger the dump role cannot read refuses the
+dump rather than recording it as absent. Values are stored in Postgres text-output
 form with a `$n::type` cast on restore — faithful for every owned type
 without per-type decoding. `column_types` is additive to the legacy envelope.
 Port-written row cells are strings/nulls. Frozen legacy v3 dumps have no
