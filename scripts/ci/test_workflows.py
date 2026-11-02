@@ -8854,12 +8854,20 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(job.get("timeout-minutes"), "45")
 
     def test_nightly_sweep_timeout_ceilings_are_pinned(self):
-        # Schedule/dispatch get 180 minutes for the serial ignored sweep; a PR
-        # run keeps 45. The pin forces a reviewed change to either ceiling.
-        job = self.workflows["nightly.yml"]["jobs"]["sweep"]
+        # Schedule/dispatch get 180 minutes for the serial ignored sweep;
+        # every other event keeps 45. The allow-list form fails closed, so a
+        # future trigger cannot silently inherit the 180-minute ceiling. The
+        # pin forces a reviewed change to either ceiling, and the trigger-set
+        # pin beside it keeps the set the ceilings were chosen for explicit.
+        workflow = self.workflows["nightly.yml"]
+        self.assertEqual(
+            set(workflow.get("on") or {}),
+            {"schedule", "workflow_dispatch", "pull_request"},
+        )
+        job = workflow["jobs"]["sweep"]
         self.assertEqual(
             job.get("timeout-minutes"),
-            "${{ github.event_name == 'pull_request' && 45 || 180 }}",
+            "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}",
         )
 
     def test_nextest_container_pins_disposable_database_service_address(self):
