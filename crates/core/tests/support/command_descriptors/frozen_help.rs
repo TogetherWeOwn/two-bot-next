@@ -41,7 +41,7 @@ const VOICE_LAYOUT: &[Group] = &[
     ),
 ];
 
-pub const RSVP_GUIDANCE: &str = "Paste the event id or its link, e.g. https://discord.com/events/<server-id>/<event-id>.\nTotals include your saved response and saved time; live event availability is not checked.\n";
+pub const RSVP_GUIDANCE: &str = "Paste the event id or link, e.g. https://discord.com/events/<server-id>/<event-id>.\nTotals include your saved response and saved time; live event availability is not checked.\n";
 
 pub const FOOTER: &str =
     "\nThis is the last confirmed command list. Your picker hides gated commands you cannot use.";
@@ -58,7 +58,7 @@ pub fn voice_names() -> impl Iterator<Item = &'static str> {
 pub fn expected_help_text(names: &[&str]) -> String {
     let live: BTreeSet<&str> = names.iter().copied().collect();
     let mut out = format!(
-        "**Server commands** ({} live)\nGated commands need the listed permission.\n",
+        "**Server commands** ({} live)\nGated commands need permission.\n",
         live.len()
     );
     let voice = live.contains("textchannels");

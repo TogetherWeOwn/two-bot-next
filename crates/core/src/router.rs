@@ -2046,9 +2046,9 @@ mod tests {
         assert!(gates.voice && gates.voice_assistant);
     }
 
-    /// The 22 voice names in published order (pinned independently in
+    /// The 23 voice names in published order (pinned independently in
     /// `voice_rooms::tests::voice_command_shapes_and_gates`).
-    const VOICE_NAMES: [&str; 22] = [
+    const VOICE_NAMES: [&str; 23] = [
         "create",
         "setup",
         "ping",
@@ -2071,6 +2071,7 @@ mod tests {
         "public",
         "limit",
         "unlimit",
+        "room-access-inspect",
     ];
 
     fn voice_on() -> RouterGates {
@@ -2100,9 +2101,9 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 46 builtins keep their order; the 21 voice names that survive
+        // 46 builtins keep their order; the 22 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 67);
+        assert_eq!(on.len(), 68);
         assert_eq!(on_names[..46], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
@@ -2171,12 +2172,12 @@ mod tests {
             );
         }
         // Both gates on is the full voice set without the assistant: 46
-        // builtins plus the 21 surviving voice names.
+        // builtins plus the 22 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 67);
+        assert_eq!(both.len(), 68);
     }
 
     #[test]

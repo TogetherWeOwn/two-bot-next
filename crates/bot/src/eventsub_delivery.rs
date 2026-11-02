@@ -69,12 +69,12 @@ pub fn build_delivery_deps(
     announcements_permitted: bool,
 ) -> Result<DeliveryDeps, &'static str> {
     if !announcements_permitted {
-        return Err("receiver_prerequisites_invalid");
+        return Err("receiver_identity_refused");
     }
     let admission = two_bot_core::send_admission::PgSendAdmission::new(pool.clone(), token)
-        .map_err(|_| "receiver_prerequisites_invalid")?;
+        .map_err(|_| "receiver_admission_rejected")?;
     let executor = ActionExecutor::with_admission(token.to_owned(), proxy, Arc::new(admission))
-        .map_err(|_| "receiver_prerequisites_invalid")?;
+        .map_err(|_| "receiver_proxy_invalid")?;
     Ok(DeliveryDeps::production(pool, executor, config))
 }
 
@@ -243,7 +243,7 @@ mod tests {
                         &delivery_config(),
                         permitted,
                     ),
-                    Err("receiver_prerequisites_invalid")
+                    Err("receiver_identity_refused")
                 ),
                 "{label} must refuse delivery deps"
             );
@@ -254,7 +254,7 @@ mod tests {
     async fn build_delivery_deps_refuses_credentials_the_admission_rejects() {
         assert!(matches!(
             build_delivery_deps(lazy_pool(), "has space", None, &delivery_config(), true),
-            Err("receiver_prerequisites_invalid")
+            Err("receiver_admission_rejected")
         ));
     }
 
@@ -269,7 +269,7 @@ mod tests {
                 &delivery_config(),
                 true,
             ),
-            Err("receiver_prerequisites_invalid")
+            Err("receiver_proxy_invalid")
         ));
     }
 

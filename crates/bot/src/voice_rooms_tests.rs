@@ -71,12 +71,18 @@ mod private;
 mod responder_admission_acceptance;
 #[path = "voice_import_review_regressions_tests.rs"]
 mod review_regressions;
+#[path = "voice_room_access_inspect_acceptance_tests.rs"]
+mod room_access_inspect_acceptance;
+#[path = "voice_room_access_inspect_tests.rs"]
+mod room_access_inspect_tests;
 #[path = "voice_setup_access_paging_acceptance_tests.rs"]
 mod setup_access_paging_acceptance;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
 #[path = "voice_snapshot_fence_acceptance_tests.rs"]
 mod snapshot_fence_acceptance;
+#[path = "voice_textchannels_reset_acceptance_tests.rs"]
+mod textchannels_reset_acceptance;
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
 #[path = "voice_votekick_ballot_truth_acceptance_tests.rs"]
@@ -5084,7 +5090,8 @@ fn voice_command_set_is_gated_on_two_voice() {
             "private",
             "public",
             "limit",
-            "unlimit"
+            "unlimit",
+            "room-access-inspect"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
@@ -7810,17 +7817,17 @@ fn parse_textchannels_extracts_every_option() {
         ],
         Some(Permissions::MANAGE_CHANNELS),
     );
-    assert_eq!(
-        parse_voice_command(&interaction),
-        Some(VoiceCommand::TextChannels {
-            channel_id: CREATOR,
-            request: TextChannelsRequest {
-                enabled: Some(false),
-                name: Some("lounge".to_owned()),
-                viewer_role: Some(42),
-            },
-        })
-    );
+    let Some(VoiceCommand::TextChannels {
+        channel_id,
+        request,
+    }) = parse_voice_command(&interaction)
+    else {
+        panic!("textchannels must parse");
+    };
+    assert_eq!(channel_id, CREATOR);
+    assert_eq!(request.enabled, Some(false));
+    assert_eq!(request.name.as_deref(), Some("lounge"));
+    assert_eq!(request.viewer_role, Some(42));
 }
 
 #[test]
@@ -7832,17 +7839,17 @@ fn parse_textchannels_leaves_unset_options_unset() {
         )],
         Some(Permissions::MANAGE_CHANNELS),
     );
-    assert_eq!(
-        parse_voice_command(&interaction),
-        Some(VoiceCommand::TextChannels {
-            channel_id: CREATOR,
-            request: TextChannelsRequest {
-                enabled: None,
-                name: None,
-                viewer_role: None,
-            },
-        })
-    );
+    let Some(VoiceCommand::TextChannels {
+        channel_id,
+        request,
+    }) = parse_voice_command(&interaction)
+    else {
+        panic!("textchannels must parse");
+    };
+    assert_eq!(channel_id, CREATOR);
+    assert_eq!(request.enabled, None);
+    assert_eq!(request.name, None);
+    assert_eq!(request.viewer_role, None);
 }
 
 #[test]
@@ -7918,10 +7925,33 @@ fn textchannels_shape_correction_names_the_field_before_the_usage_example() {
 }
 
 fn request(enabled: Option<bool>, name: Option<&str>, role: Option<u64>) -> TextChannelsRequest {
-    TextChannelsRequest {
-        enabled,
-        name: name.map(str::to_owned),
-        viewer_role: role,
+    // Build old-field requests through the existing parser so additive reset
+    // controls need not change the preserved decision-test fixtures' shape.
+    let mut options = vec![typed_option(
+        "channel",
+        CommandOptionValue::Channel(Id::new(CREATOR)),
+    )];
+    if let Some(value) = enabled {
+        options.push(typed_option("enabled", CommandOptionValue::Boolean(value)));
+    }
+    if let Some(value) = name {
+        options.push(typed_option(
+            "name",
+            CommandOptionValue::String(value.to_owned()),
+        ));
+    }
+    if let Some(value) = role {
+        options.push(typed_option(
+            "viewer-role",
+            CommandOptionValue::Role(Id::new(value)),
+        ));
+    }
+    match parse_voice_command(&textchannels_interaction(
+        options,
+        Some(Permissions::MANAGE_CHANNELS),
+    )) {
+        Some(VoiceCommand::TextChannels { request, .. }) => request,
+        other => panic!("valid old-field request did not parse: {other:?}"),
     }
 }
 
@@ -8035,6 +8065,13 @@ fn command_names_key_the_role_restrictions() {
         );
     }
     assert_eq!(commands[4].name(), "textchannels");
+    // The owner read keeps its own name, so it never inherits another
+    // command's restriction. It is not per-command restrictable: a stored
+    // key would make an older binary reject the guild's whole controls row
+    // on rollback. The guild-wide required role still gates it.
+    let inspect = VoiceCommand::RoomAccessInspect(PageArg::Missing);
+    assert_eq!(inspect.name(), "room-access-inspect");
+    assert!(!two_bot_core::voice_access::VOICE_COMMANDS.contains(&inspect.name()));
 }
 
 #[test]
