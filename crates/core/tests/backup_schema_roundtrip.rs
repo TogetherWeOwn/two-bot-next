@@ -1166,11 +1166,22 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         mirror_fields, control_fields_after,
         "the replay syncs the legacy mirror columns to the enforced values"
     );
-    // The translated restrictions are what the command gate enforces: decode
-    // the restored rows into gate controls and evaluate a non-admin member.
+    // Gate decisions, not row equality: decode every restored row in full —
+    // creation switch, required role and per-command restrictions — and run
+    // non-admin members through the runtime gates, for all four merge cases.
     let gate_controls = |guild: &str| AccessControls {
-        room_creation_enabled: true,
-        required_role: None,
+        room_creation_enabled: control_fields_after
+            .iter()
+            .find(|(g, ..)| g == guild)
+            .unwrap()
+            .1,
+        required_role: control_fields_after
+            .iter()
+            .find(|(g, ..)| g == guild)
+            .unwrap()
+            .2
+            .as_deref()
+            .map(|id| id.parse().unwrap()),
         command_roles: command_roles
             .iter()
             .find(|(g, _)| g == guild)
@@ -1191,42 +1202,35 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
             })
             .collect(),
     };
-    let roleless = AccessMember {
+    let member = |roles: &[u64]| AccessMember {
         is_admin: false,
-        roles: Vec::new(),
+        roles: roles.to_vec(),
     };
-    assert_eq!(
-        may_use_command(&gate_controls("100000000000000003"), &roleless, "private"),
-        AccessDecision::Deny(AccessDenyReason::CommandRestricted),
-        "the legacy-only restriction is enforced after restore"
+    let roleless = member(&[]);
+    // ...001: the enforced values were already tighter, so the displaced
+    // legacy command role admits nobody and the enforced one still does.
+    let enforced = gate_controls("100000000000000001");
+    assert!(
+        !may_create_room(&enforced),
+        "guild ...001's enforced creation switch stays off"
     );
     assert_eq!(
-        may_use_command(
-            &gate_controls("100000000000000003"),
-            &AccessMember {
-                is_admin: false,
-                roles: vec![100_000_000_000_000_044],
-            },
-            "private",
-        ),
+        may_use_command(&enforced, &member(&[100_000_000_000_000_040]), "create"),
         AccessDecision::Allow,
-        "the translated member role still admits its holders"
+        "holders of guild ...001's enforced role pass the gate"
     );
     assert_eq!(
-        may_use_command(&gate_controls("100000000000000001"), &roleless, "limit"),
+        may_use_command(&enforced, &member(&[100_000_000_000_000_043]), "create"),
+        AccessDecision::Deny(AccessDenyReason::RequiredRole),
+        "guild ...001's displaced legacy role is not let back in"
+    );
+    assert_eq!(
+        may_use_command(&enforced, &member(&[100_000_000_000_000_040]), "limit"),
         AccessDecision::Deny(AccessDenyReason::CommandRestricted),
         "a legacy restriction with no member roles denies every non-admin"
     );
-    // The merged switch and role are what the runtime gates read: decode
-    // guild ...002's restored row in full and evaluate both gates.
-    let merged = AccessControls {
-        room_creation_enabled: control_fields_after[1].1,
-        required_role: control_fields_after[1]
-            .2
-            .as_deref()
-            .map(|id| id.parse().unwrap()),
-        command_roles: gate_controls("100000000000000002").command_roles,
-    };
+    // ...002: the imported switch and role land on a permissive row.
+    let merged = gate_controls("100000000000000002");
     assert!(
         !may_create_room(&merged),
         "the imported creation switch is off after restore"
@@ -1237,16 +1241,53 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         "the imported command role gates after restore"
     );
     assert_eq!(
-        may_use_command(
-            &merged,
-            &AccessMember {
-                is_admin: false,
-                roles: vec![100_000_000_000_000_045],
-            },
-            "create",
-        ),
+        may_use_command(&merged, &member(&[100_000_000_000_000_045]), "create"),
         AccessDecision::Allow,
         "holders of the imported role still pass the gate"
+    );
+    // ...003: the imported role lands on the row the 0469 replay inserted,
+    // on top of the translated 'private' restriction, so a member needs
+    // both roles: either one alone is denied by the other gate.
+    let inserted = gate_controls("100000000000000003");
+    assert!(
+        may_create_room(&inserted),
+        "guild ...003 created no legacy switch, so creation stays on"
+    );
+    assert_eq!(
+        may_use_command(&inserted, &roleless, "private"),
+        AccessDecision::Deny(AccessDenyReason::RequiredRole),
+        "the imported role gates before the per-command restriction"
+    );
+    assert_eq!(
+        may_use_command(&inserted, &member(&[100_000_000_000_000_044]), "private"),
+        AccessDecision::Deny(AccessDenyReason::RequiredRole),
+        "the per-command role alone does not clear the imported role gate"
+    );
+    assert_eq!(
+        may_use_command(&inserted, &member(&[100_000_000_000_000_046]), "private"),
+        AccessDecision::Deny(AccessDenyReason::CommandRestricted),
+        "the imported role alone does not clear the per-command restriction"
+    );
+    assert_eq!(
+        may_use_command(
+            &inserted,
+            &member(&[100_000_000_000_000_044, 100_000_000_000_000_046]),
+            "private",
+        ),
+        AccessDecision::Allow,
+        "holders of both roles pass both gates"
+    );
+    // ...004: the translation inserts the enforced row with creation off;
+    // the switch gates creation only, never commands on existing rooms.
+    let switched_off = gate_controls("100000000000000004");
+    assert!(
+        !may_create_room(&switched_off),
+        "guild ...004's inserted row carries the imported creation switch"
+    );
+    assert_eq!(
+        may_use_command(&switched_off, &roleless, "limit"),
+        AccessDecision::Allow,
+        "the creation switch is not a command gate"
     );
     for legacy in ["voice_command_roles", "voice_command_role_members"] {
         let count: i64 = sqlx::query_scalar(audited(format!(
