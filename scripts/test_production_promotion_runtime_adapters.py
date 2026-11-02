@@ -555,6 +555,31 @@ class ColdAndLagServingTests(unittest.TestCase):
                 self.assert_refused(result)
                 self.assertEqual(result[3].runtime_calls, [])
 
+    def test_preflight_timeout_names_rollout_listing_wait(self):
+        routes = self.live_routes(converged_row(ROLL_ID, PROD_IMAGE))
+        routes[f"/containers/applications/{APP_ID}/rollouts?limit=100"] = \
+            lambda: []
+        code, message, proof, plane, _ = self.attempt(
+            routes=routes, preflight=True, url=None)
+        self.assert_refused((code, message, proof, plane, None))
+        self.assertIn("(awaiting_rollout_listing)", message)
+        self.assertEqual(plane.runtime_calls, [])
+
+    def test_preflight_timeout_names_application_config_wait(self):
+        routes = self.live_routes(converged_row(ROLL_ID, PROD_IMAGE),
+                                  app_image=OLD_IMAGE)
+        code, message, proof, plane, _ = self.attempt(
+            routes=routes, preflight=True, url=None)
+        self.assert_refused((code, message, proof, plane, None))
+        self.assertIn("(awaiting_application_config)", message)
+        self.assertEqual(plane.runtime_calls, [])
+
+    def test_final_timeout_without_url_names_runtime_convergence_wait(self):
+        result = self.attempt(self.lag_row(), url=None)
+        self.assert_refused(result)
+        self.assertIn("(awaiting_runtime_convergence)", result[1])
+        self.assertEqual(result[3].runtime_calls, [])
+
     def test_both_lag_shapes_need_two_exact_live_health_and_readyz_confirmations(self):
         for active, healthy in ((0, 1), (1, 0)):
             for dictionary in (False, True):

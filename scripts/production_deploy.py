@@ -377,6 +377,10 @@ def serving(args):
         client = rollback.base.Client(account, os.environ.get("CLOUDFLARE_API_TOKEN"), deadline)
         lag_streak = 0
         lag_identity = None
+        # Fixed-vocabulary wait class for the timeout verdict below: what the
+        # last unaccepted poll was still waiting on. Remote values never enter
+        # diagnostics, so the verdict stays greppable after a 600s expiry.
+        unready = None
         while time.monotonic() < deadline:
             version = rollback.serving_version(client, rollback.WORKERS["production"])
             if version != args.expected_worker_version:
@@ -427,9 +431,16 @@ def serving(args):
             if not accepted:
                 # Empty/stale listings and any unready poll break consecutive
                 # confirmations, including when application state lags.
-                if row is None or not app_matches:
+                if row is None:
                     lag_streak = 0
                     lag_identity = None
+                    unready = "awaiting_rollout_listing"
+                elif not app_matches:
+                    lag_streak = 0
+                    lag_identity = None
+                    unready = "awaiting_application_config"
+                else:
+                    unready = "awaiting_runtime_convergence"
                 time.sleep(min(5, max(0, deadline - time.monotonic())))
                 continue
             # Re-read after every accepted observation: an intervening secret-
@@ -448,7 +459,10 @@ def serving(args):
             return 0
     except (OSError, ValueError, RecursionError, rollback.GateError):
         return reject("serving: promoted production identity refused")
-    return reject("serving: promoted production identity refused; image did not converge")
+    verdict = "serving: promoted production identity refused; image did not converge"
+    if unready:
+        verdict += f" ({unready})"
+    return reject(verdict)
 
 
 def excerpt(args):
