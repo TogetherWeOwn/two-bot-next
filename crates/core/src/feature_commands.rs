@@ -219,6 +219,48 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
             )
             .required()
             .max_length(MAX_COMMAND_NAME_CHARS as u32)]),
+        // Next-only in-place correction (parity row 49): PATCH-like, so an
+        // omitted `template`, `description` or `text-trigger` keeps its saved
+        // value. `clear-trigger:true` is the only way to remove a trigger.
+        // `/command` stays full replacement. Published after `command-enable`;
+        // a reserved builtin name, so a stored row can never execute under it.
+        CommandDefinition::new(
+            "command-edit",
+            "Correct one saved custom command, keeping omitted fields",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "name",
+                "Saved command name, a-z 0-9 _ -",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32),
+            CommandOption::new(
+                "template",
+                "New response text (omit to keep the saved text)",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_TEMPLATE_CHARS as u32),
+            CommandOption::new(
+                "description",
+                "New command-picker description (omit to keep it)",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_DESCRIPTION_CHARS as u32),
+            CommandOption::new(
+                "text-trigger",
+                "New !trigger (omit to keep it)",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_TEXT_TRIGGER_CHARS as u32),
+            CommandOption::new(
+                "clear-trigger",
+                "True removes the !trigger (not with text-trigger)",
+                CommandOptionType::Boolean,
+            ),
+        ]),
         CommandDefinition::new("schedule", "Schedule a message, once or recurring")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![
@@ -763,7 +805,7 @@ mod tests {
 
     #[test]
     fn slice2_names_match_legacy_in_order() {
-        assert_eq!(automation_commands().len(), 13);
+        assert_eq!(automation_commands().len(), 14);
         assert_eq!(
             names(&feature_commands()),
             [
@@ -775,6 +817,7 @@ mod tests {
                 "command-clone",
                 "command-disable",
                 "command-enable",
+                "command-edit",
                 "schedule",
                 "schedule-remove",
                 "schedule-list",
@@ -800,8 +843,8 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 7 core + 1 scorecard + 13 automation + 12 announcements.
-        assert_eq!(merged.len(), 33);
+        // 7 core + 1 scorecard + 14 automation + 12 announcements.
+        assert_eq!(merged.len(), 34);
         assert_eq!(
             &names(&merged)[..8],
             [
@@ -839,6 +882,7 @@ mod tests {
             "command-clone",
             "command-disable",
             "command-enable",
+            "command-edit",
             "schedule",
             "schedule-remove",
             "schedule-list",
@@ -891,6 +935,10 @@ mod tests {
             ("command-clone", 1, 32),
             ("command-disable", 0, 32),
             ("command-enable", 0, 32),
+            ("command-edit", 0, 32),
+            ("command-edit", 1, 2000),
+            ("command-edit", 2, 100),
+            ("command-edit", 3, 33),
             ("schedule", 0, 2000),
             ("schedule-remove", 0, 128),
             ("sticky", 0, 2000),
@@ -1155,8 +1203,8 @@ mod tests {
         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
         assert_eq!(json[0]["options"][0]["max_length"], 128);
         // Saved-response inspection publishes after `command-list`, the
-        // clone immediately after inspection, then pause/resume, and giveaway
-        // after sticky-remove; none replaces an existing command.
+        // clone immediately after inspection, then pause/resume, in-place
+        // editing after resume, and giveaway after sticky-remove.
         assert_eq!(json[4]["name"], "command-inspect");
         assert_eq!(json[4]["options"][2]["max_length"], 500);
         assert_eq!(json[5]["name"], "command-clone");
@@ -1166,11 +1214,21 @@ mod tests {
         assert_eq!(json[7]["name"], "command-enable");
         assert_eq!(json[7]["default_member_permissions"], "32");
         assert_eq!(json[7]["options"].as_array().expect("options").len(), 1);
-        assert_eq!(json[13]["name"], "giveaway");
-        assert_eq!(json[13]["default_member_permissions"], "32");
-        assert_eq!(json[15]["name"], "rsvp-attendance");
-        assert!(json[15].get("default_member_permissions").is_none());
-        assert_eq!(json[15]["options"][0]["name"], "event-id");
+        assert_eq!(json[8]["name"], "command-edit");
+        assert_eq!(json[8]["default_member_permissions"], "32");
+        let edit_options = json[8]["options"].as_array().expect("options");
+        assert_eq!(edit_options.len(), 5);
+        assert_eq!(edit_options[0]["required"], true);
+        for option in &edit_options[1..] {
+            assert!(option.get("required").is_none_or(|r| r == false));
+        }
+        assert_eq!(edit_options[4]["name"], "clear-trigger");
+        assert_eq!(edit_options[4]["type"], 5);
+        assert_eq!(json[14]["name"], "giveaway");
+        assert_eq!(json[14]["default_member_permissions"], "32");
+        assert_eq!(json[16]["name"], "rsvp-attendance");
+        assert!(json[16].get("default_member_permissions").is_none());
+        assert_eq!(json[16]["options"][0]["name"], "event-id");
     }
 
     #[test]

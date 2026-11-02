@@ -1,10 +1,12 @@
 # Dashboard sticky configuration contract
 
-Status: **Proposed; design only**, 2026-10-26. Intent review by 2026-11-02.
-Source inventory: `e1868d97d3519cae3f2ed91726e83e98f77dff0d`.
-This is the repository source of truth for a future single-channel editor, not
-an available page, endpoint, permission, schema migration or activation. Nothing
-here authorizes a build or changes a sticky. Source-shipped is not deployed.
+Status: **Deferred to the two-web-next roadmap** (owner decision 2026-11-01).
+Build the bot half only when a two-web-next goal claims this page. Original
+proposal: written 2026-10-26. Source inventory:
+`e1868d97d3519cae3f2ed91726e83e98f77dff0d`. This is the repository source of
+truth for a future single-channel editor, not an available page, endpoint,
+permission, schema migration or activation. Nothing here authorizes a build or
+changes a sticky. Source-shipped is not deployed.
 
 ## Decision and no-build alternative
 

@@ -31,7 +31,8 @@ run_link = incident_issue.run_link
 INCIDENT_KEY = "daily-digest"
 
 SHA = re.compile(r"[0-9a-f]{40}")
-TAG = re.compile(r"v[0-9]{4}\.[0-9]{2}\.[0-9]{2}")
+# Legacy daily digests (vYYYY.MM.DD) or stable CalVer digests (vYYYY.MDD.P).
+TAG = re.compile(r"v[0-9]{4}\.(?:[0-9]{2}\.[0-9]{2}|[1-9][0-9]{2,3}\.(?:0|[1-9][0-9]*))")
 
 
 def printable(value):
@@ -58,7 +59,7 @@ def main(argv=None):
         print("digest_alert: refusing: live SHA is not 40 hex", file=sys.stderr)
         return 1
     if args.prev_tag and not TAG.fullmatch(args.prev_tag):
-        print("digest_alert: refusing: prev tag is not vYYYY.MM.DD", file=sys.stderr)
+        print("digest_alert: refusing: prev tag is not vYYYY.MM.DD or vYYYY.MDD.P", file=sys.stderr)
         return 1
     content = build_content(args.live_sha, args.prev_tag, run_link())
     print(content)

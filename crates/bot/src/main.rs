@@ -267,9 +267,18 @@ async fn run(cli_args: &[String]) {
             std::process::exit(1);
         }
         tracing::warn!(msg = "config_invalid", reason = %err, "config invalid; continuing with safe defaults");
+        // `Config::from_env` only fails on `GUILD_ID`; keep the token and
+        // database values from the environment so an invalid guild does not
+        // misreport as `receiver_token_missing`. The guild stays `None` and
+        // surfaces through the store refusal, whose catalog row names both
+        // `DATABASE_URL` and `GUILD_ID`.
         Config {
-            discord_token: None,
-            database_url: None,
+            discord_token: std::env::var("DISCORD_TOKEN")
+                .ok()
+                .map(two_bot_core::Secret::new),
+            database_url: std::env::var("DATABASE_URL")
+                .ok()
+                .map(two_bot_core::Secret::new),
             // Gateway config errors must not move the listener away from
             // the Worker probes and Docker healthcheck's configured address.
             listen_addr: std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_owned()),
@@ -449,18 +458,20 @@ async fn run(cli_args: &[String]) {
                     tracing::error!(error_class, "eventsub startup refused");
                     std::process::exit(1);
                 };
-                let Some(db) = store.as_ref() else {
-                    refuse("receiver_prerequisites_invalid")
-                };
-                let pool = db.pool().clone();
+                // A missing token also prevents pool construction; report
+                // that cause before checking the store it depends on.
                 let Some(token) = config
                     .discord_token
                     .as_ref()
                     .map(|secret| secret.expose().as_str())
                     .filter(|token| !token.is_empty())
                 else {
-                    refuse("receiver_prerequisites_invalid")
+                    refuse("receiver_token_missing")
                 };
+                let Some(db) = store.as_ref() else {
+                    refuse("receiver_store_missing")
+                };
+                let pool = db.pool().clone();
                 let proxy = std::env::var("DISCORD_API_BASE")
                     .ok()
                     .filter(|value| !value.is_empty());

@@ -281,6 +281,44 @@ pub fn export_configuration(
     Ok(compact)
 }
 
+/// Remove role IDs the guild no longer has from `settings.command_roles`
+/// and return how many went. `/access restrict` stores live role IDs and
+/// nothing prunes them when Discord deletes a role, so without this `/export`
+/// would refuse the whole guild. Enforcement is unchanged: nobody holds a
+/// deleted role, and a restriction left with no roles still denies every
+/// non-admin, which is what it did before.
+///
+/// Prunes nothing unless the inventory holds the guild's `@everyone` role
+/// (its ID is the guild ID), which Discord always sends with the full role
+/// list. Without it the role cache is not loaded and an absent role may be
+/// live, so export keeps refusing rather than writing a backup that would
+/// drop a live role on re-import.
+///
+/// The inventory is a snapshot taken when the `/export` interaction arrived,
+/// before the configuration is read. A role created after that snapshot and
+/// saved by `/access` in between is absent yet live, so only roles whose
+/// snowflake predates `snapshot_id` (the interaction ID) are pruned. A newer
+/// absent role, or one that is not a snowflake, is kept, and export refuses.
+pub fn drop_deleted_command_roles(
+    config: &mut VoiceConfiguration,
+    inventory: &GuildInventory,
+    snapshot_id: u64,
+) -> usize {
+    if inventory.roles.get(&inventory.guild_id) != Some(&inventory.guild_id) {
+        return 0;
+    }
+    let mut dropped = 0;
+    for restriction in &mut config.settings.command_roles {
+        let before = restriction.role_ids.len();
+        restriction.role_ids.retain(|role| {
+            inventory.roles.get(role) == Some(&inventory.guild_id)
+                || !role.parse::<u64>().is_ok_and(|id| id < snapshot_id)
+        });
+        dropped += before - restriction.role_ids.len();
+    }
+    dropped
+}
+
 pub fn validate_configuration(
     config: &VoiceConfiguration,
     inventory: &GuildInventory,

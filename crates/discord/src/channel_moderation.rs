@@ -1,6 +1,11 @@
 //! Channel handlers after shared-router adjudication. All HTTP uses ActionExecutor;
 //! the durable store owns replay, channel exclusion and exact overwrite recovery.
 
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -9,16 +14,24 @@ use twilight_model::{
         application_command::{CommandData, CommandOptionValue},
         Interaction, InteractionData, InteractionType,
     },
-    channel::message::MessageFlags,
+    channel::message::{
+        component::{ActionRow, Button, ButtonStyle},
+        Component, MessageFlags,
+    },
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 use two_bot_core::{
     channel_moderation::{self as domain, ChannelOutcome, EveryoneOverwrite, UnlockPlan},
+    lockdown_preview::{plan_preview, PreviewError, PreviewSnapshot},
     ChannelAuditRow, ChannelClaim, ChannelClaimTicket, ChannelModerationStore, HandlerId,
     InteractionHandler, InteractionRouter, LockdownRecord, ModerationAction, SlashOutcome,
 };
 
 use crate::{
+    lockdown_preview::{
+        cancel_custom_id, confirm_custom_id, preview_audit_metadata, render_preview, PendingEntry,
+        PendingStore, RateLimiter, PREVIEW_TTL_SECS,
+    },
     route_interaction, ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordError,
     RoutedInteraction,
 };
@@ -43,7 +56,11 @@ pub fn register_channel_handlers(router: &mut InteractionRouter) {
     {
         router.register(Box::new(ChannelHandler(HandlerId::Moderation(action))));
     }
-    for handler in [HandlerId::PurgePreview, HandlerId::ChannelInspect] {
+    for handler in [
+        HandlerId::PurgePreview,
+        HandlerId::ChannelInspect,
+        HandlerId::LockdownPreview,
+    ] {
         router.register(Box::new(ChannelHandler(handler)));
     }
 }
@@ -53,6 +70,12 @@ pub struct ChannelReply {
     pub text: String,
     pub outcome: String,
     pub replayed: bool,
+    /// Present only on an armed `/lockdown-preview` render: the first 32 hex
+    /// characters of the preview digest. `respond` attaches the Confirm /
+    /// Cancel buttons from it; the confirm slice consumes the pending entry.
+    /// Absent on every other reply, including unarmed previews.
+    #[serde(default)]
+    pub digest32: Option<String>,
 }
 
 impl ChannelReply {
@@ -61,10 +84,11 @@ impl ChannelReply {
             text: text.into(),
             outcome: "refused".to_owned(),
             replayed: false,
+            digest32: None,
         }
     }
     fn uncertain() -> Self {
-        Self { text: "This channel action is in progress or requires reconciliation; no new mutation was attempted.".to_owned(), outcome: "in_progress".to_owned(), replayed: false }
+        Self { text: "This channel action is in progress or requires reconciliation; no new mutation was attempted.".to_owned(), outcome: "in_progress".to_owned(), replayed: false, digest32: None }
     }
 }
 
@@ -92,6 +116,19 @@ pub enum ChannelResponseError {
 pub struct ChannelModerationRuntime {
     store: ChannelModerationStore,
     executor: ActionExecutor,
+    /// Armed `/lockdown-preview` entries: in-memory only, gone on
+    /// consume/cancel/expiry/restart. Shared across clones so a spawned
+    /// responder observes the same pending set. Short critical sections,
+    /// never held across an await.
+    preview_pending: Arc<Mutex<PendingStore>>,
+    /// Per-attempt ownership nonces for armed previews, shared across clones
+    /// like the pending set: concurrent same-interaction redeliveries mint
+    /// distinct nonces so a losing attempt unwinds only its own entry and can
+    /// never remove the winner's.
+    preview_attempt: Arc<AtomicU64>,
+    /// Preview budget: in-memory sliding windows, reset on restart.
+    /// Shared across clones like the pending set.
+    preview_limiter: Arc<Mutex<RateLimiter>>,
 }
 
 struct Request {
@@ -134,7 +171,13 @@ struct Prepared {
 impl ChannelModerationRuntime {
     #[must_use]
     pub fn new(store: ChannelModerationStore, executor: ActionExecutor) -> Self {
-        Self { store, executor }
+        Self {
+            store,
+            executor,
+            preview_pending: Arc::new(Mutex::new(PendingStore::new())),
+            preview_attempt: Arc::new(AtomicU64::new(0)),
+            preview_limiter: Arc::new(Mutex::new(RateLimiter::new())),
+        }
     }
 
     /// Ownership only, never authorization. The shared router still adjudicates
@@ -145,6 +188,7 @@ impl ChannelModerationRuntime {
             (interaction.kind, interaction.data.as_ref()),
             (InteractionType::ApplicationCommand, Some(InteractionData::ApplicationCommand(data)))
                 if reads::handler(&data.name).is_some()
+                    || data.name == "lockdown-preview"
                     || ModerationAction::ALL.into_iter().any(|a| !a.targets_member() && a.command_name() == data.name)
         )
     }
@@ -185,7 +229,58 @@ impl ChannelModerationRuntime {
             Ok(Some(reply)) => reply.text.as_str(),
             _ => "The channel action requires reconciliation; do not repeat it.",
         };
-        let edit = if matches!(&result, Ok(Some(reply)) if reply.outcome == "channel_inspect") {
+        // An armed lockdown preview carries its digest: attach the bound
+        // Confirm / Cancel buttons (the confirm slice owns the presses).
+        // The digest never enters logs or metrics; only the buttons do.
+        let preview_buttons = match &result {
+            Ok(Some(reply)) => reply.digest32.clone(),
+            _ => None,
+        };
+        let edit = if let Some(digest32) = preview_buttons {
+            let actor = interaction
+                .member
+                .as_ref()
+                .and_then(|member| member.user.as_ref())
+                .map(|user| user.id.get())
+                .unwrap_or_default();
+            let components = vec![Component::ActionRow(ActionRow {
+                id: None,
+                components: vec![
+                    Component::Button(Button {
+                        id: None,
+                        custom_id: Some(confirm_custom_id(actor, &digest32)),
+                        disabled: false,
+                        emoji: None,
+                        label: Some("Confirm lockdown".to_owned()),
+                        style: ButtonStyle::Danger,
+                        url: None,
+                        sku_id: None,
+                    }),
+                    Component::Button(Button {
+                        id: None,
+                        custom_id: Some(cancel_custom_id(actor, &digest32)),
+                        disabled: false,
+                        emoji: None,
+                        label: Some("Cancel".to_owned()),
+                        style: ButtonStyle::Secondary,
+                        url: None,
+                        sku_id: None,
+                    }),
+                ],
+            })];
+            // Blocked-retry like every other channel reply: a Blocked
+            // attempt never reached the wire, so retrying it cannot repeat
+            // an accepted edit, and the moderator is not left on a stuck
+            // deferred reply under admission contention.
+            self.executor
+                .edit_interaction_response_with_components_and_blocked_retry(
+                    interaction.application_id.get(),
+                    &interaction.token,
+                    text,
+                    &components,
+                )
+                .await
+        } else if matches!(&result, Ok(Some(reply)) if reply.outcome == "channel_inspect") {
             // Staff must see their bounded saved reason verbatim. The shared
             // private-view edit still disables all allowed_mentions explicitly.
             self.executor
@@ -252,6 +347,15 @@ impl ChannelModerationRuntime {
         if let Some(handler) = reads::handler(&name) {
             return Ok(Some(
                 reads::execute(self, router, interaction, handler, outcome).await,
+            ));
+        }
+        // The lockdown preview takes no idempotency claim, no channel lane and
+        // no lease, and records no enforcement sample: it renders one diff
+        // and arms one pending entry. Only the confirmed execution (next
+        // slice) enters the mutation path below.
+        if name == "lockdown-preview" {
+            return Ok(Some(
+                self.execute_preview(router, interaction, outcome).await?,
             ));
         }
         let Some(action) = ModerationAction::ALL
@@ -387,6 +491,7 @@ impl ChannelModerationRuntime {
                         text: domain::moderation_result_text(outcome),
                         outcome: outcome.name().to_owned(),
                         replayed: false,
+                        digest32: None,
                     },
                     prepared.restore,
                 )
@@ -412,6 +517,281 @@ impl ChannelModerationRuntime {
             return Ok(Some(ChannelReply::uncertain()));
         }
         Ok(Some(reply))
+    }
+
+    /// Unwind a failed `/lockdown-preview` replacement: drop this attempt's
+    /// pending entry only while it still owns the key under its per-attempt
+    /// nonce, restoring the displaced preview only when its audit committed
+    /// so the earlier Confirm survives. A newer same-key preview (including
+    /// a concurrent redelivery under the same request id but a different
+    /// nonce) keeps its entry and row.
+    fn unwind_preview_replacement(
+        &self,
+        key: (u64, u64, u64),
+        preview_request_id: &str,
+        nonce: u64,
+        prior: Option<PendingEntry>,
+        now: i64,
+    ) {
+        let _unwound = self.preview_pending.lock().map(|mut pending| {
+            pending.unwind_replacement(key, preview_request_id, nonce, prior, now)
+        });
+    }
+
+    /// Render one `/lockdown-preview`: validate, rate-limit, read once each,
+    /// plan, audit, and arm. Anything before the audit insert refuses with no
+    /// row and no pending entry; a redelivered interaction (zero new audit
+    /// rows) renders nothing. Unarmed previews audit but store no entry, so
+    /// they can never exhaust the pending cap.
+    async fn execute_preview(
+        &self,
+        router: &InteractionRouter,
+        interaction: &Interaction,
+        outcome: SlashOutcome,
+    ) -> Result<ChannelReply, ChannelRuntimeError> {
+        if !matches!(
+            outcome,
+            SlashOutcome::Handled {
+                handler: HandlerId::LockdownPreview
+            }
+        ) || router.handler_for(&HandlerId::LockdownPreview).is_none()
+        {
+            let text = match outcome {
+                SlashOutcome::Refuse { refusal } => format!(
+                    "{} Check the guild and your permissions, then try again.",
+                    refusal.message()
+                ),
+                _ => "Lockdown preview is unavailable; try again shortly.".to_owned(),
+            };
+            return Ok(ChannelReply::refused(text));
+        }
+        let channel_id = invoking_channel_id(interaction);
+        let member = interaction
+            .member
+            .as_ref()
+            .and_then(|member| member.user.as_ref());
+        let (Some(guild_id), Some(channel_id), Some(actor)) =
+            (interaction.guild_id, channel_id, member)
+        else {
+            return Ok(ChannelReply::refused(
+                "A guild member and channel are required; try again there.",
+            ));
+        };
+        let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref() else {
+            return Ok(ChannelReply::refused(
+                "Use the /lockdown-preview slash command and try again.",
+            ));
+        };
+        if data.options.iter().any(|option| option.name != "reason") {
+            return Ok(ChannelReply::refused(
+                "Supply only \"reason\" and try again.",
+            ));
+        }
+        let reason = match string_option(data, "reason").and_then(|value| {
+            domain::require_channel_reason(value).map_err(|error| error.to_string())
+        }) {
+            Ok(reason) => reason,
+            Err(text) => return Ok(ChannelReply::refused(format!("{text}; try again."))),
+        };
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let admitted = self
+            .preview_limiter
+            .lock()
+            .map(|mut limiter| limiter.admit(actor.id.get(), guild_id.get(), now))
+            .unwrap_or(false);
+        if !admitted {
+            return Ok(ChannelReply::refused(
+                "Lockdown preview is rate limited; try again shortly. Nothing was changed.",
+            ));
+        }
+        let guild = guild_id.to_string();
+        let channel_doc = match self
+            .executor
+            .read_preview_channel(&channel_id, &guild)
+            .await
+        {
+            Ok(doc) => doc,
+            Err(_) => {
+                return Ok(ChannelReply::refused(
+                    "Could not read the live channel permissions; try again shortly. Nothing was changed.",
+                ));
+            }
+        };
+        let roles = match self.executor.read_preview_roles(&guild).await {
+            Ok(roles) => roles,
+            Err(_) => {
+                return Ok(ChannelReply::refused(
+                    "Could not read the live role list; try again shortly. Nothing was changed.",
+                ));
+            }
+        };
+        let saved = match self.store.get_lockdown(&channel_id).await {
+            Ok(record) => record,
+            Err(error) => return Err(error.into()),
+        };
+        if saved
+            .as_ref()
+            .is_some_and(|record| record.guild_id != guild)
+        {
+            return Ok(ChannelReply::refused(
+                "Saved restriction guild does not match; try again in the correct channel.",
+            ));
+        }
+        let Some(channel_num) = channel_id.parse::<u64>().ok() else {
+            return Ok(ChannelReply::refused(
+                "A guild member and channel are required; try again there.",
+            ));
+        };
+        let snapshot = PreviewSnapshot {
+            guild_id: guild_id.get(),
+            channel_id: channel_num,
+            channel_type: channel_doc.channel_type,
+            parent_id: channel_doc.parent_id,
+            actor_id: actor.id.get(),
+            reason,
+            saved_present: saved.is_some(),
+            saved_generation: saved.map_or_else(String::new, |record| record.recovery_generation),
+            roles,
+            overwrites: channel_doc.overwrites,
+        };
+        let plan = match plan_preview(&snapshot) {
+            Ok(plan) => plan,
+            Err(PreviewError::UnsupportedChannel) => {
+                return Ok(ChannelReply::refused(
+                    "Lockdown preview supports text and announcement channels only. Nothing was changed.",
+                ));
+            }
+            Err(PreviewError::TooComplex) => {
+                return Ok(ChannelReply::refused(
+                    "This channel is too complex to preview safely; open the channel permissions screen and use /channel-inspect instead. Nothing was changed.",
+                ));
+            }
+            Err(_) => {
+                return Ok(ChannelReply::refused(
+                    "Could not verify the live channel permissions; try again shortly. Nothing was changed.",
+                ));
+            }
+        };
+        let expires_at = now.saturating_add(PREVIEW_TTL_SECS);
+        let text = render_preview(
+            &plan,
+            channel_num,
+            channel_doc.channel_type,
+            channel_doc.parent_id,
+            snapshot.saved_present,
+            expires_at,
+        );
+        // Arm the pending entry before the audit row would double-count a
+        // redelivery: a new key at cap refuses PREVIEW_BUSY with no audit
+        // row, while a same-key replacement succeeds atomically. The
+        // displaced prior entry is held aside so a failed replacement
+        // (audit error or redelivery) restores it instead of leaving the
+        // earlier Confirm dead; only a newer same-key preview that
+        // superseded this attempt keeps the slot. The nonce makes ownership
+        // attempt-specific: concurrent redeliveries share the request id but
+        // mint distinct nonces, so a loser never removes the winner's entry.
+        // Restoration additionally requires the prior's audit to have
+        // committed, otherwise overlapping failures would revive an unaudited
+        // entry with no row behind it.
+        let digest32 = plan.digest32().to_owned();
+        let pending_key = (guild_id.get(), channel_num, actor.id.get());
+        let interaction_id = interaction.id.to_string();
+        let nonce = self.preview_attempt.fetch_add(1, Ordering::Relaxed);
+        let mut displaced: Option<PendingEntry> = None;
+        if plan.armed {
+            let replacement = self
+                .preview_pending
+                .lock()
+                .map(|mut pending| {
+                    let prior = pending.peek(pending_key, now);
+                    pending
+                        .insert(
+                            pending_key,
+                            PendingEntry {
+                                digest: plan.digest.clone(),
+                                reason: snapshot.reason.clone(),
+                                preview_request_id: interaction_id.clone(),
+                                expires_at,
+                                nonce,
+                            },
+                            now,
+                        )
+                        .map(|()| prior)
+                })
+                .unwrap_or(Err(crate::lockdown_preview::PendingFull));
+            match replacement {
+                Ok(prior) => displaced = prior,
+                Err(_) => {
+                    return Ok(ChannelReply::refused(
+                        "Too many live lockdown previews; wait for one to expire and try again. Nothing was changed.",
+                    ));
+                }
+            }
+        }
+        let row = ChannelAuditRow {
+            request_id: interaction_id.clone(),
+            guild_id: guild,
+            actor_id: actor.id.to_string(),
+            action: ModerationAction::Lockdown.action_name().to_owned(),
+            channel_id: Some(channel_id),
+            reason: String::new(),
+            outcome: "lockdown_preview".to_owned(),
+            idempotency_key: interaction_id.clone(),
+            metadata_json: preview_audit_metadata(&plan),
+            created_at: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+        };
+        // Unwind only this attempt's own entry, matched by request id and
+        // per-attempt nonce, and restore the displaced preview only when its
+        // audit committed so the earlier Confirm survives the failed
+        // replacement. A newer same-key preview that superseded this attempt
+        // keeps its entry and row: the ownership check fails and nothing is
+        // restored.
+        let recorded = match self.store.try_record_audit(&row).await {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                if plan.armed {
+                    self.unwind_preview_replacement(
+                        pending_key,
+                        &interaction_id,
+                        nonce,
+                        displaced,
+                        now,
+                    );
+                }
+                return Err(error.into());
+            }
+        };
+        if !recorded {
+            if plan.armed {
+                self.unwind_preview_replacement(
+                    pending_key,
+                    &interaction_id,
+                    nonce,
+                    displaced,
+                    now,
+                );
+            }
+            return Ok(ChannelReply::refused(
+                "Could not record the preview audit row; try again. Nothing was rendered and nothing was changed.",
+            ));
+        }
+        // The audit row exists, so a later failed replacement may restore
+        // this attempt's entry. Unarmed previews store no entry and mark
+        // nothing: there is nothing a replacement could displace.
+        if plan.armed {
+            let _marked = self
+                .preview_pending
+                .lock()
+                .map(|mut pending| pending.mark_committed(&interaction_id, expires_at, now));
+        }
+        Ok(ChannelReply {
+            text,
+            outcome: "lockdown_preview".to_owned(),
+            replayed: false,
+            digest32: plan.armed.then_some(digest32),
+        })
     }
 
     /// Run one prepared call. Purge is split into its two phases: a failed

@@ -332,6 +332,22 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
     } else {
         Vec::new()
     };
+    // The cutover ledger is the one restore gates behavior on (see the 0469
+    // replay): only a source that had not applied 0469 holds authoritative
+    // voice restrictions in the legacy tables. Same absent-ledger care as
+    // above; only successful applications count as applied.
+    let (has_cutover_ledger,): (bool,) =
+        sqlx::query_as("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+            .fetch_one(&mut *tx)
+            .await?;
+    let cutover_migrations: Vec<(i64,)> = if has_cutover_ledger {
+        sqlx::query_as("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| DbDumpError::Refused(format!("cannot read _sqlx_migrations: {e}")))?
+    } else {
+        Vec::new()
+    };
 
     // Rows alone cannot show values handed out and then deleted; the marks
     // let restore resume past them (the cutover allocator gate).
@@ -356,6 +372,10 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
         tables,
         events_sequence: seq.0,
         schema_migrations: migrations.into_iter().map(|(id,)| id).collect(),
+        cutover_migrations: cutover_migrations
+            .into_iter()
+            .map(|(version,)| version)
+            .collect(),
         sequence_marks,
     };
 
@@ -417,7 +437,49 @@ pub struct RestoreReport {
     pub missing_member_ban_ownership: bool,
     /// All executable expiry rows made non-executable for reconciliation.
     pub quarantined_unbans: u64,
+    /// Legacy `voice_command_roles` rows consumed by the restore-time replay
+    /// of the 0469 translation into `voice_access_controls.command_roles`.
+    /// Zero when the archive held no legacy restrictions.
+    pub translated_voice_command_roles: u64,
+    /// Legacy `voice_command_role_members` rows consumed by the same replay.
+    pub translated_voice_command_role_members: u64,
+    /// Guilds whose creation switch or guild-wide command role the
+    /// restore-time replay of the 0470 translation tightened in
+    /// `voice_access_controls`, from values only the legacy
+    /// `voice_guild_settings` row carried. Zero when the archive proves 0470
+    /// was applied or the two stores already agreed.
+    pub translated_voice_creation_gates: u64,
+    /// `voice_access_controls` rows the 0469/0470 replays inserted for
+    /// guilds whose restrictions only the legacy stores held.
+    pub voice_access_controls_added: u64,
     pub ok: bool,
+}
+
+impl RestoreReport {
+    /// Rows the count check expects in `table` after this restore: the
+    /// manifest count, adjusted for rows restore itself initialized or
+    /// moved. The 0469 replay empties the legacy voice tables and the
+    /// 0469/0470 replays can add `voice_access_controls` guild rows, so
+    /// those three tables legitimately differ from the manifest.
+    pub fn expected_count(&self, table: &str) -> u64 {
+        let archived = self
+            .manifest
+            .tables
+            .iter()
+            .find(|t| t.name == table)
+            .map_or_else(
+                || self.initialized_tables.get(table).copied().unwrap_or(0),
+                |t| t.count,
+            );
+        match table {
+            "voice_command_roles" => archived.saturating_sub(self.translated_voice_command_roles),
+            "voice_command_role_members" => {
+                archived.saturating_sub(self.translated_voice_command_role_members)
+            }
+            "voice_access_controls" => archived + self.voice_access_controls_added,
+            _ => archived,
+        }
+    }
 }
 
 /// Replace the contents of the bot-owned tables with a dump.
@@ -697,6 +759,176 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         .await?;
     }
 
+    // Pre-0469 archives hold per-command voice restrictions only in the
+    // legacy voice_command_roles tables. Since 0469 the command gate reads
+    // only voice_access_controls.command_roles, so restoring the legacy rows
+    // as they are would silently leave those restrictions unenforced.
+    // Replay the 0469 translation over the restored rows, like the 0142
+    // backfill above: same recognised-command filter (the live
+    // VOICE_COMMANDS the gate accepts, frozen identically in 0469) and same
+    // merge rule (a command already restricted in voice_access_controls
+    // keeps its enforced role list; a legacy-only command is added, an empty
+    // member list landing as deny-every-non-admin). Unknown legacy command
+    // names are dropped, as in 0469. The legacy tables are then emptied so
+    // the move happens once: a dump of the restored database carries the
+    // restrictions only where the gate reads them. Targets predating either
+    // store fail the column guards and take no translation.
+    //
+    // Only a source that had not applied 0469 holds authoritative
+    // restrictions in the legacy tables. After 0469, /import mirrors its
+    // restrictions into both stores but /access updates only the gate's, so
+    // a post-0469 archive can carry a legacy row for a restriction an admin
+    // has since lifted; replaying it would resurrect that restriction.
+    // Archives proving 0469 was applied therefore restore both voice stores
+    // verbatim. Archives without recorded evidence predate the evidence
+    // field and replay fail-closed; the report names the translated counts.
+    let archive_pre_voice_authority = !manifest.applied_cutover(469);
+    let mut translated_voice_command_roles = 0;
+    let mut translated_voice_command_role_members = 0;
+    let mut voice_access_controls_added = 0;
+    let has_columns = |columns: &[(String, String)], names: &[&str]| {
+        names
+            .iter()
+            .all(|name| columns.iter().any(|(column, _)| column == name))
+    };
+    if archive_pre_voice_authority
+        && has_columns(
+            &columns_of(&mut tx, "voice_command_roles").await?,
+            &["guild_id", "command"],
+        )
+        && has_columns(
+            &columns_of(&mut tx, "voice_command_role_members").await?,
+            &["guild_id", "command", "role_id"],
+        )
+        && has_columns(
+            &columns_of(&mut tx, "voice_access_controls").await?,
+            &["guild_id", "command_roles"],
+        )
+    {
+        let legacy_rows = count_of(&mut tx, "voice_command_roles").await?
+            + count_of(&mut tx, "voice_command_role_members").await?;
+        if legacy_rows > 0 {
+            let controls_before = count_of(&mut tx, "voice_access_controls").await?;
+            // VOICE_COMMANDS entries are compile-time constants; the quote
+            // escaping keeps the interpolation safe regardless.
+            let recognised = crate::voice_access::VOICE_COMMANDS
+                .iter()
+                .map(|name| format!("'{}'", name.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            sqlx::query(audited(format!(
+                "INSERT INTO voice_access_controls (guild_id, command_roles)
+                 SELECT c.guild_id,
+                        jsonb_object_agg(
+                          c.command,
+                          COALESCE(
+                            (SELECT jsonb_agg(m.role_id ORDER BY length(m.role_id), m.role_id)
+                               FROM voice_command_role_members m
+                              WHERE m.guild_id = c.guild_id AND m.command = c.command),
+                            '[]'::jsonb))
+                   FROM voice_command_roles c
+                  WHERE c.command IN ({recognised})
+                  GROUP BY c.guild_id
+                 ON CONFLICT (guild_id) DO UPDATE
+                   SET command_roles = EXCLUDED.command_roles || voice_access_controls.command_roles"
+            )))
+            .execute(&mut *tx)
+            .await?;
+            voice_access_controls_added =
+                (count_of(&mut tx, "voice_access_controls").await? - controls_before) as u64;
+            translated_voice_command_role_members =
+                sqlx::query("DELETE FROM voice_command_role_members")
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+            translated_voice_command_roles = sqlx::query("DELETE FROM voice_command_roles")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
+    }
+
+    // Pre-0470 archives can hold the guild creation switch and guild-wide
+    // command role only in voice_guild_settings (/import, 0229). Since 0470
+    // the runtime gates read only voice_access_controls.room_creation_enabled
+    // and required_role_id, so restoring a disagreeing pair as archived
+    // would leave the imported switch and role silently unenforced. Replay
+    // the 0470 translation, in migration order after the 0469 one above:
+    // same tighten-only merge (creation stays off if either store says off;
+    // a role already enforced wins over the imported one) and the same
+    // mirror sync back to voice_guild_settings, leading-zero guard included,
+    // so the previous binary's /export after a backout shows what is
+    // enforced. Two differences from the migration file, neither of which
+    // changes the enforced outcome: only settings rows that can tighten
+    // (creation off, or a role present) merge, because a missing
+    // voice_access_controls row already means the permissive defaults; and
+    // there are no per-guild advisory locks, because restore already holds
+    // ACCESS EXCLUSIVE locks on the replaced tables, so no /access save from
+    // a still-running previous binary can race the merge. Targets predating
+    // either store fail the column guards and take no translation.
+    //
+    // The evidence gate is 0469's, one migration later: only a source that
+    // had not applied 0470 holds authoritative switch/role values in
+    // voice_guild_settings. After 0470 those columns are a mirror /access
+    // does not keep current, so a post-0470 archive can carry a switch or
+    // role an admin has since lifted; replaying it would resurrect that
+    // gate. Archives proving 0470 was applied therefore restore both voice
+    // stores verbatim. Archives without recorded evidence predate the
+    // evidence field and replay fail-closed; the report names how many
+    // guilds the replay tightened.
+    let mut translated_voice_creation_gates = 0;
+    if !manifest.applied_cutover(470)
+        && has_columns(
+            &columns_of(&mut tx, "voice_guild_settings").await?,
+            &["guild_id", "creation_enabled", "command_role_id"],
+        )
+        && has_columns(
+            &columns_of(&mut tx, "voice_access_controls").await?,
+            &["guild_id", "room_creation_enabled", "required_role_id"],
+        )
+        && count_of(&mut tx, "voice_guild_settings").await? > 0
+    {
+        // Guilds the merge actually tightens: no enforced row yet, a switch
+        // about to turn off, or a role about to land where none is enforced.
+        let (tightened,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM voice_guild_settings s \
+              LEFT JOIN voice_access_controls a ON a.guild_id = s.guild_id \
+             WHERE (NOT s.creation_enabled OR s.command_role_id IS NOT NULL) \
+               AND (a.guild_id IS NULL \
+                 OR (a.room_creation_enabled AND NOT s.creation_enabled) \
+                 OR (a.required_role_id IS NULL AND s.command_role_id IS NOT NULL))",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        translated_voice_creation_gates = tightened as u64;
+        let controls_before = count_of(&mut tx, "voice_access_controls").await?;
+        sqlx::query(
+            "INSERT INTO voice_access_controls (guild_id, room_creation_enabled, required_role_id) \
+             SELECT guild_id, creation_enabled, command_role_id \
+               FROM voice_guild_settings \
+              WHERE NOT creation_enabled OR command_role_id IS NOT NULL \
+             ON CONFLICT (guild_id) DO UPDATE \
+               SET room_creation_enabled = \
+                     voice_access_controls.room_creation_enabled AND EXCLUDED.room_creation_enabled, \
+                   required_role_id = \
+                     COALESCE(voice_access_controls.required_role_id, EXCLUDED.required_role_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        voice_access_controls_added +=
+            (count_of(&mut tx, "voice_access_controls").await? - controls_before) as u64;
+        sqlx::query(
+            "UPDATE voice_guild_settings s \
+                SET creation_enabled = a.room_creation_enabled, \
+                    command_role_id = a.required_role_id \
+               FROM voice_access_controls a \
+              WHERE a.guild_id = s.guild_id \
+                AND (a.required_role_id IS NULL OR a.required_role_id NOT LIKE '0%')",
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+
     // v3 predates the required singleton. Clearing stale target data is not
     // enough: settings writes would subsequently fail without this baseline.
     // Never synthesize application settings/history or replace an archived row.
@@ -762,38 +994,114 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     }
     tx.commit().await?;
 
-    let mut restored = BTreeMap::new();
-    let mut ok = true;
+    let missing_member_ban_ownership = !manifest
+        .tables
+        .iter()
+        .any(|table| table.name == "moderation_member_bans");
+    let mut report = RestoreReport {
+        manifest,
+        restored: BTreeMap::new(),
+        dropped_columns,
+        initialized_tables,
+        missing_member_ban_ownership,
+        quarantined_unbans,
+        translated_voice_command_roles,
+        translated_voice_command_role_members,
+        translated_voice_creation_gates,
+        voice_access_controls_added,
+        ok: true,
+    };
     for table in &target_tables {
         let row: (i64,) = sqlx::query_as(audited(format!("SELECT COUNT(*) FROM {table}")))
             .fetch_one(pool)
             .await?;
         let count = row.0 as u64;
-        let expected = manifest
-            .tables
-            .iter()
-            .find(|t| t.name == *table)
-            .map_or_else(
-                || initialized_tables.get(*table).copied().unwrap_or(0),
-                |t| t.count,
-            );
-        if count != expected {
-            ok = false;
+        if count != report.expected_count(table) {
+            report.ok = false;
         }
-        restored.insert((*table).to_owned(), count);
+        report.restored.insert((*table).to_owned(), count);
+    }
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(translated_roles: u64, translated_members: u64, added: u64) -> RestoreReport {
+        let table = |name: &str, count: u64| DumpTableInfo {
+            name: name.to_owned(),
+            columns: Vec::new(),
+            column_types: Vec::new(),
+            count,
+        };
+        RestoreReport {
+            manifest: DumpManifest {
+                kind: "manifest".to_owned(),
+                version: DUMP_VERSION,
+                created_at: String::new(),
+                tables: vec![
+                    table("members", 3),
+                    table("voice_access_controls", 2),
+                    table("voice_command_roles", 4),
+                    table("voice_command_role_members", 5),
+                ],
+                events_sequence: 0,
+                schema_migrations: Vec::new(),
+                cutover_migrations: Vec::new(),
+                sequence_marks: Vec::new(),
+            },
+            restored: BTreeMap::new(),
+            dropped_columns: BTreeMap::new(),
+            initialized_tables: BTreeMap::from([("guild_settings_revision".to_owned(), 1)]),
+            missing_member_ban_ownership: false,
+            quarantined_unbans: 0,
+            translated_voice_command_roles: translated_roles,
+            translated_voice_command_role_members: translated_members,
+            translated_voice_creation_gates: 0,
+            voice_access_controls_added: added,
+            ok: true,
+        }
     }
 
-    let missing_member_ban_ownership = !manifest
-        .tables
-        .iter()
-        .any(|table| table.name == "moderation_member_bans");
-    Ok(RestoreReport {
-        manifest,
-        restored,
-        dropped_columns,
-        initialized_tables,
-        missing_member_ban_ownership,
-        quarantined_unbans,
-        ok,
-    })
+    #[test]
+    fn applied_cutover_needs_recorded_evidence_at_or_past_the_version() {
+        let mut report = report(0, 0, 0);
+        // Archives written before the evidence field prove nothing.
+        assert!(!report.manifest.applied_cutover(469));
+        report.manifest.cutover_migrations = vec![467, 468];
+        assert!(!report.manifest.applied_cutover(469));
+        report.manifest.cutover_migrations = vec![468, 469];
+        assert!(report.manifest.applied_cutover(469));
+        // Proving 0469 does not prove 0470: an archive taken between the two
+        // migrations replays only the 0470 translation.
+        assert!(!report.manifest.applied_cutover(470));
+        // A later version implies the chain ran through 0469 in order.
+        report.manifest.cutover_migrations = vec![470];
+        assert!(report.manifest.applied_cutover(469));
+        assert!(report.manifest.applied_cutover(470));
+    }
+
+    #[test]
+    fn expected_count_matches_manifest_without_translation() {
+        let report = report(0, 0, 0);
+        assert_eq!(report.expected_count("members"), 3);
+        assert_eq!(report.expected_count("voice_access_controls"), 2);
+        assert_eq!(report.expected_count("voice_command_roles"), 4);
+        assert_eq!(report.expected_count("voice_command_role_members"), 5);
+        // Absent from the manifest: initialized baseline, else zero.
+        assert_eq!(report.expected_count("guild_settings_revision"), 1);
+        assert_eq!(report.expected_count("events"), 0);
+    }
+
+    #[test]
+    fn expected_count_reflects_the_0469_replay() {
+        // Every legacy row consumed; one guild row inserted on top of the
+        // two archived voice_access_controls rows.
+        let report = report(4, 5, 1);
+        assert_eq!(report.expected_count("voice_command_roles"), 0);
+        assert_eq!(report.expected_count("voice_command_role_members"), 0);
+        assert_eq!(report.expected_count("voice_access_controls"), 3);
+        assert_eq!(report.expected_count("members"), 3);
+    }
 }

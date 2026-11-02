@@ -1,9 +1,11 @@
 # Tickets: an opener's resolution request is not Close
 
-Status: **Proposed — design only**. Written 2026-10-26; review by 2026-11-02.
-This is the repository source of truth; the task spec mirrors it. Merge publishes
-neither an enabled command nor implementation approval. No runtime, schema,
-permission, credential, spend, retention-policy or live-operation change here.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-26. This is the repository source of truth; the task spec mirrors it.
+Merge publishes neither an enabled command nor implementation approval. No
+runtime, schema, permission, credential, spend, retention-policy or
+live-operation change here.
 
 ## Decision and alternatives
 

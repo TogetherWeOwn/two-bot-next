@@ -102,27 +102,29 @@ fn documented_legacy_rows_equal_parity_section1() {
     // `/command-disable` and `/command-enable` (rows 40 and 41),
     // `/welcome-preview` (42), `/game-mix` (43), feed pause/resume (44/45),
     // `/tempban-list` saved expiry inspection (46), and the staff ledger
-    // read `/moderation-recent` (47), plus `/command-clone` (48).
+    // read `/moderation-recent` (47), the dark private lockdown preview
+    // `/lockdown-preview` (48, unpublished until its publication slice),
+    // in-place `/command-edit` (49), plus `/command-clone` (50).
     // No Next-only row appears in the legacy §1 table above;
     // the registry-equality test below covers every published builtin instead.
-    // 49 entries: 48 contiguous parity rows plus the `/lfg-edit` companion
+    // 51 entries: 50 contiguous parity rows plus the `/lfg-edit` companion
     // sharing LFG row 26.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 49);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 51);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        49
+        51
     );
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.parity_row)
             .collect::<HashSet<_>>(),
-        (1..=48).collect::<HashSet<_>>(),
-        "parity rows are contiguous 1..=48"
+        (1..=50).collect::<HashSet<_>>(),
+        "parity rows are contiguous 1..=50"
     );
     for (name, parity_row, required_permissions) in
         [("command-inspect", 33, 1 << 5), ("lfg-list", 38, 1 << 33)]
@@ -171,7 +173,11 @@ fn documented_legacy_rows_equal_parity_section1() {
     assert_eq!(resume.required_permissions, 32, "ManageGuild bit");
     assert_eq!(resume.surface, CommandSurface::BuiltinSlash);
     assert_eq!(resume.policy_hook, None);
-    for (name, parity_row) in [("command-disable", 40), ("command-enable", 41)] {
+    for (name, parity_row) in [
+        ("command-disable", 40),
+        ("command-enable", 41),
+        ("command-edit", 49),
+    ] {
         let row = command_permission(name).expect("lifecycle command has a permission row");
         assert_eq!(row.parity_row, parity_row, "{name}");
         assert_eq!(row.required_permissions, 32, "{name} ManageGuild bit");
@@ -185,7 +191,7 @@ fn documented_legacy_rows_equal_parity_section1() {
     assert_eq!(preview.surface, CommandSurface::BuiltinSlash);
     assert_eq!(preview.policy_hook, None);
     let clone = command_permission("command-clone").expect("clone has a permission row");
-    assert_eq!(clone.parity_row, 48);
+    assert_eq!(clone.parity_row, 50);
     assert_eq!(clone.required_permissions, 32, "ManageGuild bit");
     assert_eq!(clone.surface, CommandSurface::BuiltinSlash);
     assert_eq!(clone.policy_hook, None);
@@ -229,6 +235,7 @@ fn next_only_read_permission_rows_do_not_become_mutation_policy_hooks() {
         ("channel-inspect", 36, 16),
         ("tempban-list", 46, 4),
         ("moderation-recent", 47, 1_099_511_627_776),
+        ("lockdown-preview", 48, 16),
     ] {
         let row = command_permission(name).expect("read has a permission row");
         assert_eq!(row.parity_row, number);
@@ -254,9 +261,16 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 46);
-    assert_eq!(published.len(), builtins.len() + 1);
+    assert_eq!(builtins.len(), 48);
+    // Routed-but-unpublished commands stay dark: adjudicated by the router
+    // and permission table, absent from the publish set. The publication
+    // slice removes the entry here when it ships the definition.
+    const DARK_COMMANDS: [&str; 1] = ["lockdown-preview"];
+    assert_eq!(published.len(), builtins.len() + 1 - DARK_COMMANDS.len());
     for row in builtins {
+        if DARK_COMMANDS.contains(&row.command) {
+            continue;
+        }
         let definition = published
             .iter()
             .find(|def| def.name == row.command)
@@ -388,7 +402,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 46, "every retained builtin routes");
+    assert_eq!(routed, 48, "every retained builtin routes");
 }
 
 #[test]

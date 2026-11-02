@@ -1,10 +1,15 @@
 # Automod verdict preview (private, dry-run)
 
-Status: **Proposed; design only**. Written 2026-10-26; intent review **not
-before 2026-11-02**. This indexed repository file is the editable contract.
-Merge publishes a proposal, not permission to build, publish a command, or
-change any automod scope. No code, config keys, dashboard surface, live-guild
-scope change, or deploy here.
+Status: **Accepted for M2** (owner decision 2026-11-01). Build is tracked on
+linked cards; each build re-checks this spec's `file:line` seams on current
+`main` first. This acceptance is the owner intent review the original proposal
+waits for; its own technical gates, test matrix and kill rule still apply before
+any build PR merges. Acceptance does not lift the no-build state in section 1;
+A/no-build stays in force until those gates are met on a build PR. Original
+proposal: written 2026-10-26. This indexed
+repository file is the editable contract. Merge publishes a proposal, not
+permission to build, publish a command, or change any automod scope. No code,
+config keys, dashboard surface, live-guild scope change, or deploy here.
 
 Question the preview answers, privately, for one synthetic message: *if I
 posted this text now, in this channel, which single automod filter would

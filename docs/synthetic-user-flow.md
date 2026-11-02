@@ -16,7 +16,23 @@ a request is sent. No Gatus or third-party monitor is used.
 Each job writes one JSON evidence receipt (`synthetic-staging-<run>.json`,
 `synthetic-prod-<run>.json`, 14-day artifacts) and fails on any check FAIL
 or fence refusal. Production is passive: the prod job observes and alerts
-only, and never blocks a deploy.
+only, and never blocks a deploy. The production promotion reuses the same
+probe once as a baseline (see
+[production-deploy.md](production-deploy.md#regression-gate-against-production)):
+a journey failing on production lowers that baseline, it never blocks a deploy.
+
+### Promotion prerequisite
+
+The scheduled run is not the only check. Every `deploy-staging` run also runs
+the staging probe once, as the `user-flow-synthetic` job ("staging user-flow
+synthetic (exact SHA)"), right after its deploy and pinned with
+`--expected-sha` to the commit that run deployed. `certify-promotion` needs
+that job, and the `deploy-production` guard refuses a promotion unless the
+job of that exact name succeeded in the same staging run and attempt it
+promotes. A failed, skipped or missing synthetic leaves the commit staged but
+never promoted. This job has no incident-issue path: the five-minute
+scheduled run keeps alerting. Rollbacks and the live-SHA redeploy waive
+staging history, so they never read it.
 
 The production probe accepts only a stamped identity with a 40-character,
 lowercase hexadecimal `build_revision` and a `build_id` containing exactly two

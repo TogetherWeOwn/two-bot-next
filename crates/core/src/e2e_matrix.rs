@@ -274,7 +274,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "command-clone",
-            48,
+            50,
             E2eGate::Automations,
             PERM_MANAGE_GUILD,
             "ManageGuild",
@@ -313,6 +313,21 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
                 "Gate:AutomationsDisabled",
                 "Perm:ManageServerRequired",
                 "Valid:name:required",
+            ],
+        ),
+        row(
+            "command-edit",
+            49,
+            E2eGate::Automations,
+            PERM_MANAGE_GUILD,
+            "ManageGuild",
+            "AutomationAdmin",
+            "Ephemeral defer then ephemeral confirmation after only the supplied template, description or trigger changes plus one audit row; omitted fields, creator and enabled state are kept, and an unchanged edit is an explicit no-op without republish.",
+            &[
+                "Gate:AutomationsDisabled",
+                "Perm:ManageServerRequired",
+                "Valid:name:required",
+                "Valid:text-trigger|clear-trigger:not-both",
             ],
         ),
         row(

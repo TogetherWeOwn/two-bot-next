@@ -17,8 +17,9 @@
 //! the acceptance card):
 //!
 //! - `/setup` gains an optional Integer `page` (min 1, default 1) and
-//!   `/access show` gains the same nested option. No other command or
-//!   subcommand gains `page`; no new command, setting, or surface.
+//!   `/access show` gains the same nested option. No other existing command
+//!   or subcommand gains `page`. The later owner-only `/room-access-inspect`
+//!   read may independently page; it does not broaden creator-settings reads.
 //! - Every non-empty read page is bounded to 2000 UTF-16 units *before*
 //!   the final safety clip, carries `Page {n} of {total}`, preserves every
 //!   creator ID, command restriction, and role ID across pages exactly
@@ -356,7 +357,14 @@ fn maximal_controls() -> AccessControls {
 #[test]
 fn registry_adds_optional_page_only_to_setup_and_access_show() {
     let defs = voice_command_set(&VoiceGates { enabled: true });
-    assert_eq!(defs.len(), 22, "no new commands: {defs:?}");
+    assert_eq!(defs.len(), 23, "includes the owner access read: {defs:?}");
+    assert_eq!(
+        defs.iter()
+            .filter(|def| def.name == "room-access-inspect")
+            .count(),
+        1,
+        "exactly one additive owner access read"
+    );
     let integer = two_bot_core::commands::CommandOptionType::Integer.as_u8();
 
     let setup = defs
@@ -422,7 +430,7 @@ fn registry_adds_optional_page_only_to_setup_and_access_show() {
     );
 
     for def in &defs {
-        if def.name == "setup" || def.name == "access" {
+        if def.name == "setup" || def.name == "access" || def.name == "room-access-inspect" {
             continue;
         }
         assert!(

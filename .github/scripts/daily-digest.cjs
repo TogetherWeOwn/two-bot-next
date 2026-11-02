@@ -1,239 +1,50 @@
 #!/usr/bin/env node
 "use strict";
 
-// Daily digest release: tag the live production commit vYYYY.MM.DD and publish
-// a GitHub Release whose notes come from the Conventional Commit subjects since
-// the previous digest. One tag per day; quiet days (production already matches
-// the last digest) skip green with no tag. Rollbacks serve an older commit and
-// never get a tag, mirroring the retired per-promote guard.
+// Daily digest adapter for the shared CalVer releaser (docs/releases.md).
+// The shared action (TogetherWeOwn/.github actions/calver, `live-digest`
+// policy) allocates vYYYY.MDD.P, renders notes and publishes the tag and
+// Release. This adapter keeps the bot-specific behaviour around it:
 //
-// Note rendering is reused from the retired release-on-promote.cjs, with its
-// fatal flaw fixed: git log ranges stream through a raised maxBuffer (32 MiB)
-// instead of Node's default 1 MiB, which crashed with ENOBUFS on a 200-commit
-// / 1.36 MB range. A regression test pins a 200-commit range above 1 MiB.
+//   request  Build the read-only plan request for the live production SHA.
+//            The operation is bound to the SHA, so a retry for the same
+//            build recovers its frozen plan instead of allocating again.
+//   adapt    Read the plan step. A classified skip (quiet-day, rollback,
+//            digest-already-published) and a replay of a SHA whose Release
+//            already exists owe no tag. Today's CalVer tag left without its
+//            Release (a failed publish before production moved again) is
+//            finished from its own frozen plan. Otherwise persist the
+//            owed-digest outputs for the alert job and emit the publish
+//            request. Every non-dry path reconciles the Latest release's
+//            SBOM assets.
+//   record   Read the publish step. A new Release dispatches the SBOM
+//            chain; an existing one redispatches only when assets are
+//            missing.
 //
-// Env: PROD_SHA (40-hex, must be on origin/main), GH_REPO, GITHUB_SERVER_URL,
-// GITHUB_OUTPUT, DIGEST_DATE=YYYY-MM-DD (default today UTC), DRY_RUN=true to
-// print without publishing. Needs a full-history checkout with tags.
+// Env: PROD_SHA (40-hex), GH_REPO, GITHUB_OUTPUT, DRY_RUN=true for a
+// zero-write run (no gh calls besides the shared action's own reads); adapt
+// reads SKIPPED, REASON, PLAN and PREV_TAG; record reads CREATED and TAG.
+// sbom_tags is a space-separated list of release tags owed an SBOM dispatch.
 
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
+const path = require("node:path");
 
-const HEADER =
-	/^(?<type>[a-z]+)(?:\((?<scope>[^()\r\n]+)\))?(?<bang>!)?: (?<desc>\S.*)$/;
-const DIGEST_TAG = /^v(\d{4})\.(\d{2})\.(\d{2})$/;
-const SEMVER_TAG = /^v(\d+)\.(\d+)\.(\d+)$/;
-// 32 MiB covers ~20x the 1.36 MB range that crashed the 1 MiB default.
-const LOG_MAX_BUFFER = 32 * 1024 * 1024;
-
-function parseCommit(sha, subject, body) {
-	const m = HEADER.exec(String(subject).trim());
-	if (!m) return null;
-	let desc = m.groups.desc.trim();
-	let pr = null;
-	const prMatch = / \(#(\d+)\)$/.exec(desc);
-	if (prMatch) {
-		pr = Number(prMatch[1]);
-		desc = desc.slice(0, prMatch.index);
-	}
-	return {
-		sha,
-		type: m.groups.type,
-		scope: m.groups.scope ? m.groups.scope.trim() : null,
-		breaking:
-			Boolean(m.groups.bang) || /^BREAKING[ -]CHANGE: /m.test(body || ""),
-		desc,
-		pr,
-	};
-}
-
-function parseDigestTag(tag) {
-	const m = DIGEST_TAG.exec(tag);
-	if (!m) return null;
-	const [, y, mo, d] = m;
-	const dt = new Date(Date.UTC(Number(y), Number(mo) - 1, Number(d)));
-	if (
-		dt.getUTCFullYear() !== Number(y) ||
-		dt.getUTCMonth() !== Number(mo) - 1 ||
-		dt.getUTCDate() !== Number(d)
-	)
-		return null;
-	return tag;
-}
-
-function parseTag(tag) {
-	const m = SEMVER_TAG.exec(tag);
-	return m ? m.slice(1, 4).map(Number) : null;
-}
-
-function compareVersions(a, b) {
-	for (let i = 0; i < 3; i += 1) if (a[i] !== b[i]) return a[i] - b[i];
-	return 0;
-}
-
-function loadOptions(path) {
-	const pkg = JSON.parse(fs.readFileSync(path, "utf8")).packages["."];
-	return {
-		sections: pkg["changelog-sections"] || [],
-	};
-}
-
-function entry(c, repoUrl) {
-	const scope = c.scope ? `**${c.scope}:** ` : "";
-	const pr = c.pr ? ` ([#${c.pr}](${repoUrl}/issues/${c.pr}))` : "";
-	return `* ${scope}${c.desc}${pr} ([${c.sha.slice(0, 7)}](${repoUrl}/commit/${c.sha}))`;
-}
-
-function renderNotes({ tag, prevTag, date, commits, sections, repoUrl }) {
-	const lines = [`## [${tag}](${repoUrl}/compare/${prevTag}...${tag}) (${date})`];
-	const bySort = (a, b) =>
-		(a.scope || "").localeCompare(b.scope || "") ||
-		a.desc.localeCompare(b.desc);
-	const breaking = commits.filter((c) => c.breaking).sort(bySort);
-	if (breaking.length)
-		lines.push(
-			"",
-			"",
-			"### ⚠ BREAKING CHANGES",
-			"",
-			...breaking.map((c) => entry(c, repoUrl)),
-		);
-	const visible = new Map();
-	for (const s of sections) {
-		if (s.hidden) continue;
-		if (!visible.has(s.section)) visible.set(s.section, new Set());
-		visible.get(s.section).add(s.type);
-	}
-	let any = breaking.length > 0;
-	for (const [section, types] of visible) {
-		const items = commits.filter((c) => types.has(c.type)).sort(bySort);
-		if (!items.length) continue;
-		any = true;
-		lines.push(
-			"",
-			"",
-			`### ${section}`,
-			"",
-			...items.map((c) => entry(c, repoUrl)),
-		);
-	}
-	if (!any)
-		lines.push(
-			"",
-			"No user-facing changes in this release; the compare link lists every commit.",
-		);
-	return `${lines.join("\n")}\n`;
-}
-
-function git(...args) {
-	return execFileSync("git", args, { encoding: "utf8" }).trim();
-}
-
-function gitLog(range) {
-	const args =
-		range === null
-			? ["log", "--format=%H%x1f%s%x1f%b%x1e"]
-			: ["log", "--format=%H%x1f%s%x1f%b%x1e", range];
-	return execFileSync("git", args, {
-		encoding: "utf8",
-		maxBuffer: LOG_MAX_BUFFER,
-	});
-}
-
-// Latest vYYYY.MM.DD digest tag by calendar date (zero-padded, so string sort
-// orders chronologically), or null when there is none. Invalid calendar dates
-// (v2026.13.99) are ignored, as are non-digest tags.
-function latestDigestTag() {
-	const tags = git("tag", "--list", "v*")
-		.split("\n")
-		.map((t) => t.trim())
-		.filter((t) => parseDigestTag(t));
-	tags.sort();
-	return tags.length ? tags[tags.length - 1] : null;
-}
-
-// Latest digest tag strictly before a given tag (zero-padded dates sort
-// chronologically as strings), or null when there is none. The repair path
-// ranges its notes from this tag so a tag is never compared against itself.
-function latestDigestTagBefore(tag) {
-	const tags = git("tag", "--list", "v*")
-		.split("\n")
-		.map((t) => t.trim())
-		.filter((t) => parseDigestTag(t) && t < tag);
-	tags.sort();
-	return tags.length ? tags[tags.length - 1] : null;
-}
-
-function tagTarget(tag) {
-	return git("rev-list", "-n", "1", tag);
-}
-
-function isAncestor(sha, target) {
-	try {
-		git("merge-base", "--is-ancestor", sha, target);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-// Highest vX.Y.Z tag reachable from a SHA, for notes continuity on the first
-// digest (which has no previous digest). Null when there is none.
-function latestSemverReachable(sha) {
-	return (
-		git("tag", "--merged", sha, "--list", "v*")
-			.split("\n")
-			.map((t) => t.trim())
-			.filter((t) => parseTag(t) && !parseDigestTag(t))
-			.sort((a, b) => compareVersions(parseTag(b), parseTag(a)))[0] || null
-	);
-}
-
-function releaseExists(tag) {
-	try {
-		execFileSync("gh", ["release", "view", tag, "--json", "tagName"], {
-			stdio: "ignore",
-		});
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-// Release assets release.yml attaches to every digest (release.yml uploads
-// sbom/*.cdx.json, SHA256SUMS, source-sha.txt and image-id.txt; sbom.yml
-// names the two CycloneDX inventories). True when the release exists but
-// lacks any of them. False when the assets are complete, when the release
-// itself is missing (a DIGEST_DATE manual repair owns that), or when the
-// lookup fails: a quiet day must never turn red or spam dispatches on a
-// lookup error.
-const SBOM_ASSETS = new Set([
+const SKIP_REASONS = new Set(["quiet-day", "rollback", "digest-already-published"]);
+// release.yml uploads these to every digest; sbom.yml names the two inventories.
+const SBOM_ASSETS = [
 	"rust-workspace.cdx.json",
 	"container-image.cdx.json",
 	"SHA256SUMS",
 	"source-sha.txt",
 	"image-id.txt",
-]);
-
-function sbomAssetsMissing(tag) {
-	let raw;
-	try {
-		raw = execFileSync("gh", ["release", "view", tag, "--json", "assets"], {
-			encoding: "utf8",
-		});
-	} catch {
-		return false;
-	}
-	let assets;
-	try {
-		assets = JSON.parse(raw).assets || [];
-	} catch {
-		return false;
-	}
-	const names = new Set(assets.map((a) => a && a.name).filter(Boolean));
-	for (const asset of SBOM_ASSETS) if (!names.has(asset)) return true;
-	return false;
-}
+];
+// A quiet streak longer than this while main moves ahead is a stalled
+// production, not a quiet day (2026-10-23..31: guard skips reported green).
+const STALE_DAYS = 3;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const STABLE_TAG = /^v[0-9]+\.[0-9]+\.[0-9]+$/;
+const ANNOTATION = "calver-plan-v1\n";
 
 function output(values) {
 	const text = Object.entries(values)
@@ -244,243 +55,214 @@ function output(values) {
 	process.stdout.write(text);
 }
 
-function main() {
+function summary(text) {
+	if (process.env.GITHUB_STEP_SUMMARY)
+		fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${text}\n`);
+}
+
+function prodSha() {
 	const sha = (process.env.PROD_SHA || "").trim().toLowerCase();
-	const repo = process.env.GH_REPO;
-	const dryRun = process.env.DRY_RUN === "true";
-	const date = (process.env.DIGEST_DATE || "").trim() ||
-		new Date().toISOString().slice(0, 10);
 	if (!/^[0-9a-f]{40}$/.test(sha))
 		throw new Error("PROD_SHA must be a full 40-character commit SHA");
-	if (!repo) throw new Error("GH_REPO is required");
-	if (!/^\d{4}-\d{2}-\d{2}$/.test(date))
-		throw new Error("DIGEST_DATE must be YYYY-MM-DD");
-	const digestTag = `v${date.replace(/-/g, ".")}`;
-	if (!parseDigestTag(digestTag))
-		throw new Error("DIGEST_DATE must be a real calendar date");
-	const repoUrl = `${process.env.GITHUB_SERVER_URL || "https://github.com"}/${repo}`;
-	try {
-		git("merge-base", "--is-ancestor", sha, "origin/main");
-	} catch {
-		throw new Error(`${sha} is not on origin/main; refusing to tag it`);
-	}
+	return sha;
+}
 
-	const lastDigest = latestDigestTag();
-	const latestFlag = !lastDigest || digestTag >= lastDigest ? "--latest" : "--latest=false";
-	// Persist the owed state before any fallible note/publish operation. On a
-	// failure these step outputs survive for the workflow's alert job; success
-	// overwrites released below. Policy skips never call this helper.
-	const pendingDigest = () => output({
-		tag_name: "", released: "false", prod_changed: "true",
-		prev_tag: lastDigest || "",
-	});
-	// Quiet and rollback days owe no tag, but may still owe SBOM assets: a
-	// red run after yesterday's cut leaves the release without inventories,
-	// and no later scheduled run backfills it. Redispatch the idempotent
-	// chain for the last digest when its assets are incomplete; dry runs
-	// and lookup failures skip green without dispatching.
-	const reconcileSbom = () => {
-		if (dryRun || !lastDigest || !sbomAssetsMissing(lastDigest)) return false;
-		console.log(`${lastDigest} lacks SBOM assets; redispatching the SBOM chain`);
-		output({
-			tag_name: lastDigest, released: "true", prod_changed: "false",
-			prev_tag: lastDigest,
-		});
-		return true;
+function dryRun() {
+	return process.env.DRY_RUN === "true";
+}
+
+// One release lookup; null when it fails. A quiet day must never turn red
+// or spam dispatches on a lookup error. No tag selects the Latest release.
+function releaseView(tag) {
+	const args = ["release", "view", ...(tag ? [tag] : []), "--json", "tagName,assets,publishedAt"];
+	try {
+		const view = ghJson(args);
+		return view && typeof view.tagName === "string" && STABLE_TAG.test(view.tagName) ? view : null;
+	} catch {
+		return null;
+	}
+}
+
+function ghJson(args) {
+	return JSON.parse(execFileSync("gh", args, { encoding: "utf8" }));
+}
+
+function assetsMissing(view) {
+	const names = new Set((view.assets || []).map((a) => a && a.name).filter(Boolean));
+	return SBOM_ASSETS.some((asset) => !names.has(asset));
+}
+
+// Commits main is ahead of the live SHA; null when the lookup fails.
+function aheadOfLive(sha) {
+	try {
+		const ahead = execFileSync(
+			"gh",
+			["api", `repos/${process.env.GH_REPO}/compare/${sha}...main`, "--jq", ".ahead_by"],
+			{ encoding: "utf8" },
+		).trim();
+		return /^[0-9]+$/.test(ahead) ? Number(ahead) : null;
+	} catch {
+		return null;
+	}
+}
+
+// The bot's note sections live in release-please-config.json (Common
+// Changelog headings, `security` under Fixed); the shared releaser
+// validates and freezes them into the plan. Fail closed on a missing or
+// malformed list instead of silently falling back to built-in headings.
+function changelogSections() {
+	const config = JSON.parse(
+		fs.readFileSync(path.join(__dirname, "..", "..", "release-please-config.json"), "utf8"),
+	);
+	const sections = config.packages?.["."]?.["changelog-sections"];
+	if (!Array.isArray(sections) || sections.length === 0)
+		throw new Error("release-please-config.json must list changelog-sections for the digest notes");
+	return sections;
+}
+
+function request() {
+	const sha = prodSha();
+	const plan = {
+		phase: "plan",
+		input: {
+			channel: "stable", policy: "live-digest", sha,
+			operation: `daily-digest/${sha}`, sections: changelogSections(),
+		},
 	};
-	const lastTarget = lastDigest ? tagTarget(lastDigest) : null;
-	const prevTag = lastDigest || latestSemverReachable(sha);
+	output({ request: JSON.stringify(plan) });
+}
 
-	// Probe for today's tag once; tagTarget throws when the ref is missing,
-	// which is the expected first-run path. Only the probe is guarded: a
-	// later failure must exit red for a clean retry, never fall through.
-	let existing = null;
+// Warn, never fail: the stall belongs to deploy-production, and a red
+// digest would page for a day that owes no tag.
+function staleWarning(sha, latest, now) {
+	const published = Date.parse((latest && latest.publishedAt) || "");
+	if (!Number.isFinite(published) || now - published <= STALE_DAYS * DAY_MS) return;
+	const ahead = aheadOfLive(sha);
+	if (!ahead) return;
+	const days = Math.floor((now - published) / DAY_MS);
+	const text =
+		`Production still serves ${sha.slice(0, 7)} (${latest.tagName}, ${days} days old) ` +
+		`while main is ${ahead} commits ahead; check deploy-production for skipped runs`;
+	console.log(`::warning title=daily-digest stalled production::${text}`);
+	summary(`### Stalled production\n\n${text}.`);
+}
+
+// Today's CalVer tag whose Release is missing, as its own frozen plan read
+// from the tag annotation the shared releaser wrote; null when there is
+// none or a lookup fails.
+function unfinishedToday(now) {
+	const d = new Date(now);
+	const prefix = `v${d.getUTCFullYear()}.${d.getUTCMonth() + 1}${String(d.getUTCDate()).padStart(2, "0")}.`;
 	try {
-		existing = tagTarget(digestTag);
+		const refs = ghJson(["api", `repos/${process.env.GH_REPO}/git/matching-refs/tags/${prefix}`]);
+		for (const ref of Array.isArray(refs) ? refs : []) {
+			const tag = String(ref && ref.ref).replace(/^refs\/tags\//, "");
+			if (!STABLE_TAG.test(tag) || ref.object?.type !== "tag" || releaseView(tag)) continue;
+			const message = ghJson(["api", `repos/${process.env.GH_REPO}/git/tags/${ref.object.sha}`]).message;
+			if (typeof message !== "string" || !message.startsWith(ANNOTATION)) continue;
+			const { publicationEvidence, ...plan } = JSON.parse(message.slice(ANNOTATION.length));
+			if (plan.tag === tag && plan.policy === "live-digest") return plan;
+		}
 	} catch {
-		existing = null;
+		return null;
 	}
+	return null;
+}
 
-	if (!dryRun && existing && !releaseExists(digestTag)) {
-		// Today's digest tag exists but its Release is missing (a manual tag
-		// or a failed create). Repair it before any skip: production may
-		// already serve this exact SHA (quiet-day shape) yet the Release is
-		// still owed. Notes range from the previous digest, never the tag
-		// against itself. Dry runs skip the repair (no `gh` calls offline).
-		pendingDigest();
-		const repairPrev =
-			latestDigestTagBefore(digestTag) || latestSemverReachable(existing);
-		const opts = loadOptions("release-please-config.json");
-		const range = repairPrev ? `${repairPrev}..${existing}` : existing;
-		const commits = gitLog(range)
-			.split("\x1e")
-			.map((r) => r.trim())
-			.filter(Boolean)
-			.map((r) => {
-				const [h, s, b] = r.split("\x1f");
-				return parseCommit(h, s, b);
-			})
-			.filter(Boolean);
-		const notes = renderNotes({
-			tag: digestTag,
-			prevTag: repairPrev || existing,
-			date,
-			commits,
-			sections: opts.sections,
-			repoUrl,
-		});
-		console.log(notes);
-		const notesFile = `${process.env.RUNNER_TEMP || "/tmp"}/digest-notes-${digestTag}.md`;
-		fs.writeFileSync(notesFile, notes);
-		execFileSync(
-			"gh",
-			[
-				"release",
-				"create",
-				digestTag,
-				"--target",
-				existing,
-				"--title",
-				digestTag,
-				"--notes-file",
-				notesFile,
-				latestFlag,
-			],
-			{ stdio: "inherit" },
-		);
-		output({
-			tag_name: digestTag,
-			released: "true",
-			prod_changed: "true",
-			prev_tag: lastDigest || "",
-		});
-		return;
-	}
-
-	if (!dryRun && existing) {
-		// Reconcile a lost SBOM dispatch even when production still matches
-		// today's tag. Attaching inventories is idempotent (--clobber).
-		output({
-			tag_name: digestTag, released: "true", prod_changed: "false",
-			prev_tag: lastDigest || "",
-		});
-		return;
-	}
-
-	if (lastTarget === sha) {
-		if (reconcileSbom()) return;
-		console.log(`${sha} already matches ${lastDigest}; quiet day, no new tag`);
-		output({
-			tag_name: "",
-			released: "false",
-			prod_changed: "false",
-			prev_tag: lastDigest,
-		});
-		return;
-	}
-	if (lastTarget && isAncestor(sha, lastTarget)) {
-		// Production serves an older commit than the last digest (a rollback
-		// or redeploy of a prior build). It is never tagged, mirroring the
-		// retired per-promote rollback guard; the next forward deploy digests.
-		if (reconcileSbom()) return;
-		console.log(
-			`${sha} is older than ${lastDigest}; rollback serving, no new tag`,
-		);
-		output({
-			tag_name: "",
-			released: "false",
-			prod_changed: "false",
-			prev_tag: lastDigest,
-		});
-		return;
-	}
-	if (existing) {
-		// Today's digest tag already exists with its Release (or a dry-run
-		// preview of either). Tomorrow's digest covers any production move
-		// since. Never a second tag for the same day.
-		console.log(`${digestTag} already exists; no new tag today`);
-		output({
-			tag_name: "",
-			released: "false",
-			prod_changed: "false",
-			prev_tag: lastDigest || "",
-		});
-		return;
-	}
-
-	if (!dryRun) pendingDigest();
-	const opts = loadOptions("release-please-config.json");
-	const range = prevTag ? `${prevTag}..${sha}` : sha;
-	const commits = gitLog(range)
-		.split("\x1e")
-		.map((r) => r.trim())
-		.filter(Boolean)
-		.map((r) => {
-			const [h, s, b] = r.split("\x1f");
-			return parseCommit(h, s, b);
-		})
-		.filter(Boolean);
-	const notes = renderNotes({
-		tag: digestTag,
-		prevTag: prevTag || sha,
-		date,
-		commits,
-		sections: opts.sections,
-		repoUrl,
-	});
-	console.log(notes);
-	if (dryRun) {
-		output({
-			tag_name: "",
-			released: "false",
-			prod_changed: "true",
-			prev_tag: lastDigest || "",
-		});
-		return;
-	}
-	if (!releaseExists(digestTag)) {
-		const notesFile = `${process.env.RUNNER_TEMP || "/tmp"}/digest-notes-${digestTag}.md`;
-		fs.writeFileSync(notesFile, notes);
-		// Creates the tag on the live production commit when it does not exist
-		// yet. Backdated cuts/repairs must not move Latest backward.
-		execFileSync(
-			"gh",
-			[
-				"release",
-				"create",
-				digestTag,
-				"--target",
-				sha,
-				"--title",
-				digestTag,
-				"--notes-file",
-				notesFile,
-				latestFlag,
-			],
-			{ stdio: "inherit" },
-		);
-	}
+function noDigest(reason, latest, owed) {
+	summary(`## Daily digest skipped: ${reason}\n\nLive production: \`${prodSha()}\``);
 	output({
-		tag_name: digestTag,
-		released: "true",
-		prod_changed: "true",
-		prev_tag: lastDigest || "",
+		publish: "false", tag_name: "", released: "false", prod_changed: "false",
+		prev_tag: latest ? latest.tagName : "", sbom_tags: [...new Set(owed)].join(" "),
 	});
 }
 
-module.exports = {
-	parseCommit,
-	parseDigestTag,
-	parseTag,
-	renderNotes,
-	compareVersions,
-	loadOptions,
-	LOG_MAX_BUFFER,
-};
+// Persist the owed state before publication. On a failed publish these
+// outputs survive for the alert job; record overwrites released.
+// `repair` lets a retry finish a tag whose Release creation failed.
+function owe(plan, prevTag, owed) {
+	const publish = { phase: "publish", plan, dryRun: dryRun(), repair: true };
+	output({
+		publish: "true", tag_name: "", released: "false", prod_changed: "true",
+		prev_tag: prevTag, sbom_tags: owed.join(" "),
+		publish_request: JSON.stringify(publish),
+	});
+}
+
+function adapt() {
+	const sha = prodSha();
+	const dry = dryRun();
+	const now = Date.now();
+	// A red run after an earlier cut leaves its release without inventories,
+	// and no later run backfills it. Every path redispatches the idempotent
+	// chain for the Latest release when its assets are missing.
+	const latest = dry ? null : releaseView("");
+	const owed = latest && assetsMissing(latest) ? [latest.tagName] : [];
+	if (owed.length) console.log(`${owed[0]} lacks SBOM assets; redispatching the SBOM chain`);
+	if (process.env.SKIPPED === "true") {
+		const reason = process.env.REASON || "";
+		if (!SKIP_REASONS.has(reason)) throw new Error(`unclassified skip reason ${JSON.stringify(reason)}`);
+		const unfinished = !dry && reason === "digest-already-published" ? unfinishedToday(now) : null;
+		if (unfinished) {
+			console.log(`${unfinished.tag} has no Release; finishing it from its frozen plan`);
+			owe(unfinished, unfinished.previousStableTag || "", owed);
+			return;
+		}
+		console.log(`${sha} owes no digest today: ${reason}`);
+		if (reason === "quiet-day") staleWarning(sha, latest, now);
+		noDigest(reason, latest, owed);
+		return;
+	}
+	let plan;
+	try {
+		plan = JSON.parse(process.env.PLAN || "");
+	} catch {
+		throw new Error("plan step returned neither a skip nor a JSON plan");
+	}
+	if (!plan || plan.sha !== sha || plan.policy !== "live-digest" || !STABLE_TAG.test(plan.tag))
+		throw new Error("plan does not bind the live production SHA under live-digest");
+	// The shared planner recovers a SHA's prior plan before its quiet-day and
+	// rollback checks. When that Release already exists, production has not
+	// moved to anything new: owe nothing, and never re-publish (a transient
+	// publish error would page for a digest that exists).
+	const own = dry ? null : releaseView(plan.tag);
+	if (own) {
+		console.log(`${sha} is already published as ${plan.tag}; no new digest`);
+		if (latest && latest.tagName === plan.tag) staleWarning(sha, latest, now);
+		if (assetsMissing(own)) owed.push(plan.tag);
+		noDigest("already-published", latest, owed);
+		return;
+	}
+	owe(plan, process.env.PREV_TAG || "", owed);
+}
+
+function record() {
+	const tag = (process.env.TAG || "").trim();
+	if (!STABLE_TAG.test(tag)) throw new Error("publish step returned no stable tag");
+	if (dryRun()) {
+		console.log(`dry run: would publish ${tag}`);
+		output({ tag_name: "", released: "false", sbom_tags: "" });
+		return;
+	}
+	let owed = tag;
+	if (process.env.CREATED !== "true") {
+		// A repaired or replayed digest: dispatch only when its inventories
+		// are incomplete. A lookup failure stays green.
+		const view = releaseView(tag);
+		owed = view && assetsMissing(view) ? tag : "";
+	}
+	output({ tag_name: tag, released: "true", sbom_tags: owed });
+}
+
+const MODES = { request, adapt, record };
+
+module.exports = { SBOM_ASSETS, STALE_DAYS, assetsMissing, MODES };
 
 if (require.main === module) {
 	try {
-		main();
+		const mode = MODES[process.argv[2]];
+		if (!mode) throw new Error("usage: daily-digest.cjs request|adapt|record");
+		mode();
 	} catch (err) {
 		console.error(`::error title=daily-digest::${err.message}`);
 		process.exit(1);

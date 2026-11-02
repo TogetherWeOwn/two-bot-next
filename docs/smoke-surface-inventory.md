@@ -9,8 +9,8 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 46 compiled built-ins plus the voice set
-  (67 with the voice gates on), registry bounds,
+- Rendered reference: `docs/commands.md` — the 47 compiled built-ins plus the voice set
+  (69 with the voice gates on), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
@@ -66,6 +66,7 @@ handler family with a covered command.
 | `/command-clone` | automations | Requires a saved source and writes a new definition plus audit, then republishes the registry; excluded from the read-only smoke. Disposable-database acceptance covers cloning and its failure/race paths. |
 | `/command-disable` | automations | Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke. |
 | `/command-enable` | automations | Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke. |
+| `/command-edit` | automations | Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke. |
 | `/schedule` | automations | Effect fires on a wall-clock delay the offline smoke cannot observe; needs a timed live-guild pass. |
 | `/schedule-remove` | automations | Destructive and needs a live scheduled-message id; sequenced after a schedule create, not standalone. |
 | `/schedule-list` | automations | Needs seeded scheduled rows (DB); the no-DB rule excludes it. |

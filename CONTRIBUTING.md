@@ -121,25 +121,39 @@ Use an issue form: bug report, feature request, enhancement or documentation
 issue. Blank issues are off. Report a vulnerability privately; see
 [`SECURITY.md`](SECURITY.md).
 
+### Design-only specs
+
+A new design-only spec under `docs/` needs a linked tracking card or issue that
+names the date the owner will decide it. Say so in the PR body. The spec's
+`Status:` line then records the decision: accepted for a milestone, deferred to
+a month or a roadmap, declined (no build), or merged into another spec. A spec
+with no decision stays no-build. Keep a declined spec as the record.
+
 ## Releases
 
-The daily `daily-digest` workflow tags the live production commit `vYYYY.MM.DD`
-when production has moved forward since the last digest, and publishes a GitHub
-Release from Conventional Commit subjects. Deploys never create version tags.
+The daily `daily-digest` workflow tags the live production commit with a
+stable CalVer version `vYYYY.MDD.P` (for example `v2026.1101.0`) when
+production has moved forward since the last digest, and publishes a GitHub
+Release from Conventional Commit subjects. The shared releaser in
+`TogetherWeOwn/.github` (`actions/calver`, `live-digest` policy) cuts it, at
+most once a day, so `P` stays 0. Deploys never create version tags.
 There is no release PR or freeze. One digest tag covers the whole repository,
-not one release per crate. See [`docs/releases.md`](docs/releases.md) for repair
-and dry-run dispatches. Never tag or release by hand.
+not one release per crate. Legacy `vYYYY.MM.DD` and `vX.Y.Z` tags stay as they
+are. See [`docs/releases.md`](docs/releases.md) for repair and dry-run
+dispatches. Never tag or release by hand.
 
 Release notes use the [Common Changelog](https://common-changelog.org/)
 categories, in its order: **Changed** (`perf`, `revert`), **Added** (`feat`),
-**Fixed** (`fix`). `chore`, `docs`, `test`, `ci`, `build`, `refactor` and
-`style` stay out of the notes. Each squash-merged PR title becomes one
+**Fixed** (`fix`, `security`). The digest adapter passes the
+`changelog-sections` from `release-please-config.json` to the shared
+releaser; `chore`, `docs`, `test`, `ci`, `build`, `refactor`, `style` and
+`deps` stay out of the notes. Each squash-merged PR title becomes one
 entry, so write it for a reader of the release notes: imperative mood, one
 user-facing change.
 
-Release tags use UTC calendar dates. Cargo package versions stay at `0.4.0`;
-`feat!` and `BREAKING CHANGE` still appear in the breaking-changes notes but
-no longer choose a SemVer bump.
+Release tags use the UTC date the release was planned. Cargo package versions
+stay at `0.4.0`; `feat!` and `BREAKING CHANGE` still appear in the
+breaking-changes notes but never choose a version bump.
 
 ## Local development
 
@@ -189,6 +203,7 @@ python3 scripts/test-docker-deps.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
 python3 scripts/check_soak_checklist.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist_noexec_acceptance.py' -v
 python3 tests/voice_templates/validate.py
 python3 -m unittest discover -s tests/voice_templates -p 'test_*.py' -v
 ```

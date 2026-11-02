@@ -22,6 +22,7 @@
     "command-clone",
     "command-disable",
     "command-enable",
+    "command-edit",
     "schedule",
     "schedule-remove",
     "schedule-list",
@@ -72,6 +73,7 @@
     "command-clone",
     "command-disable",
     "command-enable",
+    "command-edit",
     "schedule",
     "schedule-remove",
     "schedule-list",
@@ -131,7 +133,8 @@
       { "name": "private", "default_member_permissions": null },
       { "name": "public", "default_member_permissions": null },
       { "name": "limit", "default_member_permissions": null },
-      { "name": "unlimit", "default_member_permissions": null }
+      { "name": "unlimit", "default_member_permissions": null },
+      { "name": "room-access-inspect", "default_member_permissions": null }
     ],
     "shadowed_by_first_wins": [
       "kick"

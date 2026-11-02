@@ -637,7 +637,7 @@ mod tests {
         );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 67);
+        assert_eq!(with_voice.len(), 69);
         assert!(
             with_voice.iter().any(|def| def.name == "tempban-list"),
             "tempban-list survives the voice registry"
@@ -727,7 +727,7 @@ mod tests {
                     }
                     let definitions =
                         desired_definitions(2222, &env).expect("desired registry assembles");
-                    for name in ["command-inspect", "giveaway"] {
+                    for name in ["command-inspect", "command-edit", "giveaway"] {
                         assert_eq!(
                             definitions.iter().filter(|def| def.name == name).count(),
                             usize::from(automations == Some("1")),

@@ -47,6 +47,7 @@ pub mod leveling_runtime;
 pub mod lfg_interactions;
 #[cfg(feature = "db")]
 mod lfg_list;
+pub mod lockdown_preview;
 pub mod member_moderation;
 mod message_safety;
 pub mod onboarding_config;

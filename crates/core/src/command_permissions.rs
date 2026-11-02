@@ -90,10 +90,12 @@ use PolicyHook::{
 /// `/welcome-preview` admin preview (parity row 42), staff aggregate
 /// `/game-mix` (43), and feed lifecycle `/feed-pause` (44) and
 /// `/feed-resume` (45), saved expiry inspection `/tempban-list` (46),
-/// staff-only saved-ledger read `/moderation-recent` (47), and
-/// management-only `/command-clone` (48). Only `/game-mix` admits
+/// the staff-only saved-ledger read `/moderation-recent` (47), the Next-only
+/// private lockdown preview `/lockdown-preview` (48, dark until its
+/// publication slice), in-place saved-response correction `/command-edit`
+/// (49), and management-only `/command-clone` (50). Only `/game-mix` admits
 /// Administrator alone; legacy masks are unchanged.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 49] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 51] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -156,6 +158,16 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 49] = [
         PERM_MANAGE_CHANNELS,
         None,
     ),
+    // Next-only private lockdown preview (`docs/lockdown-preview-spec.md`).
+    // Dark until the publication slice: adjudicated here so the router can
+    // refuse without `ManageChannels`, but with no published definition.
+    row(
+        48,
+        "lockdown-preview",
+        BuiltinSlash,
+        PERM_MANAGE_CHANNELS,
+        None,
+    ),
     row(
         47,
         "moderation-recent",
@@ -177,7 +189,8 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 49] = [
     row(33, "command-inspect", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(40, "command-disable", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(41, "command-enable", BuiltinSlash, PERM_MANAGE_GUILD, None),
-    row(48, "command-clone", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(49, "command-edit", BuiltinSlash, PERM_MANAGE_GUILD, None),
+    row(50, "command-clone", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(17, "schedule", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(18, "schedule-remove", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(19, "schedule-list", BuiltinSlash, PERM_MANAGE_GUILD, None),
