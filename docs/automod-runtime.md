@@ -235,7 +235,7 @@ otherwise the loop is unchanged.
   | `Retained(_)` (needs recorded reconciliation) | disposition | `CaptureOnly` | no (trigger is capture-only) |
   | `Duplicate(Some(receipt))` (settled replay) | from the receipt: matched → capture-only, clean → accept (`crates/discord/src/automod_activation.rs:107-113`) | = `funnel` | iff the receipt was clean (`Accept`) |
   | `Duplicate(None)` (in-flight replay) | capture-only for a create, `None` for an update | = `funnel` | no for a create |
-  | `Unavailable` (enrichment/claim/target failed) | `CaptureOnly` for a create, `None` for an update (`crates/discord/src/automod_activation.rs:161`) | = `funnel` | no |
+  | `Unavailable` (enrichment/claim/target failed) | `CaptureOnly` for a create, `None` for an update (`crates/discord/src/automod_activation.rs:170`) | = `funnel` | no |
   | `process` timeout | `kind.funnel(true)`: capture-only for a create, `None` for an update | same | no |
   | automod inactive (no verdict) | — | — | yes (`None` passes the gate) |
 - **Funnel once-per-message.** The funnel's writes commit with the gateway
