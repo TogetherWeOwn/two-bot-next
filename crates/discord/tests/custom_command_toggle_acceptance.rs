@@ -31,8 +31,9 @@ use two_bot_core::{
     commands::CustomCommand,
     custom_command_service as service, custom_command_store as store,
     custom_commands::{
-        builtin_command_names, max_custom_commands, reserved_command_names,
-        AutomationMessageAcceptance, CommandError, PutCommandInput, StoredCommand,
+        builtin_command_names, max_custom_commands, publishable_builtin_names,
+        reserved_command_names, AutomationMessageAcceptance, CommandError, PutCommandInput,
+        StoredCommand,
     },
     HandlerId, InteractionRouter, RouterGates, SlashContext, SlashOutcome,
     AUTOMATIONS_DISABLED_REPLY, MANAGE_SERVER_REQUIRED,
@@ -899,16 +900,16 @@ async fn toggle_paused_trigger_remains_owned_and_existing_replacement_semantics_
 async fn toggle_at_capacity_can_resume_existing_definition_but_cannot_add_another() {
     let f = Fixture::new(false).await;
     // Independent pin: customs fill the guild ceiling around the live
-    // reserved set (68 published +2 held). The fixture already stores `faq`
-    // and `other`; peers fill the rest of the budget. Disabled rows count
-    // toward storage, not just picker entries.
+    // publishable set (68 published; 2 more squatted but unpublished). The
+    // fixture already stores `faq` and `other`; peers fill the rest of the
+    // budget. Disabled rows count toward storage, not just picker entries.
     let reserved = reserved_command_names();
     assert_eq!(
         reserved.len(),
         70,
         "70 reserved names pin the oracle: 68 published +2 held"
     );
-    let capacity = max_custom_commands(reserved.len());
+    let capacity = max_custom_commands(publishable_builtin_names().len());
     for index in 2..capacity {
         seed(
             f.db.pool(),
@@ -1456,9 +1457,10 @@ async fn toggle_control_existing_replace_and_remove_are_not_repurposed() {
 // Capacity pins: the parser envelope is the guild ceiling (100); the planner
 // and PUT path refuse only past it, with a no-growth exception for rows
 // saved under an older budget. Publication withholds excess customs instead
-// of failing. The live custom budget derives from the reserved set via
-// `max_custom_commands`, so a new builtin never silently strands a catalog;
-// the fixed 33-row catalog below exercises the stranded-over-budget path.
+// of failing. The live custom budget derives from the publishable set via
+// `max_custom_commands` (squatted-but-unpublished names hold no slots), so
+// a new builtin never silently strands a catalog; the fixed 33-row catalog
+// below exercises the stranded-over-budget path.
 const STRANDED_CATALOG_ROWS: usize = 33;
 const STRANDED_CATALOG_PLUS_ONE: usize = 34;
 const EXPECTED_BUILTINS_WITHOUT_VOICE: usize = 45;
@@ -1606,9 +1608,9 @@ fn custom_catalog_33_row_export_parses_and_diffs_without_growth() {
     assert_eq!(parsed.entries.len(), 33);
     assert_eq!(parsed.invalid_entries, 0);
     assert!(!parsed.overwrite);
-    // The planner budget follows the live reserved set; fresh growth past it
-    // is refused even though the envelope allows the parse.
-    let budget = max_custom_commands(reserved.len());
+    // The planner budget follows the live publishable set; fresh growth
+    // past it is refused even though the envelope allows the parse.
+    let budget = max_custom_commands(publishable_builtin_names().len());
     assert_eq!(
         transfer::diff_import(&[], &parsed, &reserved, false),
         Err(CommandError::OverCapacity(budget)),
@@ -1802,9 +1804,9 @@ fn myroom_router_precedence_off_runs_custom_and_on_yields_to_voice_sink() {
 #[tokio::test]
 async fn custom_catalog_service_import_budget_succeeds_and_over_budget_overflows_with_bulk_updates()
 {
-    // The import budget follows the live reserved set, so the row counts
+    // The import budget follows the live publishable set, so the row counts
     // derive from it instead of repeating a stale capacity literal.
-    let budget = max_custom_commands(reserved_command_names().len());
+    let budget = max_custom_commands(publishable_builtin_names().len());
     let url = std::env::var("TWO_TEST_DATABASE_URL")
         .expect("explicit disposable test bootstrap required");
     let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))

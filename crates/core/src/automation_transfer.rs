@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use super::commands::GUILD_COMMAND_LIMIT;
 use super::custom_commands::{
-    error_code, max_custom_commands, validate_put_input, CommandError, PutCommandInput,
-    StoredCommand,
+    error_code, max_custom_commands, publishable_builtin_names, validate_put_input, CommandError,
+    PutCommandInput, StoredCommand,
 };
 use super::mee6::{parse_mee6_entry, translate_export, Mee6CommandInput};
 
@@ -318,7 +318,11 @@ pub fn diff_import(
             }),
         }
     }
-    let max = max_custom_commands(builtins.len());
+    // Capacity counts publication slots, not the wider write-reservation set
+    // in `builtins`: `templateassistant` and dark names block writes but
+    // occupy no slot, so holding their slots would reject imports that still
+    // fit under the 100-command ceiling.
+    let max = max_custom_commands(publishable_builtin_names().len());
     let mut union: HashSet<&str> = existing.iter().map(|row| row.name.as_str()).collect();
     let stored = union.len();
     for (_, entry) in &valid {
@@ -688,7 +692,7 @@ mod tests {
     #[test]
     fn union_capacity_fails_the_whole_diff() {
         let builtins = builtins();
-        let max = max_custom_commands(builtins.len());
+        let max = max_custom_commands(publishable_builtin_names().len());
         let desired: Vec<PutCommandInput> = (0..=max)
             .map(|i| PutCommandInput {
                 name: format!("fresh-{i}"),
@@ -714,7 +718,7 @@ mod tests {
         // The guild saved one more row than today's budget allows, as if a
         // release added a builtin after it filled the old maximum.
         let builtins = builtins();
-        let max = max_custom_commands(builtins.len());
+        let max = max_custom_commands(publishable_builtin_names().len());
         let existing: Vec<StoredCommand> = (0..=max)
             .map(|i| stored(&format!("saved-{i:02}"), "t", None))
             .collect();

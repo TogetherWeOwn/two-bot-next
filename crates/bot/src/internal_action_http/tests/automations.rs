@@ -4,7 +4,7 @@
 //! replay without a second apply. Only guarded TestDatabase pools; never
 //! staging or production.
 use super::*;
-use two_bot_core::custom_commands::max_custom_commands;
+use two_bot_core::custom_commands::{max_custom_commands, publishable_builtin_names};
 
 const AUTOMATIONS_ACTOR: &str = "111111111111111111";
 
@@ -105,10 +105,10 @@ async fn capacity_command_rows(pool: &sqlx::PgPool) -> Vec<Value> {
 
 #[tokio::test]
 async fn import_at_budget_backup_updates_and_replays_but_over_budget_never_writes() {
-    // The import planner budget follows the live reserved set. A
+    // The import planner budget follows the live publishable set. A
     // budget-sized backup imports, bulk-updates and replays idempotently;
     // one row more never writes.
-    let budget = max_custom_commands(reserved_command_names().len());
+    let budget = max_custom_commands(publishable_builtin_names().len());
     let db = database()
         .await
         .expect("explicit disposable test bootstrap required");
