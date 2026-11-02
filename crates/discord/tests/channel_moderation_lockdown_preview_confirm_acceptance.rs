@@ -13,7 +13,8 @@
 //!   and the confirm interaction id as idempotency identity: one lockdown
 //!   row whose `preview_request_id` equals the confirmed preview's
 //!   interaction id, zero extra rows, and the lane's own recheck refusing
-//!   before any seed or PUT on drift.
+//!   before any seed or PUT on drift — including an empty `@everyone` row
+//!   appearing or disappearing, which carries the same masks as no row.
 //! * Actor-gate loss refuses before reads with the entry already consumed
 //!   and no row; foreign/forged/double/cancel-then-confirm/restart presses
 //!   collapse to `PREVIEW_EXPIRED` with no row. Cancel consumes the entry,
@@ -23,7 +24,8 @@
 //!   retired.
 //! * Transport: an owned live press defers with type 6 and clears the
 //!   buttons; any other press defers ephemeral (type 5) and edits text-only,
-//!   preserving live buttons.
+//!   preserving live buttons. A fenced press (moderation off or a foreign
+//!   guild) stays silent: no defer, no reply, no row, and the entry alive.
 //!
 //! Expiry-at-boundary (`now == expires`) is covered at the store seam by the
 //! `expiry_equality_frees_and_take_refuses_expired` unit test: driving a
@@ -47,6 +49,7 @@ use two_bot_discord::{
 use two_bot_testsupport::TestDatabase;
 
 const GUILD: &str = "111111111111111111";
+const FOREIGN_GUILD: &str = "999999999999999999";
 const CHANNEL: &str = "222222222222222222";
 const ACTOR: &str = "333333333333333333";
 const ACTOR_U64: u64 = 333333333333333333;
@@ -123,6 +126,25 @@ fn router() -> InteractionRouter {
     router
 }
 
+/// Same guild, but the moderation gate off: preview presses route `Ignore`.
+fn off_router() -> InteractionRouter {
+    let mut router = InteractionRouter::new(RouterGates {
+        configured_guild: Some(GUILD.parse().unwrap()),
+        moderation: false,
+        voice: false,
+        voice_assistant: false,
+        scorecard: false,
+        automations: false,
+        announcements: false,
+        tickets: false,
+        self_roles: false,
+        onboarding_picker: false,
+        session_picker: false,
+    });
+    register_channel_handlers(&mut router);
+    router
+}
+
 fn slash(id: u64, permissions: u64) -> Interaction {
     serde_json::from_value(json!({
         "id": id.to_string(), "application_id": "444444444444444444", "type": 2,
@@ -137,13 +159,17 @@ fn slash(id: u64, permissions: u64) -> Interaction {
 }
 
 fn press(id: u64, user: &str, permissions: u64, custom_id: &str) -> Interaction {
+    press_in(id, GUILD, user, permissions, custom_id)
+}
+
+fn press_in(id: u64, guild: &str, user: &str, permissions: u64, custom_id: &str) -> Interaction {
     serde_json::from_value(json!({
         "id": id.to_string(), "application_id": "444444444444444444", "type": 3,
-        "guild_id": GUILD, "channel": {"id": CHANNEL, "type": 0, "permissions": permissions.to_string()},
+        "guild_id": guild, "channel": {"id": CHANNEL, "type": 0, "permissions": permissions.to_string()},
         "member": {"user": {"id": user, "username": "member", "discriminator": "0", "avatar": null},
                    "roles": [], "flags": 0, "deaf": false, "mute": false, "permissions": permissions.to_string()},
         "token": "synthetic-interaction-token", "version": 1, "locale": "en-US", "guild_locale": "en-US",
-        "authorizing_integration_owners": {"0": GUILD}, "entitlements": [],
+        "authorizing_integration_owners": {"0": guild}, "entitlements": [],
         "data": {"custom_id": custom_id, "component_type": 2}
     })).expect("synthetic Twilight component interaction")
 }
@@ -186,6 +212,27 @@ fn roles_doc() -> Value {
         {"id": GUILD, "position": 0, "permissions": "104324673"},
         {"id": KEEPER_ROLE, "position": 1, "permissions": "3072"},
     ])
+}
+
+/// No `@everyone` row at all: the lane reads no overwrite.
+fn absent_channel_doc() -> Value {
+    json!({
+        "id": CHANNEL,
+        "type": 0,
+        "guild_id": GUILD,
+        "permission_overwrites": [],
+    })
+}
+
+/// An empty `@everyone` row: present, but both masks zero — the same masks
+/// as no row, with flipped existence.
+fn empty_channel_doc() -> Value {
+    json!({
+        "id": CHANNEL,
+        "type": 0,
+        "guild_id": GUILD,
+        "permission_overwrites": [{"id": GUILD, "type": 0, "allow": "0", "deny": "0"}],
+    })
 }
 
 /// Keeper role with `EMBED_LINKS` added: outside `INTEREST_BITS`, so the
@@ -920,6 +967,231 @@ async fn respond_foreign_press_stays_ephemeral_and_preserves_live_buttons() {
     );
     assert_eq!(reply.outcome, "locked_down");
     assert_eq!(db.audit_count().await, 2, "the foreign press wrote no row");
+    assert_eq!(put_count(&mock), 1);
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+async fn prepare_lane_empty_row_appearing_refuses_before_seed_or_put() {
+    let db = Database::open().await;
+    let mock = MockRest::start(
+        vec![
+            // Preview reads: no `@everyone` row at all.
+            ScriptedResponse::json(200, absent_channel_doc()),
+            ScriptedResponse::json(200, roles_doc()),
+            // The confirm recheck still reads no row, so the digest matches.
+            ScriptedResponse::json(200, absent_channel_doc()),
+            ScriptedResponse::json(200, roles_doc()),
+            // The lane's own GET finds an empty row: same masks, new
+            // existence — a later `/unlock` would delete instead of doing
+            // nothing, so the lane refuses.
+            ScriptedResponse::json(200, empty_channel_doc()),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    let digest = preview_armed(&runtime, 300).await;
+
+    let reply = handled(
+        runtime
+            .execute(
+                &router(),
+                &press(
+                    301,
+                    ACTOR,
+                    MANAGE_CHANNELS,
+                    &confirm_custom_id(ACTOR_U64, &digest),
+                ),
+            )
+            .await
+            .unwrap(),
+        "appearing-row confirm",
+    );
+    assert_eq!(reply.outcome, "refused");
+    assert!(
+        reply.text.contains("changed after this preview"),
+        "{}",
+        reply.text
+    );
+    let rows = db.audit_rows().await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].0, "301");
+    assert_eq!(
+        serde_json::from_str::<Value>(&rows[1].3).unwrap(),
+        json!({"preview_request_id": "300"}),
+        "a mutation-path refusal keeps the preview correlation"
+    );
+    assert!(
+        !db.lockdown_present().await,
+        "existence drift refuses before any seed"
+    );
+    all_get(&mock);
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+async fn prepare_lane_empty_row_disappearing_refuses_before_seed_or_put() {
+    let db = Database::open().await;
+    let mock = MockRest::start(
+        vec![
+            // Preview reads: an empty `@everyone` row (both masks zero).
+            ScriptedResponse::json(200, empty_channel_doc()),
+            ScriptedResponse::json(200, roles_doc()),
+            // The confirm recheck still reads the empty row.
+            ScriptedResponse::json(200, empty_channel_doc()),
+            ScriptedResponse::json(200, roles_doc()),
+            // The lane's own GET reads no row: same masks, lost existence —
+            // a later `/unlock` would do nothing instead of restoring.
+            ScriptedResponse::json(200, absent_channel_doc()),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    let digest = preview_armed(&runtime, 310).await;
+
+    let reply = handled(
+        runtime
+            .execute(
+                &router(),
+                &press(
+                    311,
+                    ACTOR,
+                    MANAGE_CHANNELS,
+                    &confirm_custom_id(ACTOR_U64, &digest),
+                ),
+            )
+            .await
+            .unwrap(),
+        "disappearing-row confirm",
+    );
+    assert_eq!(reply.outcome, "refused");
+    assert!(
+        reply.text.contains("changed after this preview"),
+        "{}",
+        reply.text
+    );
+    let rows = db.audit_rows().await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].0, "311");
+    assert_eq!(
+        serde_json::from_str::<Value>(&rows[1].3).unwrap(),
+        json!({"preview_request_id": "310"}),
+        "a mutation-path refusal keeps the preview correlation"
+    );
+    assert!(
+        !db.lockdown_present().await,
+        "existence drift refuses before any seed"
+    );
+    all_get(&mock);
+    mock.shutdown().await;
+    db.close().await;
+}
+
+#[tokio::test]
+async fn respond_fenced_press_stays_silent_and_consumes_nothing() {
+    let db = Database::open().await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, armed_channel_doc()),
+            ScriptedResponse::json(200, roles_doc()),
+            // The owner Confirm after the fenced presses still executes.
+            ScriptedResponse::json(200, armed_channel_doc()),
+            ScriptedResponse::json(200, roles_doc()),
+            ScriptedResponse::json(200, armed_channel_doc()),
+            ScriptedResponse::status(204),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(&db, &mock);
+    let router = router();
+    let digest = preview_armed(&runtime, 320).await;
+
+    // Moderation off: the router says `Ignore` — no defer, no reply.
+    assert!(
+        !runtime
+            .respond(
+                &off_router(),
+                &press(
+                    321,
+                    ACTOR,
+                    MANAGE_CHANNELS,
+                    &confirm_custom_id(ACTOR_U64, &digest)
+                )
+            )
+            .await
+            .unwrap(),
+        "a moderation-off press stays silent"
+    );
+    // Foreign guild: the fence says `Ignore` the same way.
+    assert!(
+        !runtime
+            .respond(
+                &router,
+                &press_in(
+                    322,
+                    FOREIGN_GUILD,
+                    ACTOR,
+                    MANAGE_CHANNELS,
+                    &confirm_custom_id(ACTOR_U64, &digest)
+                )
+            )
+            .await
+            .unwrap(),
+        "a foreign-guild press stays silent"
+    );
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "silent presses touch no wire: {:?}",
+        mock.requests()
+            .iter()
+            .map(|r| (r.method.clone(), r.path.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    // A direct `execute` on a fenced press gets the expired notice, not the
+    // reconciliation fallback — and consumes nothing.
+    let fenced = handled(
+        runtime
+            .execute(
+                &off_router(),
+                &press(
+                    323,
+                    ACTOR,
+                    MANAGE_CHANNELS,
+                    &confirm_custom_id(ACTOR_U64, &digest),
+                ),
+            )
+            .await
+            .unwrap(),
+        "fenced confirm",
+    );
+    assert_eq!(fenced.outcome, PREVIEW_EXPIRED);
+    assert_eq!(db.audit_count().await, 1, "fenced presses write no row");
+
+    // The owner's entry survived every fenced press: Confirm executes.
+    let reply = handled(
+        runtime
+            .execute(
+                &router,
+                &press(
+                    324,
+                    ACTOR,
+                    MANAGE_CHANNELS,
+                    &confirm_custom_id(ACTOR_U64, &digest),
+                ),
+            )
+            .await
+            .unwrap(),
+        "owner confirm after fenced presses",
+    );
+    assert_eq!(reply.outcome, "locked_down");
+    assert_eq!(db.audit_count().await, 2);
     assert_eq!(put_count(&mock), 1);
     mock.shutdown().await;
     db.close().await;

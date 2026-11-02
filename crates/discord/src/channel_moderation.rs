@@ -172,13 +172,17 @@ struct Prepared {
     rejected_seed: Option<LockdownRecord>,
 }
 
-/// The masks a confirmed preview must reproduce inside the lane (spec section
+/// The write a confirmed preview must reproduce inside the lane (spec section
 /// 3 step 5): `prepare`'s own fresh GET must still yield this `@everyone`
 /// prior and this planned write, or it refuses before recording a seed or
 /// sending a PUT. Carried from the confirm-time plan, which the digest check
-/// already proved identical to the previewed snapshot.
+/// already proved identical to the previewed snapshot. Existence rides along
+/// because an empty overwrite appearing or disappearing carries the same
+/// masks as no row: without it a later `/unlock` would delete instead of
+/// restoring (or vice versa).
 #[derive(Debug, Clone, Copy)]
 struct PreviewedWrite {
+    prior_exists: bool,
     prior_allow: u64,
     prior_deny: u64,
     write_allow: u64,
@@ -277,6 +281,24 @@ impl ChannelModerationRuntime {
         interaction: &Interaction,
     ) -> Result<bool, ChannelResponseError> {
         if !Self::accepts(interaction) {
+            return Ok(false);
+        }
+        // The router's silent fence runs before any defer: `accepts` matches
+        // preview buttons by custom id alone, so with moderation off or in a
+        // foreign guild the press still arrives here although the router says
+        // `Ignore`. Answering (even deferring) would break the fence contract
+        // and surface the reconciliation fallback for a press that ran
+        // nothing, so stay silent exactly like the shared interaction path.
+        if matches!(
+            route_interaction(router, interaction, None),
+            RoutedInteraction::Component {
+                outcome: ComponentOutcome::Ignore,
+                ..
+            } | RoutedInteraction::Modal {
+                outcome: ComponentOutcome::Ignore,
+                ..
+            } | RoutedInteraction::Ignore
+        ) {
             return Ok(false);
         }
         // A press that addresses a live entry collapses its message: the
@@ -454,6 +476,20 @@ impl ChannelModerationRuntime {
                     self.execute_preview_component(router, interaction, &custom_id)
                         .await?,
                 ));
+            }
+            RoutedInteraction::Component { custom_id, .. }
+                if parse_preview_custom_id(&custom_id).is_some() =>
+            {
+                // A preview press the router did not handle (moderation off
+                // or a foreign guild reaching `execute` directly): the wire
+                // path stays silent in `respond`, and a direct caller gets
+                // the expired notice instead of the reconciliation fallback.
+                return Ok(Some(ChannelReply {
+                    text: EXPIRED_COMPONENT_REPLY.to_owned(),
+                    outcome: PREVIEW_EXPIRED.to_owned(),
+                    replayed: false,
+                    digest32: None,
+                }));
             }
             _ => return Ok(None),
         };
@@ -1169,6 +1205,7 @@ impl ChannelModerationRuntime {
             ));
         }
         let expected = PreviewedWrite {
+            prior_exists: plan.prior_exists,
             prior_allow: plan.prior_allow,
             prior_deny: plan.prior_deny,
             write_allow: plan.planned_allow,
@@ -1269,19 +1306,22 @@ impl ChannelModerationRuntime {
                     Ok(plan) => plan,
                     Err(_) => return Ok(Err("Invalid channel permission masks.".to_owned())),
                 };
-                // A confirmed preview must reproduce the previewed masks here:
+                // A confirmed preview must reproduce the previewed write here:
                 // an external edit between the confirm recheck and this lane
                 // GET refuses before any seed or PUT (spec section 3 step 5).
                 // The masks parsed for the plan above, so only a mismatch can
-                // fail these numeric reads; fail closed either way.
+                // fail these numeric reads; fail closed either way. An empty
+                // overwrite appearing or disappearing carries the same masks
+                // as no row, so existence is compared too.
                 if let Some(expected) = expected {
-                    let prior: Option<(u64, u64)> = match current.as_ref() {
+                    let prior: Option<(bool, u64, u64)> = match current.as_ref() {
                         Some(ow) => ow
                             .allow
                             .parse::<u64>()
                             .ok()
-                            .zip(ow.deny.parse::<u64>().ok()),
-                        None => Some((0, 0)),
+                            .zip(ow.deny.parse::<u64>().ok())
+                            .map(|(allow, deny)| (true, allow, deny)),
+                        None => Some((false, 0, 0)),
                     };
                     let write: Option<(u64, u64)> = plan
                         .write
@@ -1290,8 +1330,12 @@ impl ChannelModerationRuntime {
                         .ok()
                         .zip(plan.write.deny.parse::<u64>().ok());
                     let reproduced = match (prior, write) {
-                        (Some((prior_allow, prior_deny)), Some((write_allow, write_deny))) => {
-                            prior_allow == expected.prior_allow
+                        (
+                            Some((exists, prior_allow, prior_deny)),
+                            Some((write_allow, write_deny)),
+                        ) => {
+                            exists == expected.prior_exists
+                                && prior_allow == expected.prior_allow
                                 && prior_deny == expected.prior_deny
                                 && write_allow == expected.write_allow
                                 && write_deny == expected.write_deny
