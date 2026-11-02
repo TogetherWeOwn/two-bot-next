@@ -1,10 +1,11 @@
 # Feeds: a bounded private sample before saving
 
-Status: **proposed, design only**. Written 2026-10-25; review by 2026-10-31.
-No executable surface, live fetch experiment, database/Discord mutation,
-credential, service, spend or runtime activation. Merge publishes a proposal,
-not a build grant. This file is the single repository contract; the issue
-spec binds its exact commit and SHA-256, not a moving branch.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-25. No executable surface, live fetch experiment, database/Discord
+mutation, credential, service, spend or runtime activation. Merge publishes a
+proposal, not a build grant. This file is the single repository contract; the
+issue spec binds its exact commit and SHA-256, not a moving branch.
 
 ## 1. Decision and value still to validate
 

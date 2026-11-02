@@ -46,14 +46,14 @@ JOB_INVENTORY = {
                   # Promoted nextest lane (shared reusable), gated by ci-ok
                   # like the Rust lanes.
                   "nextest"},
-    "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "recheck",
+    "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
                               "production"},
-    "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic",
+    "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "user-flow-synthetic",
                            "pinned-history-guard", "certify-promotion"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
-    "release.yml": {"sbom-target", "release-sbom", "attach-sbom", "verdict"},
-    # Daily digest release (docs/releases.md): one vYYYY.MM.DD tag per day,
+    "release.yml": {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"},
+    # Daily digest release (docs/releases.md): at most one vYYYY.MDD.P tag a day,
     # plus the missing-digest alert; pinned shape below.
     "daily-digest.yml": {"digest", "alert", "rollback-proof-watch"},
     "staging-migrate.yml": {"plan", "claim", "apply"},
@@ -116,10 +116,11 @@ JOB_INVENTORY = {
     # Advisory PR-size labels (org reusable, advisory only, never required):
     # thin caller to the central labeller + weekly tally.
     "pr-size.yml": {"pr-size", "pr-size-weekly"},
-    # Weekly DORA delivery metrics (docs/dora-metrics.md): reads 30 days of
-    # production Deployments and commits one JSON file plus a markdown
-    # summary to ops/metrics/ on the automation branch with the job token.
-    "dora-metrics.yml": {"metrics"},
+    # Weekly DORA delivery metrics (docs/dora-metrics.md): the read-only
+    # compute job reads 30 days of production Deployments; the main-only
+    # publish job commits one JSON file plus a markdown summary to
+    # ops/metrics/ on the automation branch with its own job token.
+    "dora-metrics.yml": {"metrics", "publish"},
 }
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
@@ -842,13 +843,16 @@ def staging_pinned_sha_errors(workflows):
     dispatch-or-head ref at full depth, and each carries one SHA step that
     resolves the same expression through the environment, proves HEAD equals
     it, enforces a full 40-hex shape and refuses anything that is not an
-    ancestor of origin/main. Each SHA step refuses exactly four ways (shape,
-    length, checkout equality, ancestry), pinned by exit count so no refusal
-    can go green. Exactly eight reads exist (three checkout refs, three
-    SHA-step envs, the schema gate's --source-sha env, the history guard's
-    comparison env): seven use the pinned expression and the eighth is the
-    guard's raw pin-vs-head comparison, so no other step can resolve or judge
-    a different commit. Build identity and provenance then follow the
+    ancestor of origin/main. Each SHA step refuses exactly five ways
+    (workflow ref, shape, length, checkout equality, ancestry), pinned by
+    exit count so no refusal can go green. The workflow-ref refusal comes
+    first: the job must itself run from `refs/heads/main`, an in-file
+    fail-closed backstop behind the Environment branch policy (a job-level
+    `if:` would skip silently instead, so the job still carries none). Exactly nine reads exist (three checkout refs, three
+    SHA-step envs, the schema gate's --source-sha env, the user-flow
+    synthetic's expected SHA, the history guard's comparison env): eight use
+    the pinned expression and the ninth is the guard's raw pin-vs-head
+    comparison, so no other step can resolve or judge a different commit. Build identity and provenance then follow the
     validated SHA through the deploy job's DEPLOY_SHA export, pinned by
     staging_deploy_identity_errors. Every other workflow must not mention the
     switch at all, except deploy-production, which carries its own reviewed
@@ -862,11 +866,11 @@ def staging_pinned_sha_errors(workflows):
             errors.append(f"{name}: pinned-sha marker inputs.sha outside the deploy workflows")
     staging = workflows.get("deploy-staging.yml") or {}
     text = str(staging)
-    if text.count("inputs.sha") != 8:
-        errors.append("deploy-staging.yml: sha must be read exactly eight times "
+    if text.count("inputs.sha") != 9:
+        errors.append("deploy-staging.yml: sha must be read exactly nine times "
                       "(three checkouts, three SHA steps, the schema gate env, "
-                      "the history guard comparison)")
-    if text.count(DEPLOY_SHA_EXPRESSION) != 7:
+                      "the user-flow synthetic expected SHA, the history guard comparison)")
+    if text.count(DEPLOY_SHA_EXPRESSION) != 8:
         errors.append("deploy-staging.yml: every sha read but the history guard comparison "
                       "must use the pinned dispatch-or-head expression")
     jobs = staging.get("jobs") or {}
@@ -912,17 +916,27 @@ def staging_pinned_sha_errors(workflows):
         if (step.get("env") or {}).get("SOURCE_SHA") != DEPLOY_SHA_EXPRESSION:
             errors.append(f"deploy-staging.yml:{job_id}: SHA step must resolve the dispatch-or-head "
                           "SHA through the environment")
+        if (step.get("env") or {}).get("WORKFLOW_REF") != "${{ github.ref }}":
+            errors.append(f"deploy-staging.yml:{job_id}: SHA step must resolve the workflow ref "
+                          "through the environment")
         run = str(step.get("run") or "")
-        for needle in ("git rev-parse HEAD", "git fetch origin main",
+        for needle in ('[ "$WORKFLOW_REF" = "refs/heads/main" ]',
+                       "git rev-parse HEAD", "git fetch origin main",
                        'git merge-base --is-ancestor "$SOURCE_SHA" origin/main',
                        "[!0-9a-f]", '"${#SOURCE_SHA}"', "-eq 40"):
             if needle not in run:
                 errors.append(f"deploy-staging.yml:{job_id}: SHA step must contain {needle}")
-        # Four refusals, four exits: flipping any refusal green (in
+        # Five refusals, five exits: flipping any refusal green (in
         # particular the ancestry rejection) trips this count.
-        if run.count("exit 1") != 4:
-            errors.append(f"deploy-staging.yml:{job_id}: SHA step must refuse exactly four ways "
-                          "(shape, length, checkout equality, ancestry)")
+        if run.count("exit 1") != 5:
+            errors.append(f"deploy-staging.yml:{job_id}: SHA step must refuse exactly five ways "
+                          "(workflow ref, shape, length, checkout equality, ancestry)")
+        # The workflow-ref refusal runs before the shape check: a job not
+        # running from main stops before it can judge or touch anything else.
+        if ('"$WORKFLOW_REF"' in run and "[!0-9a-f]" in run
+                and run.index('"$WORKFLOW_REF"') > run.index("[!0-9a-f]")):
+            errors.append(f"deploy-staging.yml:{job_id}: SHA step must check the workflow ref "
+                          "before the 40-hex shape")
         # The shape check runs before the checkout equality: HEAD is always a
         # full SHA, so an equality-first order would refuse a short or branch
         # pin with no message before the shape refusal could explain it.
@@ -992,6 +1006,62 @@ def soak_hold_errors(workflow, name="deploy-staging.yml"):
                       "1 for unparsable/over-long/armed")
     if "uses" in step or "${{" in run:
         errors.append(f"{name}:soak-hold: step must use the environment only, never an inline expression")
+    return errors
+
+
+def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
+    """The exact-SHA user-flow synthetic gates promotion, read-only.
+
+    One job runs after the deploy with no Environment, no secret and no
+    write grant: it checks out the reviewed probe from the workflow head and
+    runs the read-only staging health-contract probe pinned to the deployed
+    dispatch-or-head SHA, refusing when the staging origin is unset.
+    certify-promotion needs it, so a red or skipped synthetic certifies no
+    bytes, and the production guard refuses a staging attempt without a
+    successful job of this exact name (scripts/test-deploy-production.py).
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    job = jobs.get("user-flow-synthetic") or {}
+    if job.get("name") != "staging user-flow synthetic (exact SHA)":
+        errors.append(f"{name}:user-flow-synthetic: job identity changed (the production guard reads it by name)")
+    if job.get("needs") != "deploy":
+        errors.append(f"{name}:user-flow-synthetic: must run after the deploy")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:user-flow-synthetic: must keep contents:read only")
+    if not runner_allowed("user-flow-synthetic", job.get("runs-on")):
+        errors.append(f"{name}:user-flow-synthetic: must use the routed runner expression "
+                      "for job 'user-flow-synthetic'")
+    for key in ("if", "uses", "environment", "services", "container",
+                "continue-on-error", "strategy", "concurrency"):
+        if key in job:
+            errors.append(f"{name}:user-flow-synthetic: must not set {key}")
+    text = str(job).lower()
+    if "secrets." in text or any(marker in text for marker in DEPLOY_MARKERS[:4]):
+        errors.append(f"{name}:user-flow-synthetic: must never read a secret or deploy")
+    steps = job.get("steps") or []
+    probes = [step for step in steps
+              if "staging_health_contract_probe.py" in str(step.get("run", ""))]
+    if len(probes) != 1 or any(key in probes[0] for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:user-flow-synthetic: must run the probe in exactly one unconditional step")
+    else:
+        probe = probes[0]
+        run = str(probe.get("run", ""))
+        if probe.get("env") != {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+                                "EXPECTED_SHA": DEPLOY_SHA_EXPRESSION}:
+            errors.append(f"{name}:user-flow-synthetic: probe must bind exactly the staging origin "
+                          "and the deployed dispatch-or-head SHA")
+        if '--expected-sha "$EXPECTED_SHA"' not in run or "set -euo pipefail" not in run:
+            errors.append(f"{name}:user-flow-synthetic: probe must enforce the exact deployed SHA")
+        if '[ -z "$STAGING_WORKER_URL" ]' not in run or "exit 1" not in run:
+            errors.append(f"{name}:user-flow-synthetic: an unset staging origin must fail, never pass empty")
+    checkouts = [step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")]
+    if len(checkouts) != 1 or (checkouts[0].get("with") or {}).get("ref") != "${{ github.sha }}" \
+            or (checkouts[0].get("with") or {}).get("persist-credentials") != "false":
+        errors.append(f"{name}:user-flow-synthetic: must check out the reviewed workflow head without credentials")
+    certify = jobs.get("certify-promotion") or {}
+    if "user-flow-synthetic" not in (certify.get("needs") or []):
+        errors.append(f"{name}:certify-promotion: must need the user-flow synthetic")
     return errors
 
 
@@ -2483,15 +2553,21 @@ def release_errors(workflow):
 
     release.yml is dispatch-only with the dry_run and release_tag inputs
     (per-promote sha tagging is retired), and every job but the verdict is
-    input-guarded: an all-default dispatch skips sbom-target, release-sbom
-    and attach-sbom and would read green with nothing published. One verdict
-    job runs after all three (no input guard, always() so failures still
-    judge): it fails the run with an error naming the skipped jobs and why
-    when every input sits at its default, fails on any failed or cancelled
+    input-guarded: an all-default dispatch skips sbom-target, release-sbom,
+    verify-sbom and attach-sbom and would read green with nothing published.
+    One verdict job runs after all four (no input guard, always() so failures
+    still judge): it fails the run with an error naming the skipped jobs and
+    why when every input sits at its default, fails a release_tag publication
+    dispatched from any ref but main, fails on any failed or cancelled
     dependency, and passes otherwise, so the dry_run and release_tag
     dispatches behave exactly as before (their designed skips stay green).
     Every real job carries an explicit timeout: the SBOM plumbing
-    (sbom-target, attach-sbom) and the verdict 5 minutes.
+    (sbom-target, verify-sbom, attach-sbom) and the verdict 5 minutes.
+    Publication is main-only and the write token stays in attach-sbom alone:
+    sbom-target refuses a release_tag dispatch from another ref before any
+    write token exists, verify-sbom runs the source-verification script with
+    contents:read, and attach-sbom (contents:write, main-guarded) runs no
+    checkout and no repository script, only the asset upload.
     """
     name = "release.yml"
     errors = []
@@ -2515,17 +2591,49 @@ def release_errors(workflow):
     if workflow.get("permissions") != {}:
         errors.append(f"{name}: top-level permissions must stay empty")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"sbom-target", "release-sbom", "attach-sbom", "verdict"}:
-        errors.append(f"{name}: jobs must be exactly sbom-target, release-sbom, attach-sbom and verdict")
+    if set(jobs) != {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"}:
+        errors.append(f"{name}: jobs must be exactly sbom-target, release-sbom, verify-sbom, attach-sbom and verdict")
         return errors
-    for job_id, expected_timeout in (("sbom-target", "5"), ("attach-sbom", "5")):
+    for job_id, expected_timeout in (("sbom-target", "5"), ("verify-sbom", "5"), ("attach-sbom", "5")):
         if jobs[job_id].get("timeout-minutes") != expected_timeout:
             errors.append(f"{name}:{job_id}: timeout must stay {expected_timeout} minutes")
+    main_ref = "github.ref == 'refs/heads/main'"
+    if main_ref not in str(jobs["sbom-target"].get("if") or ""):
+        errors.append(f"{name}:sbom-target: release_tag publication must stay main-guarded")
+    verify_sbom = jobs["verify-sbom"]
+    if verify_sbom.get("needs") != ["sbom-target", "release-sbom"]:
+        errors.append(f"{name}:verify-sbom: must run after sbom-target and release-sbom")
+    if "needs.release-sbom.result == 'success'" not in str(verify_sbom.get("if") or ""):
+        errors.append(f"{name}:verify-sbom: must only verify after a successful release-sbom")
+    if verify_sbom.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:verify-sbom: script execution must keep contents:read only")
+    if "release-sbom-target.py --verify-source" not in str(verify_sbom.get("steps") or ""):
+        errors.append(f"{name}:verify-sbom: must run the source-verification script")
+    attach = jobs["attach-sbom"]
+    if attach.get("needs") != ["sbom-target", "verify-sbom"]:
+        errors.append(f"{name}:attach-sbom: must run after sbom-target and verify-sbom")
+    # The !cancelled() wrapper drops GitHub's implicit success() guard, so
+    # the explicit success check is what keeps a failed/cancelled/skipped
+    # verification from ever scheduling the upload.
+    if "needs.verify-sbom.result == 'success'" not in str(attach.get("if") or ""):
+        errors.append(f"{name}:attach-sbom: must only upload after a successful verify-sbom")
+    if main_ref not in str(attach.get("if") or ""):
+        errors.append(f"{name}:attach-sbom: the write job must stay main-guarded")
+    attach_runs = "\n".join(str(step.get("run") or "") for step in attach.get("steps") or [])
+    if "git/ref/tags/" not in attach_runs or 'test "$obj_sha" = "$EXPECTED_SHA"' not in attach_runs:
+        errors.append(f"{name}:attach-sbom: must re-resolve the tag to the expected SHA before upload")
+    if attach.get("permissions") != {"contents": "write"}:
+        errors.append(f"{name}:attach-sbom: must keep contents:write only")
+    for step in attach.get("steps") or []:
+        if "actions/checkout" in str(step.get("uses") or ""):
+            errors.append(f"{name}:attach-sbom: the write job must not check out a ref")
+        if "scripts/" in str(step.get("run") or ""):
+            errors.append(f"{name}:attach-sbom: the write job must not run a repository script")
     verdict = jobs["verdict"]
     if verdict.get("name") != "release verdict (fail closed on empty dispatch)":
         errors.append(f"{name}:verdict: consumer job identity changed")
-    if verdict.get("needs") != ["sbom-target", "release-sbom", "attach-sbom"]:
-        errors.append(f"{name}:verdict: must run after sbom-target, release-sbom and attach-sbom")
+    if verdict.get("needs") != ["sbom-target", "release-sbom", "verify-sbom", "attach-sbom"]:
+        errors.append(f"{name}:verdict: must run after sbom-target, release-sbom, verify-sbom and attach-sbom")
     if verdict.get("if") != "${{ always() }}":
         errors.append(f"{name}:verdict: must run with if: always() so failures still judge")
     if verdict.get("permissions") != {"contents": "read"}:
@@ -2547,13 +2655,15 @@ def release_errors(workflow):
     step = steps[0]
     if step.get("env") != {"DRY_RUN": "${{ inputs.dry_run }}",
                            "RELEASE_TAG": "${{ inputs.release_tag }}",
+                           "DISPATCH_REF": "${{ github.ref }}",
                            "SBOM_TARGET_RESULT": "${{ needs.sbom-target.result }}",
                            "RELEASE_SBOM_RESULT": "${{ needs.release-sbom.result }}",
+                           "VERIFY_SBOM_RESULT": "${{ needs.verify-sbom.result }}",
                            "ATTACH_SBOM_RESULT": "${{ needs.attach-sbom.result }}"}:
         errors.append(f"{name}:verdict: step must bind exactly the dispatch inputs and job results "
                       "via the environment")
     run = str(step.get("run") or "")
-    for needle in ("DRY_RUN", "RELEASE_TAG", "skipped",
+    for needle in ("DRY_RUN", "RELEASE_TAG", "DISPATCH_REF", "refs/heads/main", "skipped",
                    "failure", "cancelled", "::error::"):
         if needle not in run:
             errors.append(f"{name}:verdict: missing pin {needle}")
@@ -2565,16 +2675,18 @@ def release_errors(workflow):
 
 
 def daily_digest_errors(workflow):
-    """daily-digest cuts one vYYYY.MM.DD tag per day and alerts when production moved but no tag was made.
+    """daily-digest cuts at most one vYYYY.MDD.P tag a day and alerts when production moved but no tag was made.
 
     Schedule-only plus manual dispatch: one daily cron at an off-minute (never
     :00 or :30, never bunched with the deploy-production backstop) and a
     dry_run-only dispatch. The digest job resolves the live production SHA
     (/readyz, falling back to the newest recorded successful production
     Deployment: rows whose description is a deploy ID),
-    cuts the tag via daily-digest.cjs, and dispatches the SBOM chain for the
-    fresh or existing release. The alert job consumes owed-digest outputs even
-    on a failed publication and opens the `daily-digest` incident issue with
+    plans and publishes through the shared CalVer action (both steps pinned to
+    one full TogetherWeOwn/.github commit) around the daily-digest.cjs
+    adapter, and dispatches the SBOM chain for the fresh or existing release. The alert job consumes owed-digest outputs even
+    on a failed publication, or a digest job that failed before classification
+    with a proven live SHA, and opens the `daily-digest` incident issue with
     the job token (issues: write), no environment or secret.
     """
     name = "daily-digest.yml"
@@ -2627,6 +2739,12 @@ def daily_digest_errors(workflow):
             errors.append(f"{name}:digest: missing pin {required}")
     if "release-on-promote" in digest_text or "vX.Y.Z" in digest_text:
         errors.append(f"{name}:digest: must not reference the retired per-promote tagging")
+    calver = [step.get("uses", "") for step in digest.get("steps") or []
+              if "actions/calver" in str(step.get("uses", ""))]
+    calver_pin = re.compile(r"TogetherWeOwn/\.github/actions/calver@[0-9a-f]{40}")
+    if len(calver) != 2 or len(set(calver)) != 1 or not all(calver_pin.fullmatch(u) for u in calver):
+        errors.append(f"{name}:digest: plan and publish must use the shared CalVer action "
+                      "pinned to one full commit SHA")
     outputs = digest.get("outputs") or {}
     for output in ("released", "tag_name", "prod_changed", "live_sha", "prev_tag"):
         if output not in outputs:
@@ -2634,10 +2752,12 @@ def daily_digest_errors(workflow):
     alert = jobs["alert"]
     if alert.get("needs") != "digest":
         errors.append(f"{name}:alert: must wait for the digest job")
-    expected_alert_if = ("${{ !cancelled() && "
-                         "needs.digest.outputs.prod_changed == 'true' && "
-                         "needs.digest.outputs.released != 'true' && "
-                         "inputs.dry_run != true }}")
+    expected_alert_if = ("${{ !cancelled() && inputs.dry_run != true && "
+                         "((needs.digest.outputs.prod_changed == 'true' && "
+                         "needs.digest.outputs.released != 'true') || "
+                         "(needs.digest.result == 'failure' && "
+                         "needs.digest.outputs.prod_changed == '' && "
+                         "needs.digest.outputs.live_sha != '')) }}")
     if alert.get("if") != expected_alert_if:
         errors.append(f"{name}:alert: must consume owed-digest outputs even on failure, "
                       "never on a dry run")
@@ -2681,12 +2801,13 @@ def production_errors(workflow):
         "((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || "
         "(needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && "
         "(needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || "
-        "(needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))"
+        "(needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && "
+        "needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
     )
     if production.get("environment") != "production" \
-            or set(needs) != {"guard", "soak", "recheck", "schema-gate", "roles-gate"}:
+            or set(needs) != {"guard", "soak", "recheck", "schema-gate", "roles-gate", "staging-soak-evidence"}:
         errors.append(f"{name}:production: must wait for the guard, the soak, the recheck, "
-                      "the schema gate, the roles gate and the protected Environment")
+                      "the schema gate, the roles gate, the staging soak evidence and the protected Environment")
     if production.get("if") != expected_production_if:
         errors.append(f"{name}:production: rollback may bypass skipped gates; deploy requires both gates, "
                       "a completed soak, a fresh recheck and no skip; cancelled runs never deploy")
@@ -2700,7 +2821,7 @@ def production_errors(workflow):
     if jobs.get("production", {}).get("concurrency") != {"group": "deploy-production",
                                                          "cancel-in-progress": "false"}:
         errors.append(f"{name}:production: must hold the deploy-production lane without cancelling")
-    for job_id in ("guard", "schema-gate", "roles-gate", "soak", "recheck"):
+    for job_id in ("guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck"):
         if "concurrency" in jobs.get(job_id, {}):
             errors.append(f"{name}:{job_id}: must not hold the deploy lane")
     expected_soak_if = ("needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' "
@@ -2714,20 +2835,38 @@ def production_errors(workflow):
     for required in ("SOAK_SECONDS - int(time.time() - green_at)", "time.sleep(remaining)"):
         if required not in soak_script:
             errors.append(f"{name}:soak: must recompute the remainder from the staging-green time")
-    soak_env = str((soak.get("steps") or [{}])[0].get("env", ""))
+    # The soak job records the soak-baseline counters before it sleeps, so
+    # GREEN_AT may live on the sleep step rather than the first step.
+    soak_env = "\n".join(str(step.get("env", "")) for step in soak.get("steps", []))
     if "GREEN_AT" not in soak_env or "needs.guard.outputs.green_at" not in soak_env:
         errors.append(f"{name}:soak: must read the staging-green timestamp from the guard")
     expected_recheck_if = (
         "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.auto == 'true' && "
         "(needs.soak.result == 'success' || needs.soak.result == 'skipped') && "
-        "needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'"
+        "needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && "
+        "needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''"
     )
-    if recheck.get("needs") != ["guard", "soak", "schema-gate", "roles-gate"]:
+    if recheck.get("needs") != ["guard", "soak", "schema-gate", "roles-gate", "staging-soak-evidence"]:
         errors.append(f"{name}:recheck: must wait for the guard, the soak and both gates "
                       "(the fresh read happens after the last long build)")
     if recheck.get("if") != expected_recheck_if:
         errors.append(f"{name}:recheck: must recheck only automatic deploys after the soak and both gates")
+    # The regression gate's staging leg reads only the staging scrape bearer,
+    # writes no deployment record and holds no lane; its skip never deploys.
+    evidence_job = jobs.get("staging-soak-evidence", {})
+    if evidence_job.get("needs") != ["guard", "soak"] \
+            or evidence_job.get("environment") != {"name": "staging", "deployment": "false"} \
+            or evidence_job.get("permissions") != {"contents": "read", "actions": "read"}:
+        errors.append(f"{name}:staging-soak-evidence: must follow the soak with contents:read plus "
+                      "actions:read and the staging Environment (deployment: false)")
+    evidence_text = str(evidence_job)
+    if re.findall(r"secrets\.[A-Z_]+", evidence_text) != ["secrets.STAGING_METRICS_SCRAPE_TOKEN"] \
+            or "PRODUCTION_" in evidence_text:
+        errors.append(f"{name}:staging-soak-evidence: must read only the staging scrape bearer")
+    if (evidence_job.get("outputs") or {}) != {"skip": "${{ steps.judge.outputs.skip }}",
+                                               "evidence": "${{ steps.judge.outputs.evidence }}"}:
+        errors.append(f"{name}:staging-soak-evidence: must publish the skip and evidence outputs")
     if (recheck.get("outputs") or {}).get("skip") != "${{ steps.recheck.outputs.skip }}":
         errors.append(f"{name}:recheck: must publish the skip output for production")
     recheck_text = str(recheck)
@@ -3791,8 +3930,44 @@ def scheduled_binding_audit_errors(workflows):
     return errors
 
 
+# The only Environments that hold the Cloudflare deploy pair. The pair is
+# Environment-scoped (no repository-scope copy), so a job may read it only
+# from inside one of these Environments.
+CLOUDFLARE_ENVIRONMENTS = ("staging", "production")
+
+
+def cloudflare_environment_errors(workflows):
+    """The Cloudflare pair is readable only inside its Environments.
+
+    `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` live in the `staging`
+    and `production` Environment secret stores and nowhere else: a job that
+    references either secret without declaring one of those Environments
+    could only have read it at repository scope, the placement this pin
+    keeps retired. The check is on the job's own `environment:`, so a future
+    reusable-workflow caller that forwards the pair needs an explicit
+    policy change rather than a silent new reader.
+    """
+    errors = []
+    for name, workflow in workflows.items():
+        for job_id, job in (workflow.get("jobs") or {}).items():
+            if not isinstance(job, dict):
+                continue
+            text = str(job)
+            if "secrets.CLOUDFLARE_API_TOKEN" not in text \
+                    and "secrets.CLOUDFLARE_ACCOUNT_ID" not in text:
+                continue
+            environment = job.get("environment")
+            if isinstance(environment, dict):
+                environment = environment.get("name")
+            if environment not in CLOUDFLARE_ENVIRONMENTS:
+                errors.append(f"{name}:{job_id}: Cloudflare secrets are Environment-scoped; "
+                              "the job must declare the staging or production environment")
+    return errors
+
+
 def workflow_policy_errors(workflows):
     errors = []
+    errors.extend(cloudflare_environment_errors(workflows))
     errors.extend(staging_gateway_injection_errors(workflows))
     errors.extend(staging_error_rate_gate_errors(workflows))
     errors.extend(staging_fault_injection_errors(workflows))
@@ -3820,6 +3995,7 @@ def workflow_policy_errors(workflows):
             errors.extend(staging_deploy_id_errors(workflow))
             errors.extend(soak_hold_errors(workflow))
             errors.extend(pinned_history_guard_errors(workflow))
+            errors.extend(user_flow_synthetic_errors(workflow))
             errors.extend(schema_gate_errors(workflow))
             errors.extend(roles_gate_errors(workflow))
         if name == "release.yml":
@@ -3921,6 +4097,8 @@ def workflow_policy_errors(workflows):
                 continue  # push-deferral gate: pinned by soak_hold_errors above
             if name == "deploy-staging.yml" and job_id == "pinned-history-guard":
                 continue  # pinned-drill verdict: pinned by pinned_history_guard_errors above
+            if name == "deploy-staging.yml" and job_id == "user-flow-synthetic":
+                continue  # read-only exact-SHA probe: pinned by user_flow_synthetic_errors above
             else:
                 # Retargeting a known CI job must not create an unapproved
                 # deploy/probe route outside the deploy workflows.
@@ -3958,6 +4136,22 @@ class WorkflowTests(unittest.TestCase):
         # Queue validation never becomes a deployment entry point.
         for name in ("deploy-staging.yml", "deploy-production.yml"):
             self.assertNotIn("merge_group", self.workflows[name]["on"])
+
+    def test_pr_lint_feeds_changed_files_to_the_t0_gate(self):
+        # The T0 attestation floor in pr_standards.py needs the PR file list.
+        # Pin the step and its wiring so the gate cannot be silently starved.
+        # The step runs on PR events only: on push there is no PR number and
+        # the numeric guard would fail every main commit.
+        steps = self.workflows["supply-chain.yml"]["jobs"]["pr-lint"]["steps"]
+        listed = next(s for s in steps if s.get("name") == "List changed files")
+        self.assertEqual(listed["if"],
+                         "github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'")
+        self.assertIn("pulls/", listed["run"])
+        self.assertIn("previous_filename", listed["run"])
+        check = next(s for s in steps if s.get("name") == "Check title, body, branch and commits")
+        self.assertEqual(check["env"]["CHANGED_FILES_FILE"],
+                         "${{ steps.changed.outputs.changed_files_file }}")
+        self.assertIn("CHANGED_FILES", check["run"])
 
     def test_quality_gates_diff_merge_checkout_against_its_first_parent(self):
         steps = self.workflows["check.yml"]["jobs"]["check"]["steps"]
@@ -6141,6 +6335,26 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(staging_fault_injection_errors(changed))
                 self.assertTrue(workflow_policy_errors(changed))
 
+    def test_cloudflare_secrets_stay_environment_scoped(self):
+        workflows = self.workflows
+        self.assertEqual(cloudflare_environment_errors(workflows), [])
+        mutations = {
+            "staging deploy loses its environment": lambda w:
+                w["deploy-staging.yml"]["jobs"]["deploy"].pop("environment"),
+            "production loses its environment": lambda w:
+                w["deploy-production.yml"]["jobs"]["production"].pop("environment"),
+            "a non-environment job reads the pair": lambda w:
+                next(iter(w["check.yml"]["jobs"].values()))
+                .setdefault("env", {}).__setitem__(
+                    "T", "${{ secrets.CLOUDFLARE_API_TOKEN }}"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(workflows)
+                mutate(changed)
+                self.assertTrue(cloudflare_environment_errors(changed), label)
+                self.assertTrue(workflow_policy_errors(changed), label)
+
     def test_pinned_sha_is_dispatch_only_and_ancestor_checked(self):
         workflows = self.workflows
         staging = workflows["deploy-staging.yml"]
@@ -6181,6 +6395,12 @@ class WorkflowTests(unittest.TestCase):
                 .__setitem__("fetch-depth", "1"),
             "SHA env constant": lambda w: w["jobs"]["deploy"]["steps"][2]["env"]
                 .__setitem__("SOURCE_SHA", "abc"),
+            "workflow ref env constant": lambda w: w["jobs"]["deploy"]["steps"][2]["env"]
+                .__setitem__("WORKFLOW_REF", "refs/heads/main"),
+            "workflow ref check dropped": lambda w: w["jobs"]["deploy"]["steps"][2]
+                .__setitem__("run", "\n".join(line for line in
+                                             w["jobs"]["deploy"]["steps"][2]["run"].splitlines()
+                                             if "WORKFLOW_REF" not in line)),
             "ancestry check dropped": lambda w: w["jobs"]["deploy"]["steps"][2]
                 .__setitem__("run", "\n".join(line for line in
                                              w["jobs"]["deploy"]["steps"][2]["run"].splitlines()
@@ -6273,6 +6493,33 @@ class WorkflowTests(unittest.TestCase):
                     or roles_gate_errors(changed["deploy-staging.yml"]),
                     label,
                 )
+                self.assertTrue(workflow_policy_errors(changed), label)
+
+    def test_user_flow_synthetic_gates_certification_on_the_exact_sha(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(user_flow_synthetic_errors(staging), [])
+        probe = lambda w: next(step for step in w["jobs"]["user-flow-synthetic"]["steps"]
+                               if "staging_health_contract_probe.py" in str(step.get("run", "")))
+        mutations = {
+            "renamed": lambda w: w["jobs"]["user-flow-synthetic"].__setitem__("name", "synthetic"),
+            "conditional": lambda w: w["jobs"]["user-flow-synthetic"].__setitem__("if", "false"),
+            "tolerated": lambda w: probe(w).__setitem__("continue-on-error", "true"),
+            "head sha only": lambda w: probe(w)["env"].__setitem__("EXPECTED_SHA", "${{ github.sha }}"),
+            "no sha pin": lambda w: probe(w).__setitem__(
+                "run", probe(w)["run"].replace('--expected-sha "$EXPECTED_SHA" ', "")),
+            "empty origin passes": lambda w: probe(w).__setitem__(
+                "run", probe(w)["run"].replace("exit 1", "exit 0")),
+            "secret read": lambda w: probe(w)["env"].__setitem__("TOKEN", "${{ secrets.X }}"),
+            "write grant": lambda w: w["jobs"]["user-flow-synthetic"].__setitem__(
+                "permissions", {"contents": "write"}),
+            "certify ignores it": lambda w: w["jobs"]["certify-promotion"].__setitem__(
+                "needs", ["deploy", "voice-synthetic", "pinned-history-guard"]),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(self.workflows)
+                mutate(changed["deploy-staging.yml"])
+                self.assertTrue(user_flow_synthetic_errors(changed["deploy-staging.yml"]), label)
                 self.assertTrue(workflow_policy_errors(changed), label)
 
     def test_soak_hold_shell_behaves(self):
@@ -6391,8 +6638,8 @@ class WorkflowTests(unittest.TestCase):
     def test_pinned_sha_shell_behaves(self):
         # Execute the actual SHA-check shells in a scratch git repo: a valid
         # ancestor passes and (in the deploy job) exports DEPLOY_SHA, while a
-        # short, uppercase, empty or branch pin, a non-ancestor and a
-        # HEAD-mismatch all refuse with their reason. The temp remote's
+        # non-main or empty workflow ref, a short, uppercase, empty or branch
+        # pin, a non-ancestor and a HEAD-mismatch all refuse with their reason. The temp remote's
         # origin/main is the ancestry root; each case checks out its commit
         # first, exactly as the workflow checkout lands on the pin before the
         # SHA step runs. The deploy shell runs from a subdirectory, mirroring
@@ -6458,15 +6705,17 @@ class WorkflowTests(unittest.TestCase):
             unmerged = git("rev-parse", "HEAD", cwd=repo).stdout.strip()
             (repo / "wrangler").mkdir()
             cases = (
-                ("valid ancestor passes", head, head, 0, ""),
-                ("short pin refuses", head, "abc123", 1, "full 40-hex"),
-                ("uppercase pin refuses", head, head.upper(), 1, "full 40-hex"),
-                ("empty pin refuses", head, "", 1, "full 40-hex"),
-                ("branch pin refuses", head, "main", 1, "full 40-hex"),
-                ("non-ancestor refuses", unmerged, unmerged, 1, "not an ancestor"),
-                ("head mismatch refuses", head, ancestor, 1, "did not land"),
+                ("valid ancestor passes", head, head, "refs/heads/main", 0, ""),
+                ("non-main workflow ref refuses", head, head, "refs/heads/feat/x", 1, "must run from main"),
+                ("empty workflow ref refuses", head, head, "", 1, "must run from main"),
+                ("short pin refuses", head, "abc123", "refs/heads/main", 1, "full 40-hex"),
+                ("uppercase pin refuses", head, head.upper(), "refs/heads/main", 1, "full 40-hex"),
+                ("empty pin refuses", head, "", "refs/heads/main", 1, "full 40-hex"),
+                ("branch pin refuses", head, "main", "refs/heads/main", 1, "full 40-hex"),
+                ("non-ancestor refuses", unmerged, unmerged, "refs/heads/main", 1, "not an ancestor"),
+                ("head mismatch refuses", head, ancestor, "refs/heads/main", 1, "did not land"),
             )
-            for label, checkout_ref, source_sha, expected_code, needle in cases:
+            for label, checkout_ref, source_sha, workflow_ref, expected_code, needle in cases:
                 with self.subTest(label):
                     git("checkout", checkout_ref, cwd=repo)
                     for job_id, shell in shells.items():
@@ -6474,7 +6723,8 @@ class WorkflowTests(unittest.TestCase):
                             exported = temp / f"github-env-{job_id}"
                             exported.write_text("", encoding="utf-8")
                             env = dict(base_env, GITHUB_WORKSPACE=str(repo),
-                                       SOURCE_SHA=source_sha, GITHUB_ENV=str(exported))
+                                       SOURCE_SHA=source_sha, WORKFLOW_REF=workflow_ref,
+                                       GITHUB_ENV=str(exported))
                             workdir = repo / "wrangler" if job_id == "deploy" else repo
                             proc = subprocess.run(
                                 ["bash", "-e", "-c", shell], cwd=str(workdir), env=env,
@@ -8407,17 +8657,20 @@ class WorkflowTests(unittest.TestCase):
         # (build scripts and tests execute at a head that is not on `main`
         # yet, and a shared R2 bucket has no per-PR scope: a PR could poison
         # objects main later links). check.yml runs on merge_group, so a
-        # pull_request-only denylist is not enough. Only push-to-main and
-        # workflow_dispatch runs may use shared backends; every other event
-        # uses sccache on local disk only. The GitHub-cache backend has the
-        # same quota shape: the lane's entries share the repo Actions cache
-        # with the warm `check` entry, so non-main runs must not grow it.
+        # pull_request-only denylist is not enough, and workflow_dispatch
+        # accepts any branch or tag, so the event name alone is not enough
+        # either. Only push and workflow_dispatch runs on `main` may use
+        # shared backends; every other event or ref uses sccache on local
+        # disk only. The GitHub-cache backend has the same quota shape: the
+        # lane's entries share the repo Actions cache with the warm `check`
+        # entry, so non-main runs must not grow it.
         lane = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
         select = next(step for step in lane.get("steps", [])
                       if str(step.get("name", "")).startswith("Select sccache backend"))
         run_text = str(select.get("run", ""))
         self.assertIn("workflow_dispatch", run_text)
         self.assertIn("github.event_name", str(select.get("env", "")))
+        self.assertIn("github.ref", str(select.get("env", "")))
         self.assertIn("local disk", run_text)
         # The allowlist branch must come FIRST: a denylist (`!=`) or a
         # reordered R2 branch ahead of it would let shared-backend
@@ -8427,12 +8680,12 @@ class WorkflowTests(unittest.TestCase):
         lines = run_text.splitlines()
         gate = next(i for i, line in enumerate(lines)
                     if "NEXTEST_EVENT" in line)
-        # Exact pin: a denylist, dead (&& false), or reordered guard all keep
-        # the `if ` prefix, so pin the full first line.
+        # Exact pin: a denylist, dead (&& false), reordered, or ref-less
+        # guard all keep the `if ` prefix, so pin the full first line.
         self.assertEqual(
             lines[gate].strip(),
-            'if [ "$NEXTEST_EVENT" = "push" ] || [ "$NEXTEST_EVENT" = "workflow_dispatch" ]; then',
-            f"push/workflow_dispatch allowlist must be the exact first branch, got: {lines[gate]!r}",
+            'if { [ "$NEXTEST_EVENT" = "push" ] || [ "$NEXTEST_EVENT" = "workflow_dispatch" ]; } && [ "$NEXTEST_REF" = "refs/heads/main" ]; then',
+            f"push/workflow_dispatch-on-main allowlist must be the exact first branch, got: {lines[gate]!r}",
         )
         before = "\n".join(lines[:gate])
         self.assertNotIn("GITHUB_ENV", before)
@@ -8464,9 +8717,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("GITHUB_ENV", "\n".join(lines[gate + 1 : outer_else]))
         # Behavioral pin: run the extracted step under bash. On
         # pull_request, merge_group, and other events the env file stays
-        # empty even with all R2 vars set; on push and workflow_dispatch
-        # the R2 lines appear. Catches inverted/dead guards and disk-branch
-        # writes that structural pins miss.
+        # empty even with all R2 vars set, and so it does on push and
+        # workflow_dispatch runs at a ref other than `main` (a manual
+        # dispatch can target any branch or tag); only push and
+        # workflow_dispatch on `main` write the R2 lines. Catches
+        # inverted/dead guards and disk-branch writes that structural pins
+        # miss.
         import os
         import subprocess
         import tempfile
@@ -8482,12 +8738,21 @@ class WorkflowTests(unittest.TestCase):
             backend_env_path = tmp.name
         try:
             base = dict(os.environ)
-            for event in ("pull_request", "merge_group", "schedule"):
-                with self.subTest(event=event):
+            withheld = (
+                ("pull_request", "refs/pull/1/merge"),
+                ("merge_group", "refs/heads/gh-readonly-queue/main/pr-1-abc"),
+                ("schedule", "refs/heads/main"),
+                ("push", "refs/heads/some-feature"),
+                ("workflow_dispatch", "refs/heads/some-feature"),
+                ("workflow_dispatch", "refs/tags/v1.0.0"),
+            )
+            for event, ref in withheld:
+                with self.subTest(event=event, ref=ref):
                     run_env = dict(base)
                     run_env.update(
                         {
                             "NEXTEST_EVENT": event,
+                            "NEXTEST_REF": ref,
                             **r2_env,
                             "GITHUB_ENV": backend_env_path,
                         }
@@ -8504,14 +8769,15 @@ class WorkflowTests(unittest.TestCase):
                     self.assertEqual(
                         Path(backend_env_path).read_text(encoding="utf-8"),
                         "",
-                        f"{event} run must not write shared-backend credentials",
+                        f"{event} run at {ref} must not write shared-backend credentials",
                     )
             for event in ("push", "workflow_dispatch"):
-                with self.subTest(event=event):
+                with self.subTest(event=event, ref="refs/heads/main"):
                     run_env = dict(base)
                     run_env.update(
                         {
                             "NEXTEST_EVENT": event,
+                            "NEXTEST_REF": "refs/heads/main",
                             **r2_env,
                             "GITHUB_ENV": backend_env_path,
                         }
@@ -8538,26 +8804,29 @@ class WorkflowTests(unittest.TestCase):
 
     def test_required_nextest_withholds_r2_secrets_on_pull_request(self):
         # Even with the callee-side guard, the caller must forward R2 write
-        # secrets only on push to main and workflow_dispatch. check.yml runs
-        # on merge_group too, so a `!= 'pull_request'` gate would forward the
-        # secrets to queued code that is not on `main` yet. The gate must
-        # read `(== 'push' || == 'workflow_dispatch') && secrets.X || ''`:
-        # the seemingly equivalent `== 'pull_request' && '' || secrets.X`
-        # forwards the secret anyway, because '' is falsy in GitHub
-        # expressions.
+        # secrets only on push and workflow_dispatch runs on `main`.
+        # check.yml runs on merge_group too, so a `!= 'pull_request'` gate
+        # would forward the secrets to queued code that is not on `main`
+        # yet, and workflow_dispatch accepts any branch or tag, so the event
+        # name without the ref would forward them to a manual run off
+        # `main`. The gate must read `ref == 'refs/heads/main' && (== 'push'
+        # || == 'workflow_dispatch') && secrets.X || ''`: the seemingly
+        # equivalent `== 'pull_request' && '' || secrets.X` forwards the
+        # secret anyway, because '' is falsy in GitHub expressions.
         job = self.workflows["check.yml"]["jobs"]["nextest"]
         r2_keys = ("SCCACHE_BUCKET", "SCCACHE_ENDPOINT", "SCCACHE_REGION",
                    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
         for key in r2_keys:
             with self.subTest(secret=key):
                 # Exact pin: the allowlist form withholds the secret on
-                # pull_request AND merge_group. A `!= 'pull_request'` form or
-                # a leading `== ... && ''` form forwards it on some event
-                # while keeping every substring present, so substrings
-                # cannot pin this gate.
+                # pull_request, merge_group, and any ref off `main`. A
+                # `!= 'pull_request'` form, an event-only form, or a leading
+                # `== ... && ''` form forwards it on some dispatch while
+                # keeping every substring present, so substrings cannot pin
+                # this gate.
                 self.assertEqual(
                     str(job["secrets"][key]),
-                    "${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets." + key + " || '' }}",
+                    "${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets." + key + " || '' }}",
                 )
 
     def test_required_nextest_caller_shape_is_pinned(self):
@@ -8583,6 +8852,23 @@ class WorkflowTests(unittest.TestCase):
         job = self.workflows["reusable-rust-nextest.yml"]["jobs"]["nextest"]
         # BaseLoader keeps scalars as strings; "45" is the 45-minute ceiling.
         self.assertEqual(job.get("timeout-minutes"), "45")
+
+    def test_nightly_sweep_timeout_ceilings_are_pinned(self):
+        # Schedule/dispatch get 180 minutes for the serial ignored sweep;
+        # every other event keeps 45. The allow-list form fails closed, so a
+        # future trigger cannot silently inherit the 180-minute ceiling. The
+        # pin forces a reviewed change to either ceiling, and the trigger-set
+        # pin beside it keeps the set the ceilings were chosen for explicit.
+        workflow = self.workflows["nightly.yml"]
+        self.assertEqual(
+            set(workflow.get("on") or {}),
+            {"schedule", "workflow_dispatch", "pull_request"},
+        )
+        job = workflow["jobs"]["sweep"]
+        self.assertEqual(
+            job.get("timeout-minutes"),
+            "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}",
+        )
 
     def test_nextest_container_pins_disposable_database_service_address(self):
         # Same hardening as the check.yml lanes: the shared lane runs the
@@ -8787,6 +9073,10 @@ class WorkflowTests(unittest.TestCase):
                         # Reads workflow runs to skip while an operator
                         # dispatch is active; the compare read needs contents.
                         expected = {"contents": "read", "actions": "read"}
+                    elif (name, job_id) == ("deploy-production.yml", "staging-soak-evidence"):
+                        # Reads deploy-staging runs to tell a promoted newer
+                        # build (skip green) from a stalled promotion (refuse).
+                        expected = {"contents": "read", "actions": "read"}
                     elif (name, job_id) == ("daily-digest.yml", "digest"):
                         # Cuts the vYYYY.MM.DD tag and its release, reads the
                         # production Deployments fallback, and dispatches the
@@ -8822,16 +9112,58 @@ class WorkflowTests(unittest.TestCase):
                         # proofs under the test label).
                         expected = {"contents": "read", "issues": "write"}
                     elif (name, job_id) == ("dora-metrics.yml", "metrics"):
-                        # Weekly DORA file: commits the JSON and summary to
-                        # the automation branch, reads the production
+                        # Weekly DORA compute: reads the production
                         # Deployments history and verifies each recorded
-                        # deploy's Actions run.
-                        expected = {"contents": "write", "deployments": "read",
+                        # deploy's Actions run. It executes the checked-out
+                        # scoring script (the dry run admits any ref), so it
+                        # holds read grants only.
+                        expected = {"contents": "read", "deployments": "read",
                                     "actions": "read"}
+                    elif (name, job_id) == ("dora-metrics.yml", "publish"):
+                        # Weekly DORA publish: commits the computed JSON and
+                        # summary to the automation branch. This main-only
+                        # job is the workflow's sole write grant.
+                        expected = {"contents": "write"}
                     self.assertEqual(job["permissions"], expected)
                     for step in job.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):
                             self.assertEqual(step["with"]["persist-credentials"], "false")
+
+    def test_dora_compute_is_read_only_and_publish_is_main_only(self):
+        # The dry run admits any ref and executes that ref's scoring script,
+        # so the compute job's token stays read-only. The write grant lives
+        # in the separate publish job: it needs the compute job, runs only
+        # for a live main run, and copies the two files out of the compute
+        # artifact instead of executing checked-out code.
+        workflow = self.workflows["dora-metrics.yml"]
+        self.assertEqual(set(workflow["jobs"]), {"metrics", "publish"})
+        compute = workflow["jobs"]["metrics"]
+        publish = workflow["jobs"]["publish"]
+        self.assertEqual(compute["permissions"],
+                         {"contents": "read", "deployments": "read",
+                          "actions": "read"})
+        self.assertEqual(compute["if"],
+                         "github.ref == 'refs/heads/main' || inputs.dry_run == true")
+        self.assertEqual(compute["outputs"],
+                         {"week": "${{ steps.metrics.outputs.week }}"})
+        compute_runs = "\n".join(step.get("run", "") for step in compute["steps"])
+        self.assertIn("scripts/dora_metrics.py", compute_runs)
+        self.assertNotIn("git push", compute_runs)
+        self.assertEqual(publish["permissions"], {"contents": "write"})
+        self.assertEqual(publish["needs"], "metrics")
+        self.assertEqual(publish["if"],
+                         "inputs.dry_run != true && github.ref == 'refs/heads/main'")
+        publish_runs = "\n".join(step.get("run", "") for step in publish["steps"])
+        self.assertNotIn("dora_metrics.py", publish_runs)
+        downloads = [step for step in publish["steps"]
+                     if str(step.get("uses", "")).startswith("actions/download-artifact@")]
+        self.assertEqual(len(downloads), 1)
+        self.assertEqual(downloads[0]["with"]["name"],
+                         "dora-metrics-${{ github.run_id }}")
+        self.assertEqual(downloads[0]["with"]["path"], "ops/metrics")
+        commit = next(step for step in publish["steps"]
+                      if step.get("name") == "Commit the weekly DORA file")
+        self.assertEqual(commit["env"]["WEEK"], "${{ needs.metrics.outputs.week }}")
 
     def test_every_job_declares_a_timeout(self):
         # Direct jobs state a ceiling instead of burning the six-hour default.

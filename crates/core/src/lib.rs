@@ -101,6 +101,7 @@ pub mod lfg;
 pub mod lfg_list;
 #[cfg(feature = "db")]
 pub mod lfg_store;
+pub mod lockdown_preview;
 pub mod mac;
 pub mod mee6;
 pub mod member_leave_gap;
@@ -224,7 +225,9 @@ pub use channel_moderation_store::{
     STATEMENT_TIMEOUT_MS,
 };
 pub use clock_guard::{ClockGuard, ClockRollback, CLOCK_SKEW_TOLERANCE_MS};
-pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
+pub use commands::{
+    merge_commands, merge_registry, CommandDefinition, CustomCommand, MergedRegistry, RegistryError,
+};
 pub use community::{
     build_scorecard, classify, is_scorecard_run_time, previous_closed_week, scorecard_tick,
     week_start_ms, Classification, ClassifierConfig, ClassifyInput, FactRow, ScorecardGates,

@@ -1,8 +1,8 @@
 # Proposed member play-now posts
 
-Status: **Proposed, design only**, 2026-10-26. Not implemented, published or
-approved for a pilot. Review this proposal on **2026-11-02**; implementation
-requires explicit host/CEO intent alignment after that review. Merging this
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-26. Not implemented, published or approved for a pilot. Merging this
 page approves documentation, not a new command, permission, schema or deploy.
 All numbers below are proposed pilot defaults, not existing runtime settings.
 

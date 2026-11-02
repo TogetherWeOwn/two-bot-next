@@ -19,7 +19,8 @@ name: deploy-production
 # triggering staging run did not succeed. The guard job refuses
 # a SHA that is not on main with a successful full `ci-ok` verdict and
 # `worker check` from the latest check.yml run/current attempt, plus a
-# successful deploy-staging run, except that a rollback (Worker version +
+# successful deploy-staging run whose exact-SHA user-flow synthetic job
+# succeeded in the same attempt, except that a rollback (Worker version +
 # container image) never needs staging history, and a live-SHA takeover
 # redeploy (`allow_unstaged` with `takeover`) waives it when the operator
 # confirms the SHA is live. A pre-deploy schema gate then runs the
@@ -44,6 +45,10 @@ name: deploy-production
 # `recheck` job re-reads the hold and the live revision immediately before
 # the deploy: a hold set, or a target gone stale, while the gates built or
 # the soak slept skips green instead of deploying through the incident. A
+# regression gate (`staging-soak-evidence` plus a step in `production`)
+# compares the soaked candidate on staging with production before any
+# mutation: no journey that passes on production may fail on staging, and
+# staging's REST 5xx ratio may not exceed max(1.5 x production's, 5%). A
 # failed gate after a takeover auto-rolls back to the pre-deploy snapshot
 # (Worker version AND container image) and still fails the run. Runbook:
 # docs/production-deploy.md.
@@ -93,7 +98,7 @@ on:
 permissions: {}
 
 # No workflow-level concurrency: only the `production` job below holds the
-# `deploy-production` lane. The guard, gates, soak and recheck jobs run outside it, so a sleeping automatic promotion can never queue an
+# `deploy-production` lane (through its post-deploy watch). The guard, gates, soak and recheck jobs run outside it, so a sleeping automatic promotion can never queue an
 # operator rollback behind it. The lane keeps the default single pending
 # slot, so the `recheck` job skips an automatic run while an operator
 # dispatch is active — otherwise the automatic `production` job would enter
@@ -570,6 +575,26 @@ jobs:
               staging_run = max(staging_runs, key=lambda run: (run["run_number"], run["id"]))
               if staging_run.get("status") != "completed" or staging_run.get("conclusion") != "success":
                   refuse(f"the latest deploy-staging run on {sha} is not a completed success")
+              # The exact-SHA user-flow synthetic is a promotion prerequisite,
+              # not only a scheduled check: a green run whose synthetic job
+              # was skipped, renamed or ran in another attempt certifies nothing.
+              staging_attempt = staging_run.get("run_attempt")
+              if type(staging_attempt) is not int or staging_attempt <= 0:
+                  refuse(f"the latest deploy-staging run on {sha} carries no verifiable attempt")
+              staging_jobs = collection(
+                  f"repos/{repo}/actions/runs/{staging_run['id']}/attempts/{staging_attempt}/jobs",
+                  "the latest deploy-staging attempt's jobs", "jobs",
+              )
+              synthetic = [job for job in staging_jobs
+                           if job.get("name") == "staging user-flow synthetic (exact SHA)"]
+              if len(synthetic) != 1 or any(
+                  job.get("run_id") != staging_run["id"] or job.get("run_attempt") != staging_attempt
+                  or job.get("head_sha") != sha
+                  or job.get("status") != "completed" or job.get("conclusion") != "success"
+                  for job in synthetic
+              ):
+                  refuse(f"the staging user-flow synthetic has no successful run on {sha} "
+                         "in the latest deploy-staging attempt")
 
           SNAPSHOT_ARTIFACT = "production-rollback-snapshot"
           SNAPSHOT_FILE = SNAPSHOT_ARTIFACT + ".json"
@@ -814,6 +839,11 @@ jobs:
                   + ")\n"
                   f"- Full CI: check.yml run `{ci['id']}`, attempt `{ci['run_attempt']}` (latest, completed/success)\n"
                   + (
+                      f"- Staging user-flow synthetic: green on `{sha}` in deploy-staging run "
+                      f"`{staging_run['id']}`, attempt `{staging_run['run_attempt']}`\n"
+                      if staging_run else ""
+                  )
+                  + (
                       f"- Approval: automated (PRODUCTION_AUTO_APPROVE), latest deploy-staging run `{staging_run['id']}` green\n"
                       if auto_approve and needs_staging else ""
                   )
@@ -1002,17 +1032,50 @@ jobs:
   # never queued behind — or displaced by — a sleeping promotion. The
   # remainder is recomputed here from the staging-green timestamp the guard
   # reported, not carried from guard time, so the gate builds and any
-  # Environment approval wait do not extend the soak.
+  # Environment approval wait do not extend the soak. The job first records
+  # the soak-baseline REST counters (the judged soak window starts at that
+  # sample), then sleeps.
   soak:
     name: post-staging soak (automatic runs only)
     needs: guard
     if: needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && needs.guard.outputs.soak_seconds != '0'
     permissions:
       contents: read
+    environment:
+      name: staging
+      deployment: false
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'soak') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 35
+    outputs:
+      baseline: ${{ steps.baseline.outputs.receipt }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Reviewed tooling from the workflow's own commit, never the guarded SHA.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Record the soak-baseline REST counters
+        id: baseline
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The judged soak window starts here: the regression gate compares
+          # this baseline with the post-soak sample and records
+          # `insufficient_data` when the process identity changed between
+          # them (a restart resets the cumulative counters). A missing
+          # bearer records no data (exit 0); a failed scrape fails the soak
+          # closed.
+          node wrangler/scripts/rest-5xx-counters.mjs --metrics-url "$STAGING_WORKER_URL" \
+            --out "$RUNNER_TEMP/staging-soak-baseline.json"
+          echo "receipt=$(cat "$RUNNER_TEMP/staging-soak-baseline.json")" >> "$GITHUB_OUTPUT"
       - name: Wait out the remainder of the 30-minute post-staging soak
         env:
           GREEN_AT: ${{ needs.guard.outputs.green_at }}
@@ -1036,6 +1099,93 @@ jobs:
           if remaining > 0:
               time.sleep(remaining)
 
+  # Promotion regression gate, staging leg (docs/production-deploy.md,
+  # "Regression gate against production"). After the soak, it reads the
+  # candidate on staging: the user-flow probe (pinned to the guarded SHA and
+  # bound to the guarded run-attempt build: a same-SHA redeploy no longer
+  # proves the candidate soaked) and staging's cumulative REST counters,
+  # judged against the soak-baseline sample the `soak` job recorded. The
+  # `production` job compares them with production's own probe and counters
+  # before any mutation. Staging serving another build cannot be judged: an
+  # automatic run skips green when a main-branch staging run still promotes
+  # that build (`staging-superseded`: the newer build promotes itself) and
+  # refuses when nothing promotes it (the promotion stalled); a manual run
+  # refuses. `deployment: false` reads the staging scrape bearer without
+  # writing a staging deployment record. Rollback and live-SHA redeploys skip it.
+  staging-soak-evidence:
+    name: staging soak evidence for the regression gate
+    needs: [guard, soak]
+    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && (needs.soak.result == 'success' || needs.soak.result == 'skipped')"
+    permissions:
+      contents: read
+      actions: read # deploy-staging runs: which build the serving revision still promotes
+    environment:
+      name: staging
+      deployment: false
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'staging-soak-evidence') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 10
+    outputs:
+      skip: ${{ steps.judge.outputs.skip }}
+      evidence: ${{ steps.judge.outputs.evidence }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Reviewed tooling from the workflow's own commit, never the guarded SHA.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Read the candidate's staging journeys and soak REST counters
+        id: judge
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
+          SHA: ${{ needs.guard.outputs.sha }}
+          AUTO: ${{ needs.guard.outputs.auto }}
+          RUN_ID: ${{ needs.guard.outputs.staging_run_id }}
+          RUN_ATTEMPT: ${{ needs.guard.outputs.staging_attempt }}
+          BASELINE: ${{ needs.soak.outputs.baseline }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Exit 1 is a recorded journey failure the comparison judges;
+          # anything else (a refused origin) fails closed here.
+          probe=0
+          python3 scripts/staging_health_contract_probe.py --expected-sha "$SHA" \
+            --evidence "$RUNNER_TEMP/staging-soak-probe.json" || probe=$?
+          if [ "$probe" -gt 1 ]; then
+            echo "::error::staging probe refused to run (exit $probe); the regression gate cannot judge"
+            exit 1
+          fi
+          node wrangler/scripts/rest-5xx-counters.mjs --metrics-url "$STAGING_WORKER_URL" \
+            --out "$RUNNER_TEMP/staging-soak-counters.json"
+          # Which main-branch staging runs still promote the serving
+          # revision: a serving build nothing promotes means the promotion
+          # stalled, which refuses instead of skipping. A failed listing
+          # fails closed here. The soak was already over before this run
+          # started when the soak skipped, so no baseline is expected then.
+          # gh api switches to POST when -f fields are passed, but the
+          # runs listing is a GET endpoint: request GET explicitly. The jq
+          # filter wraps the rows in one JSON array, which read_runs needs.
+          gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-staging.yml/runs" \
+            -f branch=main -f per_page=100 \
+            -q '[.workflow_runs[] | {head_sha, head_branch, status, conclusion}]' \
+            > "$RUNNER_TEMP/staging-runs.json"
+          baseline_args=()
+          if [ -n "$BASELINE" ]; then
+            printf '%s\n' "$BASELINE" > "$RUNNER_TEMP/staging-soak-baseline.json"
+            baseline_args=(--baseline-counters "$RUNNER_TEMP/staging-soak-baseline.json")
+          fi
+          python3 scripts/promotion_regression_gate.py staging \
+            --probe "$RUNNER_TEMP/staging-soak-probe.json" --counters "$RUNNER_TEMP/staging-soak-counters.json" \
+            --sha "$SHA" --auto "$AUTO" --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" \
+            --staging-runs "$RUNNER_TEMP/staging-runs.json" "${baseline_args[@]}" \
+            --out "$RUNNER_TEMP/staging-soak-evidence.json"
+
   # Pre-deploy recheck for automatic runs: the guard's hold and live checks
   # go stale while the gates build, the Environment approval waits and the
   # soak sleeps. It waits for the soak AND both gates, so the fresh read
@@ -1050,8 +1200,8 @@ jobs:
   # production job.
   recheck:
     name: pre-deploy hold and live recheck (automatic runs only)
-    needs: [guard, soak, schema-gate, roles-gate]
-    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.auto == 'true' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'"
+    needs: [guard, soak, schema-gate, roles-gate, staging-soak-evidence]
+    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.auto == 'true' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''"
     permissions:
       contents: read # compare API: whether the live revision contains the target
       actions: read # workflow runs: whether an operator dispatch is active
@@ -1226,13 +1376,13 @@ jobs:
 
   production:
     name: wrangler ${{ needs.guard.outputs.mode }} + readyz gate
-    needs: [guard, soak, recheck, schema-gate, roles-gate]
+    needs: [guard, soak, recheck, schema-gate, roles-gate, staging-soak-evidence]
     # `!cancelled()` (not `always()`): a cancelled run must never deploy, while
     # skipped gates still bypass for rollback and live-SHA redeploys. The soak
     # must have succeeded or been skipped (a failed soak fails closed: no bake,
     # no deploy), and a skipped recheck counts only for manual runs — an
     # automatic run always needs a fresh recheck pass with no skip.
-    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success'))"
+    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && (needs.soak.result == 'success' || needs.soak.result == 'skipped') && ((needs.guard.outputs.auto != 'true' && needs.recheck.result == 'skipped') || (needs.recheck.result == 'success' && needs.recheck.outputs.skip == '')) && (needs.guard.outputs.mode == 'rollback' || needs.guard.outputs.allow_unstaged == 'true' || (needs.schema-gate.result == 'success' && needs.roles-gate.result == 'success' && needs.staging-soak-evidence.result == 'success' && needs.staging-soak-evidence.outputs.skip == ''))"
     # The only job holding the deploy-production lane: only a running or
     # pending production job occupies it. The guard, gates, soak and recheck
     # jobs carry no concurrency, so recovery
@@ -1247,10 +1397,11 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'production') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     # Sized for the worst case: a ~442 s deploy, a failing readyz gate
     # (~15 min of polls), the error-rate gate (~4 min of live scrapes) and
-    # the auto-rollback budget (600 s image + 900 s gate). The 30 min soak
-    # sleeps in its own job, outside this cap. A 60 min cap can cancel the
-    # run mid-rollback and leave production fenced.
-    timeout-minutes: 90
+    # the auto-rollback budget (600 s image + 900 s gate), then the 30 min
+    # post-deploy watch (plus its final-window grace) and a second rollback
+    # budget. The 30 min soak sleeps in its own job, outside this cap. A
+    # tighter cap can cancel the run mid-rollback and leave production fenced.
+    timeout-minutes: 150
     # The human gate: this job waits for the Environment's required
     # reviewers. The guard job refused to get here without them, unless
     # vars.PRODUCTION_AUTO_APPROVE is true and either the latest staging
@@ -1373,6 +1524,57 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+      # Rollback-target preflight, before any production mutation: the
+      # snapshot must name a complete receipt (previous Worker version, its
+      # SHA, its image digest), live Cloudflare state must still bind it, the
+      # registry must still hold the image, and no migration added since the
+      # serving SHA may be backward-incompatible (the serving build must run
+      # on the candidate's schema after a rollback). No valid target refuses
+      # the promotion. Recovery paths (rollback, live-SHA redeploy) skip it.
+      - name: Preflight the rollback target before production mutation
+        id: rollback_preflight
+        if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          python3 ../tooling/scripts/rollback_target_preflight.py \
+            --snapshot "$RUNNER_TEMP/production-rollback-snapshot.json" \
+            --sha "$SHA" --repo .. --out "$RUNNER_TEMP/production-rollback-preflight.json"
+      # Promotion regression gate, production leg, before any production
+      # mutation: the passive production probe and production's cumulative
+      # REST counters are the baseline. A journey that passes on production
+      # but failed on staging for the candidate, or a staging soak REST 5xx
+      # ratio above max(1.5 x production's, 5%) with at least 3 staging 5xx,
+      # refuses the promotion. Recovery paths skip it.
+      - name: Gate on regression against the production baseline
+        id: regression_gate
+        if: env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true'
+        env:
+          PROD_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}
+          STAGING_EVIDENCE: ${{ needs.staging-soak-evidence.outputs.evidence }}
+        run: |
+          set -euo pipefail
+          # A failing production journey lowers the baseline, never the bar;
+          # only a refused origin (exit 2) fails here.
+          probe=0
+          python3 ../tooling/scripts/prod_passive_probe.py \
+            --evidence "$RUNNER_TEMP/production-baseline-probe.json" || probe=$?
+          if [ "$probe" -gt 1 ]; then
+            echo "::error::production probe refused to run (exit $probe); the regression gate cannot judge"
+            exit 1
+          fi
+          node ../tooling/wrangler/scripts/rest-5xx-counters.mjs --metrics-url "$PRODUCTION_WORKER_URL" \
+            --user-agent "two-bot-next-production-rollout/1.0" \
+            --out "$RUNNER_TEMP/production-baseline-counters.json"
+          python3 ../tooling/scripts/promotion_regression_gate.py compare \
+            --staging-evidence "$STAGING_EVIDENCE" \
+            --probe "$RUNNER_TEMP/production-baseline-probe.json" \
+            --counters "$RUNNER_TEMP/production-baseline-counters.json" \
+            --sha "$SHA" --out "$RUNNER_TEMP/production-regression-gate.json"
       # Ordinary promotion consumes only the bytes certified by the exact
       # guarded staging attempt. Recovery remains independent of artifacts.
       - name: Admit the immutable staging artifact before production mutation
@@ -1541,12 +1743,16 @@ jobs:
           # The takeover steps below pin to the single version serving 100% of
           # traffic. Anything else (split traffic, unreadable status) refuses
           # the takeover rather than handing ownership to an unknown version.
+          # The release notification also needs the published version ID on a
+          # cutover hold (takeover=false still publishes a new Worker), so
+          # export it for every deploy that leaves one version at 100%.
+          if mode == "deploy" and len(after) == 1 and after[0][1] == 100:
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+                  env_file.write(f"NEW_VERSION={after[0][0]}\n")
           if takeover:
               if len(after) != 1 or after[0][1] != 100:
                   print("::error::takeover requested but no single Worker version serves 100% of traffic")
                   sys.exit(1)
-              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
-                  env_file.write(f"NEW_VERSION={after[0][0]}\n")
       # P2/P3 (docs/cutover-production-takeover-design.md): read control state
       # without starting, then take over at exactly the read epoch. Both run
       # only when the dispatch requested the takeover; a routine deploy leaves
@@ -1864,3 +2070,83 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+      # Post-deploy watch (docs/production-deploy.md, "Post-deploy watch"):
+      # the gates above judge minutes; these steps keep judging /health,
+      # /readyz (200, gateway ready, the promoted revision) and the REST 5xx
+      # promotion gate for 30 minutes after an ordinary takeover promotion.
+      # They run inside this job, so the deploy-production lane stays held
+      # from the deploy to the end of the watch: no newer deploy lands
+      # mid-watch, and no separate job re-enters the single pending slot. A
+      # breach re-reads the serving version and restores the pre-deploy
+      # snapshot (Worker version AND container image) only if the promoted
+      # version still serves; the run then fails red. Cancel the run to free
+      # the lane for an urgent operator dispatch.
+      - name: Watch production for 30 minutes after the promotion
+        id: watch
+        if: success() && env.MODE == 'deploy' && env.ALLOW_UNSTAGED != 'true' && env.TAKEOVER == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/post-deploy-watch"
+          python3 ../tooling/scripts/post_deploy_watch.py --worker-url "$PRODUCTION_WORKER_URL" \
+            --sha "$SHA" --version "$NEW_VERSION" --evidence "$RUNNER_TEMP/post-deploy-watch/watch.json"
+      - name: Auto-roll back Worker version and container image after a watch breach
+        id: watch_rollback
+        if: failure() && steps.watch.outputs.verdict == 'breach'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          ROLLBACK_ACTOR: github-actions:${{ github.run_id }}:${{ needs.guard.outputs.sha }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.PRODUCTION_OWNERSHIP_CONTROL_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 ../tooling/scripts/worker_container_rollback.py rollback \
+            --variant production \
+            --worker-url "$PRODUCTION_WORKER_URL" \
+            --staging-url "$STAGING_WORKER_URL" \
+            --snapshot "$RUNNER_TEMP/production-rollback-snapshot.json" \
+            --actor "$ROLLBACK_ACTOR" \
+            --evidence "$RUNNER_TEMP/post-deploy-watch/rollback.json"
+          echo "- Post-deploy watch auto-rollback: restored the pre-deploy Worker version and container image with takeover (the run still fails)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the post-deploy watch evidence
+        if: always() && steps.watch.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-post-deploy-watch
+          path: ${{ runner.temp }}/post-deploy-watch
+          if-no-files-found: ignore
+          retention-days: 14
+      # Deploy-notify (docs/production-deploy.md, "Deploy notifications"): the
+      # final step reports every production change (a deploy, its automatic
+      # rollback, or an operator rollback) to the release-verification
+      # webhook as one HMAC-signed record: SHA, Worker version, image digest,
+      # outcome, reason and run URL. Never a gate: continue-on-error, a short
+      # timeout, and a notice when the bindings are unset. The daily release
+      # audit cross-checks GitHub runs, so a missed delivery is still caught.
+      - name: Notify the release log of this production change
+        if: always() && (steps.deploy.outcome == 'success' || steps.rollback.outcome == 'success' || steps.rollback.outcome == 'failure')
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAPERCLIP_DEPLOY_WEBHOOK_URL: ${{ vars.PAPERCLIP_DEPLOY_WEBHOOK_URL }}
+          PAPERCLIP_DEPLOY_WEBHOOK_SECRET: ${{ secrets.PAPERCLIP_DEPLOY_WEBHOOK_SECRET }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          JOB_STATUS: ${{ job.status }}
+          ALLOW_UNSTAGED: ${{ env.ALLOW_UNSTAGED }}
+          ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          PROMOTION_OUTCOME: ${{ steps.promotion_recheck.outcome }}
+          ERROR_GATE_OUTCOME: ${{ steps.error_rate_gate.outcome }}
+          AUTO_ROLLBACK_OUTCOME: ${{ steps.auto_rollback.outcome }}
+          WATCH_ROLLBACK_OUTCOME: ${{ steps.watch_rollback.outcome }}
+          WATCH_REASON: ${{ steps.watch.outputs.reason }}
+        run: |
+          set -euo pipefail
+          python3 ../tooling/scripts/deploy_notify.py --from-workflow --sha "$SHA" --run-url "$RUN_URL"

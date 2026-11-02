@@ -302,7 +302,7 @@ pub fn e2e_command_matrix() -> Vec<E2eMatrixRow> {
         ),
         row(
             "command-edit",
-            48,
+            49,
             E2eGate::Automations,
             PERM_MANAGE_GUILD,
             "ManageGuild",

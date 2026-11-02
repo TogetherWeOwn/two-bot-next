@@ -62,10 +62,10 @@ use two_bot_core::{
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
     },
     voice_config::{
-        decode_configuration, export_configuration, validate_configuration,
-        validate_time_zone_change, ChannelKind, ChannelReference, GuildInventory,
-        RoomPosition as PlacementSide, VoiceConfigError, VoiceConfiguration, MAX_IMPORT_BYTES,
-        VOICE_CONFIG_VERSION,
+        decode_configuration, drop_deleted_command_roles, export_configuration,
+        validate_configuration, validate_time_zone_change, ChannelKind, ChannelReference,
+        GuildInventory, RoomPosition as PlacementSide, VoiceConfigError, VoiceConfiguration,
+        MAX_IMPORT_BYTES, VOICE_CONFIG_VERSION,
     },
     voice_config_diff::{
         diff_configuration, diff_content_hash, render_preview, render_review_preview,
@@ -236,10 +236,13 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         guild: Snowflake,
     ) -> impl Future<Output = Result<AccessControls, StoreError>> + Send;
-    /// Replace the guild's controls (validated before the write).
+    /// Replace the guild's controls (validated before the write) while they
+    /// still equal `expected`, the value read for this change: `/import`
+    /// writes the same row, so a change in between is `Conflict`.
     fn save_access_controls(
         &self,
         guild: Snowflake,
+        expected: &AccessControls,
         controls: &AccessControls,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     /// The guild's V10a logging settings; an unconfigured guild reads as the defaults.
@@ -524,11 +527,16 @@ impl RoomPersistence for PgRoomStore {
     async fn save_access_controls(
         &self,
         guild: Snowflake,
+        expected: &AccessControls,
         controls: &AccessControls,
     ) -> Result<(), StoreError> {
-        self.save_access_controls(guild, controls)
-            .await
-            .map_err(store_error)
+        match self.save_access_controls(guild, expected, controls).await {
+            Ok(()) => Ok(()),
+            // The store's compare-and-swap sentinel: an import changed the
+            // controls between the `/access` read and this write.
+            Err(sqlx::Error::RowNotFound) => Err(StoreError::Conflict),
+            Err(error) => Err(store_error(error)),
+        }
     }
 
     async fn logging_settings(&self, guild: Snowflake) -> Result<LoggingSettings, StoreError> {
@@ -8273,8 +8281,9 @@ pub struct VoiceRuntime<S, H> {
     /// set, a live view that is not ready is a fault, not an outage, and
     /// every dispatch retries the cached snapshot (see `heal_not_ready`).
     gateway_connected: AtomicBool,
-    /// Serializes `/access` read-modify-write cycles so two admins cannot
-    /// overwrite each other's change (rare, admin-only, so one lock is enough).
+    /// Serializes `/access` read-modify-write cycles and import Confirm so
+    /// two admins cannot overwrite each other's change (rare, admin-only, so
+    /// one lock is enough).
     access_lock: tokio::sync::Mutex<()>,
     /// Previewed import candidates by (guild, uploading member, content
     /// hash). Confirm consumes the entry, so a double click cannot apply
@@ -9101,6 +9110,19 @@ where
             let _ = actor.send_command_lossless(ActorCommand::NameSettingsChanged(
                 NameSettings::from_config(config),
             ));
+        }
+    }
+
+    /// Hand a confirmed import's access gates to the guild worker. The
+    /// worker caches the creation switch, so without this push an imported
+    /// `creation_enabled: false` would wait for a restart while the
+    /// command gate (which reads the store per command) already enforces
+    /// the imported role gates. The candidate was validated before apply,
+    /// so its role IDs parse; a value that does not is skipped rather
+    /// than pushed half-built.
+    fn access_imported(&self, guild_id: Snowflake, config: &VoiceConfiguration) {
+        if let Some(controls) = import_access_controls(config) {
+            self.access_changed(guild_id, controls);
         }
     }
 
@@ -11854,6 +11876,37 @@ pub fn plan_import_confirm(
     plan_reviewable_import(current, remaining, &diff)
 }
 
+/// The access controls a confirmed import saved, in the gate's own shape:
+/// `settings.creation_enabled` is the creation switch,
+/// `settings.command_role_id` the guild-wide required role, and
+/// `settings.command_roles` the per-command restrictions (one store:
+/// `voice_access_controls`). `None` when a role ID does not parse, which
+/// a validated candidate never carries.
+fn import_access_controls(config: &VoiceConfiguration) -> Option<AccessControls> {
+    let settings = &config.settings;
+    let required_role = settings
+        .command_role_id
+        .as_deref()
+        .map(str::parse::<Snowflake>)
+        .transpose()
+        .ok()?;
+    let mut command_roles = BTreeMap::new();
+    for restriction in &settings.command_roles {
+        let roles = restriction
+            .role_ids
+            .iter()
+            .map(|role| role.parse::<Snowflake>())
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        command_roles.insert(restriction.command.clone(), roles);
+    }
+    Some(AccessControls {
+        room_creation_enabled: settings.creation_enabled,
+        required_role,
+        command_roles,
+    })
+}
+
 /// How many creator channels `candidate` adds over `current`.
 fn added_creator_count(current: &VoiceConfiguration, candidate: &VoiceConfiguration) -> usize {
     candidate
@@ -13691,7 +13744,8 @@ fn access_unrestrict_ack(command: &str) -> String {
 
 /// Apply one `/access` action: read, change, validate, save, then hand the
 /// saved controls to `on_saved` (the live actor). A failed read or write
-/// changes nothing and says so.
+/// changes nothing and says so; so does a save that finds the controls
+/// changed since the read (a confirmed import), instead of reverting it.
 async fn execute_access<S: RoomPersistence>(
     store: &S,
     guild_id: Snowflake,
@@ -13710,7 +13764,7 @@ async fn execute_access<S: RoomPersistence>(
     if show_page_invalid {
         return access_page_refusal();
     }
-    let mut controls = match store.access_controls(guild_id).await {
+    let read = match store.access_controls(guild_id).await {
         Ok(controls) => controls,
         Err(error) => {
             log_admin_store_failure("access_read", guild_id, error);
@@ -13718,6 +13772,7 @@ async fn execute_access<S: RoomPersistence>(
                 .to_owned();
         }
     };
+    let mut controls = read.clone();
     let ack = match action {
         AccessAction::Show { page } => {
             let Some(number) = page.number() else {
@@ -13757,10 +13812,15 @@ async fn execute_access<S: RoomPersistence>(
     if validate_access_controls(&controls).is_err() {
         return "Those settings are not valid, so nothing was changed.".to_owned();
     }
-    match store.save_access_controls(guild_id, &controls).await {
+    match store.save_access_controls(guild_id, &read, &controls).await {
         Ok(()) => {
             on_saved(controls);
             ack
+        }
+        Err(StoreError::Conflict) => {
+            "The voice-room settings changed while this was saving (an import was confirmed). \
+             Nothing was changed; check /access show and try again."
+                .to_owned()
         }
         Err(error) => {
             log_admin_store_failure("access_save", guild_id, error);
@@ -14604,7 +14664,7 @@ where
                 return true;
             }
             let (store, _) = runtime.make_pair();
-            let config = match store.config_snapshot(guild_id).await {
+            let mut config = match store.config_snapshot(guild_id).await {
                 Ok(config) => config,
                 Err(error) => {
                     log_admin_store_failure("export_read", guild_id, error);
@@ -14615,11 +14675,20 @@ where
                     return true;
                 }
             };
+            let dropped = drop_deleted_command_roles(&mut config, inventory, interaction.id.get());
+            let dropped_note = if dropped == 0 {
+                String::new()
+            } else {
+                format!(
+                    " Left out {dropped} deleted role(s) from /access command restrictions; \
+                     the restrictions still apply."
+                )
+            };
             match export_configuration(&config, inventory) {
                 Ok(bytes) => {
                     reply(export_file_response(
                         &format!(
-                            "Voice configuration for this server (v{}). Re-import it with /import.",
+                            "Voice configuration for this server (v{}). Re-import it with /import.{dropped_note}",
                             VOICE_CONFIG_VERSION
                         ),
                         export_filename(guild_id),
@@ -14842,6 +14911,10 @@ where
         .await;
         return true;
     };
+    // Same lock as `/access`: import writes the access controls
+    // `/access` read-modify-writes, and the store's advisory lock only
+    // serializes imports. Held from the re-read through the apply.
+    let _serialized = runtime.access_lock.lock().await;
     let current = match store.config_snapshot(guild_id).await {
         Ok(config) => config,
         Err(_) => {
@@ -14886,6 +14959,7 @@ where
             match store.config_apply(guild_id, &candidate, &current).await {
                 Ok(()) => {
                     runtime.name_settings_updated(guild_id, &candidate);
+                    runtime.access_imported(guild_id, &candidate);
                     reply(ephemeral_response(&message)).await;
                 }
                 Err(StoreError::Conflict) => {
@@ -14931,6 +15005,7 @@ where
                                     match store.config_apply(guild_id, &retry, &fresh).await {
                                         Ok(()) => {
                                             runtime.name_settings_updated(guild_id, &retry);
+                                            runtime.access_imported(guild_id, &retry);
                                             reply(ephemeral_response(&fresh_message)).await;
                                         }
                                         Err(_) => {

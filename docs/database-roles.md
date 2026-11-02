@@ -48,7 +48,11 @@ both through `DUMP_TABLES` (`crates/core/src/backup/dump_file.rs`, via
 `dump.rs`; a runtime-group login cannot read them, so the nightly dump would
 abort), and the go.two.gg `REDIRECT_DB` connector reads `invite_campaigns`
 (`wrangler/src/redirect-store.ts`, unbound today with a snapshot fallback).
-Each of those readers needs its own reviewed identity. The plan transfers both
+Each of those readers needs its own reviewed identity. The reviewed backup
+identity also needs `SELECT` on the SQLx ledger (`_sqlx_migrations`) when it
+exists, because the dump records the applied cutover migrations in the
+manifest (see `docs/backup.md`); no group here gains that grant for backup —
+runtime stays unable to read the ledger. The plan transfers both
 tables to the migrator and grants the migrator ALL with no runtime or reader
 grant; the verifier requires migrator ownership/privileges and rejects any
 runtime/reader access, including TOAST-storage ownership drift.

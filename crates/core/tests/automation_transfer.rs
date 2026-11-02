@@ -13,7 +13,7 @@ use two_bot_core::automation_transfer::{
 };
 use two_bot_core::custom_command_service as service;
 use two_bot_core::custom_command_store as store;
-use two_bot_core::custom_commands::StoredCommand;
+use two_bot_core::custom_commands::{max_custom_commands, reserved_command_names, StoredCommand};
 
 const MIGRATION: &str = include_str!("../../cutover/migrations/0130_custom_commands.sql");
 const AT: &str = "2026-10-03T01:00:00Z";
@@ -230,7 +230,7 @@ async fn import_capacity_overflow_writes_nothing() {
         .expect("seed applies");
     // Exactly the budget fits the envelope cap, but the union with the stored
     // row exceeds it, so planning fails the whole import.
-    let max = max_import_entries();
+    let max = max_custom_commands(reserved_command_names().len());
     let commands: Vec<serde_json::Value> = (0..max)
         .map(|i| json!({"command": format!("fresh-{i}"), "response": "t"}))
         .collect();
