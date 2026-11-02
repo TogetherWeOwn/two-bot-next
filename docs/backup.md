@@ -368,6 +368,18 @@ legacy tables empty and any inserted `voice_access_controls` guild rows on
 top of the manifest count; the CLI names the translation in both dry-run
 and apply output.
 
+The replay runs only for archives whose recorded cutover migrations
+(`cutoverMigrations` in the manifest, written from the source's
+`_sqlx_migrations` ledger) prove the source had **not** applied 0469.
+After 0469, `/import` mirrors restrictions into both stores but `/access`
+updates only the gate's, so a post-0469 archive can hold a legacy row for
+a restriction an admin has since lifted; those archives restore both
+voice stores verbatim and the lifted restriction stays lifted. Archives
+written before the evidence field existed carry no proof either way and
+replay fail-closed; the restore report and CLI name the translated counts,
+so check them after restoring such an archive taken shortly after 0469
+shipped and re-lift anything the translation reinstated.
+
 ### Migration-backed regression suite
 
 `crates/core/tests/backup_schema_roundtrip.rs` creates uniquely named isolated

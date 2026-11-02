@@ -332,6 +332,22 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
     } else {
         Vec::new()
     };
+    // The cutover ledger is the one restore gates behavior on (see the 0469
+    // replay): only a source that had not applied 0469 holds authoritative
+    // voice restrictions in the legacy tables. Same absent-ledger care as
+    // above; only successful applications count as applied.
+    let (has_cutover_ledger,): (bool,) =
+        sqlx::query_as("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+            .fetch_one(&mut *tx)
+            .await?;
+    let cutover_migrations: Vec<(i64,)> = if has_cutover_ledger {
+        sqlx::query_as("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| DbDumpError::Refused(format!("cannot read _sqlx_migrations: {e}")))?
+    } else {
+        Vec::new()
+    };
 
     // Rows alone cannot show values handed out and then deleted; the marks
     // let restore resume past them (the cutover allocator gate).
@@ -356,6 +372,10 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
         tables,
         events_sequence: seq.0,
         schema_migrations: migrations.into_iter().map(|(id,)| id).collect(),
+        cutover_migrations: cutover_migrations
+            .into_iter()
+            .map(|(version,)| version)
+            .collect(),
         sequence_marks,
     };
 
@@ -747,6 +767,16 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     // the move happens once: a dump of the restored database carries the
     // restrictions only where the gate reads them. Targets predating either
     // store fail the column guards and take no translation.
+    //
+    // Only a source that had not applied 0469 holds authoritative
+    // restrictions in the legacy tables. After 0469, /import mirrors its
+    // restrictions into both stores but /access updates only the gate's, so
+    // a post-0469 archive can carry a legacy row for a restriction an admin
+    // has since lifted; replaying it would resurrect that restriction.
+    // Archives proving 0469 was applied therefore restore both voice stores
+    // verbatim. Archives without recorded evidence predate the evidence
+    // field and replay fail-closed; the report names the translated counts.
+    let archive_pre_voice_authority = !manifest.applied_cutover(469);
     let mut translated_voice_command_roles = 0;
     let mut translated_voice_command_role_members = 0;
     let mut voice_access_controls_added = 0;
@@ -755,16 +785,20 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             .iter()
             .all(|name| columns.iter().any(|(column, _)| column == name))
     };
-    if has_columns(
-        &columns_of(&mut tx, "voice_command_roles").await?,
-        &["guild_id", "command"],
-    ) && has_columns(
-        &columns_of(&mut tx, "voice_command_role_members").await?,
-        &["guild_id", "command", "role_id"],
-    ) && has_columns(
-        &columns_of(&mut tx, "voice_access_controls").await?,
-        &["guild_id", "command_roles"],
-    ) {
+    if archive_pre_voice_authority
+        && has_columns(
+            &columns_of(&mut tx, "voice_command_roles").await?,
+            &["guild_id", "command"],
+        )
+        && has_columns(
+            &columns_of(&mut tx, "voice_command_role_members").await?,
+            &["guild_id", "command", "role_id"],
+        )
+        && has_columns(
+            &columns_of(&mut tx, "voice_access_controls").await?,
+            &["guild_id", "command_roles"],
+        )
+    {
         let legacy_rows = count_of(&mut tx, "voice_command_roles").await?
             + count_of(&mut tx, "voice_command_role_members").await?;
         if legacy_rows > 0 {
@@ -926,6 +960,7 @@ mod tests {
                 ],
                 events_sequence: 0,
                 schema_migrations: Vec::new(),
+                cutover_migrations: Vec::new(),
                 sequence_marks: Vec::new(),
             },
             restored: BTreeMap::new(),
@@ -938,6 +973,20 @@ mod tests {
             voice_access_controls_added: added,
             ok: true,
         }
+    }
+
+    #[test]
+    fn applied_cutover_needs_recorded_evidence_at_or_past_the_version() {
+        let mut report = report(0, 0, 0);
+        // Archives written before the evidence field prove nothing.
+        assert!(!report.manifest.applied_cutover(469));
+        report.manifest.cutover_migrations = vec![467, 468];
+        assert!(!report.manifest.applied_cutover(469));
+        report.manifest.cutover_migrations = vec![468, 469];
+        assert!(report.manifest.applied_cutover(469));
+        // A later version implies the chain ran through 0469 in order.
+        report.manifest.cutover_migrations = vec![470];
+        assert!(report.manifest.applied_cutover(469));
     }
 
     #[test]

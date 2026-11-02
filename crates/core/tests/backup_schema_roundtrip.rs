@@ -234,6 +234,31 @@ async fn seed(pool: &PgPool) {
     .unwrap();
 }
 
+/// Simulate a backup source that had not applied 0469. The seed's legacy
+/// voice rows are the pre-0469 shape, so the dump must record pre-0469
+/// migration evidence; with 0469 recorded, restore (correctly) treats the
+/// archive as post-0469 and restores both voice stores verbatim instead of
+/// replaying the translation.
+async fn forget_voice_authority_migration(pool: &PgPool) {
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version >= 469")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// The `voice_access_controls` columns the 0469 replay must not touch, by
+/// guild. Only `command_roles` is translated (plus inserted guild rows),
+/// so these round-trip exactly for every pre-existing guild.
+async fn voice_control_fields(pool: &PgPool) -> Vec<(String, bool, Option<String>)> {
+    sqlx::query_as(
+        "SELECT guild_id, room_creation_enabled, required_role_id \
+         FROM voice_access_controls ORDER BY guild_id COLLATE \"C\"",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TableSnapshot {
     columns: Vec<(String, String)>,
@@ -996,6 +1021,8 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     };
     let pool = db.pool();
     seed(pool).await;
+    forget_voice_authority_migration(pool).await;
+    let control_fields_before = voice_control_fields(pool).await;
     let tables = covered_tables(pool).await;
     let before = snapshot(pool, &tables).await;
     let ledgers = vec![
@@ -1012,6 +1039,10 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     assert_eq!(
         manifest.schema_migrations,
         vec!["legacy-ledger-diagnostic", "target-ledger"]
+    );
+    assert!(
+        !manifest.cutover_migrations.is_empty() && !manifest.applied_cutover(469),
+        "the simulated pre-0469 source records pre-0469 cutover evidence"
     );
     let contents = inspect(&original).unwrap();
     assert_archive_matches(&contents, &before);
@@ -1097,6 +1128,17 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         inserted_defaults,
         (true, None),
         "a guild inserted by the translation takes the column defaults"
+    );
+    // Only command_roles is translated: every pre-existing guild's creation
+    // switch and required role round-trip exactly.
+    let control_fields_after: Vec<_> = voice_control_fields(pool)
+        .await
+        .into_iter()
+        .filter(|(guild, _, _)| control_fields_before.iter().any(|(g, _, _)| g == guild))
+        .collect();
+    assert_eq!(
+        control_fields_after, control_fields_before,
+        "the replay leaves pre-existing guilds' non-translated controls untouched"
     );
     // The translated restrictions are what the command gate enforces: decode
     // the restored rows into gate controls and evaluate a non-admin member.
@@ -1267,6 +1309,100 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     ] {
         assert_sqlstate(&sqlx::query(audited(statement.to_owned())).execute(pool).await.unwrap_err(), "23505");
     }
+    target.close().await.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn post_0469_archive_restores_voice_stores_verbatim() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    // The post-0469 import -> unrestrict shape: /import mirrored a 'kick'
+    // restriction into the legacy tables, then /access unrestrict removed
+    // it from the gate's store only. The gate's empty map is authoritative;
+    // the legacy row is a stale backout mirror that restore must not
+    // resurrect. The ledger still records 0469, unlike the pre-0469 seed.
+    sqlx::raw_sql(
+        "INSERT INTO voice_access_controls (guild_id, room_creation_enabled, required_role_id, \
+             command_roles) \
+         VALUES ('100000000000000001', FALSE, '100000000000000040', '{}'::jsonb); \
+         INSERT INTO voice_command_roles (guild_id, command) \
+         VALUES ('100000000000000001', 'kick'); \
+         INSERT INTO voice_command_role_members (guild_id, command, role_id) \
+         VALUES ('100000000000000001', 'kick', '100000000000000043');",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let directory = ArchiveDirectory::new();
+    let path = directory.path("post-0469.ndjson.gz");
+    let manifest = dump(pool, &path).await.unwrap();
+    assert!(
+        manifest.applied_cutover(469),
+        "a migrated source records that 0469 was applied"
+    );
+
+    let target = database().await.expect("test bootstrap already configured");
+    let pool = target.pool();
+    let report = restore(pool, &path).await.unwrap();
+    assert!(report.ok);
+    assert_eq!(report.translated_voice_command_roles, 0);
+    assert_eq!(report.translated_voice_command_role_members, 0);
+    assert_eq!(report.voice_access_controls_added, 0);
+    // Both stores restore verbatim: the lifted restriction stays lifted and
+    // the backout mirror survives untouched.
+    let controls: (bool, Option<String>, String) = sqlx::query_as(
+        "SELECT room_creation_enabled, required_role_id, command_roles::text \
+         FROM voice_access_controls WHERE guild_id = '100000000000000001'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(!controls.0, "creation switch round-trips");
+    assert_eq!(controls.1.as_deref(), Some("100000000000000040"));
+    let parsed: BTreeMap<String, Vec<String>> = serde_json::from_str(&controls.2).unwrap();
+    assert!(
+        parsed.is_empty(),
+        "the lifted kick restriction is not resurrected from the mirror: {parsed:?}"
+    );
+    let gate = AccessControls {
+        room_creation_enabled: controls.0,
+        required_role: controls.1.as_deref().map(|id| id.parse().unwrap()),
+        command_roles: parsed
+            .into_iter()
+            .map(|(command, ids)| (command, ids.iter().map(|id| id.parse().unwrap()).collect()))
+            .collect(),
+    };
+    assert_eq!(
+        may_use_command(
+            &gate,
+            &AccessMember {
+                is_admin: false,
+                // Holds the guild-wide required role but not the lifted
+                // restriction's old role.
+                roles: vec![100_000_000_000_000_040],
+            },
+            "kick",
+        ),
+        AccessDecision::Allow,
+        "a member without the old role can use the lifted command after restore"
+    );
+    let mirror: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.command, m.role_id FROM voice_command_roles c \
+         JOIN voice_command_role_members m \
+           ON m.guild_id = c.guild_id AND m.command = c.command \
+         WHERE c.guild_id = '100000000000000001'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        mirror,
+        vec![("kick".to_owned(), "100000000000000043".to_owned())],
+        "the legacy backout mirror restores verbatim"
+    );
     target.close().await.unwrap();
     db.close().await.unwrap();
 }
@@ -2828,6 +2964,8 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     };
     let source = db.pool();
     seed(source).await;
+    forget_voice_authority_migration(source).await;
+    let control_fields_before = voice_control_fields(source).await;
     let tables = covered_tables(source).await;
     let before = snapshot(source, &tables).await;
     let version = schema_version(source).await;
@@ -2874,6 +3012,10 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     let contents = inspect(archive).unwrap();
     assert_archive_matches(&contents, &before);
     assert_eq!(contents.manifest.events_sequence, 107);
+    assert!(
+        !contents.manifest.applied_cutover(469),
+        "the shipped backup records the simulated pre-0469 source evidence"
+    );
 
     // Each run allocates a NEW migrated scratch database and retains its
     // evidence, as the drill unit does. Nothing restores into a reused target.
@@ -3043,6 +3185,15 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
                 ),
             ],
             "month {month}: the 0469 replay merges legacy restrictions"
+        );
+        let control_fields_after: Vec<_> = voice_control_fields(&pool)
+            .await
+            .into_iter()
+            .filter(|(guild, _, _)| control_fields_before.iter().any(|(g, _, _)| g == guild))
+            .collect();
+        assert_eq!(
+            control_fields_after, control_fields_before,
+            "month {month}: pre-existing guilds' non-translated controls round-trip"
         );
         for (table, expected_table) in &expected {
             if [

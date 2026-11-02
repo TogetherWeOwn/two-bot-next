@@ -724,10 +724,12 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
     {
         eprintln!("restore: old v3 has no member-ban ownership; apply does not infer acceptance; keep moderation off pending reconciliation");
     }
-    if contents.manifest.tables.iter().any(|table| {
-        (table.name == "voice_command_roles" || table.name == "voice_command_role_members")
-            && table.count > 0
-    }) {
+    if !contents.manifest.applied_cutover(469)
+        && contents.manifest.tables.iter().any(|table| {
+            (table.name == "voice_command_roles" || table.name == "voice_command_role_members")
+                && table.count > 0
+        })
+    {
         eprintln!("restore: apply replays the 0469 translation, moving legacy voice command restrictions into voice_access_controls.command_roles (unknown command names dropped) and emptying the legacy voice_command_roles tables");
     }
     println!(
