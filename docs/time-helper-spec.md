@@ -1,7 +1,8 @@
 # Time: private, copyable Discord timestamps
 
-Status: **proposed, design only**. Written 2026-10-25; intent review by
-2026-10-31. No command, registration, help behavior, storage, network call or
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-25. No command, registration, help behavior, storage, network call or
 live message is added. Merging this file does not authorize a build or rollout.
 This file is the repository source of truth; decision records bind its commit
 and SHA-256. Revisions require renewed alignment before build cards.

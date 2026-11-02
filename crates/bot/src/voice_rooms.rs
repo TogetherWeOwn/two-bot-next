@@ -62,10 +62,10 @@ use two_bot_core::{
         AccessControls, AccessDecision, AccessDenyReason, AccessMember,
     },
     voice_config::{
-        decode_configuration, export_configuration, validate_command_role_change,
-        validate_configuration, validate_time_zone_change, ChannelKind, ChannelReference,
-        GuildInventory, RoomPosition as PlacementSide, VoiceConfigError, VoiceConfiguration,
-        MAX_IMPORT_BYTES, VOICE_CONFIG_VERSION,
+        decode_configuration, drop_deleted_command_roles, export_configuration,
+        validate_command_role_change, validate_configuration, validate_time_zone_change,
+        ChannelKind, ChannelReference, GuildInventory, RoomPosition as PlacementSide,
+        VoiceConfigError, VoiceConfiguration, MAX_IMPORT_BYTES, VOICE_CONFIG_VERSION,
     },
     voice_config_diff::{
         diff_configuration, diff_content_hash, render_preview, render_review_preview,
@@ -236,10 +236,13 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         guild: Snowflake,
     ) -> impl Future<Output = Result<AccessControls, StoreError>> + Send;
-    /// Replace the guild's controls (validated before the write).
+    /// Replace the guild's controls (validated before the write) while they
+    /// still equal `expected`, the value read for this change: `/import`
+    /// writes the same row, so a change in between is `Conflict`.
     fn save_access_controls(
         &self,
         guild: Snowflake,
+        expected: &AccessControls,
         controls: &AccessControls,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
     /// The guild's V10a logging settings; an unconfigured guild reads as the defaults.
@@ -524,11 +527,16 @@ impl RoomPersistence for PgRoomStore {
     async fn save_access_controls(
         &self,
         guild: Snowflake,
+        expected: &AccessControls,
         controls: &AccessControls,
     ) -> Result<(), StoreError> {
-        self.save_access_controls(guild, controls)
-            .await
-            .map_err(store_error)
+        match self.save_access_controls(guild, expected, controls).await {
+            Ok(()) => Ok(()),
+            // The store's compare-and-swap sentinel: an import changed the
+            // controls between the `/access` read and this write.
+            Err(sqlx::Error::RowNotFound) => Err(StoreError::Conflict),
+            Err(error) => Err(store_error(error)),
+        }
     }
 
     async fn logging_settings(&self, guild: Snowflake) -> Result<LoggingSettings, StoreError> {
@@ -7902,6 +7910,14 @@ enum ActorCommand {
         command: PrivacyCommand,
         reply: oneshot::Sender<String>,
     },
+    /// `/room-access-inspect`: read the caller's room privacy lists. Pure
+    /// read; the reply is the ephemeral text.
+    RoomAccess {
+        actor_id: Snowflake,
+        is_admin: bool,
+        page: PageArg,
+        reply: oneshot::Sender<String>,
+    },
     /// V4: start a vote-kick; the reply carries the vote state or the refusal.
     KickStart {
         vote_id: Snowflake,
@@ -8301,6 +8317,7 @@ fn requires_guild_authority(command: &VoiceCommand) -> bool {
         command,
         VoiceCommand::Create { .. }
             | VoiceCommand::TextChannels { .. }
+            | VoiceCommand::TextChannelsReset { .. }
             | VoiceCommand::Position { .. }
             | VoiceCommand::Group { .. }
             | VoiceCommand::InheritPermissions { .. }
@@ -8337,8 +8354,9 @@ pub struct VoiceRuntime<S, H> {
     /// set, a live view that is not ready is a fault, not an outage, and
     /// every dispatch retries the cached snapshot (see `heal_not_ready`).
     gateway_connected: AtomicBool,
-    /// Serializes `/access` read-modify-write cycles so two admins cannot
-    /// overwrite each other's change (rare, admin-only, so one lock is enough).
+    /// Serializes `/access` read-modify-write cycles and import Confirm so
+    /// two admins cannot overwrite each other's change (rare, admin-only, so
+    /// one lock is enough).
     access_lock: tokio::sync::Mutex<()>,
     /// Previewed import candidates by (guild, uploading member, content
     /// hash). Confirm consumes the entry, so a double click cannot apply
@@ -8871,6 +8889,34 @@ where
             .ok()
     }
 
+    /// Run one `/room-access-inspect` read on the live worker and return the
+    /// ephemeral reply text. `None` when the guild has no live actor, when its
+    /// inbox already drained, or when no answer arrived within
+    /// `WORKER_ACK_WAIT`.
+    pub async fn run_room_access(
+        &self,
+        guild: Snowflake,
+        actor_id: Snowflake,
+        is_admin: bool,
+        page: PageArg,
+    ) -> Option<String> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::RoomAccess {
+                actor_id,
+                is_admin,
+                page,
+                reply,
+            })
+            .ok()?;
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
+    }
+
     /// Start a vote-kick through the guild actor. `vote_id` is the initiating
     /// interaction ID. `None` when the guild has no live actor, when its
     /// inbox already drained, or when no answer arrived within
@@ -9182,6 +9228,19 @@ where
             let _ = actor.send_command_lossless(ActorCommand::NameSettingsChanged(
                 NameSettings::from_config(config),
             ));
+        }
+    }
+
+    /// Hand a confirmed import's access gates to the guild worker. The
+    /// worker caches the creation switch, so without this push an imported
+    /// `creation_enabled: false` would wait for a restart while the
+    /// command gate (which reads the store per command) already enforces
+    /// the imported role gates. The candidate was validated before apply,
+    /// so its role IDs parse; a value that does not is skipped rather
+    /// than pushed half-built.
+    fn access_imported(&self, guild_id: Snowflake, config: &VoiceConfiguration) {
+        if let Some(controls) = import_access_controls(config) {
+            self.access_changed(guild_id, controls);
         }
     }
 
@@ -10484,6 +10543,14 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
         } => {
             let _ = reply.send(worker.apply_privacy(actor_id, is_admin, &actor_display, command));
         }
+        ActorCommand::RoomAccess {
+            actor_id,
+            is_admin,
+            page,
+            reply,
+        } => {
+            let _ = reply.send(worker.apply_room_access(actor_id, is_admin, page));
+        }
         ActorCommand::KickStart {
             vote_id,
             room_id,
@@ -11017,6 +11084,21 @@ pub struct TextChannelsRequest {
     pub viewer_role: Option<Snowflake>,
 }
 
+/// The explicit `/textchannels` reset controls. `true` clears the stored
+/// override so the creator falls back to its default (`voice-chat`, occupants
+/// and admins only); `false` and an omitted control both keep the stored value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextChannelsResets {
+    pub name: bool,
+    pub viewer_role: bool,
+}
+
+impl TextChannelsResets {
+    fn any(self) -> bool {
+        self.name || self.viewer_role
+    }
+}
+
 /// What `/textchannels` means for one creator channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TextChannelsPlan {
@@ -11032,14 +11114,42 @@ pub fn decide_text_channels(
     creator: Option<CreatorChannel>,
     request: &TextChannelsRequest,
 ) -> TextChannelsPlan {
+    decide_text_channels_with_resets(creator, request, TextChannelsResets::default())
+}
+
+/// [`decide_text_channels`] plus the reset controls. A reset and a
+/// replacement for the same field refuse together, before any value is
+/// applied; the other field is never reset or replaced by a refused call.
+#[must_use]
+pub fn decide_text_channels_with_resets(
+    creator: Option<CreatorChannel>,
+    request: &TextChannelsRequest,
+    resets: TextChannelsResets,
+) -> TextChannelsPlan {
     let refuse = |message: &str| TextChannelsPlan::Refuse {
         message: message.to_owned(),
     };
     let Some(mut creator) = creator else {
         return refuse("That channel is not a voice-room creator. Pick one made with /create.");
     };
+    if resets.name && request.name.is_some() {
+        return refuse(
+            "Choose either reset-name or a new name, not both. Nothing was changed. Try again with one of them.",
+        );
+    }
+    if resets.viewer_role && request.viewer_role.is_some() {
+        return refuse(
+            "Choose either reset-viewer-role or a new viewer-role, not both. Nothing was changed. Try again with one of them.",
+        );
+    }
     if let Some(enabled) = request.enabled {
         creator.text_channels = enabled;
+    }
+    if resets.name {
+        creator.text_channel_name = None;
+    }
+    if resets.viewer_role {
+        creator.text_viewer_role_id = None;
     }
     if let Some(name) = &request.name {
         if !is_usable_channel_name(name) {
@@ -11405,6 +11515,51 @@ fn text_channels_summary(creator: &CreatorChannel) -> String {
     )
 }
 
+/// Receipt for a `/textchannels` call that used a reset control. It always
+/// states the saved name and audience, even with companions off, and says
+/// which resets changed nothing because the field was already the default.
+fn text_channels_reset_summary(
+    before: &CreatorChannel,
+    after: &CreatorChannel,
+    resets: TextChannelsResets,
+) -> String {
+    let channel_id = after.channel_id;
+    let name = after
+        .text_channel_name
+        .as_deref()
+        .unwrap_or(DEFAULT_TEXT_CHANNEL_NAME);
+    let viewers = match after.text_viewer_role_id {
+        None => "occupants and admins".to_owned(),
+        Some(role) if role == after.guild_id => "everyone".to_owned(),
+        Some(role) => format!("occupants, admins and <@&{role}>"),
+    };
+    let mut text = if after.text_channels {
+        format!(
+            "Saved. Companion text channels are on for <#{channel_id}>: named `{name}`, visible to {viewers}."
+        )
+    } else {
+        format!(
+            "Saved. Companion text channels are off for <#{channel_id}> and stay off. When turned on they are named `{name}`, visible to {viewers}."
+        )
+    };
+    for (requested, was_default, label) in [
+        (resets.name, before.text_channel_name.is_none(), "name"),
+        (
+            resets.viewer_role,
+            before.text_viewer_role_id.is_none(),
+            "viewer role",
+        ),
+    ] {
+        if requested && was_default {
+            text.push_str(&format!(" The {label} was already the default: no change."));
+        }
+    }
+    text.push_str(
+        " Applies to future companions created from now on; existing companion channels keep their creation-time name and access.",
+    );
+    text
+}
+
 fn position_summary(creator: &CreatorChannel) -> String {
     let channel_id = creator.channel_id;
     let side = match creator.position {
@@ -11727,7 +11882,7 @@ fn setup_shape_correction(command: &str, field: &str) -> String {
     let usage = match command {
         "create" => "name: lobby",
         "textchannels" => {
-            "channel: #voice-creator enabled: true name: voice-chat viewer-role: @role"
+            "channel: #voice-creator enabled: true name: voice-chat viewer-role: @role\nor reset-name: true reset-viewer-role: true"
         }
         "position" => "channel: #voice-creator position: below first-number: 5",
         "group" => "channel: #voice-creator enabled: true",
@@ -11738,6 +11893,12 @@ fn setup_shape_correction(command: &str, field: &str) -> String {
         "alwaysprivate" => "channel: #voice-creator enabled: true",
         _ => "channel: #voice-creator",
     };
+    if field == UNRECOGNISED_OPTION {
+        return format!(
+            "That `/{command}` call has an option I don't recognise. Nothing was changed. \
+             Try:\n`/{command} {usage}`"
+        );
+    }
     format!(
         "That `/{command}` call has a problem with its `{field}` option: send it exactly once, \
          with the right type. Nothing was changed. Try:\n`/{command} {usage}`"
@@ -11943,6 +12104,37 @@ pub fn plan_import_confirm(
     plan_reviewable_import(current, remaining, &diff)
 }
 
+/// The access controls a confirmed import saved, in the gate's own shape:
+/// `settings.creation_enabled` is the creation switch,
+/// `settings.command_role_id` the guild-wide required role, and
+/// `settings.command_roles` the per-command restrictions (one store:
+/// `voice_access_controls`). `None` when a role ID does not parse, which
+/// a validated candidate never carries.
+fn import_access_controls(config: &VoiceConfiguration) -> Option<AccessControls> {
+    let settings = &config.settings;
+    let required_role = settings
+        .command_role_id
+        .as_deref()
+        .map(str::parse::<Snowflake>)
+        .transpose()
+        .ok()?;
+    let mut command_roles = BTreeMap::new();
+    for restriction in &settings.command_roles {
+        let roles = restriction
+            .role_ids
+            .iter()
+            .map(|role| role.parse::<Snowflake>())
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        command_roles.insert(restriction.command.clone(), roles);
+    }
+    Some(AccessControls {
+        room_creation_enabled: settings.creation_enabled,
+        required_role,
+        command_roles,
+    })
+}
+
 /// How many creator channels `candidate` adds over `current`.
 fn added_creator_count(current: &VoiceConfiguration, candidate: &VoiceConfiguration) -> usize {
     candidate
@@ -12130,6 +12322,12 @@ pub enum VoiceCommand {
         channel_id: Snowflake,
         request: TextChannelsRequest,
     },
+    /// `/textchannels` with at least one reset control set to true.
+    TextChannelsReset {
+        channel_id: Snowflake,
+        request: TextChannelsRequest,
+        resets: TextChannelsResets,
+    },
     /// V8 per-creator placement: side plus first room number.
     Position {
         channel_id: Snowflake,
@@ -12215,6 +12413,9 @@ pub enum VoiceCommand {
     /// V3 `/name`: the owner's panel to set a custom name or restore the
     /// template name.
     Name,
+    /// `/room-access-inspect [page]`: the owner's read-only list of blocked,
+    /// granted and pending members for the room they are in.
+    RoomAccessInspect(PageArg),
 }
 
 /// One `/logging` sub-command. `Invalid` is a malformed or unknown shape; it
@@ -12313,6 +12514,8 @@ fn setup_shape_fields(command: &str) -> Option<&'static [(&'static str, SetupOpt
             ("enabled", SetupOptionKind::Boolean),
             ("name", SetupOptionKind::String),
             ("viewer-role", SetupOptionKind::Role),
+            ("reset-name", SetupOptionKind::Boolean),
+            ("reset-viewer-role", SetupOptionKind::Boolean),
         ]),
         "position" => Some(&[
             ("channel", SetupOptionKind::Channel),
@@ -12340,6 +12543,9 @@ fn setup_shape_fields(command: &str) -> Option<&'static [(&'static str, SetupOpt
     }
 }
 
+/// Pseudo field [`setup_shape_refusal`] reports for an unrecognised option.
+const UNRECOGNISED_OPTION: &str = "unrecognised";
+
 /// The one registration-required option of a strict-shape command:
 /// `/textchannels` requires `channel`; its other options stay optional so
 /// omission keeps the stored value.
@@ -12363,6 +12569,12 @@ fn setup_shape_refusal(command: &str, options: &[CommandDataOption]) -> Option<&
     for option in options {
         let Some(&(name, kind)) = fields.iter().find(|field| option.name.as_str() == field.0)
         else {
+            // `/textchannels` carries clearing flags: an unrecognised boolean
+            // may be a mistyped reset or toggle, so refuse instead of saving
+            // without it. Other unknown names stay ignored.
+            if command == "textchannels" && matches!(option.value, CommandOptionValue::Boolean(_)) {
+                return Some(UNRECOGNISED_OPTION);
+            }
             continue;
         };
         if seen.contains(&name) || !kind.matches(&option.value) {
@@ -12469,9 +12681,14 @@ fn parse_voice_command_with_registry(
                 name: None,
                 viewer_role: None,
             };
+            let mut resets = TextChannelsResets::default();
             for option in &command.options {
                 match (option.name.as_str(), &option.value) {
                     ("channel", CommandOptionValue::Channel(id)) => channel_id = id.get(),
+                    ("reset-name", CommandOptionValue::Boolean(value)) => resets.name = *value,
+                    ("reset-viewer-role", CommandOptionValue::Boolean(value)) => {
+                        resets.viewer_role = *value;
+                    }
                     ("enabled", CommandOptionValue::Boolean(value)) => {
                         request.enabled = Some(*value);
                     }
@@ -12483,6 +12700,13 @@ fn parse_voice_command_with_registry(
                     }
                     _ => {}
                 }
+            }
+            if resets.any() {
+                return Some(VoiceCommand::TextChannelsReset {
+                    channel_id,
+                    request,
+                    resets,
+                });
             }
             Some(VoiceCommand::TextChannels {
                 channel_id,
@@ -12676,6 +12900,9 @@ fn parse_voice_command_with_registry(
         ))),
         "unlimit" => Some(VoiceCommand::Unlimit),
         "name" => Some(VoiceCommand::Name),
+        "room-access-inspect" => Some(VoiceCommand::RoomAccessInspect(decode_page(
+            &command.options,
+        ))),
         _ => None,
     }
 }
@@ -13103,7 +13330,7 @@ impl VoiceCommand {
             Self::Ping => "ping",
             Self::Invite => "invite",
             Self::MyRoom => "myroom",
-            Self::TextChannels { .. } => "textchannels",
+            Self::TextChannels { .. } | Self::TextChannelsReset { .. } => "textchannels",
             Self::Position { .. } => "position",
             Self::Group { .. } => "group",
             Self::InheritPermissions { .. } => "inheritpermissions",
@@ -13124,6 +13351,7 @@ impl VoiceCommand {
             Self::Limit(_) => "limit",
             Self::Unlimit => "unlimit",
             Self::Name => "name",
+            Self::RoomAccessInspect(_) => "room-access-inspect",
         }
     }
 }
@@ -13387,6 +13615,20 @@ pub fn ephemeral_response(content: &str) -> InteractionResponse {
             ..Default::default()
         }),
     }
+}
+
+/// [`ephemeral_response`] that pings nobody, for receipts that print role mentions.
+fn ephemeral_no_mentions_response(content: &str) -> InteractionResponse {
+    let mut response = ephemeral_response(content);
+    if let Some(data) = response.data.as_mut() {
+        data.allowed_mentions = Some(AllowedMentions {
+            parse: Vec::new(),
+            users: Vec::new(),
+            roles: Vec::new(),
+            replied_user: false,
+        });
+    }
+    response
 }
 
 /// Live worker snapshot for `/setup`: room count, recent failure lines and
@@ -13786,7 +14028,8 @@ fn access_unrestrict_ack(command: &str) -> String {
 
 /// Apply one `/access` action: read, change, validate, save, then hand the
 /// saved controls to `on_saved` (the live actor). A failed read or write
-/// changes nothing and says so.
+/// changes nothing and says so; so does a save that finds the controls
+/// changed since the read (a confirmed import), instead of reverting it.
 async fn execute_access<S: RoomPersistence>(
     store: &S,
     guild_id: Snowflake,
@@ -13805,7 +14048,7 @@ async fn execute_access<S: RoomPersistence>(
     if show_page_invalid {
         return access_page_refusal();
     }
-    let mut controls = match store.access_controls(guild_id).await {
+    let read = match store.access_controls(guild_id).await {
         Ok(controls) => controls,
         Err(error) => {
             log_admin_store_failure("access_read", guild_id, error);
@@ -13813,6 +14056,7 @@ async fn execute_access<S: RoomPersistence>(
                 .to_owned();
         }
     };
+    let mut controls = read.clone();
     let ack = match action {
         AccessAction::Show { page } => {
             let Some(number) = page.number() else {
@@ -13861,10 +14105,15 @@ async fn execute_access<S: RoomPersistence>(
     if validate_access_controls(&controls).is_err() {
         return "Those settings are not valid, so nothing was changed.".to_owned();
     }
-    match store.save_access_controls(guild_id, &controls).await {
+    match store.save_access_controls(guild_id, &read, &controls).await {
         Ok(()) => {
             on_saved(controls);
             ack
+        }
+        Err(StoreError::Conflict) => {
+            "The voice-room settings changed while this was saving (an import was confirmed). \
+             Nothing was changed; check /access show and try again."
+                .to_owned()
         }
         Err(error) => {
             log_admin_store_failure("access_save", guild_id, error);
@@ -14348,13 +14597,23 @@ where
             reply(ephemeral_response(&text)).await;
             true
         }
-        VoiceCommand::TextChannels {
-            channel_id,
-            request,
-        } => {
+        command @ (VoiceCommand::TextChannels { .. } | VoiceCommand::TextChannelsReset { .. }) => {
+            let (channel_id, request, resets) = match command {
+                VoiceCommand::TextChannels {
+                    channel_id,
+                    request,
+                } => (channel_id, request, TextChannelsResets::default()),
+                VoiceCommand::TextChannelsReset {
+                    channel_id,
+                    request,
+                    resets,
+                } => (channel_id, request, resets),
+                // Cannot happen: the arm only matches the two variants above.
+                _ => return false,
+            };
             let permissions = runtime.guild_permissions(interaction);
             if !may_create(permissions) {
-                reply(ephemeral_response(
+                reply(ephemeral_no_mentions_response(
                     "You need Manage Channels to use /textchannels.",
                 ))
                 .await;
@@ -14364,19 +14623,25 @@ where
             let text = match store.creator_for(guild_id, channel_id).await {
                 Err(error) => format!("Could not read the creator channel ({error}). Try again."),
                 // Channel alone reads back the saved settings; nothing is saved.
+                // A reset control always takes the update path, even when every
+                // replacement field is omitted.
                 Ok(Some(creator))
                     if request.enabled.is_none()
                         && request.name.is_none()
-                        && request.viewer_role.is_none() =>
+                        && request.viewer_role.is_none()
+                        && !resets.any() =>
                 {
                     text_channels_summary(&creator)
                 }
-                Ok(creator) => match decide_text_channels(creator, &request) {
+                Ok(creator) => match decide_text_channels_with_resets(creator.clone(), &request, resets) {
                     TextChannelsPlan::Refuse { message } => message,
-                    TextChannelsPlan::Update(creator) => match store.add_creator(&creator).await {
+                    TextChannelsPlan::Update(updated) => match store.add_creator(&updated).await {
                         Ok(()) => {
-                            runtime.creator_updated(&creator);
-                            text_channels_summary(&creator)
+                            runtime.creator_updated(&updated);
+                            match creator.as_ref().filter(|_| resets.any()) {
+                                Some(before) => text_channels_reset_summary(before, &updated, resets),
+                                None => text_channels_summary(&updated),
+                            }
                         }
                         Err(StoreError::CredentialRefused) => "Voice rooms are paused: the database refused the bot credential. Tell an admin to fix it, then restart the bot.".to_owned(),
                         Err(error) => {
@@ -14385,7 +14650,7 @@ where
                     },
                 },
             };
-            reply(ephemeral_response(&text)).await;
+            reply(ephemeral_no_mentions_response(&text)).await;
             true
         }
         VoiceCommand::Position {
@@ -14718,6 +14983,27 @@ where
             reply(ephemeral_response(&text)).await;
             true
         }
+        VoiceCommand::RoomAccessInspect(page) => {
+            let Some(actor_id) = invoker_member_id(interaction) else {
+                reply(ephemeral_response(
+                    "I couldn't tell who invoked /room-access-inspect — try again.",
+                ))
+                .await;
+                return true;
+            };
+            let text = runtime
+                .run_room_access(guild_id, actor_id, member.is_admin, page)
+                .await
+                .unwrap_or_else(|| {
+                    if runtime.has_actor(guild_id) {
+                        WORKER_LOST_REPLY.to_owned()
+                    } else {
+                        "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                    }
+                });
+            reply(ephemeral_response(&text)).await;
+            true
+        }
         VoiceCommand::Export => {
             let Some(inventory) = inventory else {
                 reply(ephemeral_response(
@@ -14732,7 +15018,7 @@ where
                 return true;
             }
             let (store, _) = runtime.make_pair();
-            let config = match store.config_snapshot(guild_id).await {
+            let mut config = match store.config_snapshot(guild_id).await {
                 Ok(config) => config,
                 Err(error) => {
                     log_admin_store_failure("export_read", guild_id, error);
@@ -14743,11 +15029,20 @@ where
                     return true;
                 }
             };
+            let dropped = drop_deleted_command_roles(&mut config, inventory, interaction.id.get());
+            let dropped_note = if dropped == 0 {
+                String::new()
+            } else {
+                format!(
+                    " Left out {dropped} deleted role(s) from /access command restrictions; \
+                     the restrictions still apply."
+                )
+            };
             match export_configuration(&config, inventory) {
                 Ok(bytes) => {
                     reply(export_file_response(
                         &format!(
-                            "Voice configuration for this server (v{}). Re-import it with /import.",
+                            "Voice configuration for this server (v{}). Re-import it with /import.{dropped_note}",
                             VOICE_CONFIG_VERSION
                         ),
                         export_filename(guild_id),
@@ -14970,6 +15265,10 @@ where
         .await;
         return true;
     };
+    // Same lock as `/access`: import writes the access controls
+    // `/access` read-modify-writes, and the store's advisory lock only
+    // serializes imports. Held from the re-read through the apply.
+    let _serialized = runtime.access_lock.lock().await;
     let current = match store.config_snapshot(guild_id).await {
         Ok(config) => config,
         Err(_) => {
@@ -15014,6 +15313,7 @@ where
             match store.config_apply(guild_id, &candidate, &current).await {
                 Ok(()) => {
                     runtime.name_settings_updated(guild_id, &candidate);
+                    runtime.access_imported(guild_id, &candidate);
                     reply(ephemeral_response(&message)).await;
                 }
                 Err(StoreError::Conflict) => {
@@ -15059,6 +15359,7 @@ where
                                     match store.config_apply(guild_id, &retry, &fresh).await {
                                         Ok(()) => {
                                             runtime.name_settings_updated(guild_id, &retry);
+                                            runtime.access_imported(guild_id, &retry);
                                             reply(ephemeral_response(&fresh_message)).await;
                                         }
                                         Err(_) => {
@@ -15641,6 +15942,7 @@ mod presence;
 pub use limit::{LimitArg, LimitCommand};
 mod private_runtime;
 pub use private_runtime::PrivacyCommand;
+mod room_access;
 
 mod join_requests;
 use join_requests::{

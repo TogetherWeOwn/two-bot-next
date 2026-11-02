@@ -57,7 +57,7 @@ use std::sync::OnceLock;
 
 use super::command_permissions::command_permission;
 use super::commands::{
-    core_commands, merge_commands, CommandDefinition, CustomCommand, RegistryError,
+    core_commands, merge_registry, CommandDefinition, CustomCommand, RegistryError,
 };
 use super::feature_commands::{
     announcement_commands, automation_commands, scorecard_attendance_command, FeatureGates,
@@ -117,6 +117,13 @@ pub const MODERATION_DISABLED_REPLY: &str = "Moderation is not enabled on this s
 /// Scorecard gate: env-gated, not a Discord role — say who enables it.
 pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
 
+/// Slash names routed while dark (unpublished until their slice lands).
+/// Dispatch shadows each name (see `route_slash`), so a custom row under
+/// one could publish yet never execute. [`crate::custom_commands::reserved_command_names`]
+/// mirrors this set on the write path (`/command`, imports), so writes
+/// refuse the names instead of accepting rows that can never publish.
+pub const DARK_RESERVED_NAMES: &[&str] = &["lockdown-preview"];
+
 // --- handler identity ----------------------------------------------------------
 
 /// Which feature slice owns a routed slash command (parity §1 row).
@@ -152,6 +159,7 @@ pub enum HandlerId {
     Moderation(ModerationAction),
     PurgePreview,
     ChannelInspect,
+    LockdownPreview,
     TempbanList,
     ModerationRecent,
 }
@@ -293,6 +301,7 @@ pub enum RouterRefusal {
     ModerationPermission(ModerationAction),
     PurgePreviewPermission,
     ChannelInspectPermission,
+    LockdownPreviewPermission,
     TempbanListPermission,
     ModerationRecentPermission,
 }
@@ -312,6 +321,7 @@ impl RouterRefusal {
             Self::GuildRestricted => GUILD_RESTRICTED_REPLY.to_owned(),
             Self::PurgePreviewPermission => "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it.".to_owned(),
             Self::ChannelInspectPermission => "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it.".to_owned(),
+            Self::LockdownPreviewPermission => "You need the Manage Channels permission to use /lockdown-preview. Ask a server moderator or admin to grant it.".to_owned(),
             Self::TempbanListPermission => "You need the Ban Members permission to use /tempban-list. Ask a server moderator or admin to grant it.".to_owned(),
             Self::ModerationRecentPermission => "You need the Moderate Members permission to use /moderation-recent. Ask a server moderator or admin to grant it.".to_owned(),
             // Names the Discord permission (Ban Members, …) and the slash
@@ -423,6 +433,7 @@ impl InteractionRouter {
             }
             register(HandlerId::PurgePreview);
             register(HandlerId::ChannelInspect);
+            register(HandlerId::LockdownPreview);
             register(HandlerId::ModerationRecent);
         }
         if gates.automations {
@@ -603,6 +614,12 @@ impl InteractionRouter {
             "channel-inspect" => Some((
                 HandlerId::ChannelInspect,
                 RouterRefusal::ChannelInspectPermission,
+            )),
+            // Dark until the publication slice: routed and adjudicated like
+            // the other channel reads, but with no published definition.
+            "lockdown-preview" => Some((
+                HandlerId::LockdownPreview,
+                RouterRefusal::LockdownPreviewPermission,
             )),
             "moderation-recent" => Some((
                 HandlerId::ModerationRecent,
@@ -909,6 +926,10 @@ impl InteractionRouter {
             reserved.extend(voice_command_names().iter().cloned());
         }
         reserved.insert("templateassistant".to_owned());
+        // Dark routed names (see [`DARK_RESERVED_NAMES`]): dispatch shadows
+        // each one until its publish slice lands, so a custom row under it
+        // could publish yet never execute.
+        reserved.extend(DARK_RESERVED_NAMES.iter().map(|name| (*name).to_owned()));
         reserved
     }
 
@@ -917,7 +938,7 @@ impl InteractionRouter {
     /// announcement, moderation, then the voice set — then DB custom
     /// commands). `/templateassistant` stays unpublished until its slice
     /// lands with a handler: no published command may lack one. First-wins
-    /// dedupe and the 100-command ceiling come from `merge_commands`; voice
+    /// dedupe and the 100-command ceiling come from `merge_registry`; voice
     /// `kick` loses to moderation `/kick` there.
     ///
     /// Two publish/routing agreements keep a published command executable:
@@ -954,7 +975,7 @@ impl InteractionRouter {
         custom: &[CustomCommand],
     ) -> Result<(Vec<CommandDefinition>, Option<&'static str>), RegistryError> {
         match self.build_publish_set(custom, None) {
-            Err(RegistryError::TotalLimit(_)) => self
+            Err(RegistryError::BuiltinLimit(_)) => self
                 .build_publish_set(custom, Some(OPTIONAL_CAPACITY_BUILTIN))
                 .map(|defs| (defs, Some(OPTIONAL_CAPACITY_BUILTIN))),
             result => result.map(|defs| (defs, None)),
@@ -1004,7 +1025,20 @@ impl InteractionRouter {
         } else {
             Vec::new()
         };
-        merge_commands(&extra, &visible)
+        let merged = merge_registry(&extra, &visible)?;
+        if !merged.withheld.is_empty() {
+            // Operator signal for a guild whose stored custom commands no
+            // longer fit beside the builtins (for example after a release adds
+            // one). Names are validated slash names, never member content.
+            tracing::warn!(
+                target: "two_bot_core::command_registry",
+                guild_id = self.gates.configured_guild.map(|id| id.to_string()),
+                withheld_count = merged.withheld.len(),
+                withheld = ?merged.withheld,
+                "custom_commands_withheld_over_guild_limit"
+            );
+        }
+        Ok(merged.commands)
     }
 }
 
@@ -1084,6 +1118,7 @@ mod tests {
             ("unlock", HandlerId::Moderation(ModerationAction::Unlock)),
             ("purge-preview", HandlerId::PurgePreview),
             ("channel-inspect", HandlerId::ChannelInspect),
+            ("lockdown-preview", HandlerId::LockdownPreview),
             ("moderation-recent", HandlerId::ModerationRecent),
             ("attendance", HandlerId::ScorecardAttendance),
             ("command", HandlerId::AutomationAdmin),
@@ -1111,7 +1146,7 @@ mod tests {
             ("feed-list", HandlerId::FeedList),
             ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 45, "all 45 handler-owned builtins covered");
+        assert_eq!(cases.len(), 46, "all 46 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1294,6 +1329,8 @@ mod tests {
              "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it."),
             ("channel-inspect", 16, HandlerId::ChannelInspect, RouterRefusal::ChannelInspectPermission,
              "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it."),
+            ("lockdown-preview", 16, HandlerId::LockdownPreview, RouterRefusal::LockdownPreviewPermission,
+             "You need the Manage Channels permission to use /lockdown-preview. Ask a server moderator or admin to grant it."),
             ("moderation-recent", 1_099_511_627_776, HandlerId::ModerationRecent, RouterRefusal::ModerationRecentPermission,
              "You need the Moderate Members permission to use /moderation-recent. Ask a server moderator or admin to grant it."),
         ] {
@@ -2055,7 +2092,7 @@ mod tests {
 
     /// The 23 voice names in published order (pinned independently in
     /// `voice_rooms::tests::voice_command_shapes_and_gates`).
-    const VOICE_NAMES: [&str; 23] = [
+    const VOICE_NAMES: [&str; 24] = [
         "create",
         "setup",
         "ping",
@@ -2079,6 +2116,7 @@ mod tests {
         "limit",
         "unlimit",
         "myroom",
+        "room-access-inspect",
     ];
 
     fn voice_on() -> RouterGates {
@@ -2108,9 +2146,9 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 45 builtins keep their order; the 22 voice names that survive
+        // 45 builtins keep their order; the 23 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 67);
+        assert_eq!(on.len(), 68);
         assert_eq!(on_names[..45], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
@@ -2179,12 +2217,12 @@ mod tests {
             );
         }
         // Both gates on is the full voice set without the assistant: 45
-        // builtins plus the 22 surviving voice names.
+        // builtins plus the 23 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 67);
+        assert_eq!(both.len(), 68);
     }
 
     #[test]

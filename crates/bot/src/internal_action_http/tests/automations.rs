@@ -4,6 +4,7 @@
 //! replay without a second apply. Only guarded TestDatabase pools; never
 //! staging or production.
 use super::*;
+use two_bot_core::custom_commands::max_custom_commands;
 
 const AUTOMATIONS_ACTOR: &str = "111111111111111111";
 
@@ -103,33 +104,44 @@ async fn capacity_command_rows(pool: &sqlx::PgPool) -> Vec<Value> {
 }
 
 #[tokio::test]
-async fn import_33_row_backup_updates_and_replays_but_34_rows_never_write() {
-    // Break caught: internal-action/replay callers retain a 32-entry budget
-    // after real publication still fits 67 builtins +33 noncolliding rows.
+async fn import_at_budget_backup_updates_and_replays_but_over_budget_never_writes() {
+    // The import planner budget follows the live reserved set. A
+    // budget-sized backup imports, bulk-updates and replays idempotently;
+    // one row more never writes.
+    let budget = max_custom_commands(reserved_command_names().len());
     let db = database()
         .await
         .expect("explicit disposable test bootstrap required");
     let _flag = AUTOMATIONS_FLAG_LOCK.lock().await;
     set_automations_flags(true, true);
     let app = automations_app(db.pool().clone());
-    let raw = capacity_import_payload(33, false, false);
+    let raw = capacity_import_payload(budget, false, false);
     let (first_status, first_headers, first) =
-        answer(app.clone(), signed(&raw, "old", "backup33-initial")).await;
+        answer(app.clone(), signed(&raw, "old", "backup-budget-initial")).await;
     let initial_rows = capacity_command_rows(db.pool()).await;
-    let update = capacity_import_payload(33, true, true);
+    let update = capacity_import_payload(budget, true, true);
     let (update_status, _, updated) =
-        answer(app.clone(), signed(&update, "old", "backup33-update")).await;
+        answer(app.clone(), signed(&update, "old", "backup-budget-update")).await;
     let updated_rows = capacity_command_rows(db.pool()).await;
     let audit_before_replay = audit_count(db.pool()).await;
     let (replay_status, replay_headers, replay) =
-        answer(app.clone(), signed(&raw, "new", "backup33-initial")).await;
+        answer(app.clone(), signed(&raw, "new", "backup-budget-initial")).await;
     let replay_rows = capacity_command_rows(db.pool()).await;
     let audit_after_replay = audit_count(db.pool()).await;
-    let overflow = capacity_import_payload(34, true, true);
+    let overflow = capacity_import_payload(budget + 1, true, true);
     let (overflow_status, _, refused) =
-        answer(app, signed(&overflow, "old", "backup34-overflow")).await;
+        answer(app, signed(&overflow, "old", "backup-over-budget")).await;
     let after_overflow = capacity_command_rows(db.pool()).await;
     let audit_after_overflow = audit_count(db.pool()).await;
+    // The over-budget document fits the parser envelope, so planning refuses
+    // it and mints the same audited rejection the service owes every refused
+    // write; nothing else is applied.
+    let rejection: (String, Option<String>) =
+        sqlx::query_as("SELECT outcome, reason FROM automation_audit_log WHERE id = $1")
+            .bind("internal:automations.import:backup-over-budget")
+            .fetch_one(db.pool())
+            .await
+            .expect("rejection audit");
     set_automations_flags(false, false);
     db.close()
         .await
@@ -138,25 +150,25 @@ async fn import_33_row_backup_updates_and_replays_but_34_rows_never_write() {
     assert_eq!(
         first_status,
         StatusCode::OK,
-        "33-row backup is legal: {first}"
+        "budget-sized backup is legal: {first}"
     );
     assert!(!first_headers.contains_key("idempotent-replay"));
-    assert_eq!(first["result"]["imported"], 33);
-    assert_eq!(initial_rows.len(), 33);
+    assert_eq!(first["result"]["imported"], json!(budget));
+    assert_eq!(initial_rows.len(), budget);
     assert_eq!(
         update_status,
         StatusCode::OK,
         "no-growth bulk update: {updated}"
     );
-    assert_eq!(updated["result"]["imported"], 33);
-    assert_eq!(updated_rows.len(), 33);
+    assert_eq!(updated["result"]["imported"], json!(budget));
+    assert_eq!(updated_rows.len(), budget);
     assert!(updated_rows
         .iter()
         .all(|row| row["template"].as_str().unwrap().starts_with("Updated ")));
     assert_eq!(
         replay_status,
         StatusCode::OK,
-        "replay still parses 33: {replay}"
+        "replay still parses the budget: {replay}"
     );
     assert_eq!(
         replay_headers
@@ -179,7 +191,7 @@ async fn import_33_row_backup_updates_and_replays_but_34_rows_never_write() {
     assert_eq!(
         overflow_status,
         StatusCode::BAD_REQUEST,
-        "34 rows exceed the real bound: {refused}"
+        "over budget exceeds the real bound: {refused}"
     );
     assert_eq!(refused["error"]["code"], "malformed");
     assert_eq!(
@@ -187,8 +199,13 @@ async fn import_33_row_backup_updates_and_replays_but_34_rows_never_write() {
         "overflow writes no rows or timestamps"
     );
     assert_eq!(
-        audit_after_overflow, audit_after_replay,
-        "parser refusal never applies"
+        audit_after_overflow,
+        audit_after_replay + 1,
+        "one rejection audit, no apply"
+    );
+    assert_eq!(
+        rejection,
+        ("rejected".to_owned(), Some("over_capacity".to_owned()))
     );
 }
 

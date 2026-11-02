@@ -19,11 +19,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use super::custom_commands::reserved_command_names;
+use super::commands::GUILD_COMMAND_LIMIT;
 use super::custom_commands::{
-    error_code, max_custom_commands, published_builtin_count, validate_put_input, CommandError,
-    PutCommandInput, StoredCommand,
+    error_code, max_custom_commands, validate_put_input, CommandError, PutCommandInput,
+    StoredCommand,
 };
 use super::mee6::{parse_mee6_entry, translate_export, Mee6CommandInput};
 
@@ -248,11 +247,14 @@ pub fn parse_import_document(
     }
 }
 
-/// Maximum import entries for this guild: definitions past the remaining
-/// command budget are refused before planning.
+/// Maximum import entries: a document longer than the guild command ceiling
+/// is refused before planning. The parser cannot see stored rows, so the
+/// per-guild budget is left to [`diff_import`]: deriving this bound from the
+/// reserved set would refuse an unchanged re-export of a guild that saved the
+/// old maximum before a release added a builtin.
 #[must_use]
 pub fn max_import_entries() -> usize {
-    max_custom_commands(published_builtin_count())
+    GUILD_COMMAND_LIMIT
 }
 
 /// One dry-run rejection: the definition plus its stable reason code
@@ -316,12 +318,15 @@ pub fn diff_import(
             }),
         }
     }
-    let max = max_import_entries();
+    let max = max_custom_commands(builtins.len());
     let mut union: HashSet<&str> = existing.iter().map(|row| row.name.as_str()).collect();
+    let stored = union.len();
     for (_, entry) in &valid {
         union.insert(entry.name.as_str());
     }
-    if union.len() > max {
+    // No-growth path, like a same-name `/command` update: rows saved under an
+    // older, larger budget stay re-importable as long as the import adds none.
+    if union.len() > max && union.len() > stored {
         return Err(CommandError::OverCapacity(max));
     }
     let mut by_name: HashMap<&str, PutCommandInput> = existing
@@ -410,6 +415,7 @@ pub struct ImportOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custom_commands::reserved_command_names;
     use serde_json::json;
 
     fn builtins() -> HashSet<String> {
@@ -682,13 +688,8 @@ mod tests {
     #[test]
     fn union_capacity_fails_the_whole_diff() {
         let builtins = builtins();
-        // 67 published definitions leave 33 slots. The held assistant name
-        // remains reserved, but it must not reduce a legal catalog to 32.
-        let max = 33;
-        assert_eq!(crate::custom_commands::published_builtin_count(), 67);
-        assert_eq!(max_custom_commands(67), max);
-        assert_eq!(max_import_entries(), max);
-        let desired: Vec<PutCommandInput> = (0..max)
+        let max = max_custom_commands(builtins.len());
+        let desired: Vec<PutCommandInput> = (0..=max)
             .map(|i| PutCommandInput {
                 name: format!("fresh-{i}"),
                 description: "Fresh".to_owned(),
@@ -696,53 +697,56 @@ mod tests {
                 text_trigger: None,
             })
             .collect();
-        let mut parsed = ParsedImport {
+        let parsed = ParsedImport {
             entries: desired,
             translation_conflicts: Vec::new(),
             invalid_entries: 0,
             overwrite: true,
         };
-        let legal = diff_import(&[], &parsed, &builtins, true).expect("all 33 rows fit");
-        assert_eq!(legal.to_create.len(), 33);
-        assert!(legal.to_update.is_empty());
-        assert!(legal.rejected.is_empty());
-        let existing: Vec<_> = parsed
-            .entries
-            .iter()
-            .map(|input| {
-                let mut row = stored(&input.name, &input.template, input.text_trigger.as_deref());
-                row.description = input.description.clone();
-                row
-            })
-            .collect();
-        let same = diff_import(&existing, &parsed, &builtins, true).expect("no-growth convergence");
-        assert_eq!(same.unchanged.len(), 33);
-        assert!(same.to_create.is_empty());
-        assert!(same.to_update.is_empty());
-        assert!(same.rejected.is_empty());
-        for input in &mut parsed.entries {
-            input.template = "updated".to_owned();
-        }
-        let updates =
-            diff_import(&existing, &parsed, &builtins, true).expect("33 no-growth updates");
-        assert_eq!(updates.to_update.len(), 33);
-        assert!(updates.to_create.is_empty());
-        assert!(updates.rejected.is_empty());
-        parsed.entries.push(PutCommandInput {
-            name: "fresh-overflow".to_owned(),
-            description: "One too many".to_owned(),
-            template: "t".to_owned(),
-            text_trigger: None,
-        });
-        assert_eq!(parsed.entries.len(), 34);
         assert_eq!(
             diff_import(&[], &parsed, &builtins, true),
-            Err(CommandError::OverCapacity(33))
+            Err(CommandError::OverCapacity(max))
         );
+    }
+
+    #[test]
+    fn rows_saved_under_an_older_budget_stay_reimportable() {
+        // The guild saved one more row than today's budget allows, as if a
+        // release added a builtin after it filled the old maximum.
+        let builtins = builtins();
+        let max = max_custom_commands(builtins.len());
+        let existing: Vec<StoredCommand> = (0..=max)
+            .map(|i| stored(&format!("saved-{i:02}"), "t", None))
+            .collect();
+        let export = export_document(&existing);
+        let wire = serde_json::to_value(&export).expect("export serializes");
+        let parsed = parse_import_document(&wire, max_import_entries())
+            .expect("an unchanged export of a stranded guild still parses");
+        let diff = diff_import(&existing, &parsed, &builtins, false).expect("no growth");
+        assert_eq!(diff.unchanged.len(), max + 1);
+        assert!(diff.to_create.is_empty() && diff.rejected.is_empty());
+
+        // A one-entry update of a saved row also adds nothing.
+        let one = ParsedImport {
+            entries: vec![PutCommandInput {
+                name: "saved-00".to_owned(),
+                description: "Edited".to_owned(),
+                template: "t".to_owned(),
+                text_trigger: None,
+            }],
+            translation_conflicts: Vec::new(),
+            invalid_entries: 0,
+            overwrite: true,
+        };
+        let diff = diff_import(&existing, &one, &builtins, true).expect("update fits");
+        assert_eq!(diff.to_update, ["saved-00"]);
+
+        // Any new name still refuses while the guild is over the budget.
+        let mut grow = one.clone();
+        grow.entries[0].name = "fresh".to_owned();
         assert_eq!(
-            diff_import(&existing, &parsed, &builtins, true),
-            Err(CommandError::OverCapacity(33)),
-            "one new row refuses the whole diff, including all 33 updates"
+            diff_import(&existing, &grow, &builtins, true),
+            Err(CommandError::OverCapacity(max))
         );
     }
 }

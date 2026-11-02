@@ -1,11 +1,13 @@
 # Existing event reminders: no-new-preference baseline
 
-Status: **revised proposal, design only**. Revised 2026-10-24; review by
-**2026-10-31**. Recommendation: stop the new reminder-preference proposal and
-retain the existing reminder behavior. No runtime, schema, command, endpoint,
-permission, configuration or retention-policy change. Merge records this analysis,
-not design acceptance, host alignment, activation or proof of production behavior.
-This file is the sole editable spec; disposition records bind its commit and SHA-256.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: revised
+2026-10-24. Recommendation: stop the new reminder-preference proposal and retain
+the existing reminder behavior. No runtime, schema, command, endpoint,
+permission, configuration or retention-policy change. Merge records this
+analysis, not design acceptance, host alignment, activation or proof of
+production behavior. This file is the sole editable spec; disposition records
+bind its commit and SHA-256.
 
 ## 1. Decision and evidence
 
@@ -203,7 +205,7 @@ No claimed silence benefit may substitute for the shared-channel limitation.
 No implementation or acceptance-test/build subtasks before **new design acceptance
 AND recorded host alignment**, then separate COO admission, test-first execution,
 independent non-author CISO disposition where required, exact-head `pr-lint`,
-`ci-ok`, `gitleaks` and independent Paperclip Review 5/5. The baseline recommends
+`ci-ok`, `gitleaks`, `CodeRabbit` and `Devin Review`. The baseline recommends
 no implementation even if this design record is accepted. Any later feature needs
 a new evidenced design disposition, not automatic continuation of either alternative.
 No live send, preference/DB change, retention-policy change, access grant,

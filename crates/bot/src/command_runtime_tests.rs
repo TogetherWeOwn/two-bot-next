@@ -43,6 +43,8 @@ mod sticky_unsaved_preview_acceptance_tests;
 #[path = "tempban_inventory_acceptance_tests.rs"]
 mod tempban_inventory_acceptance_tests;
 
+#[path = "custom_command_inspect_eligibility_acceptance.rs"]
+mod custom_command_inspect_eligibility_acceptance;
 #[path = "custom_command_list_pages_acceptance.rs"]
 mod custom_command_list_pages_acceptance;
 #[path = "custom_command_toggle_acceptance.rs"]
@@ -2357,7 +2359,7 @@ async fn leveling_interaction_fence_precedes_any_store_read() {
 
 /// The 22 voice names that publish beside the builtins (`kick` is
 /// moderation's under first-wins).
-const VOICE_ONLY_NAMES: [&str; 22] = [
+const VOICE_ONLY_NAMES: [&str; 23] = [
     "create",
     "setup",
     "ping",
@@ -2380,6 +2382,7 @@ const VOICE_ONLY_NAMES: [&str; 22] = [
     "limit",
     "unlimit",
     "myroom",
+    "room-access-inspect",
 ];
 
 #[tokio::test]
@@ -4448,6 +4451,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::FeedInspect,
             HandlerId::PurgePreview,
             HandlerId::ChannelInspect,
+            HandlerId::LockdownPreview,
             HandlerId::TempbanList,
         ];
         ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));

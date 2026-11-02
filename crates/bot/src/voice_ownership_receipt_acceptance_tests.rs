@@ -53,7 +53,7 @@ impl RoomPersistence for ReceiptStore {
         fn custom_names(&self, guild: u64) -> Result<Vec<(u64, String)>, StoreError>;
         fn save_custom_name(&self, guild: u64, channel: u64, name: Option<&str>) -> Result<bool, StoreError>;
         fn access_controls(&self, guild: u64) -> Result<AccessControls, StoreError>;
-        fn save_access_controls(&self, guild: u64, controls: &AccessControls) -> Result<(), StoreError>;
+        fn save_access_controls(&self, guild: u64, expected: &AccessControls, controls: &AccessControls) -> Result<(), StoreError>;
         fn logging_settings(&self, guild: u64) -> Result<LoggingSettings, StoreError>;
         fn save_logging_settings(&self, guild: u64, settings: &LoggingSettings) -> Result<(), StoreError>;
         fn config_snapshot(&self, guild: u64) -> Result<VoiceConfiguration, StoreError>;

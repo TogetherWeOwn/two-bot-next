@@ -90,9 +90,11 @@ use PolicyHook::{
 /// `/welcome-preview` admin preview (parity row 42), staff aggregate
 /// `/game-mix` (43), and feed lifecycle `/feed-pause` (44) and
 /// `/feed-resume` (45), and the staff-only saved-ledger read
-/// `/moderation-recent` (47). Only `/game-mix` admits Administrator
+/// `/moderation-recent` (47), and the Next-only private lockdown preview
+/// `/lockdown-preview` (48, dark until its publication slice).
+/// Only `/game-mix` admits Administrator
 /// alone; legacy masks are unchanged.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 48] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 49] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -151,6 +153,16 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 48] = [
     row(
         36,
         "channel-inspect",
+        BuiltinSlash,
+        PERM_MANAGE_CHANNELS,
+        None,
+    ),
+    // Next-only private lockdown preview (`docs/lockdown-preview-spec.md`).
+    // Dark until the publication slice: adjudicated here so the router can
+    // refuse without `ManageChannels`, but with no published definition.
+    row(
+        48,
+        "lockdown-preview",
         BuiltinSlash,
         PERM_MANAGE_CHANNELS,
         None,

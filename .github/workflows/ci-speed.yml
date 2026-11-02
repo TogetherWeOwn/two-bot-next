@@ -96,10 +96,14 @@ jobs:
               - 'docs/backup.md'
               - 'docs/tickets.md'
               - 'docs/community-jobs.md'
+              - 'docs/custom-commands.md'
+              - 'docs/cutover-migration-ledger.md'
               - 'docs/metrics.md'
+              - 'docs/observability-event-catalog.md'
               - 'docs/startup-diagnostics.md'
               - 'docs/README.md'
               - 'wrangler/wrangler.toml'
+              - 'wrangler/src/container-env.ts'
             worker:
               - 'wrangler/**'
             docs:

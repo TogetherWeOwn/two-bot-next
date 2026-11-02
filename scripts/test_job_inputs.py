@@ -22,6 +22,7 @@ SPEC.loader.exec_module(inputs)
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_YML = ROOT / ".github/workflows/check.yml"
+DOCS_PREFIX = inputs.DOCS_PREFIX
 RUST, WORKER, PARITY = inputs.RUST, inputs.WORKER, inputs.PARITY
 SUPPLY, DOCS = inputs.SUPPLY, inputs.DOCS
 
@@ -434,21 +435,90 @@ class ReaderCoverageTests(unittest.TestCase):
         "docs/runbook.md",
     })
 
+    # Quoted path literals in Rust: bare repo-relative ("docs/x.md",
+    # root.join("wrangler/src/x.ts")), manifest-relative
+    # (.join("../../docs/x.md"), read_manifest_file("../../docs/x.md")) and
+    # format-prefixed ("{}/../../docs/x.md" after CARGO_MANIFEST_DIR).
+    PATH_LITERAL = re.compile(
+        r'"(?:\{\}/)?((?:\.\./)*[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]+)"')
+    INCLUDE_STR = re.compile(r'include_str!\(\s*"([A-Za-z0-9_./-]+)"\s*\)')
+    # Rust-owned roots already select the rust job by prefix.
+    RUST_ROOTS = ("crates/", "src/", "tests/")
+
+    @staticmethod
+    def manifest_dir(source):
+        for parent in source.parents:
+            if (parent / "Cargo.toml").is_file():
+                return parent
+        return ROOT
+
+    @classmethod
+    def rust_content_readers(cls, source, text):
+        """Repo files outside Rust roots that one Rust source names by path.
+
+        include_str! resolves from the source file; every other literal
+        resolves from the crate's CARGO_MANIFEST_DIR and, when it does not
+        climb with ``../``, from the repo root. Outside docs/ only literals
+        that land on an existing repo file count, so prose and identifiers
+        drop out; docs/*.md|json count even when absent, because ignored
+        generated docs (docs/generated/commands.md) do not exist when the
+        selector regressions run.
+        """
+        text = "\n".join(line for line in text.splitlines()
+                         if not line.strip().startswith("//"))
+        candidates = [(source.parent / path).resolve()
+                      for path in cls.INCLUDE_STR.findall(text)]
+        manifest = cls.manifest_dir(source)
+        for literal in cls.PATH_LITERAL.findall(text):
+            candidates.append((manifest / literal).resolve())
+            if not literal.startswith("../"):
+                candidates.append((ROOT / literal).resolve())
+        readers = set()
+        for resolved in candidates:
+            if not resolved.is_relative_to(ROOT):
+                continue
+            relative = resolved.relative_to(ROOT).as_posix()
+            is_doc = relative.startswith(DOCS_PREFIX) and \
+                resolved.suffix in (".md", ".json")
+            if (is_doc or resolved.is_file()) and \
+                    not relative.startswith(cls.RUST_ROOTS):
+                readers.add(relative)
+        return readers
+
+    def test_reader_scan_resolves_relative_literal_shapes(self):
+        source = ROOT / "crates/core/tests/fixture.rs"
+        shapes = {
+            'Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/custom-commands.md")':
+                "docs/custom-commands.md",
+            'read_manifest_file("../../docs/cutover-migration-ledger.md")':
+                "docs/cutover-migration-ledger.md",
+            'root.join("wrangler/src/container-env.ts")':
+                "wrangler/src/container-env.ts",
+            'format!("{}/../../docs/observability-event-catalog.md", dir)':
+                "docs/observability-event-catalog.md",
+            'include_str!("../../../docs/tickets.md")': "docs/tickets.md",
+        }
+        for text, want in shapes.items():
+            with self.subTest(shape=text):
+                self.assertEqual(self.rust_content_readers(source, text), {want})
+                self.assertIn(RUST, inputs.classify(want), want)
+        # Ignored generated docs are absent on CI but stay in the scan.
+        self.assertEqual(
+            self.rust_content_readers(
+                source, '.join("../../docs/generated/not-generated.md")'),
+            {"docs/generated/not-generated.md"})
+        for text in ('"../../wrangler/no-such-file.ts"', '// "docs/README.md"',
+                     '"src/lib.rs"', '"not a path"'):
+            with self.subTest(ignored=text):
+                self.assertEqual(self.rust_content_readers(source, text), set())
+
     def test_rust_content_readers_are_classified_rust(self):
         content_readers = set()
         rust_sources = list((ROOT / "crates").rglob("*.rs")) + (
             [ROOT / "src/lib.rs"] if (ROOT / "src/lib.rs").exists() else [])
         for source in rust_sources:
-            source_text = "\n".join(
-                line for line in source.read_text().splitlines()
-                if not line.strip().startswith("//"))
-            content_readers.update(re.findall(
-                r'"(docs/[A-Za-z0-9_./-]+\.(?:md|json))"', source_text))
-            for include_path in re.findall(
-                    r'include_str!\(\s*"([A-Za-z0-9_./-]+)"\s*\)', source_text):
-                resolved = (source.parent / include_path).resolve()
-                if resolved.is_file() and resolved.is_relative_to(ROOT):
-                    content_readers.add(resolved.relative_to(ROOT).as_posix())
+            content_readers |= self.rust_content_readers(
+                source, source.read_text())
         self.assertTrue(content_readers, "expected Rust content readers")
         for doc in self.EXISTENCE_ONLY_DOCS:
             self.assertIn(doc, content_readers, f"{doc} left Rust sources")

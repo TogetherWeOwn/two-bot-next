@@ -44,6 +44,8 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
 The rulesets on `main` require one PR and squash-only merges, and block deletion
 and force-pushes. `ci-ok`, `gitleaks` and `pr-lint` are required checks on `main`.
 `ci-ok` runs from `check.yml`; the other two run from `supply-chain.yml`.
+The review apps CodeRabbit and Devin Review are required checks too. No approving
+review is required.
 `pr-lint` runs `.github/scripts/pr_standards.py` (tests beside it): it checks
 the title format, the 100-character limit, the trailing period and a non-empty
 body as errors, and the two required template sections (Linked Issues and
@@ -52,6 +54,17 @@ Verification), the advisory title/body remainder and branch names in warn mode
 instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
+
+Who merges (owner decision 2026-10-31): the agent that did the work merges a PR
+once every required check is green and each review finding is fixed or answered
+with evidence. A merge to `main` that touches a path outside the
+`paths-ignore` list in `deploy-staging.yml` starts `deploy-staging`, and
+`deploy-production` then promotes that commit on its own once staging and
+`ci-ok` are green. That merge therefore needs the owner's approval through
+`request_confirmation` on the card first, and the approval covers the automatic
+promotion that follows. A merge that only touches ignored paths (root `*.md`,
+`docs/**` and the rest of that list) starts no deploy and needs no owner
+approval. A manual production dispatch or rollback needs its own approval.
 
 `check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
 finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
@@ -108,25 +121,39 @@ Use an issue form: bug report, feature request, enhancement or documentation
 issue. Blank issues are off. Report a vulnerability privately; see
 [`SECURITY.md`](SECURITY.md).
 
+### Design-only specs
+
+A new design-only spec under `docs/` needs a linked tracking card or issue that
+names the date the owner will decide it. Say so in the PR body. The spec's
+`Status:` line then records the decision: accepted for a milestone, deferred to
+a month or a roadmap, declined (no build), or merged into another spec. A spec
+with no decision stays no-build. Keep a declined spec as the record.
+
 ## Releases
 
-The daily `daily-digest` workflow tags the live production commit `vYYYY.MM.DD`
-when production has moved forward since the last digest, and publishes a GitHub
-Release from Conventional Commit subjects. Deploys never create version tags.
+The daily `daily-digest` workflow tags the live production commit with a
+stable CalVer version `vYYYY.MDD.P` (for example `v2026.1101.0`) when
+production has moved forward since the last digest, and publishes a GitHub
+Release from Conventional Commit subjects. The shared releaser in
+`TogetherWeOwn/.github` (`actions/calver`, `live-digest` policy) cuts it, at
+most once a day, so `P` stays 0. Deploys never create version tags.
 There is no release PR or freeze. One digest tag covers the whole repository,
-not one release per crate. See [`docs/releases.md`](docs/releases.md) for repair
-and dry-run dispatches. Never tag or release by hand.
+not one release per crate. Legacy `vYYYY.MM.DD` and `vX.Y.Z` tags stay as they
+are. See [`docs/releases.md`](docs/releases.md) for repair and dry-run
+dispatches. Never tag or release by hand.
 
 Release notes use the [Common Changelog](https://common-changelog.org/)
 categories, in its order: **Changed** (`perf`, `revert`), **Added** (`feat`),
-**Fixed** (`fix`). `chore`, `docs`, `test`, `ci`, `build`, `refactor` and
-`style` stay out of the notes. Each squash-merged PR title becomes one
+**Fixed** (`fix`, `security`). The digest adapter passes the
+`changelog-sections` from `release-please-config.json` to the shared
+releaser; `chore`, `docs`, `test`, `ci`, `build`, `refactor`, `style` and
+`deps` stay out of the notes. Each squash-merged PR title becomes one
 entry, so write it for a reader of the release notes: imperative mood, one
 user-facing change.
 
-Release tags use UTC calendar dates. Cargo package versions stay at `0.4.0`;
-`feat!` and `BREAKING CHANGE` still appear in the breaking-changes notes but
-no longer choose a SemVer bump.
+Release tags use the UTC date the release was planned. Cargo package versions
+stay at `0.4.0`; `feat!` and `BREAKING CHANGE` still appear in the
+breaking-changes notes but never choose a version bump.
 
 ## Local development
 
@@ -141,8 +168,9 @@ cargo test --workspace --locked
 
 Generate `docs/generated/commands.md` before compiling workspace tests or
 all-targets Clippy: one test embeds the generated Markdown at compile time.
-On the persistent controller use `python3 scripts/generate_command_reference.py --controller`,
-which builds only the generator through bounded Cargo admission. The output is
+On the persistent controller use `python3 scripts/generate_command_reference.py --controller`
+(or set `TWO_CARGO_CONTROLLER=1`), which builds only the generator through bounded
+Cargo admission. Nothing else selects controller mode: elsewhere it runs plain `cargo`. The output is
 ignored; never commit generated registry rows. The authored
 [command-reference landing page](docs/commands.md) links to same-head CI artifacts.
 Normal reference-doc tests compare bytes without writing. Missing or stale output
@@ -175,6 +203,7 @@ python3 scripts/test-docker-deps.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
 python3 scripts/check_soak_checklist.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist_noexec_acceptance.py' -v
 python3 tests/voice_templates/validate.py
 python3 -m unittest discover -s tests/voice_templates -p 'test_*.py' -v
 ```
@@ -190,6 +219,38 @@ shared guard refuses loopback URLs even with CI flags set. Do not
 use `DATABASE_URL`, application credentials, credential fallbacks, or libpq
 `PG*` connection variables. A configured connection/setup failure must fail the
 test, not skip it.
+
+#### One-command local harness
+
+`python3 scripts/local_testdb.py test` mirrors the CI `rust-tests` job with Docker:
+it starts the same digest-pinned Postgres as `agent-testdb:5432` (trust auth,
+tmpfs data, bounded WAL) on a private network, creates the same bootstrap
+databases, and runs the job's test steps with the same step-scoped environment
+in a runner built from the job's `rust:bookworm` image. The guard accepts only
+the literal `agent-testdb` host, so Cargo runs inside that runner rather than on
+the host. Unlike CI it adds `--no-fail-fast`, so one failing test binary does not
+hide the rest, and it prints per-step exit codes and pass/fail/ignored totals.
+It also runs the job's property-test 30-second budget and metrics RSS steps; the
+budget is timed on your host, so a local pass does not prove the CI runner's.
+
+```sh
+python3 scripts/local_testdb.py test                  # fresh DB + rust-tests steps + summary
+python3 scripts/local_testdb.py exec -- python3 scripts/generate_command_reference.py  # once per fresh checkout
+python3 scripts/local_testdb.py exec [--fresh] -- cargo test -p two-bot-core --features db --locked
+python3 scripts/local_testdb.py env                   # the exported test environment
+python3 scripts/local_testdb.py down [--volumes]      # --volumes also drops the target cache
+```
+
+Each checkout gets its own network, database, runner and Cargo target volume.
+`test` always starts on an empty database; `up`/`exec` reuse it unless `--fresh`
+is given. The database tmpfs defaults to 4 GiB (`TWO_LOCAL_TESTDB_TMPFS_GIB`), not
+CI's 1 GiB: a many-core host keeps more fixture databases alive at once, and a full
+tmpfs surfaces as `No space left on device` (SQLSTATE 53100) failures.
+The Cargo registry and rustup toolchain live in a shared `two-localtest-cache`
+volume. `scripts/ci/test_local_testdb.py` fails when `check.yml` and the
+harness drift apart.
+
+#### Manual setup
 
 Create one empty bootstrap database `two_bot_test_local` on the disposable
 service, owned by its documented `agent_test` principal (empty password, with

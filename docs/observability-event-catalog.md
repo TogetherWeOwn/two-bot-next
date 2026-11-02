@@ -81,7 +81,10 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `notification acknowledged` | `crates/bot/src/eventsub_http.rs` (`handle_notification`, two sites) | Notification verified and acknowledged; when delivery dependencies are injected, the durable claim → send → settle flow has settled (or deduped) before the ack |
 | `revocation acknowledged` | `crates/bot/src/eventsub_http.rs` (`receive`) | Revocation verified and acknowledged; boot/periodic reconcile owns re-subscription; bounded `reason` (`user_removed` / `authorization_revoked` / `notification_failures_exceeded` / `version_removed` / `other`) answers counts by reason |
 | `delivery ignored` | `crates/bot/src/eventsub_http.rs` (`receive`, one info site) | Unknown message type acknowledged with 2xx; deterministic planning errors warn sampled with their `error_variant` instead, and unknown/future classification errors record their variant label and are refused with retryable 503 |
-| `event = "eventsub_receiver"` | `crates/bot/src/eventsub_http.rs` (`refuse`, `sampled_classify_warn`, `receive`, `handle_notification`) | Bounded `event` field value every receiver emission carries; no header, token or body leaves the process |
+| `delivery child failed; durable claim fences retain uncertainty` | `crates/bot/src/eventsub_http.rs` (`report_child_failure`) | Warn, emitted from the failing child's own request span when it ends by panic or cancellation (`panicked` / `cancelled` booleans only; no join error or panic payload is logged); any started durable claim remains uncertain and fenced |
+| `receiver shutdown deadline exhausted with delivery children unfinished` | `crates/bot/src/eventsub_http.rs` (`join_children`) | Warn; joining children exceeded the receiver's HTTP-drain shutdown budget (`pending` count); children detach instead of aborting and started claims stay fenced |
+| `receiver shutdown deadline exhausted; unfinished delivery claims remain fenced` | `crates/bot/src/eventsub_http.rs` (`serve`) | Warn; the receiver exhausted its HTTP-drain shutdown budget, reports failure to its caller, and leaves unfinished claim state fenced |
+| `event = "eventsub_receiver"` | `crates/bot/src/eventsub_http.rs` (`serve`, `join_children`, `report_child_failure`, `refuse`, `sampled_classify_warn`, `receive`, `handle_notification`) | Bounded `event` field value every receiver emission carries; no header, token or body leaves the process |
 | `eventsub reconcile parked: TWO_EVENTSUB is not exactly 1` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`, `spawn_if_enabled`) | Info; gate dark at spawn or per pass, no subscription is listed or mutated (`status = "parked"`, `reason = "flag_dark"`) |
 | `eventsub reconcile parked: the EventSub receiver is dark, no shared secret snapshot` | `crates/bot/src/eventsub_reconcile.rs` (`spawn_if_enabled`) | Info; enabled but no receiver snapshot at spawn, so no task and no pass (`status = "parked"`, `reason = "receiver_dark"`) |
 | `eventsub reconcile refused: callback configuration is invalid` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; `TWO_TWITCH_CALLBACK_URL` missing or not an https callback, no Helix call (`error_class = "reconcile_config_invalid"`) |
@@ -448,7 +451,34 @@ Startup `error_class` values logged before fatal exits (see
 `gateway_override_invalid`, `database_connect_failed`,
 `receiver_config_invalid`, `receiver_prerequisites_invalid`,
 `receiver_bind_failed`, `moderation_disable_unknown`,
-`container_service_failed`, plus the twelve classes above.
+`container_service_failed`, plus the twelve classes above and the five
+EventSub delivery classes below. `receiver_prerequisites_invalid` remains
+only for internal-action startup prerequisites, not EventSub delivery.
+
+### EventSub startup classes
+
+With delivery enabled, each prerequisite refusal emits one
+`eventsub startup refused` event with the scalar `error_class` below and
+exits 1. No token, URL or underlying error text is logged. Token presence
+is checked before the store because a missing token also prevents pool
+construction. Identity permission is checked before key derivation, and
+key derivation before proxy construction; with multiple invalid inputs,
+the first failing check wins.
+
+| Class | Meaning | Next action |
+| --- | --- | --- |
+| `receiver_token_missing` | `DISCORD_TOKEN` is absent or empty | Provision the correct bot token secret; never paste it into logs or tickets |
+| `receiver_store_missing` | No shared bot database pool exists for delivery | Check that `DATABASE_URL` and `GUILD_ID` are present and nonempty; database connection failures have their own `database_connect_failed` class |
+| `receiver_identity_refused` | The boot identity is not permitted to use Announcements for go-live delivery | Verify the staging bot/guild identity and activation policy; do not bypass the fence or enable delivery for an uncleared identity |
+| `receiver_admission_rejected` | Send-admission key derivation rejected the token format | Correct the token format or whitespace through secret provisioning without printing its value |
+| `receiver_proxy_invalid` | REST executor construction failed, normally from an unusable `DISCORD_API_BASE` override | Correct or remove the API override; it must be a supported origin without userinfo, path, query or fragment. If the override is valid or unset, check platform TLS verifier setup, which can also fail this constructor |
+
+The token/store classes originate in `crates/bot/src/main.rs` (`run`);
+the identity/admission/proxy classes originate in
+`crates/bot/src/eventsub_delivery.rs` (`build_delivery_deps`) and propagate
+unchanged to the same fatal log. Receiver/delivery configuration parsing
+continues to use `receiver_config_invalid`; private listener bind failures
+continue to use `receiver_bind_failed`.
 
 ## Voice responder overload
 

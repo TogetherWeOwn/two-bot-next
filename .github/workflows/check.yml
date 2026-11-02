@@ -296,6 +296,7 @@ jobs:
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist_noexec_acceptance.py' -v
 
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_probe.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_probe_timeout_location_acceptance.py' -v
@@ -310,6 +311,14 @@ jobs:
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_slow_burn_tracker_duplicate_key_acceptance.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_docker_manifests_no_assert_acceptance.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docker_deps_no_assert.py' -v
+      - name: Docker replay confinement acceptance (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docker_replay_intake_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -O -m unittest discover -s scripts -p 'test_docker_replay_intake_acceptance.py' -v
+      - name: Tracker scratch failure acceptance (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_slow_burn_tracker_scratch_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -O -m unittest discover -s scripts -p 'test_slow_burn_tracker_scratch_acceptance.py' -v
 
       - name: soak evidence parser (offline, fixtures only)
         run: |
@@ -374,10 +383,14 @@ jobs:
       # includes the advisory scan, and the deny image carries its own
       # toolchain, so this also reports advisories on docs-only PRs for the
       # cost of one advisory-DB fetch. Advisory findings fail the PR (HARD).
+      # `--workspace` is required: the root manifest is also a package, so
+      # without it the graph holds only `two-bot-next` and every check
+      # passes on one crate with no dependencies.
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check all
+          arguments: --workspace --all-features
 
       - name: Install Rust toolchain
         id: toolchain
@@ -1766,22 +1779,25 @@ jobs:
     uses: ./.github/workflows/reusable-rust-nextest.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
-    # R2 write credentials flow only on push to main and workflow_dispatch:
-    # the lane compiles and executes code, and any other event (pull_request,
-    # merge_group, ...) runs a head that is not on `main` yet. The reusable
-    # lane independently refuses shared backends off those two events
-    # (defense in depth; see its backend step). Empty elsewhere, so the lane
-    # falls back to local-disk sccache.
-    # NOTE: the gate must read `(== 'push' || == 'workflow_dispatch') &&
-    # secrets.X || ''`. A `!= 'pull_request' && secrets.X` form forwards the
-    # secret on merge_group, and `== 'pull_request' && '' || secrets.X`
-    # forwards it everywhere, because '' is falsy in GitHub expressions.
+    # R2 write credentials flow only on push and workflow_dispatch runs on
+    # `main`: the lane compiles and executes code, and any other event
+    # (pull_request, merge_group, ...) or ref (a manual dispatch can target
+    # any branch or tag) runs a head that is not on `main`. The reusable
+    # lane independently refuses shared backends off `main` (defense in
+    # depth; see its backend step). Empty elsewhere, so the lane falls back
+    # to local-disk sccache.
+    # NOTE: the gate must read `ref == 'refs/heads/main' && (== 'push' ||
+    # == 'workflow_dispatch') && secrets.X || ''`. Event name alone is not
+    # enough, because workflow_dispatch accepts any ref. A
+    # `!= 'pull_request' && secrets.X` form forwards the secret on
+    # merge_group, and `== 'pull_request' && '' || secrets.X` forwards it
+    # everywhere, because '' is falsy in GitHub expressions.
     secrets:
-      SCCACHE_BUCKET: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_BUCKET || '' }}
-      SCCACHE_ENDPOINT: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_ENDPOINT || '' }}
-      SCCACHE_REGION: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_REGION || '' }}
-      AWS_ACCESS_KEY_ID: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_ACCESS_KEY_ID || '' }}
-      AWS_SECRET_ACCESS_KEY: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_SECRET_ACCESS_KEY || '' }}
+      SCCACHE_BUCKET: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_BUCKET || '' }}
+      SCCACHE_ENDPOINT: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_ENDPOINT || '' }}
+      SCCACHE_REGION: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_REGION || '' }}
+      AWS_ACCESS_KEY_ID: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_SECRET_ACCESS_KEY || '' }}
 
   ignored-db-stores:
     name: ignored db (stores)
@@ -3526,6 +3542,14 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback_dry_run_acceptance.py -v
       - name: Verify worker-container rollback dry-run pins (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback_dry_run_pins.py -v
+      - name: Verify production rollback-target preflight (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_rollback_target_preflight.py -v
+      - name: Verify promotion regression gate (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_promotion_regression_gate.py -v
+      - name: Verify production post-deploy watch (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_post_deploy_watch.py -v
+      - name: Verify production deploy-notify (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_deploy_notify.py -v
       - name: Verify staging container backout/restore drill (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill.py -v
       - name: Verify staging container drill duplicate-key refusal (offline fixtures)
@@ -3587,6 +3611,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_build_identity_acceptance.py -v
       - name: Verify passive production probe duplicate-key refusal (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_duplicate_key_acceptance.py -v
+      - name: Verify incident issue sink (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_incident_issue.py -v
       - name: Verify synthetic alert delivery (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert.py -v
       - name: Verify synthetic history admission boundaries (offline fixtures)
@@ -3637,9 +3663,9 @@ jobs:
         run: python3 ../scripts/test-commit-parse-guard-ci.py
       - name: Verify the daily digest release (offline fixtures)
         if: needs.job-inputs.outputs.worker != 'false'
-        # Digest tags, notes, quiet-day and rollback skips, off-main refusal
-        # and the 200-commit ENOBUFS regression against a throwaway git
-        # repository (no network, no token).
+        # CalVer adapter modes: plan/publish requests, classified skips, SBOM
+        # redispatch and the stalled-production warning against a mocked gh
+        # (no network, no token).
         run: node ../scripts/test-daily-digest.cjs
       - name: Verify the production digest resolver (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_digest_resolve.py -v

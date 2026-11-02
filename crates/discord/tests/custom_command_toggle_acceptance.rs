@@ -28,11 +28,11 @@ use twilight_model::{application::interaction::Interaction, channel::Message};
 use two_bot_core::{
     automation_transfer as transfer,
     command_permissions::{command_permission, CommandSurface},
-    commands::{CustomCommand, RegistryError},
+    commands::CustomCommand,
     custom_command_service as service, custom_command_store as store,
     custom_commands::{
-        builtin_command_names, reserved_command_names, AutomationMessageAcceptance, CommandError,
-        PutCommandInput, StoredCommand,
+        builtin_command_names, max_custom_commands, reserved_command_names,
+        AutomationMessageAcceptance, CommandError, PutCommandInput, StoredCommand,
     },
     HandlerId, InteractionRouter, RouterGates, SlashContext, SlashOutcome,
     AUTOMATIONS_DISABLED_REPLY, MANAGE_SERVER_REQUIRED,
@@ -898,18 +898,17 @@ async fn toggle_paused_trigger_remains_owned_and_existing_replacement_semantics_
 #[tokio::test]
 async fn toggle_at_capacity_can_resume_existing_definition_but_cannot_add_another() {
     let f = Fixture::new(false).await;
-    // Independent pin: 67 published +33 custom =100. The reservation-only
-    // `templateassistant` holds no guild slot, so storage uses 100-67=33, not
-    // 100-68=32. Disabled rows count toward storage, not just picker entries.
-    // Rationale: `reserved_command_names().len()` is 68 (67 published +1 held),
-    // but `max_custom_commands(68)=32` would refuse the 33rd valid row. The
-    // 34th row must still overflow; this test preserves that control.
+    // Independent pin: customs fill the guild ceiling around the live
+    // reserved set (68 published +2 held). The fixture already stores `faq`
+    // and `other`; peers fill the rest of the budget. Disabled rows count
+    // toward storage, not just picker entries.
+    let reserved = reserved_command_names();
     assert_eq!(
-        reserved_command_names().len(),
-        68,
-        "68 reserved names pin the 32-vs-33 oracle: 67 published +1 held"
+        reserved.len(),
+        70,
+        "70 reserved names pin the oracle: 68 published +2 held"
     );
-    let capacity = 33;
+    let capacity = max_custom_commands(reserved.len());
     for index in 2..capacity {
         seed(
             f.db.pool(),
@@ -947,10 +946,10 @@ async fn toggle_at_capacity_can_resume_existing_definition_but_cannot_add_anothe
         matches!(
             overflow,
             Err(service::ServiceError::Validation(
-                CommandError::OverCapacity(33)
-            ))
+                CommandError::OverCapacity(budget)
+            )) if budget == capacity
         ),
-        "34th row overflows with independent 33 payload"
+        "one row past the live budget overflows"
     );
     let sets = publications(&resumed.requests);
     assert_eq!(sets.len(), 1);
@@ -1454,14 +1453,16 @@ async fn toggle_control_existing_replace_and_remove_are_not_repurposed() {
     assert!(publications(&absent.requests).is_empty());
 }
 
-// Independent capacity pins for findings 6 and 7: 67 published +33 custom
-// =100. The reservation-only `templateassistant` holds no guild slot, so the
-// budget is 100-67=33, not 100-68=32. Expected values below are literals,
-// never derived from the production helper under test.
-const EXPECTED_CUSTOM_CAPACITY: usize = 33;
-const OVERFLOW_CUSTOM_COUNT: usize = 34;
+// Capacity pins: the parser envelope is the guild ceiling (100); the planner
+// and PUT path refuse only past it, with a no-growth exception for rows
+// saved under an older budget. Publication withholds excess customs instead
+// of failing. The live custom budget derives from the reserved set via
+// `max_custom_commands`, so a new builtin never silently strands a catalog;
+// the fixed 33-row catalog below exercises the stranded-over-budget path.
+const STRANDED_CATALOG_ROWS: usize = 33;
+const STRANDED_CATALOG_PLUS_ONE: usize = 34;
 const EXPECTED_BUILTINS_WITHOUT_VOICE: usize = 45;
-const EXPECTED_BUILTINS_WITH_VOICE: usize = 67;
+const EXPECTED_BUILTINS_WITH_VOICE: usize = 68;
 const EXPECTED_GUILD_LIMIT: usize = 100;
 
 fn bulk_name(index: usize) -> String {
@@ -1505,8 +1506,8 @@ fn bulk_import_body(count: usize) -> Value {
     json!({"version": 1, "commands": commands})
 }
 
-fn bulk_update_body() -> Value {
-    let commands: Vec<Value> = (0..EXPECTED_CUSTOM_CAPACITY)
+fn bulk_update_body(count: usize) -> Value {
+    let commands: Vec<Value> = (0..count)
         .map(|index| {
             let name = bulk_name(index);
             json!({
@@ -1580,7 +1581,7 @@ fn prefix_with(id: u64, actor: u64, content: &str) -> Message {
 #[test]
 fn custom_catalog_33_row_export_parses_and_diffs_without_growth() {
     let reserved = reserved_command_names();
-    for index in 0..OVERFLOW_CUSTOM_COUNT {
+    for index in 0..STRANDED_CATALOG_PLUS_ONE {
         let name = bulk_name(index);
         assert!(
             !reserved.contains(&name),
@@ -1588,7 +1589,7 @@ fn custom_catalog_33_row_export_parses_and_diffs_without_growth() {
         );
         assert!(!builtin_command_names().contains(&name));
     }
-    let rows: Vec<StoredCommand> = (0..EXPECTED_CUSTOM_CAPACITY).map(bulk_stored).collect();
+    let rows: Vec<StoredCommand> = (0..STRANDED_CATALOG_ROWS).map(bulk_stored).collect();
     let document = transfer::export_document(&rows);
     assert_eq!(document.version, 1);
     assert_eq!(document.commands.len(), 33);
@@ -1605,33 +1606,56 @@ fn custom_catalog_33_row_export_parses_and_diffs_without_growth() {
     assert_eq!(parsed.entries.len(), 33);
     assert_eq!(parsed.invalid_entries, 0);
     assert!(!parsed.overwrite);
-    let diff = transfer::diff_import(&[], &parsed, &reserved, false).expect("33-row diff plans");
-    assert_eq!(diff.to_create.len(), 33);
-    assert!(diff.to_update.is_empty());
-    assert!(diff.rejected.is_empty());
-    assert_eq!(diff.accepted_entry_indices.len(), 33);
+    // The planner budget follows the live reserved set; fresh growth past it
+    // is refused even though the envelope allows the parse.
+    let budget = max_custom_commands(reserved.len());
+    assert_eq!(
+        transfer::diff_import(&[], &parsed, &reserved, false),
+        Err(CommandError::OverCapacity(budget)),
+        "33 fresh customs exceed the live budget"
+    );
+    // The parser envelope is the guild ceiling; the per-guild custom budget
+    // is enforced in planning, where stored rows are known.
     assert_eq!(
         transfer::max_import_entries(),
-        33,
-        "parser budget is 33, not 32; reservation-only templateassistant holds no slot"
+        100,
+        "parser envelope is the guild ceiling"
     );
-    let overflow_body = bulk_import_body(34);
-    let parser_overflow = transfer::parse_import_document(&overflow_body, 33);
+    assert!(
+        transfer::max_import_entries() > budget,
+        "envelope stays above the planner budget"
+    );
+    let overflow_body = bulk_import_body(101);
+    let parser_overflow =
+        transfer::parse_import_document(&overflow_body, transfer::max_import_entries());
     assert!(
         matches!(
             parser_overflow,
-            Err(transfer::ImportParseError::TooManyEntries { count: 34, max: 33 })
+            Err(transfer::ImportParseError::TooManyEntries {
+                count: 101,
+                max: 100
+            })
         ),
-        "parser refuses 34 with independent 33 budget: {parser_overflow:?}"
+        "parser refuses past the ceiling: {parser_overflow:?}"
     );
     let parsed_loose =
-        transfer::parse_import_document(&overflow_body, 100).expect("loose parse reaches planner");
+        transfer::parse_import_document(&overflow_body, 101).expect("loose parse reaches planner");
     assert_eq!(
         transfer::diff_import(&[], &parsed_loose, &reserved, true),
-        Err(CommandError::OverCapacity(33)),
-        "34-row union overflows with independent 33 payload"
+        Err(CommandError::OverCapacity(budget)),
+        "101-row union overflows the planner budget"
     );
-    let updates = transfer::parse_import_document(&bulk_update_body(), 33)
+    // ...while a full-ceiling catalog still re-imports unchanged.
+    let stranded: Vec<StoredCommand> = (0..100).map(bulk_stored).collect();
+    let stranded_body =
+        serde_json::to_value(transfer::export_document(&stranded)).expect("export serializes");
+    let stranded_parsed =
+        transfer::parse_import_document(&stranded_body, transfer::max_import_entries())
+            .expect("full-ceiling catalog parses");
+    let stranded_diff =
+        transfer::diff_import(&stranded, &stranded_parsed, &reserved, false).expect("no growth");
+    assert_eq!(stranded_diff.unchanged.len(), 100);
+    let updates = transfer::parse_import_document(&bulk_update_body(STRANDED_CATALOG_ROWS), 33)
         .expect("no-growth bulk updates parse");
     let planned = transfer::diff_import(&rows, &updates, &reserved, true).expect("no-growth plans");
     assert_eq!(planned.to_update.len(), 33);
@@ -1645,7 +1669,7 @@ fn custom_catalog_33_row_export_parses_and_diffs_without_growth() {
 }
 
 #[test]
-fn all_enabled_publication_67_plus_33_equals_100_with_voice_off_and_on() {
+fn all_enabled_publication_withholds_custom_overflow_with_voice_off_and_on() {
     for assistant in [false, true] {
         let off = InteractionRouter::new(all_enabled_gates(false, assistant));
         let off_builtins = off.publish_set(&[]).expect("off assembles");
@@ -1671,14 +1695,33 @@ fn all_enabled_publication_67_plus_33_equals_100_with_voice_off_and_on() {
                 .any(|definition| definition.name == "templateassistant"),
             "assistant stays unpublished assistant={assistant}"
         );
+        // 68 builtins + 33 customs no longer fit: publication withholds the
+        // last custom in store order instead of failing the whole sync.
         let on_full = on
             .publish_set(&bulk_custom_commands(33))
-            .expect("on 33 fits");
-        assert_eq!(on_full.len(), EXPECTED_GUILD_LIMIT, "67+33=100");
-        let overflow = on.publish_set(&bulk_custom_commands(34));
+            .expect("on 33 still publishes");
+        assert_eq!(on_full.len(), EXPECTED_GUILD_LIMIT, "assistant={assistant}");
+        let on_names: Vec<_> = on_full.iter().map(|def| def.name.as_str()).collect();
         assert!(
-            matches!(overflow, Err(RegistryError::TotalLimit(101))),
-            "67+34=101 overflows publication assistant={assistant}: {overflow:?}"
+            on_names.contains(&"zzbulk00"),
+            "first custom still publishes assistant={assistant}"
+        );
+        assert!(
+            !on_names.contains(&"zzbulk32"),
+            "68+33=101 withholds the last custom assistant={assistant}"
+        );
+        let overflow = on
+            .publish_set(&bulk_custom_commands(34))
+            .expect("custom overflow still publishes");
+        assert_eq!(
+            overflow.len(),
+            EXPECTED_GUILD_LIMIT,
+            "assistant={assistant}"
+        );
+        let overflow_names: Vec<_> = overflow.iter().map(|def| def.name.as_str()).collect();
+        assert!(
+            !overflow_names.contains(&"zzbulk32") && !overflow_names.contains(&"zzbulk33"),
+            "68+34=102 withholds two customs assistant={assistant}"
         );
     }
 }
@@ -1757,34 +1800,40 @@ fn myroom_router_precedence_off_runs_custom_and_on_yields_to_voice_sink() {
 }
 
 #[tokio::test]
-async fn custom_catalog_service_import_33_succeeds_and_34_overflows_with_bulk_updates() {
+async fn custom_catalog_service_import_budget_succeeds_and_over_budget_overflows_with_bulk_updates()
+{
+    // The import budget follows the live reserved set, so the row counts
+    // derive from it instead of repeating a stale capacity literal.
+    let budget = max_custom_commands(reserved_command_names().len());
     let url = std::env::var("TWO_TEST_DATABASE_URL")
         .expect("explicit disposable test bootstrap required");
     let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
         .await
         .expect("isolated migrated fixture");
-    let parsed = transfer::parse_import_document(&bulk_import_body(33), 33).expect("33 parses");
+    let parsed =
+        transfer::parse_import_document(&bulk_import_body(budget), budget).expect("budget parses");
     let outcome = service::import(
         db.pool(),
         "2222",
         "3333",
         &parsed,
         false,
-        "bulk33-import",
+        "bulk-budget-import",
         AT,
     )
     .await;
     let stored = store::list_commands(db.pool(), "2222")
         .await
         .expect("list imported rows");
-    let updated = transfer::parse_import_document(&bulk_update_body(), 33).expect("updates parse");
+    let updated =
+        transfer::parse_import_document(&bulk_update_body(budget), budget).expect("updates parse");
     let applied = service::import(
         db.pool(),
         "2222",
         "3333",
         &updated,
         true,
-        "bulk33-update",
+        "bulk-budget-update",
         AT,
     )
     .await;
@@ -1792,15 +1841,15 @@ async fn custom_catalog_service_import_33_succeeds_and_34_overflows_with_bulk_up
         .await
         .expect("list after updates");
     let before_overflow = definitions(db.pool()).await;
-    let loose =
-        transfer::parse_import_document(&bulk_import_body(34), 100).expect("loose 34 parses");
+    let loose = transfer::parse_import_document(&bulk_import_body(budget + 1), 100)
+        .expect("loose over-budget parses");
     let overflow = service::import(
         db.pool(),
         "2222",
         "3333",
         &loose,
         true,
-        "bulk34-overflow",
+        "bulk-over-budget-overflow",
         AT,
     )
     .await;
@@ -1808,15 +1857,15 @@ async fn custom_catalog_service_import_33_succeeds_and_34_overflows_with_bulk_up
     db.close()
         .await
         .expect("drop owned test database before the expected RED assertion");
-    let outcome = outcome.expect("33-row import commits");
+    let outcome = outcome.expect("budget-sized import commits");
     let applied = applied.expect("no-growth bulk updates commit");
-    assert_eq!(outcome.imported, 33);
+    assert_eq!(outcome.imported, budget);
     assert_eq!(outcome.skipped, 0);
     assert!(outcome.conflicts.is_empty());
-    assert_eq!(stored.len(), 33);
-    assert_eq!(applied.imported, 33);
+    assert_eq!(stored.len(), budget);
+    assert_eq!(applied.imported, budget);
     assert_eq!(applied.skipped, 0);
-    assert_eq!(after_update.len(), 33);
+    assert_eq!(after_update.len(), budget);
     assert!(
         after_update
             .iter()
@@ -1824,8 +1873,8 @@ async fn custom_catalog_service_import_33_succeeds_and_34_overflows_with_bulk_up
         "bulk updates rewrite templates without growth"
     );
     assert!(
-        matches!(overflow, Err(service::ImportServiceError::OverCapacity(33))),
-        "34th row overflows with independent 33 payload: {overflow:?}"
+        matches!(overflow, Err(service::ImportServiceError::OverCapacity(max)) if max == budget),
+        "one row past budget overflows: {overflow:?}"
     );
     assert_eq!(
         before_overflow, after_overflow,
@@ -1835,8 +1884,11 @@ async fn custom_catalog_service_import_33_succeeds_and_34_overflows_with_bulk_up
         .iter()
         .map(StoredCommand::registry_entry)
         .collect();
-    assert_eq!(live.len(), 33);
-    for (voice, expected) in [(false, 78), (true, 100)] {
+    assert_eq!(live.len(), budget);
+    for (voice, expected) in [
+        (false, EXPECTED_BUILTINS_WITHOUT_VOICE + budget),
+        (true, EXPECTED_BUILTINS_WITH_VOICE + budget),
+    ] {
         let router = InteractionRouter::new(all_enabled_gates(voice, false));
         let set = router.publish_set(&live).expect("bulk publishes");
         assert_eq!(set.len(), expected, "voice={voice}");

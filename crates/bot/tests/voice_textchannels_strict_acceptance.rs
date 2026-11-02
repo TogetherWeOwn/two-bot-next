@@ -253,7 +253,7 @@ impl RoomPersistence for Store {
     store_refuses!(prepare_owner_grants(_room: &VoiceRoom, _previous: u64) -> OwnerGrantIntent);
     store_refuses!(update_ownership(_room: &VoiceRoom, _revision: &str) -> bool);
     store_refuses!(save_custom_name(_guild: u64, _channel: u64, _name: Option<&str>) -> bool);
-    store_refuses!(save_access_controls(_guild: u64, _controls: &AccessControls) -> ());
+    store_refuses!(save_access_controls(_guild: u64, _expected: &AccessControls, _controls: &AccessControls) -> ());
     store_refuses!(save_logging_settings(_guild: u64, _settings: &LoggingSettings) -> ());
     store_refuses!(config_apply(_guild: u64, _config: &VoiceConfiguration, _expected: &VoiceConfiguration) -> ());
     store_refuses!(forget(_guild: u64, _channel: u64) -> ());
@@ -1030,10 +1030,19 @@ fn registry_keeps_the_textchannels_shape_without_new_required_options() {
         .iter()
         .map(|opt| opt.name.as_str())
         .collect();
+    // The two reset controls are the only additions since the strict
+    // decode landed; both stay optional booleans.
     assert_eq!(
         names,
-        ["channel", "enabled", "name", "viewer-role"],
-        "no new /textchannels option"
+        [
+            "channel",
+            "enabled",
+            "name",
+            "viewer-role",
+            "reset-name",
+            "reset-viewer-role"
+        ],
+        "only the reset controls are new on /textchannels"
     );
     let kind = |name: &str| -> u8 {
         textchannels
@@ -1048,6 +1057,8 @@ fn registry_keeps_the_textchannels_shape_without_new_required_options() {
     assert_eq!(kind("enabled"), 5);
     assert_eq!(kind("name"), 3);
     assert_eq!(kind("viewer-role"), 8);
+    assert_eq!(kind("reset-name"), 5);
+    assert_eq!(kind("reset-viewer-role"), 5);
     let required = |name: &str| -> Option<bool> {
         textchannels
             .options
@@ -1072,4 +1083,11 @@ fn registry_keeps_the_textchannels_shape_without_new_required_options() {
         Some(true),
         "viewer-role stays optional so omission keeps the stored value"
     );
+    for reset in ["reset-name", "reset-viewer-role"] {
+        assert_ne!(
+            required(reset),
+            Some(true),
+            "{reset} stays optional so omission keeps the stored value"
+        );
+    }
 }

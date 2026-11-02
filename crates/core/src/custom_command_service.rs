@@ -11,9 +11,9 @@ use crate::automation_transfer::{diff_import, ImportOutcome, ParsedImport};
 use crate::custom_command_store as store;
 use crate::custom_commands::{
     adjudicate_delete, adjudicate_put, adjudicate_toggle, builtin_command_names, check_capacity,
-    error_code, published_builtin_count, require_automations_enabled, reserved_command_names,
-    validate_put_input, validate_toggle_enable, AuditRecord, CommandError, DeleteDecision,
-    PutCommandInput, PutDecision, StoredCommand, ToggleDecision,
+    error_code, require_automations_enabled, reserved_command_names, validate_put_input,
+    validate_toggle_enable, AuditRecord, CommandError, DeleteDecision, PutCommandInput,
+    PutDecision, StoredCommand, ToggleDecision,
 };
 use crate::leveling::valid_command_name;
 
@@ -52,7 +52,7 @@ pub async fn put(
     }
     let rows = store::list_commands(&mut *tx, guild).await?;
     let validation = validate_put_input(input, &builtins)
-        .and_then(|()| check_capacity(rows.len(), existing.is_none(), published_builtin_count()));
+        .and_then(|()| check_capacity(rows.len(), existing.is_none(), builtins.len()));
     if let Err(err) = validation {
         let record = AuditRecord::put_rejected(guild, actor, &input.name, existing.is_some(), &err);
         store::audit(&mut *tx, &record, audit_id, at).await?;

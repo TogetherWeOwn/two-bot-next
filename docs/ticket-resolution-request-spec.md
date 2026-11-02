@@ -1,9 +1,11 @@
 # Tickets: an opener's resolution request is not Close
 
-Status: **Proposed — design only**. Written 2026-10-26; review by 2026-11-02.
-This is the repository source of truth; the task spec mirrors it. Merge publishes
-neither an enabled command nor implementation approval. No runtime, schema,
-permission, credential, spend, retention-policy or live-operation change here.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-26. This is the repository source of truth; the task spec mirrors it.
+Merge publishes neither an enabled command nor implementation approval. No
+runtime, schema, permission, credential, spend, retention-policy or
+live-operation change here.
 
 ## Decision and alternatives
 
@@ -365,7 +367,7 @@ contract, not deliver the member feature or resolve the retention gap. Its kill
 rule is no accepted host demand or no bounded implementation path: retain A,
 without creating further cards from this proposal. No build card is created now.
 Any later live proposal needs a newly bounded plan and exact intent/security
-records; exact-head CI, independent Paperclip Review 5/5, relevant security gate
+records; exact-head CI, CodeRabbit and Devin Review, relevant security gate
 and existing authorized staging/rollback/deploy contracts still apply.
 
 Review metric by 2026-11-02: all 28 matrix rows accepted/revised, exact host/CEO

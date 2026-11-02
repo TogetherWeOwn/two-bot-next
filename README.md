@@ -55,9 +55,10 @@ Browse the [documentation map](docs/README.md) for every guide, contract and evi
   Discord permissions, rendered from the compiled all-enabled registry.
 - [Event help and attendee reminders](docs/event-reminders.md): fixed 15-minute,
   channel-only reminders, delivery limits and restart-safe failure behavior.
-- [Proposed RSVP seats and waitlist](docs/rsvp-capacity-spec.md): design only;
-  optional Going capacity, explicit queue consent, race/privacy contracts and
-  unresolved existing-post assumptions. Not an enabled feature.
+- [Proposed RSVP seats and waitlist](docs/rsvp-capacity-spec.md): deferred to
+  2026-12; the single RSVP-policy spec. Optional Going capacity, explicit queue
+  consent, race/privacy contracts and unresolved existing-post assumptions. Not
+  an enabled feature.
 - [Sticky delivery recovery](docs/sticky-debounce-acceptance.md#uncertain-delivery-recovery):
   inspect uncertain re-posts before resetting the durable delivery fence.
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed
@@ -167,11 +168,15 @@ failure. CI generates before consumers, then runs these read-only tests.
 Squash-merge only; PR titles follow Conventional Commits and the body follows the
 [PR template](.github/pull_request_template.md). This repo is public, so keep
 internal tracker IDs out of titles, bodies, commits and branch names. The rulesets
-require `ci-ok`, `gitleaks` and `pr-lint` on the exact head commit. The single
+require `ci-ok`, `gitleaks`, `pr-lint`, `CodeRabbit` and `Devin Review` on the exact
+head commit, with no approving review. The single
 `ci-ok` aggregate gates both selectors, lint (`check`: fmt, clippy -D warnings,
 cargo-deny), all selected `rust tests` and `ignored db` lanes, and `worker check`
-(including the runbook command-drift test). The approving non-author reviewer
-squash-merges. See [Contributing](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). The
+(including the runbook command-drift test). The agent that did the work
+squash-merges once every required check is green and each review finding is fixed
+or answered with evidence. A merge to `main` that touches a path outside the
+`paths-ignore` list in `deploy-staging.yml` (CI scripts and workflows included)
+deploys production, so it also needs the owner's approval. See [Contributing](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). The
 workspace toolchain is pinned in `rust-toolchain.toml`.
 
 Persistent-controller Rust builds use the [bounded Cargo cache wrapper](docs/build-cache.md),
