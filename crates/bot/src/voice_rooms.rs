@@ -9113,6 +9113,19 @@ where
         }
     }
 
+    /// Hand a confirmed import's access gates to the guild worker. The
+    /// worker caches the creation switch, so without this push an imported
+    /// `creation_enabled: false` would wait for a restart while the
+    /// command gate (which reads the store per command) already enforces
+    /// the imported role gates. The candidate was validated before apply,
+    /// so its role IDs parse; a value that does not is skipped rather
+    /// than pushed half-built.
+    fn access_imported(&self, guild_id: Snowflake, config: &VoiceConfiguration) {
+        if let Some(controls) = import_access_controls(config) {
+            self.access_changed(guild_id, controls);
+        }
+    }
+
     fn creator_updated(&self, creator: &CreatorChannel) {
         if let Some(actor) = self.live_actor(creator.guild_id) {
             actor.live.protect_creators([creator.channel_id]);
@@ -11861,6 +11874,37 @@ pub fn plan_import_confirm(
     // remembered candidate is already pruned by the original preview.
     let diff = diff_configuration(current, candidate, inventory);
     plan_reviewable_import(current, remaining, &diff)
+}
+
+/// The access controls a confirmed import saved, in the gate's own shape:
+/// `settings.creation_enabled` is the creation switch,
+/// `settings.command_role_id` the guild-wide required role, and
+/// `settings.command_roles` the per-command restrictions (one store:
+/// `voice_access_controls`). `None` when a role ID does not parse, which
+/// a validated candidate never carries.
+fn import_access_controls(config: &VoiceConfiguration) -> Option<AccessControls> {
+    let settings = &config.settings;
+    let required_role = settings
+        .command_role_id
+        .as_deref()
+        .map(str::parse::<Snowflake>)
+        .transpose()
+        .ok()?;
+    let mut command_roles = BTreeMap::new();
+    for restriction in &settings.command_roles {
+        let roles = restriction
+            .role_ids
+            .iter()
+            .map(|role| role.parse::<Snowflake>())
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        command_roles.insert(restriction.command.clone(), roles);
+    }
+    Some(AccessControls {
+        room_creation_enabled: settings.creation_enabled,
+        required_role,
+        command_roles,
+    })
 }
 
 /// How many creator channels `candidate` adds over `current`.
@@ -14867,7 +14911,7 @@ where
         .await;
         return true;
     };
-    // Same lock as `/access`: import writes the per-command restrictions
+    // Same lock as `/access`: import writes the access controls
     // `/access` read-modify-writes, and the store's advisory lock only
     // serializes imports. Held from the re-read through the apply.
     let _serialized = runtime.access_lock.lock().await;
@@ -14915,6 +14959,7 @@ where
             match store.config_apply(guild_id, &candidate, &current).await {
                 Ok(()) => {
                     runtime.name_settings_updated(guild_id, &candidate);
+                    runtime.access_imported(guild_id, &candidate);
                     reply(ephemeral_response(&message)).await;
                 }
                 Err(StoreError::Conflict) => {
@@ -14960,6 +15005,7 @@ where
                                     match store.config_apply(guild_id, &retry, &fresh).await {
                                         Ok(()) => {
                                             runtime.name_settings_updated(guild_id, &retry);
+                                            runtime.access_imported(guild_id, &retry);
                                             reply(ephemeral_response(&fresh_message)).await;
                                         }
                                         Err(_) => {

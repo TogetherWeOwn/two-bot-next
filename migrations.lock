@@ -528,6 +528,10 @@
     "crates/cutover/migrations/0469_voice_command_roles_authority.sql": {
       "sha256": "5d1662e647f54afc9aa430b424899c3fe20e97122d2f45450c9d76ec17e1c5ee",
       "justification": "Expand step: copy legacy /import per-command voice restrictions into voice_access_controls.command_roles, the column the command gate enforces, keeping any role list already enforced there and skipping command names the gate refuses; the legacy tables keep their rows for the previous binary until a contract migration drops them; data copy only, no DDL."
+    },
+    "crates/cutover/migrations/0470_voice_creation_gates_authority.sql": {
+      "sha256": "eb1feb5257b747b8d114923f32a40a032929dd4437c61329b1c62d1c1dd1ad8b",
+      "justification": "Expand step: copy the imported voice creation switch and guild-wide command role from voice_guild_settings into voice_access_controls, the columns the runtime gates enforce, tightening only (creation off wins, an enforced role wins) and syncing the legacy columns as a mirror for the previous binary until a contract migration drops them; data copy only, no DDL."
     }
   }
 }

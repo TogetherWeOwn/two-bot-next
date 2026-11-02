@@ -14,7 +14,12 @@
 //! `voice_command_roles` tables are legacy and nothing here reads them; apply
 //! still mirrors the imported restrictions into them so the previous binary's
 //! `/export` and `/import` match after a backout, until a contract migration
-//! drops them.
+//! drops them. `settings.creation_enabled` and `settings.command_role_id`
+//! live the same way in `voice_access_controls.room_creation_enabled` and
+//! `required_role_id` (0470) — the spec's creation switch and guild-wide
+//! command role — so an imported switch or role is enforced and an `/access`
+//! switch or role is exported. Apply keeps mirroring both into the 0229
+//! `voice_guild_settings` columns for the previous binary's `/export`.
 //!
 //! The caller validates against a trusted guild inventory with
 //! `two_bot_core::voice_config::validate_configuration` before applying; the
@@ -231,16 +236,23 @@ async fn read_configuration(
                 .await?,
             }),
         };
-    // The command gate's own store (0469): `/access` and `/import` share it.
-    let stored: Option<String> = sqlx::query_scalar(
-        "SELECT command_roles::text FROM voice_access_controls WHERE guild_id = $1",
+    // The runtime gates' own store (0469, 0470): `/access` and `/import`
+    // share it. No row is the defaults: creation on, no guild-wide role,
+    // no per-command restrictions.
+    let access = sqlx::query(
+        "SELECT room_creation_enabled, required_role_id, command_roles::text AS command_roles
+         FROM voice_access_controls WHERE guild_id = $1",
     )
     .bind(guild)
     .fetch_optional(&mut **tx)
     .await?;
-    let command_roles = match stored {
-        None => Vec::new(),
-        Some(json) => decode_command_roles(&json)?,
+    let (creation_enabled, command_role_id, command_roles) = match access {
+        None => (true, None, Vec::new()),
+        Some(row) => (
+            row.try_get("room_creation_enabled")?,
+            row.try_get("required_role_id")?,
+            decode_command_roles(&row.try_get::<String, _>("command_roles")?)?,
+        ),
     };
     let settings = match sqlx::query("SELECT * FROM voice_guild_settings WHERE guild_id = $1")
         .bind(guild)
@@ -248,7 +260,7 @@ async fn read_configuration(
         .await?
     {
         Some(row) => GuildSettings {
-            creation_enabled: row.try_get("creation_enabled")?,
+            creation_enabled,
             unique_names: row.try_get("unique_names")?,
             no_game_label: row.try_get("no_game_label")?,
             force_single_game: row.try_get("force_single_game")?,
@@ -256,11 +268,11 @@ async fn read_configuration(
             time_zone: row.try_get("time_zone")?,
             text_channel_name: row.try_get("text_channel_name")?,
             text_viewer_role_id: row.try_get("text_viewer_role_id")?,
-            command_role_id: row.try_get("command_role_id")?,
+            command_role_id,
             command_roles,
         },
         None => GuildSettings {
-            creation_enabled: true,
+            creation_enabled,
             unique_names: false,
             no_game_label: DEFAULT_NO_GAME_LABEL.to_owned(),
             force_single_game: false,
@@ -268,7 +280,7 @@ async fn read_configuration(
             time_zone: DEFAULT_TIME_ZONE.to_owned(),
             text_channel_name: DEFAULT_TEXT_CHANNEL_NAME.to_owned(),
             text_viewer_role_id: None,
-            command_role_id: None,
+            command_role_id,
             command_roles,
         },
     };
@@ -479,6 +491,11 @@ async fn write_settings(
     config: &VoiceConfiguration,
 ) -> Result<(), sqlx::Error> {
     let settings = &config.settings;
+    let command_role_id = settings
+        .command_role_id
+        .as_deref()
+        .map(snowflake)
+        .transpose()?;
     for table in [
         "DELETE FROM voice_command_role_members WHERE guild_id = $1",
         "DELETE FROM voice_command_roles WHERE guild_id = $1",
@@ -508,19 +525,15 @@ async fn write_settings(
             .map(snowflake)
             .transpose()?,
     )
-    .bind(
-        settings
-            .command_role_id
-            .as_deref()
-            .map(snowflake)
-            .transpose()?,
-    )
+    .bind(command_role_id)
     .execute(&mut **tx)
     .await?;
-    // Per-command restrictions go to the store the command gate reads
-    // (`PgRoomStore::access_controls`), so an imported restriction is
-    // enforced like one saved with `/access`. Only `command_roles` changes:
-    // the creation switch and the guild-wide role gate stay `/access`'s.
+    // The creation switch, the guild-wide role gate and the per-command
+    // restrictions go to the store the runtime gates read
+    // (`PgRoomStore::access_controls`), so an imported gate is enforced
+    // like one saved with `/access` (0469, 0470). The
+    // `voice_guild_settings` row above mirrors the switch and the role
+    // for the previous binary's `/export` (expand/contract).
     let mut command_roles: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for restriction in &settings.command_roles {
         if !is_voice_command(&restriction.command) {
@@ -539,10 +552,17 @@ async fn write_settings(
         }
     }
     sqlx::query(
-        "INSERT INTO voice_access_controls (guild_id, command_roles) VALUES ($1,$2::jsonb)
-         ON CONFLICT (guild_id) DO UPDATE SET command_roles = EXCLUDED.command_roles",
+        "INSERT INTO voice_access_controls
+         (guild_id, room_creation_enabled, required_role_id, command_roles)
+         VALUES ($1,$2,$3,$4::jsonb)
+         ON CONFLICT (guild_id) DO UPDATE SET
+           room_creation_enabled = EXCLUDED.room_creation_enabled,
+           required_role_id = EXCLUDED.required_role_id,
+           command_roles = EXCLUDED.command_roles",
     )
     .bind(guild)
+    .bind(settings.creation_enabled)
+    .bind(command_role_id)
     .bind(serde_json::to_string(&command_roles).map_err(invalid_argument)?)
     .execute(&mut **tx)
     .await?;

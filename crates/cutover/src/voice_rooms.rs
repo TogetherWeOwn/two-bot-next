@@ -1101,7 +1101,7 @@ impl PgRoomStore {
 
     /// Replace the guild's access controls, but only while they still equal
     /// `expected` (the value the caller read and modified). `/import` writes
-    /// `command_roles` too (0469), from the bot and the operator CLI, so the
+    /// the whole row too (0469, 0470), from the bot and the operator CLI, so the
     /// compare runs under the same per-guild advisory lock
     /// `PgVoiceConfigStore::apply` takes: a change in between is
     /// `RowNotFound`, never a silent revert of a confirmed import. Refuses
