@@ -38,6 +38,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from email.message import Message
 from pathlib import Path
@@ -582,22 +583,29 @@ class ColdAndLagServingTests(unittest.TestCase):
 
     def test_rollout_timeout_after_unaccepted_poll_names_wait(self):
         # A control-plane read straddling the shared 600s deadline raises
-        # rollout_timeout after at least one unaccepted poll: the same
-        # expiry as the clean while-exit, so it takes the timeout verdict
-        # with the last wait class. No proof, no runtime probes.
-        reads = {"listing": 0}
+        # rollout_timeout after unaccepted polls: the same expiry as the
+        # clean while-exit, so it takes the timeout verdict with the last
+        # wait class. No proof, no runtime probes. The stub consults the
+        # mocked clock (patched over time.monotonic during the attempt)
+        # and raises only on a poll starting inside the final 5s, modelling
+        # the real deadline straddle instead of failing an early poll.
+        started = []
         routes = self.live_routes(converged_row(ROLL_ID, PROD_IMAGE))
 
         def listing():
-            reads["listing"] += 1
-            if reads["listing"] == 1:
+            now = time.monotonic()
+            if not started:
+                started.append(now)
+                return []
+            if now - started[0] < 595.0:
                 return []
             raise base.GateError("rollout_timeout")
 
         routes[f"/containers/applications/{APP_ID}/rollouts?limit=100"] = listing
         result = self.attempt(routes=routes, preflight=True, url=None)
         self.assert_refused(result)
-        code, message, proof, plane, _ = result
+        code, message, proof, plane, clock = result
+        self.assertGreaterEqual(len(clock.sleeps), 100)
         self.assertIn("; image did not converge (awaiting_rollout_listing)",
                       message)
         self.assertIsNone(proof)
@@ -605,20 +613,25 @@ class ColdAndLagServingTests(unittest.TestCase):
 
     def test_non_timeout_gate_error_stays_bare_refusal(self):
         # Every other GateError keeps the byte-identical bare refusal,
-        # even after an unaccepted poll set the wait class.
-        reads = {"listing": 0}
+        # even when raised at the same deadline boundary after unaccepted
+        # polls set the wait class.
+        started = []
         routes = self.live_routes(converged_row(ROLL_ID, PROD_IMAGE))
 
         def listing():
-            reads["listing"] += 1
-            if reads["listing"] == 1:
+            now = time.monotonic()
+            if not started:
+                started.append(now)
+                return []
+            if now - started[0] < 595.0:
                 return []
             raise base.GateError("api_http_failure")
 
         routes[f"/containers/applications/{APP_ID}/rollouts?limit=100"] = listing
         result = self.attempt(routes=routes, preflight=True, url=None)
         self.assert_refused(result)
-        code, message, proof, plane, _ = result
+        code, message, proof, plane, clock = result
+        self.assertGreaterEqual(len(clock.sleeps), 100)
         self.assertEqual(message.strip(),
                          "serving: promoted production identity refused")
         self.assertIsNone(proof)
