@@ -42,7 +42,8 @@ event replays are not detected by this core.
 `PgRoomStore::access_controls(guild)` / `save_access_controls(guild, expected, controls)`
 (migration `0227_voice_access_controls.sql`, table `voice_access_controls`)
 read and replace the whole per-guild row in one upsert. `/import` writes the
-row's `command_roles` too (0469), so the save is a compare-and-swap under the
+whole row too — `settings.creation_enabled`, `settings.command_role_id` and
+`settings.command_roles` are this row's three controls (0469, 0470) — so the save is a compare-and-swap under the
 same per-guild advisory lock as `PgVoiceConfigStore::apply`: when the row no
 longer equals `expected` it refuses (`RowNotFound`, the bot's `Conflict`)
 instead of reverting a confirmed import. No row reads as
@@ -61,7 +62,11 @@ runtime lock, validated by `validate_access_controls`, saved with
 `save_access_controls`, then pushed to the guild's live actor so a creation
 switch applies immediately. A failed read or write changes nothing and says so,
 as does a save that finds an import confirmed since its read. Import Confirm
-takes the same runtime lock.
+takes the same runtime lock and, after a successful apply, pushes the imported
+controls to the live actor the same way, so an imported creation switch also
+applies immediately. An out-of-process writer (the operator CLI) cannot push,
+so the worker's five-minute configuration reload also refreshes its cached
+controls from the same snapshot.
 
 ## Residual parent work
 

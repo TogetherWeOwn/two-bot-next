@@ -1020,7 +1020,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
 
     /// Re-read the guild's naming settings every five minutes, or a minute
     /// after a failed read, so writers other than `/import` (the operator
-    /// CLI) reach automatic names and a transient error does not stick.
+    /// CLI) reach automatic names and a transient error does not stick. The
+    /// same snapshot refreshes the cached access controls: an out-of-process
+    /// writer cannot push `AccessChanged`, so its creation switch lands
+    /// here within the reload interval instead of waiting for a restart.
     pub(super) async fn reload_name_settings(&mut self, now_ms: u64) {
         let interval = if self.name_settings_loaded {
             NAME_SETTINGS_RELOAD_MS
@@ -1103,6 +1106,12 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 self.name_inputs = None;
             }
             self.update_name_settings(NameSettings::from_config(&config));
+            // An unparseable value keeps the cached controls rather than a
+            // half-built set; the snapshot came from the gate's own store,
+            // so this only fails on a hand-edited row.
+            if let Some(controls) = super::import_access_controls(&config) {
+                self.access = controls;
+            }
             self.name_settings_loaded = true;
         }
     }

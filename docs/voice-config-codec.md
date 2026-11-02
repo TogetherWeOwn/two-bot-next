@@ -85,11 +85,18 @@ Further checks, each naming only the field (never the uploaded text):
   case-folded unique keys and no alias chains.
 - **Lists.** At most 100 lists of at most 100 choices; names and choices are
   nonblank, at most 100 characters and free of control characters.
-- **Command roles.** `settings.command_roles[].command` must be an exact entry of
+- **Access gates.** `settings.command_roles[].command` must be an exact entry of
   `voice_access::VOICE_COMMANDS`.
   Apply stores them in `voice_access_controls.command_roles`, the same column
   `/access` writes and the command gate reads, so an imported restriction is
-  enforced and an `/access` restriction is exported. Nothing prunes a role
+  enforced and an `/access` restriction is exported. `settings.creation_enabled`
+  and `settings.command_role_id` are the spec's creation switch and guild-wide
+  command role, so they live in the same row (`room_creation_enabled`,
+  `required_role_id`): an imported switch or role is enforced, and one set with
+  `/access` is exported. Apply still mirrors both into the legacy
+  `voice_guild_settings` columns for the previous binary's `/export`, and a
+  confirmed import hands the saved controls to the live worker so the creation
+  switch applies without a restart. Nothing prunes a role
   Discord deletes from that column, so `/export` first drops role IDs missing
   from the inventory (`drop_deleted_command_roles`) and says how many it left
   out; the restriction itself stays, and an emptied one still denies every
