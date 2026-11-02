@@ -1,9 +1,11 @@
 # Onboarding: persistent game roles on rejoin
 
-Status: **Proposed; design only**. Written 2026-10-26. No code, migrations,
-role writes, settings or runtime tests are added. Merge publishes a proposal,
-not permission to build or to restore any role. This indexed file is the
-editable contract; a future acceptance decision must bind its exact revision.
+Status: **Deferred to 2026-12** (owner decision 2026-11-01). Revisit then, or
+earlier if a host names a need and an M2 slot opens. Original proposal: written
+2026-10-26. No code, migrations, role writes, settings or runtime tests are
+added. Merge publishes a proposal, not permission to build or to restore any
+role. This indexed file is the editable contract; a future acceptance decision
+must bind its exact revision.
 
 ## 1. Decision, alternatives and scope
 

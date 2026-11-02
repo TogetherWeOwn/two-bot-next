@@ -1,10 +1,15 @@
 # RSVP: an optional registration cutoff
 
-Status: **Proposed, design only**. Written 2026-10-26; review by **2026-11-02**.
-No runtime, command, endpoint, schema, permission, migration or deployment change.
-Merge records this proposal, not accepted intent, security disposition or build
-approval. This indexed file is the sole editable contract; the task document
-captures its exact commit and SHA-256, not an independent moving specification.
+Status: **Merged into [RSVP capacity](rsvp-capacity-spec.md)**, deferred to
+2026-12 (owner decision 2026-11-01). That doc is now the single RSVP-policy
+spec; this one stays as the detailed record of its slice. Edit policy there,
+not here: the "sole editable contract" wording in the original proposal text
+below is superseded by this merge. Original proposal:
+written 2026-10-26. No runtime, command, endpoint, schema, permission, migration
+or deployment change. Merge records this proposal, not accepted intent, security
+disposition or build approval. This indexed file is the sole editable contract;
+the task document captures its exact commit and SHA-256, not an independent
+moving specification.
 
 ## 1. User value and no-build comparison
 
@@ -418,8 +423,8 @@ erasure-wide replay fence. The author cannot accept that boundary. Record exact
 file commit/hash and task-document revision for both paths; changed intent needs
 fresh disposition. No new privilege, credential, routine approval hop or spend.
 Later authorized code still needs test-first protected fixtures, exact-head
-required checks and independent Paperclip Review 5/5, controller-managed squash
-auto-merge and normal staging/health/rollback gates; never a manual merge bypass.
+required checks (including CodeRabbit and Devin Review), squash merge by the
+authoring agent and normal staging/health/rollback gates; never a manual merge bypass.
 
 Review by 2026-11-02: metric is 16/16 scenario rows with agreed future assertions
 and explicit intent/security disposition, not registrations or measured demand.

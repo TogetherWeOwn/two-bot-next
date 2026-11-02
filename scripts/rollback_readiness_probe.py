@@ -127,6 +127,35 @@ WHERE t.seq IS NOT NULL;
 """
 
 
+# Strings are skipped whole, so brackets inside them never count. An
+# unterminated string runs to the end, which keeps the scan linear.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
+# CPython's old default recursion limit, which bounded the C JSON decoder.
+MAX_JSON_DEPTH = 1000
+
+
+def _loads_bounded(raw, **kwargs):
+    """json.loads with a lexical nesting bound that raises RecursionError.
+
+    Newer CPython sizes the decoder's recursion guard from the real C stack
+    and decodes 10,000 levels, so the bound no longer depends on the
+    interpreter: existing RecursionError refusals keep working unchanged.
+    """
+    # Decode bytes exactly as json.loads would, then scan and parse that text.
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
+    depth = 0
+    for match in JSON_TOKEN.finditer(raw):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise RecursionError("JSON nesting exceeds the decoder bound")
+        elif token in "]}":
+            depth -= 1
+    return json.loads(raw, **kwargs)
+
+
 class ProbeError(Exception):
     """A check's one-line failure reason."""
 
@@ -162,7 +191,7 @@ def _reject_duplicate_keys(pairs):
 
 def decode_strict(body):
     """Decode JSON while refusing duplicate object keys at any depth."""
-    return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+    return _loads_bounded(body, object_pairs_hook=_reject_duplicate_keys)
 
 
 def is_int(value, low=0, high=I64_MAX):

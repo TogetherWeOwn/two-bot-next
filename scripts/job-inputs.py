@@ -148,7 +148,11 @@ WORKER_PREFIX = "wrangler/"
 # crates/bot/src/ticket_component_admission_acceptance_tests.rs),
 # community-jobs by the exclusion live-keys acceptance (offline verification
 # commands in crates/core/tests/community_exclusion_live_keys_acceptance.rs;
-# its README index control lives in RUST_WORKER_DOCS below).
+# its README index control lives in RUST_WORKER_DOCS below), custom-commands
+# by the custom command lookup outage acceptance
+# (crates/discord/tests/custom_command_lookup_outage_acceptance.rs), and
+# cutover-migration-ledger by the admin token registry acceptance
+# (crates/core/tests/admin_token_registry_acceptance.rs).
 # parity.md and the baseline also gate parity-docs. Existence-only docs
 # (staging-soak/preflight: the preconditions binary checks is_file,
 # never content) and runbook/container-readiness (worker tests only) fall
@@ -174,6 +178,8 @@ RUST_DOCS = frozenset({
     "docs/backup.md",
     "docs/tickets.md",
     "docs/community-jobs.md",
+    "docs/custom-commands.md",
+    "docs/cutover-migration-ledger.md",
 })
 PARITY_DOCS = frozenset({
     "docs/parity.md",
@@ -184,9 +190,13 @@ PARITY_DOCS = frozenset({
 # failure test and read by the worker docs listing assertion, and README.md
 # is pinned by the exclusion live-keys index-discoverability control
 # (crates/core/tests/community_exclusion_live_keys_acceptance.rs) while the
-# worker docs listing assertion owns its directory shape. Edits select both.
+# worker docs listing assertion owns its directory shape, and
+# observability-event-catalog.md is read by the Rust observability
+# conformance and voice boot settings tests and by alert-rules.test.ts.
+# Edits select both.
 RUST_WORKER_DOCS = frozenset({
     "docs/metrics.md",
+    "docs/observability-event-catalog.md",
     "docs/startup-diagnostics.md",
     "docs/README.md",
 })
@@ -231,10 +241,12 @@ WORKER_EXACT = frozenset({
     ".release-please-manifest.json",
     "CONTRIBUTING.md",
 })
-# The Rust shutdown test embeds the live Wrangler config; its edits also run
-# the worker job that validates that config.
+# The Rust shutdown test embeds the live Wrangler config, and the voice
+# assistant credential test reads the container env forwarding list; their
+# edits also run the worker job that owns those files.
 RUST_WORKER_EXACT = frozenset({
     "wrangler/wrangler.toml",
+    "wrangler/src/container-env.ts",
 })
 
 # Image-only inputs: the container selector owns the image build, and the

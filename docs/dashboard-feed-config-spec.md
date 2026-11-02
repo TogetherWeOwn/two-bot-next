@@ -1,12 +1,13 @@
 # Dashboard feed configuration contract
 
-Status: **proposed; design only**, re-inventoried 2026-10-26. Intent review by 2026-10-31.
-No page, signed verb, runtime change, permission, migration, live write or
-activation is implemented or authorized here. This file is the single repository
-source, including the JSON manifest and offline oracle. The separate
-[ticket](dashboard-ticket-config-spec.md) and
-[onboarding/self-role](dashboard-onboarding-self-roles-spec.md) proposals are not
-extended by this change.
+Status: **Deferred to the two-web-next roadmap** (owner decision 2026-11-01).
+Build the bot half only when a two-web-next goal claims this page. Original
+proposal: re-inventoried 2026-10-26. No page, signed verb, runtime change,
+permission, migration, live write or activation is implemented or authorized
+here. This file is the single repository source, including the JSON manifest and
+offline oracle. The separate [ticket](dashboard-ticket-config-spec.md) and
+[onboarding/self-role](dashboard-onboarding-self-roles-spec.md) proposals are
+not extended by this change.
 
 ## Decision
 

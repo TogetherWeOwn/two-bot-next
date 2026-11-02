@@ -1,10 +1,12 @@
 # LFG signup reminders: one quiet pre-start heads-up
 
-Status: **proposed, design only**. Written 2026-10-26; review by **2026-11-02**.
-**Choose no build now.** This proposal adds no commands, sends, schedules,
-preferences, migrations or runtime behavior. Merge records a design, not
-acceptance, host consent, security disposition or activation. This is the sole
-editable repo spec; decision records must bind its exact commit and SHA-256.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-26. **Choose no build now.** This proposal adds no commands, sends,
+schedules, preferences, migrations or runtime behavior. Merge records a design,
+not acceptance, host consent, security disposition or activation. This is the
+sole editable repo spec; decision records must bind its exact commit and
+SHA-256.
 
 ## 1. Decision, evidence and alternatives
 

@@ -1,10 +1,11 @@
 # Feeds: a bounded private sample before saving
 
-Status: **proposed, design only**. Written 2026-10-25; review by 2026-10-31.
-No executable surface, live fetch experiment, database/Discord mutation,
-credential, service, spend or runtime activation. Merge publishes a proposal,
-not a build grant. This file is the single repository contract; the issue
-spec binds its exact commit and SHA-256, not a moving branch.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-25. No executable surface, live fetch experiment, database/Discord
+mutation, credential, service, spend or runtime activation. Merge publishes a
+proposal, not a build grant. This file is the single repository contract; the
+issue spec binds its exact commit and SHA-256, not a moving branch.
 
 ## 1. Decision and value still to validate
 
@@ -326,8 +327,8 @@ prove quotas, cancellation, peak heap, safe rendering or zero effects.
 circulation of the bounded candidate, **not approval of our own capability
 request**. An independent authorized boundary decision must cover outbound
 abuse/rate, sole-owner enforcement, cancellation/CPU/heap and title-only value
-before any build card; independent exact-head Paperclip Review 5/5 and CI are
-separate gates, never replaced by this document.
+before any build card; exact-head `ci-ok`, `gitleaks`, `pr-lint`, CodeRabbit and
+Devin Review are separate gates, never replaced by this document.
 
 Request CEO acceptance and actual guild-host intent alignment through the
 President/COO, bound to the issue spec revision plus this file's commit and

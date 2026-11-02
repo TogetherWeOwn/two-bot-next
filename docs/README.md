@@ -127,7 +127,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Reuse](lfg-reuse-spec.md)
 - [Threads](lfg-thread-spec.md)
 - [LFG voice](lfg-voice-room-spec.md)
-- [LFG page (design only)](dashboard-lfg-config-spec.md)
+- [LFG page](dashboard-lfg-config-spec.md)
 - [Signup reminder](lfg-reminder-spec.md)
 - [Play-now](lfg-play-now-spec.md)
 - [Feed ops](feed-supervisor.md)

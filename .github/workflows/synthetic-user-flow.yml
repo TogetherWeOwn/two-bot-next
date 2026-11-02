@@ -2,11 +2,12 @@ name: synthetic-user-flow
 
 # Five-minute synthetic on the main user flow (docs/synthetic-user-flow.md):
 # the staging health-contract probe plus a passive production probe, each
-# read-only GETs against its own Worker origin. A probe failure posts one
-# Discord ops-channel alert reusing the Worker alert pattern (build revision
-# plus the GitHub run link). Alerts fire after two consecutive failed probes,
-# once per incident, with a recovery message on the first successful probe
-# after a delivered alert. A decide step writes the event to GITHUB_OUTPUT
+# read-only GETs against its own Worker origin. A probe failure opens one
+# GitHub issue labelled `incident` per env (build revision plus the GitHub run
+# link) through scripts/incident_issue.py; Paperclip turns each open incident
+# issue into an agent task. Alerts fire after two consecutive failed probes,
+# once per incident (a repeat comments on the open issue), and the first
+# successful probe after a delivered alert comments and closes the issue. A decide step writes the event to GITHUB_OUTPUT
 # and the post step runs only when an event is due, so a no-op is skipped
 # (never success): only a successful post counts as delivered in history.
 # A healthy run whose history read failed fails its decide step instead, so
@@ -19,17 +20,18 @@ name: synthetic-user-flow
 # When it runs: every 5 minutes on main, plus manual dispatch. The dispatch
 # `force_fail` input proves the failure-to-alert path without touching prod:
 # it points the staging probe at an unallowlisted origin so the fence refuses
-# (exit 2), the upload tolerates the missing receipt, and the alert posts with
-# unknown build identity plus the run link.
+# (exit 2), the upload tolerates the missing receipt, and the incident issue
+# opens with unknown build identity plus the run link. Dispatches are not
+# scheduled history, so the next healthy scheduled run closes that issue.
 #
 # Operator bindings (never in this file): repository vars STAGING_WORKER_URL
 # and PRODUCTION_WORKER_URL carry the two Worker origins. PRODUCTION_WORKER_URL
 # is the single source for deploy and passive synthetic checks; remove any
-# production Environment override. The `synthetic-alerts` environment secret
-# SYNTHETIC_ALERT_WEBHOOK_URL carries the Discord webhook.
+# production Environment override. Alerts need no secret: the job-scoped
+# GITHUB_TOKEN carries issues: write.
 # Missing target vars fail that job with an error naming the unset variable,
 # so a run with zero probe samples never reads green; an event that needs a
-# notification fails if the webhook is missing or delivery fails.
+# notification fails if the incident issue cannot be written.
 on:
   schedule:
     - cron: '*/5 * * * *'
@@ -52,8 +54,8 @@ jobs:
     permissions:
       actions: read
       contents: read
+      issues: write # open, comment on and close this env's incident issue
     if: github.ref == 'refs/heads/main'
-    environment: synthetic-alerts
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'staging') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
@@ -95,10 +97,10 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/synthetic_alert.py --env staging --evidence "synthetic-staging-$RUN_ID.json" --decide-only
-      - name: Alert the ops channel on incident transition
+      - name: File or close the incident issue on transition
         if: ${{ !cancelled() && steps.decide.outputs.event != '' }}
         env:
-          SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ALERT_EVENT: ${{ steps.decide.outputs.event }}
           RUN_ID: ${{ github.run_id }}
           GIT_SHA: ${{ github.sha }}
@@ -110,8 +112,8 @@ jobs:
     permissions:
       actions: read
       contents: read
+      issues: write # open, comment on and close this env's incident issue
     if: github.ref == 'refs/heads/main'
-    environment: synthetic-alerts
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'prod-passive') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 10
@@ -152,10 +154,10 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/synthetic_alert.py --env prod --evidence "synthetic-prod-$RUN_ID.json" --decide-only
-      - name: Alert the ops channel on incident transition
+      - name: File or close the incident issue on transition
         if: ${{ !cancelled() && steps.decide.outputs.event != '' }}
         env:
-          SYNTHETIC_ALERT_WEBHOOK_URL: ${{ secrets.SYNTHETIC_ALERT_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ALERT_EVENT: ${{ steps.decide.outputs.event }}
           RUN_ID: ${{ github.run_id }}
           GIT_SHA: ${{ github.sha }}

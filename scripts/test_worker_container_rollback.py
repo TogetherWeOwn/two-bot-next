@@ -976,6 +976,19 @@ class PostStatusTests(unittest.TestCase):
             self.client(202).post("/x", {})
         self.assertEqual(str(raised.exception), "api_http_failure")
 
+    def test_deeply_nested_error_body_fails_closed_without_a_traceback(self):
+        body = io.BytesIO(b"[" * (base.MAX_JSON_DEPTH + 1))
+        error = base.HTTPError("https://api.invalid/x", 500, "boom", {}, body)
+
+        def refuse(_self, request, timeout):
+            raise error
+
+        client = rollback.RollbackClient(ACCOUNT, "token")
+        client.opener = type("Opener", (), {"open": refuse})()
+        with self.assertRaises(base.GateError) as raised:
+            client.post("/x", {})
+        self.assertEqual(str(raised.exception), "api_http_failure")
+
 
 class ControlFenceHintTests(unittest.TestCase):
     FENCED = ("Singleton is intentionally fenced or uninitialized; "
