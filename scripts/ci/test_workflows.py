@@ -3072,7 +3072,7 @@ def staging_active_errors(workflow):
 # Pinned build image shared with the migration plan jobs (same runner
 # binary, same toolchain). A digest bump must move all consumers together.
 SCHEMA_GATE_IMAGE = ("rust:1.99-trixie@sha256:"
-                     "931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc")
+                     "09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137")
 
 
 def schema_gate_errors(workflow, name="deploy-staging.yml"):
@@ -4121,7 +4121,7 @@ BOOKWORM_JOBS = {
     "pipeline-benchmark.yml": ("benchmark",),
 }
 BOOKWORM_IMAGE = ("rust:1.99-bookworm@sha256:"
-                  "e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c")
+                  "9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b")
 CACHE_JOBS = {"nightly.yml": ("sweep", "nightly-cargo"),
               "pipeline-benchmark.yml": ("benchmark", "pipeline-bench")}
 CACHE_PATHS = "~/.cargo/registry\n~/.cargo/git\ntarget\n"

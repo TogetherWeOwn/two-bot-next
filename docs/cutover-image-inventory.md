@@ -20,7 +20,7 @@ that main head, described under Measured sample image.
 
 | Stage | Reference (pinned) | OS | Purpose |
 |---|---|---|---|
-| builder | `rust:1.99-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc` | Debian 13 (trixie) | Full toolchain; compiles the release binary, then discarded |
+| builder | `rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137` | Debian 13 (trixie) | Full toolchain; compiles the release binary, then discarded |
 | runtime | `gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2` | Debian 13, distroless `cc` | Ships glibc, libgcc, CA trust data and the `nonroot` account (uid/gid 65532); carries only the release binary |
 
 Both stages are Debian 13, so the binary links against the glibc it runs on.

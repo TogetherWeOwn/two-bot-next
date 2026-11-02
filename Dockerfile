@@ -7,7 +7,7 @@
 # Multi-platform manifest digests keep tag names readable for Dependabot while
 # making both stages immutable. The builder and distroless runtime are both
 # Debian 13 (trixie), so the binary links against the same glibc it runs on.
-FROM rust:1.99-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc AS builder
+FROM rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137 AS builder
 
 WORKDIR /app
 

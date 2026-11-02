@@ -108,7 +108,7 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'check') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
     container:
-      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       CARGO_TERM_COLOR: always
       # Disk hygiene (same pins as the test lanes): smaller binaries, no incremental artifacts.
@@ -587,7 +587,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       CARGO_TERM_COLOR: always
       TWO_CUSTOM_COMMAND_TEST_CI: "1"
@@ -1083,7 +1083,7 @@ jobs:
     # rides separately in `rust-tests`, so the three fail independently.
     timeout-minutes: 45
     container:
-      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       CARGO_TERM_COLOR: always
       TWO_CUSTOM_COMMAND_TEST_CI: "1"
@@ -1813,7 +1813,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       # Same env as `rust-tests`: disk hygiene pins and CI-service-only settings.
       CARGO_TERM_COLOR: always
@@ -2288,7 +2288,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       # Same env as `rust-tests`: disk hygiene pins and CI-service-only settings.
       CARGO_TERM_COLOR: always
@@ -2719,7 +2719,7 @@ jobs:
     # Each job container has a private service network; never publish a fixed
     # host port on the shared self-hosted runner Docker host.
     container:
-      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     services:
       agent-testdb:
         image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
@@ -2818,7 +2818,7 @@ jobs:
     # A job container resolves service names directly. The test's fixed
     # agent-testdb endpoint cannot fall back to an inherited DATABASE_URL.
     container:
-      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     services:
       agent-testdb:
         image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
@@ -3101,7 +3101,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     services:
       agent-testdb:
         image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
@@ -3188,7 +3188,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
     services:
@@ -3256,7 +3256,7 @@ jobs:
     timeout-minutes: 15
     # Service DNS stays inside this job's network; never publish a shared port.
     container:
-      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     services:
       agent-testdb:
         image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
@@ -3351,7 +3351,7 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'fuzz-compile') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
     container:
-      image: rust:1.99-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       CARGO_TERM_COLOR: always
       CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
