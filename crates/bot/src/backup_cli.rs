@@ -662,8 +662,20 @@ async fn cmd_restore(args: &[String]) -> i32 {
                 || report.translated_voice_command_role_members > 0
             {
                 eprintln!(
-                    "restore: replayed the 0469 translation for {} legacy voice command restriction(s) into voice_access_controls.command_roles ({} guild row(s) added; unknown command names dropped); legacy voice_command_roles tables emptied",
-                    report.translated_voice_command_roles, report.voice_access_controls_added
+                    "restore: replayed the 0469 translation for {} legacy voice command restriction(s) into voice_access_controls.command_roles (unknown command names dropped); legacy voice_command_roles tables emptied",
+                    report.translated_voice_command_roles
+                );
+            }
+            if report.translated_voice_creation_gates > 0 {
+                eprintln!(
+                    "restore: replayed the 0470 translation, tightening the voice creation switch / command role in voice_access_controls for {} guild(s) from voice_guild_settings (legacy columns synced to the enforced values)",
+                    report.translated_voice_creation_gates
+                );
+            }
+            if report.voice_access_controls_added > 0 {
+                eprintln!(
+                    "restore: the voice translations inserted {} voice_access_controls guild row(s)",
+                    report.voice_access_controls_added
                 );
             }
             for (table, cols) in &report.dropped_columns {
@@ -731,6 +743,15 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
         })
     {
         eprintln!("restore: apply replays the 0469 translation, moving legacy voice command restrictions into voice_access_controls.command_roles (unknown command names dropped) and emptying the legacy voice_command_roles tables");
+    }
+    if !contents.manifest.applied_cutover(470)
+        && contents
+            .manifest
+            .tables
+            .iter()
+            .any(|table| table.name == "voice_guild_settings" && table.count > 0)
+    {
+        eprintln!("restore: apply replays the 0470 translation, merging any voice_guild_settings creation switch / command role into voice_access_controls (tighten only) and syncing the legacy columns to the enforced values");
     }
     println!(
         "restore: migrations in dump: {}",
