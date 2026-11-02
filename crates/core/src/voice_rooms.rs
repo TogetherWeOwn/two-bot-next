@@ -1917,6 +1917,16 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         )
         .int_range(0, MAX_USER_LIMIT)]),
         CommandDefinition::new("unlimit", "Remove your room's user limit"),
+        CommandDefinition::new(
+            "room-access-inspect",
+            "See who is blocked, granted and waiting to join your voice room",
+        )
+        .options(vec![CommandOption::new(
+            "page",
+            "Page of a long list (starting at 1)",
+            CommandOptionType::Integer,
+        )
+        .min_value(1)]),
     ]
 }
 
@@ -3077,7 +3087,8 @@ mod tests {
                 "private",
                 "public",
                 "limit",
-                "unlimit"
+                "unlimit",
+                "room-access-inspect"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
@@ -3303,6 +3314,18 @@ mod tests {
             assert_eq!(def.default_member_permissions, None);
             assert!(def.options.is_empty());
         }
+        // `/room-access-inspect` is owner-gated at the handler like
+        // `/private`, so it carries no staff default gate. It publishes
+        // exactly one option, an optional 1-based Integer page: removing
+        // the selector or shifting its minimum must fail here, independent
+        // of the rendered reference docs.
+        assert_eq!(defs[22].name, "room-access-inspect");
+        assert_eq!(defs[22].default_member_permissions, None);
+        assert_eq!(defs[22].options.len(), 1);
+        assert_eq!(defs[22].options[0].name, "page");
+        assert_eq!(defs[22].options[0].kind, CommandOptionType::Integer.as_u8());
+        assert_eq!(defs[22].options[0].required, None);
+        assert_eq!(defs[22].options[0].min_value, Some(1));
         // Merges cleanly alongside the other slices, first-wins.
         // Moderation's `kick` sorts before the voice one, so the shared
         // merge keeps the moderation definition; runtime dispatch (not the

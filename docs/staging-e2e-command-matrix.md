@@ -11,7 +11,7 @@ a matrix row and when this doc drops one.
 
 Scope: 45 built-in slash commands (core + scorecard + automation +
 announcement + moderation — the commands `docs/commands.md` renders ahead of
-the voice set; with the voice gates on it renders 66). No guild was
+the voice set; with the voice gates on it renders 67). No guild was
 touched, no staging secrets used, no credentials created.
 
 Staging env the live suite needs: `TWO_COMMUNITY_SCORECARD=1`,
@@ -107,7 +107,8 @@ ship separately and are untouched here.
 
 - Voice `/create /setup /ping /invite /textchannels /access /reclaim
   /transfer /logging /export /import /position /group /inheritpermissions
-  /defaultlimit /alwaysprivate /kick /name /private /public /limit /unlimit`
+  /defaultlimit /alwaysprivate /kick /name /private /public /limit /unlimit
+  /room-access-inspect`
   (separate `TWO_VOICE` slice; its
   `kick` loses the merge to moderation first-wins — runtime dispatch decides).
   The published voice set is pinned separately by the `voice` section of
