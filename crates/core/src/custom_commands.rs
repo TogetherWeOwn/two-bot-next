@@ -1732,17 +1732,20 @@ mod tests {
         let reserved = reserved_command_names();
         let definitions = router.publish_set(&[]).unwrap();
         let published: HashSet<_> = definitions.iter().map(|def| def.name.clone()).collect();
-        // `templateassistant` and `lockdown-preview` are unpublished until
-        // their slices land, but the names stay squatted: reservations cover
-        // the publish set plus exactly those two held names. Capacity math
-        // counts only the publishable set, so unused slots keep accepting
-        // custom commands; the held names rejoin the budget when published.
+        // `templateassistant`, `lockdown-preview`, and `automod-preview` are
+        // unpublished until their slices land, but the names stay squatted:
+        // reservations cover the publish set plus exactly those three held
+        // names. Capacity math counts only the publishable set, so unused
+        // slots keep accepting custom commands; the held names rejoin the
+        // budget when published.
         assert!(published.is_subset(&reserved));
-        assert_eq!(reserved.len(), published.len() + 2);
+        assert_eq!(reserved.len(), published.len() + 3);
         assert!(reserved.contains("templateassistant"));
         assert!(reserved.contains("lockdown-preview"));
+        assert!(reserved.contains("automod-preview"));
         assert!(!published.contains("templateassistant"));
         assert!(!published.contains("lockdown-preview"));
+        assert!(!published.contains("automod-preview"));
         assert_eq!(
             validate_put_input(&put_input("templateassistant"), &reserved),
             Err(CommandError::ReservedName("templateassistant".to_owned()))
@@ -1750,6 +1753,10 @@ mod tests {
         assert_eq!(
             validate_put_input(&put_input("lockdown-preview"), &reserved),
             Err(CommandError::ReservedName("lockdown-preview".to_owned()))
+        );
+        assert_eq!(
+            validate_put_input(&put_input("automod-preview"), &reserved),
+            Err(CommandError::ReservedName("automod-preview".to_owned()))
         );
         assert_eq!(publishable_builtin_names(), published);
         let capacity = max_custom_commands(published.len());
