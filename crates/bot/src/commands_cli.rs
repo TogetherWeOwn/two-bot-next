@@ -591,9 +591,9 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 46 all-gate builtins: 7 core + 1 scorecard + 13 automation
+            // 47 all-gate builtins: 7 core + 1 scorecard + 14 automation
             // + 12 announcements + 9 moderation mutations + 4 private reads.
-            46
+            47
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
