@@ -1276,9 +1276,16 @@ async fn settled_decisions_reach_the_global_outcome_counters() {
 
 /// Slice 3d (spec §5.0): the preview handle reads the shared runtime under
 /// its lock and releases it synchronously — no executor, ledger, or facts
-/// call, and a second read sees the same live state.
-#[test]
-fn preview_handle_reads_live_runtime_without_mutation() {
+/// call, and a second read sees the same live state. Runs on a Tokio runtime
+/// (like every other test in this file) because building the real executor
+/// spawns twilight's rate-limit reactor, which requires a runtime context
+/// even though the preview path never sends.
+///
+/// Correction (CI, 2026-11-02): plain #[test] panics with "there is no
+/// reactor running" at executor construction; #[tokio::test] fixes it with
+/// no body change.
+#[tokio::test]
+async fn preview_handle_reads_live_runtime_without_mutation() {
     // Loopback origin satisfies send admission at build time; the preview
     // handle never touches the executor, so no request is ever sent.
     let activation = AutomodActivation::new(
