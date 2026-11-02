@@ -258,7 +258,8 @@ These skips keep it green while deploying nothing:
   staging run cannot downgrade production (intentional downgrades stay an
   explicit operator rollback, which also serves the older container image).
 
-A skipped promotion also runs the **`production promotion skipped (<reason>)`**
+A guard skip or a pre-deploy recheck skip also runs the
+**`production promotion skipped (<reason>)`**
 job, emits a warning, and uploads the JSON artifact
 `production-promotion-skipped-<run_id>-<run_attempt>`. Its receipt contains
 `outcome: "skipped"`, `reason`, the target `sha`, `run_id` and `run_attempt`;
