@@ -43,7 +43,7 @@ RUN cargo build --release --locked
 
 # The runtime base already ships Debian trust data (ca-certificates) and the
 # nonroot account (uid/gid 65532, home /home/nonroot); nothing is installed.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1 AS runtime
 
 # Non-secret build provenance (main #137/#156), recorded as image labels.
 ARG BOT_BUILD_REVISION=unknown
