@@ -10,10 +10,11 @@ use sqlx::PgPool;
 use crate::automation_transfer::{diff_import, ImportOutcome, ParsedImport};
 use crate::custom_command_store as store;
 use crate::custom_commands::{
-    adjudicate_delete, adjudicate_put, adjudicate_toggle, builtin_command_names, check_capacity,
-    error_code, require_automations_enabled, reserved_command_names, validate_put_input,
-    validate_toggle_enable, AuditRecord, CommandError, DeleteDecision, PutCommandInput,
-    PutDecision, StoredCommand, ToggleDecision,
+    adjudicate_delete, adjudicate_edit, adjudicate_put, adjudicate_toggle, builtin_command_names,
+    check_capacity, error_code, require_automations_enabled, reserved_command_names, validate_edit,
+    validate_put_input, validate_toggle_enable, AuditRecord, CommandError, DeleteDecision,
+    EditDecision, EditOutcome, EditPatch, PutCommandInput, PutDecision, StoredCommand,
+    ToggleDecision, TriggerPatch,
 };
 use crate::leveling::valid_command_name;
 
@@ -180,6 +181,77 @@ pub async fn set_enabled(
     );
     // The guards above prove a real flip, which always audits.
     let audit = decision.audit.as_ref().expect("changed toggle audits");
+    store::audit(&mut *tx, audit, request.audit_id, request.at).await?;
+    tx.commit().await?;
+    Ok(decision)
+}
+
+/// One `/command-edit` request: the lowercased admin name, the patch, and
+/// the audit identity the caller supplies (one interaction ID and one
+/// timestamp, like `put`).
+pub struct EditRequest<'a> {
+    pub guild: &'a str,
+    pub actor: &'a str,
+    pub name: &'a str,
+    pub patch: &'a EditPatch,
+    pub audit_id: &'a str,
+    pub at: &'a str,
+}
+
+/// Patch one saved definition in place. The row is read under the guild
+/// lock, so omitted fields, creator, enabled state and concurrent changes
+/// are preserved from the freshly committed row, never from a stale read.
+/// The complete merged definition passes the `/command` write rules and
+/// trigger ownership (disabled siblings still own theirs) before any write.
+/// Like `set_enabled`, refusals, misses and no-ops are zero-write: no audit
+/// fact, no timestamp touch, no republish. Only a real change and its
+/// content-free audit fact commit together, so a failed audit rolls the patch
+/// back. Callers publish after commit; a Discord failure must not claim the
+/// write rolled back.
+pub async fn edit(
+    pool: &PgPool,
+    automations: bool,
+    request: &EditRequest<'_>,
+) -> Result<EditDecision, ServiceError> {
+    require_automations_enabled(automations)?;
+    let reserved = reserved_command_names();
+    if !valid_command_name(request.name) {
+        return Err(CommandError::InvalidName.into());
+    }
+    if reserved.contains(request.name) {
+        return Err(CommandError::ReservedName(request.name.to_owned()).into());
+    }
+    let mut tx = pool.begin().await?;
+    store::lock_command_capacity(&mut tx, request.guild).await?;
+    let existing = store::get_command(&mut *tx, request.guild, request.name).await?;
+    let decision = adjudicate_edit(
+        request.guild,
+        request.actor,
+        request.name,
+        existing.as_ref(),
+        request.patch,
+    );
+    let (EditOutcome::Changed, Some(row)) = (decision.outcome, existing.as_ref()) else {
+        tx.rollback().await?;
+        return Ok(decision);
+    };
+    let merged = request.patch.apply(row);
+    validate_edit(&merged, request.patch, &reserved, &builtin_command_names())?;
+    if let TriggerPatch::Set(trigger) = &request.patch.text_trigger {
+        let rows = store::list_commands(&mut *tx, request.guild).await?;
+        if rows.iter().any(|other| {
+            other.name != request.name
+                && other
+                    .text_trigger
+                    .as_ref()
+                    .is_some_and(|held| held.eq_ignore_ascii_case(trigger))
+        }) {
+            return Err(ServiceError::TriggerInUse);
+        }
+    }
+    store::update_command_fields(&mut *tx, &merged, request.actor, request.at).await?;
+    // The guards above prove a real change, which always audits.
+    let audit = decision.audit.as_ref().expect("changed edit audits");
     store::audit(&mut *tx, audit, request.audit_id, request.at).await?;
     tx.commit().await?;
     Ok(decision)
