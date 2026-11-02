@@ -1,11 +1,13 @@
 # Dashboard leveling reward configuration
 
-Status: **proposed; design only**, 2026-10-25. Review by 2026-11-01.
-This is the authoritative repository contract, including its offline fixture
-oracle. No page, runtime, schema, permission, activation or production change is
-implemented or authorized. Bot-source baseline:
-`c3af7333df80a766f5d4c229506a3bce53680828`. The separate web project has not been
-inspected; this inventory does not establish whether it already has a page.
+Status: **Deferred to the two-web-next roadmap** (owner decision 2026-11-01).
+Build the bot half only when a two-web-next goal claims this page. Original
+proposal: written 2026-10-25. This is the authoritative repository contract,
+including its offline fixture oracle. No page, runtime, schema, permission,
+activation or production change is implemented or authorized. Bot-source
+baseline: `c3af7333df80a766f5d4c229506a3bce53680828`. The separate web project
+has not been inspected; this inventory does not establish whether it already has
+a page.
 
 ## Decision and alternatives
 

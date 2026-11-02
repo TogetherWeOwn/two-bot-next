@@ -87,8 +87,8 @@ remains distinct from outage-start-to-verified-recovery.
 Secrets are GitHub Actions secrets on the repo and Worker secrets per
 environment. Names only — values never go in cards, logs, or PRs:
 
-- `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` — GitHub Actions secrets,
-  used by `deploy-staging.yml`.
+- `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` — `staging` Environment
+  secrets (no repository-scope copies), used by `deploy-staging.yml`.
 - `DISCORD_TOKEN` — Worker secret (staged with `wrangler versions secret put
   --env staging DISCORD_TOKEN --message <sha>`, then `wrangler versions deploy --env staging`),
   the staging bot token.

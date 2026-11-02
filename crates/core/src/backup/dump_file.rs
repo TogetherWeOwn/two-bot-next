@@ -424,6 +424,18 @@ pub struct DumpManifest {
     /// Which migrations the source had applied, for diagnosing an old backup.
     #[serde(rename = "schemaMigrations")]
     pub schema_migrations: Vec<String>,
+    /// Cutover migration versions (`_sqlx_migrations`, successful rows) the
+    /// source had applied. Absent from archives written before this field
+    /// existed. Restore gates behavior on it: it is how a pre-0469 source —
+    /// whose authoritative voice restrictions still sit in the legacy
+    /// tables — is told apart from a post-0469 one, where the gate's store
+    /// is authoritative and the legacy rows are only a backout mirror.
+    #[serde(
+        rename = "cutoverMigrations",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub cutover_migrations: Vec<i64>,
     /// Source allocator positions. Absent from v3 and from v4 archives written
     /// before marks existed; restore then knows only the restored rows and the
     /// target's own allocators, which cannot see deleted top rows.
@@ -462,6 +474,17 @@ impl SequenceMark {
 }
 
 impl DumpManifest {
+    /// True when the recorded cutover migrations prove the source had
+    /// applied `version`. A later recorded version implies it: the migrator
+    /// applies the chain in order. Archives without recorded evidence
+    /// prove nothing.
+    #[must_use]
+    pub fn applied_cutover(&self, version: i64) -> bool {
+        self.cutover_migrations
+            .iter()
+            .any(|applied| *applied >= version)
+    }
+
     /// The archived position of the allocator feeding `table.column`, if any.
     #[must_use]
     pub fn sequence_mark(&self, table: &str, column: &str) -> Option<&SequenceMark> {
@@ -1175,6 +1198,18 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
     if let Some(marks) = obj.get("sequenceMarks") {
         validate_sequence_marks(marks)?;
     }
+    // Additive like sequenceMarks: archives predating the field omit it, but
+    // a present list must be usable evidence, never silently ignored.
+    if let Some(versions) = obj.get("cutoverMigrations") {
+        let valid = versions.as_array().is_some_and(|versions| {
+            versions
+                .iter()
+                .all(|version| version.as_i64().is_some_and(|version| version >= 0))
+        });
+        if !valid {
+            return Err(refuse("manifest has an invalid cutoverMigrations list"));
+        }
+    }
     let tables = obj
         .get("tables")
         .and_then(Value::as_array)
@@ -1873,6 +1908,41 @@ mod tests {
             .unwrap()
             .get("sequenceMarks")
             .is_none());
+    }
+
+    #[test]
+    fn cutover_migrations_parse_as_restore_evidence() {
+        let mut objs = empty_dump();
+        objs[0]["cutoverMigrations"] = serde_json::json!([467, 468, 469]);
+        let manifest = inspect_bytes(&gzip_lines(&objs)).unwrap().manifest;
+        assert_eq!(manifest.cutover_migrations, vec![467, 468, 469]);
+        assert!(manifest.applied_cutover(469));
+        // Absent evidence (archives predating the field) defaults to none
+        // and is not re-emitted.
+        let manifest = inspect_bytes(&gzip_lines(&empty_dump())).unwrap().manifest;
+        assert!(manifest.cutover_migrations.is_empty());
+        assert!(!manifest.applied_cutover(469));
+        assert!(serde_json::to_value(&manifest)
+            .unwrap()
+            .get("cutoverMigrations")
+            .is_none());
+        for versions in [
+            Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("469"),
+            serde_json::json!(["469"]),
+            serde_json::json!([-1]),
+            serde_json::json!([469.0]),
+            serde_json::json!([null]),
+        ] {
+            let mut objs = empty_dump();
+            objs[0]["cutoverMigrations"] = versions.clone();
+            let err = inspect_bytes(&gzip_lines(&objs)).unwrap_err();
+            assert!(
+                err.to_string().contains("cutoverMigrations"),
+                "{versions}: {err}"
+            );
+        }
     }
 
     #[test]

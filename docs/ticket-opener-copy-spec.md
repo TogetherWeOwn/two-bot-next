@@ -1,10 +1,11 @@
 # Ticket transcript delivery to the opener
 
-Status: **Proposed; design only**. Written 2026-10-26; intent review **not
-before 2026-11-02**. This indexed repository file is the editable contract;
-the task spec records its exact commit and SHA-256. Merge publishes a proposal,
-not permission to build, export content or enable DMs. No code, migrations,
-close-mechanics changes, live reads, new service, spend or activation here.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-26. This indexed repository file is the editable contract; the task spec
+records its exact commit and SHA-256. Merge publishes a proposal, not permission
+to build, export content or enable DMs. No code, migrations, close-mechanics
+changes, live reads, new service, spend or activation here.
 
 ## 1. Decision, alternatives and prior boundary
 

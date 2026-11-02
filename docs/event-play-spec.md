@@ -1,12 +1,13 @@
 # Events: host-written play expectations — Decision
 
-Status: **Decision, design only: no build.** Written 2026-10-27; review
-**2026-11-03**. No product or runtime command is added (section 8 adds only an
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-27. No product or runtime command is added (section 8 adds only an
 offline documentation check); no storage, migration, RSVP field, permission,
 send or runtime test is added, and no outreach, experiment or activation is
-authorized.
-Merge accepts documentation, not host intent or a privacy boundary. This file is
-the single repository contract; review requests bind its commit and SHA-256.
+authorized. Merge accepts documentation, not host intent or a privacy boundary.
+This file is the single repository contract; review requests bind its commit and
+SHA-256.
 
 ## 1. Decision and evidence
 

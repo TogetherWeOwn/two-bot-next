@@ -1,11 +1,13 @@
 # Dashboard giveaway configuration contract
 
-Status: **proposed; design only**. Written 2026-10-26; intent review by
-2026-11-01. This proposal adds no runtime, page, migration, verb, permission,
-live write or activation. Publication is not implementation or production
-approval. This file is the single repository source, including the manifest and
-fixture oracle. It owns no sibling scope: entry/withdrawal, eligibility,
-inspection, preview, audit-export and strict-mode slices keep theirs.
+Status: **Deferred to the two-web-next roadmap** (owner decision 2026-11-01).
+Build the bot half only when a two-web-next goal claims this page. Original
+proposal: written 2026-10-26. This proposal adds no runtime, page, migration,
+verb, permission, live write or activation. Publication is not implementation or
+production approval. This file is the single repository source, including the
+manifest and fixture oracle. It owns no sibling scope: entry/withdrawal,
+eligibility, inspection, preview, audit-export and strict-mode slices keep
+theirs.
 
 ## Decision
 

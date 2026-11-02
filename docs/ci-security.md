@@ -57,13 +57,21 @@ job-container service isolation, per-job grants and nonpersistent checkouts.
 
 The active job retains GitHub environment `staging`. **A YAML environment
 name alone does not create protection rules or scope repository-level secrets.**
-The environment scoping stays in place, and secret placement must remain
-environment-scoped with no unintended fallback:
+The environment scoping stays in place, and secret placement is
+environment-scoped with no repository-level fallback:
 
 - The `staging` environment keeps its approved deployment approval and branch
   restrictions (only approved staging code, normally `main`).
-- `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are environment-scoped, with no
-  unintended repository/organization fallback exposing them to other jobs.
+- `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are stored only as
+  Environment secrets, in `staging` and in `production`; there are no
+  repository-scope copies, so only jobs running in those Environments can
+  read them. The offline regression rejects any job that references the pair
+  without declaring one of those Environments.
+- As an in-file backstop behind the Environment branch policy, each
+  `deploy-staging` Environment job (`schema-gate`, `roles-gate`, `deploy`)
+  fails closed when its workflow ref is not `main`. The refusal is a step in
+  the existing SHA check, not a job condition, so a wrong-ref run goes red
+  instead of skipping silently.
 - The existing deployment/approval principal can still deploy and the
   `STAGING_WORKER_URL` variable resolves in that environment.
 

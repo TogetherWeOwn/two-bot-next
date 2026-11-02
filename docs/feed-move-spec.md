@@ -1,10 +1,11 @@
 # Move a feed relay without moving its history
 
-Status: **proposed, design only**. Written 2026-10-25; review by **2026-11-01**.
-No command, endpoint, schema, permission, live read/write, service or spend is
-introduced. Merge records a proposal, not security acceptance or host intent.
-This is the sole editable repository spec; decision records bind its commit and
-SHA-256. Stop before any implementation or protected-test cards.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-25. No command, endpoint, schema, permission, live read/write, service
+or spend is introduced. Merge records a proposal, not security acceptance or
+host intent. This is the sole editable repository spec; decision records bind
+its commit and SHA-256. Stop before any implementation or protected-test cards.
 
 ## Decision and alternatives
 
