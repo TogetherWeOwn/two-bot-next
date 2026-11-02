@@ -1,12 +1,14 @@
-//! Slice 2: `/automod-preview` command definition + permission row (unpublished).
+//! Slices 2+4: `/automod-preview` command definition + permission row,
+//! staging-scoped publication.
 //!
-//! The definition is pinned here but stays dark until the publication slice:
-//! routed and adjudicated, absent from `publish_set`, reserved against custom
-//! rows. Covers spec §3.1 (options), §4.1 (ManageGuild, router-enforced) and
-//! the T8 permission-matrix shape. Offline only.
+//! The definition is pinned here; since slice 4 it reaches `publish_set`
+//! only for the staging guild's registry (spec §5.0, T18). Routed and
+//! adjudicated everywhere, reserved against custom rows in every guild.
+//! Covers spec §3.1 (options), §4.1 (ManageGuild, router-enforced) and the
+//! T8 permission-matrix shape. Offline only.
 
 use two_bot_core::automod_preview::{
-    automod_preview_definition, AUTOMOD_PREVIEW_ATTACHMENTS_MAX_UTF16,
+    automod_preview_definition, preview_publishable_in, AUTOMOD_PREVIEW_ATTACHMENTS_MAX_UTF16,
     AUTOMOD_PREVIEW_MENTIONS_MAX, AUTOMOD_PREVIEW_TEXT_MAX_UTF16,
 };
 use two_bot_core::command_permissions::command_permission;
@@ -143,12 +145,76 @@ fn routes_for_manage_guild_and_refuses_without() {
 }
 
 #[test]
-fn stays_dark_until_the_publication_slice() {
+fn publishes_only_into_the_staging_guild_registry() {
+    use two_bot_core::automod_runtime::{LIVE_GUILD_ID, STAGING_GUILD_ID};
+
+    let staging: u64 = STAGING_GUILD_ID.parse().expect("staging id parses");
+    let live: u64 = LIVE_GUILD_ID.parse().expect("live id parses");
+    assert!(preview_publishable_in(Some(staging)));
+    assert!(!preview_publishable_in(Some(live)));
+    assert!(!preview_publishable_in(Some(GUILD)));
+    assert!(!preview_publishable_in(None));
+
+    for (guild, present) in [
+        (Some(staging), true),
+        (Some(live), false),
+        (Some(GUILD), false),
+        (None, false),
+    ] {
+        let mut gates = all_on();
+        gates.configured_guild = guild;
+        let set = InteractionRouter::new(gates)
+            .publish_set(&[])
+            .expect("set assembles");
+        assert_eq!(
+            set.iter().any(|def| def.name == "automod-preview"),
+            present,
+            "staging-only publication for configured guild {guild:?}"
+        );
+    }
+    // Moderation off in staging: no moderation set, no preview either.
+    let mut gates = all_on();
+    gates.configured_guild = Some(staging);
+    gates.moderation = false;
+    let set = InteractionRouter::new(gates)
+        .publish_set(&[])
+        .expect("set assembles");
+    assert!(
+        !set.iter().any(|def| def.name == "automod-preview"),
+        "no preview without the moderation set"
+    );
+
+    // Position: last of the moderation set, ahead of any voice names.
+    let mut gates = all_on();
+    gates.configured_guild = Some(staging);
+    let set = InteractionRouter::new(gates)
+        .publish_set(&[])
+        .expect("set assembles");
+    let names: Vec<_> = set.iter().map(|def| def.name.as_str()).collect();
+    let preview = names
+        .iter()
+        .position(|name| *name == "automod-preview")
+        .expect("staging set carries the preview");
+    let recent = names
+        .iter()
+        .position(|name| *name == "moderation-recent")
+        .expect("moderation set intact");
+    assert_eq!(
+        preview,
+        recent + 1,
+        "preview is the last moderation row: {names:?}"
+    );
+    let def = &set[preview];
+    assert_eq!(def, &automod_preview_definition());
+}
+
+#[test]
+fn stays_dark_outside_the_staging_guild() {
     let router = InteractionRouter::new(all_on());
     let set = router.publish_set(&[]).expect("set assembles");
     assert!(
         !set.iter().any(|def| def.name == "automod-preview"),
-        "no published definition while dark"
+        "no published definition outside staging"
     );
     let row = CustomCommand {
         name: "automod-preview".to_owned(),

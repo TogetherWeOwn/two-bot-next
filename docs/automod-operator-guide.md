@@ -102,6 +102,29 @@ swept tracker plus a preserved-decision replay (same-revision retries replay
 the stored IDs/reason code instead of re-running the tracker), not a lost
 message.
 
+## Private verdict preview
+
+Staff with Manage Server can ask `/automod-preview` what a sample text
+would trip under the *current* effective config, without posting it. The
+full contract is the [preview spec](automod-preview-spec.md); what an
+operator needs:
+
+- Answer only: the deciding filter's name (first match, same order as
+  above) plus the deciding setting *name* — never a value, threshold,
+  count, or excerpt. The sample text is memory-only and never appears in
+  the reply, logs, metrics, or audit rows.
+- The command is published only into the staging guild's registry and only
+  answers there; elsewhere (live guild, DMs, automod off) it answers one
+  generic `not_evaluated` line. Sanctions are never predicted.
+- Previews record nothing: they neither build nor break a real repeat
+  streak, and they consume no violation history.
+- Abuse metering: 5 s / hourly / daily per-actor caps plus a shared
+  guild-day cap; refusals are generic and audited content-free in
+  `automation_audit_log`. Thresholds stay inferable by binary search
+  through any honest oracle, so review per-actor counts in the audit
+  stream; fewer than 10 legitimate uses in 30 days, or any probing
+  pattern, removes the command (one unpublish, no state to clean).
+
 ## Corpus management
 
 The offline golden corpus is the change-detector for matcher behavior:
