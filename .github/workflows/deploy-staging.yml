@@ -174,7 +174,9 @@ jobs:
       - name: Deploy SHA must be exact and reachable from main
         env:
           SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          WORKFLOW_REF: ${{ github.ref }}
         run: |
+          [ "$WORKFLOW_REF" = "refs/heads/main" ] || { echo "::error::This job must run from main (workflow ref: $WORKFLOW_REF)" >&2; exit 1; }
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           case "$SOURCE_SHA" in
             *[!0-9a-f]*|'') echo "::error::Deploy SHA must be a full 40-hex commit SHA" >&2; exit 1 ;;
@@ -242,7 +244,9 @@ jobs:
       - name: Deploy SHA must be exact and reachable from main
         env:
           SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          WORKFLOW_REF: ${{ github.ref }}
         run: |
+          [ "$WORKFLOW_REF" = "refs/heads/main" ] || { echo "::error::This job must run from main (workflow ref: $WORKFLOW_REF)" >&2; exit 1; }
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           case "$SOURCE_SHA" in
             *[!0-9a-f]*|'') echo "::error::Deploy SHA must be a full 40-hex commit SHA" >&2; exit 1 ;;
@@ -321,7 +325,9 @@ jobs:
       - name: Deploy SHA must be exact and reachable from main
         env:
           SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          WORKFLOW_REF: ${{ github.ref }}
         run: |
+          [ "$WORKFLOW_REF" = "refs/heads/main" ] || { echo "::error::This job must run from main (workflow ref: $WORKFLOW_REF)" >&2; exit 1; }
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           case "$SOURCE_SHA" in
             *[!0-9a-f]*|'') echo "::error::Deploy SHA must be a full 40-hex commit SHA" >&2; exit 1 ;;

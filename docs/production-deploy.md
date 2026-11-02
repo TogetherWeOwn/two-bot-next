@@ -32,9 +32,10 @@ since Environment settings can drift.
    Environment, so an Environment-scoped value alone is invisible to the guard
    and every `allow_unstaged` dispatch refuses before probing. The deploy job
    refuses when it is unset, not an `https://` URL, or equal to staging.
-3. Optionally add production-scoped `CLOUDFLARE_API_TOKEN` /
-   `CLOUDFLARE_ACCOUNT_ID` secrets. Environment secrets override the
-   repository secrets that staging uses.
+3. Add the `production` Environment secrets `CLOUDFLARE_API_TOKEN` /
+   `CLOUDFLARE_ACCOUNT_ID`. The pair is Environment-scoped (`staging` and
+   `production`) with no repository-scope copies; the production job reads
+   only the `production` copies.
 
 The `sha guard` job refuses every dispatch until the Environment has
 reviewers and a main-only branch policy. `PRODUCTION_AUTO_APPROVE=true`
