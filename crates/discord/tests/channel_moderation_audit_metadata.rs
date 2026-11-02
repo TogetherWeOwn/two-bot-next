@@ -46,7 +46,7 @@ pub mod executor {
 /// two modules have no overlapping item names.
 pub mod lockdown_preview {
     pub use real_core::lockdown_preview::{
-        plan_preview, PreviewError, PreviewSnapshot, RoleSnapshot,
+        plan_preview, PreviewError, PreviewPlan, PreviewSnapshot, RoleSnapshot,
     };
     pub use two_bot_discord::lockdown_preview::{
         cancel_custom_id, confirm_custom_id, parse_preview_custom_id, preview_audit_metadata,

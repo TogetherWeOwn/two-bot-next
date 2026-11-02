@@ -22,7 +22,7 @@ use twilight_model::{
 };
 use two_bot_core::{
     channel_moderation::{self as domain, ChannelOutcome, EveryoneOverwrite, UnlockPlan},
-    lockdown_preview::{plan_preview, PreviewError, PreviewSnapshot, RoleSnapshot},
+    lockdown_preview::{plan_preview, PreviewError, PreviewPlan, PreviewSnapshot, RoleSnapshot},
     router::replies::EXPIRED_COMPONENT_REPLY,
     ChannelAuditRow, ChannelClaim, ChannelClaimTicket, ChannelModerationStore, ComponentHandler,
     ComponentOutcome, HandlerId, InteractionHandler, InteractionRouter, LockdownRecord,
@@ -193,6 +193,51 @@ struct PreviewInputs {
     doc: PreviewChannel,
     roles: Vec<RoleSnapshot>,
     saved: Option<LockdownRecord>,
+}
+
+/// One shared snapshot-plus-plan constructor for the slash preview and the
+/// confirm recheck, so their snapshot fields and `plan_preview` refusal texts
+/// cannot drift apart. A digest mismatch still fails closed at the call site.
+fn snapshot_and_plan(
+    guild_id: u64,
+    channel_id: u64,
+    actor_id: u64,
+    reason: String,
+    inputs: PreviewInputs,
+) -> Result<(PreviewSnapshot, PreviewPlan), ChannelReply> {
+    let snapshot = PreviewSnapshot {
+        guild_id,
+        channel_id,
+        channel_type: inputs.doc.channel_type,
+        parent_id: inputs.doc.parent_id,
+        actor_id,
+        reason,
+        saved_present: inputs.saved.is_some(),
+        saved_generation: inputs
+            .saved
+            .map_or_else(String::new, |record| record.recovery_generation),
+        roles: inputs.roles,
+        overwrites: inputs.doc.overwrites,
+    };
+    let plan = match plan_preview(&snapshot) {
+        Ok(plan) => plan,
+        Err(PreviewError::UnsupportedChannel) => {
+            return Err(ChannelReply::refused(
+                "Lockdown preview supports text and announcement channels only. Nothing was changed.",
+            ));
+        }
+        Err(PreviewError::TooComplex) => {
+            return Err(ChannelReply::refused(
+                "This channel is too complex to preview safely; open the channel permissions screen and use /channel-inspect instead. Nothing was changed.",
+            ));
+        }
+        Err(_) => {
+            return Err(ChannelReply::refused(
+                "Could not verify the live channel permissions; try again shortly. Nothing was changed.",
+            ));
+        }
+    };
+    Ok((snapshot, plan))
 }
 
 impl ChannelModerationRuntime {
@@ -778,52 +823,22 @@ impl ChannelModerationRuntime {
             Ok(inputs) => inputs,
             Err(reply) => return Ok(reply),
         };
-        let PreviewInputs {
-            doc: channel_doc,
-            roles,
-            saved,
-        } = inputs;
         let Some(channel_num) = channel_id.parse::<u64>().ok() else {
             return Ok(ChannelReply::refused(
                 "A guild member and channel are required; try again there.",
             ));
         };
-        let snapshot = PreviewSnapshot {
-            guild_id: guild_id.get(),
-            channel_id: channel_num,
-            channel_type: channel_doc.channel_type,
-            parent_id: channel_doc.parent_id,
-            actor_id: actor.id.get(),
-            reason,
-            saved_present: saved.is_some(),
-            saved_generation: saved.map_or_else(String::new, |record| record.recovery_generation),
-            roles,
-            overwrites: channel_doc.overwrites,
-        };
-        let plan = match plan_preview(&snapshot) {
-            Ok(plan) => plan,
-            Err(PreviewError::UnsupportedChannel) => {
-                return Ok(ChannelReply::refused(
-                    "Lockdown preview supports text and announcement channels only. Nothing was changed.",
-                ));
-            }
-            Err(PreviewError::TooComplex) => {
-                return Ok(ChannelReply::refused(
-                    "This channel is too complex to preview safely; open the channel permissions screen and use /channel-inspect instead. Nothing was changed.",
-                ));
-            }
-            Err(_) => {
-                return Ok(ChannelReply::refused(
-                    "Could not verify the live channel permissions; try again shortly. Nothing was changed.",
-                ));
-            }
-        };
+        let (snapshot, plan) =
+            match snapshot_and_plan(guild_id.get(), channel_num, actor.id.get(), reason, inputs) {
+                Ok(pair) => pair,
+                Err(reply) => return Ok(reply),
+            };
         let expires_at = now.saturating_add(PREVIEW_TTL_SECS);
         let text = render_preview(
             &plan,
             channel_num,
-            channel_doc.channel_type,
-            channel_doc.parent_id,
+            snapshot.channel_type,
+            snapshot.parent_id,
             snapshot.saved_present,
             expires_at,
         );
@@ -1149,37 +1164,15 @@ impl ChannelModerationRuntime {
             Ok(inputs) => inputs,
             Err(reply) => return Ok(reply),
         };
-        let snapshot = PreviewSnapshot {
+        let (_snapshot, plan) = match snapshot_and_plan(
             guild_id,
             channel_id,
-            channel_type: inputs.doc.channel_type,
-            parent_id: inputs.doc.parent_id,
-            actor_id: presser,
-            reason: pending.reason.clone(),
-            saved_present: inputs.saved.is_some(),
-            saved_generation: inputs
-                .saved
-                .map_or_else(String::new, |record| record.recovery_generation),
-            roles: inputs.roles,
-            overwrites: inputs.doc.overwrites,
-        };
-        let plan = match plan_preview(&snapshot) {
-            Ok(plan) => plan,
-            Err(PreviewError::UnsupportedChannel) => {
-                return Ok(ChannelReply::refused(
-                    "Lockdown preview supports text and announcement channels only. Nothing was changed.",
-                ));
-            }
-            Err(PreviewError::TooComplex) => {
-                return Ok(ChannelReply::refused(
-                    "This channel is too complex to preview safely; open the channel permissions screen and use /channel-inspect instead. Nothing was changed.",
-                ));
-            }
-            Err(_) => {
-                return Ok(ChannelReply::refused(
-                    "Could not verify the live channel permissions; try again shortly. Nothing was changed.",
-                ));
-            }
+            presser,
+            pending.reason.clone(),
+            inputs,
+        ) {
+            Ok(pair) => pair,
+            Err(reply) => return Ok(reply),
         };
         if plan.digest != pending.digest {
             // Stale: one refused row pinning the divergence, no mutation at
