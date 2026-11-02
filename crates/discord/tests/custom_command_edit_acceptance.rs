@@ -23,9 +23,10 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use twilight_model::{application::interaction::Interaction, channel::Message, id::Id};
 use two_bot_core::{
     command_permissions::{command_permission, CommandSurface},
-    custom_command_store as store,
+    custom_command_service as service, custom_command_store as store,
     custom_commands::{
-        builtin_command_names, reserved_command_names, AutomationMessageAcceptance, StoredCommand,
+        builtin_command_names, reserved_command_names, AutomationMessageAcceptance, CommandError,
+        EditPatch, StoredCommand, TriggerPatch,
     },
     help::help_text,
     InteractionRouter, RouterGates,
@@ -1342,4 +1343,88 @@ async fn control_existing_command_keeps_full_replacement_defaults_not_patch_sema
         })
     })
     .await;
+}
+
+/// A grandfathered saved `myroom` (written before the voice command was
+/// reserved) stays patchable through `/command-edit`, while a reserved name
+/// with no saved row stays rejected. Mirrors the `put` same-name maintenance
+/// and `set_enabled` resume carve-outs for the edit path.
+#[tokio::test]
+async fn grandfathered_myroom_accepts_partial_edit_while_absent_reserved_name_stays_rejected() {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap required");
+    let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("isolated migrated fixture");
+    store::put_command(
+        db.pool(),
+        &StoredCommand {
+            guild_id: "2222".to_owned(),
+            name: "myroom".to_owned(),
+            description: DESCRIPTION.to_owned(),
+            template: ORIGINAL.to_owned(),
+            text_trigger: Some("!myroom".to_owned()),
+            enabled: true,
+        },
+        "111",
+        "222",
+        "2026-10-01T00:00:00Z",
+        "2026-10-02T00:00:00Z",
+    )
+    .await
+    .expect("seed pre-reservation myroom row");
+    let patched = service::edit(
+        db.pool(),
+        true,
+        &service::EditRequest {
+            guild: "2222",
+            actor: "3333",
+            name: "myroom",
+            patch: &EditPatch {
+                template: Some(CHANGED.to_owned()),
+                description: None,
+                text_trigger: TriggerPatch::Keep,
+            },
+            audit_id: "myroom-partial-edit",
+            at: "2026-10-24T00:00:00Z",
+        },
+    )
+    .await;
+    assert!(
+        patched.is_ok(),
+        "existing myroom accepts a partial edit: {patched:?}"
+    );
+    let row = store::get_command(db.pool(), "2222", "myroom")
+        .await
+        .expect("read patched row")
+        .expect("myroom row survives its own edit");
+    assert_eq!(row.template, CHANGED);
+    assert_eq!(row.description, DESCRIPTION);
+    assert_eq!(row.text_trigger.as_deref(), Some("!myroom"));
+    let absent = service::edit(
+        db.pool(),
+        true,
+        &service::EditRequest {
+            guild: "2222",
+            actor: "3333",
+            name: "rank",
+            patch: &EditPatch {
+                template: Some(CHANGED.to_owned()),
+                description: None,
+                text_trigger: TriggerPatch::Keep,
+            },
+            audit_id: "absent-reserved-edit",
+            at: "2026-10-24T00:00:00Z",
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            absent,
+            Err(service::ServiceError::Validation(
+                CommandError::ReservedName(_)
+            ))
+        ),
+        "reserved name with no saved row stays rejected: {absent:?}"
+    );
+    db.close().await.expect("drop only the owned test database");
 }

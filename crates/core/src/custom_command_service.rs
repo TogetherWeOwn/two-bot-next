@@ -231,16 +231,22 @@ pub async fn edit(
     request: &EditRequest<'_>,
 ) -> Result<EditDecision, ServiceError> {
     require_automations_enabled(automations)?;
-    let reserved = reserved_command_names();
     if !valid_command_name(request.name) {
         return Err(CommandError::InvalidName.into());
-    }
-    if reserved.contains(request.name) {
-        return Err(CommandError::ReservedName(request.name.to_owned()).into());
     }
     let mut tx = pool.begin().await?;
     store::lock_command_capacity(&mut tx, request.guild).await?;
     let existing = store::get_command(&mut *tx, request.guild, request.name).await?;
+    // The additive voice surface must not strand a pre-existing saved myroom.
+    // Same-name maintenance cannot create a collision; voice slash dispatch
+    // still takes precedence when enabled. Fresh writes stay reserved.
+    let mut reserved = reserved_command_names();
+    if existing.is_some() && request.name == "myroom" {
+        reserved.remove("myroom");
+    }
+    if reserved.contains(request.name) {
+        return Err(CommandError::ReservedName(request.name.to_owned()).into());
+    }
     let decision = adjudicate_edit(
         request.guild,
         request.actor,
