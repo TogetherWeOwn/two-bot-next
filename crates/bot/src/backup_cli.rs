@@ -658,13 +658,13 @@ async fn cmd_restore(args: &[String]) -> i32 {
                     report.quarantined_unbans
                 );
             }
-            if report.translated_voice_command_roles > 0
-                || report.translated_voice_command_role_members > 0
-            {
-                eprintln!(
-                    "restore: replayed the 0469 translation for {} legacy voice command restriction(s) into voice_access_controls.command_roles ({} guild row(s) added; unknown command names dropped); legacy voice_command_roles tables emptied",
-                    report.translated_voice_command_roles, report.voice_access_controls_added
-                );
+            for note in voice_translation_notes(
+                report.translated_voice_command_roles,
+                report.translated_voice_command_role_members,
+                report.translated_voice_creation_gates,
+                report.voice_access_controls_added,
+            ) {
+                eprintln!("{note}");
             }
             for (table, cols) in &report.dropped_columns {
                 eprintln!(
@@ -686,6 +686,57 @@ async fn cmd_restore(args: &[String]) -> i32 {
     pool.close().await;
     println!("\nRESTORE VERIFIED");
     0
+}
+
+/// Apply-output lines naming the voice translations a restore replayed, in
+/// migration order. Empty when the archive needed neither replay.
+fn voice_translation_notes(
+    translated_voice_command_roles: u64,
+    translated_voice_command_role_members: u64,
+    translated_voice_creation_gates: u64,
+    voice_access_controls_added: u64,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if translated_voice_command_roles > 0 || translated_voice_command_role_members > 0 {
+        notes.push(format!(
+            "restore: replayed the 0469 translation for {translated_voice_command_roles} legacy voice command restriction(s) into voice_access_controls.command_roles (unknown command names dropped); legacy voice_command_roles tables emptied"
+        ));
+    }
+    if translated_voice_creation_gates > 0 {
+        notes.push(format!(
+            "restore: replayed the 0470 translation, tightening the voice creation switch / command role in voice_access_controls for {translated_voice_creation_gates} guild(s) from voice_guild_settings (legacy columns synced to the enforced values)"
+        ));
+    }
+    if voice_access_controls_added > 0 {
+        notes.push(format!(
+            "restore: the voice translations inserted {voice_access_controls_added} voice_access_controls guild row(s)"
+        ));
+    }
+    notes
+}
+
+/// Dry-run warnings for the voice translations an apply of this archive
+/// would replay, from the manifest alone: the recorded cutover migrations
+/// gate each replay exactly as in `restore()`.
+fn voice_replay_warnings(manifest: &dump_file::DumpManifest) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+    if !manifest.applied_cutover(469)
+        && manifest.tables.iter().any(|table| {
+            (table.name == "voice_command_roles" || table.name == "voice_command_role_members")
+                && table.count > 0
+        })
+    {
+        warnings.push("restore: apply replays the 0469 translation, moving legacy voice command restrictions into voice_access_controls.command_roles (unknown command names dropped) and emptying the legacy voice_command_roles tables");
+    }
+    if !manifest.applied_cutover(470)
+        && manifest
+            .tables
+            .iter()
+            .any(|table| table.name == "voice_guild_settings" && table.count > 0)
+    {
+        warnings.push("restore: apply replays the 0470 translation, merging any voice_guild_settings creation switch / command role into voice_access_controls (tighten only) and syncing the legacy columns to the enforced values");
+    }
+    warnings
 }
 
 fn warn_missing_dump_tables(manifest: &dump_file::DumpManifest) {
@@ -724,13 +775,8 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
     {
         eprintln!("restore: old v3 has no member-ban ownership; apply does not infer acceptance; keep moderation off pending reconciliation");
     }
-    if !contents.manifest.applied_cutover(469)
-        && contents.manifest.tables.iter().any(|table| {
-            (table.name == "voice_command_roles" || table.name == "voice_command_role_members")
-                && table.count > 0
-        })
-    {
-        eprintln!("restore: apply replays the 0469 translation, moving legacy voice command restrictions into voice_access_controls.command_roles (unknown command names dropped) and emptying the legacy voice_command_roles tables");
+    for warning in voice_replay_warnings(&contents.manifest) {
+        eprintln!("{warning}");
     }
     println!(
         "restore: migrations in dump: {}",
@@ -1713,6 +1759,71 @@ mod tests {
     #[test]
     fn admission_query_guard_redacts_dependency_logs() {
         crate::admission_test_support::run_probe("backup_cli::tests::admission_query_guard_child");
+    }
+
+    #[test]
+    fn voice_translation_notes_name_each_replay() {
+        use super::voice_translation_notes;
+        assert!(voice_translation_notes(0, 0, 0, 0).is_empty());
+        // Member rows consumed on their own still name the 0469 replay.
+        let notes = voice_translation_notes(0, 2, 0, 0);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("0469"), "{notes:?}");
+        let notes = voice_translation_notes(4, 3, 3, 2);
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert!(
+            notes[0].contains("0469 translation for 4 legacy"),
+            "{notes:?}"
+        );
+        assert!(
+            notes[1].contains("0470 translation") && notes[1].contains("for 3 guild(s)"),
+            "{notes:?}"
+        );
+        assert!(
+            notes[2].contains("inserted 2 voice_access_controls"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn voice_replay_warnings_follow_the_evidence_gates() {
+        use super::dump_file::{DumpManifest, DumpTableInfo, DUMP_VERSION};
+        use super::voice_replay_warnings;
+        let manifest = |cutover: Vec<i64>, tables: Vec<(&str, u64)>| DumpManifest {
+            kind: "manifest".to_owned(),
+            version: DUMP_VERSION,
+            created_at: String::new(),
+            tables: tables
+                .into_iter()
+                .map(|(name, count)| DumpTableInfo {
+                    name: name.to_owned(),
+                    columns: Vec::new(),
+                    column_types: Vec::new(),
+                    count,
+                })
+                .collect(),
+            events_sequence: 0,
+            schema_migrations: Vec::new(),
+            cutover_migrations: cutover,
+            sequence_marks: Vec::new(),
+        };
+        let legacy = vec![("voice_command_roles", 1), ("voice_guild_settings", 1)];
+        // No recorded evidence: apply would replay both, fail-closed.
+        let warnings = voice_replay_warnings(&manifest(vec![], legacy.clone()));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("0469"), "{warnings:?}");
+        assert!(warnings[1].contains("0470"), "{warnings:?}");
+        // Between 0469 and 0470 only the 0470 replay remains.
+        let warnings = voice_replay_warnings(&manifest(vec![469], legacy.clone()));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("0470"), "{warnings:?}");
+        // Post-0470 archives and empty legacy tables warn about neither.
+        assert!(voice_replay_warnings(&manifest(vec![470], legacy)).is_empty());
+        assert!(voice_replay_warnings(&manifest(
+            vec![],
+            vec![("voice_command_roles", 0), ("voice_guild_settings", 0)],
+        ))
+        .is_empty());
     }
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};

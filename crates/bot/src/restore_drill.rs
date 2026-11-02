@@ -131,6 +131,7 @@ async fn restore_fresh(
             "missing_member_ban_ownership": report.missing_member_ban_ownership,
             "translated_voice_command_roles": report.translated_voice_command_roles,
             "translated_voice_command_role_members": report.translated_voice_command_role_members,
+            "translated_voice_creation_gates": report.translated_voice_creation_gates,
             "voice_access_controls_added": report.voice_access_controls_added,
         }))
     }

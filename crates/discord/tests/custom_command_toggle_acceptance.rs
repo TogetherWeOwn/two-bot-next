@@ -900,14 +900,14 @@ async fn toggle_paused_trigger_remains_owned_and_existing_replacement_semantics_
 async fn toggle_at_capacity_can_resume_existing_definition_but_cannot_add_another() {
     let f = Fixture::new(false).await;
     // Independent pin: customs fill the guild ceiling around the live
-    // publishable set (68 published; 2 more squatted but unpublished). The
+    // publishable set (69 published; 2 more squatted but unpublished). The
     // fixture already stores `faq` and `other`; peers fill the rest of the
     // budget. Disabled rows count toward storage, not just picker entries.
     let reserved = reserved_command_names();
     assert_eq!(
         reserved.len(),
-        70,
-        "70 reserved names pin the oracle: 68 published +2 held"
+        71,
+        "71 reserved names pin the oracle: 69 published +2 held"
     );
     let capacity = max_custom_commands(publishable_builtin_names().len());
     for index in 2..capacity {
@@ -1463,8 +1463,8 @@ async fn toggle_control_existing_replace_and_remove_are_not_repurposed() {
 // below exercises the stranded-over-budget path.
 const STRANDED_CATALOG_ROWS: usize = 33;
 const STRANDED_CATALOG_PLUS_ONE: usize = 34;
-const EXPECTED_BUILTINS_WITHOUT_VOICE: usize = 45;
-const EXPECTED_BUILTINS_WITH_VOICE: usize = 68;
+const EXPECTED_BUILTINS_WITHOUT_VOICE: usize = 46;
+const EXPECTED_BUILTINS_WITH_VOICE: usize = 69;
 const EXPECTED_GUILD_LIMIT: usize = 100;
 
 fn bulk_name(index: usize) -> String {
@@ -1683,7 +1683,7 @@ fn all_enabled_publication_withholds_custom_overflow_with_voice_off_and_on() {
         let off_full = off
             .publish_set(&bulk_custom_commands(33))
             .expect("off 33 fits");
-        assert_eq!(off_full.len(), 78, "45+33=78 assistant={assistant}");
+        assert_eq!(off_full.len(), 79, "46+33=79 assistant={assistant}");
         let on = InteractionRouter::new(all_enabled_gates(true, assistant));
         let on_builtins = on.publish_set(&[]).expect("on assembles");
         assert_eq!(
@@ -1697,7 +1697,7 @@ fn all_enabled_publication_withholds_custom_overflow_with_voice_off_and_on() {
                 .any(|definition| definition.name == "templateassistant"),
             "assistant stays unpublished assistant={assistant}"
         );
-        // 68 builtins + 33 customs no longer fit: publication withholds the
+        // 69 builtins + 33 customs no longer fit: publication withholds the
         // last custom in store order instead of failing the whole sync.
         let on_full = on
             .publish_set(&bulk_custom_commands(33))
@@ -1710,7 +1710,7 @@ fn all_enabled_publication_withholds_custom_overflow_with_voice_off_and_on() {
         );
         assert!(
             !on_names.contains(&"zzbulk32"),
-            "68+33=101 withholds the last custom assistant={assistant}"
+            "69+33=102 withholds the last custom assistant={assistant}"
         );
         let overflow = on
             .publish_set(&bulk_custom_commands(34))
@@ -1723,7 +1723,7 @@ fn all_enabled_publication_withholds_custom_overflow_with_voice_off_and_on() {
         let overflow_names: Vec<_> = overflow.iter().map(|def| def.name.as_str()).collect();
         assert!(
             !overflow_names.contains(&"zzbulk32") && !overflow_names.contains(&"zzbulk33"),
-            "68+34=102 withholds two customs assistant={assistant}"
+            "69+34=103 withholds two customs assistant={assistant}"
         );
     }
 }

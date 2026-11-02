@@ -126,13 +126,17 @@ fn reply_to(request: &RestRequest, remaining_failures: &AtomicUsize) -> Scripted
                 request.path == format!("/api/v10/applications/1111/guilds/{guild}/commands")
             }) =>
         {
-            if remaining_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-            {
-                return ScriptedResponse::status(403);
+            let mut remaining = remaining_failures.load(Ordering::SeqCst);
+            while let Some(next) = remaining.checked_sub(1) {
+                match remaining_failures.compare_exchange_weak(
+                    remaining,
+                    next,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => return ScriptedResponse::status(403),
+                    Err(actual) => remaining = actual,
+                }
             }
             let mut receipt = body(request);
             for (index, command) in receipt

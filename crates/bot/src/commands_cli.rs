@@ -591,9 +591,9 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 45 all-gate builtins: 7 core + 1 scorecard + 12 automation
+            // 46 all-gate builtins: 7 core + 1 scorecard + 13 automation
             // + 12 announcements + 9 moderation mutations + 4 private reads.
-            45
+            46
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
@@ -727,7 +727,7 @@ mod tests {
                     }
                     let definitions =
                         desired_definitions(2222, &env).expect("desired registry assembles");
-                    for name in ["command-inspect", "giveaway"] {
+                    for name in ["command-inspect", "command-edit", "giveaway"] {
                         assert_eq!(
                             definitions.iter().filter(|def| def.name == name).count(),
                             usize::from(automations == Some("1")),

@@ -191,10 +191,34 @@ remaining gateway/accepted-prefix work:
    records the same resync marker as a define; a repeated state never
    claims the picker repaired, and no reply advises a restart, a delete
    or repeating the toggle.
+10. `/command-edit name:<name>` corrects one saved definition in place, unlike
+   `/command`, which still replaces the whole definition with its defaults
+   (description `Custom command`, no trigger). Optional `template`,
+   `description` and `text-trigger` replace only what is supplied; every
+   omitted field, the creator, the enabled flag and the command identity are
+   kept, so a disabled definition stays disabled. `clear-trigger:true` is the
+   only way to remove the text trigger; `clear-trigger:false` does nothing, an
+   empty `text-trigger` is invalid, and `text-trigger` with `clear-trigger:true`
+   is a contradiction. A forged type, a duplicate or an unknown option refuses
+   before any store read, and the Manage Server and automation checks run
+   before any parsing. The row is re-read under the guild lifecycle lock, so a
+   concurrent change to another field survives, and the complete merged
+   definition must pass the `/command` write rules: an invalid saved template
+   refuses even when the edit did not touch it. A newly supplied trigger may
+   not name a built-in and may not be held by any other command, including a
+   disabled one. The patch commits with one content-free `command.edit` audit
+   fact (no field names or text); a failed write or audit rolls both back.
+   A missing name, a value identical to the saved one and an empty patch are
+   zero-write: no audit fact, no timestamp touch, no republish. A real change
+   republishes the full registry once. A failed publication reports
+   saved-but-pending, records the same resync marker as a define and
+   resyncs automatically on the next successful full-set publication, with no
+   advice to restart or repeat the edit.
+   Confirmations are private and mention-safe and never echo saved text.
 
 ## Pending registry resync
 
-A define, remove or toggle commits its saved definition (and its one audit
+A define, edit, remove or toggle commits its saved definition (and its one audit
 fact) before the full registry is republished. If that publication fails —
 for example Discord refuses the replace-all PUT during an outage — the
 picker would otherwise stay stale until a restart. Instead, the failed
@@ -205,7 +229,7 @@ idempotent, so repeated failures keep exactly one pending row.
 
 The private confirmation names both halves of the outcome truthfully — the
 definition is saved, synchronization is pending and will resync
-automatically on the next publication — and never advises restarting the
+automatically on the next successful full-set publication — and never advises restarting the
 bot, deleting the definition or repeating the mutation (a repeated toggle
 is a no-op that does not republish). The last confirmed discovery snapshot
 does not advance.
