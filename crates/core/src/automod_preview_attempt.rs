@@ -5,18 +5,18 @@
 //! and the sqlx transaction; it calls [`attempt_preview`] with those pieces
 //! so the redelivery protocol lives in one reviewable function, not prose:
 //!
-//! 1. [`plan_pre_claim`]: strict
+//! 1. [`plan_pre_claim`][]: strict
 //!    decode and scope gate first. Either refusal answers immediately — no
 //!    lock, no limiter charge, no audit row, and the store is never touched.
 //! 2. [`claim_and_read`](PreviewAttemptStore::claim_and_read): the winner
 //!    takes the transaction-scoped advisory lock and reads the audit id on
 //!    that same connection. Any store error fails closed as unavailable with
 //!    `metric_unavailable` — never an unlocked evaluation.
-//! 3. [`plan_post_claim`]: a
+//! 3. [`plan_post_claim`][]: a
 //!    committed row replays byte-identical with no limiter charge, no
 //!    evaluation, and no new metric (the winner already counted it); no row
 //!    goes fresh.
-//! 4. [`plan_fresh`]: only
+//! 4. [`plan_fresh`][]: only
 //!    `RateLimited` refuses, evaluating nothing; `Admit` and the idempotent
 //!    `ReplayDuplicate` evaluate exactly once via the caller's closure.
 //! 5. The winner inserts the commit bundle and commits **before any verdict
