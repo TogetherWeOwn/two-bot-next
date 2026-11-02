@@ -538,6 +538,64 @@ class LibtestOptionArityTests(NoexecAcceptanceBase):
                 self.assert_stable(command, "EMPTY_SELECTION")
 
 
+class CargoTargetFlagArityTests(NoexecAcceptanceBase):
+    """Refuse repeated Cargo target flags pinned Cargo rejects outright."""
+
+    # Pinned Cargo 1.98.1 exits before running any test with "the argument
+    # '--lib' cannot be used multiple times" (identical for --tests and
+    # --all-targets). The validator must fail closed with UNSUPPORTED rather
+    # than union the duplicate selector away.
+    REPEATED_LIB = (
+        "-p demo --lib --lib alpha_test",
+        "-p demo --lib alpha_test --lib",
+    )
+    REPEATED_TESTS = (
+        "-p demo --tests --tests alpha_test",
+        "-p demo --tests alpha_test --tests",
+    )
+    REPEATED_ALL_TARGETS = (
+        "-p demo --all-targets --all-targets alpha_test",
+        "-p demo --all-targets alpha_test --all-targets",
+    )
+
+    def test_repeated_lib_is_unsupported(self):
+        for command in self.REPEATED_LIB:
+            with self.subTest(command=command):
+                self.assert_stable(command, "UNSUPPORTED")
+
+    def test_repeated_tests_is_unsupported(self):
+        for command in self.REPEATED_TESTS:
+            with self.subTest(command=command):
+                self.assert_stable(command, "UNSUPPORTED")
+
+    def test_repeated_all_targets_is_unsupported(self):
+        for command in self.REPEATED_ALL_TARGETS:
+            with self.subTest(command=command):
+                self.assert_stable(command, "UNSUPPORTED")
+
+    def test_target_flag_refusals_are_row_scoped_stable_and_actionable(self):
+        commands = (
+            self.REPEATED_LIB + self.REPEATED_TESTS
+            + self.REPEATED_ALL_TARGETS
+        )
+        for index, command in enumerate(commands, 1):
+            entry_id = f"s9-cargo-{index:02d}"
+            with self.subTest(entry=entry_id, command=command):
+                self.assert_stable(command, "UNSUPPORTED", entry_id=entry_id)
+
+    def test_distinct_targets_and_repeatable_test_selectors_keep_resolving(self):
+        # Distinct target flags stay combinable; `--test <name>` remains
+        # repeatable for multiple integration targets.
+        for command in (
+            "-p demo --lib alpha_test",
+            "-p demo --tests alpha_test",
+            "-p demo --all-targets alpha_test",
+            "-p demo --lib --tests alpha_test",
+        ):
+            with self.subTest(command=command):
+                self.assert_accepts(command)
+
+
 class IgnoredSelectionTests(NoexecAcceptanceBase):
     """Effective selection honors ignore mode; empty executable fails."""
 

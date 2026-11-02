@@ -384,6 +384,22 @@ class AutomatedVerificationTests(unittest.TestCase):
         check_verification(
             "row", WRAPPED + "-p demo --features db --lib tests::unit", self.root)
 
+    def test_cargo_target_flags_reject_repeats(self):
+        # Pinned Cargo 1.98.1 rejects `--lib --lib` (and the same for
+        # `--tests`/`--all-targets`) with "cannot be used multiple times"
+        # before running any test; the validator must fail closed with
+        # UNSUPPORTED. Distinct target flags stay combinable and `--test`
+        # stays repeatable for multiple integration targets.
+        for command in (
+            WRAPPED + "-p demo --lib --lib tests::unit",
+            WRAPPED + "-p demo --tests --tests tests::unit",
+            WRAPPED + "-p demo --all-targets --all-targets tests::unit",
+        ):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(ValueError, "^row: UNSUPPORTED"):
+                    check_verification("row", command, self.root)
+        check_verification("row", WRAPPED + "-p demo --lib tests::unit", self.root)
+
 
 class DeltaChecklistTests(unittest.TestCase):
     """Parity §12 additions and §13 non-dropped ledger rows (B4 gate)."""

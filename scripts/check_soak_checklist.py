@@ -416,6 +416,7 @@ def check_cargo_test(args, root, packages):
     names, selectors, filters, skips = [], [], [], []
     exact, ignored_only, include_ignored, libtest = False, False, False, False
     test_threads_seen = False
+    seen_cargo_flags = set()
     pre_filters = 0
     words = iter(args[1:])
     for word in words:
@@ -534,6 +535,15 @@ def check_cargo_test(args, root, packages):
                 raise ValueError(
                     f"INVALID_VALUE: flag {option!r} takes no value but got {value!r}; "
                     f"next: drop `={value}` and pass {option} alone")
+            # Pinned Cargo 1.98.1 rejects a repeated target flag with
+            # "cannot be used multiple times" and runs nothing; distinct
+            # target flags stay combinable, while `--test <name>` remains
+            # repeatable for multiple integration targets.
+            if option in seen_cargo_flags:
+                raise ValueError(
+                    f"UNSUPPORTED: Cargo option {option!r} is single-use "
+                    f"but was repeated; next: pass {option} at most once")
+            seen_cargo_flags.add(option)
             selectors.append((option, None))
         elif not word.startswith("-"):
             # Pinned Cargo 1.98.1 takes a single [TESTNAME] before `--` and
