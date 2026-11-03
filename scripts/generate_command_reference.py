@@ -14,6 +14,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 
@@ -26,21 +27,29 @@ EXAMPLE = "generate_command_reference"
 BOUNDED_POOL_POLICY = Path("/paperclip/.cache/two-bot-next-bounded/policy.json")
 
 # Lookup failures that mean "no policy here", as opposed to a broken lookup.
-_POLICY_ABSENT = (errno.ENOENT, errno.ENOTDIR)
+# Only ENOENT: any other OSError (EACCES, ELOOP, ENOTDIR, ...) must fail
+# closed rather than silently fall back to plain cargo.
+_POLICY_ABSENT = (errno.ENOENT,)
 
 
 def bounded_pool_present():
     """True when the controller's bounded Cargo pool policy exists.
 
     Raises OSError when the lookup itself fails, so the caller fails closed
-    instead of silently falling back to plain cargo.
+    instead of silently falling back to plain cargo. Probes with stat()
+    directly: Path.is_file() swallows ELOOP and ENOTDIR into False, which
+    would select plain cargo on a broken lookup.
     """
     try:
-        return BOUNDED_POOL_POLICY.is_file()
+        mode = BOUNDED_POOL_POLICY.stat().st_mode
     except OSError as exc:
         if exc.errno in _POLICY_ABSENT:
             return False
         raise
+    if not stat.S_ISREG(mode):
+        raise OSError(errno.EINVAL, os.strerror(errno.EINVAL),
+                      str(BOUNDED_POOL_POLICY))
+    return True
 
 
 def controller_selected(explicit_flag):

@@ -15,6 +15,7 @@ silently skipped: supplying both binaries explicitly selects that suite.
 
 import argparse
 import contextlib
+import errno
 import importlib.util
 import io
 import os
@@ -165,10 +166,42 @@ with mock.patch.object(unittest.TextTestRunner, "run") as run:
             with mock.patch.object(generator, "BOUNDED_POOL_POLICY", missing):
                 self.assertTrue(generator.bounded_pool_present())
             denied = mock.MagicMock(spec=Path)
-            denied.is_file.side_effect = PermissionError(13, "denied")
+            denied.stat.side_effect = PermissionError(13, "denied")
             with mock.patch.object(generator, "BOUNDED_POOL_POLICY", denied), \
                     self.assertRaises(PermissionError):
                 generator.bounded_pool_present()
+
+    def test_pool_probe_fails_closed_on_broken_lookup(self):
+        generator = load_script("generate_command_reference")
+        with tempfile.TemporaryDirectory() as tmp:
+            # A regular file where a directory component is expected: stat()
+            # raises ENOTDIR, which must not be mistaken for "no pool here".
+            blocker = Path(tmp) / "blocker"
+            blocker.write_text("not a directory", encoding="utf-8")
+            broken = blocker / "policy.json"
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", broken):
+                with self.assertRaises(OSError) as caught:
+                    generator.bounded_pool_present()
+                self.assertEqual(caught.exception.errno, errno.ENOTDIR)
+            # A symlink loop at the policy path: stat() raises ELOOP, which
+            # Path.is_file() would have swallowed into a fail-open False.
+            loop = Path(tmp) / "loop.json"
+            loop.symlink_to(loop)
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", loop):
+                with self.assertRaises(OSError) as caught:
+                    generator.bounded_pool_present()
+                self.assertEqual(caught.exception.errno, errno.ELOOP)
+            # A non-regular policy path also fails closed, end to end: the
+            # generator refuses to build instead of falling back to plain
+            # cargo.
+            clean = {key: value for key, value in os.environ.items()
+                     if key not in ("PAPERCLIP_RUN_ID", "TWO_CARGO_CONTROLLER",
+                                    "GITHUB_ACTIONS")}
+            with mock.patch.dict(os.environ, clean, clear=True), \
+                    mock.patch.object(generator, "BOUNDED_POOL_POLICY", broken), \
+                    mock.patch.object(generator, "build_executable") as build:
+                self.assertEqual(generator.main([]), 1)
+            build.assert_not_called()
 
     def test_consumer_census_covers_standalone_coverage_and_filtered_bot_tests(self):
         for command in (
