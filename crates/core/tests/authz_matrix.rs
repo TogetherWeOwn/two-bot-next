@@ -146,8 +146,8 @@ fn role_x_route_matrix_matches_expected_status() {
             checked += 1;
         }
     }
-    // 48 routes x 10 roles: a silently emptied fixture must not pass.
-    assert_eq!(checked, 480, "matrix size drifted");
+    // 49 routes x 10 roles: a silently emptied fixture must not pass.
+    assert_eq!(checked, 490, "matrix size drifted");
 }
 
 #[test]
@@ -169,6 +169,7 @@ fn guild_fence_and_unresolved_permissions() {
                     "purge-preview"
                         | "channel-inspect"
                         | "lockdown-preview"
+                        | "automod-preview"
                         | "tempban-list"
                         | "moderation-recent"
                 );

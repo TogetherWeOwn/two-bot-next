@@ -4452,6 +4452,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::PurgePreview,
             HandlerId::ChannelInspect,
             HandlerId::LockdownPreview,
+            HandlerId::AutomodPreview,
             HandlerId::TempbanList,
         ];
         ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));

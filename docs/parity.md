@@ -66,10 +66,10 @@ Original registry surface: `CORE_COMMAND_DATA` (always published) = leveling onl
 | 30 | `/feed-list` | `page` opt ≥1 (1-based, default 1) | `ManageGuild` | **S4** |
 
 Runtime permission contract: `crates/core/src/command_permissions.rs` represents
-all 51 entries (48 retained builtins — the 27 legacy ones plus the Next-only
+all 52 entries (49 retained builtins — the 27 legacy ones plus the Next-only
 `/help`, `/privacy`, `/command-inspect`, `/command-clone`, `/reopen`, `/welcome-preview`, `/lfg-edit`,
 `/command-disable`, `/command-enable`, `/command-edit`, `/purge-preview`, `/channel-inspect`,
-`/lockdown-preview`,
+`/lockdown-preview`, `/automod-preview`,
 `/giveaway`, `/lfg-list`, `/feed-inspect`, `/feed-pause`, `/feed-resume`, `/tempban-list`,
 `/moderation-recent` and `/game-mix` — the dropped rota command, custom
 slash commands, and prefix triggers). The router checks the invoking interaction's resolved

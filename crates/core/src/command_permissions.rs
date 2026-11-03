@@ -93,9 +93,11 @@ use PolicyHook::{
 /// the staff-only saved-ledger read `/moderation-recent` (47), the Next-only
 /// private lockdown preview `/lockdown-preview` (48, dark until its
 /// publication slice), in-place saved-response correction `/command-edit`
-/// (49), and management-only `/command-clone` (50). Only `/game-mix` admits
+/// (49), management-only `/command-clone` (50), and the Next-only private
+/// automod verdict preview `/automod-preview` (51, dark until its
+/// publication slice). Only `/game-mix` admits
 /// Administrator alone; legacy masks are unchanged.
-pub const COMMAND_PERMISSIONS: [CommandPermission; 51] = [
+pub const COMMAND_PERMISSIONS: [CommandPermission; 52] = [
     row(1, "rank", BuiltinSlash, 0, None),
     row(2, "leaderboard", BuiltinSlash, 0, None),
     row(31, "help", BuiltinSlash, 0, None),
@@ -168,6 +170,10 @@ pub const COMMAND_PERMISSIONS: [CommandPermission; 51] = [
         PERM_MANAGE_CHANNELS,
         None,
     ),
+    // Next-only private automod verdict preview (`docs/automod-preview-spec.md`).
+    // Dark until the publication slice: adjudicated here so the router can
+    // refuse without `ManageGuild`, but with no published definition.
+    row(51, "automod-preview", BuiltinSlash, PERM_MANAGE_GUILD, None),
     row(
         47,
         "moderation-recent",

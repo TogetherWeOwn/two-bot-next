@@ -278,12 +278,13 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
     // 23 legacy restricted rows plus management-only command-inspect,
     // command-clone, command-disable, command-enable, command-edit, giveaway
     // and welcome-preview, plus purge-preview, channel-inspect, lockdown-preview,
-    // lfg-edit, lfg-list, feed-inspect, game-mix, tempban-list and moderation-recent.
-    // Discord defaults never replace any runtime permission gate.
+    // automod-preview, lfg-edit, lfg-list, feed-inspect, game-mix, tempban-list
+    // and moderation-recent. Discord defaults never replace any runtime
+    // permission gate.
     assert_eq!(
         restricted.len(),
-        41,
-        "23 legacy restricted rows plus eighteen Next-only management commands"
+        42,
+        "23 legacy restricted rows plus nineteen Next-only management commands"
     );
     tracing::subscriber::with_default(audit.clone(), || {
         for row in &restricted {
@@ -379,7 +380,7 @@ fn overridden_discord_defaults_cannot_bypass_permissions_and_denials_are_audited
 fn twilight_publication_permissions_equal_the_runtime_matrix() {
     use two_bot_core::command_permissions::{command_permission, COMMAND_PERMISSIONS};
 
-    assert_eq!(COMMAND_PERMISSIONS.len(), 51);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 52);
     let router = InteractionRouter::new(all_on());
     let defs = router.publish_set(&[]).unwrap();
     let commands = publish_commands(&defs);
