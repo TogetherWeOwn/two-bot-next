@@ -51,8 +51,8 @@ JOB_INVENTORY = {
                   "nextest"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
                               "promotion-skipped", "production"},
-    "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "user-flow-synthetic",
-                           "pinned-history-guard", "certify-promotion"},
+    "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "help-embed-synthetic",
+                           "user-flow-synthetic", "pinned-history-guard", "certify-promotion"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"},
@@ -91,6 +91,9 @@ JOB_INVENTORY = {
     "sbom.yml": {"image", "verify"},
     # Live staging voice synthetic (docs/voice-synthetic.md); pinned shape below.
     "voice-synthetic.yml": {"synthetic"},
+    # Live staging /help embed smoke (docs/staging-help-embed-smoke.md);
+    # pinned shape below.
+    "help-embed-synthetic.yml": {"help-embed-smoke"},
     # Five-minute user-flow synthetic (docs/synthetic-user-flow.md): staging
     # health-contract plus passive production probes; pinned shape below.
     "synthetic-user-flow.yml": {"staging", "prod-passive"},
@@ -132,6 +135,8 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                    # After every staging deploy; its failure fails deploy-staging (promotion gate).
                    ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
+                   # After every staging deploy; its failure fails deploy-staging (promotion gate).
+                   ("deploy-staging.yml", "help-embed-synthetic"): "./.github/workflows/help-embed-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
                    ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
                    # Read-only shadow engine, pinned to the published central merge commit.
@@ -3472,6 +3477,82 @@ def voice_synthetic_errors(workflow):
     return errors
 
 
+def help_embed_synthetic_errors(workflow):
+    """Live staging /help embed smoke (docs/staging-help-embed-smoke.md).
+
+    Runs on workflow_call (deploy-staging) and dispatch, only from main,
+    through the existing `voice-synthetic` environment whose single secret
+    is the dedicated test bot token (the staging product bot token never
+    enters GitHub), on the routed runner for job `help-embed-smoke`, with
+    its own non-cancelling concurrency group and a 25 minute timeout (it
+    builds the payload example). Exactly five steps: pinned checkout
+    without persisted credentials, the pinned Rust toolchain, payload
+    generation from the reviewed example, one smoke step (the only holder
+    of the token) that runs the reviewed script, and the evidence upload.
+    No wrangler, no production path, no staging Worker URL, no `set -x`.
+    """
+    name = "help-embed-synthetic.yml"
+    errors = []
+    if "env" in workflow:
+        errors.append(f"{name}: workflow-level env must stay absent")
+    on = workflow.get("on") or {}
+    if set(on) != {"workflow_call", "workflow_dispatch"}:
+        errors.append(f"{name}: triggers must be exactly workflow_call and workflow_dispatch")
+    call = on.get("workflow_call") or {}
+    if on.get("workflow_dispatch") or set(call) - {"secrets"} or (
+        call.get("secrets") is not None
+        and call["secrets"] != {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": {"required": "false"}}
+    ):
+        errors.append(
+            f"{name}: workflow_call takes only the optional TWO_VOICE_SYNTHETIC_BOT_TOKEN secret; "
+            "workflow_dispatch takes no inputs"
+        )
+    if workflow.get("permissions") != {}:
+        errors.append(f"{name}: top-level permissions must stay empty")
+    if workflow.get("concurrency") != {"group": "help-embed-synthetic", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must use its own help-embed-synthetic group without cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"help-embed-smoke"}:
+        errors.append(f"{name}: jobs must be exactly help-embed-smoke")
+        return errors
+    job = jobs["help-embed-smoke"]
+    if job.get("environment") != "voice-synthetic":
+        errors.append(f"{name}:help-embed-smoke: must read only the voice-synthetic Environment")
+    if job.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:help-embed-smoke: must run only from main")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:help-embed-smoke: must keep contents:read only")
+    if job.get("timeout-minutes") != "25":
+        errors.append(f"{name}:help-embed-smoke: timeout must stay 25 minutes")
+    if not runner_allowed("help-embed-smoke", job.get("runs-on")):
+        errors.append(f"{name}:help-embed-smoke: must use the routed runner expression for job 'help-embed-smoke'")
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        if key in job:
+            errors.append(f"{name}:help-embed-smoke: must not set {key}")
+    steps = job.get("steps") or []
+    runs = [step for step in steps if "run" in step]
+    if len(steps) != 5 or len(runs) != 2 \
+            or "help_embed_smoke_payloads" not in runs[0]["run"] \
+            or "scripts/staging_help_embed_smoke.py" not in runs[-1]["run"]:
+        errors.append(f"{name}:help-embed-smoke: must be checkout, toolchain, payload generation, "
+                      "one smoke step of the reviewed script, evidence upload")
+    elif '"$status" = 3' not in runs[-1]["run"]:
+        # Exit 3 is the script's cleanup-failed signal; the retry loop must
+        # fail on it at once so a later clean attempt cannot read green
+        # over a message an earlier attempt left in the test channel.
+        errors.append(f"{name}:help-embed-smoke: retry loop must fail immediately on the "
+                      "cleanup-failed exit status 3")
+    for step in steps:
+        if "secrets." in str(step) and step is not (runs[-1] if runs else None):
+            errors.append(f"{name}:help-embed-smoke: only the smoke step may hold a secret")
+    text = str(job).lower().replace(" ", "")
+    for marker in ("wrangler", "production", "staging_worker_url", "tojson(secrets", "secrets[", "set-x",
+                   "setx", "xtrace", "cloudflare_api_token", "ownership_control"):
+        if marker in text:
+            errors.append(f"{name}:help-embed-smoke: must not contain {marker!r}")
+    return errors
+
+
 SYNTHETIC_MISSING_BINDING_RUN = {
     "staging": ('echo "::error::Staging synthetic has zero probe samples because '
                 'STAGING_WORKER_URL is unset; refusing to report green"\n'
@@ -4012,6 +4093,11 @@ def workflow_policy_errors(workflows):
             # Pinned shape above; the generic environment scan below would
             # flag its voice-synthetic Environment binding.
             errors.extend(voice_synthetic_errors(workflow))
+            continue
+        if name == "help-embed-synthetic.yml":
+            # Pinned shape above; the generic environment scan below would
+            # flag its help-embed-synthetic Environment binding.
+            errors.extend(help_embed_synthetic_errors(workflow))
             continue
         if name == "synthetic-user-flow.yml":
             # Pinned shape above; the generic environment/marker scan below
@@ -6433,6 +6519,50 @@ class WorkflowTests(unittest.TestCase):
             job.get("secrets"),
             {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"},
         )
+
+    def test_help_embed_synthetic_shape_is_pinned_and_mutations_fail(self):
+        import copy
+        synthetic = self.workflows["help-embed-synthetic.yml"]
+        self.assertEqual(help_embed_synthetic_errors(synthetic), [])
+        for mutate in (
+            lambda w: w["jobs"]["help-embed-smoke"].pop("if"),
+            lambda w: w["jobs"]["help-embed-smoke"].__setitem__("environment", "staging"),
+            lambda w: w["on"].__setitem__("push", None),
+            lambda w: w["jobs"]["help-embed-smoke"]["steps"][3].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["help-embed-smoke"]["steps"][0].__setitem__("env", {"T": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}),
+            lambda w: w["jobs"]["help-embed-smoke"]["steps"][2].__setitem__("run", "echo {} > payloads.json"),
+            lambda w: w["jobs"]["help-embed-smoke"]["steps"][3].__setitem__(
+                "run", w["jobs"]["help-embed-smoke"]["steps"][3]["run"].replace('"$status" = 3', '"$status" = 9')),
+        ):
+            changed = copy.deepcopy(synthetic)
+            mutate(changed)
+            self.assertNotEqual(help_embed_synthetic_errors(changed), [])
+
+    def test_staging_deploy_gates_on_the_help_embed_synthetic(self):
+        staging = self.workflows["deploy-staging.yml"]
+        job = staging["jobs"]["help-embed-synthetic"]
+        self.assertEqual(job.get("needs"), "deploy")
+        self.assertEqual(job.get("uses"), "./.github/workflows/help-embed-synthetic.yml")
+        self.assertNotIn("if", job)
+        # An environment secret is empty in a called workflow unless the caller
+        # passes it; pass exactly the test bot token, never `inherit`.
+        self.assertEqual(
+            job.get("secrets"),
+            {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"},
+        )
+        needs = staging["jobs"]["certify-promotion"]["needs"]
+        needs = [needs] if isinstance(needs, str) else needs
+        self.assertIn("help-embed-synthetic", needs)
+
+    def test_help_embed_smoke_offline_suite_runs_in_ci(self):
+        # The parent `scripts/` directory has no blanket discovery; the
+        # offline suite must be invoked explicitly or PR checks stay green
+        # when the read-back assertions regress.
+        worker_steps = self.workflows["check.yml"]["jobs"]["worker"]["steps"]
+        covering = [s for s in worker_steps
+                    if "test_staging_help_embed_smoke.py" in str(s.get("run") or "")]
+        self.assertEqual(len(covering), 1,
+                         "check.yml worker must run the help embed smoke suite exactly once")
 
     def test_schema_gate_shape_is_pinned_and_mutations_fail(self):
         import copy
