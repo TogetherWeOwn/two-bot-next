@@ -193,13 +193,17 @@ columns.
 Migration `0471` widens the `internal_idempotency.action` allowlist to admit
 `reminder.send` and `place_offer.send`, and widens the
 `internal_action_log.evidence_code` allowlist with `suppressed` for the consent
-backstop. It adds no column: the audit row keeps
-only the member/event-key linkage, the outcome bit and the message-id scalar,
-never DM text. A suppressed member's refusal finishes the same
-`dm_unavailable` receipt as a closed-DM refusal, but its terminal audit carries
-`suppressed` instead of `executor`. It is backward-compatible (the previous binary never sends the
-new verbs). Roll back in the same order as `0424`: disable the receiver and
-deploy the previous binary, then restore the prior constraint.
+backstop. It adds nullable `event_key` columns to intents and audit rows,
+restricted to 1–64 characters of `[A-Za-z0-9._:-]`: the audit keeps the
+member/event-key linkage, the outcome bit and the message-id scalar,
+never event names, timestamps or DM text. A suppressed member's refusal finishes
+the same `dm_unavailable` receipt as a closed-DM refusal, but its terminal audit
+carries `suppressed` instead of `executor`. Apply the migration before this
+binary; every claim and audit writes the new column. The previous binary remains
+compatible. For rollback, disable the receiver and deploy the previous binary;
+leave the additive columns and widened constraints in place so notification
+receipts remain available. Restoring the old constraints requires separately
+handling retained notification rows, not deleting their evidence.
 
 TOG-16851 proved a loopback-only receiver never becomes healthy: the Containers
 port check and `containerFetch` cannot reach it, so the container waited on 8091

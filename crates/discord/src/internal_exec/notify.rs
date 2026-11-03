@@ -8,8 +8,9 @@
 //! that on the linked page.
 
 use super::{
-    member::{numeric_id, MemberError},
-    ActionExecutor,
+    is_definitive_rejection,
+    member::{member_status_error, numeric_id, MemberError},
+    ActionExecutor, RawResponse,
 };
 use serde::Deserialize;
 use twilight_http::request::TryIntoRequest;
@@ -45,6 +46,23 @@ fn classify_notify_error(error: ActionError) -> Result<NotifyOutcome, ActionErro
     }
 }
 
+// Membership preserves its legacy 4xx mapping. Notifications must instead
+// retain uncertainty for ambiguous statuses, and a bot-token outage is never
+// a member's DM refusal. Keep classification at the raw status boundary.
+fn notify_status_error(response: &RawResponse) -> Option<ActionError> {
+    let error = member_status_error(response)?;
+    if error.code == ErrorCode::DiscordRejected
+        && (response.status == 401 || !is_definitive_rejection(response.status))
+    {
+        return Some(ActionError::new(
+            ErrorCode::DiscordUnavailable,
+            "Discord delivery could not be confirmed",
+            "dm_delivery_unconfirmed",
+        ));
+    }
+    Some(error)
+}
+
 fn unreadable_receipt() -> ActionError {
     ActionError::new(
         ErrorCode::DiscordUnavailable,
@@ -74,12 +92,13 @@ impl ActionExecutor {
         text: &str,
     ) -> Result<NotifyOutcome, MemberError> {
         let mut channel_response = self
-            .member_request(
+            .member_request_with_status(
                 self.inner
                     .factory
                     .create_private_channel(numeric_id(discord_id)?.cast())
                     .try_into_request(),
                 NOTIFY_DM_TIMEOUT_MS,
+                notify_status_error,
             )
             .await?;
         let channel: OpenedChannel =
@@ -90,7 +109,7 @@ impl ActionExecutor {
         channel_response.complete().await;
         let mentions = AllowedMentions::default();
         let mut message_response = self
-            .member_request(
+            .member_request_with_status(
                 self.inner
                     .factory
                     .create_message(channel_id)
@@ -98,6 +117,7 @@ impl ActionExecutor {
                     .allowed_mentions(Some(&mentions))
                     .try_into_request(),
                 NOTIFY_DM_TIMEOUT_MS,
+                notify_status_error,
             )
             .await?;
         let message: PostedMessage =
@@ -145,7 +165,7 @@ mod tests {
 
     #[test]
     fn definitive_refusals_are_dm_unavailable_everything_else_is_an_error() {
-        for status in [400, 401, 403, 404, 405, 413, 415, 422] {
+        for status in [400, 403, 404, 405, 413, 415, 422] {
             let refused = ActionError::new(
                 ErrorCode::DiscordRejected,
                 format!("Discord refused the request with {status}"),

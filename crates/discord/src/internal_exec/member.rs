@@ -165,6 +165,16 @@ impl ActionExecutor {
         request: Result<Request, twilight_http::Error>,
         timeout_ms: u64,
     ) -> Result<RawResponse, MemberError> {
+        self.member_request_with_status(request, timeout_ms, member_status_error)
+            .await
+    }
+
+    pub(crate) async fn member_request_with_status(
+        &self,
+        request: Result<Request, twilight_http::Error>,
+        timeout_ms: u64,
+        status_error: fn(&RawResponse) -> Option<ActionError>,
+    ) -> Result<RawResponse, MemberError> {
         let request = request.map_err(|_| {
             ActionError::new(
                 ErrorCode::Malformed,
@@ -188,7 +198,7 @@ impl ActionExecutor {
                     "discord_unreachable",
                 )),
             })?;
-        if let Some(error) = member_status_error(&response) {
+        if let Some(error) = status_error(&response) {
             tracing::warn!(code = error.code.as_str(), reason = %error.log_reason,
                 "internal member action refused");
             return Err(error.into());

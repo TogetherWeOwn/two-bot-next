@@ -2031,31 +2031,26 @@ async fn execute_notify(
     };
     let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
     // Validate before the claim: no Discord call, no idempotency row on bad
-    // input. Only the validated facts below reach the template; the event key
-    // travels in the signed body (the site correlates via its idempotency
-    // key), and no DM text is ever stored.
-    enum Validated {
-        Reminder { discord_id: String },
-        PlaceOffer { discord_id: String },
+    // input. Retain the validated facts borrowed from the immutable signed
+    // body; only the member and bounded event-key scalars enter the audit.
+    enum Validated<'a> {
+        Reminder(ReminderSendRequest<'a>),
+        PlaceOffer(PlaceOfferSendRequest<'a>),
     }
     let validated = match decision.action.as_str() {
         "reminder.send" => match ReminderSendRequest::validate(&decision.body) {
-            Ok(request) => Validated::Reminder {
-                discord_id: request.discord_id().to_owned(),
-            },
+            Ok(request) => Validated::Reminder(request),
             Err(error) => return reject(Failure::from_action(error)),
         },
         "place_offer.send" => match PlaceOfferSendRequest::validate(&decision.body) {
-            Ok(request) => Validated::PlaceOffer {
-                discord_id: request.discord_id().to_owned(),
-            },
+            Ok(request) => Validated::PlaceOffer(request),
             Err(error) => return reject(Failure::from_action(error)),
         },
         _ => return reject(Failure::code(ErrorCode::ActionNotAllowed)),
     };
-    let target_id = match &validated {
-        Validated::Reminder { discord_id } => discord_id.as_str(),
-        Validated::PlaceOffer { discord_id } => discord_id.as_str(),
+    let (target_id, event_key) = match &validated {
+        Validated::Reminder(request) => (request.discord_id(), request.event_key()),
+        Validated::PlaceOffer(request) => (request.discord_id(), request.event_key()),
     };
     let subject = {
         let guild = match DiscordId::new(guild_id) {
@@ -2080,7 +2075,11 @@ async fn execute_notify(
         Ok(identity) => identity,
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
-    let claim = match state.store.claim(&identity, &subject).await {
+    let claim = match state
+        .store
+        .claim_notify(&identity, &subject, event_key)
+        .await
+    {
         Ok(InternalClaim::Claimed(claim)) => claim,
         Ok(InternalClaim::Replay(response)) => {
             return state.terminal(response, true, id, key.clone(), action);
@@ -2099,21 +2098,25 @@ async fn execute_notify(
     // `suppressed` scalar instead of `executor`. A database error fails
     // closed: the claim is retained unknown and the member is not messaged,
     // because an uncertain suppression must never send.
-    let mut conn = match state.store.pool().acquire().await {
-        Ok(conn) => conn,
-        Err(_) => {
-            mark_unknown_best_effort(&state.store, &claim, action).await;
-            return reject(Failure::reconciliation());
-        }
-    };
-    let suppressed =
-        match two_bot_core::privacy::suppressed_in(&mut *conn, guild_id, target_id).await {
-            Ok(suppressed) => suppressed,
+    let suppression = {
+        let mut conn = match state.store.pool().acquire().await {
+            Ok(conn) => conn,
             Err(_) => {
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
             }
         };
+        two_bot_core::privacy::suppressed_in(&mut conn, guild_id, target_id).await
+    };
+    // Return the lookup connection before delivery or any store transition;
+    // even a one-connection pool must be able to persist the receipt.
+    let suppressed = match suppression {
+        Ok(suppressed) => suppressed,
+        Err(_) => {
+            mark_unknown_best_effort(&state.store, &claim, action).await;
+            return reject(Failure::reconciliation());
+        }
+    };
     if suppressed {
         if let Err(finish_error) = state.store.finish_suppressed(&claim).await {
             log_terminal_persist_failed(action, "finish", finish_error);
@@ -2128,29 +2131,10 @@ async fn execute_notify(
         };
         return state.terminal(response, false, id, key.clone(), action);
     }
-    // The claim is committed: the single Discord send below runs after it.
-    // Revalidate against the same signed body the pre-claim check used, so
-    // the DM reaching the member is the pinned facts, not a retargeted
-    // mid-request edit.
-    let outcome = match validated {
-        Validated::Reminder { .. } => {
-            let request = match ReminderSendRequest::validate(&decision.body) {
-                Ok(request) => request,
-                Err(_) => {
-                    return finish_malformed(state, &claim, id, key.clone(), action).await;
-                }
-            };
-            state.notify.execute_reminder(&request).await
-        }
-        Validated::PlaceOffer { .. } => {
-            let request = match PlaceOfferSendRequest::validate(&decision.body) {
-                Ok(request) => request,
-                Err(_) => {
-                    return finish_malformed(state, &claim, id, key.clone(), action).await;
-                }
-            };
-            state.notify.execute_place_offer(&request).await
-        }
+    // The claim is committed: send only the facts validated before it.
+    let outcome = match &validated {
+        Validated::Reminder(request) => state.notify.execute_reminder(request).await,
+        Validated::PlaceOffer(request) => state.notify.execute_place_offer(request).await,
     };
     match outcome {
         Ok(NotifyOutcome::Sent { message_id }) => {
@@ -2205,35 +2189,6 @@ async fn execute_notify(
             reject(Failure::reconciliation())
         }
     }
-}
-
-/// Shared post-claim malformed finish for the notify revalidation above.
-/// A body that changed under the claim cannot be delivered; the stored
-/// `malformed` receipt keeps replays deterministic.
-async fn finish_malformed(
-    state: &ReceiverState,
-    claim: &ExecutionClaim,
-    id: &str,
-    key: KeyLabel,
-    action: ActionLabel,
-) -> Response {
-    if let Err(error) = state
-        .store
-        .finish(
-            &claim,
-            &TerminalResponse::Failure(TerminalFailure::Malformed),
-        )
-        .await
-    {
-        log_terminal_persist_failed(action, "finish", error);
-    }
-    state.terminal(
-        TerminalResponse::Failure(TerminalFailure::Malformed),
-        false,
-        id,
-        key,
-        action,
-    )
 }
 
 /// Website restrictive moderation (`moderation.ban`, `moderation.tempban`,

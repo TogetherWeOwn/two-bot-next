@@ -14,6 +14,13 @@ ALTER TABLE internal_idempotency ADD CONSTRAINT internal_idempotency_action_chec
         'reminder.send', 'place_offer.send'
     ));
 
+-- Pin the site's bounded event key with the member and receipt. Both intent
+-- and audit retain correlation without retaining event names or DM text.
+ALTER TABLE internal_idempotency ADD COLUMN event_key TEXT
+    CHECK (event_key ~ '^[A-Za-z0-9._:-]{1,64}$');
+ALTER TABLE internal_action_log ADD COLUMN event_key TEXT
+    CHECK (event_key ~ '^[A-Za-z0-9._:-]{1,64}$');
+
 -- Contract v2 §7 consent backstop: a suppressed member's refusal finishes the
 -- same `dm_unavailable` receipt, but the terminal audit records *why* it never
 -- sent. Widen the audit evidence allowlist with `suppressed` (existing rows

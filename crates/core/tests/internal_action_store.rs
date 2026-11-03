@@ -551,6 +551,95 @@ async fn proven_unsent_release_retains_binding_and_allows_one_new_owner() {
 }
 
 #[tokio::test]
+async fn notify_claim_pins_bounded_event_key_through_release_and_suppression() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let subject = subject();
+    let other = identity("notify-invalid:123", "role.assign", b"payload");
+    assert_eq!(
+        store
+            .claim_notify(&other, &subject, "launch:2026")
+            .await
+            .unwrap_err(),
+        InternalStoreError::InvalidInput
+    );
+    for verb in ["reminder.send", "place_offer.send"] {
+        let id = identity(&format!("notify-{verb}:123"), verb, b"payload");
+        for invalid in ["".to_owned(), "has space".to_owned(), "k".repeat(65)] {
+            assert_eq!(
+                store
+                    .claim_notify(&id, &subject, &invalid)
+                    .await
+                    .unwrap_err(),
+                InternalStoreError::InvalidInput
+            );
+        }
+        let claim = claimed(
+            store
+                .claim_notify(&id, &subject, "launch:2026")
+                .await
+                .unwrap(),
+        );
+        store.release_proven_not_sent(claim).await.unwrap();
+        assert!(matches!(
+            store
+                .claim_notify(&id, &subject, "other:2026")
+                .await
+                .unwrap(),
+            InternalClaim::Mismatch
+        ));
+        let claim = claimed(
+            store
+                .claim_notify(&id, &subject, "launch:2026")
+                .await
+                .unwrap(),
+        );
+        store.finish_suppressed(&claim).await.unwrap();
+        assert!(matches!(
+            store
+                .claim_notify(&id, &subject, "launch:2026")
+                .await
+                .unwrap(),
+            InternalClaim::Replay(TerminalResponse::Success {
+                affected: 0,
+                resource_id: None,
+                ..
+            })
+        ));
+    }
+    let audit: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT event_key, phase, evidence_code FROM internal_action_log ORDER BY audit_id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let expected: Vec<_> = (0..2)
+        .flat_map(|_| {
+            [
+                ("launch:2026".into(), "intent".into(), None),
+                (
+                    "launch:2026".into(),
+                    "released".into(),
+                    Some("proven_not_sent".into()),
+                ),
+                (
+                    "launch:2026".into(),
+                    "terminal".into(),
+                    Some("suppressed".into()),
+                ),
+            ]
+        })
+        .collect();
+    assert_eq!(audit, expected);
+    let intents: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_idempotency")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(intents, 2, "invalid claims never persist");
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn unsent_release_refuses_uncertainty_and_rolls_back_with_its_audit() {
     let db = TestDb::new().await;
     let store = db.store();

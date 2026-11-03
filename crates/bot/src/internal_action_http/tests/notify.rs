@@ -20,6 +20,17 @@ fn set_member_notify_flag(on: bool) {
 
 const MEMBER: &str = "111111111111111111";
 
+async fn assert_event_key_audit(pool: &sqlx::PgPool) {
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT event_key FROM internal_idempotency \
+         UNION ALL SELECT event_key FROM internal_action_log",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(keys, vec!["launch:2026"; 3], "intent and both audit phases");
+}
+
 fn reminder_payload() -> String {
     serde_json::json!({
         "action": "reminder.send",
@@ -126,7 +137,7 @@ async fn notify_verbs_stay_dark_without_the_flag() {
         (reminder_payload(), "intent-notify-dark-reminder"),
         (offer_payload(), "intent-notify-dark-offer"),
     ] {
-        let (_, _, refused) = answer(app.clone(), signed(&raw, "old", &intent)).await;
+        let (_, _, refused) = answer(app.clone(), signed(&raw, "old", intent)).await;
         assert_eq!(refused["error"]["code"], "action_not_allowed", "{intent}");
     }
     assert_eq!(effect.calls(), 0);
@@ -262,6 +273,7 @@ async fn reminder_send_succeeds_with_sent_envelope_and_audit_scalars() {
     assert_eq!(audit[0].1, "intent");
     assert_eq!(audit[1].1, "terminal");
     assert_eq!(audit[1].2.as_deref(), Some("success"));
+    assert_event_key_audit(db.pool()).await;
     set_member_notify_flag(false);
     db.close().await.unwrap();
 }
@@ -306,6 +318,7 @@ async fn place_offer_dm_unavailable_is_200_and_consumes_no_place() {
     assert_eq!(row.5, Some(0));
     assert_eq!(row.6.as_deref(), Some(staging_guild()));
     assert_eq!(row.8.as_deref(), Some(MEMBER));
+    assert_event_key_audit(db.pool()).await;
     set_member_notify_flag(false);
     db.close().await.unwrap();
 }
@@ -366,7 +379,69 @@ async fn notify_suppressed_member_answers_dm_unavailable_without_sending() {
     assert_eq!(audit[0].1, "intent");
     assert_eq!(audit[1].1, "terminal");
     assert_eq!(audit[1].3.as_deref(), Some("suppressed"));
+    assert_event_key_audit(db.pool()).await;
     set_member_notify_flag(false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn notify_consent_lookup_releases_a_single_connection_before_finalizing() {
+    let Some(db) = database().await else { return };
+    let _flag = MEMBER_NOTIFY_FLAG_LOCK.lock().await;
+    set_member_notify_flag(true);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(db.pool().connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let app = router(state(pool.clone(), effect.clone()));
+    for (step, expected) in [
+        ("sent", "sent"),
+        ("suppressed", "dm_unavailable"),
+        ("lookup-error", "needs_reconciliation"),
+    ] {
+        if step == "suppressed" {
+            sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ($1, $2)")
+                .bind(staging_guild())
+                .bind(MEMBER)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        } else if step == "lookup-error" {
+            sqlx::query("ALTER TABLE privacy_opt_outs RENAME TO notify_hidden_opt_outs")
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let intent = format!("intent-notify-one-connection-{step}");
+        let (status, _, body) = tokio::time::timeout(
+            Duration::from_secs(5),
+            answer(app.clone(), signed(&reminder_payload(), "old", &intent)),
+        )
+        .await
+        .expect("consent lookup must return its connection before finalization");
+        if step == "lookup-error" {
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["error"]["code"], expected);
+        } else {
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["result"]["outcome"], expected);
+        }
+        assert_eq!(
+            effect.calls(),
+            1,
+            "suppression and lookup errors never send"
+        );
+    }
+    let states: Vec<String> =
+        sqlx::query_scalar("SELECT state FROM internal_idempotency ORDER BY intent_id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(states, vec!["completed", "completed", "unknown"]);
+    set_member_notify_flag(false);
+    pool.close().await;
     db.close().await.unwrap();
 }
 
@@ -444,12 +519,21 @@ async fn notify_rate_limited_releases_claim_and_answers_429() {
     assert_eq!(refused["error"]["retryable"], true);
     assert_eq!(headers["retry-after"], "7");
     assert_eq!(notify.calls(), 1);
-    // A 429 proves no effect, so the claim is released instead of completed.
-    let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM internal_idempotency")
-        .fetch_one(db.pool())
+    // A 429 proves no effect: release retains the payload binding and audit
+    // evidence in a retryable `not_sent` row instead of deleting the intent.
+    let claims: Vec<String> = sqlx::query_scalar("SELECT state FROM internal_idempotency")
+        .fetch_all(db.pool())
         .await
         .unwrap();
-    assert_eq!(claims, 0, "released claims leave no row");
+    assert_eq!(claims, vec!["not_sent"], "release retains the bound intent");
+    let released: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM internal_action_log \
+         WHERE phase = 'released' AND evidence_code = 'proven_not_sent'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(released, 1, "release keeps its audit evidence");
     // The same key may retry: a fresh nonce re-takes the claim and runs the
     // effect again, with no bursting past the refusal.
     let (status, _, again) =

@@ -54,6 +54,11 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
   `Claimed(ExecutionClaim)`, `InFlight`, `NeedsReconciliation`, `Replay(response)`
   or `Mismatch`. All except `Claimed` prohibit execution. An `ExecutionClaim` has
   private fields and is only produced after intent and audit commit.
+- `claim_notify(&RequestIdentity, &AuditSubject, event_key)` applies the same
+  claim fence for the two DM verbs and pins the validated 1–64-character event-key
+  scalar on the intent and every audit phase (migration `0471`). A changed event
+  key refuses as a mismatch, including when reclaiming a proven-unsent intent.
+  Event names, timestamps and rendered DM text are never persisted.
 - `release_proven_not_sent(ExecutionClaim)` requires owning-executor proof that
   the mutation was never dispatched. It consumes the opaque, non-Clone claim on
   every return path, atomically records a `released`/`proven_not_sent` audit and

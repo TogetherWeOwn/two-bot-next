@@ -532,6 +532,10 @@
     "crates/cutover/migrations/0470_voice_creation_gates_authority.sql": {
       "sha256": "eb1feb5257b747b8d114923f32a40a032929dd4437c61329b1c62d1c1dd1ad8b",
       "justification": "Expand step: copy the imported voice creation switch and guild-wide command role from voice_guild_settings into voice_access_controls, the columns the runtime gates enforce, tightening only (creation off wins, an enforced role wins) and syncing the legacy columns as a mirror for the previous binary until a contract migration drops them; data copy only, no DDL."
+    },
+    "crates/cutover/migrations/0471_internal_action_member_notify.sql": {
+      "sha256": "c7174496ec59c0b9b27e01cf0b15be5c8a8a7b574f2686d7af696d89324ebb7b",
+      "justification": "Admit reminder.send and place_offer.send to durable internal-action intents, add nullable bounded event-key correlation to intents and audit rows, and admit suppressed consent-refusal evidence. Existing rows and previous binaries remain compatible; disable the receiver and roll back the binary before any schema backout."
     }
   }
 }

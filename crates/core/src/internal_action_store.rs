@@ -10,8 +10,8 @@ use crate::channel_moderation::PurgeStopReason;
 use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
 use crate::internal_actions::{
     body_hash, is_implemented, is_snowflake, valid_event_key, valid_idempotency_key,
-    valid_nonce_format, within_skew, CLAIM_STALE_SECONDS, MAX_BODY_BYTES, NONCE_TTL_SECONDS,
-    SKEW_SECONDS,
+    valid_nonce_format, valid_notify_event_key, within_skew, CLAIM_STALE_SECONDS, MAX_BODY_BYTES,
+    NONCE_TTL_SECONDS, SKEW_SECONDS,
 };
 
 /// Clock domain for the durable nonce high-water mark. One guard per clock
@@ -492,11 +492,38 @@ impl InternalActionStore {
         identity: &RequestIdentity,
         subject: &AuditSubject,
     ) -> Result<InternalClaim, InternalStoreError> {
+        self.claim_inner(identity, subject, None).await
+    }
+
+    /// Pin a notification's event-key scalar in the same transaction as its
+    /// member subject and intent audit. No event name, timestamp or DM text.
+    pub async fn claim_notify(
+        &self,
+        identity: &RequestIdentity,
+        subject: &AuditSubject,
+        event_key: &str,
+    ) -> Result<InternalClaim, InternalStoreError> {
+        if !matches!(
+            identity.action.as_str(),
+            "reminder.send" | "place_offer.send"
+        ) || !valid_notify_event_key(event_key)
+        {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        self.claim_inner(identity, subject, Some(event_key)).await
+    }
+
+    async fn claim_inner(
+        &self,
+        identity: &RequestIdentity,
+        subject: &AuditSubject,
+        event_key: Option<&str>,
+    ) -> Result<InternalClaim, InternalStoreError> {
         let mut tx = self.pool.begin().await?;
         let inserted: Option<i64> = sqlx::query_scalar(
             "INSERT INTO internal_idempotency \
-             (caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id, target_id, resolved_role_id) \
-             VALUES ($1, $2, $3, $4, 'in_flight', $5, $6, $7, $8) \
+             (caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id, target_id, resolved_role_id, event_key) \
+             VALUES ($1, $2, $3, $4, 'in_flight', $5, $6, $7, $8, $9) \
              ON CONFLICT (caller_hash, key_hash) DO NOTHING RETURNING intent_id",
         )
         .bind(&identity.caller_hash)
@@ -507,6 +534,7 @@ impl InternalActionStore {
         .bind(subject.actor_id.as_ref().map(DiscordId::as_str))
         .bind(subject.target_id.as_ref().map(DiscordId::as_str))
         .bind(subject.resolved_role_id.as_ref().map(DiscordId::as_str))
+        .bind(event_key)
         .fetch_optional(&mut *tx)
         .await?;
         let result = if let Some(intent_id) = inserted {
@@ -527,7 +555,9 @@ impl InternalActionStore {
             })
         } else {
             let row = Self::lock_identity(&mut tx, identity).await?;
-            if !Self::matches(&row, identity)? {
+            if !Self::matches(&row, identity)?
+                || row.try_get::<Option<&str>, _>("event_key")? != event_key
+            {
                 InternalClaim::Mismatch
             } else {
                 match row.try_get::<&str, _>("state")? {
@@ -961,9 +991,9 @@ impl InternalActionStore {
         sqlx::query(
             "INSERT INTO internal_action_log \
              (intent_id, phase, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-              response_code, http_status, evidence_code, resource_id, affected, outcome, stop_reason) \
+              response_code, http_status, evidence_code, resource_id, affected, outcome, stop_reason, event_key) \
              SELECT intent_id, $2, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-                    response_code, http_status, $3, resource_id, affected, outcome, stop_reason \
+                    response_code, http_status, $3, resource_id, affected, outcome, stop_reason, event_key \
              FROM internal_idempotency WHERE intent_id = $1 \
              ON CONFLICT (intent_id, phase) DO NOTHING",
         )

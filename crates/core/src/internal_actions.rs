@@ -1528,6 +1528,11 @@ impl<'a> ReminderSendRequest<'a> {
         self.discord_id
     }
 
+    #[must_use]
+    pub fn event_key(&self) -> &'a str {
+        self.event_key
+    }
+
     /// Bot-side DM template: facts only, plus the site deep link. The path is
     /// bare (`/e/{event_key}`) on purpose — the bot never invents the site's
     /// domain. Mention suppression happens at send time, not here.
@@ -1570,6 +1575,11 @@ impl<'a> PlaceOfferSendRequest<'a> {
     #[must_use]
     pub fn discord_id(&self) -> &'a str {
         self.discord_id
+    }
+
+    #[must_use]
+    pub fn event_key(&self) -> &'a str {
+        self.event_key
     }
 
     /// Bot-side DM template: facts only, plus the site deep link. The path is
@@ -2114,24 +2124,25 @@ fn authorize_burned(
     if action == "reminder.send" || action == "place_offer.send" {
         // Contract v2 §7 per-member notify bucket: burst 3, at most 10/day,
         // keyed `notify:<discord_id>` on top of the per-caller bucket above.
-        // The id is still unvalidated here (validation refuses malformed
-        // facts later, before the claim); only a present non-empty string
-        // takes a token, so a misshapen body cannot burn a member's budget.
-        let member = body.get("discord_id").and_then(Value::as_str).unwrap_or("");
-        if !member.is_empty() {
-            let per_member = buckets.take(
-                &format!("notify:{member}"),
-                NOTIFY_MEMBER_BUCKET,
-                verified.guarded_ms,
-            );
-            if !per_member.allowed {
-                return Err(ActionError::new(
-                    ErrorCode::RateLimited,
-                    "Rate limit exceeded for member notifications",
-                    "rate_limited_notify",
-                )
-                .with_retry_after(per_member.retry_after_secs));
-            }
+        // Validate all facts before charging the member, so malformed
+        // requests cannot consume a real member's notification budget.
+        let member = if action == "reminder.send" {
+            ReminderSendRequest::validate(&body)?.discord_id()
+        } else {
+            PlaceOfferSendRequest::validate(&body)?.discord_id()
+        };
+        let per_member = buckets.take(
+            &format!("notify:{member}"),
+            NOTIFY_MEMBER_BUCKET,
+            verified.guarded_ms,
+        );
+        if !per_member.allowed {
+            return Err(ActionError::new(
+                ErrorCode::RateLimited,
+                "Rate limit exceeded for member notifications",
+                "rate_limited_notify",
+            )
+            .with_retry_after(per_member.retry_after_secs));
         }
     }
 
@@ -3222,11 +3233,12 @@ mod tests {
         // Together these shift eight entries between those classes. The
         // assistant credential binding and required event-voice category
         // slices add two env-only keys
-        // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID).
+        // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID). Member
+        // notifications add the env-only TWO_INTERNAL_ALLOW_MEMBER_NOTIFY gate.
         for (class, expected) in [
             (SettingClass::Hot, 52),
             (SettingClass::Cold, 18),
-            (SettingClass::EnvOnly, 66),
+            (SettingClass::EnvOnly, 67),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
@@ -3750,6 +3762,18 @@ mod tests {
         };
         // Burst 3 for one member, all under the caller's 20-burst key bucket.
         let capped = body_for("123456789012345678");
+        let mut malformed: Value = serde_json::from_str(&capped).unwrap();
+        malformed["kind"] = json!("unsupported");
+        for _ in 0..4 {
+            let err = attempt(
+                &malformed.to_string(),
+                &mut nonces,
+                &mut buckets,
+                &mut clock,
+            )
+            .expect_err("malformed facts do not consume the member budget");
+            assert_eq!(err.code, ErrorCode::Malformed);
+        }
         for _ in 0..3 {
             attempt(&capped, &mut nonces, &mut buckets, &mut clock).expect("burst");
         }

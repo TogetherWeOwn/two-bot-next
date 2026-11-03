@@ -5,8 +5,10 @@ mod common;
 
 use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
 use two_bot_core::internal_actions::{ErrorCode, PlaceOfferSendRequest, ReminderSendRequest};
 use two_bot_discord::executor::notify::NotifyOutcome;
+use two_bot_discord::ratelimit_guard::{GuardConfig, RateLimitGuard};
 use two_bot_discord::ActionExecutor;
 
 const USER: &str = "100000000000000002";
@@ -41,7 +43,12 @@ fn offer_body() -> Map<String, Value> {
 }
 
 fn executor(mock: &MockRest) -> ActionExecutor {
-    ActionExecutor::with_proxy("fixture-bot-token".into(), Some(mock.origin())).unwrap()
+    ActionExecutor::with_proxy_and_guard(
+        "fixture-bot-token".into(),
+        Some(mock.origin()),
+        Arc::new(RateLimitGuard::new(GuardConfig::default()).unwrap()),
+    )
+    .unwrap()
 }
 
 fn opened_channel() -> ScriptedResponse {
@@ -59,7 +66,8 @@ async fn reminder_post_carries_template_text_with_no_pings() {
         ScriptedResponse::status(500),
     )
     .await;
-    let reminder = ReminderSendRequest::validate(&reminder_body()).unwrap();
+    let body = reminder_body();
+    let reminder = ReminderSendRequest::validate(&body).unwrap();
     let actual = executor(&mock).send_reminder_dm(&reminder).await.unwrap();
     assert_eq!(
         actual,
@@ -104,7 +112,8 @@ async fn offer_post_carries_template_text_with_no_pings() {
         ScriptedResponse::status(500),
     )
     .await;
-    let offer = PlaceOfferSendRequest::validate(&offer_body()).unwrap();
+    let body = offer_body();
+    let offer = PlaceOfferSendRequest::validate(&body).unwrap();
     let actual = executor(&mock).send_place_offer_dm(&offer).await.unwrap();
     assert_eq!(
         actual,
@@ -127,17 +136,50 @@ async fn offer_post_carries_template_text_with_no_pings() {
 async fn channel_open_refusal_is_dm_unavailable_without_a_second_call() {
     // Closed DMs, a blocked bot, or no shared guild surface here as a
     // definitive refusal: a 200 outcome, never a second wire attempt.
-    for status in [400, 401, 403, 404, 405, 413, 415, 422] {
+    for status in [400, 403, 404, 405, 413, 415, 422] {
         let mock = MockRest::start(
             vec![ScriptedResponse::json(status, json!({"message": "no"}))],
             posted_message(),
         )
         .await;
-        let reminder = ReminderSendRequest::validate(&reminder_body()).unwrap();
+        let body = reminder_body();
+        let reminder = ReminderSendRequest::validate(&body).unwrap();
         let actual = executor(&mock).send_reminder_dm(&reminder).await.unwrap();
         assert_eq!(actual, NotifyOutcome::DmUnavailable, "{status}");
         assert_eq!(mock.requests().len(), 1, "{status}");
         mock.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_statuses_and_invalid_token_are_unknown_at_either_call() {
+    for status in [401, 408, 409, 425] {
+        for opening in [true, false] {
+            let refusal = ScriptedResponse::json(status, json!({"message": "no"}));
+            let script = if opening {
+                vec![refusal]
+            } else {
+                vec![opened_channel(), refusal]
+            };
+            let mock = MockRest::start(script, posted_message()).await;
+            let body = reminder_body();
+            let reminder = ReminderSendRequest::validate(&body).unwrap();
+            let executor = executor(&mock);
+            let error = executor.send_reminder_dm(&reminder).await.unwrap_err();
+            assert_eq!(error.code, ErrorCode::DiscordUnavailable, "{status}");
+            assert_eq!(error.log_reason, "dm_delivery_unconfirmed", "{status}");
+            let calls = if opening { 1 } else { 2 };
+            assert_eq!(mock.requests().len(), calls, "no retries for {status}");
+            if status == 401 {
+                // The triggering request and the latched guard both surface
+                // authentication failure, never a member-specific refusal.
+                let error = executor.send_reminder_dm(&reminder).await.unwrap_err();
+                assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+                assert_eq!(error.log_reason, "discord_guard_refused");
+                assert_eq!(mock.requests().len(), calls);
+            }
+            mock.shutdown().await;
+        }
     }
 }
 
@@ -151,7 +193,8 @@ async fn message_post_refusal_is_dm_unavailable() {
         ScriptedResponse::status(500),
     )
     .await;
-    let offer = PlaceOfferSendRequest::validate(&offer_body()).unwrap();
+    let body = offer_body();
+    let offer = PlaceOfferSendRequest::validate(&body).unwrap();
     let actual = executor(&mock).send_place_offer_dm(&offer).await.unwrap();
     assert_eq!(actual, NotifyOutcome::DmUnavailable);
     assert_eq!(mock.requests().len(), 2);
@@ -165,7 +208,8 @@ async fn rate_limit_is_retryable_with_retry_after_and_no_burst() {
         posted_message(),
     )
     .await;
-    let reminder = ReminderSendRequest::validate(&reminder_body()).unwrap();
+    let body = reminder_body();
+    let reminder = ReminderSendRequest::validate(&body).unwrap();
     let error = executor(&mock)
         .send_reminder_dm(&reminder)
         .await
@@ -186,7 +230,8 @@ async fn server_error_is_unknown_never_dm_unavailable() {
         ScriptedResponse::status(500),
     )
     .await;
-    let offer = PlaceOfferSendRequest::validate(&offer_body()).unwrap();
+    let body = offer_body();
+    let offer = PlaceOfferSendRequest::validate(&body).unwrap();
     let error = executor(&mock)
         .send_place_offer_dm(&offer)
         .await
@@ -204,7 +249,8 @@ async fn redirect_is_unknown_without_forwarding_credentials() {
     let mut redirect = ScriptedResponse::json(307, json!({"message": "elsewhere"}));
     redirect.headers.push(("location".into(), target.origin()));
     let mock = MockRest::start(vec![redirect], ScriptedResponse::status(201)).await;
-    let reminder = ReminderSendRequest::validate(&reminder_body()).unwrap();
+    let body = reminder_body();
+    let reminder = ReminderSendRequest::validate(&body).unwrap();
     let error = executor(&mock)
         .send_reminder_dm(&reminder)
         .await
@@ -227,7 +273,8 @@ async fn unreadable_receipt_is_unknown_not_a_phantom_send() {
             ScriptedResponse::status(500),
         )
         .await;
-        let reminder = ReminderSendRequest::validate(&reminder_body()).unwrap();
+        let body = reminder_body();
+        let reminder = ReminderSendRequest::validate(&body).unwrap();
         let error = executor(&mock)
             .send_reminder_dm(&reminder)
             .await

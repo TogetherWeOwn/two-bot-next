@@ -310,9 +310,8 @@ fn member_notify_verbs_require_admin() {
             !InternalFlags::admin_scope_allows(&[SCOPE_READ], verb),
             "read must refuse the write verb {verb}"
         );
-        assert_eq!(
+        assert!(
             live_token_allows(&[SCOPE_ADMIN], verb, GUILD),
-            true,
             "token predicate must preserve exact scope on {verb}"
         );
     }
