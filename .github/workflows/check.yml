@@ -2146,6 +2146,11 @@ jobs:
           AUTOMOD_CI_TESTDB: '1'
         run: cargo test -p two-bot-core --features db --locked --test automod_store --test automod_preserved_replay -- --ignored
 
+      - name: automod preview wiring acceptance (CI service container only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: cargo test -p two-bot-discord --features db --locked --test automod_preview_handler_acceptance -- --ignored --test-threads=1
+
       # The 15 quarantined red backfill tests (TOG-34944) are skipped in the
       # run below; BACKFILL_QUARANTINE in test_workflows.py pins the set.
       - name: Store Postgres integration (isolated CI schemas)
