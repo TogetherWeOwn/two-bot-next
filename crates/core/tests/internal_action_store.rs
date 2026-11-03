@@ -2218,9 +2218,9 @@ async fn botlog_page_projects_only_the_closed_publishable_kinds() {
     assert_eq!(first.next, first.entries[0].seq);
     assert_ne!(first.next, BotlogCursor::zero().encode());
     // A non-snowflake guild refuses before any read.
-    assert_eq!(
+    assert!(matches!(
         store.list_botlog_page("not-a-guild", 0, 0, 200).await,
         Err(InternalStoreError::InvalidInput)
-    );
+    ));
     db.cleanup().await;
 }
