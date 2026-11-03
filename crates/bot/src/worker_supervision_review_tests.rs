@@ -231,3 +231,42 @@ fn main_retains_every_worker_supervisor_for_the_shutdown_join() {
         }
     }
 }
+
+#[test]
+fn main_releases_the_activity_flush_after_the_gateway_joins_and_joins_it() {
+    // The flush loop's final pass must follow its only producer: latching it
+    // on the service watch (or before the gateway supervisor returns) lets
+    // late presence/voice frames and the voice guard's closed spans miss the
+    // pass. Dropping the flush join detaches the pass from the process exit.
+    let main = code_only(MAIN_SOURCE);
+    assert_eq!(
+        occurrences(
+            &main,
+            "build_voice_runtime(&config, VoiceGates::from_env().enabled, activity_drain)"
+        ),
+        1,
+        "the flush loop must take its own drain latch, not the service watch"
+    );
+    assert_eq!(
+        occurrences(&main, "activity_drained.send_replace(true)"),
+        1,
+        "the activity drain latch must be sent exactly once"
+    );
+    let gateway_joined = main
+        .find("supervise_gateway(task, http, gateway, shutdown).await")
+        .expect("gateway supervisor joins the gateway task");
+    let released = main
+        .find("activity_drained.send_replace(true)")
+        .expect("activity drain latch");
+    let joined = main
+        .find("join_worker_supervisors(flush_task.into_iter().collect(), &latch_mark)")
+        .expect("the flush handle must be joined on the shutdown path");
+    assert!(
+        gateway_joined < released,
+        "the final flush must be released after the gateway task joins"
+    );
+    assert!(
+        released < joined,
+        "the flush handle is joined after its release"
+    );
+}
