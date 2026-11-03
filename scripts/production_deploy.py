@@ -343,6 +343,10 @@ def serving(args):
     import worker_container_rollback as rollback
     from bot_promotion import PRODUCTION_APP, REGISTRY_HOST, load_admitted
 
+    # Bound before the try: a rollout_timeout raised by a control-plane read
+    # straddling the shared 600s deadline must still report the last wait
+    # class instead of falling back to the bare exception verdict.
+    unready = None
     try:
         admitted = load_admitted(args.artifact, args.sha)
         if not is_deploy_id_shape(args.deploy_id) or parse_deploy_id(args.deploy_id)[2] != args.sha[:7]:
@@ -377,6 +381,11 @@ def serving(args):
         client = rollback.base.Client(account, os.environ.get("CLOUDFLARE_API_TOKEN"), deadline)
         lag_streak = 0
         lag_identity = None
+        # Fixed-vocabulary wait class for the timeout verdict below: what the
+        # last unaccepted poll was still waiting on. Remote values never enter
+        # diagnostics, so the verdict stays greppable after a 600s expiry.
+        # (unready is initialized before the try so the rollout_timeout path
+        # below can read it too.)
         while time.monotonic() < deadline:
             version = rollback.serving_version(client, rollback.WORKERS["production"])
             if version != args.expected_worker_version:
@@ -427,9 +436,16 @@ def serving(args):
             if not accepted:
                 # Empty/stale listings and any unready poll break consecutive
                 # confirmations, including when application state lags.
-                if row is None or not app_matches:
+                if row is None:
                     lag_streak = 0
                     lag_identity = None
+                    unready = "awaiting_rollout_listing"
+                elif not app_matches:
+                    lag_streak = 0
+                    lag_identity = None
+                    unready = "awaiting_application_config"
+                else:
+                    unready = "awaiting_runtime_convergence"
                 time.sleep(min(5, max(0, deadline - time.monotonic())))
                 continue
             # Re-read after every accepted observation: an intervening secret-
@@ -446,9 +462,25 @@ def serving(args):
             print("promoted production identity verified; readiness pending" if preflight
                   else "promoted production Worker and container digest verified")
             return 0
-    except (OSError, ValueError, RecursionError, rollback.GateError):
+    except rollback.GateError as error:
+        # A control-plane read straddling the shared 600s deadline raises
+        # rollout_timeout after at least one unaccepted poll: that is the
+        # same expiry as the clean while-exit, so it takes the timeout
+        # verdict with the last wait class. Every other GateError stays on
+        # the byte-identical bare refusal.
+        if str(error) == "rollout_timeout":
+            verdict = ("serving: promoted production identity refused"
+                       "; image did not converge")
+            if unready:
+                verdict += f" ({unready})"
+            return reject(verdict)
         return reject("serving: promoted production identity refused")
-    return reject("serving: promoted production identity refused; image did not converge")
+    except (OSError, ValueError, RecursionError):
+        return reject("serving: promoted production identity refused")
+    verdict = "serving: promoted production identity refused; image did not converge"
+    if unready:
+        verdict += f" ({unready})"
+    return reject(verdict)
 
 
 def excerpt(args):

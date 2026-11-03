@@ -499,8 +499,12 @@ requires image convergence and live exact-version `/health` plus original-stamp
 0/1 or 1/0) need two consecutive fully passing observations, finished rollout steps
 and all instances updated; any miss resets confirmations. Empty rollout listings
 or the exact older rollout identified by the pre-deploy snapshot may poll; a newer
-foreign-image rollout refuses. A different same-SHA build still refuses. The
-production event ID is not restamped into the image.
+foreign-image rollout refuses. If the 600-second window expires without any
+accepted observation, the refusal names the last wait class in fixed vocabulary —
+`awaiting_rollout_listing`, `awaiting_application_config` or
+`awaiting_runtime_convergence` — so the next run can tell a stalled control-plane
+rollout from an application-config lag. A different same-SHA build still refuses.
+The production event ID is not restamped into the image.
 
 Rollback and explicitly authorized live-SHA recovery remain independent of
 artifact retention. Only live-SHA recovery builds a fresh image. Its rendered
