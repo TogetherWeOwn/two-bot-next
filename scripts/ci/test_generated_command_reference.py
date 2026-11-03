@@ -58,7 +58,37 @@ def logical_lines(script):
             if line.strip() and not line.lstrip().startswith("#")]
 
 
+NIGHTLY_HELPER = ".github/scripts/nightly_partition.py"
+
+
+def helper_compile_modes():
+    """Helper modes that spawn `cargo test --workspace` (compile or doctest).
+
+    Read from the helper itself so the census follows the implementation: plan
+    and run call discover(), whose CARGO build uses --no-run; docs runs CARGO
+    with --doc. Aggregate never spawns cargo.
+    """
+    import ast
+    source = (ROOT / NIGHTLY_HELPER).read_text()
+    tree = ast.parse(source)
+    cargo = next(ast.literal_eval(node.value) for node in ast.walk(tree)
+                 if isinstance(node, ast.Assign)
+                 and any(getattr(t, "id", "") == "CARGO" for t in node.targets))
+    if cargo[:3] != ["cargo", "test", "--workspace"]:
+        return set()
+    modes = set()
+    consts = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant)}
+    if "--no-run" in consts:
+        modes |= {"plan", "run"}
+    if "--doc" in consts:
+        modes.add("docs")
+    return modes
+
+
 def compiles_reference_consumers(line):
+    helper = re.search(r"nightly_partition\.py\s+(plan|run|docs|aggregate)\b", line)
+    if helper:
+        return helper.group(1) in helper_compile_modes()
     executable = r'(?:\bcargo|"\$COV")\s+'
     if not re.search(executable + r"(?:test|clippy|build|check|nextest\s+run|llvm-cov)\b", line):
         return False
@@ -225,6 +255,35 @@ with mock.patch.object(unittest.TextTestRunner, "run") as run:
             "cargo test -p two-bot-core --test reference_docs",
         ):
             self.assertFalse(compiles_reference_consumers(command), command)
+
+    def test_nightly_helper_modes_are_compile_consumers(self):
+        self.assertEqual(helper_compile_modes(), {"plan", "run", "docs"})
+        prefix = "python3 .github/scripts/nightly_partition.py "
+        for command in (
+            prefix + "plan -- --include-ignored --test-threads=1 --skip x",
+            prefix + 'run --partition "$NIGHTLY_PARTITION" --receipt r.json',
+            prefix + "docs",
+        ):
+            self.assertTrue(compiles_reference_consumers(command), command)
+        for command in (
+            prefix + "aggregate --needs nightly-needs.json",
+            "python3 .github/scripts/other.py plan",
+        ):
+            self.assertFalse(compiles_reference_consumers(command), command)
+        # The census sees the real workflow's helper compile calls and each
+        # still has a prior generator step (the census test above enforces it).
+        workflow = load_workflow(ROOT / ".github/workflows/nightly.yml")
+        seen = {
+            job_id for job_id, job in workflow["jobs"].items()
+            for step in job.get("steps", [])
+            for line in logical_lines(step.get("run", ""))
+            if re.search(r"nightly_partition\.py\s+(plan|run|docs)\b", line)
+            and compiles_reference_consumers(line)
+        }
+        self.assertEqual(seen, {"sweep-plan", "sweep-partition", "sweep-docs"})
+        # A helper that stopped compiling cargo tests would drop out, not pass vacuously.
+        with mock.patch(f"{__name__}.helper_compile_modes", return_value=set()):
+            self.assertFalse(compiles_reference_consumers(prefix + "plan"))
 
     def test_generated_output_is_ignored_but_authored_contracts_stay_tracked(self):
         tracked = set(subprocess.check_output(
