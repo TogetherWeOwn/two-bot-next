@@ -731,6 +731,13 @@ GATEWAY_FAIL_INJECTION_VAR = "TWO_GATEWAY_READINESS_FAIL_INJECTION"
 CONTAINER_RELEASE_VAR = "CONTAINER_RELEASE"
 VOICE_STALL_FAULT_VAR = "TWO_VOICE_STALL_FAULT_INJECTION"
 UNPAIRED_FAULT_VAR = "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"
+# Staging bot avatar one-shot (docs/runbook.md#staging-bot-avatar-one-shot): the same
+# generated-only rule as the drill switches above. Committed anywhere —
+# staging included — fails; only the generated per-deploy staging config from
+# a manual dispatch may carry it, so a toml change alone can never arm (or
+# leave armed) a bot avatar change. Discord rate-limits avatar changes, so
+# the dispatch is run once, then left off again.
+AVATAR_SYNC_VAR = "TWO_SET_BOT_AVATAR_ONCE"
 
 
 def apply_gateway_fail_injection(config, enabled):
@@ -800,6 +807,37 @@ def apply_remediation_fault_injection(config, voice_stall, unpaired_disconnect):
         variables[UNPAIRED_FAULT_VAR] = "1"
 
 
+def apply_avatar_sync_flag(config, enabled):
+    """Stage the bot avatar one-shot in the GENERATED config only.
+
+    Same fence as the drill helpers above: the committed TOML may never
+    carry the switch (wrangler/scripts/check-env-bindings.py), and this
+    helper refuses such a source again so a hand-generated config cannot
+    smuggle it past CI. When armed, the staging fence marker must already
+    be exactly "staging" and only the staging vars of the generated config
+    gain the switch — top-level, production and every other environment
+    stay untouched, and the checked-in file is never modified. When not
+    enabled nothing is added, so a plain push deploy is byte-identical in
+    behavior to before the one-shot existed.
+    """
+    envs = config.get("env") or {}
+    tables = [("top-level", config.get("vars") or {})]
+    tables += [(name, (env or {}).get("vars") or {}) for name, env in envs.items()]
+    for _name, variables in tables:
+        require(AVATAR_SYNC_VAR not in variables,
+                "avatar_sync_in_source_config")
+    for name, variables in tables:
+        if name != "staging":
+            require(DEPLOY_ENV_VAR not in variables, "deploy_env_outside_staging")
+    if not enabled:
+        return
+    staging = mapping(mapping(config.get("env")).get("staging"))
+    variables = staging.get("vars")
+    require(isinstance(variables, dict) and variables.get(DEPLOY_ENV_VAR) == "staging",
+            "avatar_sync_fence_missing")
+    variables[AVATAR_SYNC_VAR] = "1"
+
+
 def prepare(args, client):
     staging_url()
     revision = os.environ.get("GITHUB_SHA", "")
@@ -847,6 +885,9 @@ def prepare(args, client):
     # deployed build solely as these flags on the generated staging config.
     apply_remediation_fault_injection(config, bool(getattr(args, "inject_voice_stall", False)),
                                       bool(getattr(args, "inject_unpaired_disconnect", False)))
+    # Bot avatar one-shot only: the dispatch-only workflow input reaches the
+    # deployed build solely as this flag on the generated staging config.
+    apply_avatar_sync_flag(config, bool(getattr(args, "set_bot_avatar_once", False)))
     save(args.deploy_config, config)
     save(args.receipt, {"started": started, "application_id": app["id"],
                         "namespace_id": app["durable_objects"]["namespace_id"],
@@ -1108,6 +1149,9 @@ def main():
     parser.add_argument("--inject-unpaired-disconnect", action="store_true",
                         help="prepare only: staging remediation drill — the generated "
                              "staging deploy config holds an unpaired disconnect")
+    parser.add_argument("--set-bot-avatar-once", action="store_true",
+                        help="prepare only: staging bot avatar one-shot — the generated "
+                             "staging deploy config arms the Icon 1 avatar sync")
     args = parser.parse_args()
     if args.inject_gateway_failure and args.mode != "prepare":
         parser.error("--inject-gateway-failure is prepare-only")
@@ -1115,6 +1159,8 @@ def main():
         parser.error("--inject-voice-stall is prepare-only")
     if args.inject_unpaired_disconnect and args.mode != "prepare":
         parser.error("--inject-unpaired-disconnect is prepare-only")
+    if args.set_bot_avatar_once and args.mode != "prepare":
+        parser.error("--set-bot-avatar-once is prepare-only")
     client = None
     try:
         deadline = time.monotonic() + VERIFY_TIMEOUT_SECONDS if args.mode == "verify" else None

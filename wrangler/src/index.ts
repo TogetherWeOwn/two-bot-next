@@ -20,7 +20,7 @@
  * exists; otherwise REDIRECT_MAPPINGS_JSON carries a snapshot of the same rows.
  */
 
-import { Container } from "@cloudflare/containers";
+import { Container, type ContainerStartConfigOptions } from "@cloudflare/containers";
 // SDK 0.3.7 reattaches outbound callbacks even for an already-running process.
 // https://developers.cloudflare.com/containers/container-package/
 export { ContainerProxy } from "@cloudflare/containers";
@@ -254,6 +254,12 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
    * Container (NOT_FORWARDED in container-env.ts) and never logged. */
   TWO_VOICE_STALL_FAULT_INJECTION?: string;
   TWO_GATEWAY_UNPAIRED_FAULT_INJECTION?: string;
+  /** Staging bot avatar one-shot (docs/runbook.md#staging-bot-avatar-one-shot).
+   * Set only in the generated staging deploy config by a manual deploy-staging
+   * dispatch, never a committed var (check-env-bindings.py). Reaches the
+   * Container on an explicit fenced line below, never flag-forwarded. The
+   * TWO_DEPLOY_ENV marker it is fenced by rides FORWARDED_FLAGS. */
+  TWO_SET_BOT_AVATAR_ONCE?: string;
   /** Operator-set Worker secrets for the private receiver. Never flag-forwarded. */
   TWO_INTERNAL_ACTIONS?: string;
   TWO_INTERNAL_CALLERS?: string;
@@ -758,6 +764,8 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   if (env.TWO_DEPLOY_ENV === "staging" && env.TWO_GATEWAY_READINESS_FAIL_INJECTION === "1") {
     vars["TWO_GATEWAY_READINESS_FAIL_INJECTION"] = "1";
   }
+  // Avatar authorization is never a class default. Only avatarStartOptions
+  // may forward it, after durably consuming the staging one-shot.
   vars["LISTEN_ADDR"] = `0.0.0.0:${port}`;
   // Private internal-actions receiver (TOG-12980, bind TOG-16851). Dark unless
   // the Operator sets TWO_INTERNAL_ACTIONS to exactly "1"; any other value
@@ -820,6 +828,11 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
   }
   return vars;
 }
+
+// Per singleton and per icon, deliberately not per process or deployment.
+// Never clear this receipt to retry an uncertain Discord write.
+export const AVATAR_SYNC_CONSUMED_KEY = "two-bot:avatar-sync:icon-1:v1";
+const AVATAR_SYNC_VAR = "TWO_SET_BOT_AVATAR_ONCE";
 
 export class TwoBotContainer extends Container<Env> {
   override defaultPort = containerPort(this.env.BOT_PORT);
@@ -1376,22 +1389,65 @@ export class TwoBotContainer extends Container<Env> {
 
   // SDK 0.3.7 containerFetch auto-starts via startAndWaitForPorts, NOT start.
   // Guard all three supported entries, including direct binding/RPC calls.
+  private avatarSyncClaimed = false;
+
+  /** Called inside the ownership gate, before any armed process can start.
+   * Consume before start, even if startup or the Discord outcome is uncertain.
+   * A storage failure disarms this boot, never normal gateway startup.
+   */
+  private async avatarStartOptions(options?: ContainerStartConfigOptions): Promise<ContainerStartConfigOptions> {
+    const envVars = { ...(options?.envVars ?? this.envVars) };
+    delete envVars[AVATAR_SYNC_VAR];
+    const disarmed = { ...options, envVars };
+    if (this.ctx.container?.running || this.avatarSyncClaimed ||
+        this.env.TWO_DEPLOY_ENV !== "staging" || this.env.TWO_SET_BOT_AVATAR_ONCE !== "1" ||
+        envVars.TWO_DEPLOY_ENV !== "staging") return disarmed;
+    // Also excludes same-event concurrent calls before the first storage await.
+    this.avatarSyncClaimed = true;
+    try {
+      // Any existing value, including corrupt state, denies another attempt.
+      if (await this.ctx.storage.get(AVATAR_SYNC_CONSUMED_KEY) !== undefined) return disarmed;
+      await this.ctx.storage.put(AVATAR_SYNC_CONSUMED_KEY, true);
+      await this.ctx.storage.sync();
+    } catch {
+      console.warn(JSON.stringify({ event: "bot_avatar_sync_disarmed", reason: "storage_unavailable" }));
+      return disarmed;
+    }
+    envVars[AVATAR_SYNC_VAR] = "1";
+    return disarmed;
+  }
+
   override async start(...args: Parameters<Container<Env>["start"]>): Promise<void> {
-    return this.owned(() => super.start(...args));
+    return this.owned(async () => {
+      const [options, wait] = args;
+      const startOptions = await this.avatarStartOptions(options);
+      // SDK 0.3.7 can restart inside its polling loop. An armed call must have
+      // only one flight; subsequent calls go through durable admission again.
+      return super.start(startOptions, startOptions.envVars?.[AVATAR_SYNC_VAR] === "1"
+        ? { ...wait, portToCheck: wait?.portToCheck ?? this.defaultPort, retries: 1 } : wait);
+    });
   }
 
   override async startAndWaitForPorts(...args: Parameters<Container<Env>["startAndWaitForPorts"]>): Promise<void> {
-    // containerFetch always names one port. While a receiver is enabled its
-    // port is checked with it; the explicit port stays first for the SDK.
-    const [ports, ...rest] = args;
-    let checked = ports;
-    if (typeof ports === "number" && (receiverEnabled(this.env) || eventsubReceiverForwarded(this.env))) {
-      const extra = [ports, this.defaultPort ?? ports];
-      if (receiverEnabled(this.env)) extra.push(RECEIVER_PORT);
-      if (eventsubReceiverForwarded(this.env)) extra.push(EVENTSUB_RECEIVER_PORT);
-      checked = [...new Set(extra)];
-    }
-    return this.owned(() => super.startAndWaitForPorts(checked, ...rest));
+    return this.owned(async () => {
+      const [portsOrOptions, cancellation, options] = args;
+      const objectForm = typeof portsOrOptions === "object" && portsOrOptions !== null && !Array.isArray(portsOrOptions);
+      const ports = objectForm ? portsOrOptions.ports : portsOrOptions;
+      const wait = objectForm ? portsOrOptions.cancellationOptions : cancellation;
+      const startOptions = await this.avatarStartOptions(objectForm ? portsOrOptions.startOptions : options);
+      // containerFetch always names one port. While a receiver is enabled its
+      // port is checked with it; the explicit port stays first for the SDK.
+      let checked = ports;
+      if (typeof ports === "number" && (receiverEnabled(this.env) || eventsubReceiverForwarded(this.env))) {
+        const extra = [ports, this.defaultPort ?? ports];
+        if (receiverEnabled(this.env)) extra.push(RECEIVER_PORT);
+        if (eventsubReceiverForwarded(this.env)) extra.push(EVENTSUB_RECEIVER_PORT);
+        checked = [...new Set(extra)];
+      }
+      // ceil(instanceGetTimeoutMS / waitInterval) == 1 prevents SDK replay.
+      return super.startAndWaitForPorts(checked, startOptions.envVars?.[AVATAR_SYNC_VAR] === "1"
+        ? { ...wait, waitInterval: 300, instanceGetTimeoutMS: 300 } : wait, startOptions);
+    });
   }
 
   override async containerFetch(...args: Parameters<Container<Env>["containerFetch"]>): Promise<Response> {

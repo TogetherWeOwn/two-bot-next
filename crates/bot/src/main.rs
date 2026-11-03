@@ -11,6 +11,7 @@ mod admission_test_support;
 mod audit_gateway;
 mod audit_runtime;
 mod automod_gateway;
+mod avatar_sync;
 #[cfg(test)]
 mod backfill_error_chain_acceptance_tests;
 mod backfill_retention_chains;
@@ -340,6 +341,17 @@ async fn run(cli_args: &[String]) {
             std::process::exit(1);
         }
     }
+
+    // One-shot staging bot avatar sync (Icon 1): uses the token the process
+    // already holds, runs only when the generated staging config armed it,
+    // and never blocks boot. Needs the token alone, never the database.
+    avatar_sync::maybe_sync_on_boot(
+        config
+            .discord_token
+            .as_ref()
+            .map(|secret| secret.expose().as_str()),
+    )
+    .await;
 
     let store = match gateway_prerequisites(&config).ok().map(|(_, url, _)| url) {
         Some(url) => match tokio::time::timeout(

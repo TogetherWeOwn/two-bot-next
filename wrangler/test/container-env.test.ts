@@ -175,6 +175,30 @@ test("gateway readiness failure injection forwards only under the staging marker
   assert.equal(armed["TWO_DEPLOY_ENV"], "staging");
 });
 
+test("bot avatar one-shot is never a class default; only the staging marker is forwarded", () => {
+  const key = "TWO_SET_BOT_AVATAR_ONCE";
+  // The switch is never on the generic flag allowlist.
+  assert.equal(forwardedFlagVars({ [key]: "1", TWO_DEPLOY_ENV: "staging" })[key], undefined);
+  // Production shape: no marker (or a non-staging one) forwards nothing,
+  // even with the switch set on the Worker.
+  for (const env of [
+    { [key]: "1" },
+    { [key]: "1", TWO_DEPLOY_ENV: "production" },
+    { [key]: "1", TWO_DEPLOY_ENV: "staging " },
+    { [key]: "true", TWO_DEPLOY_ENV: "staging" },
+    { [key]: "0", TWO_DEPLOY_ENV: "staging" },
+    { TWO_DEPLOY_ENV: "staging" },
+  ]) {
+    assert.equal(containerEnv(env)[key], undefined, JSON.stringify(env));
+  }
+  // Even the staging shape never forwards it as a class default: only the
+  // durable consumed-receipt guard in start may arm it (container.test.ts).
+  // The marker still travels so the Rust fence can repeat the check.
+  const staging = containerEnv({ [key]: "1", TWO_DEPLOY_ENV: "staging" });
+  assert.equal(staging[key], undefined);
+  assert.equal(staging["TWO_DEPLOY_ENV"], "staging");
+});
+
 test("remediation-drill switches never reach the Container: Worker-only trigger input", () => {
   for (const key of ["TWO_VOICE_STALL_FAULT_INJECTION", "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION"]) {
     // Never on the generic flag allowlist, even armed.
