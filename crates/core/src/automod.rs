@@ -252,7 +252,8 @@ impl AutomodPolicy {
 /// Zero-width / invisible characters legacy strips or skips: U+200B ZWSP,
 /// U+200C ZWNJ, U+200D ZWJ, U+2060 word joiner, U+FEFF BOM (legacy
 /// `ZERO_WIDTH` plus the inter-word `[\s​-‍⁠﻿]*` class).
-const ZERO_WIDTH: [char; 5] = ['\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{FEFF}'];
+pub(crate) const ZERO_WIDTH: [char; 5] =
+    ['\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{FEFF}'];
 
 /// Trailing punctuation stripped from URL candidates (legacy
 /// `TRAILING_URL_PUNCTUATION`).
@@ -337,7 +338,7 @@ fn matches_bad_word(content: &[char], word: &[char]) -> bool {
     false
 }
 
-fn has_bad_word(normalized: &str, words: &[String]) -> bool {
+pub(crate) fn has_bad_word(normalized: &str, words: &[String]) -> bool {
     let content: Vec<char> = normalized.chars().collect();
     words.iter().any(|raw| {
         let word: Vec<char> = normalize_bad_word(raw).chars().collect();
@@ -353,7 +354,7 @@ fn has_bad_word(normalized: &str, words: &[String]) -> bool {
 /// Content identity is a non-cryptographic hash of the normalized text; the
 /// legacy HMAC key only avoids storing message text, which this tracker
 /// already avoids. Never persisted, never sent anywhere.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RepeatTracker {
     rows: HashMap<String, Vec<RepeatRow>>,
 }
@@ -422,28 +423,18 @@ impl RepeatTracker {
         let key = format!("{}:{}", message.guild_id, message.author_id);
         let digest = digest_content(normalized);
         let keep = policy.repeated_message_count.max(1) as usize;
-        let matches_window = |rows: &[RepeatRow]| {
-            // Include this revision once, then up to `keep` preceding rows
-            // in its interval, matching legacy `MemoryRepeatTracker.observe`
-            // (the new row plus up to `count` earlier rows).
-            rows.iter()
-                .rev()
-                .filter(|row| {
-                    row.message_id != message.message_id
-                        && row.at_ms >= cutoff
-                        && row.at_ms <= message.observed_timestamp_ms
-                })
-                .take(keep)
-                .filter(|row| row.digest == digest)
-                .count()
-                + 1
-                >= keep
-        };
+        let probe = RepeatProbe::new(
+            &message.message_id,
+            digest,
+            cutoff,
+            message.observed_timestamp_ms,
+            keep,
+        );
         if observation != RepeatObservation::Create {
             // REST may return a future revision while older CREATEs are queued.
             // Inspect edits against CREATE history without replacing a row or
             // inserting one that could evict history needed by that batch.
-            return matches_window(self.rows.get(&key).map_or(&[], Vec::as_slice));
+            return probe.window_matches(self.rows.get(&key).map_or(&[], Vec::as_slice));
         }
         let rows = self.rows.entry(key).or_default();
         if rows.iter().any(|row| {
@@ -451,10 +442,10 @@ impl RepeatTracker {
         }) {
             // An older CREATE cannot replace a newer retained observation
             // of the same message.
-            return matches_window(rows);
+            return probe.window_matches(rows);
         }
         rows.retain(|row| row.message_id != message.message_id && row.at_ms >= cutoff);
-        let matched = matches_window(rows);
+        let matched = probe.window_matches(rows);
         rows.push(RepeatRow {
             message_id: message.message_id.clone(),
             digest,
@@ -467,6 +458,75 @@ impl RepeatTracker {
             rows.drain(..rows.len() - keep);
         }
         matched
+    }
+
+    /// Read-only preview probe (automod preview spec §5.1): would posting
+    /// `message` now complete a repeat streak? Never inserts, replaces,
+    /// prunes, or expires any row. The verdict equals a CREATE evaluated on
+    /// a cloned tracker because `retain` only drops rows the window filter
+    /// already ignores (same message id or outside the cutoff), and a
+    /// preview id (`preview:<interaction_id>`) never equals a real row.
+    pub(crate) fn preview_would_match(
+        &self,
+        message: &AutomodMessage,
+        normalized: &str,
+        policy: &AutomodPolicy,
+    ) -> bool {
+        if normalized.is_empty() {
+            return false;
+        }
+        let window_ms = policy.repeated_message_window_seconds.saturating_mul(1000);
+        let cutoff = message.observed_timestamp_ms.saturating_sub(window_ms);
+        let key = format!("{}:{}", message.guild_id, message.author_id);
+        let digest = digest_content(normalized);
+        let keep = policy.repeated_message_count.max(1) as usize;
+        RepeatProbe::new(
+            &message.message_id,
+            digest,
+            cutoff,
+            message.observed_timestamp_ms,
+            keep,
+        )
+        .window_matches(self.rows.get(&key).map_or(&[], Vec::as_slice))
+    }
+}
+
+/// Shared window predicate for CREATE evaluation and read-only preview
+/// probes: include the candidate once, then up to `keep` preceding rows in
+/// its interval, matching legacy `MemoryRepeatTracker.observe` (the new row
+/// plus up to `count` earlier rows).
+struct RepeatProbe {
+    message_id: String,
+    digest: u64,
+    cutoff_ms: u64,
+    now_ms: u64,
+    keep: usize,
+}
+
+impl RepeatProbe {
+    fn new(message_id: &str, digest: u64, cutoff_ms: u64, now_ms: u64, keep: usize) -> Self {
+        Self {
+            message_id: message_id.to_owned(),
+            digest,
+            cutoff_ms,
+            now_ms,
+            keep,
+        }
+    }
+
+    fn window_matches(&self, rows: &[RepeatRow]) -> bool {
+        rows.iter()
+            .rev()
+            .filter(|row| {
+                row.message_id != self.message_id
+                    && row.at_ms >= self.cutoff_ms
+                    && row.at_ms <= self.now_ms
+            })
+            .take(self.keep)
+            .filter(|row| row.digest == self.digest)
+            .count()
+            + 1
+            >= self.keep
     }
 }
 
@@ -522,7 +582,7 @@ pub(crate) fn match_automod_with_clock(
 /// Discord invite links: `discord.gg/<code>`, `discord.com/invite/<code>`,
 /// `discordapp.com/invite/<code>`, each with optional scheme/`www.` prefix
 /// (legacy `INVITE`). Content is already lowercased.
-fn has_invite(content: &str) -> bool {
+pub(crate) fn has_invite(content: &str) -> bool {
     for marker in [
         "discord.gg/",
         "discord.com/invite/",
@@ -554,7 +614,7 @@ fn host_allowed(host: &str, allowed: &[String]) -> bool {
 /// Unanchored explicit and bare-domain scans (legacy `hasExternalLink`).
 /// Preserve the legacy TLD alternation order and lack of a right boundary;
 /// URL parsing supplies host canonicalization, ignoring query/path/userinfo.
-fn has_external_link(content: &str, allowed: &[String]) -> bool {
+pub(crate) fn has_external_link(content: &str, allowed: &[String]) -> bool {
     static EXPLICIT: OnceLock<Regex> = OnceLock::new();
     static BARE: OnceLock<Regex> = OnceLock::new();
     static BARE_LEFT_EXCLUSION: OnceLock<Regex> = OnceLock::new();
@@ -620,7 +680,7 @@ fn has_external_link(content: &str, allowed: &[String]) -> bool {
     false
 }
 
-fn has_blocked_attachment(names: &[String], blocked: &[String]) -> bool {
+pub(crate) fn has_blocked_attachment(names: &[String], blocked: &[String]) -> bool {
     names.iter().any(|name| {
         let lowered = name.to_lowercase();
         let extension = lowered.rsplit('.').next().unwrap_or("");
