@@ -7,7 +7,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tower::ServiceExt;
-use twilight_cache_inmemory::{DefaultInMemoryCache, UpdateCache};
+use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
 use twilight_model::gateway::payload::incoming::{GuildCreate, VoiceStateUpdate};
 use twilight_model::guild::Guild;
