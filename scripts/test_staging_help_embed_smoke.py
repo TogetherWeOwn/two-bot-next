@@ -82,6 +82,12 @@ class FakeDiscord:
             query = parse_qs(urlparse(path).query)
             after = query.get("after", [None])[0]
             before = query.get("before", [None])[0]
+            # Discord documents before/after/around as mutually exclusive:
+            # passing more than one is a validation error, not an
+            # intersection filter.
+            if sum(cursor is not None for cursor in
+                   (after, before, query.get("around", [None])[0])) > 1:
+                return 400, b"{}"
             limit = int(query.get("limit", ["50"])[0])
             # The anchor read asks for 1; reconciliation pages at the
             # reconciliation page size.
@@ -274,6 +280,24 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         self.assertTrue(
             all(m["author"]["id"] == OTHER_APP for m in remaining),
             "the timed-out test-bot post is removed; fillers stay")
+
+    def test_reconciliation_keeps_test_bot_messages_at_or_below_the_anchor(self):
+        # A test-bot message that predates this attempt (id at or below
+        # the pre-post anchor) is not this attempt's to remove, even
+        # though backwards paging reads past the anchor to prove the
+        # newer range was fully inspected.
+        fake = FakeDiscord(post_timeout=True, fill_after_timeout=10)
+        old = {"id": str(fake.next_id - 1), "channel_id": CHANNEL,
+               "author": {"id": TEST_BOT}, "embeds": []}
+        fake.messages[old["id"]] = old
+        code, out = self.run_main(fake)
+        self.assertEqual(1, code)
+        self.assertIn("reconciled uncertain post", out)
+        remaining = list(fake.messages.values())
+        self.assertIn(old, remaining,
+                      "the pre-existing test-bot message stays")
+        self.assertEqual(11, len(remaining),
+                         "only the timed-out post is removed")
 
     def test_reconciliation_past_the_page_bound_uses_no_retry_exit(self):
         # If every allowed page comes back full, reconciliation cannot

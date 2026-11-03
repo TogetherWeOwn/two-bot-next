@@ -86,9 +86,10 @@ PRODUCT_APPLICATION_IDS = (
     "1537629682449649724",
 )
 # Reconciliation pages newest-first through the range newer than the
-# pre-post anchor. A short page proves the whole range was inspected; a
-# full page proves nothing, so traversal continues with a `before`
-# cursor and gives up (no-retry exit 3) past this many pages.
+# pre-post anchor. Reaching the anchor — or a short page at the start of
+# the channel — proves the whole range was inspected; a full page proves
+# nothing, so traversal continues with a `before` cursor and gives up
+# (no-retry exit 3) past this many pages.
 RECONCILE_PAGE_SIZE = 10
 RECONCILE_MAX_PAGES = 10
 
@@ -356,35 +357,41 @@ def reconcile_uncertain_post(transport, channel_id, application_id, anchor_id):
     any newer test-bot message is this attempt's. History reads return
     newest first, so a full first page can hide the committed post
     behind newer messages from other authors; page backwards with a
-    `before` cursor until a short page proves the whole range newer
-    than the anchor was inspected. Returns how many were removed;
-    raises SmokeFail when removal — or complete inspection — cannot be
-    established.
+    `before` cursor until the anchor (or a short page at the start of
+    the channel) proves the whole range newer than the anchor was
+    inspected. Discord treats `before`/`after`/`around` as mutually
+    exclusive, so the anchor is a stop condition on the walk, never a
+    second cursor. Returns how many were removed; raises SmokeFail
+    when removal — or complete inspection — cannot be established.
     """
     removed = 0
     before = None
+    anchor = int(anchor_id) if anchor_id is not None else None
     for _ in range(RECONCILE_MAX_PAGES):
         path = f"/channels/{channel_id}/messages?limit={RECONCILE_PAGE_SIZE}"
-        if anchor_id is not None:
-            path += f"&after={anchor_id}"
         if before is not None:
             path += f"&before={before}"
         messages = call_json(transport, "GET", path)
         if not isinstance(messages, list):
             raise SmokeFail("reconciliation read answered without a message list")
         page_oldest = None
+        reached_anchor = False
         for message in messages:
             if not isinstance(message, dict):
                 raise SmokeFail("reconciliation read answered without message objects")
             if not fenced.is_snowflake(message.get("id")):
                 raise SmokeFail("reconciliation read answered without a valid message id")
             message_id = int(message["id"])
-            if anchor_id is not None and message_id <= int(anchor_id):
-                raise SmokeFail("reconciliation read answered outside the anchored range")
             if before is not None and message_id >= int(before):
                 raise SmokeFail("reconciliation read answered outside the paged range")
             if page_oldest is None or message_id < page_oldest:
                 page_oldest = message_id
+            if anchor is not None and message_id <= anchor:
+                # History reads are newest-first, so the anchored range
+                # is fully inspected once the walk reaches the anchor;
+                # older messages predate this attempt and stay.
+                reached_anchor = True
+                continue
             author = message.get("author")
             if not isinstance(author, dict) or author.get("id") != application_id:
                 continue
@@ -392,7 +399,7 @@ def reconcile_uncertain_post(transport, channel_id, application_id, anchor_id):
                       f"/channels/{channel_id}/messages/{message['id']}",
                       expect=(204,))
             removed += 1
-        if len(messages) < RECONCILE_PAGE_SIZE:
+        if reached_anchor or len(messages) < RECONCILE_PAGE_SIZE:
             return removed
         before = str(page_oldest)
     raise SmokeFail(
