@@ -2140,7 +2140,7 @@ async fn rsvp_candidate_parity_accepted_rsvp_defers() {
         "accepted RSVP is a candidate"
     );
     let prepared = runtime
-        .prepare(interaction)
+        .prepare(interaction, runtime.router.gates().announcements)
         .await
         .expect("prepare accepted RSVP");
     let shown = format!("{prepared:?}");
@@ -2199,7 +2199,7 @@ async fn rsvp_candidate_parity_rsvp_refusal_answers_without_deferring() {
     let candidate = runtime.is_rsvp_candidate(&interaction);
     assert_eq!(candidate, EXPECTED_CANDIDATE, "refused RSVP is a candidate");
     let prepared = runtime
-        .prepare(interaction)
+        .prepare(interaction, runtime.router.gates().announcements)
         .await
         .expect("prepare refused RSVP");
     let shown = format!("{prepared:?}");
@@ -2238,7 +2238,7 @@ async fn rsvp_candidate_parity_foreign_application_is_ignored() {
         "foreign app is never a candidate"
     );
     let prepared = runtime
-        .prepare(foreign)
+        .prepare(foreign, runtime.router.gates().announcements)
         .await
         .expect("prepare foreign interaction");
     let shown = format!("{prepared:?}");
@@ -2276,7 +2276,7 @@ async fn rsvp_candidate_parity_unknown_command_identity_is_ignored() {
         "unresolvable identity is never a candidate"
     );
     let prepared = runtime
-        .prepare(interaction)
+        .prepare(interaction, runtime.router.gates().announcements)
         .await
         .expect("prepare unresolvable interaction");
     let shown = format!("{prepared:?}");
@@ -2313,7 +2313,7 @@ async fn rsvp_candidate_parity_non_rsvp_slash_is_ignored() {
         "non-RSVP slash is never a candidate"
     );
     let prepared = runtime
-        .prepare(interaction)
+        .prepare(interaction, runtime.router.gates().announcements)
         .await
         .expect("prepare non-RSVP slash");
     let shown = format!("{prepared:?}");
@@ -2350,7 +2350,7 @@ async fn rsvp_candidate_parity_component_is_ignored() {
         "components are never candidates"
     );
     let prepared = runtime
-        .prepare(interaction)
+        .prepare(interaction, runtime.router.gates().announcements)
         .await
         .expect("prepare component");
     let shown = format!("{prepared:?}");
