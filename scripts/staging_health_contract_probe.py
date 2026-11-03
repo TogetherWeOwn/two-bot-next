@@ -17,7 +17,8 @@ every component is ready), and the build-identity fields. A gateway_failure
 class of checkpoint_load_failed reports only the failed checkpoint read;
 its root cause needs separate reviewed schema/ACL/connectivity evidence
 (docs/voice-cutover-rollback-triggers.md T1). A shape-correct 503 is still a
-FAIL: a truthful parked process is never E2E approval.
+FAIL: observed unready components are never E2E approval. A starting or
+down gateway does not establish a lifecycle cause.
 
 No probe may apply a migration or test production. This probe never writes,
 follows no redirects, and sends no credentials. The only network calls
@@ -86,7 +87,12 @@ CHECKPOINT_READ_CLASS = "checkpoint_load_failed"
 
 
 class ProbeError(Exception):
-    """A check's one-line failure reason (fixed vocabulary plus observed values)."""
+    """A check's fixed-vocabulary failure, with bounded response metadata."""
+
+    def __init__(self, reason, failure_class="contract_failure", http_status=None):
+        super().__init__(reason)
+        self.failure_class = failure_class
+        self.http_status = http_status
 
 
 class DuplicateKeyError(ValueError):
@@ -114,6 +120,8 @@ class Result:
     ok: bool
     reason: str
     checkpoint_read_failed: bool = False
+    failure_class: str | None = None
+    http_status: int | None = None
 
     def line(self):
         return f"{'PASS' if self.ok else 'FAIL'} {self.name}: {self.reason}"
@@ -177,14 +185,16 @@ def get_json(fetch_fn, url, name):
     """One GET returning (status, headers, parsed JSON or None)."""
     try:
         status, headers, body = fetch_fn(url)
-    except (OSError, http.client.HTTPException) as error:
-        raise ProbeError(f"{name} probe did not respond ({error.__class__.__name__})")
+    except (OSError, http.client.HTTPException):
+        raise ProbeError(f"{name} probe did not respond (transport failure)",
+                         failure_class="transport_failure") from None
     if len(body) > BODY_CAP:
-        raise ProbeError(f"{name} probe answered over the body cap")
+        raise ProbeError(f"{name} probe answered over the body cap", http_status=status)
     try:
         value = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
     except DuplicateKeyError:
-        raise ProbeError(f"{name} probe carries duplicate JSON object keys") from None
+        raise ProbeError(f"{name} probe carries duplicate JSON object keys",
+                         http_status=status) from None
     except (ValueError, UnicodeDecodeError, RecursionError):
         # Deeply nested in-cap JSON exhausts the decoder recursion limit;
         # refuse it as malformed, same as any other unparseable body.
@@ -255,19 +265,22 @@ def check_build(report, expected_sha):
     if expected_sha is not None and not is_build_revision_shape(expected_sha):
         return Result("build", False, "expected SHA must be a canonical 40-character lowercase hex commit")
     if not isinstance(report, dict):
-        return Result("build", False, "no readyz body to read build identity from")
+        return Result("build", False, "no readyz body to read build identity from",
+                      failure_class="build_identity_unavailable")
     identity = canonical_build_identity(report)
     if identity is None:
         return Result("build", False, "readyz without the compiled build_revision/build_id "
-                      "in the canonical shape")
+                      "in the canonical shape", failure_class="build_identity_invalid")
     revision, build_id = identity
     if revision == UNSTAMPED:
         return Result("build", expected_sha is None,
                       "build identity is unstamped (unknown)" +
-                      ("; cannot match the expected SHA" if expected_sha is not None else ""))
+                      ("; cannot match the expected SHA" if expected_sha is not None else ""),
+                      failure_class="build_identity_unstamped" if expected_sha is not None else None)
     if expected_sha is not None and revision != expected_sha:
         return Result("build", False,
-                      f"build_revision {revision} does not match the expected SHA")
+                      f"build_revision {revision} does not match the expected SHA",
+                      failure_class="build_mismatch")
     detail = f"build_revision {revision} build_id {build_id}"
     if expected_sha is not None:
         detail += " matches the expected SHA"
@@ -287,6 +300,7 @@ def run(args, fetch_fn=fetch):
     except ProbeError as error:
         results.append(Result("health", False, str(error)))
     report = None
+    status = None
     try:
         status, _, value = get_json(fetch_fn, origin + "/readyz", "readyz")
         state, report = parse_readyz(status, value)
@@ -295,33 +309,50 @@ def run(args, fetch_fn=fetch):
             raise ProbeError(f"readyz {status} contradicts the component breakdown "
                              f"(expected {expected})")
         if status == 200:
-            results.append(Result("readyz", True, "readyz 200: every component ready"))
+            results.append(Result("readyz", True, "readyz 200: every component ready",
+                                  http_status=status))
         else:
-            down = sorted(name for name, text in state.items() if text != "ready")
+            unready = ", ".join(f"{name}={state[name]}" for name in REQUIRED_COMPONENTS
+                                if state[name] != "ready")
             failure = value.get("gateway_failure") or {}
             if failure.get("class") == CHECKPOINT_READ_CLASS:
                 results.append(Result("readyz", False,
-                                      "readyz 503: checkpoint read failed "
+                                      f"readyz 503: {unready} not ready; checkpoint read failed "
                                       f"(gateway_failure durable_gateway:{CHECKPOINT_READ_CLASS}); "
                                       "root cause unverified; require separate reviewed "
                                       "schema/ACL/connectivity evidence",
-                                      checkpoint_read_failed=True))
+                                      checkpoint_read_failed=True,
+                                      failure_class="unready", http_status=status))
             else:
                 results.append(Result("readyz", False,
-                                      f"readyz 503: parked ({', '.join(down)} not ready); "
-                                      "truthful, not E2E approval"))
+                                      f"readyz 503: {unready} not ready; "
+                                      "truthful, not E2E approval; lifecycle cause not observed",
+                                      failure_class="unready", http_status=status))
     except ProbeError as error:
-        results.append(Result("readyz", False, str(error)))
+        results.append(Result("readyz", False, str(error),
+                              failure_class=error.failure_class,
+                              http_status=status if status is not None else error.http_status))
     results.append(check_build(report, args.expected_sha))
     return origin, results, report
 
 
 def evidence_shape(results, report, expected_sha):
-    """Allowlisted receipt: check names, verdicts and shape tokens only."""
-    failure = (report or {}).get("gateway_failure") or {}
+    """Retain fixed component/enumeration fields, never raw response diagnostics."""
+    try:
+        state, validated = parse_readyz(0, report)
+    except ProbeError:
+        state, validated = {}, {}
+    failure = validated.get("gateway_failure") or {}
     identity = canonical_build_identity(report)
+    readyz = next((result for result in results if result.name == "readyz"), None)
+    build = next((result for result in results if result.name == "build"), None)
     return {"checks": [{"check": result.name, "verdict": "pass" if result.ok else "fail",
                         "shape": result.reason} for result in results],
+            "readiness": {"http_status": readyz.http_status if readyz else None,
+                          "failure_class": readyz.failure_class if readyz else None,
+                          "components": {name: state[name] for name in REQUIRED_COMPONENTS
+                                         if name in state}},
+            "build_failure_class": build.failure_class if build else None,
             "build_revision": identity[0] if identity else None,
             "build_id": identity[1] if identity else None,
             "gateway_failure_class": failure.get("class"),
