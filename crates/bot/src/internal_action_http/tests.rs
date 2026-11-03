@@ -10,11 +10,13 @@ use tower::ServiceExt;
 use two_bot_core::internal_actions::{sign, ActionError, ErrorCode};
 use two_bot_core::internal_actions::{GuildAddMemberRequest, RoleAssignRequest};
 use two_bot_discord::executor::member::MemberOutcome;
+use two_bot_discord::executor::notify::NotifyOutcome;
 use two_bot_testsupport::TestDatabase;
 
 mod adapter;
 mod automations;
 mod drain_shutdown;
+mod notify;
 mod receipt_lifecycle;
 mod settings;
 
@@ -210,6 +212,50 @@ impl MemberEffect for MockEffect {
     }
 }
 
+impl NotifyEffect for MockEffect {
+    fn execute_reminder<'a>(
+        &'a self,
+        _: &'a ReminderSendRequest<'a>,
+    ) -> BoxFuture<'a, Result<NotifyOutcome, ActionError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                MockOutcome::Success | MockOutcome::Wait => Ok(NotifyOutcome::Sent {
+                    message_id: "444444444444444444".to_owned(),
+                }),
+                // A definitive refusal is a 200 outcome, never an error.
+                MockOutcome::NoEffect => Ok(NotifyOutcome::DmUnavailable),
+                MockOutcome::Unknown => Err(ActionError::new(
+                    ErrorCode::DiscordUnavailable,
+                    "Discord was unreachable",
+                    "discord_unreachable",
+                )),
+            }
+        })
+    }
+
+    fn execute_place_offer<'a>(
+        &'a self,
+        _: &'a PlaceOfferSendRequest<'a>,
+    ) -> BoxFuture<'a, Result<NotifyOutcome, ActionError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                MockOutcome::Success | MockOutcome::Wait => Ok(NotifyOutcome::Sent {
+                    message_id: "444444444444444444".to_owned(),
+                }),
+                // A definitive refusal is a 200 outcome, never an error.
+                MockOutcome::NoEffect => Ok(NotifyOutcome::DmUnavailable),
+                MockOutcome::Unknown => Err(ActionError::new(
+                    ErrorCode::DiscordUnavailable,
+                    "Discord was unreachable",
+                    "discord_unreachable",
+                )),
+            }
+        })
+    }
+}
+
 fn state(pool: sqlx::PgPool, effect: Arc<MockEffect>) -> Arc<ReceiverState> {
     state_with_reads(pool, effect, Arc::new(MockEventRead::default()))
 }
@@ -253,12 +299,13 @@ fn state_full_with_channel(
     moderation: Arc<MockModeration>,
     channel: Arc<MockChannel>,
 ) -> Arc<ReceiverState> {
-    // The announcement double also stands in as the membership double:
-    // membership tests share the mock and assert its calls, while moderation
-    // tests never reach the member effect.
+    // The announcement double also stands in as the membership and
+    // member-notify doubles: membership and notify tests share the mock and
+    // assert its calls, while moderation tests never reach the member effect.
     Arc::new(ReceiverState::new(
         config(),
         pool,
+        effect.clone(),
         effect.clone(),
         effect,
         reads,
@@ -1214,6 +1261,7 @@ async fn event_release_failure_is_logged_without_releasing_claim() {
         db.pool().clone(),
         Arc::new(MockEffect::new(MockOutcome::Success)),
         Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
         Arc::new(MockEventRead::default()),
         mutates.clone(),
         Arc::new(MockModeration::default()),
@@ -1280,6 +1328,7 @@ async fn event_release_failure_is_logged_without_releasing_claim() {
         db.pool().clone(),
         Arc::new(MockEffect::new(MockOutcome::Success)),
         Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
         Arc::new(MockEventRead::default()),
         ok_mutates.clone(),
         Arc::new(MockModeration::default()),
@@ -1321,6 +1370,7 @@ async fn event_key_failure_after_confirmed_write_is_logged_as_reconciliation() {
     let app = router(Arc::new(ReceiverState::new(
         config(),
         db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
         Arc::new(MockEffect::new(MockOutcome::Success)),
         Arc::new(MockEffect::new(MockOutcome::Success)),
         Arc::new(MockEventRead::default()),
@@ -1896,6 +1946,7 @@ fn read_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
         config(),
         pool,
         effect.clone(),
+        effect.clone(),
         effect,
         reads,
         Arc::new(MockEventMutate),
@@ -1916,6 +1967,7 @@ fn mutate_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
         config(),
         pool,
         effect,
+        Arc::new(MockEffect::new(MockOutcome::Success)),
         Arc::new(MockEffect::new(MockOutcome::Success)),
         reads,
         mutates,
@@ -3180,6 +3232,7 @@ fn moderation_resolve_app(pool: sqlx::PgPool, mock: &MockMembers) -> Router {
         config(),
         pool,
         effect.clone(),
+        effect.clone(),
         effect,
         Arc::new(MockEventRead::default()),
         Arc::new(MockEventMutate),
@@ -4186,6 +4239,7 @@ async fn event_create_admission_refusal_releases_claim_for_same_key_retry() {
         db.pool().clone(),
         effect,
         Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
         reads,
         mutates,
         Arc::new(MockModeration::default()),
@@ -4237,6 +4291,7 @@ async fn event_cancel_admission_refusal_releases_claim_for_same_key_retry() {
         db.pool().clone(),
         effect,
         Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
         reads,
         mutates,
         Arc::new(MockModeration::default()),
@@ -4287,6 +4342,7 @@ async fn event_create_admission_storage_is_typed_internal_and_releases_claim() {
         db.pool().clone(),
         effect,
         Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
         reads,
         mutates,
         Arc::new(MockModeration::default()),
@@ -4336,6 +4392,7 @@ async fn event_mutation_queued_behind_the_gate_is_refused_before_any_claim() {
         db.pool().clone(),
         effect,
         Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
         reads,
         mutates,
         Arc::new(MockModeration::default()),
@@ -4384,6 +4441,7 @@ async fn event_create_mirror_failure_leaves_the_key_unmapped_and_unknown() {
         config(),
         db.pool().clone(),
         effect,
+        Arc::new(MockEffect::new(MockOutcome::Success)),
         Arc::new(MockEffect::new(MockOutcome::Success)),
         reads,
         mutates,
@@ -4446,6 +4504,7 @@ async fn event_mutation_completes_its_receipt_after_the_client_is_dropped() {
         config(),
         db.pool().clone(),
         effect,
+        Arc::new(MockEffect::new(MockOutcome::Success)),
         Arc::new(MockEffect::new(MockOutcome::Success)),
         reads,
         mutates,
@@ -4510,6 +4569,7 @@ async fn event_read_queued_behind_the_gate_is_refused_before_any_discord_call() 
         config(),
         db.pool().clone(),
         effect,
+        Arc::new(MockEffect::new(MockOutcome::Success)),
         Arc::new(MockEffect::new(MockOutcome::Success)),
         reads,
         mutates,
