@@ -245,8 +245,17 @@ const RECONCILE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// budget is kept; anything slower is abandoned and retried on the next
 /// healthy boot. Never fails boot: drops straight through to the exit.
 pub async fn drain_reconcile_on_failure(handle: Option<tokio::task::JoinHandle<()>>) {
+    drain_reconcile_with_timeout(handle, RECONCILE_DRAIN_TIMEOUT).await;
+}
+
+/// Same drain with an injectable budget, so tests prove the wait and the
+/// deadline without paying the production budget.
+async fn drain_reconcile_with_timeout(
+    handle: Option<tokio::task::JoinHandle<()>>,
+    budget: Duration,
+) {
     if let Some(handle) = handle {
-        let _ = tokio::time::timeout(RECONCILE_DRAIN_TIMEOUT, handle).await;
+        let _ = tokio::time::timeout(budget, handle).await;
     }
 }
 
@@ -638,6 +647,71 @@ mod tests {
         // Gate closed (marker unset): no handle, no network, no token use.
         assert!(maybe_reconcile_on_boot(None, None).is_none());
         assert!(maybe_reconcile_on_boot(Some("fixture-token".to_owned()), None).is_none());
+    }
+
+    // The direct-vs-double limiter branch lives in `client_for`, which needs
+    // a Tokio reactor to build a client: keep these async like the fence test.
+    #[tokio::test]
+    async fn client_keeps_default_limiter_for_direct_discord() {
+        let direct = client_for("fixture-token", Some(""))
+            .expect("empty override builds a direct client");
+        assert!(
+            direct.ratelimiter().is_some(),
+            "direct Discord calls keep Twilight's default rate limiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_skips_limiter_for_loopback_double() {
+        let doubled = client_for("fixture-token", Some("http://127.0.0.1:9"))
+            .expect("loopback override builds a test-double client");
+        assert!(
+            doubled.ratelimiter().is_none(),
+            "the loopback double handles its own pacing"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_without_handle_returns_immediately() {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_reconcile_with_timeout(None, Duration::from_millis(50)),
+        )
+        .await
+        .expect("draining nothing returns without waiting");
+    }
+
+    #[tokio::test]
+    async fn drain_awaits_a_fast_task() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        drain_reconcile_with_timeout(Some(handle), Duration::from_secs(2)).await;
+        assert!(
+            done.load(Ordering::SeqCst),
+            "drain waits for a task that finishes inside the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_abandons_a_slow_task_within_budget() {
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let start = std::time::Instant::now();
+        drain_reconcile_with_timeout(Some(handle), Duration::from_millis(50)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a task slower than the budget never holds the failure exit"
+        );
     }
 
     fn member_doc(user_id: &str, bot: bool) -> serde_json::Value {
