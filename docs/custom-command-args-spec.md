@@ -130,6 +130,13 @@ stay quiet, as render failures do today). Preview: the existing
   instead of rendering a literal placeholder (for example imported or
   corrupt rows). Old binaries lack this check; their skew behavior is
   defined in §6.
+- A render with no message text (for example an `{args}`-only template with
+  absent, empty or whitespace-only arguments) refuses as a render failure
+  (`render_failed`) on every run path — never an empty send or a
+  `delivery_failed` fact. The check reuses the existing sendability gate, so
+  no new reason code or reply enters the §5 vocabulary; previews show the
+  fixed-copy refusal instead of a blank body so they stay truthful about
+  what an invocation does.
 - Channel-bound output (slash completion, prefix POST) keeps the existing
   double defense unchanged: `neutralize_mentions` over the rendered content
   plus `allowed_mentions: { parse: [] }` at the REST boundary. Arguments
@@ -232,6 +239,7 @@ approval and alignment.
 | ARG-17 | foreign guild / unknown / deleted / disabled row with well-formed, malformed and over-long args | existing silence/miss in all three; arguments never read; no validation correction |
 | ARG-18 | `{args}` repeated in one template | every occurrence receives the same value in one pass |
 | ARG-19 | slash, unknown row plus duplicate `arguments` option | existing silence/miss; no ephemeral correction; no audit row |
+| ARG-20 | render with no message text (for example an `{args}`-only template with absent/empty/whitespace-only arguments) | refused as a render failure (`render_failed`), never an empty send or `delivery_failed`; previews show the fixed-copy refusal instead of a blank body |
 
 Runnable check now (no new target exists yet):
 
@@ -247,7 +255,7 @@ acceptance.
 
 ## 9. Agent and adapter contract (future)
 
-- Stable fixture IDs `ARG-01…ARG-19`; closed reason codes
+- Stable fixture IDs `ARG-01…ARG-20`; closed reason codes
   (`args_malformed`, `args_too_long`, plus existing vocabulary);
   `next_action` strings from §5.
 - Dry-run preview: `/command-inspect name:<name> view:preview

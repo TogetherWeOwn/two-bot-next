@@ -138,3 +138,30 @@ fn pills_and_links_render_inert_as_member_text() {
         "pills carry no mass mention to neutralize"
     );
 }
+
+#[test]
+fn empty_render_refuses_preview_in_fixed_copy() {
+    // ARG-20 (core half): an `{args}`-only template with empty arguments
+    // renders no message text, which run paths refuse — so both previews say
+    // so in fixed copy instead of showing a blank body.
+    use two_bot_core::custom_commands::{
+        format_draft_preview, format_inspect_preview, StoredCommand,
+    };
+    let row = StoredCommand {
+        guild_id: "2222".to_owned(),
+        name: "faq".to_owned(),
+        description: "FAQ".to_owned(),
+        template: "{args}".to_owned(),
+        text_trigger: Some("!faq".to_owned()),
+        enabled: true,
+    };
+    let ctx = ctx_with_args("");
+    assert_eq!(
+        format_inspect_preview(&row, &ctx),
+        "Template for /faq renders no message text with these arguments. Add text around {args} with /command name:faq template:..."
+    );
+    assert_eq!(
+        format_draft_preview("{args}", &ctx),
+        "Draft renders no message text with these arguments. Add text around {args} and retry /command-inspect draft:Hello. Nothing was saved or published."
+    );
+}

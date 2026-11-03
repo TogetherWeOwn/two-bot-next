@@ -1398,6 +1398,16 @@ pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> Str
             );
         }
     };
+    // Previews stay truthful about delivery: a render with no message text
+    // (for example an `{args}`-only template with an empty sample) refuses
+    // at run time, so the preview says so instead of showing a blank body.
+    // Fixed copy only — the rendered text may carry member content.
+    if !crate::message_safety::has_message_text(&rendered) {
+        let shown = escape_inspect_text(&row.name);
+        return format!(
+            "Template for /{shown} renders no message text with these arguments. Add text around {{args}} with /command name:{shown} template:..."
+        );
+    }
     format_bounded_view(
         &InspectView::Preview.heading(&row.name),
         &escape_inspect_text(&rendered),
@@ -1410,10 +1420,18 @@ pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> Str
 #[must_use]
 pub fn format_draft_preview(template: &str, ctx: &TemplateContext) -> String {
     match validate_template(template).and_then(|()| render_template(template, ctx)) {
-        Ok(rendered) => format_bounded_view(
-            "Draft preview — not saved or published",
-            &escape_inspect_text(&rendered),
-        ),
+        Ok(rendered)
+            if crate::message_safety::has_message_text(&rendered) =>
+        {
+            format_bounded_view(
+                "Draft preview — not saved or published",
+                &escape_inspect_text(&rendered),
+            )
+        }
+        // A draft that renders no message text would refuse at run time, so
+        // the preview says so. Fixed copy only — never the rendered text.
+        Ok(_) => "Draft renders no message text with these arguments. Add text around {args} and retry /command-inspect draft:Hello. Nothing was saved or published."
+            .to_owned(),
         Err(error) => {
             let detail = escape_inspect_text(&error.to_string());
             let detail = if detail.encode_utf16().count() > 256 {
@@ -2727,6 +2745,42 @@ mod tests {
         assert!(view.starts_with("Template for /faq is invalid: Unknown placeholder"));
         assert!(view.contains("…[truncated]"));
         assert!(view.ends_with(" Replace it with /command name:faq template:..."));
+    }
+
+    #[test]
+    fn inspect_preview_refuses_a_render_with_no_message_text() {
+        // ARG-20: an `{args}`-only template with an empty sample renders no
+        // message text, which run paths refuse — so the preview says so in
+        // fixed copy instead of showing a blank body.
+        let row = StoredCommand {
+            template: "{args}".to_owned(),
+            ..inspect_row()
+        };
+        assert_eq!(
+            format_inspect_preview(&row, &inspect_ctx()),
+            "Template for /faq renders no message text with these arguments. Add text around {args} with /command name:faq template:..."
+        );
+        // Text around the placeholder still previews normally.
+        let row = StoredCommand {
+            template: "Says {args}".to_owned(),
+            ..inspect_row()
+        };
+        assert_eq!(
+            format_inspect_preview(&row, &inspect_ctx()),
+            "Preview /faq\nSays "
+        );
+    }
+
+    #[test]
+    fn draft_preview_refuses_a_render_with_no_message_text() {
+        assert_eq!(
+            format_draft_preview("{args}", &inspect_ctx()),
+            "Draft renders no message text with these arguments. Add text around {args} and retry /command-inspect draft:Hello. Nothing was saved or published."
+        );
+        assert_eq!(
+            format_draft_preview("Says {args}", &inspect_ctx()),
+            "Draft preview — not saved or published\nSays "
+        );
     }
 
     #[test]
