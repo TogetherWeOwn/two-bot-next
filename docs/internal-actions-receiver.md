@@ -5,7 +5,8 @@
 **Direct-container support is not the shipped Worker capability set.** The
 container source integrates an opt-in private `POST /internal/actions`
 listener with the durable store, announcement executor, event-read,
-event-mutation, settings, automations, moderation, membership and
+event-mutation, settings, automations, moderation, membership,
+member-notify DM delivery, and
 channel-moderation executors, nonce-commit authentication capability and strict
 receiver configuration. It supports `announcement.post`, the keyless `event.read`
 (behind `TWO_INTERNAL_ALLOW_EVENT_READ`), `event.upsert` and `event.cancel`
@@ -16,7 +17,11 @@ transactional import), the restrictive member verbs `moderation.ban`,
 `moderation.tempban`, `moderation.kick`, `moderation.warn` and
 `moderation.timeout`, the membership pair (`role.assign` through the
 allowlisted role-key map, `guild.add_member`
-behind its own allowlist flag with a transient OAuth token), and the
+behind its own allowlist flag with a transient OAuth token), the member-notify
+DM pair (`reminder.send`, `place_offer.send`, one shared allowlist flag
+`TWO_INTERNAL_ALLOW_MEMBER_NOTIFY` with a required `Idempotency-Key`: the site
+owns scheduling and waitlist state, the bot only delivers a templated DM with
+a `/e/{event_key}` deep link), and the
 channel-moderation verbs (`moderation.purge`, `moderation.slowmode`,
 `moderation.lockdown`, `moderation.unlock`), regardless of the core action
 catalogue's broader defaults. Every other verb stays refused by the per-effect
@@ -136,6 +141,7 @@ capabilities; this table is not an instruction to create or stage them.
 | `TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE` | Automation overwrite stays gated off |
 | `TWO_INTERNAL_ALLOW_EVENT_CANCEL` | `event.cancel` stays gated off |
 | `TWO_INTERNAL_ALLOW_EVENT_READ` | `event.read` stays gated off |
+| `TWO_INTERNAL_ALLOW_MEMBER_NOTIFY` | `reminder.send`/`place_offer.send` stay gated off |
 | `TWO_INTERNAL_ALLOW_MODERATION` | Member/channel moderation stay gated off, even with `TWO_MODERATION=1` |
 | `TWO_INTERNAL_ALLOW_SETTINGS` | Settings get/set stay gated off |
 
@@ -167,7 +173,7 @@ in `docs/production-deploy.md`).
 1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values), only under the separately authorized enablement contract; no role keys or optional capability gates travel through this Worker.
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
-4. Operator applies migrations `0423` (settings CAS) and `0424` (event outcome) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
+4. Operator applies migrations `0423` (settings CAS), `0424` (event outcome), and `0471` (member-notify idempotency verbs) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
 5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete --env staging TWO_INTERNAL_ACTIONS --message <sha>`, same precheck and stamp as above), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
 
 Migration `0424` adds the nullable `internal_idempotency.outcome` column that
@@ -181,6 +187,13 @@ early stop's reason for outer replays. Every finish writes the column and every
 replay reads it, so apply it before this binary and roll back in the same order
 as `0424`: disable the receiver and deploy the previous binary, then drop both
 columns.
+
+Migration `0471` widens the `internal_idempotency.action` allowlist to admit
+`reminder.send` and `place_offer.send`. It adds no column: the audit row keeps
+only the member/event-key linkage, the outcome bit and the message-id scalar,
+never DM text. It is backward-compatible (the previous binary never sends the
+new verbs). Roll back in the same order as `0424`: disable the receiver and
+deploy the previous binary, then restore the prior constraint.
 
 TOG-16851 proved a loopback-only receiver never becomes healthy: the Containers
 port check and `containerFetch` cannot reach it, so the container waited on 8091
@@ -390,7 +403,8 @@ The website-compatible envelopes contain `ok`, `request_id`, and either
 `result.message_id` (announcements), `result.{outcome,event_id}` (event
 upsert/cancel, with `outcome` replayed from the stored receipt, never
 re-derived), `result.outcome` (membership: `assigned`/`already_held`,
-`added`/`already_member`) or `error.{code,message,retryable}`. Durable replay
+`added`/`already_member`; member-notify: `sent`/`dm_unavailable`) or
+`error.{code,message,retryable}`. Durable replay
 adds
 `Idempotent-Replay: true`; inbound bucket refusal carries `Retry-After`.
 Messages are fixed/redacted and all envelopes use `Cache-Control: no-store`.
@@ -418,6 +432,7 @@ Success (`200` only, `result` always an object, no `error` key):
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
+| reminder.send / place_offer.send | `{outcome}` | `sent`/`dm_unavailable`; `dm_unavailable` (closed DMs, blocked bot, or member not in guild) is a 200 that consumes no place; the wire carries no `message_id` |
 | moderation.\* | `{outcome[, affected]}` | |
 
 Refusals keep their code, status and retry policy with the fixed message
@@ -491,6 +506,9 @@ capacity, redacted authentication failures, nonce-before-parse ordering,
 concurrent/restarted/key-rotated replay, byte mismatch, unsupported actions,
 membership happy-path/replay/refusal (allowlisted role assignment, OAuth-backed
 joins, redacted unknown-key/malformed refusals, dark add-member flag),
+member-notify DM delivery (dark flag, required key, fact validation, `sent` /
+`dm_unavailable` envelopes with scalar-only audit, replay-once, 429 release,
+unknown retention),
 cancellation/stale ownership, unknown/no-effect outcomes, unavailable stores,
 failed receipt finalization, event verb flags, malformed event bodies (including a
 101-character location), concurrent creates for one key, a gate-wait refusal before

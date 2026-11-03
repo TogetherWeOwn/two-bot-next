@@ -298,6 +298,7 @@ Catalog entries: 136.
 | `TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE` | env_only | Not specified in Next | environment only | Separate capability gate for overwriting automations. |
 | `TWO_INTERNAL_ALLOW_EVENT_CANCEL` | env_only | Not specified in Next | environment only | Capability gate for event cancellation. |
 | `TWO_INTERNAL_ALLOW_EVENT_READ` | env_only | Not specified in Next | environment only | Capability gate for event reads. |
+| `TWO_INTERNAL_ALLOW_MEMBER_NOTIFY` | env_only | Not specified in Next | environment only | Capability gate for member-notify DM delivery (`reminder.send`, `place_offer.send`). |
 | `TWO_INTERNAL_ALLOW_MODERATION` | env_only | Not specified in Next | environment only | Capability gate for internal moderation actions. |
 | `TWO_INTERNAL_ALLOW_SETTINGS` | env_only | Not specified in Next | environment only | Capability gate for internal settings actions. |
 | `TWO_INTERNAL_BIND` | env_only | Not specified in Next | environment only | Canonical combined IP:port for receiver configuration; a wildcard bind requires the Worker-set container marker (TOG-16851). |
