@@ -17,6 +17,24 @@ use two_bot_core::internal_actions::{
     ErrorCode, InternalFlags, MAX_EVENT_NAME_CHARS,
 };
 
+const IDEMPOTENCY_REQUIREMENTS: [(&str, bool); 6] = [
+    ("voice.snapshot", false),
+    ("voice.move_member", false),
+    ("reminder.send", true),
+    ("place_offer.send", true),
+    ("event.attendance.read", false),
+    ("botlog.read", false),
+];
+
+const BOTLOG_KINDS: [&str; 6] = [
+    "event.opened",
+    "event.updated",
+    "event.cancelled",
+    "announcement.posted",
+    "rank.assigned",
+    "member.joined",
+];
+
 fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/bot-site-contract-v2.json"))
         .expect("contract v2 fixture parses")
@@ -42,6 +60,29 @@ fn assert_timestamp_field(body: &Map<String, Value>, field: &str) {
     let normalised =
         require_timestamp(body, field).unwrap_or_else(|_| panic!("{field} is a valid timestamp"));
     assert!(normalised.ends_with('Z'), "{field} normalises to UTC Zulu");
+}
+
+fn check_idempotency_contract(fixture: &Value) -> Result<(), &'static str> {
+    for (name, expected) in IDEMPOTENCY_REQUIREMENTS {
+        if verb(fixture, name)["needs_idempotency_key"].as_bool() != Some(expected) {
+            return Err(name);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn fixture_idempotency_matches_independent_contract_requirements() {
+    check_idempotency_contract(&fixture()).expect("fixture matches the decided key requirements");
+}
+
+#[test]
+fn notification_keyless_declarations_are_rejected() {
+    for name in ["reminder.send", "place_offer.send"] {
+        let mut fx = fixture();
+        fx["verbs"][name]["needs_idempotency_key"] = Value::Bool(false);
+        assert_eq!(check_idempotency_contract(&fx), Err(name));
+    }
 }
 
 #[test]
@@ -123,16 +164,8 @@ fn unimplemented_verbs_stay_closed_until_they_land() {
         // shape test to drive the real validators.
         assert_eq!(v["implemented"], false, "{name} pins unimplemented");
         assert!(!is_implemented(name), "{name} is not on the allowlist yet");
-        // The pin records the decided contract, which already requires
-        // idempotency keys for the notify verbs; today's registry only knows
-        // the verbs that exist yet, so check the pin's shape here. Landing
-        // the verb must tighten this to
-        // assert_eq!(needs_idempotency_key(name), pin).
-        assert!(
-            v.get("needs_idempotency_key")
-                .is_some_and(Value::is_boolean),
-            "{name} pins its idempotency requirement"
-        );
+        // Independent contract expectations are checked separately. Once a
+        // verb lands, also compare its key requirement with the real registry.
         let err = assert_allowed(
             name,
             &flags_with("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT"),
@@ -295,6 +328,7 @@ fn botlog_read_shapes_hold() {
         .iter()
         .map(|k| k.as_str().expect("kind str"))
         .collect();
+    assert_eq!(kinds, BOTLOG_KINDS, "only bot-origin kinds are on the wire");
     let page = &v["results"]["page"];
     assert_eq!(page["v"], 1);
     let entries = page["entries"].as_array().expect("entries array");
@@ -306,10 +340,18 @@ fn botlog_read_shapes_hold() {
         owned.insert("at".to_owned(), entry["at"].clone());
         assert_timestamp_field(&owned, "at");
         let kind = entry["kind"].as_str().expect("kind str");
-        assert!(kinds.contains(&kind), "{kind} is a publishable kind");
+        assert!(BOTLOG_KINDS.contains(&kind), "{kind} is a bot-wire kind");
         if let Some(subject) = entry.get("subject_id") {
             assert!(is_snowflake(subject.as_str().expect("subject_id str")));
         }
     }
     assert!(!page["next"].as_str().expect("next str").is_empty());
+    assert_eq!(page["next"], entries.last().expect("non-empty page")["seq"]);
+    let empty = &v["results"]["empty"];
+    assert_eq!(empty["v"], 1);
+    assert!(empty["entries"].as_array().expect("empty page").is_empty());
+    assert_eq!(
+        empty["next"], request["after"],
+        "empty page retains position"
+    );
 }

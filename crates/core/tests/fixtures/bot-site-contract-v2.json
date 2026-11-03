@@ -78,18 +78,18 @@
       }
     },
     "botlog.read": {
-      "request": {"action": "botlog.read", "after": "cursor-0000", "limit": 200},
+      "request": {"action": "botlog.read", "after": "test-publication-origin", "limit": 200},
       "implemented": false,
       "needs_idempotency_key": false,
       "gate_flag": "TWO_INTERNAL_ALLOW_BOTLOG_READ",
-      "kinds": ["event.opened", "event.updated", "event.cancelled", "announcement.posted", "rank.assigned", "member.joined", "echo.frozen"],
+      "kinds": ["event.opened", "event.updated", "event.cancelled", "announcement.posted", "rank.assigned", "member.joined"],
       "results": {
         "page": {"v": 1, "entries": [
-          {"seq": "cursor-0001", "at": "2026-11-03T19:04:11Z", "kind": "event.opened", "event_key": "test-raid-night-1"},
-          {"seq": "cursor-0002", "at": "2026-11-03T19:05:02Z", "kind": "rank.assigned", "subject_id": "100000000000000001", "detail": "ember-3"},
-          {"seq": "cursor-0003", "at": "2026-11-03T19:06:44Z", "kind": "member.joined", "subject_id": "100000000000000002"},
-          {"seq": "cursor-0004", "at": "2026-11-03T21:16:00Z", "kind": "echo.frozen", "event_key": "test-raid-night-1"}
-        ], "next": "cursor-0004"}
+          {"seq": "test-publication-z", "at": "2026-11-03T19:04:11Z", "kind": "event.opened", "event_key": "test-raid-night-1"},
+          {"seq": "test-publication-a", "at": "2026-11-03T19:05:02Z", "kind": "rank.assigned", "subject_id": "100000000000000001", "detail": "ember-3"},
+          {"seq": "test-publication-m", "at": "2026-11-03T19:03:00Z", "kind": "member.joined", "subject_id": "100000000000000002"}
+        ], "next": "test-publication-m"},
+        "empty": {"v": 1, "entries": [], "next": "test-publication-origin"}
       }
     }
   }
