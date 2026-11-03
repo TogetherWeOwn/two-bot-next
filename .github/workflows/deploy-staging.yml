@@ -724,6 +724,9 @@ jobs:
           HELP_EMBED_SMOKE_CHANNEL_ID: ${{ vars.HELP_EMBED_SMOKE_CHANNEL_ID }}
           HELP_EMBED_SMOKE_REQUIRED: ${{ vars.HELP_EMBED_SMOKE_REQUIRED }}
           RUN_ID: ${{ github.run_id }}
+        # `shell: bash`: the container default `sh` has no pipefail, so the
+        # step would fail on `set -euo pipefail` before reaching Python.
+        shell: bash
         run: |
           set -euo pipefail
           # Two retries absorb a transient REST hiccup; three failures fail

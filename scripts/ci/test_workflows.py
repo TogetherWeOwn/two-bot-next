@@ -1136,6 +1136,9 @@ def help_embed_smoke_errors(workflow, name="deploy-staging.yml"):
                           "by name plus the channel, required-flag and run-id bindings")
         if "--payloads" not in run or "--evidence" not in run or "set -euo pipefail" not in run:
             errors.append(f"{name}:help-embed-smoke: smoke step must render payloads to evidence under pipefail")
+        if probe.get("shell") != "bash":
+            errors.append(f"{name}:help-embed-smoke: smoke step must set shell bash "
+                          "(the container default sh has no pipefail)")
         if run.count("attempt in 1 2 3") != 1 or "sleep 60" not in run or run.count("exit 1") < 1:
             errors.append(f"{name}:help-embed-smoke: smoke step must retry transient REST hiccups, then fail")
     uploads = [step for step in steps if "help-embed-smoke-${{ github.run_id }}" in str((step.get("with") or {}))]

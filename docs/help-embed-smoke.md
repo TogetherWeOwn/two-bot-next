@@ -21,10 +21,12 @@ then asserts on the read-back messages:
 | footer_icon_fetch | the Icon 1 asset URL answers HTTP 200 as `image/png` |
 | provenance_recorded | the evidence records which case took the builder embed branch |
 | cleanup | both test messages are deleted afterwards |
+| smoke_error | no mid-run REST failure; when one lands after a post, the evidence still records the posted ids, the cleanup outcomes and this FAIL |
 
 A PASS means Discord served and returned the brand intact; a FAIL names the
 assertion that did not hold. The message ids and every assertion land in the
-evidence JSON and in `$GITHUB_STEP_SUMMARY`.
+evidence JSON and in `$GITHUB_STEP_SUMMARY`, including on a mid-run failure
+(the run still exits 2 and retries).
 
 ## Fences
 

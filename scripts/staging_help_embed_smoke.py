@@ -178,6 +178,10 @@ def _rest(token, method, path, payload=None):
         if error.code in REDIRECT_STATUSES:
             raise RedirectRefused("authenticated read answered a redirect")
         raise Refusal("Discord REST call failed")
+    if not body:
+        # A successful DELETE answers 204 with an empty body: there is no
+        # JSON to decode, and refusing here would fail every cleanup.
+        return status, None
     return status, _decode_json(body)
 
 
@@ -281,9 +285,13 @@ def summarize(checks, help_id, detail_id, topic, meta):
                      + f" message `{message_id}`: {states}")
     lines.append(f"- footer icon fetch: {verdict.get('footer_icon_fetch', '?')}")
     lines.append(
-        "- provenance: help_builder_embedded="
-        f"{meta.get('help_builder_embedded')!r} "
-        f"detail_builder_embedded={meta.get('help_detail_builder_embedded')!r}")
+        f"- provenance check: {verdict.get('provenance_recorded', '?')} "
+        f"(help_builder_embedded={meta.get('help_builder_embedded')!r} "
+        f"detail_builder_embedded={meta.get('help_detail_builder_embedded')!r})")
+    for item in checks:
+        if item["check"].startswith("cleanup_"):
+            message_id = item["check"][len("cleanup_"):]
+            lines.append(f"- cleanup message `{message_id}`: {item['verdict']}")
     failed = [item["check"] for item in checks if item["verdict"] == "FAIL"]
     if failed:
         lines += ["", f"FAILED: {', '.join(failed)}"]
@@ -325,7 +333,10 @@ def run_smoke(token, channel_id, payloads):
 
     Raises Refusal on fence violations and live-call failures with fixed
     vocabulary (never the token, bodies, headers or URLs). Deletion is best
-    effort inside a finally: a failed delete is recorded, never silent.
+    effort inside a finally: a failed delete is recorded, never silent. When
+    a failure lands after a post, the raised error carries the partial
+    ``evidence`` (posted ids, cleanup outcomes and a ``smoke_error`` check)
+    so the caller can still persist the artifact.
     """
     if not channel_id.isdigit():
         raise Refusal("test channel id has the wrong shape")
@@ -338,6 +349,10 @@ def run_smoke(token, channel_id, payloads):
     if not isinstance(channel, dict) or channel.get("guild_id") != STAGING_GUILD_ID:
         raise Refusal("test channel is not in TWO Staging")
     posted = []
+    checks = []
+    meta = {"help_builder_embedded": None, "help_detail_builder_embedded": None,
+            "help_topic": None}
+    failure = None
     try:
         _status, created_help = _rest(
             token, "POST", f"/channels/{channel_id}/messages",
@@ -374,6 +389,8 @@ def run_smoke(token, channel_id, payloads):
             "help_topic": detail_case.get("topic") if isinstance(detail_case, dict) else None,
         }
         checks = evaluate(help_message, detail_message, icon_status, icon_content_type, meta)
+    except (Refusal, RedirectRefused, BodyTooLarge, DuplicateKeyError) as error:
+        failure = error
     finally:
         deletions = {}
         for message_id in posted:
@@ -385,6 +402,8 @@ def run_smoke(token, channel_id, payloads):
     for message_id, outcome in deletions.items():
         checks.append(check(f"cleanup_{message_id}", outcome == "deleted",
                             f"test message {message_id}: {outcome}"))
+    if failure is not None:
+        checks.append(check("smoke_error", False, f"{failure}"))
     evidence = {
         "channel_id": channel_id,
         "help_message_id": posted[0] if len(posted) > 0 else None,
@@ -392,6 +411,9 @@ def run_smoke(token, channel_id, payloads):
         "meta": meta,
         "checks": checks,
     }
+    if failure is not None:
+        failure.evidence = evidence
+        raise failure
     return evidence
 
 
@@ -435,7 +457,16 @@ def main(argv=None):
         evidence = run_smoke(token, args.channel_id, payloads)
     except (Refusal, RedirectRefused, BodyTooLarge, DuplicateKeyError) as error:
         print(f"::error::{error}", flush=True)
+        partial = getattr(error, "evidence", None)
+        if partial is None:
+            return 2
+        _persist(args, partial)
         return 2
+    return _persist(args, evidence)
+
+
+def _persist(args, evidence):
+    """Write the evidence JSON and step summary; return the exit code."""
     checks = evidence.get("checks", [])
     failed = [item for item in checks if item.get("verdict") == "FAIL"]
     evidence["verdict"] = "FAIL" if failed else "PASS"

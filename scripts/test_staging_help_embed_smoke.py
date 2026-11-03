@@ -154,6 +154,16 @@ class EvaluateTest(unittest.TestCase):
         summary = smoke.summarize([bad], "11", "22", "some-topic", good_meta())
         self.assertIn("FAILED: help_color", summary)
 
+    def test_summary_reports_provenance_and_cleanup_verdicts(self):
+        checks = smoke.evaluate(branded_message("11"), branded_message("22"),
+                                200, "image/png", good_meta())
+        checks.append(smoke.check("cleanup_11", True, "test message 11: deleted"))
+        checks.append(smoke.check("cleanup_22", True, "test message 22: deleted"))
+        summary = smoke.summarize(checks, "11", "22", "some-topic", good_meta())
+        self.assertIn("provenance check: PASS", summary)
+        self.assertIn("cleanup message `11`: PASS", summary)
+        self.assertIn("cleanup message `22`: PASS", summary)
+
 
 class FenceTest(unittest.TestCase):
     def _payloads(self):
@@ -392,6 +402,14 @@ class TransportTest(unittest.TestCase):
         with self.assertRaises(smoke.DuplicateKeyError):
             self.run_with_transport(transport, smoke._rest, TOKEN, "GET", "/channels/123")
 
+    def test_a_204_empty_delete_returns_no_payload(self):
+        # Discord answers a successful DELETE with 204 and an empty body.
+        # Decoding that empty body as JSON must not fail the cleanup.
+        transport = FakeTransport([(204, headers_for(), b"")])
+        (status, decoded), _transport = self.run_with_transport(
+            transport, smoke._rest, TOKEN, "DELETE", "/channels/42/messages/99")
+        self.assertEqual((status, decoded), (204, None))
+
 
 class RunSmokeFlowTest(unittest.TestCase):
     def _payloads(self):
@@ -447,6 +465,79 @@ class RunSmokeFlowTest(unittest.TestCase):
         self.assertEqual(by_name["cleanup_msg-2"], "FAIL")
         self.assertEqual(by_name["help_color"], "PASS")
         self.assertEqual(by_name["help_detail_color"], "PASS")
+
+    def test_a_mid_run_rest_failure_still_leaves_evidence(self):
+        # The read-back GET fails after both posts: the messages are still
+        # deleted, and the raised error carries evidence with the posted ids,
+        # the cleanup outcomes and a fixed-vocabulary failure check.
+        calls = []
+        payloads = self._payloads()
+
+        def fake_rest(token, method, path, payload=None):
+            calls.append((method, path))
+            if method == "GET" and path == "/channels/42":
+                return 200, {"id": "42", "guild_id": GUILD}
+            if method == "POST" and path == "/channels/42/messages":
+                return 200, {"id": f"msg-{len(calls)}"}
+            if method == "DELETE":
+                return 204, None
+            raise smoke.Refusal("Discord REST call failed")
+
+        with mock.patch.object(smoke, "_rest", side_effect=fake_rest), \
+             mock.patch.object(smoke, "_fetch_icon",
+                               return_value=(200, "image/png")):
+            with self.assertRaises(smoke.Refusal) as caught:
+                smoke.run_smoke(TOKEN, "42", payloads)
+        evidence = caught.exception.evidence
+        self.assertEqual(evidence["help_message_id"], "msg-2")
+        self.assertEqual(evidence["help_detail_message_id"], "msg-3")
+        by_name = {item["check"]: item["verdict"] for item in evidence["checks"]}
+        self.assertEqual(by_name["smoke_error"], "FAIL")
+        self.assertEqual(by_name["cleanup_msg-2"], "PASS")
+        self.assertEqual(by_name["cleanup_msg-3"], "PASS")
+        deletes = sorted(path for method, path in calls if method == "DELETE")
+        self.assertEqual(deletes, ["/channels/42/messages/msg-2",
+                                   "/channels/42/messages/msg-3"])
+
+    def test_a_mid_run_rest_failure_still_writes_the_evidence_file(self):
+        evidence_path = Path("help-embed-smoke-failure-evidence.json")
+        self.addCleanup(lambda: evidence_path.unlink(missing_ok=True))
+        summary_path = Path("help-embed-smoke-failure-summary.md")
+        self.addCleanup(lambda: summary_path.unlink(missing_ok=True))
+        payloads_path = Path("help-embed-smoke-failure-payloads.json")
+        self.addCleanup(lambda: payloads_path.unlink(missing_ok=True))
+        payloads_path.write_text(json.dumps(self._payloads()), encoding="utf-8")
+
+        def fake_rest(token, method, path, payload=None):
+            if method == "GET" and path == "/channels/42":
+                return 200, {"id": "42", "guild_id": GUILD}
+            if method == "POST" and path == "/channels/42/messages":
+                return 200, {"id": "msg-9"}
+            if method == "DELETE":
+                return 204, None
+            raise smoke.Refusal("Discord REST call failed")
+
+        with mock.patch.dict(os.environ,
+                             {"TWO_HELP_EMBED_SMOKE_BOT_TOKEN": TOKEN},
+                             clear=True), \
+             mock.patch.object(smoke, "_rest", side_effect=fake_rest), \
+             mock.patch.object(smoke, "_fetch_icon",
+                               return_value=(200, "image/png")):
+            stdout = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout):
+                code = smoke.main(["--payloads", str(payloads_path),
+                                   "--evidence", str(evidence_path),
+                                   "--channel-id", "42",
+                                   "--summary", str(summary_path)])
+        self.assertEqual(code, 2)
+        saved = json.loads(evidence_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["verdict"], "FAIL")
+        self.assertEqual(saved["help_message_id"], "msg-9")
+        by_name = {item["check"]: item["verdict"] for item in saved["checks"]}
+        self.assertEqual(by_name["smoke_error"], "FAIL")
+        summary = summary_path.read_text(encoding="utf-8")
+        self.assertIn("msg-9", summary)
+        self.assertIn("FAILED:", summary)
 
 
 if __name__ == "__main__":
