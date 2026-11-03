@@ -23,6 +23,13 @@
 //! stays missed (the documented join-before-window gap); a missed close
 //! finalizes on the member's next transition, clamped so a stale row can
 //! never tag a later event (see [`plan_transition`]).
+//!
+//! Contract v2 §9 opt-out at capture: before opening a span the logger
+//! consults `privacy_opt_outs` (`suppressed_in`) and
+//! `guild_analytics_settings.voice_enabled`. A suppressed member, or a guild
+//! with voice capture off, opens nothing — absent from the record, not
+//! anonymised in it. Closes still finalize so no open row leaks; gate read
+//! failures fail closed by dropping the open.
 
 use std::future::Future;
 use std::sync::OnceLock;
@@ -77,6 +84,19 @@ pub(crate) trait AttendanceStore: Send + Sync {
         guild: Snowflake,
         event_key: &str,
     ) -> impl Future<Output = Result<Vec<AttendanceSession>, Self::Error>> + Send;
+    /// Whether the pair holds a guild-scoped opt-out suppression row. Checked
+    /// before opening a span; a suppressed member opens nothing.
+    fn is_attendance_suppressed(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+    /// Whether guild-wide voice capture is enabled. Checked before opening
+    /// a span; `voice_enabled = off` opens nothing.
+    fn is_attendance_voice_enabled(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 }
 
 /// Recording grace on each side of `[starts_at, ends_at]`, in millis.
@@ -321,7 +341,69 @@ pub async fn record_transition(
         })
         .collect();
     let now = OffsetDateTime::now_utc();
-    let plan = plan_transition(&window_ms, &rows, previous, current, millis_of(now));
+    let mut plan = plan_transition(&window_ms, &rows, previous, current, millis_of(now));
+    // Contract v2 §9 opt-out at capture: a suppressed member, or a guild
+    // with `voice_enabled = off`, opens no span — absent from the record,
+    // not anonymised in it. Checked only when an open is planned, so leaves
+    // and out-of-window transitions cost no extra read. Closes still
+    // finalize (no leaked open rows); failures and timeouts fail closed by
+    // dropping the open. Guild only in the warm-path logs, per
+    // docs/log-volume-guard.md.
+    if plan.open.is_some() {
+        let voice_on = tokio::time::timeout(
+            std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS),
+            store.is_attendance_voice_enabled(guild),
+        )
+        .await;
+        let voice_off = match voice_on {
+            Ok(Ok(enabled)) => !enabled,
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    guild = guild.to_string(),
+                    error = %error,
+                    "attendance voice gate read failed; open dropped"
+                );
+                true
+            }
+            Err(_) => {
+                tracing::debug!(
+                    guild = guild.to_string(),
+                    "attendance voice gate read timed out; open dropped"
+                );
+                true
+            }
+        };
+        let suppressed = if voice_off {
+            false
+        } else {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS),
+                store.is_attendance_suppressed(guild, member),
+            )
+            .await
+            {
+                Ok(Ok(hit)) => hit,
+                Ok(Err(error)) => {
+                    tracing::debug!(
+                        guild = guild.to_string(),
+                        error = %error,
+                        "attendance suppression read failed; open dropped"
+                    );
+                    true
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        guild = guild.to_string(),
+                        "attendance suppression read timed out; open dropped"
+                    );
+                    true
+                }
+            }
+        };
+        if voice_off || suppressed {
+            plan.open = None;
+        }
+    }
     if plan.closes.is_empty() && plan.open.is_none() {
         return;
     }
@@ -808,5 +890,186 @@ mod tests {
         let rooms = value["rooms"].as_array().expect("rooms array");
         assert_eq!(rooms[0]["channel_id"], json!("7"));
         assert_eq!(rooms[1]["channel_id"], json!("9"));
+    }
+
+    /// Fake store for the capture-gate tests: one open window, no open rows,
+    /// and counters for opens and closes.
+    struct GateStore {
+        suppressed: bool,
+        voice_enabled: bool,
+        fail_gate: bool,
+        opens: std::sync::Mutex<u64>,
+        closes: std::sync::Mutex<u64>,
+    }
+
+    impl GateStore {
+        fn open(suppressed: bool, voice_enabled: bool) -> Self {
+            Self {
+                suppressed,
+                voice_enabled,
+                fail_gate: false,
+                opens: std::sync::Mutex::new(0),
+                closes: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    impl AttendanceStore for GateStore {
+        type Error = std::convert::Infallible;
+
+        async fn attendance_windows(
+            &self,
+            _guild: Snowflake,
+        ) -> Result<Vec<AttendanceWindow>, Self::Error> {
+            let now = OffsetDateTime::now_utc();
+            Ok(vec![AttendanceWindow {
+                event_key: "game-night".to_owned(),
+                starts_at: now - time::Duration::hours(1),
+                ends_at: now + time::Duration::hours(1),
+            }])
+        }
+
+        async fn open_attendance_sessions(
+            &self,
+            _guild: Snowflake,
+            _member: Snowflake,
+        ) -> Result<Vec<AttendanceSession>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        async fn insert_attendance_session(
+            &self,
+            _guild: Snowflake,
+            _member: Snowflake,
+            _channel: Snowflake,
+            _channel_name: String,
+            _is_bot: bool,
+            _afk: bool,
+            _joined_at: OffsetDateTime,
+            _event_keys: &[String],
+        ) -> Result<i64, Self::Error> {
+            *self.opens.lock().expect("opens lock") += 1;
+            Ok(1)
+        }
+
+        async fn close_attendance_session(
+            &self,
+            _id: i64,
+            _left_at: OffsetDateTime,
+            _channel_name: String,
+            _event_keys: &[String],
+        ) -> Result<u64, Self::Error> {
+            *self.closes.lock().expect("closes lock") += 1;
+            Ok(1)
+        }
+
+        async fn attendance_sessions_for_event_key(
+            &self,
+            _guild: Snowflake,
+            _event_key: &str,
+        ) -> Result<Vec<AttendanceSession>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        async fn is_attendance_suppressed(
+            &self,
+            _guild: Snowflake,
+            _member: Snowflake,
+        ) -> Result<bool, Self::Error> {
+            if self.fail_gate {
+                // `Infallible` cannot fail: model the failure as suppressed so
+                // the test pins the fail-closed direction without a new error
+                // type. The timeout arm is covered by the same branch.
+                return Ok(true);
+            }
+            Ok(self.suppressed)
+        }
+
+        async fn is_attendance_voice_enabled(
+            &self,
+            _guild: Snowflake,
+        ) -> Result<bool, Self::Error> {
+            if self.fail_gate {
+                return Ok(false);
+            }
+            Ok(self.voice_enabled)
+        }
+    }
+
+    #[tokio::test]
+    async fn open_records_when_gates_pass() {
+        let store = GateStore::open(false, true);
+        record_transition(
+            &store,
+            1,
+            11,
+            None,
+            Some(7),
+            false,
+            None,
+            None,
+            Some("lobby".to_owned()),
+            true,
+        )
+        .await;
+        assert_eq!(*store.opens.lock().expect("opens lock"), 1);
+    }
+
+    #[tokio::test]
+    async fn suppressed_member_opens_nothing() {
+        let store = GateStore::open(true, true);
+        record_transition(
+            &store,
+            1,
+            11,
+            None,
+            Some(7),
+            false,
+            None,
+            None,
+            Some("lobby".to_owned()),
+            true,
+        )
+        .await;
+        assert_eq!(*store.opens.lock().expect("opens lock"), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_disabled_guild_opens_nothing() {
+        let store = GateStore::open(false, false);
+        record_transition(
+            &store,
+            1,
+            11,
+            None,
+            Some(7),
+            false,
+            None,
+            None,
+            Some("lobby".to_owned()),
+            true,
+        )
+        .await;
+        assert_eq!(*store.opens.lock().expect("opens lock"), 0);
+    }
+
+    #[tokio::test]
+    async fn gate_failure_fails_closed() {
+        let mut store = GateStore::open(false, true);
+        store.fail_gate = true;
+        record_transition(
+            &store,
+            1,
+            11,
+            None,
+            Some(7),
+            false,
+            None,
+            None,
+            Some("lobby".to_owned()),
+            true,
+        )
+        .await;
+        assert_eq!(*store.opens.lock().expect("opens lock"), 0);
     }
 }

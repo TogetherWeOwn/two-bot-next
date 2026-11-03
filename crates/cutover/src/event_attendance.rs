@@ -320,6 +320,41 @@ pub async fn count_attendance_sessions_before(
     )
 }
 
+/// Whether the pair holds a guild-scoped opt-out suppression row. The
+/// attendance logger consults this before opening a span (contract v2 §9):
+/// a suppressed member opens nothing, so they stay absent from the record
+/// instead of anonymised in it. Read-only; closes still finalize.
+pub async fn is_attendance_suppressed(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    member_id: &str,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",
+    )
+    .bind(guild_id)
+    .bind(member_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Whether guild-wide voice capture is enabled. `guild_analytics_settings`
+/// rows are opt-out toggles: a missing row means enabled, matching the
+/// pre-toggle behavior. `voice_enabled = off` stops attendance capture
+/// guild-wide (contract v2 §9). Read-only; closes still finalize.
+pub async fn is_attendance_voice_enabled(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let enabled: Option<bool> = sqlx::query_scalar(
+        "SELECT voice_enabled FROM guild_analytics_settings WHERE guild_id = $1",
+    )
+    .bind(guild_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(enabled.unwrap_or(true))
+}
+
 impl PgRoomStore {
     /// [`put_attendance_window`] over this store's pool.
     pub async fn put_attendance_window(
@@ -409,5 +444,19 @@ impl PgRoomStore {
         cutoff: OffsetDateTime,
     ) -> Result<i64, sqlx::Error> {
         count_attendance_sessions_before(self.pool(), cutoff).await
+    }
+
+    /// [`is_attendance_suppressed`] over this store's pool.
+    pub async fn is_attendance_suppressed(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        is_attendance_suppressed(self.pool(), guild_id, member_id).await
+    }
+
+    /// [`is_attendance_voice_enabled`] over this store's pool.
+    pub async fn is_attendance_voice_enabled(&self, guild_id: &str) -> Result<bool, sqlx::Error> {
+        is_attendance_voice_enabled(self.pool(), guild_id).await
     }
 }

@@ -513,6 +513,28 @@ pub trait RoomPersistence: Send + Sync {
         let _ = (guild, event_key);
         async { Ok::<Vec<AttendanceSession>, StoreError>(Vec::new()) }
     }
+    /// Whether the pair holds a guild-scoped opt-out suppression row. The
+    /// attendance logger consults this before opening a span; a suppressed
+    /// member opens nothing. Default unsuppressed for stores without the
+    /// privacy tables.
+    fn is_attendance_suppressed(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let _ = (guild, member);
+        async { Ok::<bool, StoreError>(false) }
+    }
+    /// Whether guild-wide voice capture is enabled (`voice_enabled`, missing
+    /// row means enabled). Default enabled for stores without the settings
+    /// table.
+    fn is_attendance_voice_enabled(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let _ = guild;
+        async { Ok::<bool, StoreError>(true) }
+    }
 }
 
 /// Every `RoomPersistence` store satisfies the attendance logger's narrow
@@ -578,6 +600,19 @@ impl<T: RoomPersistence> crate::event_attendance::AttendanceStore for T {
         event_key: &str,
     ) -> impl Future<Output = Result<Vec<AttendanceSession>, Self::Error>> + Send {
         <T as RoomPersistence>::attendance_sessions_for_event_key(self, guild, event_key)
+    }
+    fn is_attendance_suppressed(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        <T as RoomPersistence>::is_attendance_suppressed(self, guild, member)
+    }
+    fn is_attendance_voice_enabled(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        <T as RoomPersistence>::is_attendance_voice_enabled(self, guild)
     }
 }
 
@@ -964,6 +999,22 @@ impl RoomPersistence for PgRoomStore {
         event_key: &str,
     ) -> Result<Vec<AttendanceSession>, StoreError> {
         self.attendance_sessions_for_event_key(&guild.to_string(), event_key)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn is_attendance_suppressed(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> Result<bool, StoreError> {
+        self.is_attendance_suppressed(&guild.to_string(), &member.to_string())
+            .await
+            .map_err(store_error)
+    }
+
+    async fn is_attendance_voice_enabled(&self, guild: Snowflake) -> Result<bool, StoreError> {
+        self.is_attendance_voice_enabled(&guild.to_string())
             .await
             .map_err(store_error)
     }

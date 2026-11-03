@@ -443,7 +443,10 @@ is true only once the window plus its 15-minute grace has passed, and the websit
 only writes an Echo from `final: true` reads. `not_found` covers unmapped keys and
 mapped windows with no tagged sessions — including every window that closed before
 the logger shipped, which has no rows by construction (no backfill). Raw sessions
-roll off 90 days after joining.
+roll off 90 days after joining. Capture consults the opt-out at open time
+(contract v2 §9): a suppressed member opens no span — absent from the record,
+not anonymised in it — and `guild_analytics_settings.voice_enabled = off`
+stops capture guild-wide; closes still finalize so no open row leaks.
 
 | Code | Status | Retryable |
 | --- | --- | --- |

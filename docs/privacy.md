@@ -408,7 +408,7 @@ voice.
 | --- | --- | --- |
 | Presence | `presence_enabled` | `presence_update` |
 | Activity | `activity_enabled` | `first/second/third_message`, community `message_created` facts |
-| Voice | `voice_enabled` | `voice_session_start/end`, `first_voice_session`, community `voice_session_started/ended` facts |
+| Voice | `voice_enabled` | `voice_session_start/end`, `first_voice_session`, community `voice_session_started/ended` facts, event-attendance session opens (`event_voice_sessions` inserts; closes still finalize) |
 
 Every other event type still persists: joins, leaves, gate clears,
 onboarding prompts, invite clicks and routing rows serve
@@ -428,7 +428,9 @@ inviters keep the aggregate use count with a blanked inviter field, in the
 standalone capture's counter baseline and the backfill baseline alike, which
 share one writer), the onboarding writers (including the prompt guard, which
 re-gates before the insert for opt-outs that land while the welcome is in
-flight), `touch_activity` / `mark_bot`, and the inactivity sweep (suppression-only:
+flight), `touch_activity` / `mark_bot`, the event-attendance session logger
+(open gate only: a suppressed member or a voice-disabled guild opens no span,
+while closes still finalize), and the inactivity sweep (suppression-only:
 a suppressed pair is skipped inside the per-member transaction, so the sweep
 never recreates the purged `member_inactive` row). Every gated writer serializes
 with concurrent opt-outs (a shared table lock, so a write that passes the
