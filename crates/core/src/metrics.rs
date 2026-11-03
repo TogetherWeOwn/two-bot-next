@@ -467,6 +467,7 @@ pub const INTERNAL_ACTION_FAMILIES: &[&str] = &[
     "settings",
     "moderation",
     "membership",
+    "voice",
     "other",
 ];
 /// Receiver outcomes for `two_bot_internal_actions_total{family,outcome}`:

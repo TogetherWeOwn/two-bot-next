@@ -266,12 +266,13 @@ const VOTE_KICK_CAP_OUTCOMES: [&str; 26] = [
 /// One row per `metrics::INTERNAL_ACTION_FAMILIES` entry, in the same order.
 /// A new receiver family fails here until it gets a budget row in the guard
 /// doc. Unknown verbs collapse to the trailing `other`.
-const INTERNAL_ACTION_CAP_FAMILIES: [&str; 6] = [
+const INTERNAL_ACTION_CAP_FAMILIES: [&str; 7] = [
     "announcement",
     "event",
     "settings",
     "moderation",
     "membership",
+    "voice",
     "other",
 ];
 /// One row per `metrics::INTERNAL_ACTION_OUTCOMES` entry, in the same order.
@@ -602,7 +603,7 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
     );
     assert_eq!(
         metrics::INTERNAL_ACTION_FAMILIES.len(),
-        6,
+        7,
         "internal-action family grew; update the cardinality budget and the guard doc"
     );
     assert_eq!(
