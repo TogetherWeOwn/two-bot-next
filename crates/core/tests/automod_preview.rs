@@ -230,13 +230,16 @@ fn t2_repeat_equivalence_and_immutability() {
     // a fresh id completes the streak but the retained id `dup-1` excludes
     // itself and falls short. Reusing an evicted id (like `seed-5` above,
     // long since truncated to the 3 newest rows) would prove nothing, so
-    // the duplicate probe targets a retained row.
+    // the duplicate probe targets a retained row. The future row stays
+    // inside the 30 s window (8 ms after the probe) so seeding it does not
+    // expire the dup history; it is still excluded from the earlier probe
+    // by the at_ms <= now filter.
     let mut live = RepeatTracker::default();
     for i in 0..2_u64 {
         let seeded = live_message(&format!("dup-{i}"), "repeat me", 6_000_000 + i);
         match_automod(&seeded, &config.policy, &mut live);
     }
-    let future = live_message("future-post", "repeat me", 9_999_999);
+    let future = live_message("future-post", "repeat me", 6_000_010);
     match_automod(&future, &config.policy, &mut live);
     for (id, expected, why) in [
         ("fresh-dup-probe", true, "fresh id completes the streak"),
