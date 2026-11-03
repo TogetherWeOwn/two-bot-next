@@ -2980,11 +2980,13 @@ mod tests {
         // Together these shift eight entries between those classes. The
         // assistant credential binding and required event-voice category
         // slices add two env-only keys
-        // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID).
+        // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID). The
+        // voice.snapshot read adds one env-only key
+        // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT).
         for (class, expected) in [
             (SettingClass::Hot, 52),
             (SettingClass::Cold, 18),
-            (SettingClass::EnvOnly, 66),
+            (SettingClass::EnvOnly, 67),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
