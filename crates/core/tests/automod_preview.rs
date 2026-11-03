@@ -154,6 +154,41 @@ fn t1_corpus_replay_matches_live() {
 /// tracker is byte-identical afterwards.
 #[test]
 fn t2_repeat_equivalence_and_immutability() {
+    // Spec §8 T2: every configured repeat count from 2 through 20. Each
+    // history seeds `count - 1` identical posts one second apart, so the
+    // probe is exactly the streak-completing post; the preview verdict must
+    // equal a CREATE evaluated on a cloned tracker, and the live tracker
+    // must read identical afterwards.
+    for count in 2..=20_u32 {
+        let mut count_policy = policy();
+        count_policy.repeated_message_count = count;
+        let count_config = config(count_policy);
+        let mut live = RepeatTracker::default();
+        for i in 0..count - 1 {
+            let seeded = live_message(
+                &format!("range-{count}-{i}"),
+                "repeat me",
+                1_000_000 + u64::from(i) * 1_000,
+            );
+            match_automod(&seeded, &count_config.policy, &mut live);
+        }
+        let at_ms = 1_000_000 + u64::from(count - 1) * 1_000;
+        let before = format!("{live:?}");
+        let preview = AutomodMessage {
+            message_id: format!("preview:range-{count}"),
+            ..synthetic("repeat me", at_ms)
+        };
+        let mut cloned = live.clone();
+        let reference = live_message(&format!("range-{count}-live"), "repeat me", at_ms);
+        let reference = match_automod(&reference, &count_config.policy, &mut cloned);
+        let verdict = preview_automod(&preview, 0, &count_config, &live);
+        assert!(reference.is_some(), "count {count}: streak completes");
+        assert_eq!(
+            verdict.filter, reference,
+            "count {count}: preview/live disagree"
+        );
+        assert_eq!(format!("{live:?}"), before, "count {count}: tracker mutated");
+    }
     let config = config(policy());
     let mut live = RepeatTracker::default();
     // Seed history: 20 identical posts, one per second.
@@ -186,20 +221,36 @@ fn t2_repeat_equivalence_and_immutability() {
         assert_eq!(verdict.filter.is_some(), expected, "{why}");
         assert_eq!(format!("{live:?}"), before, "{why}: tracker mutated");
     }
-    // Out-of-order future rows and duplicate ids never leak into the probe.
+    // Out-of-order future rows never leak into an earlier probe, and a
+    // duplicate id never double-counts: with two seeded posts and count 3,
+    // a fresh id completes the streak but the retained id `dup-1` excludes
+    // itself and falls short. Reusing an evicted id (like `seed-5` above,
+    // long since truncated to the 3 newest rows) would prove nothing, so
+    // the duplicate probe targets a retained row.
+    let mut live = RepeatTracker::default();
+    for i in 0..2_u64 {
+        let seeded = live_message(&format!("dup-{i}"), "repeat me", 6_000_000 + i);
+        match_automod(&seeded, &config.policy, &mut live);
+    }
     let future = live_message("future-post", "repeat me", 9_999_999);
     match_automod(&future, &config.policy, &mut live);
-    let before = format!("{live:?}");
-    let preview = AutomodMessage {
-        message_id: "seed-5".to_owned(),
-        ..synthetic("repeat me", 1_000_005)
-    };
-    let mut cloned = live.clone();
-    let reference = live_message("seed-5", "repeat me", 1_000_005);
-    let reference = match_automod(&reference, &config.policy, &mut cloned);
-    let verdict = preview_automod(&preview, 0, &config, &live);
-    assert_eq!(verdict.filter, reference, "duplicate-id history");
-    assert_eq!(format!("{live:?}"), before, "tracker mutated by probe");
+    for (id, expected, why) in [
+        ("fresh-dup-probe", true, "fresh id completes the streak"),
+        ("dup-1", false, "duplicate id excludes its retained row"),
+    ] {
+        let before = format!("{live:?}");
+        let preview = AutomodMessage {
+            message_id: id.to_owned(),
+            ..synthetic("repeat me", 6_000_002)
+        };
+        let mut cloned = live.clone();
+        let reference = live_message(id, "repeat me", 6_000_002);
+        let reference = match_automod(&reference, &config.policy, &mut cloned);
+        let verdict = preview_automod(&preview, 0, &config, &live);
+        assert_eq!(verdict.filter, reference, "{why}: preview/live disagree");
+        assert_eq!(verdict.filter.is_some(), expected, "{why}");
+        assert_eq!(format!("{live:?}"), before, "{why}: tracker mutated");
+    }
 }
 
 /// T3: N previews of identical text, then real CREATEs — the streak counts
@@ -237,6 +288,12 @@ fn t3_preview_storm_leaves_no_streak() {
 #[test]
 fn t4_order_masking() {
     let config = config(policy());
+    // `match_automod` reports `bad_words` before recording a repeat row,
+    // so seeding through the full policy would build no streak and the
+    // masking claim below would be vacuous. Seed with bad-word matching
+    // disabled to lay down a real repeat streak instead.
+    let mut seed_policy = policy();
+    seed_policy.bad_words.clear();
     let mut live = RepeatTracker::default();
     for i in 0..5 {
         let seeded = live_message(
@@ -244,17 +301,22 @@ fn t4_order_masking() {
             "bannedword plus discord.gg/abc",
             3_000_000 + i,
         );
-        match_automod(&seeded, &config.policy, &mut live);
+        match_automod(&seeded, &seed_policy, &mut live);
     }
-    let verdict = preview_automod(
-        &AutomodMessage {
-            message_id: "preview:mask".to_owned(),
-            ..synthetic("bannedword plus discord.gg/abc", 3_000_010)
-        },
-        0,
-        &config,
-        &live,
+    let probe = AutomodMessage {
+        message_id: "preview:mask".to_owned(),
+        ..synthetic("bannedword plus discord.gg/abc", 3_000_010)
+    };
+    // Control: without bad-word matching the same probe completes the
+    // seeded streak, so there is a real repeat (plus the invite) to mask.
+    let seed_config = config(seed_policy);
+    let control = preview_automod(&probe, 0, &seed_config, &live);
+    assert_eq!(
+        control.filter.map(|f| f.as_str()),
+        Some("repeated_message"),
+        "control: seeded streak is a live repeat"
     );
+    let verdict = preview_automod(&probe, 0, &config, &live);
     assert_eq!(
         verdict.filter.map(|f| f.as_str()),
         Some("bad_words"),
