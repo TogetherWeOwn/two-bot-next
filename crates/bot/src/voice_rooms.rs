@@ -515,6 +515,72 @@ pub trait RoomPersistence: Send + Sync {
     }
 }
 
+/// Every `RoomPersistence` store satisfies the attendance logger's narrow
+/// surface by forwarding. `event_attendance` stays shared with the binary
+/// (which never compiles this module); the binary only uses its pure
+/// projection half, so it needs no impl.
+impl<T: RoomPersistence> crate::event_attendance::AttendanceStore for T {
+    type Error = StoreError;
+    fn attendance_windows(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<Vec<AttendanceWindow>, Self::Error>> + Send {
+        <T as RoomPersistence>::attendance_windows(self, guild)
+    }
+    fn open_attendance_sessions(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<Vec<AttendanceSession>, Self::Error>> + Send {
+        <T as RoomPersistence>::open_attendance_sessions(self, guild, member)
+    }
+    fn insert_attendance_session(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        channel: Snowflake,
+        channel_name: String,
+        is_bot: bool,
+        afk: bool,
+        joined_at: OffsetDateTime,
+        event_keys: &[String],
+    ) -> impl Future<Output = Result<i64, Self::Error>> + Send {
+        <T as RoomPersistence>::insert_attendance_session(
+            self,
+            guild,
+            member,
+            channel,
+            channel_name,
+            is_bot,
+            afk,
+            joined_at,
+            event_keys,
+        )
+    }
+    fn close_attendance_session(
+        &self,
+        id: i64,
+        left_at: OffsetDateTime,
+        channel_name: String,
+        event_keys: &[String],
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+        <T as RoomPersistence>::close_attendance_session(
+            self,
+            id,
+            left_at,
+            channel_name,
+            event_keys,
+        )
+    }
+    fn attendance_sessions_for_event_key(
+        &self,
+        guild: Snowflake,
+        event_key: &str,
+    ) -> impl Future<Output = Result<Vec<AttendanceSession>, Self::Error>> + Send {
+        <T as RoomPersistence>::attendance_sessions_for_event_key(self, guild, event_key)
+    }
+}
+
 impl RoomPersistence for PgRoomStore {
     async fn creators(&self, guild: Snowflake) -> Result<Vec<CreatorChannel>, StoreError> {
         self.creators(guild).await.map_err(store_error)

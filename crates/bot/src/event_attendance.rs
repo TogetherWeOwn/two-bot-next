@@ -24,13 +24,60 @@
 //! finalizes on the member's next transition, clamped so a stale row can
 //! never tag a later event (see [`plan_transition`]).
 
+use std::future::Future;
 use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 use two_bot_core::Snowflake;
+use two_bot_cutover::event_attendance::{AttendanceSession, AttendanceWindow};
 
-use crate::voice_rooms::{RoomPersistence, REVALIDATE_TIMEOUT_MS};
+/// Inbox-protection bound for each attendance statement, mirroring
+/// `voice_rooms::REVALIDATE_TIMEOUT_MS`: a slow statement must not hold room
+/// handling. Duplicated — not imported — so the binary shares this file as a
+/// crate-local module without compiling `voice_rooms` (lib-only).
+const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
+
+/// Store surface the session logger needs. Narrower than
+/// `voice_rooms::RoomPersistence` so this file stays shared between the
+/// library (blanket impl for every `RoomPersistence` in `voice_rooms.rs`) and
+/// the binary (which never compiles `voice_rooms` and only uses the pure
+/// projection half). Bounds match the `RoomPersistence` attendance defaults.
+pub(crate) trait AttendanceStore: Send + Sync {
+    type Error: std::fmt::Display;
+    fn attendance_windows(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<Vec<AttendanceWindow>, Self::Error>> + Send;
+    fn open_attendance_sessions(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<Vec<AttendanceSession>, Self::Error>> + Send;
+    fn insert_attendance_session(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        channel: Snowflake,
+        channel_name: String,
+        is_bot: bool,
+        afk: bool,
+        joined_at: OffsetDateTime,
+        event_keys: &[String],
+    ) -> impl Future<Output = Result<i64, Self::Error>> + Send;
+    fn close_attendance_session(
+        &self,
+        id: i64,
+        left_at: OffsetDateTime,
+        channel_name: String,
+        event_keys: &[String],
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+    fn attendance_sessions_for_event_key(
+        &self,
+        guild: Snowflake,
+        event_key: &str,
+    ) -> impl Future<Output = Result<Vec<AttendanceSession>, Self::Error>> + Send;
+}
 
 /// Recording grace on each side of `[starts_at, ends_at]`, in millis.
 pub(crate) const ATTENDANCE_GRACE_MS: i64 = 15 * 60 * 1_000;
@@ -193,7 +240,7 @@ pub(crate) fn logger_enabled() -> bool {
 /// view, refreshed at close so renames converge. Never fails the actor loop.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_transition(
-    store: &impl RoomPersistence,
+    store: &impl AttendanceStore,
     guild: Snowflake,
     member: Snowflake,
     previous: Option<Snowflake>,
