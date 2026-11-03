@@ -346,15 +346,15 @@ async fn run(cli_args: &[String]) {
     // Staging-only boot reconcile for the /help embed smoke channel: uses
     // the token the process already holds, runs only when the staging
     // deployment marker and staging guild both match, and never blocks or
-    // fails boot. Needs the token alone, never the database.
+    // fails boot. Spawned detached so a slow Discord never delays gateway
+    // startup or database init. Needs the token alone, never the database.
     staging_help_smoke_reconcile::maybe_reconcile_on_boot(
         config
             .discord_token
             .as_ref()
-            .map(|secret| secret.expose().as_str()),
+            .map(|secret| secret.expose().clone()),
         config.guild_id,
-    )
-    .await;
+    );
 
     let store = match gateway_prerequisites(&config).ok().map(|(_, url, _)| url) {
         Some(url) => match tokio::time::timeout(

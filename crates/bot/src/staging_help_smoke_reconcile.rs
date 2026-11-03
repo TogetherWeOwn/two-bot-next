@@ -166,8 +166,11 @@ pub fn bots_needing_overwrite(existing: &[(u64, u64, u64)], bot_ids: &[u64]) -> 
 }
 
 /// Token-only entrypoint, called at boot after the command-registry sync.
-/// Never blocks or fails boot: every path logs and returns.
-pub async fn maybe_reconcile_on_boot(token: Option<&str>, guild_id: Option<u64>) {
+/// Spawns a detached background task and returns immediately, so a slow
+/// Discord never delays gateway startup or database init. Every path logs
+/// and boot continues; failures carry an `error_class` with redacted details
+/// (raw Discord errors can contain credential-bearing URLs).
+pub fn maybe_reconcile_on_boot(token: Option<String>, guild_id: Option<u64>) {
     if !reconcile_enabled_from_env(guild_id) {
         tracing::debug!("staging help-embed smoke reconcile skipped: gate closed");
         return;
@@ -175,43 +178,60 @@ pub async fn maybe_reconcile_on_boot(token: Option<&str>, guild_id: Option<u64>)
     let token = match token {
         Some(token) if !token.is_empty() => token,
         _ => {
-            tracing::error!("staging help-embed smoke reconcile skipped: DISCORD_TOKEN is missing");
+            tracing::error!(
+                error_class = "reconcile_token_missing",
+                "staging help-embed smoke reconcile skipped: DISCORD_TOKEN is missing"
+            );
             return;
         }
     };
     let guild = match guild_id {
         Some(guild) => guild,
         None => {
-            tracing::error!("staging help-embed smoke reconcile skipped: guild is not configured");
+            tracing::error!(
+                error_class = "reconcile_guild_missing",
+                "staging help-embed smoke reconcile skipped: guild is not configured"
+            );
             return;
         }
     };
     let candidates = std::env::var(SYNTHETIC_IDS_VAR).ok();
-    match tokio::time::timeout(
-        RECONCILE_TIMEOUT,
-        reconcile_once(token, guild, candidates.as_deref(), None),
-    )
-    .await
-    {
-        Ok(Ok((channel_id, outcome))) => {
-            tracing::info!(
-                channel_id = %channel_id,
-                outcome = outcome.as_str(),
-                "staging help-embed smoke channel reconciled"
-            );
+    tokio::spawn(async move {
+        match tokio::time::timeout(
+            RECONCILE_TIMEOUT,
+            reconcile_once(token.as_str(), guild, candidates.as_deref(), None),
+        )
+        .await
+        {
+            Ok(Ok((channel_id, outcome))) => {
+                tracing::info!(
+                    channel_id = %channel_id,
+                    outcome = outcome.as_str(),
+                    "staging help-embed smoke channel reconciled"
+                );
+            }
+            Ok(Err(_)) => {
+                tracing::error!(
+                    error_class = "reconcile_failed",
+                    "staging help-embed smoke reconcile failed; details redacted"
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    error_class = "reconcile_timed_out",
+                    "staging help-embed smoke reconcile timed out"
+                );
+            }
         }
-        Ok(Err(error)) => {
-            tracing::error!(error = %error, "staging help-embed smoke reconcile failed");
-        }
-        Err(_) => {
-            tracing::error!("staging help-embed smoke reconcile timed out");
-        }
-    }
+    });
 }
 
 /// Build the token-only REST client. `proxy_override` (or `DISCORD_API_BASE`
-/// when `None`) points the client at a loopback double in tests.
-fn client_for(token: &str, proxy_override: Option<&str>) -> TwilightClient {
+/// when `None`) points the client at a loopback double in tests. Any
+/// non-loopback override is refused before any network or token use, so a
+/// misconfigured `DISCORD_API_BASE` can never route the bot token to an
+/// untrusted host (same fence as `HyperTransport`: loopback-only overrides).
+fn client_for(token: &str, proxy_override: Option<&str>) -> Result<TwilightClient, String> {
     let mut builder = TwilightClient::builder()
         .token(token.to_owned())
         .ratelimiter(None);
@@ -220,13 +240,19 @@ fn client_for(token: &str, proxy_override: Option<&str>) -> TwilightClient {
         .or_else(|| std::env::var("DISCORD_API_BASE").ok());
     if let Some(base) = proxy {
         let base = base.trim().to_owned();
+        if base.is_empty() {
+            return Ok(builder.build());
+        }
+        if !two_bot_core::send_admission::is_loopback_http(&base) {
+            return Err("staging smoke Discord API override refused: non-loopback host".to_owned());
+        }
         if let Some(host) = base.strip_prefix("http://") {
             builder = builder.proxy(host.to_owned(), true);
-        } else if let Some(host) = base.strip_prefix("https://") {
-            builder = builder.proxy(host.to_owned(), false);
+        } else {
+            return Err("staging smoke Discord API override refused: non-loopback host".to_owned());
         }
     }
-    builder.build()
+    Ok(builder.build())
 }
 
 /// One reconcile pass: find or create the channel, then ensure the bot
@@ -239,14 +265,14 @@ async fn reconcile_once(
 ) -> Result<(u64, ReconcileOutcome), String> {
     let guild_id = Id::<GuildMarker>::new_checked(guild)
         .ok_or_else(|| "staging help-embed smoke reconcile refused: invalid guild id".to_owned())?;
-    let client = client_for(token, proxy_override);
+    let client = client_for(token, proxy_override)?;
     let listed: Vec<Channel> = client
         .guild_channels(guild_id)
         .await
-        .map_err(|error| format!("staging smoke channel list failed: {error}"))?
+        .map_err(|_| "staging smoke channel list failed; details redacted".to_owned())?
         .model()
         .await
-        .map_err(|error| format!("staging smoke channel list unreadable: {error}"))?;
+        .map_err(|_| "staging smoke channel list unreadable; details redacted".to_owned())?;
     let views: Vec<SmokeChannelView<'_>> = listed
         .iter()
         .map(|channel| SmokeChannelView {
@@ -290,19 +316,19 @@ async fn discover_bots(
                             "staging smoke reconcile: candidate is not a bot, skipped"
                         );
                     }
-                    Err(error) => {
+                    Err(_) => {
                         tracing::debug!(
                             user_id = %candidate,
-                            error = %error,
+                            error_class = "member_unreadable",
                             "staging smoke reconcile: member unreadable, skipped"
                         );
                     }
                 }
             }
-            Err(error) => {
+            Err(_) => {
                 tracing::debug!(
                     user_id = %candidate,
-                    error = %error,
+                    error_class = "member_fetch_failed",
                     "staging smoke reconcile: member fetch failed, skipped"
                 );
             }
@@ -361,7 +387,7 @@ async fn ensure_overwrite(
         client
             .update_channel_permission(channel, &overwrite)
             .await
-            .map_err(|error| format!("staging smoke overwrite failed for {bot}: {error}"))?;
+            .map_err(|_| format!("staging smoke overwrite failed for {bot}; details redacted"))?;
     }
     Ok((channel_id, ReconcileOutcome::OverwriteEnsured))
 }
@@ -394,10 +420,10 @@ async fn create_channel(
         .kind(ChannelType::GuildText)
         .permission_overwrites(&overwrites)
         .await
-        .map_err(|error| format!("staging smoke channel create failed: {error}"))?
+        .map_err(|_| "staging smoke channel create failed; details redacted".to_owned())?
         .model()
         .await
-        .map_err(|error| format!("staging smoke channel create unreadable: {error}"))?;
+        .map_err(|_| "staging smoke channel create unreadable; details redacted".to_owned())?;
     Ok((created.id.get(), ReconcileOutcome::Created))
 }
 
@@ -543,6 +569,20 @@ mod tests {
             ReconcileOutcome::OverwriteEnsured.as_str(),
             "overwrite_ensured"
         );
+    }
+
+    #[test]
+    fn api_override_refuses_non_loopback_before_network() {
+        assert!(client_for("fixture-token", Some("https://discord.com")).is_err());
+        assert!(client_for("fixture-token", Some("https://evil.invalid")).is_err());
+        assert!(client_for(
+            "fixture-token",
+            Some("http://fixture-user:fixture-password@127.0.0.1:9"),
+        )
+        .is_err());
+        assert!(client_for("fixture-token", Some("https://127.0.0.1:9")).is_err());
+        assert!(client_for("fixture-token", Some("http://127.0.0.1:9")).is_ok());
+        assert!(client_for("fixture-token", Some("")).is_ok());
     }
 
     #[test]
@@ -743,6 +783,20 @@ mod tests {
         assert_eq!(requests[3].method, "PUT");
         assert!(requests[3].path.ends_with(&bot.to_string()));
         mock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn non_loopback_override_fails_closed_without_network() {
+        let error = reconcile_once(
+            "reconcile-fixture-token",
+            staging_guild(),
+            None,
+            Some("https://evil.invalid"),
+        )
+        .await
+        .expect_err("non-loopback override must fail closed");
+        assert!(error.contains("non-loopback"));
+        assert!(!error.contains("evil.invalid"));
     }
 
     #[tokio::test]
