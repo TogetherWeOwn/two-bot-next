@@ -2128,6 +2128,53 @@ async fn voice_snapshot_warm_cache_while_reconnecting_is_discord_unavailable() {
 }
 
 #[tokio::test]
+async fn voice_snapshot_disconnect_during_key_lookup_refuses_stale_cache() {
+    let Some(db) = database().await else { return };
+    let gateway = connected_gateway();
+    let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    let state = ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        effect.clone(),
+        effect,
+        Arc::new(MockEventRead::default()),
+        Arc::new(MockEventMutate),
+        Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
+    )
+    .with_voice_cache(seeded_voice_cache())
+    .with_gateway_state(gateway.clone());
+    // Exhaust the fixture pool so the handler yields at the new key query,
+    // after its initial readiness check. No sleeps or timing assumptions.
+    let mut held = Vec::new();
+    for _ in 0..db.pool().options().get_max_connections() {
+        held.push(db.pool().acquire().await.unwrap());
+    }
+    let mut read = std::pin::pin!(read_voice_snapshot(
+        &state,
+        "fixture",
+        KeyLabel::Invalid,
+        ActionLabel::Unknown,
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(read.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    *gateway.write().await = crate::gateway::GatewayState::Armed;
+    drop(held);
+    let response = tokio::time::timeout(Duration::from_secs(5), read)
+        .await
+        .expect("snapshot read completes");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let raw = to_bytes(response.into_body(), 8192).await.unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(body["error"]["code"], "discord_unavailable");
+    assert_eq!(body["error"]["retryable"], true);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn voice_snapshot_serves_pipeline_fed_shared_cache() {
     // End to end across the contract's integration risk: the same cache
     // handle feeds the gateway pipeline and the signed receiver read. The
@@ -2406,7 +2453,6 @@ async fn voice_snapshot_windowed_event_key_stamps_the_linked_room() {
             Some("+5 minutes"),
         ),
     ] {
-        let ends_at: Option<String> = ends_in.map(|offset| format!("NOW() + INTERVAL '{offset}'"));
         sqlx::query(
             "INSERT INTO scheduled_events (guild_id, event_id, name, starts_at, channel_id, status, updated_at) \
              VALUES ($1, $2, 'fixture', '2026-11-03T10:00:00.000Z', $3, $4, '2026-11-03T10:00:00.000Z')",
@@ -2427,14 +2473,14 @@ async fn voice_snapshot_windowed_event_key_stamps_the_linked_room() {
         .execute(db.pool())
         .await
         .unwrap();
-        let starts_at = format!("NOW() + INTERVAL '{starts_in}'");
-        let ends_at = ends_at.as_deref().unwrap_or("NULL");
-        sqlx::query(&format!(
+        sqlx::query(
             "INSERT INTO event_voice_channels (event_id, instance_starts_at, starts_at, ends_at, status, voice_channel_id) \
-             VALUES ($1, {starts_at}, {starts_at}, {ends_at}, 'creating', $2)"
-        ))
+             VALUES ($1, NOW() + $3::text::interval, NOW() + $3::text::interval, NOW() + $4::text::interval, 'creating', $2)",
+        )
         .bind(event_id)
         .bind(channel)
+        .bind(starts_in)
+        .bind(ends_in)
         .execute(db.pool())
         .await
         .unwrap();

@@ -1828,6 +1828,13 @@ async fn read_voice_snapshot(
             .collect(),
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
+    // The key lookup awaited the database: readiness may have changed while
+    // it was in flight. Hold this guard through the synchronous projection so
+    // a disconnected warm cache never gets a fresh observed_at.
+    let gateway = state.gateway_state.read().await;
+    if *gateway != crate::gateway::GatewayState::Connected {
+        return reject(Failure::code(ErrorCode::DiscordUnavailable));
+    }
     match voice_snapshot::read_voice_snapshot(
         &state.voice_cache,
         &state.voice_clock,
