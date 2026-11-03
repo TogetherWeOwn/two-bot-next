@@ -52,6 +52,191 @@ async fn db_now_secs(pool: &PgPool) -> i64 {
         .unwrap()
 }
 
+const SNAPSHOT_GUILD: &str = "100000000000000001";
+const SNAPSHOT_EVENT: &str = "200000000000000001";
+const SNAPSHOT_CHANNEL: &str = "300000000000000001";
+
+async fn snapshot_event_fixture(
+    db: &TestDb,
+    status: two_bot_core::scheduled_events::EventStatus,
+) -> two_bot_core::scheduled_events::ScheduledEvent {
+    let starts_at: String = sqlx::query_scalar(
+        "SELECT to_char((NOW() - INTERVAL '1 hour') AT TIME ZONE 'UTC', \
+         'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let event = two_bot_core::scheduled_events::ScheduledEvent {
+        id: SNAPSHOT_EVENT.to_owned(),
+        name: "fixture".to_owned(),
+        starts_at,
+        channel_id: Some(SNAPSHOT_CHANNEL.to_owned()),
+        description: None,
+        status,
+    };
+    two_bot_core::website_store::upsert_event(
+        &db.pool,
+        SNAPSHOT_GUILD,
+        "2026-11-03T10:00:00.000Z",
+        &event,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO event_voice_channels \
+         (event_id, instance_starts_at, starts_at, ends_at, voice_channel_id) \
+         VALUES ($1, $2::text::timestamptz, $2::text::timestamptz, \
+                 NOW() + INTERVAL '1 hour', $3)",
+    )
+    .bind(SNAPSHOT_EVENT)
+    .bind(&event.starts_at)
+    .bind(SNAPSHOT_CHANNEL)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.store()
+        .put_event_key(SNAPSHOT_GUILD, "launch", SNAPSHOT_EVENT)
+        .await
+        .unwrap();
+    event
+}
+
+#[tokio::test]
+async fn voice_snapshot_event_key_tracks_mutation_reschedules_both_directions() {
+    use two_bot_core::{scheduled_events::EventStatus, website_store::upsert_event};
+
+    let db = TestDb::new().await;
+    let mut event = snapshot_event_fixture(&db, EventStatus::Scheduled).await;
+    let original_start = event.starts_at.clone();
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .get(SNAPSHOT_CHANNEL),
+        Some(&"launch".to_owned())
+    );
+    event.starts_at = sqlx::query_scalar(
+        "SELECT to_char((NOW() + INTERVAL '2 hours') AT TIME ZONE 'UTC', \
+         'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &event)
+        .await
+        .unwrap();
+    assert!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .is_empty(),
+        "event.upsert must move the linked room out of the live window"
+    );
+    event.starts_at = original_start;
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:02:00.000Z", &event)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .get(SNAPSHOT_CHANNEL),
+        Some(&"launch".to_owned()),
+        "rescheduling back into the window restores the link"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_event_key_retains_completed_grace_across_real_mirror_replacement() {
+    use two_bot_core::{scheduled_events::EventStatus, website_store::replace_events};
+
+    let db = TestDb::new().await;
+    snapshot_event_fixture(&db, EventStatus::Completed).await;
+    sqlx::query(
+        "UPDATE event_voice_channels SET ends_at = NOW() - INTERVAL '5 minutes' \
+         WHERE event_id = $1",
+    )
+    .bind(SNAPSHOT_EVENT)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let before = db
+        .store()
+        .windowed_event_voice_keys(SNAPSHOT_GUILD)
+        .await
+        .unwrap();
+    assert_eq!(before.get(SNAPSHOT_CHANNEL), Some(&"launch".to_owned()));
+    assert_eq!(
+        replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &[])
+            .await
+            .unwrap(),
+        None
+    );
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM scheduled_events WHERE guild_id = $1")
+            .bind(SNAPSHOT_GUILD)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, 0, "the mirror must remain an exact replacement");
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap(),
+        before,
+        "mirror omission must not cut short the known finite completed grace"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_event_key_refuses_ambiguous_aliases() {
+    use two_bot_core::scheduled_events::EventStatus;
+
+    let db = TestDb::new().await;
+    snapshot_event_fixture(&db, EventStatus::Active).await;
+    db.store()
+        .put_event_key(SNAPSHOT_GUILD, "another-site-event", SNAPSHOT_EVENT)
+        .await
+        .unwrap();
+    assert!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .is_empty(),
+        "two site keys must not become one arbitrary room link"
+    );
+    db.store()
+        .put_event_key(SNAPSHOT_GUILD, "another-site-event", "200000000000000002")
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .get(SNAPSHOT_CHANNEL),
+        Some(&"launch".to_owned()),
+        "a unique mapping remains usable after alias removal"
+    );
+    assert!(
+        db.store()
+            .windowed_event_voice_keys("100000000000000002")
+            .await
+            .unwrap()
+            .is_empty(),
+        "guild isolation survives reverse lookup"
+    );
+    db.cleanup().await;
+}
+
 // Public cross-implementation signing fixture, never runtime key material.
 fn signing_key() -> two_bot_core::internal_actions::SigningKey {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

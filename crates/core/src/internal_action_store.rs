@@ -1035,8 +1035,10 @@ impl InternalActionStore {
     /// their key through a finite closing grace window, but without a known
     /// end they cannot prove one. A `NULL ends_at` beside a live mirror status
     /// (`scheduled`, `active`) is open-ended, with no closing edge.
-    /// Store errors propagate so the caller refuses `internal` instead of
-    /// serving key-omitted rooms as if no room were linked.
+    /// A channel with more than one site key has no canonical address, so it
+    /// is omitted rather than choosing an arbitrary alias. Store errors
+    /// propagate so the caller refuses `internal` instead of serving
+    /// key-omitted rooms as if no room were linked.
     pub async fn windowed_event_voice_keys(
         &self,
         guild_id: &str,
@@ -1045,7 +1047,7 @@ impl InternalActionStore {
             return Err(InternalStoreError::InvalidInput);
         }
         let rows: Vec<(Option<String>, String)> = sqlx::query_as(
-            "SELECT c.voice_channel_id, k.event_key \
+            "SELECT c.voice_channel_id, MIN(k.event_key) \
              FROM event_voice_channels c \
              JOIN internal_event_keys k \
                ON k.guild_id = $1 AND k.event_id = c.event_id \
@@ -1056,7 +1058,8 @@ impl InternalActionStore {
              AND (s.status IN ('scheduled', 'active') \
                   OR (s.status = 'completed' AND c.ends_at IS NOT NULL)) \
              AND c.starts_at <= NOW() + INTERVAL '15 minutes' \
-             AND (c.ends_at IS NULL OR c.ends_at >= NOW() - INTERVAL '15 minutes')",
+             AND (c.ends_at IS NULL OR c.ends_at >= NOW() - INTERVAL '15 minutes') \
+             GROUP BY c.voice_channel_id HAVING COUNT(*) = 1",
         )
         .bind(guild_id)
         .fetch_all(&self.pool)
