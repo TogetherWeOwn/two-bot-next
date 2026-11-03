@@ -112,6 +112,15 @@ The test bot is a separate Discord application, **TWO Voice Synthetic
 (staging)**, invited only to the TWO Staging guild with View Channels, Connect
 and View Audit Log. It is never the bot under test.
 
+The same test bot and the same `voice-synthetic` environment secret also
+drive the [help embed smoke](staging-help-embed-smoke.md): it posts the two
+help builders' embeds to one dedicated staging text channel (a channel
+overwrite granting View Channel, Send Messages, Embed Links and Read
+Message History on that channel only), asserts the brand fields on the
+read-back, and deletes its own messages. That reuse is deliberate: the
+staging product bot's token never enters GitHub, and no second test
+credential is created.
+
 Discord marks it as a bot, and bots never count as room occupants. The staging
 Worker therefore sets `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` to its user ID, so
 the voice runtime treats it as a human: it can own a room and empty it by

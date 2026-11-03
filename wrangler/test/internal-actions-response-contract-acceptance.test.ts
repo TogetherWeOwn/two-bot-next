@@ -161,6 +161,17 @@ const SUCCESSES: { name: string; value: Record<string, unknown> }[] = [
   { name: "guild.add_member already_member", value: { ok: true, result: { outcome: "already_member" }, request_id: REQUEST_ID } },
   { name: "moderation.ban banned", value: { ok: true, result: { outcome: "banned" }, request_id: REQUEST_ID } },
   { name: "moderation.purge purged", value: { ok: true, result: { outcome: "purged", affected: 12 }, request_id: REQUEST_ID } },
+  {
+    name: "voice.snapshot",
+    value: {
+      ok: true,
+      result: {
+        v: 1, observed_at: "2026-11-03T10:00:00Z", total_in_voice: 1,
+        rooms: [{ channel_id: "222333444555666777", name: "synthetic-lobby", position: 0, user_limit: 5, member_ids: ["333444555666777888"] }],
+      },
+      request_id: REQUEST_ID,
+    },
+  },
 ];
 
 function captureLogs(t: TestContext): string[] {

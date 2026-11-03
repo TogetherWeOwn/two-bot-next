@@ -249,6 +249,22 @@ fn read_verbs_require_read() {
 }
 
 #[test]
+fn voice_snapshot_requires_read() {
+    // Slice 1 row: the keyless gateway-cache read maps to the read scope
+    // like the other keyless reads. The v0 map above stays pinned at
+    // nineteen rows; new verbs gain tests of their own.
+    assert_eq!(
+        InternalFlags::required_admin_scope("voice.snapshot"),
+        Some(SCOPE_READ),
+        "voice.snapshot is a read verb"
+    );
+    assert!(InternalFlags::admin_scope_allows(
+        &[SCOPE_READ],
+        "voice.snapshot"
+    ));
+}
+
+#[test]
 fn moderate_verbs_require_moderate() {
     for verb in [
         "moderation.warn",

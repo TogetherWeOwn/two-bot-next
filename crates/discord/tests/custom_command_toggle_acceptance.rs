@@ -815,7 +815,7 @@ async fn toggle_refuses_reserved_or_invalid_saved_definition_without_reactivatio
         refusals.push(f.observe(&toggle(501 + index as u64, true, name)).await);
         checks.push((before, definitions(f.db.pool()).await));
     }
-    for (index, template, trigger) in [(0, "Unknown {args}", "!faq"), (1, TEMPLATE, "!rank")] {
+    for (index, template, trigger) in [(0, "Unknown {guild}", "!faq"), (1, TEMPLATE, "!rank")] {
         seed(f.db.pool(), "2222", "faq", trigger, template, false).await;
         let before = definitions(f.db.pool()).await;
         refusals.push(f.observe(&toggle(510 + index, true, "faq")).await);
@@ -900,14 +900,14 @@ async fn toggle_paused_trigger_remains_owned_and_existing_replacement_semantics_
 async fn toggle_at_capacity_can_resume_existing_definition_but_cannot_add_another() {
     let f = Fixture::new(false).await;
     // Independent pin: customs fill the guild ceiling around the live
-    // publishable set (70 published; 2 more squatted but unpublished). The
+    // publishable set (70 published; 3 more squatted but unpublished). The
     // fixture already stores `faq` and `other`; peers fill the rest of the
     // budget. Disabled rows count toward storage, not just picker entries.
     let reserved = reserved_command_names();
     assert_eq!(
         reserved.len(),
-        72,
-        "72 reserved names pin the oracle: 70 published +2 held"
+        73,
+        "73 reserved names pin the oracle: 70 published +3 held"
     );
     let capacity = max_custom_commands(publishable_builtin_names().len());
     for index in 2..capacity {

@@ -398,6 +398,10 @@ impl CustomCommandRuntime {
                             username: actor.name.clone(),
                             server: server.to_owned(),
                             channel: format!("<#{}>", channel.id),
+                            // Invocation capture lands with the run-path
+                            // slice; until then `{args}` renders empty, so
+                            // templates without it behave byte-identically.
+                            args: String::new(),
                         });
                 // A stored row can predate or bypass definition-time
                 // validation (import, corruption): re-validate before
@@ -405,10 +409,15 @@ impl CustomCommandRuntime {
                 // front of members. The pure renderer stays literal; this
                 // boundary is what refuses. A refusal takes the existing
                 // content-free unavailable completion and `render_failed`
-                // fact below, and the saved row is left untouched.
+                // fact below, and the saved row is left untouched. A render
+                // with no message text (for example an `{args}`-only
+                // template with no arguments) refuses the same way: the
+                // completion never carries an empty payload.
                 let rendered = context.as_ref().and_then(|context| {
                     validate_template(&row.template).ok()?;
-                    render_template(&row.template, context).ok()
+                    render_template(&row.template, context)
+                        .ok()
+                        .filter(|content| two_bot_core::message_safety::has_message_text(content))
                 });
                 let (result, reason) = match rendered {
                     Some(content) => (self.complete(interaction, &content).await, None),
@@ -546,9 +555,13 @@ impl CustomCommandRuntime {
         // that ordering is pinned by the helper's unit tests.
         let user_mention = format!("<@{}>", message.author.id);
         let channel_mention = format!("<#{}>", message.channel_id);
+        // Remainder capture lands with the run-path slice; until then the
+        // prefix path substitutes empty, so `{args}`-free rows send
+        // byte-identically and new `{args}` rows echo nothing.
         let rendered = render_prefix_response(
             guild_name,
             &row.template,
+            "",
             &user_mention,
             &message.author.name,
             &channel_mention,
@@ -805,6 +818,9 @@ impl CustomCommandRuntime {
                     username: actor.name.clone(),
                     server: server.to_owned(),
                     channel: format!("<#{}>", channel.id),
+                    // The sample stays out of the render until the preview
+                    // slice makes it the preview input; see the run path.
+                    args: String::new(),
                 })
         };
         if let Some(draft) = draft {

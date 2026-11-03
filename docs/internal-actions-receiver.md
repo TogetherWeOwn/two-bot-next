@@ -5,11 +5,12 @@
 **Direct-container support is not the shipped Worker capability set.** The
 container source integrates an opt-in private `POST /internal/actions`
 listener with the durable store, announcement executor, event-read,
-event-mutation, settings, automations, moderation, membership,
+voice-snapshot, event-mutation, settings, automations, moderation, membership,
 member-notify DM delivery, and
 channel-moderation executors, nonce-commit authentication capability and strict
 receiver configuration. It supports `announcement.post`, the keyless `event.read`
-(behind `TWO_INTERNAL_ALLOW_EVENT_READ`), `event.upsert` and `event.cancel`
+(behind `TWO_INTERNAL_ALLOW_EVENT_READ`), the keyless `voice.snapshot`
+(behind `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT`), `event.upsert` and `event.cancel`
 (cancel behind `TWO_INTERNAL_ALLOW_EVENT_CANCEL`), `settings.get`/`settings.set`
 (behind `TWO_INTERNAL_ALLOW_SETTINGS`), the automations pair
 `automations.export` (keyless redacted read) / `automations.import` (claimed
@@ -146,6 +147,7 @@ capabilities; this table is not an instruction to create or stage them.
 | `TWO_INTERNAL_ALLOW_MEMBER_NOTIFY` | `reminder.send`/`place_offer.send` stay gated off |
 | `TWO_INTERNAL_ALLOW_MODERATION` | Member/channel moderation stay gated off, even with `TWO_MODERATION=1` |
 | `TWO_INTERNAL_ALLOW_SETTINGS` | Settings get/set stay gated off |
+| `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | `voice.snapshot` stays gated off |
 
 Fixed receiver port: **8091** (health stays on `BOT_PORT` 8080, and the two may
 not be equal while the receiver is enabled). While enabled, 8091 joins the
@@ -439,6 +441,7 @@ Success (`200` only, `result` always an object, no `error` key):
 | announcement.post | `{message_id}` | |
 | event.upsert/cancel | `{outcome, event_id}` | `outcome` replayed from the stored receipt |
 | event.read | full observed event | behind its allowlist flag |
+| voice.snapshot | live voice-room listing | behind its allowlist flag; refuses `discord_unavailable` unless the gateway is connected, so a warm cache never serves stale occupancy mid-reconnect |
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |

@@ -5,7 +5,8 @@
 //! lease.
 //!
 //! Wired effects: `announcement.post` (single-attempt send), `event.read`
-//! (keyless mapped GET), `event.upsert`/`event.cancel` (Guild Scheduled Event
+//! (keyless mapped GET), `voice.snapshot` (keyless gateway-cache projection),
+//! `event.upsert`/`event.cancel` (Guild Scheduled Event
 //! mutations through the shared event executor), `settings.get`/`settings.set`
 //! (settings executors), `automations.export` (keyless redacted read) /
 //! `automations.import` (claimed transactional import), the restrictive member
@@ -40,10 +41,11 @@ use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
 use tokio::{
     net::TcpListener,
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinSet,
 };
 use tracing::Instrument;
+use twilight_cache_inmemory::DefaultInMemoryCache;
 use two_bot_core::{
     automation_transfer::{
         diff_import, export_document, max_import_entries, parse_import_document, ImportOutcome,
@@ -93,6 +95,8 @@ use two_bot_discord::internal_member_moderation::{
 };
 use two_bot_discord::{ActionExecutor, DiscordError, EventActionError, EventCall};
 
+use crate::voice_snapshot::{self, SnapshotRefusal};
+
 const MAX_HEADER_BYTES: usize = 8192;
 const MAX_HEADERS: usize = 64;
 const MAX_REQUESTS: usize = 32;
@@ -112,10 +116,10 @@ const EVENT_GATE_WAIT: Duration = Duration::from_secs(8);
 /// `metrics::INTERNAL_ACTION_FAMILIES`: `announcement.post` to
 /// `announcement`, `event.*` to `event`, `settings.*` to `settings`,
 /// `moderation.*` to `moderation`, `role.assign`/`guild.add_member` and the
-/// member-notify DM verbs to `membership`; anything else (including unwired
-/// catalog verbs and unknown verbs) to `other`. Takes only the bounded label,
-/// never raw request bytes, so no secret, token, key id or body can become a
-/// metric label.
+/// member-notify DM verbs to `membership`, `voice.snapshot` to `voice`;
+/// anything else (including unwired catalog verbs and unknown verbs) to
+/// `other`. Takes only the bounded label, never raw request bytes, so no
+/// secret, token, key id or body can become a metric label.
 fn internal_family(action: ActionLabel) -> &'static str {
     match action {
         ActionLabel::Known(name) => match name {
@@ -125,6 +129,7 @@ fn internal_family(action: ActionLabel) -> &'static str {
             "role.assign" | "guild.add_member" | "reminder.send" | "place_offer.send" => {
                 "membership"
             }
+            "voice.snapshot" => "voice",
             _ if name.starts_with("moderation.") => "moderation",
             _ => "other",
         },
@@ -945,6 +950,18 @@ struct ReceiverState {
     event_mutate: Arc<dyn EventMutateEffect>,
     moderation: Arc<dyn ModerationEffect>,
     channel: Arc<dyn ChannelModerationEffect>,
+    /// Shared gateway voice-state cache feeding the keyless `voice.snapshot`
+    /// read. The gateway loop owns the writes through its pipeline; the
+    /// receiver only projects. A cold cache reads as `discord_unavailable`,
+    /// never as an empty guild.
+    voice_cache: Arc<DefaultInMemoryCache>,
+    /// Live gateway readiness for the keyless `voice.snapshot` read. The
+    /// supervisor owns the writes (`GatewayState::Connected` only on a
+    /// committed READY/RESUMED, `Armed` again on every transport loss); the
+    /// receiver only reads. A warm cache while the gateway is not connected
+    /// reads as `discord_unavailable` with a fresh `observed_at` never
+    /// stamped on stale occupancy.
+    gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
     clock: Mutex<ClockGuard>,
     buckets: Mutex<TokenBuckets>,
     telemetry: Mutex<RejectionTelemetry>,
@@ -986,6 +1003,13 @@ impl ReceiverState {
             event_mutate,
             moderation,
             channel,
+            // Cold by default: callers that serve `voice.snapshot` attach the
+            // shared gateway handle below, so an unwired state reads as
+            // `discord_unavailable`, never as an empty guild. Not ready by
+            // default for the same reason: the readiness gate refuses until
+            // the live gateway state is attached and connected.
+            voice_cache: voice_snapshot::new_shared_cache(),
+            gateway_state: Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
             telemetry: Mutex::new(RejectionTelemetry::default()),
@@ -995,6 +1019,28 @@ impl ReceiverState {
             children: tokio::sync::Mutex::new(JoinSet::new()),
             draining: AtomicBool::new(false),
         }
+    }
+
+    /// Attach the shared gateway voice-state cache feeding the keyless
+    /// `voice.snapshot` read. Production `bind` always attaches the handle
+    /// the gateway pipeline writes through; tests that exercise the verb
+    /// seed their own. Anything else keeps the cold default, which reads as
+    /// `discord_unavailable`.
+    fn with_voice_cache(mut self, voice_cache: Arc<DefaultInMemoryCache>) -> Self {
+        self.voice_cache = voice_cache;
+        self
+    }
+
+    /// Attach the live gateway state feeding the keyless `voice.snapshot`
+    /// readiness gate. Production `bind` always attaches the supervisor's
+    /// state; tests that exercise the verb attach `Connected` for the ready
+    /// path and keep the not-ready default for the refusal path.
+    fn with_gateway_state(
+        mut self,
+        gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
+    ) -> Self {
+        self.gateway_state = gateway_state;
+        self
     }
 
     fn reject(&self, failure: Failure, key: KeyLabel, action: ActionLabel, id: &str) -> Response {
@@ -1212,6 +1258,8 @@ pub async fn bind(
     config: InternalActionConfig,
     pool: sqlx::PgPool,
     token: &str,
+    voice_cache: Arc<DefaultInMemoryCache>,
+    gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
 ) -> std::io::Result<BoundReceiver> {
     use two_bot_core::send_admission::{PgSendAdmission, SendAdmission};
     use two_bot_discord::internal_actions::CooldownGovernor;
@@ -1259,17 +1307,21 @@ pub async fn bind(
     let listener = TcpListener::bind(config.listen_addr()).await?;
     Ok(BoundReceiver {
         listener,
-        state: Arc::new(ReceiverState::new(
-            config,
-            pool.clone(),
-            Arc::new(executor),
-            Arc::new(member),
-            Arc::new(notify),
-            Arc::new(EventReadExecutor::new(events.clone(), pool.clone())),
-            Arc::new(EventMutationExecutor::new(events, pool)),
-            Arc::new(moderation),
-            Arc::new(channel),
-        )),
+        state: Arc::new(
+            ReceiverState::new(
+                config,
+                pool.clone(),
+                Arc::new(executor),
+                Arc::new(member),
+                Arc::new(notify),
+                Arc::new(EventReadExecutor::new(events.clone(), pool.clone())),
+                Arc::new(EventMutationExecutor::new(events, pool)),
+                Arc::new(moderation),
+                Arc::new(channel),
+            )
+            .with_voice_cache(voice_cache)
+            .with_gateway_state(gateway_state),
+        ),
     })
 }
 
@@ -1553,6 +1605,11 @@ async fn receive(
     if decision.action == "event.read" {
         return read_event(state, &decision, id, key, action).await;
     }
+    // Keyless live-voice read: no durable claim, no Idempotency-Key, same as
+    // `event.read` above. The committed nonce is the replay guard.
+    if decision.action == "voice.snapshot" {
+        return read_voice_snapshot(state, id, key, action).await;
+    }
     // Mutating event verbs take the same durable claim/audit path as
     // announcements below, with their own validation and key mapping.
     if supports_event_mutation(&decision.action) {
@@ -1755,6 +1812,42 @@ async fn read_event(
             event_read_response(result, id)
         }
         Err(error) => reject(Failure::from_action(error.action_error())),
+    }
+}
+
+/// Keyless `voice.snapshot`: project the §1 shape from the shared gateway
+/// voice-state cache for the staging guild. A disabled flag refuses earlier
+/// in `authorize`. The gateway readiness gate refuses next: unless the
+/// supervisor's state is `Connected`, a warm cache is stale occupancy from
+/// before a transport loss, so the read answers `discord_unavailable`
+/// instead of stamping it with a fresh `observed_at`. A cold or split cache
+/// (gateway never READY, or the receiver running without the gateway's
+/// writes) refuses `discord_unavailable` below — the read never invents
+/// occupancy. The only wire effect is the cache read itself: no store
+/// write, no audit row, no member id in logs.
+async fn read_voice_snapshot(
+    state: &ReceiverState,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    if *state.gateway_state.read().await != crate::gateway::GatewayState::Connected {
+        return reject(Failure::code(ErrorCode::DiscordUnavailable));
+    }
+    let guild_id = match two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID.parse::<u64>() {
+        Ok(guild_id) => guild_id,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    match voice_snapshot::read_voice_snapshot(&state.voice_cache, guild_id) {
+        Ok(result) => {
+            metrics::global().internal_action(internal_family(action), "executed");
+            event_read_response(result, id)
+        }
+        Err(SnapshotRefusal::CacheIncomplete) => {
+            reject(Failure::code(ErrorCode::DiscordUnavailable))
+        }
+        Err(SnapshotRefusal::OverBudget) => reject(Failure::code(ErrorCode::Internal)),
     }
 }
 

@@ -7,8 +7,8 @@ outputs and logged arguments:
   staging:   prepare (promotion_clean) -> bundle -> snapshot -> deploy ->
              receipt -> takeover -> verify -> error-rate gate ->
              auto-rollback -> record -> evidence upload (always) ->
-             voice-synthetic -> pinned-history-guard ->
-             certify-promotion (only when clean)
+             voice-synthetic + help-embed-synthetic + user-flow-synthetic ->
+             pinned-history-guard -> certify-promotion (only when clean)
   production: guard run/attempt -> admit (before the production
              render/deploy) -> render (--artifact, no-bundle) ->
              deploy --no-bundle -> serving proof -> stable readyz gate
@@ -438,10 +438,12 @@ class WorkflowFilesTests(unittest.TestCase):
 class CertifyGraphTests(WorkflowFilesTests):
     def test_certify_runs_downstream_of_deploy_voice_and_pinned_history(self):
         job = self.staging["jobs"]["certify-promotion"]
-        self.assertEqual(job["needs"], ["deploy", "voice-synthetic", "user-flow-synthetic",
-                                        "pinned-history-guard"])
+        self.assertEqual(job["needs"], ["deploy", "voice-synthetic", "help-embed-synthetic",
+                                        "user-flow-synthetic", "pinned-history-guard"])
         voice = self.staging["jobs"]["voice-synthetic"]
         self.assertEqual(voice["needs"], "deploy")
+        help_embed = self.staging["jobs"]["help-embed-synthetic"]
+        self.assertEqual(help_embed["needs"], "deploy")
         synthetic = self.staging["jobs"]["user-flow-synthetic"]
         self.assertEqual(synthetic["needs"], "deploy")
         guard = self.staging["jobs"]["pinned-history-guard"]

@@ -187,6 +187,10 @@ fn all_refusals() -> Vec<(RouterRefusal, String)> {
             "You need the Manage Channels permission to use /lockdown-preview. Ask a server moderator or admin to grant it.".to_owned(),
         ),
         (
+            RouterRefusal::AutomodPreviewPermission,
+            "You need the Manage Server permission to use /automod-preview. Ask a server admin to grant it.".to_owned(),
+        ),
+        (
             RouterRefusal::TempbanListPermission,
             "You need the Ban Members permission to use /tempban-list. Ask a server moderator or admin to grant it.".to_owned(),
         ),
@@ -224,6 +228,7 @@ fn refusal_name(refusal: RouterRefusal) -> &'static str {
         RouterRefusal::PurgePreviewPermission => "purge-preview-permission",
         RouterRefusal::ChannelInspectPermission => "channel-inspect-permission",
         RouterRefusal::LockdownPreviewPermission => "lockdown-preview-permission",
+        RouterRefusal::AutomodPreviewPermission => "automod-preview-permission",
         RouterRefusal::TempbanListPermission => "tempban-list-permission",
         RouterRefusal::ModerationRecentPermission => "moderation-recent-permission",
     }
@@ -262,8 +267,8 @@ fn unknown_slash_answers_with_the_router_owned_unknown_copy() {
 #[test]
 fn every_refusal_matches_its_owning_copy() {
     let rows = all_refusals();
-    // Twelve fixed refusals plus one row per moderation mutation (nine verbs).
-    assert_eq!(rows.len(), 12 + ModerationAction::ALL.len());
+    // Thirteen fixed refusals plus one row per moderation mutation (nine verbs).
+    assert_eq!(rows.len(), 13 + ModerationAction::ALL.len());
     let mut seen = std::collections::BTreeSet::new();
     for (refusal, expected) in &rows {
         assert_eq!(

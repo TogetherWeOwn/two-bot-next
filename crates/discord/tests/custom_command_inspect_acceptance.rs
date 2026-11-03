@@ -5,8 +5,9 @@
 //! Boundary contract: `/command-inspect name:<name>` defaults to `summary`;
 //! `view:template` and `view:preview` are separate private responses. Optional
 //! `arguments` is a UTF-16-bounded (500-unit) sample of ordinary invocation
-//! arguments. The existing four-variable language ignores arguments: accepting
-//! a sample MUST NOT introduce `{args}` or a second interpolation pass.
+//! arguments. The five-variable language still ignores the sample: it stays
+//! out of the render (no second interpolation pass) until the preview slice
+//! makes it the preview input.
 //!
 //! Visible view headings are `Summary /name`, `Saved template /name`, and
 //! `Preview /name`. The body is plain, markdown-escaped untrusted text; headings
@@ -1028,7 +1029,7 @@ async fn inspect_invalid_saved_templates_refuse_without_rendering_or_running() {
     // the shared input validator correctly refuses their 2002 UTF-16 units.
     for (index, template) in [
         "Hello {unknown}".to_owned(),
-        "{args}".to_owned(),
+        "{guild}".to_owned(),
         "😀".repeat(1001),
     ]
     .into_iter()

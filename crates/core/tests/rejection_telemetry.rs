@@ -171,8 +171,8 @@ fn key_label_echoes_only_configured_ids() {
 
 #[test]
 fn action_label_echoes_only_catalog_names() {
-    // The card's 21-name catalog, pinned so a quiet addition is a loud diff.
-    assert_eq!(IMPLEMENTED_ACTIONS.len(), 21);
+    // The card's 22-name catalog, pinned so a quiet addition is a loud diff.
+    assert_eq!(IMPLEMENTED_ACTIONS.len(), 22);
     for name in IMPLEMENTED_ACTIONS {
         assert_eq!(ActionLabel::new(Some(name)), ActionLabel::Known(name));
         assert_eq!(ActionLabel::new(Some(name)).as_str(), name);

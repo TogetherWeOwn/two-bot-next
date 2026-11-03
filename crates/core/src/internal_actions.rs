@@ -20,8 +20,9 @@
 //!   never 0.
 //! - `errors.ts` — the typed `{code, status, retryable}` envelope and the one
 //!   message every auth failure returns.
-//! - `actions.ts` — the 19-verb allowlist (the card's 18 plus `event.read`,
-//!   which landed later under TOG-5510), the idempotency-key set, the
+//! - `actions.ts` — the 20-verb allowlist (the card's 18 plus `event.read`,
+//!   which landed later under TOG-5510, plus the keyless `voice.snapshot`
+//!   gateway-cache read), the idempotency-key set, the
 //!   settings-store set, the role/channel key maps, and the per-field
 //!   validators (snowflakes, reason, event input, moderation bounds, settings
 //!   guard).
@@ -685,12 +686,12 @@ pub fn auth_failure(log_reason: impl Into<String>) -> ActionError {
 
 /// Every verb the endpoint will run, in legacy publish order: the card's 18
 /// plus `event.read`, the narrow mapped-event verifier that landed later
-/// (TOG-5510), plus the two member-notify DM verbs (`reminder.send`,
-/// `place_offer.send`), which stay dark behind their own flag. Adding a verb
-/// here without deciding which side of
-/// [`NEEDS_IDEMPOTENCY_KEY`] it falls on is the mistake that set exists to
-/// prevent.
-pub const IMPLEMENTED_ACTIONS: [&str; 21] = [
+/// (TOG-5510), plus `voice.snapshot`, the keyless gateway-cache read, and
+/// the two member-notify DM verbs (`reminder.send`, `place_offer.send`),
+/// which stay dark behind their own flag. Adding a verb here without
+/// deciding which side of [`NEEDS_IDEMPOTENCY_KEY`] it falls on is the
+/// mistake that set exists to prevent.
+pub const IMPLEMENTED_ACTIONS: [&str; 22] = [
     "role.assign",
     "guild.add_member",
     "announcement.post",
@@ -710,6 +711,7 @@ pub const IMPLEMENTED_ACTIONS: [&str; 21] = [
     "moderation.slowmode",
     "moderation.lockdown",
     "moderation.unlock",
+    "voice.snapshot",
     "reminder.send",
     "place_offer.send",
 ];
@@ -862,6 +864,11 @@ impl InternalFlags {
         }
         if flag("TWO_INTERNAL_ALLOW_EVENT_READ") {
             enabled.insert("event.read".to_owned());
+        }
+        // Keyless live-voice read from the gateway cache. Default off like
+        // every other post-launch verb; absent or non-`1` stays refused.
+        if flag("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT") {
+            enabled.insert("voice.snapshot".to_owned());
         }
         // Merely shipping the implementation must not widen the allowlist.
         if flag("TWO_INTERNAL_ALLOW_AUTOMATIONS") {
@@ -2268,7 +2275,7 @@ pub const ADMIN_SCOPE_ADMIN: &str = "admin";
 impl InternalFlags {
     /// Scope the admin API requires for `action` (scope map v0).
     ///
-    /// Covers the 21 verbs the endpoint runs today: 3 read, 8 moderate and
+    /// Covers the 22 verbs the endpoint runs today: 4 read, 8 moderate and
     /// 10 admin. `role.assign` is deliberately admin (a privilege grant, not
     /// membership tooling); the two member-notify verbs are deliberately
     /// admin too (an outbound DM is irreversible once read, like a broadcast).
@@ -2278,7 +2285,9 @@ impl InternalFlags {
     #[must_use]
     pub fn required_admin_scope(action: &str) -> Option<&'static str> {
         match action {
-            "settings.get" | "event.read" | "automations.export" => Some(ADMIN_SCOPE_READ),
+            "settings.get" | "event.read" | "automations.export" | "voice.snapshot" => {
+                Some(ADMIN_SCOPE_READ)
+            }
             "moderation.warn"
             | "moderation.timeout"
             | "moderation.kick"
@@ -3107,6 +3116,9 @@ mod tests {
         assert!(!on("TWO_INTERNAL_ALLOW_EVENT_READ").is_enabled("reminder.send"));
         assert!(on("TWO_INTERNAL_ALLOW_EVENT_CANCEL").is_enabled("event.cancel"));
         assert!(on("TWO_INTERNAL_ALLOW_EVENT_READ").is_enabled("event.read"));
+        assert!(on("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT").is_enabled("voice.snapshot"));
+        // No flag, no read: the voice snapshot stays dark by default.
+        assert!(!InternalFlags::from_map(&HashMap::new()).is_enabled("voice.snapshot"));
         let auto = on("TWO_INTERNAL_ALLOW_AUTOMATIONS");
         assert!(auto.is_enabled("automations.import"));
         assert!(auto.is_enabled("automations.export"));
@@ -3233,12 +3245,13 @@ mod tests {
         // Together these shift eight entries between those classes. The
         // assistant credential binding and required event-voice category
         // slices add two env-only keys
-        // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID). Member
-        // notifications add the env-only TWO_INTERNAL_ALLOW_MEMBER_NOTIFY gate.
+        // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID). The
+        // voice.snapshot read and member notifications add two env-only gates
+        // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT, TWO_INTERNAL_ALLOW_MEMBER_NOTIFY).
         for (class, expected) in [
             (SettingClass::Hot, 52),
             (SettingClass::Cold, 18),
-            (SettingClass::EnvOnly, 67),
+            (SettingClass::EnvOnly, 68),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),

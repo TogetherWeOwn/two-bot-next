@@ -14,6 +14,7 @@ use crate::automod::{
     has_bad_word, has_blocked_attachment, has_external_link, has_invite, normalize_content,
     AutomodConfig, AutomodFilter, AutomodMessage, RepeatTracker, ZERO_WIDTH,
 };
+use crate::commands::{CommandDefinition, CommandOption, CommandOptionType, PERM_MANAGE_GUILD};
 
 /// Exemption class for an exempt verdict: the invoker's own channel or
 /// roles. Channel wins when both apply, matching the live exemption order.
@@ -96,6 +97,50 @@ pub fn exemption_knobs(exemption: PreviewExemption) -> &'static [&'static str] {
         PreviewExemption::ExemptChannel => &["TWO_AUTOMOD_EXEMPT_CHANNEL_IDS"],
         PreviewExemption::BypassRole => &["TWO_AUTOMOD_BYPASS_ROLE_IDS"],
     }
+}
+
+/// Bounds for the unpublished `/automod-preview` slash (spec §3.1).
+/// Text is 1–2,000 UTF-16 units; `mentions` is a synthetic count 0–100;
+/// `attachments` is one ≤1,000-unit option carrying at most 10 bare names.
+pub const AUTOMOD_PREVIEW_TEXT_MAX_UTF16: u32 = 2000;
+pub const AUTOMOD_PREVIEW_MENTIONS_MAX: i64 = 100;
+pub const AUTOMOD_PREVIEW_ATTACHMENTS_MAX_UTF16: u32 = 1000;
+pub const AUTOMOD_PREVIEW_ATTACHMENTS_MAX_FILES: usize = 10;
+
+/// Slash definition for `/automod-preview` (spec slices 2–4).
+///
+/// ManageGuild-only, guild-only, three options of §3.1. Dark until the
+/// publication slice: built here so the shape is pinned, but kept out of
+/// `publish_set` (the router still adjudicates it via the permission row).
+#[must_use]
+pub fn automod_preview_definition() -> CommandDefinition {
+    CommandDefinition::new(
+        "automod-preview",
+        "Preview which automod filter fires on text. Smallest synthetic phrase; do not paste personal data.",
+    )
+    .permissions(PERM_MANAGE_GUILD)
+    .options(vec![
+        CommandOption::new(
+            "text",
+            "Sample text to evaluate (1-2000 characters)",
+            CommandOptionType::String,
+        )
+        .required()
+        .min_length(1)
+        .max_length(AUTOMOD_PREVIEW_TEXT_MAX_UTF16),
+        CommandOption::new(
+            "mentions",
+            "Synthetic explicit user-mention count (0-100, default 0)",
+            CommandOptionType::Integer,
+        )
+        .int_range(0, AUTOMOD_PREVIEW_MENTIONS_MAX),
+        CommandOption::new(
+            "attachments",
+            "Comma-separated bare filenames, at most 10 (no slashes or commas in names)",
+            CommandOptionType::String,
+        )
+        .max_length(AUTOMOD_PREVIEW_ATTACHMENTS_MAX_UTF16),
+    ])
 }
 
 fn preview_exemption(

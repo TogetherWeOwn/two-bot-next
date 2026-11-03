@@ -1368,3 +1368,93 @@ async fn successful_slash_run_audit_row_is_unchanged() {
     assert_eq!(command_run_row_count(&pool).await, 1);
     pool.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn slash_empty_args_only_template_refuses_as_render_failed() {
+    // ARG-20 (slash): an `{args}`-only template with no arguments renders no
+    // message text, so the run takes the existing unavailable completion and
+    // `render_failed` fact — never an empty edit or `delivery_failed`.
+    let pool = test_pool().await;
+    seed_text_command(&pool, "{args}").await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),                      // defer
+            ScriptedResponse::json(200, json!({"id": "9000"})), // edit
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    assert!(runtime
+        .handle_interaction(&slash(154, "faq", 0, &[]), Some("Test guild"))
+        .await
+        .unwrap());
+    assert_eq!(mock.requests().len(), 2, "defer plus edit, nothing else");
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 1);
+    assert_eq!(
+        patches[0]["content"],
+        "Custom-command context or template is unavailable."
+    );
+    assert_eq!(patches[0]["allowed_mentions"]["parse"], json!([]));
+    mock.shutdown().await;
+
+    let row = run_audit_row(&pool, 154)
+        .await
+        .expect("the refused run audits its render failure");
+    assert_eq!(
+        row,
+        (
+            "2222".to_owned(),
+            Some("3333".to_owned()),
+            "command.run".to_owned(),
+            Some("faq".to_owned()),
+            "failed".to_owned(),
+            Some("render_failed".to_owned()),
+        )
+    );
+    assert_eq!(command_run_row_count(&pool).await, 1);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn prefix_empty_args_only_template_refuses_as_render_failed() {
+    // ARG-20 (prefix): an `{args}`-only template with no remainder (or only
+    // whitespace) renders no message text, so the claimed attempt resolves
+    // as `render_failed` with no POST — never `delivery_failed`.
+    use AutomationMessageAcceptance::Unmatched;
+    let pool = test_pool().await;
+    seed_text_command(&pool, "{args}").await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    for id in [162u64, 163] {
+        expire_actor_window().await;
+        let content = if id == 162 { "!faq" } else { "!faq   " };
+        assert!(matches!(
+            runtime
+                .handle_message(&message(id, content), Unmatched, true, Some("Test guild"))
+                .await,
+            Err(two_bot_discord::custom_commands::CustomCommandError::Render)
+        ));
+        let failed: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT action, outcome, reason FROM automation_audit_log WHERE id = $1",
+        )
+        .bind(format!("custom:text:result:{id}"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            failed,
+            (
+                "command.run".to_owned(),
+                "failed".to_owned(),
+                Some("render_failed".to_owned())
+            )
+        );
+    }
+    assert_eq!(mock.requests().len(), 0, "refusals send nothing");
+    mock.shutdown().await;
+    pool.close().await;
+}

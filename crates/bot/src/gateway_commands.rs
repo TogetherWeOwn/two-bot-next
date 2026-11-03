@@ -644,6 +644,7 @@ mod tests {
                 username: "tester".to_owned(),
                 server: "Test guild".to_owned(),
                 channel: "<#4444>".to_owned(),
+                args: String::new(),
             },
         )
         .expect("template renders");

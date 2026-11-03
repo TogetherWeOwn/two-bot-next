@@ -122,7 +122,7 @@ pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on
 /// one could publish yet never execute. [`crate::custom_commands::reserved_command_names`]
 /// mirrors this set on the write path (`/command`, imports), so writes
 /// refuse the names instead of accepting rows that can never publish.
-pub const DARK_RESERVED_NAMES: &[&str] = &["lockdown-preview"];
+pub const DARK_RESERVED_NAMES: &[&str] = &["lockdown-preview", "automod-preview"];
 
 // --- handler identity ----------------------------------------------------------
 
@@ -160,6 +160,7 @@ pub enum HandlerId {
     PurgePreview,
     ChannelInspect,
     LockdownPreview,
+    AutomodPreview,
     TempbanList,
     ModerationRecent,
 }
@@ -302,6 +303,7 @@ pub enum RouterRefusal {
     PurgePreviewPermission,
     ChannelInspectPermission,
     LockdownPreviewPermission,
+    AutomodPreviewPermission,
     TempbanListPermission,
     ModerationRecentPermission,
 }
@@ -322,6 +324,7 @@ impl RouterRefusal {
             Self::PurgePreviewPermission => "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it.".to_owned(),
             Self::ChannelInspectPermission => "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it.".to_owned(),
             Self::LockdownPreviewPermission => "You need the Manage Channels permission to use /lockdown-preview. Ask a server moderator or admin to grant it.".to_owned(),
+            Self::AutomodPreviewPermission => "You need the Manage Server permission to use /automod-preview. Ask a server admin to grant it.".to_owned(),
             Self::TempbanListPermission => "You need the Ban Members permission to use /tempban-list. Ask a server moderator or admin to grant it.".to_owned(),
             Self::ModerationRecentPermission => "You need the Moderate Members permission to use /moderation-recent. Ask a server moderator or admin to grant it.".to_owned(),
             // Names the Discord permission (Ban Members, …) and the slash
@@ -434,6 +437,7 @@ impl InteractionRouter {
             register(HandlerId::PurgePreview);
             register(HandlerId::ChannelInspect);
             register(HandlerId::LockdownPreview);
+            register(HandlerId::AutomodPreview);
             register(HandlerId::ModerationRecent);
         }
         if gates.automations {
@@ -620,6 +624,12 @@ impl InteractionRouter {
             "lockdown-preview" => Some((
                 HandlerId::LockdownPreview,
                 RouterRefusal::LockdownPreviewPermission,
+            )),
+            // Dark until the publication slice: routed and adjudicated like
+            // the other private reads, but with no published definition.
+            "automod-preview" => Some((
+                HandlerId::AutomodPreview,
+                RouterRefusal::AutomodPreviewPermission,
             )),
             "moderation-recent" => Some((
                 HandlerId::ModerationRecent,
@@ -1162,6 +1172,7 @@ mod tests {
             ("purge-preview", HandlerId::PurgePreview),
             ("channel-inspect", HandlerId::ChannelInspect),
             ("lockdown-preview", HandlerId::LockdownPreview),
+            ("automod-preview", HandlerId::AutomodPreview),
             ("moderation-recent", HandlerId::ModerationRecent),
             ("attendance", HandlerId::ScorecardAttendance),
             ("command", HandlerId::AutomationAdmin),
@@ -1191,7 +1202,7 @@ mod tests {
             ("feed-list", HandlerId::FeedList),
             ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 48, "all 48 handler-owned builtins covered");
+        assert_eq!(cases.len(), 49, "all 49 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1376,6 +1387,8 @@ mod tests {
              "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it."),
             ("lockdown-preview", 16, HandlerId::LockdownPreview, RouterRefusal::LockdownPreviewPermission,
              "You need the Manage Channels permission to use /lockdown-preview. Ask a server moderator or admin to grant it."),
+            ("automod-preview", 32, HandlerId::AutomodPreview, RouterRefusal::AutomodPreviewPermission,
+             "You need the Manage Server permission to use /automod-preview. Ask a server admin to grant it."),
             ("moderation-recent", 1_099_511_627_776, HandlerId::ModerationRecent, RouterRefusal::ModerationRecentPermission,
              "You need the Moderate Members permission to use /moderation-recent. Ask a server moderator or admin to grant it."),
         ] {
