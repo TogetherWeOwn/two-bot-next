@@ -2008,9 +2008,13 @@ async fn execute_member(
 /// to the `sent` envelope, never the announcement `message_id` envelope), and
 /// a definitive refusal from either DM call — closed DMs, a blocked bot, or
 /// no shared guild — finishes as `Success{None, 0}` (the `dm_unavailable`
-/// envelope), consuming no place. A 429 proves no effect, so the claim is
+/// envelope), consuming no place. A suppressed member (contract v2 §7 consent
+/// backstop) finishes the same receipt before any Discord call, with the
+/// `suppressed` audit scalar. A 429 proves no effect, so the claim is
 /// released and the same key may retry; every other post-claim failure
-/// (timeout, transport, unreadable receipt) retains the claim as `unknown`.
+/// (timeout, transport, unreadable receipt, suppression-lookup error)
+/// retains the claim as `unknown`. The per-member notify bucket fires in
+/// `authorize`, before the claim.
 async fn execute_notify(
     state: &ReceiverState,
     decision: &AuthDecision,
@@ -2088,6 +2092,42 @@ async fn execute_notify(
         Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
+    // Contract v2 §7 consent backstop: the site owns member-facing notify
+    // preferences; the bot refuses a suppressed member before any Discord
+    // call. The receipt is the same `dm_unavailable` shape as a closed-DM
+    // refusal (200, consumes no place), but the terminal audit carries the
+    // `suppressed` scalar instead of `executor`. A database error fails
+    // closed: the claim is retained unknown and the member is not messaged,
+    // because an uncertain suppression must never send.
+    let mut conn = match state.store.pool().acquire().await {
+        Ok(conn) => conn,
+        Err(_) => {
+            mark_unknown_best_effort(&state.store, &claim, action).await;
+            return reject(Failure::reconciliation());
+        }
+    };
+    let suppressed =
+        match two_bot_core::privacy::suppressed_in(&mut *conn, guild_id, target_id).await {
+            Ok(suppressed) => suppressed,
+            Err(_) => {
+                mark_unknown_best_effort(&state.store, &claim, action).await;
+                return reject(Failure::reconciliation());
+            }
+        };
+    if suppressed {
+        if let Err(finish_error) = state.store.finish_suppressed(&claim).await {
+            log_terminal_persist_failed(action, "finish", finish_error);
+            mark_unknown_best_effort(&state.store, &claim, action).await;
+            return reject(Failure::reconciliation());
+        }
+        let response = TerminalResponse::Success {
+            resource_id: None,
+            affected: 0,
+            outcome: None,
+            stop_reason: None,
+        };
+        return state.terminal(response, false, id, key.clone(), action);
+    }
     // The claim is committed: the single Discord send below runs after it.
     // Revalidate against the same signed body the pre-claim check used, so
     // the DM reaching the member is the pinned facts, not a retargeted

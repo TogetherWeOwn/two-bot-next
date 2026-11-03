@@ -13,3 +13,14 @@ ALTER TABLE internal_idempotency ADD CONSTRAINT internal_idempotency_action_chec
         'moderation.slowmode', 'moderation.lockdown', 'moderation.unlock',
         'reminder.send', 'place_offer.send'
     ));
+
+-- Contract v2 §7 consent backstop: a suppressed member's refusal finishes the
+-- same `dm_unavailable` receipt, but the terminal audit records *why* it never
+-- sent. Widen the audit evidence allowlist with `suppressed` (existing rows
+-- keep `executor`; backward-compatible, same rollback order as above).
+ALTER TABLE internal_action_log DROP CONSTRAINT IF EXISTS internal_action_log_evidence_code_check;
+ALTER TABLE internal_action_log ADD CONSTRAINT internal_action_log_evidence_code_check
+    CHECK (evidence_code IN (
+        'executor', 'discord_confirmed_effect', 'discord_confirmed_no_effect', 'proven_not_sent',
+        'suppressed'
+    ));

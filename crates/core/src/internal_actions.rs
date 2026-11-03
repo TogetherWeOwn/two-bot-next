@@ -31,7 +31,7 @@
 //!   module validates literal addresses.
 //! - `server.ts` — the load-bearing check order, ported as [`authorize`]:
 //!   headers → signature → skew → replay → key bucket → body → allowlist →
-//!   action bucket. The idempotency claim and the Discord run stay with the
+//!   action buckets. The idempotency claim and the Discord run stay with the
 //!   store/bot slices.
 //!
 //! Security invariants carried over verbatim: buckets are keyed only after the
@@ -462,6 +462,15 @@ pub const DEFAULT_BUCKET: BucketSpec = BucketSpec {
 pub const ADD_MEMBER_BUCKET: BucketSpec = BucketSpec {
     capacity: 10.0,
     refill_per_second: 0.5,
+};
+
+/// Member-notify DM cap (contract v2 §7): burst 3, at most 10/day, keyed
+/// `notify:<discord_id>` on top of the per-caller bucket. A repeat DM is a
+/// second message to a real member, so the budget is deliberately tight;
+/// over-limit answers `rate_limited` before any claim or Discord call.
+pub const NOTIFY_MEMBER_BUCKET: BucketSpec = BucketSpec {
+    capacity: 3.0,
+    refill_per_second: 10.0 / 86_400.0,
 };
 
 /// Bucket verdict. `retry_after_secs` is only meaningful when denied — and is
@@ -2001,7 +2010,9 @@ fn replayed_nonce() -> ActionError {
 ///    read, so a replay can never reach Discord) → 5. per-key bucket → 6. body
 ///    parses as one JSON object with no repeated key at any depth → 7. action
 ///    allowlisted and enabled, store and
-///    settings present where required → 8. `guild.add_member`'s tighter bucket.
+///    settings present where required → 8. action-specific tighter buckets:
+///    `guild.add_member`'s per-caller bucket, the member-notify verbs'
+///    per-member bucket.
 ///
 /// Buckets 5 and 8 run after verification on purpose: rate-limiting an
 /// unverified key id would let anyone lock out a legitimate caller by spamming
@@ -2097,6 +2108,30 @@ fn authorize_burned(
                 "rate_limited_add_member",
             )
             .with_retry_after(per_action.retry_after_secs));
+        }
+    }
+
+    if action == "reminder.send" || action == "place_offer.send" {
+        // Contract v2 §7 per-member notify bucket: burst 3, at most 10/day,
+        // keyed `notify:<discord_id>` on top of the per-caller bucket above.
+        // The id is still unvalidated here (validation refuses malformed
+        // facts later, before the claim); only a present non-empty string
+        // takes a token, so a misshapen body cannot burn a member's budget.
+        let member = body.get("discord_id").and_then(Value::as_str).unwrap_or("");
+        if !member.is_empty() {
+            let per_member = buckets.take(
+                &format!("notify:{member}"),
+                NOTIFY_MEMBER_BUCKET,
+                verified.guarded_ms,
+            );
+            if !per_member.allowed {
+                return Err(ActionError::new(
+                    ErrorCode::RateLimited,
+                    "Rate limit exceeded for member notifications",
+                    "rate_limited_notify",
+                )
+                .with_retry_after(per_member.retry_after_secs));
+            }
         }
     }
 
@@ -2909,6 +2944,30 @@ mod tests {
     }
 
     #[test]
+    fn notify_member_bucket_bursts_three_then_refills_daily() {
+        let mut buckets = TokenBuckets::new();
+        for _ in 0..3 {
+            assert!(buckets.take("notify:123", NOTIFY_MEMBER_BUCKET, 0).allowed);
+        }
+        let denied = buckets.take("notify:123", NOTIFY_MEMBER_BUCKET, 0);
+        assert!(!denied.allowed);
+        assert!(denied.retry_after_secs >= 1);
+        // Other members keep their own budget.
+        assert!(buckets.take("notify:456", NOTIFY_MEMBER_BUCKET, 0).allowed);
+        // One token refills per 8640 seconds (10/day).
+        assert!(
+            buckets
+                .take("notify:123", NOTIFY_MEMBER_BUCKET, 8_640_000)
+                .allowed
+        );
+        assert!(
+            !buckets
+                .take("notify:123", NOTIFY_MEMBER_BUCKET, 8_640_000)
+                .allowed
+        );
+    }
+
+    #[test]
     fn buckets_refill_over_time() {
         let mut buckets = TokenBuckets::new();
         for _ in 0..20 {
@@ -2922,7 +2981,7 @@ mod tests {
 
     #[test]
     fn buckets_clock_rollback_does_not_refill_spent_tokens_twice() {
-        for spec in [DEFAULT_BUCKET, ADD_MEMBER_BUCKET] {
+        for spec in [DEFAULT_BUCKET, ADD_MEMBER_BUCKET, NOTIFY_MEMBER_BUCKET] {
             let mut buckets = TokenBuckets::new();
             for _ in 0..spec.capacity as usize {
                 assert!(buckets.take("k", spec, 10_000).allowed);
@@ -3641,6 +3700,67 @@ mod tests {
                 assert_eq!(result.expect_err("malformed").code, ErrorCode::Malformed);
             }
         }
+    }
+
+    #[test]
+    fn notify_verbs_take_a_per_member_bucket_on_top_of_the_caller_bucket() {
+        let mut vars = HashMap::new();
+        vars.insert(
+            "TWO_INTERNAL_ALLOW_MEMBER_NOTIFY".to_owned(),
+            "1".to_owned(),
+        );
+        let flags = InternalFlags::from_map(&vars);
+        let keys = ring();
+        let now_ms = 1_750_000_000_000u64;
+        let timestamp = (now_ms / 1000).to_string();
+        let body_for = |member: &str| {
+            serde_json::json!({
+                "action": "reminder.send",
+                "discord_id": member,
+                "event_key": "launch:2026",
+                "kind": "starting_soon",
+                "starts_at": "2026-11-04T18:00:00Z",
+                "event_name": "Launch Night",
+            })
+            .to_string()
+        };
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
+        let attempt = |raw: &str,
+                       nonces: &mut NonceCache,
+                       buckets: &mut TokenBuckets,
+                       clock: &mut ClockGuard| {
+            let nonce = test_nonce();
+            let sig = sign(vec1().secret.as_bytes(), &timestamp, &nonce, raw.as_bytes());
+            let headers = signed_headers("web", &timestamp, &nonce, &sig);
+            authorize(
+                &headers,
+                raw.as_bytes(),
+                &keys,
+                &flags,
+                true,
+                true,
+                SKEW_SECONDS,
+                now_ms,
+                nonces,
+                buckets,
+                clock,
+            )
+        };
+        // Burst 3 for one member, all under the caller's 20-burst key bucket.
+        let capped = body_for("123456789012345678");
+        for _ in 0..3 {
+            attempt(&capped, &mut nonces, &mut buckets, &mut clock).expect("burst");
+        }
+        let err = attempt(&capped, &mut nonces, &mut buckets, &mut clock)
+            .expect_err("member bucket caps at burst 3");
+        assert_eq!(err.code, ErrorCode::RateLimited);
+        assert_eq!(err.log_reason, "rate_limited_notify");
+        assert!(err.retry_after_secs.is_some());
+        // Another member keeps its own budget on the same caller key.
+        let other = body_for("876543210987654321");
+        attempt(&other, &mut nonces, &mut buckets, &mut clock).expect("per-member keying");
     }
 
     #[test]

@@ -311,6 +311,115 @@ async fn place_offer_dm_unavailable_is_200_and_consumes_no_place() {
 }
 
 #[tokio::test]
+async fn notify_suppressed_member_answers_dm_unavailable_without_sending() {
+    let Some(db) = database().await else { return };
+    let _flag = MEMBER_NOTIFY_FLAG_LOCK.lock().await;
+    set_member_notify_flag(true);
+    // Contract v2 §7 consent backstop: the member opted out of per-user
+    // persistence in the bot's guild, so the bot never messages them.
+    sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ($1, $2)")
+        .bind(staging_guild())
+        .bind(MEMBER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let app = router(state(db.pool().clone(), effect.clone()));
+    let raw = reminder_payload();
+    let (status, _, first) =
+        answer(app.clone(), signed(&raw, "old", "intent-notify-suppressed")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["result"], json!({"outcome": "dm_unavailable"}));
+    assert_eq!(effect.calls(), 0, "suppressed members are never messaged");
+    // The refusal replays as the same 200 outcome without re-checking.
+    let (status, headers, replay) =
+        answer(app.clone(), signed(&raw, "new", "intent-notify-suppressed")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["idempotent-replay"], "true");
+    assert_eq!(replay["result"], json!({"outcome": "dm_unavailable"}));
+    assert_eq!(effect.calls(), 0);
+    // Stored receipt keeps the member linkage with no message id; the
+    // terminal audit carries the `suppressed` scalar instead of `executor`.
+    let rows: Vec<StoredReceiptRow> = sqlx::query_as(
+        "SELECT action, state, response_code, http_status, resource_id, affected, \
+         guild_id, actor_id, target_id, resolved_role_id \
+         FROM internal_idempotency",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "replay creates no extra intent row");
+    let row = &rows[0];
+    assert_eq!(row.0, "reminder.send");
+    assert_eq!(row.1, "completed");
+    assert_eq!(row.4, None);
+    assert_eq!(row.5, Some(0));
+    assert_eq!(row.8.as_deref(), Some(MEMBER));
+    let audit: Vec<TerminalAuditRow> = sqlx::query_as(
+        "SELECT action, phase, response_code, evidence_code, http_status, guild_id, \
+         target_id, resolved_role_id FROM internal_action_log ORDER BY audit_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(audit.len(), 2, "intent + terminal audit rows");
+    assert_eq!(audit[0].1, "intent");
+    assert_eq!(audit[1].1, "terminal");
+    assert_eq!(audit[1].3.as_deref(), Some("suppressed"));
+    set_member_notify_flag(false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn notify_member_bucket_rate_limits_after_burst() {
+    let Some(db) = database().await else { return };
+    let _flag = MEMBER_NOTIFY_FLAG_LOCK.lock().await;
+    set_member_notify_flag(true);
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let app = router(state(db.pool().clone(), effect.clone()));
+    let raw = reminder_payload();
+    // Burst 3 goes through on the per-member bucket, under the caller's
+    // 20-burst key bucket.
+    for n in 0..3 {
+        let intent = format!("intent-notify-burst-{n}");
+        let (status, _, body) = answer(app.clone(), signed(&raw, "old", &intent)).await;
+        assert_eq!(status, StatusCode::OK, "{intent}");
+        assert_eq!(body["result"], json!({"outcome": "sent"}));
+    }
+    assert_eq!(effect.calls(), 3);
+    // The 4th send to the same member is a 429 before any claim or effect.
+    let (status, _, refused) = answer(
+        app.clone(),
+        signed(&raw, "old", "intent-notify-burst-capped"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(refused["error"]["code"], "rate_limited");
+    assert_eq!(refused["error"]["retryable"], true);
+    assert_eq!(effect.calls(), 3, "capped members never reach Discord");
+    let claims: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM internal_idempotency WHERE action = 'reminder.send'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(claims, 3, "authorize refuses before the claim");
+    // Another member keeps its own budget on the same caller key.
+    let mut other: Value = serde_json::from_str(&raw).unwrap();
+    other["discord_id"] = json!("222222222222222222");
+    let (status, _, body) = answer(
+        app.clone(),
+        signed(&other.to_string(), "old", "intent-notify-burst-other"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"], json!({"outcome": "sent"}));
+    assert_eq!(effect.calls(), 4);
+    set_member_notify_flag(false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn notify_rate_limited_releases_claim_and_answers_429() {
     let Some(db) = database().await else { return };
     let _flag = MEMBER_NOTIFY_FLAG_LOCK.lock().await;

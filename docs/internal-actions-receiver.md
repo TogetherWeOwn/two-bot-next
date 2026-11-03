@@ -21,7 +21,9 @@ behind its own allowlist flag with a transient OAuth token), the member-notify
 DM pair (`reminder.send`, `place_offer.send`, one shared allowlist flag
 `TWO_INTERNAL_ALLOW_MEMBER_NOTIFY` with a required `Idempotency-Key`: the site
 owns scheduling and waitlist state, the bot only delivers a templated DM with
-a `/e/{event_key}` deep link), and the
+a `/e/{event_key}` deep link, the consent backstop refuses suppressed members
+before any send, and a per-member bucket (burst 3, 10/day) caps each member on
+top of the per-caller bucket), and the
 channel-moderation verbs (`moderation.purge`, `moderation.slowmode`,
 `moderation.lockdown`, `moderation.unlock`), regardless of the core action
 catalogue's broader defaults. Every other verb stays refused by the per-effect
@@ -189,9 +191,13 @@ as `0424`: disable the receiver and deploy the previous binary, then drop both
 columns.
 
 Migration `0471` widens the `internal_idempotency.action` allowlist to admit
-`reminder.send` and `place_offer.send`. It adds no column: the audit row keeps
+`reminder.send` and `place_offer.send`, and widens the
+`internal_action_log.evidence_code` allowlist with `suppressed` for the consent
+backstop. It adds no column: the audit row keeps
 only the member/event-key linkage, the outcome bit and the message-id scalar,
-never DM text. It is backward-compatible (the previous binary never sends the
+never DM text. A suppressed member's refusal finishes the same
+`dm_unavailable` receipt as a closed-DM refusal, but its terminal audit carries
+`suppressed` instead of `executor`. It is backward-compatible (the previous binary never sends the
 new verbs). Roll back in the same order as `0424`: disable the receiver and
 deploy the previous binary, then restore the prior constraint.
 
@@ -432,7 +438,7 @@ Success (`200` only, `result` always an object, no `error` key):
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
-| reminder.send / place_offer.send | `{outcome}` | `sent`/`dm_unavailable`; `dm_unavailable` (closed DMs, blocked bot, or member not in guild) is a 200 that consumes no place; the wire carries no `message_id` |
+| reminder.send / place_offer.send | `{outcome}` | `sent`/`dm_unavailable`; `dm_unavailable` (closed DMs, blocked bot, member not in guild, or suppressed member — a suppressed refusal carries the `suppressed` audit scalar) is a 200 that consumes no place; the wire carries no `message_id`. A per-member bucket (burst 3, 10/day, keyed `notify:<discord_id>`) answers `rate_limited` before any claim when exhausted |
 | moderation.\* | `{outcome[, affected]}` | |
 
 Refusals keep their code, status and retry policy with the fixed message
@@ -507,7 +513,9 @@ concurrent/restarted/key-rotated replay, byte mismatch, unsupported actions,
 membership happy-path/replay/refusal (allowlisted role assignment, OAuth-backed
 joins, redacted unknown-key/malformed refusals, dark add-member flag),
 member-notify DM delivery (dark flag, required key, fact validation, `sent` /
-`dm_unavailable` envelopes with scalar-only audit, replay-once, 429 release,
+`dm_unavailable` envelopes with scalar-only audit, suppression refusal with the
+`suppressed` audit scalar and no send, per-member bucket burst/cap refusal
+before any claim, replay-once, 429 release,
 unknown retention),
 cancellation/stale ownership, unknown/no-effect outcomes, unavailable stores,
 failed receipt finalization, event verb flags, malformed event bodies (including a

@@ -609,8 +609,38 @@ impl InternalActionStore {
         claim: &ExecutionClaim,
         response: &TerminalResponse,
     ) -> Result<(), InternalStoreError> {
-        self.terminalize(&claim.identity, Some(claim.intent_id), response, None)
-            .await
+        self.terminalize(
+            &claim.identity,
+            Some(claim.intent_id),
+            response,
+            None,
+            "executor",
+        )
+        .await
+    }
+
+    /// Record a consent-backstop refusal: the member suppressed bot DMs
+    /// (`privacy_opt_outs`), so delivery never ran. The receipt is the same
+    /// `dm_unavailable` shape a closed-DM refusal finishes, but the terminal
+    /// audit carries `suppressed` instead of `executor`, so operators can tell
+    /// "never attempted" from "attempted and refused". The wire is unchanged.
+    pub async fn finish_suppressed(
+        &self,
+        claim: &ExecutionClaim,
+    ) -> Result<(), InternalStoreError> {
+        self.terminalize(
+            &claim.identity,
+            Some(claim.intent_id),
+            &TerminalResponse::Success {
+                resource_id: None,
+                affected: 0,
+                outcome: None,
+                stop_reason: None,
+            },
+            None,
+            "suppressed",
+        )
+        .await
     }
 
     /// A timeout/crash path retains the intent; it never releases execution rights.
@@ -646,7 +676,7 @@ impl InternalActionStore {
         if !evidence.supports(response) {
             return Err(InternalStoreError::InvalidInput);
         }
-        self.terminalize(identity, None, response, Some(evidence))
+        self.terminalize(identity, None, response, Some(evidence), "executor")
             .await
     }
 
@@ -656,6 +686,7 @@ impl InternalActionStore {
         owner_id: Option<i64>,
         response: &TerminalResponse,
         evidence: Option<ReconciliationEvidence>,
+        executor_evidence: &'static str,
     ) -> Result<(), InternalStoreError> {
         let mut tx = self.pool.begin().await?;
         let row = Self::lock_identity(&mut tx, identity).await?;
@@ -682,7 +713,7 @@ impl InternalActionStore {
         .bind(response.stop_reason())
         .execute(&mut *tx)
         .await?;
-        Self::complete_locked(&mut tx, intent_id, response, evidence).await?;
+        Self::complete_locked(&mut tx, intent_id, response, evidence, executor_evidence).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -695,6 +726,7 @@ impl InternalActionStore {
         intent_id: i64,
         response: &TerminalResponse,
         evidence: Option<ReconciliationEvidence>,
+        executor_evidence: &'static str,
     ) -> Result<(), InternalStoreError> {
         sqlx::query(
             "UPDATE internal_idempotency SET state = 'completed', response_code = $2, \
@@ -714,7 +746,7 @@ impl InternalActionStore {
             tx,
             intent_id,
             "terminal",
-            Some(evidence.map_or("executor", ReconciliationEvidence::as_str)),
+            Some(evidence.map_or(executor_evidence, ReconciliationEvidence::as_str)),
         )
         .await?;
         Ok(())
@@ -878,7 +910,7 @@ impl InternalActionStore {
             .execute(&mut *tx)
             .await?;
         }
-        Self::complete_locked(&mut tx, intent_id, response, Some(evidence)).await?;
+        Self::complete_locked(&mut tx, intent_id, response, Some(evidence), "executor").await?;
         tx.commit().await?;
         Ok(())
     }

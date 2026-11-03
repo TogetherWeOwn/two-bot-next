@@ -66,6 +66,9 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
   no-dispatch release, not an attempt count. Reconciliation refuses `not_sent`
   even when aged. Unknown, completed or stale ordinary claims cannot be released.
 - `finish(&ExecutionClaim, &TerminalResponse)` commits completion and its audit.
+- `finish_suppressed(&ExecutionClaim)` commits the same `dm_unavailable` receipt
+  a closed-DM refusal finishes, but its terminal audit carries `suppressed`
+  instead of `executor` (contract v2 §7 consent backstop).
 - `mark_unknown(&ExecutionClaim)` preserves the slot and deduplicates the unknown
   audit. It never releases the claim.
 - `reconcile(&RequestIdentity, &TerminalResponse, ReconciliationEvidence)` accepts
