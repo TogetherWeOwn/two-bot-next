@@ -4587,6 +4587,26 @@ class WorkflowTests(unittest.TestCase):
                          "${{ steps.changed.outputs.changed_files_file }}")
         self.assertIn("CHANGED_FILES", check["run"])
 
+    def test_pr_lint_runs_the_gate_from_the_base_branch(self):
+        # The working tree is the PR merge ref: importing pr_standards.py from
+        # it would let a PR weaken its own T0 floor and pass itself. The gate
+        # must come from the base branch (same shape as the gitleaks
+        # base-branch policy) and fail closed when that copy is missing.
+        steps = self.workflows["supply-chain.yml"]["jobs"]["pr-lint"]["steps"]
+        base = next(s for s in steps if s.get("name") == "Check out base-branch gate")
+        self.assertEqual(base["if"],
+                         "github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'")
+        self.assertTrue(str(base.get("uses", "")).startswith("actions/checkout@"))
+        self.assertEqual(base["with"]["ref"],
+                         "${{ github.event.pull_request.base.sha || 'main' }}")
+        self.assertEqual(base["with"]["path"], "base-gate")
+        self.assertEqual(base["with"]["sparse-checkout"], ".github/scripts")
+        self.assertEqual(base["with"]["persist-credentials"], "false")
+        check = next(s for s in steps if s.get("name") == "Check title, body, branch and commits")
+        self.assertLess(steps.index(base), steps.index(check))
+        self.assertIn("base-gate", check["run"])
+        self.assertIn("Base-branch gate checkout is missing", check["run"])
+
     def test_quality_gates_diff_merge_checkout_against_its_first_parent(self):
         steps = self.workflows["check.yml"]["jobs"]["check"]["steps"]
         expected_base = "${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}"

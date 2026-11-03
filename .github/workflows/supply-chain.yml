@@ -18,9 +18,11 @@ name: supply-chain
 #     (non-light types) and Verification are required; the rest is optional. The rules live in
 #     .github/scripts/pr_standards.py with tests beside it; this job runs both.
 #     A PR touching a T0 path (migrations/sql/db, auth words, .github/workflows/deploy*,
-#     crates/cutover/**, wrangler config) must carry `risk_tier: T0` with checked D1–D8
-#     and no leftover placeholders. That floor is always an error, even in warn mode;
-#     the changed paths arrive from the PR files API via the List changed files step.
+#     the pr-lint gate itself, crates/cutover/**, wrangler config) must carry `risk_tier: T0`
+#     with checked D1–D8 and no leftover placeholders. That floor is always an error, even in
+#     warn mode; the changed paths arrive from the PR files API via the List changed files step.
+#     The floor itself runs from the base branch (Check out base-branch gate), so a PR cannot
+#     weaken its own gate unattested.
 #   * This repo is public. No card reference is required (`REQUIRE_CARD_REF: "false"`), and an
 #     internal tracker ID (a `TOG-` or `PAP-` prefix followed by digits) must not appear in a
 #     title, body, commit subject or branch name. The strict title/body subset (tracker id,
@@ -238,6 +240,24 @@ jobs:
           test -s "${files_path}" || { echo "Changed-file list is empty" >&2; exit 1; }
           echo "changed_files_file=${files_path}" >> "${GITHUB_OUTPUT}"
 
+      - name: Check out base-branch gate
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The already-merged policy, never the PR head: the working-tree
+          # checkout above is the PR merge ref, so importing pr_standards.py
+          # from it would let a PR weaken its own floor (drop a T0 pattern or
+          # neuter attestation_findings) and pass itself with no attestation.
+          # Same shape as the gitleaks base-branch policy below: a weakened
+          # gate merges first as its own small reviewed PR carrying a T0
+          # attestation, and only then judges others. Dispatch runs validate a
+          # PR targeting main, so an empty base SHA falls back to main.
+          ref: ${{ github.event.pull_request.base.sha || 'main' }}
+          path: base-gate
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: true
+          persist-credentials: false
+
       - name: Check title, body, branch and commits
         if: github.event_name != 'merge_group'
         env:
@@ -259,7 +279,20 @@ jobs:
           # reads env, so bridge the two in-process, where no such limit
           # applies. The changed-file list travels the same way.
           root = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
-          sys.path.insert(0, os.path.join(root, ".github/scripts"))
+          # Base-branch gate (see "Check out base-branch gate" above): the
+          # working tree is the PR merge ref, so the PR's own pr_standards.py
+          # must never decide its own floor. Import the merged copy instead
+          # and fail closed when it is missing. Push runs lint already-merged
+          # main commits, so they keep the working-tree copy.
+          if os.environ.get("EVENT") == "pull_request":
+              gate_dir = os.path.join(root, "base-gate", ".github", "scripts")
+              if not os.path.isdir(gate_dir):
+                  print("::error title=PR standards::Base-branch gate checkout is missing; "
+                        "refusing to lint with the PR's copy")
+                  raise SystemExit(1)
+              sys.path.insert(0, gate_dir)
+          else:
+              sys.path.insert(0, os.path.join(root, ".github/scripts"))
           import pr_standards
 
           if os.environ.get("EVENT") == "pull_request":
