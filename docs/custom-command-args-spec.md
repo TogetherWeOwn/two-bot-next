@@ -1,10 +1,11 @@
 # Custom commands: one bounded `{args}` substitution
 
-Status: **Shipped** — containment was proved with the bounded §8 test plan,
-so the kill rule did not trigger. Both build slices ship here: slice 1 (core
-render, `MAX_ARGS_UNITS` bound and this-slice contract cases) and slice 2
-(slash/prefix capture with the §5 corrections, the preview sample as preview
+Status: **Built in this stack, merges pending** — containment was proved with the bounded §8 test plan,
+so the kill rule did not trigger. Both build slices are built here, stacked as
+slice 1 (core render, `MAX_ARGS_UNITS` bound and this-slice contract cases) under
+slice 2 (slash/prefix capture with the §5 corrections, the preview sample as preview
 input, the published `arguments` option, and the run-path contract cases).
+Neither build PR has merged; this status becomes Shipped when both do.
 Shipping reverses the `{args}` refusal in `custom_commands.rs` and in [custom
 responses](dashboard-custom-responses-spec.md), changed together in slice 1.
 Each build re-checked this spec's `file:line` seams on current `main` first. This
