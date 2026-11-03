@@ -237,6 +237,25 @@ class CacheTests(unittest.TestCase):
         (scratch / ws_a / 'backup').mkdir()
         self.assertIn('preserved', cache.scratch_preservation_veto(scratch))
 
+    def test_rustdoc_output_allowed_but_foreign_top_level_vetoed(self):
+        for layout in ('legacy', 'worktree'):
+            with self.subTest(layout=layout):
+                target = self.root / layout
+                output = target
+                if layout == 'worktree':
+                    output = target / cache.workspace_subdir_name(self.root)
+                (output / 'doc').mkdir(parents=True)
+                (output / 'doc' / 'index.html').write_text('<html></html>')
+                fingerprint = output / '.rustdoc_fingerprint.json'
+                fingerprint.write_text('{}')
+                self.assertIsNone(cache.preservation_veto(target))
+                foreign = output / 'foreign.json'
+                foreign.write_text('{}')
+                self.assertIn('preserved foreign top-level entry: foreign.json',
+                              cache.preservation_veto(target))
+                self.assertEqual(foreign.read_text(), '{}')
+                self.assertEqual(fingerprint.read_text(), '{}')
+
     def test_evict_refuses_worktree_subdir_with_protected_content(self):
         # Eviction runs the preservation veto first: another worktree's
         # subdir holding protected material is left for Operator

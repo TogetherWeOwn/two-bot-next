@@ -664,7 +664,7 @@ def is_non_file_reference(path):
 # foreign material and vetoes retention eligibility.
 CARGO_TARGET_TOP_LEVEL = frozenset(
     {'debug', 'release', 'doc', 'package', 'tmp',
-     '.rustc_info.json', '.cargo-lock', 'CACHEDIR.TAG'})
+     '.rustc_info.json', '.rustdoc_fingerprint.json', '.cargo-lock', 'CACHEDIR.TAG'})
 # File kinds that must never be treated as regenerable build output.
 PROTECTED_SUFFIXES = frozenset(
     {'.rs', '.md', '.markdown', '.toml', '.bak', '.orig', '.rej', '.pem', '.key'})
