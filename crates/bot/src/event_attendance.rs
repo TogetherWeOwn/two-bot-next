@@ -892,12 +892,13 @@ mod tests {
         assert_eq!(rooms[1]["channel_id"], json!("9"));
     }
 
-    /// Fake store for the capture-gate tests: one open window, no open rows,
-    /// and counters for opens and closes.
+    /// Fake store for the capture-gate tests: one open window, an optional
+    /// seeded open row, and counters for opens and closes.
     struct GateStore {
         suppressed: bool,
         voice_enabled: bool,
         fail_gate: bool,
+        seed_open: bool,
         opens: std::sync::Mutex<u64>,
         closes: std::sync::Mutex<u64>,
     }
@@ -908,6 +909,7 @@ mod tests {
                 suppressed,
                 voice_enabled,
                 fail_gate: false,
+                seed_open: false,
                 opens: std::sync::Mutex::new(0),
                 closes: std::sync::Mutex::new(0),
             }
@@ -934,7 +936,20 @@ mod tests {
             _guild: Snowflake,
             _member: Snowflake,
         ) -> Result<Vec<AttendanceSession>, Self::Error> {
-            Ok(Vec::new())
+            if !self.seed_open {
+                return Ok(Vec::new());
+            }
+            Ok(vec![AttendanceSession {
+                id: 1,
+                member_id: "11".to_owned(),
+                channel_id: "7".to_owned(),
+                channel_name: "lobby".to_owned(),
+                is_bot: false,
+                afk: false,
+                joined_at: OffsetDateTime::now_utc() - time::Duration::minutes(5),
+                left_at: None,
+                event_keys: vec!["game-night".to_owned()],
+            }])
         }
 
         async fn insert_attendance_session(
@@ -1071,5 +1086,16 @@ mod tests {
         )
         .await;
         assert_eq!(*store.opens.lock().expect("opens lock"), 0);
+    }
+
+    #[tokio::test]
+    async fn suppressed_leave_still_finalizes_open_row() {
+        // Contract v2 §9: the gate drops opens, never closes — a suppressed
+        // member's seeded row finalizes on leave with no new open.
+        let mut store = GateStore::open(true, true);
+        store.seed_open = true;
+        record_transition(&store, 1, 11, Some(7), None, false, None, None, None, true).await;
+        assert_eq!(*store.opens.lock().expect("opens lock"), 0);
+        assert_eq!(*store.closes.lock().expect("closes lock"), 1);
     }
 }
