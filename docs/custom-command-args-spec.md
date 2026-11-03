@@ -6,8 +6,9 @@ becomes Declined and M2 does not slip. Building it reverses the `{args}` refusal
 in `custom_commands.rs` and in [custom
 responses](dashboard-custom-responses-spec.md); change both in the same slice.
 Build slice 1 (core render, `MAX_ARGS_UNITS` bound and this-slice contract
-cases; run paths substitute empty until the capture slice) is under review;
-run-path capture, corrections and audit follow in slice 2.
+cases) is under review; this slice wires slash/prefix capture with the §5
+corrections, the preview sample as preview input, the published `arguments`
+option, and the run-path contract cases on top.
 Each build re-checks this spec's `file:line` seams on current `main` first. This
 acceptance is the owner intent review the original proposal waits for; its own
 technical gates, test matrix and kill rule still apply before any build PR

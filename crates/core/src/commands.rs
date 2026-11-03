@@ -19,6 +19,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::custom_commands::{ARGS_OPTION_NAME, MAX_ARGS_UNITS};
+
 /// Discord's guild application-command ceiling (two-bot
 /// `DISCORD_GUILD_COMMAND_LIMIT`).
 pub const GUILD_COMMAND_LIMIT: usize = 100;
@@ -510,7 +512,18 @@ pub fn merge_registry(
             withheld.push(cmd.name.clone());
             continue;
         }
-        merged.push(CommandDefinition::new(&cmd.name, &cmd.description).options(Vec::new()));
+        // Every custom command publishes one optional `arguments` string for
+        // `{args}` (advertise-plus-enforce: `max_length` is a client UX hint
+        // only; the server-side UTF-16 unit count in `MAX_ARGS_UNITS` is
+        // authoritative and the run path refuses over-long input).
+        merged.push(
+            CommandDefinition::new(&cmd.name, &cmd.description).options(vec![CommandOption::new(
+                ARGS_OPTION_NAME,
+                "Text echoed wherever the saved response uses {args}",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_ARGS_UNITS as u32)]),
+        );
     }
     Ok(MergedRegistry {
         commands: merged,
@@ -732,6 +745,26 @@ mod tests {
                 "faq"
             ]
         );
+    }
+
+    #[test]
+    fn custom_commands_publish_one_optional_bounded_arguments_option() {
+        // Spec §3: every custom slash command publishes one optional string
+        // option carrying invocation text for `{args}`; the advertised
+        // `max_length` matches the authoritative server-side unit bound.
+        let custom = vec![CustomCommand {
+            name: "faq".to_owned(),
+            description: "FAQ".to_owned(),
+            enabled: true,
+        }];
+        let merged = merge_commands(&[], &custom).expect("merges");
+        let faq = merged.iter().find(|d| d.name == "faq").expect("custom row");
+        assert_eq!(faq.options.len(), 1, "exactly the arguments option");
+        let option = &faq.options[0];
+        assert_eq!(option.name, ARGS_OPTION_NAME);
+        assert_eq!(option.kind, CommandOptionType::String.as_u8());
+        assert!(option.required.is_none(), "absent args substitute empty");
+        assert_eq!(option.max_length, Some(MAX_ARGS_UNITS as u32));
     }
 
     #[test]
