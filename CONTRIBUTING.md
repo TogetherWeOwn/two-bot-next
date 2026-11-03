@@ -168,9 +168,10 @@ cargo test --workspace --locked
 
 Generate `docs/generated/commands.md` before compiling workspace tests or
 all-targets Clippy: one test embeds the generated Markdown at compile time.
-On the persistent controller use `python3 scripts/generate_command_reference.py --controller`
-(or set `TWO_CARGO_CONTROLLER=1`), which builds only the generator through bounded
-Cargo admission. Nothing else selects controller mode: elsewhere it runs plain `cargo`. The output is
+On the persistent controller the bounded pool policy selects controller mode implicitly
+(`--controller` still forces it, as does `TWO_CARGO_CONTROLLER=1`; `TWO_CARGO_CONTROLLER=0`
+forces plain cargo), which builds only the generator through bounded
+Cargo admission. A Paperclip run alone never selects it, and hosted CI keeps plain `cargo`. The output is
 ignored; never commit generated registry rows. The authored
 [command-reference landing page](docs/commands.md) links to same-head CI artifacts.
 Normal reference-doc tests compare bytes without writing. Missing or stale output
@@ -249,6 +250,12 @@ tmpfs surfaces as `No space left on device` (SQLSTATE 53100) failures.
 The Cargo registry and rustup toolchain live in a shared `two-localtest-cache`
 volume. `scripts/ci/test_local_testdb.py` fails when `check.yml` and the
 harness drift apart.
+
+Retention: run `down` when the checkout is done, adding `--volumes` once its
+target cache is no longer needed. A `two-localtest-*-target` volume whose
+workspace no longer exists and whose containers are gone is a removal
+candidate for the operator (exact volume name only, after re-verifying no
+container references it); never prune another checkout's live volume.
 
 #### Manual setup
 

@@ -142,7 +142,8 @@ Rust-selected check run. Generate explicitly before compiling workspace tests or
 all-targets Clippy. The generator validates tracked configuration first and
 never rewrites it or the saved publication fixtures.
 
-On the persistent controller, after bounded pool admission:
+On the persistent controller, after bounded pool admission (the pool policy
+selects controller mode automatically; `--controller` still forces it):
 
 ```sh
 python3 scripts/generate_command_reference.py --controller

@@ -15,6 +15,7 @@ silently skipped: supplying both binaries explicitly selects that suite.
 
 import argparse
 import contextlib
+import errno
 import importlib.util
 import io
 import os
@@ -106,25 +107,107 @@ with mock.patch.object(unittest.TextTestRunner, "run") as run:
             capture_output=True, text=True, check=False, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_controller_mode_is_explicit_opt_in_only(self):
+    def test_controller_mode_selection(self):
         generator = load_script("generate_command_reference")
         cases = (
-            ([], {"PAPERCLIP_RUN_ID": "run"}, False),
-            ([], {"TWO_CARGO_CONTROLLER": "0"}, False),
-            ([], {"TWO_CARGO_CONTROLLER": "1"}, True),
-            (["--controller"], {}, True),
+            # (argv, environment, pool present, expected controller mode)
+            ([], {"PAPERCLIP_RUN_ID": "run"}, False, False),
+            ([], {"TWO_CARGO_CONTROLLER": "0"}, False, False),
+            ([], {"TWO_CARGO_CONTROLLER": "0"}, True, False),
+            ([], {"TWO_CARGO_CONTROLLER": "1"}, False, True),
+            ([], {"TWO_CARGO_CONTROLLER": "1"}, True, True),
+            (["--controller"], {}, False, True),
+            (["--controller"], {}, True, True),
+            # An explicit flag wins over a conflicting environment opt-out.
+            (["--controller"], {"TWO_CARGO_CONTROLLER": "0"}, False, True),
+            # Implicit selection follows the bounded pool policy only.
+            ([], {}, False, False),
+            ([], {}, True, True),
+            ([], {"PAPERCLIP_RUN_ID": "run"}, True, True),
+            # Hosted CI keeps plain cargo even where a pool policy exists.
+            ([], {"GITHUB_ACTIONS": "true"}, True, False),
+            ([], {"GITHUB_ACTIONS": "true", "TWO_CARGO_CONTROLLER": "1"}, True, True),
+            (["--controller"], {"GITHUB_ACTIONS": "true"}, True, True),
         )
-        for argv, environment, controller in cases:
-            with self.subTest(argv=argv, environment=environment):
+        for argv, environment, pool, controller in cases:
+            with self.subTest(argv=argv, environment=environment, pool=pool):
                 clean = {key: value for key, value in os.environ.items()
-                         if key not in ("PAPERCLIP_RUN_ID", "TWO_CARGO_CONTROLLER")}
+                         if key not in ("PAPERCLIP_RUN_ID", "TWO_CARGO_CONTROLLER",
+                                        "GITHUB_ACTIONS")}
                 with mock.patch.dict(os.environ, clean | environment, clear=True), \
+                        mock.patch.object(generator, "bounded_pool_present",
+                                          return_value=pool), \
                         mock.patch.object(generator, "build_executable",
                                           return_value=(None, 1)) as build:
                     self.assertEqual(generator.main(argv), 1)
                 cargo = build.call_args.args[0]
                 self.assertEqual("scripts/cargo_cache.py" in " ".join(cargo), controller)
                 self.assertEqual(cargo == ["cargo"], not controller)
+
+    def test_unreadable_pool_policy_fails_closed(self):
+        generator = load_script("generate_command_reference")
+        clean = {key: value for key, value in os.environ.items()
+                 if key not in ("PAPERCLIP_RUN_ID", "TWO_CARGO_CONTROLLER",
+                                "GITHUB_ACTIONS")}
+        with mock.patch.dict(os.environ, clean, clear=True), \
+                mock.patch.object(generator, "bounded_pool_present",
+                                  side_effect=PermissionError(13, "denied")), \
+                mock.patch.object(generator, "build_executable") as build:
+            self.assertEqual(generator.main([]), 1)
+        build.assert_not_called()
+
+    def test_pool_probe_reads_the_filesystem(self):
+        generator = load_script("generate_command_reference")
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "policy.json"
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", missing):
+                self.assertFalse(generator.bounded_pool_present())
+            missing.write_text("{}", encoding="utf-8")
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", missing):
+                self.assertTrue(generator.bounded_pool_present())
+            denied = mock.MagicMock(spec=Path)
+            denied.stat.side_effect = PermissionError(13, "denied")
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", denied), \
+                    self.assertRaises(PermissionError):
+                generator.bounded_pool_present()
+
+    def test_pool_probe_fails_closed_on_broken_lookup(self):
+        generator = load_script("generate_command_reference")
+        with tempfile.TemporaryDirectory() as tmp:
+            # A regular file where a directory component is expected: stat()
+            # raises ENOTDIR, which must not be mistaken for "no pool here".
+            blocker = Path(tmp) / "blocker"
+            blocker.write_text("not a directory", encoding="utf-8")
+            broken = blocker / "policy.json"
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", broken):
+                with self.assertRaises(OSError) as caught:
+                    generator.bounded_pool_present()
+                self.assertEqual(caught.exception.errno, errno.ENOTDIR)
+            # A symlink loop at the policy path: stat() raises ELOOP, which
+            # Path.is_file() would have swallowed into a fail-open False.
+            loop = Path(tmp) / "loop.json"
+            loop.symlink_to(loop)
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", loop):
+                with self.assertRaises(OSError) as caught:
+                    generator.bounded_pool_present()
+                self.assertEqual(caught.exception.errno, errno.ELOOP)
+            # A directory at the policy path is not a regular file: the probe
+            # raises EINVAL, and end to end the generator refuses to build
+            # instead of falling back to plain cargo.
+            directory = Path(tmp) / "policy-dir"
+            directory.mkdir()
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", directory):
+                with self.assertRaises(OSError) as caught:
+                    generator.bounded_pool_present()
+                self.assertEqual(caught.exception.errno, errno.EINVAL)
+            clean = {key: value for key, value in os.environ.items()
+                     if key not in ("PAPERCLIP_RUN_ID", "TWO_CARGO_CONTROLLER",
+                                    "GITHUB_ACTIONS")}
+            with mock.patch.dict(os.environ, clean, clear=True), \
+                    mock.patch.object(generator, "BOUNDED_POOL_POLICY", directory), \
+                    mock.patch.object(generator, "build_executable") as build:
+                self.assertEqual(generator.main([]), 1)
+            build.assert_not_called()
 
     def test_consumer_census_covers_standalone_coverage_and_filtered_bot_tests(self):
         for command in (
