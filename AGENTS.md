@@ -62,9 +62,11 @@ cargo test --workspace --locked
 
 The generated reference is ignored at `docs/generated/commands.md`; the tracked
 `docs/commands.md` is its landing page. Generate explicitly before test-target
-compilation. On the controller use `python3 scripts/generate_command_reference.py --controller`
-(or `TWO_CARGO_CONTROLLER=1`); this builds only the generator through the bounded cache
-wrapper. Being inside a Paperclip run does not select it. The generator
+compilation. On the controller the bounded pool policy selects controller mode
+implicitly (`--controller` and `TWO_CARGO_CONTROLLER=1` still force it;
+`TWO_CARGO_CONTROLLER=0` forces plain cargo); this builds only the generator
+through the bounded cache wrapper. Being inside a Paperclip run does not
+select it, and hosted CI keeps plain cargo. The generator
 never rewrites tracked configuration or independent publication fixtures.
 
 On the persistent Paperclip controller, run the compiling commands through the

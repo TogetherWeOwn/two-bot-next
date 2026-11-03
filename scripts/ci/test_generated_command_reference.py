@@ -106,19 +106,33 @@ with mock.patch.object(unittest.TextTestRunner, "run") as run:
             capture_output=True, text=True, check=False, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_controller_mode_is_explicit_opt_in_only(self):
+    def test_controller_mode_selection(self):
         generator = load_script("generate_command_reference")
         cases = (
-            ([], {"PAPERCLIP_RUN_ID": "run"}, False),
-            ([], {"TWO_CARGO_CONTROLLER": "0"}, False),
-            ([], {"TWO_CARGO_CONTROLLER": "1"}, True),
-            (["--controller"], {}, True),
+            # (argv, environment, pool present, expected controller mode)
+            ([], {"PAPERCLIP_RUN_ID": "run"}, False, False),
+            ([], {"TWO_CARGO_CONTROLLER": "0"}, False, False),
+            ([], {"TWO_CARGO_CONTROLLER": "0"}, True, False),
+            ([], {"TWO_CARGO_CONTROLLER": "1"}, False, True),
+            ([], {"TWO_CARGO_CONTROLLER": "1"}, True, True),
+            (["--controller"], {}, False, True),
+            (["--controller"], {}, True, True),
+            # Implicit selection follows the bounded pool policy only.
+            ([], {}, False, False),
+            ([], {}, True, True),
+            ([], {"PAPERCLIP_RUN_ID": "run"}, True, True),
+            # Hosted CI keeps plain cargo even where a pool policy exists.
+            ([], {"GITHUB_ACTIONS": "true"}, True, False),
+            ([], {"GITHUB_ACTIONS": "true", "TWO_CARGO_CONTROLLER": "1"}, True, True),
         )
-        for argv, environment, controller in cases:
-            with self.subTest(argv=argv, environment=environment):
+        for argv, environment, pool, controller in cases:
+            with self.subTest(argv=argv, environment=environment, pool=pool):
                 clean = {key: value for key, value in os.environ.items()
-                         if key not in ("PAPERCLIP_RUN_ID", "TWO_CARGO_CONTROLLER")}
+                         if key not in ("PAPERCLIP_RUN_ID", "TWO_CARGO_CONTROLLER",
+                                        "GITHUB_ACTIONS")}
                 with mock.patch.dict(os.environ, clean | environment, clear=True), \
+                        mock.patch.object(generator, "bounded_pool_present",
+                                          return_value=pool), \
                         mock.patch.object(generator, "build_executable",
                                           return_value=(None, 1)) as build:
                     self.assertEqual(generator.main(argv), 1)

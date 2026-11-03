@@ -15,7 +15,8 @@ python3 scripts/generate_command_reference.py
 cargo test -p two-bot-core --test reference_docs --locked
 ```
 
-On the persistent controller, use bounded build admission:
+On the persistent controller, bounded build admission applies automatically
+(`--controller` still forces it; `TWO_CARGO_CONTROLLER=0` forces plain cargo):
 
 ```sh
 python3 scripts/generate_command_reference.py --controller

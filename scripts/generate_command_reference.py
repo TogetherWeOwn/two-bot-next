@@ -3,7 +3,8 @@
 
 Run before workspace tests or all-targets Clippy. Use --controller (or
 TWO_CARGO_CONTROLLER=1) for bounded Cargo admission on the persistent
-controller; nothing selects it implicitly. Successful stdout is
+controller; the bounded pool policy also selects it implicitly there, while
+hosted CI keeps running plain cargo. Successful stdout is
 command_reference.v1 JSON. Generation and the read-only reference_docs check
 are separate operations: this command does not replace that check.
 """
@@ -17,6 +18,37 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = "generate_command_reference"
+
+# Bounded-pool policy path shared with scripts/cargo_cache.py (DEFAULT_POOL).
+# Present only on the persistent controller; hosted CI runners are ephemeral
+# and never carry it.
+BOUNDED_POOL_POLICY = Path("/paperclip/.cache/two-bot-next-bounded/policy.json")
+
+
+def bounded_pool_present():
+    """True when the controller's bounded Cargo pool policy exists."""
+    try:
+        return BOUNDED_POOL_POLICY.is_file()
+    except OSError:
+        return False
+
+
+def controller_selected(explicit_flag):
+    """True when the generator build must go through bounded Cargo admission.
+
+    Explicit opt-in (--controller or TWO_CARGO_CONTROLLER=1) always wins, and
+    an explicit TWO_CARGO_CONTROLLER=0 always opts out. Otherwise the bounded
+    pool policy selects controller mode implicitly, except on hosted CI
+    (GITHUB_ACTIONS), which keeps running plain cargo.
+    """
+    forced = os.environ.get("TWO_CARGO_CONTROLLER")
+    if explicit_flag or forced == "1":
+        return True
+    if forced == "0":
+        return False
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        return False
+    return bounded_pool_present()
 
 
 def error(code, next_action, retryable=False):
@@ -67,9 +99,9 @@ def main(argv=None):
     parser.add_argument("--verify-lifecycle", action="store_true",
                         help="also run independent real-binary mutation tests in an isolated fixture")
     args = parser.parse_args(argv)
-    # Explicit opt-in only: other agent runtimes also set PAPERCLIP_RUN_ID but
-    # have no bounded cache pool, so that variable must not select controller mode.
-    controller = args.controller or os.environ.get("TWO_CARGO_CONTROLLER") == "1"
+    # PAPERCLIP_RUN_ID alone never selects controller mode: other agent
+    # runtimes set it but have no bounded cache pool.
+    controller = controller_selected(args.controller)
     cargo = ([sys.executable, str(ROOT / "scripts/cargo_cache.py"), "run", "--"]
              if controller else ["cargo"])
     executable, status = build_executable(
