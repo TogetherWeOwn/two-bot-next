@@ -6,6 +6,7 @@
 use sqlx::{PgPool, Row};
 use std::str::FromStr as _;
 
+use crate::botlog::{BotlogAuditRow, BOTLOG_PAGE_LIMIT_MAX};
 use crate::channel_moderation::PurgeStopReason;
 use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
 use crate::internal_actions::{
@@ -1018,6 +1019,85 @@ impl InternalActionStore {
         .bind(event_key)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    /// Publishable-kind window over `internal_action_log` for `botlog.read`
+    /// (contract §6, card B6): the public log is this query, not a table. The
+    /// WHERE clause is the closed allowlist — terminal successes only, with
+    /// the per-kind outcome words (`created`/`updated`/`cancelled`) and a
+    /// real effect (`affected >= 1`) for the two membership kinds, so an
+    /// idempotent no-op (`already_held`, `already_member`) never publishes.
+    /// Failures, refusals, in-flight intents, moves, DMs and every other verb
+    /// stay in the internal audits only because the filter never names them.
+    ///
+    /// Reverse lookups ride along: `internal_event_keys` names the event,
+    /// `rank_ladder` names the rung whose `role_id` the grant resolved to,
+    /// and `privacy_opt_outs` marks subjects the projection must omit. The
+    /// page is strictly ascending over `(created_at, audit_id)` after the
+    /// cursor, so resumption never skips or repeats; `limit` clamps to the
+    /// contract ceiling. The row order is the consumption order: `next`
+    /// advances past every consumed row, including ones the projection
+    /// cannot name.
+    pub async fn list_botlog_page(
+        &self,
+        guild_id: &str,
+        after_micros: i64,
+        after_audit_id: i64,
+        limit: i64,
+    ) -> Result<Vec<BotlogAuditRow>, InternalStoreError> {
+        if !is_snowflake(guild_id) {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        Ok(sqlx::query(
+            "SELECT log.audit_id, \
+             floor(extract(epoch FROM log.created_at) * 1000000)::bigint AS created_micros, \
+             to_char(log.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' \
+               || to_char(log.created_at AT TIME ZONE 'UTC', 'HH24:MI:SS') || 'Z' AS at_utc, \
+             log.action, log.target_id, log.resolved_role_id, log.resource_id, \
+             log.outcome, log.affected, keys.event_key, ladder.rank_key, \
+             (opt.member_id IS NOT NULL) AS suppressed \
+             FROM internal_action_log AS log \
+             LEFT JOIN internal_event_keys AS keys \
+               ON keys.guild_id = log.guild_id AND keys.event_id = log.resource_id \
+             LEFT JOIN rank_ladder AS ladder \
+               ON ladder.role_id = log.resolved_role_id \
+             LEFT JOIN privacy_opt_outs AS opt \
+               ON opt.guild_id = log.guild_id AND opt.member_id = log.target_id \
+             WHERE log.guild_id = $1 AND log.phase = 'terminal' \
+               AND log.response_code = 'success' \
+               AND ((log.action = 'event.upsert' AND log.outcome IN ('created', 'updated')) \
+                 OR (log.action = 'event.cancel' AND log.outcome = 'cancelled') \
+                 OR log.action = 'announcement.post' \
+                 OR (log.action = 'role.assign' AND log.affected >= 1) \
+                 OR (log.action = 'guild.add_member' AND log.affected >= 1)) \
+               AND (floor(extract(epoch FROM log.created_at) * 1000000)::bigint, \
+                 log.audit_id) > ($2, $3) \
+             ORDER BY created_micros, log.audit_id LIMIT $4",
+        )
+        .bind(guild_id)
+        .bind(after_micros)
+        .bind(after_audit_id)
+        .bind(limit.clamp(1, BOTLOG_PAGE_LIMIT_MAX))
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(BotlogAuditRow {
+                audit_id: row.try_get("audit_id")?,
+                created_micros: row.try_get("created_micros")?,
+                at_utc: row.try_get("at_utc")?,
+                action: row.try_get("action")?,
+                target_id: row.try_get("target_id")?,
+                resolved_role_id: row.try_get("resolved_role_id")?,
+                resource_id: row.try_get("resource_id")?,
+                outcome: row.try_get("outcome")?,
+                affected: row.try_get("affected")?,
+                event_key: row.try_get("event_key")?,
+                rank_key: row.try_get("rank_key")?,
+                suppressed: row.try_get("suppressed")?,
+            })
+        })
+        .collect::<Result<Vec<BotlogAuditRow>, sqlx::Error>>()?)
     }
 }
 

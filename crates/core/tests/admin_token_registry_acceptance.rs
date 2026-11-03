@@ -257,6 +257,22 @@ fn voice_snapshot_requires_read() {
 }
 
 #[test]
+fn botlog_read_requires_read() {
+    // Slice 2 row: the keyless public-log projection maps to the read
+    // scope like the other keyless reads. The v0 map above stays pinned;
+    // new verbs gain tests of their own.
+    assert_eq!(
+        InternalFlags::required_admin_scope("botlog.read"),
+        Some(SCOPE_READ),
+        "botlog.read is a read verb"
+    );
+    assert!(InternalFlags::admin_scope_allows(
+        &[SCOPE_READ],
+        "botlog.read"
+    ));
+}
+
+#[test]
 fn moderate_verbs_require_moderate() {
     for verb in [
         "moderation.warn",

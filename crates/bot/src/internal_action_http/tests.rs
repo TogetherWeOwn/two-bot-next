@@ -2249,6 +2249,171 @@ async fn voice_snapshot_empty_guild_lists_rooms_with_zero_total() {
     db.close().await.unwrap();
 }
 
+// ---------------------------------------------------------------------------
+// Keyless `botlog.read` (public-log projection over the internal audit)
+// ---------------------------------------------------------------------------
+
+fn botlog_payload() -> String {
+    serde_json::json!({"action": "botlog.read"}).to_string()
+}
+
+fn set_botlog_read_flag(on: bool) {
+    if on {
+        std::env::set_var("TWO_INTERNAL_ALLOW_BOTLOG_READ", "1");
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_BOTLOG_READ");
+    }
+}
+
+/// Seed one terminal success the projection can name: an event create (named
+/// through the reverse key map), an announcement (named by its channel key)
+/// or a membership arrival.
+async fn seed_botlog_row(pool: &sqlx::PgPool, key: &str, action: &str, target: Option<&str>) {
+    let store = InternalActionStore::new(pool.clone());
+    let identity = RequestIdentity::new("website", key, action, b"botlog-fixture").unwrap();
+    let subject = AuditSubject {
+        guild_id: Some(DiscordId::new(staging_guild()).unwrap()),
+        actor_id: Some(DiscordId::new("234567890123456789").unwrap()),
+        target_id: target.map(|id| DiscordId::new(id).unwrap()),
+        resolved_role_id: None,
+    };
+    let claim = match store.claim(&identity, &subject).await.unwrap() {
+        InternalClaim::Claimed(claim) => claim,
+        other => panic!("expected committed claim, got {other:?}"),
+    };
+    let created = action == "event.upsert";
+    store
+        .finish(
+            &claim,
+            &TerminalResponse::Success {
+                resource_id: created.then(|| DiscordId::new("777777777777777777").unwrap()),
+                affected: 1,
+                outcome: created.then_some(EventOutcome::Created),
+                stop_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn botlog_read_flag_off_is_refused_before_any_effect() {
+    // The nonce burns durably before authorize, so even the flag-off refusal
+    // needs the migrated test database, like the `event.read` tests.
+    let Some(db) = database().await else { return };
+    let state = state(
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+    );
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_botlog_read_flag(false);
+    // Keyless like `event.read`: no Idempotency-Key header is sent.
+    let (status, _, body) = answer(router(state), signed_read(&botlog_payload(), "old")).await;
+    set_botlog_read_flag(false);
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(body["error"]["retryable"], false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn botlog_read_malformed_cursor_and_limit_refuse() {
+    let Some(db) = database().await else { return };
+    let state = state(
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+    );
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_botlog_read_flag(true);
+    for raw in [
+        serde_json::json!({"action": "botlog.read", "limit": 0}),
+        serde_json::json!({"action": "botlog.read", "limit": 201}),
+        serde_json::json!({"action": "botlog.read", "limit": "200"}),
+        serde_json::json!({"action": "botlog.read", "after": ""}),
+        serde_json::json!({"action": "botlog.read", "after": "cursor-0000"}),
+    ] {
+        let (status, _, body) =
+            answer(router(state.clone()), signed_read(&raw.to_string(), "old")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{raw}");
+        assert_eq!(body["error"]["code"], "malformed", "{raw}");
+    }
+    set_botlog_read_flag(false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn botlog_read_projects_seeded_terminal_rows_keyless() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_botlog_read_flag(true);
+    InternalActionStore::new(db.pool().clone())
+        .put_event_key(staging_guild(), "launch", "777777777777777777")
+        .await
+        .unwrap();
+    seed_botlog_row(db.pool(), "botlog:created", "event.upsert", None).await;
+    seed_botlog_row(
+        db.pool(),
+        "botlog:posted",
+        "announcement.post",
+        Some("333333333333333333"),
+    )
+    .await;
+    seed_botlog_row(
+        db.pool(),
+        "botlog:joined",
+        "guild.add_member",
+        Some("100000000000000001"),
+    )
+    .await;
+    let app_state = state(
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+    );
+    // No Idempotency-Key header: the projection is keyless by construction.
+    let (status, headers, body) = answer(
+        router(app_state.clone()),
+        signed_read(&botlog_payload(), "old"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    assert!(body["request_id"].is_string());
+    assert!(!headers.contains_key("idempotent-replay"));
+    assert_eq!(
+        headers
+            .get(header::CACHE_CONTROL)
+            .map(HeaderValue::as_bytes),
+        Some(b"no-store".as_slice())
+    );
+    let result = &body["result"];
+    assert_eq!(result["v"], 1);
+    let entries = result["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["kind"], "event.opened");
+    assert_eq!(entries[0]["event_key"], "launch");
+    assert!(entries[0].get("subject_id").is_none());
+    assert_eq!(entries[1]["kind"], "announcement.posted");
+    assert_eq!(entries[1]["detail"], "ann");
+    assert_eq!(entries[2]["kind"], "member.joined");
+    assert_eq!(entries[2]["subject_id"], "100000000000000001");
+    // The cursor consumed everything: resume replays empty and echoes.
+    let next = result["next"].as_str().expect("opaque cursor");
+    assert_eq!(next, entries[2]["seq"].as_str().unwrap());
+    let (status, _, tail) = answer(
+        router(app_state),
+        signed_read(
+            &serde_json::json!({"action": "botlog.read", "after": next}).to_string(),
+            "old",
+        ),
+    )
+    .await;
+    set_botlog_read_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tail["result"]["entries"].as_array().unwrap().len(), 0);
+    assert_eq!(tail["result"]["next"], next);
+    db.close().await.unwrap();
+}
+
 fn mutate_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
     let executor =
         ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(api.origin.clone()))

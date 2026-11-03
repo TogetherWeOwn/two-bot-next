@@ -6,6 +6,7 @@
 //!
 //! Wired effects: `announcement.post` (single-attempt send), `event.read`
 //! (keyless mapped GET), `voice.snapshot` (keyless gateway-cache projection),
+//! `botlog.read` (keyless public-log projection over the internal audit),
 //! `event.upsert`/`event.cancel` (Guild Scheduled Event
 //! mutations through the shared event executor), `settings.get`/`settings.set`
 //! (settings executors), `automations.export` (keyless redacted read) /
@@ -51,6 +52,7 @@ use two_bot_core::{
         diff_import, export_document, max_import_entries, parse_import_document, ImportOutcome,
         ImportParseError,
     },
+    botlog::{assemble_botlog_page, validate_botlog_read, BOTLOG_READ_ACTION},
     channel_moderation_store::ChannelModerationStore,
     clock_guard::ClockGuard,
     commands::{
@@ -114,7 +116,8 @@ const EVENT_GATE_WAIT: Duration = Duration::from_secs(8);
 /// `metrics::INTERNAL_ACTION_FAMILIES`: `announcement.post` to
 /// `announcement`, `event.*` to `event`, `settings.*` to `settings`,
 /// `moderation.*` to `moderation`, `role.assign`/`guild.add_member` to
-/// `membership`, `voice.snapshot` to `voice`; anything else (including
+/// `membership`, `voice.snapshot` to `voice`, `botlog.read` to `botlog`;
+/// anything else (including
 /// unwired catalog verbs and unknown verbs) to `other`. Takes only the
 /// bounded label, never raw request bytes, so no secret, token, key id or
 /// body can become a metric label.
@@ -126,6 +129,7 @@ fn internal_family(action: ActionLabel) -> &'static str {
             "settings.get" | "settings.set" => "settings",
             "role.assign" | "guild.add_member" => "membership",
             "voice.snapshot" => "voice",
+            "botlog.read" => "botlog",
             _ if name.starts_with("moderation.") => "moderation",
             _ => "other",
         },
@@ -1568,6 +1572,11 @@ async fn receive(
     if decision.action == "voice.snapshot" {
         return read_voice_snapshot(state, id, key, action).await;
     }
+    // Keyless public-log projection: no durable claim, no Idempotency-Key,
+    // same as the reads above. The committed nonce is the replay guard.
+    if decision.action == BOTLOG_READ_ACTION {
+        return read_botlog(state, &decision, id, key, action).await;
+    }
     // Mutating event verbs take the same durable claim/audit path as
     // announcements below, with their own validation and key mapping.
     if supports_event_mutation(&decision.action) {
@@ -1800,6 +1809,55 @@ async fn read_voice_snapshot(
             reject(Failure::code(ErrorCode::DiscordUnavailable))
         }
         Err(SnapshotRefusal::OverBudget) => reject(Failure::code(ErrorCode::Internal)),
+    }
+}
+
+/// Keyless `botlog.read`: project the contract §6 page over the internal
+/// audit for the staging guild. A disabled flag refuses earlier in
+/// `authorize`. Field validation runs before the store page, so malformed
+/// cursors and limits refuse with no database read. The channel map inverts
+/// here (configured keys run key→channel): a channel the map no longer names
+/// publishes nothing rather than a raw snowflake. The read itself is the
+/// only effect: no store write, no audit row, no Discord call.
+async fn read_botlog(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let request = match validate_botlog_read(&decision.body) {
+        Ok(request) => request,
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let channel_by_id: std::collections::HashMap<String, String> = state
+        .config
+        .channel_keys()
+        .iter()
+        .map(|(name, channel_id)| (channel_id.clone(), name.clone()))
+        .collect();
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let rows = match state
+        .store
+        .list_botlog_page(
+            guild_id,
+            request.after.after_micros,
+            request.after.after_audit_id,
+            request.limit,
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let page = assemble_botlog_page(rows, &channel_by_id, &request);
+    match serde_json::to_value(&page) {
+        Ok(result) => {
+            metrics::global().internal_action(internal_family(action), "executed");
+            event_read_response(result, id)
+        }
+        Err(_) => reject(Failure::code(ErrorCode::Internal)),
     }
 }
 
