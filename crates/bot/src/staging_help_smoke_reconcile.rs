@@ -653,8 +653,8 @@ mod tests {
     // a Tokio reactor to build a client: keep these async like the fence test.
     #[tokio::test]
     async fn client_keeps_default_limiter_for_direct_discord() {
-        let direct = client_for("fixture-token", Some(""))
-            .expect("empty override builds a direct client");
+        let direct =
+            client_for("fixture-token", Some("")).expect("empty override builds a direct client");
         assert!(
             direct.ratelimiter().is_some(),
             "direct Discord calls keep Twilight's default rate limiter"
@@ -684,8 +684,8 @@ mod tests {
     #[tokio::test]
     async fn drain_awaits_a_fast_task() {
         use std::sync::{
-            Arc,
             atomic::{AtomicBool, Ordering},
+            Arc,
         };
 
         let done = Arc::new(AtomicBool::new(false));
