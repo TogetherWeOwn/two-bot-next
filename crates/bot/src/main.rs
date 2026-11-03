@@ -420,7 +420,9 @@ async fn run(cli_args: &[String]) {
     // and the gateway pipeline writes through it, so `voice.snapshot` reads
     // live occupancy. Discord exposes no REST voice-state list; a receiver
     // split from these writes answers `discord_unavailable`, never invented
-    // data.
+    // data. The receiver also binds the supervisor's gateway state below, so
+    // a warm cache while the gateway is disconnected (not `Connected`)
+    // refuses instead of serving stale occupancy with a fresh timestamp.
     let voice_cache = voice_snapshot::new_shared_cache();
     // Capture the authoritative pool before the gateway's async move owns it.
     // Bind privately before starting tasks; enabled failures never fall back.
@@ -434,15 +436,21 @@ async fn run(cli_args: &[String]) {
                 .pool()
                 .clone();
             Some(
-                internal_action_http::bind(receiver_config, pool, token, Arc::clone(&voice_cache))
-                    .await
-                    .unwrap_or_else(|_| {
-                        tracing::error!(
-                            error_class = "receiver_bind_failed",
-                            "internal-action startup refused"
-                        );
-                        std::process::exit(1);
-                    }),
+                internal_action_http::bind(
+                    receiver_config,
+                    pool,
+                    token,
+                    Arc::clone(&voice_cache),
+                    Arc::clone(&gateway),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::error!(
+                        error_class = "receiver_bind_failed",
+                        "internal-action startup refused"
+                    );
+                    std::process::exit(1);
+                }),
             )
         }
         None => None,

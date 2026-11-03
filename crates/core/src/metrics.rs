@@ -453,9 +453,9 @@ pub const AUTOMOD_DECISION_OUTCOMES: &[&str] = &[
 /// maps each bounded `action` verb to one family: `announcement.post` to
 /// `announcement`, `event.*` to `event`, `settings.*` to `settings`,
 /// `moderation.*` to `moderation`, `role.assign`/`guild.add_member` to
-/// `membership`; anything else (including unwired catalog verbs and unknown
-/// verbs) collapses to `other`. No key id, token, body or request bytes ever
-/// become a family label.
+/// `membership`, `voice.snapshot` to `voice`; anything else (including
+/// unwired catalog verbs and unknown verbs) collapses to `other`. No key id,
+/// token, body or request bytes ever become a family label.
 ///
 /// Alert rule `receiver_refusals:<family>` in `wrangler/src/alert-rules.ts`:
 /// refused outcomes rising in 3 consecutive scrapes per family pages; the

@@ -71,6 +71,10 @@ pub(crate) struct RoomDraft {
 /// [`SnapshotRefusal::CacheIncomplete`]; see [`collect_rooms`] for the one
 /// deliberate exception (a guild the cache holds whose voice-state set went
 /// missing reads as empty, not incomplete).
+///
+/// The cache alone cannot prove freshness: a transport loss leaves the last
+/// occupancy readable, so callers gate on the supervisor's readiness first
+/// and only call this while the gateway is connected.
 pub(crate) fn read_voice_snapshot(
     cache: &DefaultInMemoryCache,
     guild_id: Snowflake,

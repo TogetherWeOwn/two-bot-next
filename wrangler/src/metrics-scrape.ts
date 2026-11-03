@@ -141,8 +141,16 @@ function combinations(axes: Record<string, readonly string[]>): Record<string, s
   return rows;
 }
 
+// The `voice` internal-actions family postdates older containers: a
+// rolled-back container emits the other six families but no `voice` rows.
+// Requiring them would turn every otherwise-valid scrape into a failure and
+// starve all alert rules until the newer container returns, so the `voice`
+// rows validate when present but are never required. Every other required
+// combination keeps its fail-closed shape: exactly one row per combination.
 const REQUIRED_INPUTS = new Set(Object.entries(ALERT_INPUT_LABELS).flatMap(([name, axes]) =>
-  combinations(axes).map((labels) => identity(name, labels))));
+  combinations(axes)
+    .filter((labels) => !(name === "two_bot_internal_actions_total" && labels["family"] === "voice"))
+    .map((labels) => identity(name, labels))));
 
 // Prometheus numbers, not JavaScript's empty/hexadecimal/Infinity coercions.
 const NUMBER = "(?:[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?|NaN|[+-]?Inf)";

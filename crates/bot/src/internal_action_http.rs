@@ -41,7 +41,7 @@ use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
 use tokio::{
     net::TcpListener,
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinSet,
 };
 use tracing::Instrument;
@@ -918,6 +918,13 @@ struct ReceiverState {
     /// receiver only projects. A cold cache reads as `discord_unavailable`,
     /// never as an empty guild.
     voice_cache: Arc<DefaultInMemoryCache>,
+    /// Live gateway readiness for the keyless `voice.snapshot` read. The
+    /// supervisor owns the writes (`GatewayState::Connected` only on a
+    /// committed READY/RESUMED, `Armed` again on every transport loss); the
+    /// receiver only reads. A warm cache while the gateway is not connected
+    /// reads as `discord_unavailable` with a fresh `observed_at` never
+    /// stamped on stale occupancy.
+    gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
     clock: Mutex<ClockGuard>,
     buckets: Mutex<TokenBuckets>,
     telemetry: Mutex<RejectionTelemetry>,
@@ -959,8 +966,11 @@ impl ReceiverState {
             channel,
             // Cold by default: callers that serve `voice.snapshot` attach the
             // shared gateway handle below, so an unwired state reads as
-            // `discord_unavailable`, never as an empty guild.
+            // `discord_unavailable`, never as an empty guild. Not ready by
+            // default for the same reason: the readiness gate refuses until
+            // the live gateway state is attached and connected.
             voice_cache: voice_snapshot::new_shared_cache(),
+            gateway_state: Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
             telemetry: Mutex::new(RejectionTelemetry::default()),
@@ -979,6 +989,18 @@ impl ReceiverState {
     /// `discord_unavailable`.
     fn with_voice_cache(mut self, voice_cache: Arc<DefaultInMemoryCache>) -> Self {
         self.voice_cache = voice_cache;
+        self
+    }
+
+    /// Attach the live gateway state feeding the keyless `voice.snapshot`
+    /// readiness gate. Production `bind` always attaches the supervisor's
+    /// state; tests that exercise the verb attach `Connected` for the ready
+    /// path and keep the not-ready default for the refusal path.
+    fn with_gateway_state(
+        mut self,
+        gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
+    ) -> Self {
+        self.gateway_state = gateway_state;
         self
     }
 
@@ -1198,6 +1220,7 @@ pub async fn bind(
     pool: sqlx::PgPool,
     token: &str,
     voice_cache: Arc<DefaultInMemoryCache>,
+    gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
 ) -> std::io::Result<BoundReceiver> {
     use two_bot_core::send_admission::{PgSendAdmission, SendAdmission};
     use two_bot_discord::internal_actions::CooldownGovernor;
@@ -1254,7 +1277,8 @@ pub async fn bind(
                 Arc::new(moderation),
                 Arc::new(channel),
             )
-            .with_voice_cache(voice_cache),
+            .with_voice_cache(voice_cache)
+            .with_gateway_state(gateway_state),
         ),
     })
 }
@@ -1745,10 +1769,14 @@ async fn read_event(
 
 /// Keyless `voice.snapshot`: project the §1 shape from the shared gateway
 /// voice-state cache for the staging guild. A disabled flag refuses earlier
-/// in `authorize`; a cold or split cache (gateway not READY, or the receiver
-/// running without the gateway's writes) refuses `discord_unavailable`
-/// below — the read never invents occupancy. The only wire effect is the
-/// cache read itself: no store write, no audit row, no member id in logs.
+/// in `authorize`. The gateway readiness gate refuses next: unless the
+/// supervisor's state is `Connected`, a warm cache is stale occupancy from
+/// before a transport loss, so the read answers `discord_unavailable`
+/// instead of stamping it with a fresh `observed_at`. A cold or split cache
+/// (gateway never READY, or the receiver running without the gateway's
+/// writes) refuses `discord_unavailable` below — the read never invents
+/// occupancy. The only wire effect is the cache read itself: no store
+/// write, no audit row, no member id in logs.
 async fn read_voice_snapshot(
     state: &ReceiverState,
     id: &str,
@@ -1756,6 +1784,9 @@ async fn read_voice_snapshot(
     action: ActionLabel,
 ) -> Response {
     let reject = |failure| state.reject(failure, key.clone(), action, id);
+    if *state.gateway_state.read().await != crate::gateway::GatewayState::Connected {
+        return reject(Failure::code(ErrorCode::DiscordUnavailable));
+    }
     let guild_id = match two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID.parse::<u64>() {
         Ok(guild_id) => guild_id,
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),

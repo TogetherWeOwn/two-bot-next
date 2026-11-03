@@ -1970,7 +1970,15 @@ fn voice_state(user_id: &str, channel_id: Option<&str>) -> VoiceStateUpdate {
 /// empty), one stage channel and one text channel, with a bot, an unknown
 /// user and a stage speaker among the occupants.
 fn seeded_voice_cache() -> Arc<DefaultInMemoryCache> {
-    let cache = two_bot_discord::build_cache();
+    let cache = voice_snapshot::new_shared_cache();
+    cache.update(&seeded_guild_event());
+    cache
+}
+
+/// The guild event behind [`seeded_voice_cache`], exposed so the end-to-end
+/// test feeds the same bytes through the pipeline instead of writing the
+/// cache directly.
+fn seeded_guild_event() -> Event {
     let mut guild: Value =
         serde_json::from_str(include_str!("../../tests/fixtures/voice_guild.json"))
             .expect("voice guild fixture parses");
@@ -2009,11 +2017,38 @@ fn seeded_voice_cache() -> Arc<DefaultInMemoryCache> {
          "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false},
     ]);
     let guild: Guild = serde_json::from_value(guild).expect("patched guild deserializes");
-    cache.update(&Event::GuildCreate(Box::new(GuildCreate::Available(guild))));
-    Arc::new(cache)
+    Event::GuildCreate(Box::new(GuildCreate::Available(guild)))
+}
+
+/// Live gateway state for the ready-path tests: the supervisor publishes
+/// `Connected` only on a committed READY/RESUMED.
+fn connected_gateway() -> Arc<tokio::sync::RwLock<crate::gateway::GatewayState>> {
+    Arc::new(tokio::sync::RwLock::new(
+        crate::gateway::GatewayState::Connected,
+    ))
 }
 
 fn voice_app(pool: sqlx::PgPool, cache: Arc<DefaultInMemoryCache>) -> Router {
+    let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    router(Arc::new(
+        ReceiverState::new(
+            config(),
+            pool,
+            effect.clone(),
+            effect,
+            Arc::new(MockEventRead::default()),
+            Arc::new(MockEventMutate),
+            Arc::new(MockModeration::default()),
+            Arc::new(MockChannel::default()),
+        )
+        .with_voice_cache(cache)
+        .with_gateway_state(connected_gateway()),
+    ))
+}
+
+/// Same shared cache but the gateway mid-reconnect: `Armed`, never
+/// `Connected`. Stale occupancy must refuse, never serve.
+fn voice_app_not_ready(pool: sqlx::PgPool, cache: Arc<DefaultInMemoryCache>) -> Router {
     let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
     router(Arc::new(
         ReceiverState::new(
@@ -2053,22 +2088,90 @@ async fn voice_snapshot_flag_off_is_refused_before_any_effect() {
 
 #[tokio::test]
 async fn voice_snapshot_cold_cache_is_discord_unavailable() {
-    // The default state carries a cold cache: the gateway has not fed it, so
-    // the read refuses instead of reporting an empty guild. The nonce burn
-    // still needs the migrated test database.
+    // Ready gateway, cold cache: the gateway has not fed it (or the receiver
+    // runs split from the gateway's writes), so the read refuses instead of
+    // reporting an empty guild. The nonce burn still needs the migrated test
+    // database.
     let Some(db) = database().await else { return };
-    let state = state(
-        db.pool().clone(),
-        Arc::new(MockEffect::new(MockOutcome::Success)),
-    );
     let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_voice_snapshot_flag(true);
-    let (status, _, body) =
-        answer(router(state), signed_read(&voice_snapshot_payload(), "old")).await;
+    let (status, _, body) = answer(
+        voice_app(db.pool().clone(), voice_snapshot::new_shared_cache()),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
     set_voice_snapshot_flag(false);
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(body["error"]["code"], "discord_unavailable");
     assert_eq!(body["error"]["retryable"], true);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_snapshot_warm_cache_while_reconnecting_is_discord_unavailable() {
+    // Warm cache, gateway mid-reconnect (`Armed`, never `Connected`): the
+    // occupants are stale pre-gap state, so the read refuses instead of
+    // stamping them with a fresh `observed_at`.
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    let (status, _, body) = answer(
+        voice_app_not_ready(db.pool().clone(), seeded_voice_cache()),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"]["code"], "discord_unavailable");
+    assert_eq!(body["error"]["retryable"], true);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_snapshot_serves_pipeline_fed_shared_cache() {
+    // End to end across the contract's integration risk: the same cache
+    // handle feeds the gateway pipeline and the signed receiver read. The
+    // event travels through `OrderedLevelingPipeline::handle` — the
+    // production `with_shared_cache` wiring — never a direct cache write.
+    use two_bot_discord::{NoInvites, OrderedLevelingPipeline, PipelineSnapshots};
+
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    let cache = voice_snapshot::new_shared_cache();
+    let pipeline = OrderedLevelingPipeline::with_shared_cache(
+        two_bot_core::MemStore::new(),
+        None,
+        NoInvites,
+        PipelineSnapshots::new(),
+        Arc::clone(&cache),
+    );
+    let event = seeded_guild_event();
+    pipeline
+        .handle(&event)
+        .await
+        .expect("pipeline feeds the shared cache");
+    let (status, _, body) = answer(
+        voice_app(db.pool().clone(), cache),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    let result = &body["result"];
+    assert_eq!(result["v"], 1);
+    // Same projection as the directly-seeded cache: lobby plus alpha humans,
+    // the bot, the AFK occupant and the stage speaker out of the total.
+    assert_eq!(result["total_in_voice"], 2);
+    let rooms = result["rooms"].as_array().expect("rooms array");
+    let ids: Vec<&str> = rooms
+        .iter()
+        .map(|room| room["channel_id"].as_str().expect("channel id"))
+        .collect();
+    assert_eq!(ids, vec!["31", "32", "33", "34", "35"]);
+    assert_eq!(rooms[0]["member_ids"], serde_json::json!(["41"]));
+    assert_eq!(rooms[3]["afk"], true);
+    assert_eq!(rooms[3]["member_ids"], serde_json::json!(["44"]));
     db.close().await.unwrap();
 }
 

@@ -21,12 +21,24 @@ test("alert input dimensions match the Rust always-emitted scrape contract", () 
 });
 
 const isOptionalLine = (line: string) => Object.hasOwn(ALERT_OPTIONAL_INPUT_LABELS, line.split(/[{ ]/)[0]!);
+// The `voice` internal-actions family validates when present but is never
+// required: a rolled-back pre-`voice` container must still scrape.
+const isVoiceFamilyLine = (line: string) =>
+  line.startsWith("two_bot_internal_actions_total{") && line.includes('family="voice"');
 
 test("every current required label combination is required, not merely one row per family", () => {
-  const lines = metricsLines().filter((line) => !isOptionalLine(line));
+  const lines = metricsLines().filter((line) => !isOptionalLine(line) && !isVoiceFamilyLine(line));
   for (let i = 0; i < lines.length; i++) {
     assert.equal(parseAlertScrape(lines.filter((_, j) => j !== i).join("\n")), null, lines[i]);
   }
+});
+
+test("older exposition without the voice family still parses", () => {
+  const withoutVoice = metricsLines().filter((line) => !isVoiceFamilyLine(line)).join("\n");
+  const samples = parseAlertScrape(withoutVoice);
+  assert.ok(samples);
+  assert.equal(samples.filter((s) => s.name === "two_bot_internal_actions_total").length, 6 * 12);
+  assert.ok(parseAlertScrape(metricsBody()));
 });
 
 test("older exposition without the optional gauges still parses", () => {

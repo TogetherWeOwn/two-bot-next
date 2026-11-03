@@ -156,7 +156,7 @@ Website-action receiver executions (TOG-20119, roadmap M4.23) follow the same
 shape: every signed-receiver request increments
 `two_bot_internal_actions_total{family,outcome}` exactly once, while refusal
 `warn!` summaries stay sampled. A burst is O(1) log lines with N counter
-increments. The six families and twelve outcomes are class steady and never
+increments. The seven families and twelve outcomes are class steady and never
 shed; unknown verbs collapse to `other` and unknown outcomes to `internal`,
 so growth means a real family or refusal class arrived and needs the M2.1
 alert rule, not a new label.
