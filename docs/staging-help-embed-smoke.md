@@ -30,7 +30,11 @@ post and read-back unchanged.
    - `embeds[0].footer.text == "Together We Own"`;
    - `embeds[0].footer.icon_url == BRAND_ICON_URL`.
 4. It deletes both messages, pass or fail, and writes evidence containing
-   only row results, durations and message IDs.
+   only row results, durations and message IDs. Before each post it records
+   the channel's newest message ID as an anchor; if a post's outcome is
+   lost (timeout, 5xx or an unreadable answer), it reconciles by deleting
+   every newer test-bot message, so a committed-but-unseen post cannot be
+   left behind by a later green run.
 
 The payload deliberately uses the maximal command registry and a wide topic
 detail, matching the Rust builder tests. Short `/help` and short
@@ -63,8 +67,11 @@ or print any token value:
   the channel variable above
 
 Until provisioning is complete and the required variable is `true`, missing
-bindings produce a notice and a green run. Once it is `true`, a missing
-binding fails closed. The token is passed to the called workflow by secret
+bindings produce a notice and a green run. The workflow decides this in a
+binding-gate step before any toolchain or payload step runs, so an
+unconfigured optional smoke cannot fail on a build problem and block
+promotion; the gate sees only whether the token secret is set, never its
+value. Once it is `true`, a missing binding fails closed. The token is passed to the called workflow by secret
 name, held only in the smoke step's environment and then only in the Python
 process environment. It is never a command-line argument, never written to
 evidence and never included in error output.
@@ -95,10 +102,12 @@ python3 scripts/cargo_cache.py run -- run -p two-bot-discord --example help_embe
 - Exit `2` / `REFUSED`: a fence stopped the run before any post, for example
   the wrong guild, a missing or malformed token, a missing channel, an
   invalid snowflake or an invalid or already-unbranded payload file.
-- Exit `3` / `VERDICT FAIL`: a cleanup delete failed and a posted message
-  may remain in the dedicated test channel. The workflow fails at once on
+- Exit `3` / `VERDICT FAIL`: a cleanup delete failed, or a post whose
+  outcome was lost could not be reconciled, and a posted message may
+  remain in the dedicated test channel. The workflow fails at once on
   this status instead of retrying, so a later clean attempt cannot read
-  green over the leftover.
+  green over the leftover. A lost post that reconciliation removes (or
+  proves absent) stays a retryable exit `1`.
 
 A brand mismatch in the generated payload fails before posting. A mismatch
 only on the read-back means Discord did not serve the posted brand fields as

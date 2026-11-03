@@ -38,8 +38,11 @@ Fences, all before the first request:
     guild (GET users/@me, GET users/@me/guilds).
 
 Exit status: 0 PASS, 1 a check failed, 2 refused by a fence (nothing was
-posted), 3 a cleanup delete failed and a posted message may remain in the
-test channel. Status 3 is distinct so the workflow fails at once instead
+posted), 3 a cleanup delete failed — or a post whose outcome was lost
+(timeout, 5xx, unreadable answer) could not be reconciled against the
+pre-post channel anchor — and a posted message may remain in the test
+channel. A lost post that reconciliation removes (or proves absent)
+stays a retryable exit 1. Status 3 is distinct so the workflow fails at once instead
 of retrying: a later clean attempt must never read green over a message
 an earlier attempt left behind. Evidence carries row results, message ids
 and asserted values only — never the token, a request body or a remote
@@ -90,6 +93,12 @@ class Refused(Exception):
 
 class SmokeFail(Exception):
     """One check's fixed failure reason (exit 1 for that row)."""
+
+
+class UncertainOutcome(SmokeFail):
+    """A request whose server-side effect is unknown (transport loss, a
+    5xx or an unreadable answer to a POST). A post that fails this way may
+    have committed, so the caller must reconcile before any retry."""
 
 
 @dataclass
@@ -238,7 +247,8 @@ def call_json(transport, method, path, payload=None, expect=(200,)):
     try:
         status, body = transport(method, path, payload)
     except (OSError, http.client.HTTPException) as error:
-        raise SmokeFail(f"discord did not respond ({error.__class__.__name__})")
+        raise UncertainOutcome(
+            f"discord did not respond ({error.__class__.__name__})")
     if status == 401:
         raise SmokeFail("credential refused (401); rotation is an operator decision")
     if status == 403:
@@ -246,16 +256,20 @@ def call_json(transport, method, path, payload=None, expect=(200,)):
     if status == 429:
         raise SmokeFail("rate limited (429); rerun later")
     if status not in expect:
-        raise SmokeFail(f"discord answered {status}, expected {'/'.join(map(str, expect))}")
+        # A 5xx to a POST may still have committed the message.
+        fail = UncertainOutcome if method == "POST" and status >= 500 else SmokeFail
+        raise fail(f"discord answered {status}, expected {'/'.join(map(str, expect))}")
     if not body:
         return None
+    # An unreadable POST answer hides whether the message committed.
+    fail = UncertainOutcome if method == "POST" else SmokeFail
     if len(body) > BODY_CAP:
-        raise SmokeFail("discord answered over the body cap")
+        raise fail("discord answered over the body cap")
     try:
         return fenced._loads_bounded(
             body, object_pairs_hook=fenced._reject_duplicate_keys)
     except (ValueError, UnicodeDecodeError, RecursionError):
-        raise SmokeFail("discord answered with invalid JSON")
+        raise fail("discord answered with invalid JSON")
 
 
 def check_identity(transport, guild_id):
@@ -313,6 +327,51 @@ def assert_message(message, expected, application_id, channel_id, message_id):
         raise SmokeFail("read-back " + fault)
 
 
+def latest_message_id(transport, channel_id):
+    """Newest message id in the channel (the pre-post anchor), or None."""
+    messages = call_json(transport, "GET",
+                         f"/channels/{channel_id}/messages?limit=1")
+    if not isinstance(messages, list) or len(messages) > 1:
+        raise SmokeFail("channel history read answered without a message list")
+    if not messages:
+        return None
+    newest = messages[0]
+    if not isinstance(newest, dict) or not fenced.is_snowflake(newest.get("id")):
+        raise SmokeFail("channel history read answered without a valid message id")
+    return newest["id"]
+
+
+def reconcile_uncertain_post(transport, channel_id, application_id, anchor_id):
+    """Delete every test-bot message newer than the pre-post anchor.
+
+    Runs when a post's outcome is unknown: Discord may have committed it
+    without the row ever learning its id. The channel is a dedicated test
+    channel and the workflow's concurrency group serializes smokes, so
+    any newer test-bot message is this attempt's. Returns how many were
+    removed; raises SmokeFail when removal cannot be established.
+    """
+    path = f"/channels/{channel_id}/messages?limit=10"
+    if anchor_id is not None:
+        path += f"&after={anchor_id}"
+    messages = call_json(transport, "GET", path)
+    if not isinstance(messages, list):
+        raise SmokeFail("reconciliation read answered without a message list")
+    removed = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            raise SmokeFail("reconciliation read answered without message objects")
+        author = message.get("author")
+        if not isinstance(author, dict) or author.get("id") != application_id:
+            continue
+        if not fenced.is_snowflake(message.get("id")):
+            raise SmokeFail("reconciliation read answered without a valid message id")
+        call_json(transport, "DELETE",
+                  f"/channels/{channel_id}/messages/{message['id']}",
+                  expect=(204,))
+        removed += 1
+    return removed
+
+
 def smoke_one(transport, row_name, embed, expected, application_id, channel_id):
     """Post one embed, assert on the read-back (never the POST echo), delete."""
     started = time.monotonic()
@@ -328,14 +387,33 @@ def smoke_one(transport, row_name, embed, expected, application_id, channel_id):
     failure = None
 
     try:
+        anchor_id = latest_message_id(transport, channel_id)
+    except SmokeFail as error:
+        return done("fail", str(error))
+    try:
         posted = call_json(transport, "POST", f"/channels/{channel_id}/messages",
                            payload, expect=(200, 201))
         if not isinstance(posted, dict) or not fenced.is_snowflake(posted.get("id")):
-            raise SmokeFail("post answered without a valid message id")
+            raise UncertainOutcome("post answered without a valid message id")
         message_id = posted["id"]
         read_back = call_json(
             transport, "GET", f"/channels/{channel_id}/messages/{message_id}")
         assert_message(read_back, expected, application_id, channel_id, message_id)
+    except UncertainOutcome as error:
+        failure = str(error)
+        if message_id is None:
+            # The post may have committed unseen. Reconcile against the
+            # anchor before this row may fail retryably; if removal cannot
+            # be established, this is the no-retry cleanup class (exit 3).
+            try:
+                removed = reconcile_uncertain_post(
+                    transport, channel_id, application_id, anchor_id)
+                failure += f"; reconciled uncertain post ({removed} removed)"
+            except SmokeFail as reconcile_error:
+                cleanup_failed = True
+                failure += (f"; uncertain post could not be reconciled "
+                            f"({reconcile_error}); a message may remain in "
+                            f"the test channel")
     except SmokeFail as error:
         failure = str(error)
     if message_id is not None:

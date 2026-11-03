@@ -57,31 +57,47 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
-      - name: Generate the help embed payloads from the Rust builders
-        run: |
-          set -euo pipefail
-          cargo run --locked -p two-bot-discord --example help_embed_smoke_payloads -- "$RUNNER_TEMP/help-embed-payloads.json"
-          test -s "$RUNNER_TEMP/help-embed-payloads.json"
-      - name: Run the staging help embed smoke
+      # Binding gate first: while unconfigured (and not required) the run
+      # notice-passes here, before any toolchain or cargo step can fail the
+      # optional job and block certify-promotion. This step sees only
+      # whether the token secret is set, never its value.
+      - name: Decide whether the smoke is configured
+        id: gate
         env:
-          TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
+          HAS_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN != '' }}
           DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID: ${{ vars.DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID }}
           HELP_EMBED_SYNTHETIC_REQUIRED: ${{ vars.HELP_EMBED_SYNTHETIC_REQUIRED }}
-          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          if [ -z "${TWO_VOICE_SYNTHETIC_BOT_TOKEN:-}" ] || [ -z "${DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID:-}" ]; then
+          if [ "${HAS_TOKEN}" != "true" ] || [ -z "${DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID:-}" ]; then
             if [ "${HELP_EMBED_SYNTHETIC_REQUIRED:-false}" = "true" ]; then
               echo "::error::help embed smoke bindings missing and the gate is required (set HELP_EMBED_SYNTHETIC_REQUIRED=false to opt out)"
               exit 1
             fi
             echo "::notice::help embed smoke not configured yet (no test bot token or test channel); see docs/staging-help-embed-smoke.md"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+      - name: Install pinned Rust toolchain
+        if: steps.gate.outputs.configured == 'true'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
+        with:
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+      - name: Generate the help embed payloads from the Rust builders
+        if: steps.gate.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          cargo run --locked -p two-bot-discord --example help_embed_smoke_payloads -- "$RUNNER_TEMP/help-embed-payloads.json"
+          test -s "$RUNNER_TEMP/help-embed-payloads.json"
+      - name: Run the staging help embed smoke
+        if: steps.gate.outputs.configured == 'true'
+        env:
+          TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
+          DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID: ${{ vars.DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
           # Two retries absorb a transient Discord REST hiccup; three
           # failures fail the run. Exit 3 means a cleanup delete failed and
           # a message may remain in the test channel: fail at once, because

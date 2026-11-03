@@ -3485,10 +3485,14 @@ def help_embed_synthetic_errors(workflow):
     is the dedicated test bot token (the staging product bot token never
     enters GitHub), on the routed runner for job `help-embed-smoke`, with
     its own non-cancelling concurrency group and a 25 minute timeout (it
-    builds the payload example). Exactly five steps: pinned checkout
-    without persisted credentials, the pinned Rust toolchain, payload
-    generation from the reviewed example, one smoke step (the only holder
-    of the token) that runs the reviewed script, and the evidence upload.
+    builds the payload example). Exactly six steps: pinned checkout
+    without persisted credentials, a binding gate (sees only whether the
+    token secret is set, never its value) so an unconfigured optional run
+    notice-passes before any toolchain/cargo step can fail it, the pinned
+    Rust toolchain, payload generation from the reviewed example, one
+    smoke step (the only holder of the token value) that runs the reviewed
+    script, and the evidence upload. The toolchain, payload and smoke
+    steps run only when the gate reports the smoke configured.
     No wrangler, no production path, no staging Worker URL, no `set -x`.
     """
     name = "help-embed-synthetic.yml"
@@ -3531,19 +3535,35 @@ def help_embed_synthetic_errors(workflow):
             errors.append(f"{name}:help-embed-smoke: must not set {key}")
     steps = job.get("steps") or []
     runs = [step for step in steps if "run" in step]
-    if len(steps) != 5 or len(runs) != 2 \
-            or "help_embed_smoke_payloads" not in runs[0]["run"] \
+    gate = steps[1] if len(steps) > 1 else {}
+    if len(steps) != 6 or len(runs) != 3 \
+            or gate.get("id") != "gate" or "configured" not in str(gate.get("run") or "") \
+            or "help_embed_smoke_payloads" not in runs[1]["run"] \
             or "scripts/staging_help_embed_smoke.py" not in runs[-1]["run"]:
-        errors.append(f"{name}:help-embed-smoke: must be checkout, toolchain, payload generation, "
-                      "one smoke step of the reviewed script, evidence upload")
-    elif '"$status" = 3' not in runs[-1]["run"]:
-        # Exit 3 is the script's cleanup-failed signal; the retry loop must
-        # fail on it at once so a later clean attempt cannot read green
-        # over a message an earlier attempt left in the test channel.
-        errors.append(f"{name}:help-embed-smoke: retry loop must fail immediately on the "
-                      "cleanup-failed exit status 3")
+        errors.append(f"{name}:help-embed-smoke: must be checkout, binding gate, toolchain, "
+                      "payload generation, one smoke step of the reviewed script, evidence upload")
+    else:
+        if '"$status" = 3' not in runs[-1]["run"]:
+            # Exit 3 is the script's cleanup-failed signal; the retry loop must
+            # fail on it at once so a later clean attempt cannot read green
+            # over a message an earlier attempt left in the test channel.
+            errors.append(f"{name}:help-embed-smoke: retry loop must fail immediately on the "
+                          "cleanup-failed exit status 3")
+        # Everything after the gate must be skippable so an unconfigured
+        # optional run can never fail on a toolchain/cargo step.
+        for step in steps[2:5]:
+            if step.get("if") != "steps.gate.outputs.configured == 'true'":
+                errors.append(f"{name}:help-embed-smoke: toolchain, payload and smoke steps "
+                              "must run only when the gate reports configured")
+                break
     for step in steps:
-        if "secrets." in str(step) and step is not (runs[-1] if runs else None):
+        if "secrets." not in str(step):
+            continue
+        # The gate may test only whether the secret is set (one boolean
+        # expression, never the value); only the smoke step may hold it.
+        gate_boolean = (step is gate and str(step).count("secrets.") == 1
+                        and "secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN != ''" in str(step))
+        if not gate_boolean and step is not (runs[-1] if runs else None):
             errors.append(f"{name}:help-embed-smoke: only the smoke step may hold a secret")
     text = str(job).lower().replace(" ", "")
     for marker in ("wrangler", "production", "staging_worker_url", "tojson(secrets", "secrets[", "set-x",
@@ -6528,11 +6548,14 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["help-embed-smoke"].pop("if"),
             lambda w: w["jobs"]["help-embed-smoke"].__setitem__("environment", "staging"),
             lambda w: w["on"].__setitem__("push", None),
-            lambda w: w["jobs"]["help-embed-smoke"]["steps"][3].__setitem__("run", "wrangler deploy"),
+            lambda w: w["jobs"]["help-embed-smoke"]["steps"][4].__setitem__("run", "wrangler deploy"),
             lambda w: w["jobs"]["help-embed-smoke"]["steps"][0].__setitem__("env", {"T": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}),
-            lambda w: w["jobs"]["help-embed-smoke"]["steps"][2].__setitem__("run", "echo {} > payloads.json"),
-            lambda w: w["jobs"]["help-embed-smoke"]["steps"][3].__setitem__(
-                "run", w["jobs"]["help-embed-smoke"]["steps"][3]["run"].replace('"$status" = 3', '"$status" = 9')),
+            lambda w: w["jobs"]["help-embed-smoke"]["steps"][3].__setitem__("run", "echo {} > payloads.json"),
+            lambda w: w["jobs"]["help-embed-smoke"]["steps"][4].__setitem__(
+                "run", w["jobs"]["help-embed-smoke"]["steps"][4]["run"].replace('"$status" = 3', '"$status" = 9')),
+            lambda w: w["jobs"]["help-embed-smoke"]["steps"][2].pop("if"),
+            lambda w: w["jobs"]["help-embed-smoke"]["steps"][1]["env"].__setitem__(
+                "HAS_TOKEN", "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"),
         ):
             changed = copy.deepcopy(synthetic)
             mutate(changed)

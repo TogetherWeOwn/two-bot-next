@@ -47,7 +47,7 @@ class FakeDiscord:
     def __init__(self, app=TEST_BOT, bot=True, bot_guilds=(STAGING_GUILD,),
                  channel_guild=STAGING_GUILD,
                  channel_type=0, mutate_read=None, delete_status=204,
-                 me_status=200):
+                 me_status=200, post_timeout=False, reconcile_status=200):
         self.app = app
         self.bot = bot
         self.bot_guilds = bot_guilds
@@ -56,6 +56,9 @@ class FakeDiscord:
         self.mutate_read = mutate_read
         self.delete_status = delete_status
         self.me_status = me_status
+        self.post_timeout = post_timeout
+        self.reconcile_status = reconcile_status
+        self._timed_out = False
         self.calls = []
         self.messages = {}
         self.next_id = 1600000000000000000
@@ -72,12 +75,28 @@ class FakeDiscord:
             return 200, json.dumps(
                 {"id": CHANNEL, "guild_id": self.channel_guild,
                  "type": self.channel_type}).encode()
+        if method == "GET" and path.startswith(f"/channels/{CHANNEL}/messages?"):
+            from urllib.parse import parse_qs, urlparse
+            query = parse_qs(urlparse(path).query)
+            after = query.get("after", [None])[0]
+            limit = int(query.get("limit", ["50"])[0])
+            # The anchor read asks for 1; reconciliation asks for 10.
+            if limit != 1 and self.reconcile_status != 200:
+                return self.reconcile_status, b"{}"
+            listed = [m for m in self.messages.values()
+                      if after is None or int(m["id"]) > int(after)]
+            listed.sort(key=lambda m: int(m["id"]), reverse=True)
+            return 200, json.dumps(copy.deepcopy(listed[:limit])).encode()
         if method == "POST" and path == f"/channels/{CHANNEL}/messages":
             self.next_id += 1
             message = {"id": str(self.next_id), "channel_id": CHANNEL,
                        "author": {"id": self.app},
                        "embeds": copy.deepcopy(payload["embeds"])}
             self.messages[message["id"]] = message
+            if self.post_timeout and not self._timed_out:
+                # Discord committed the message but the response was lost.
+                self._timed_out = True
+                raise TimeoutError("response timed out after the post committed")
             return 201, json.dumps(message).encode()
         message_id = path.rsplit("/", 1)[-1]
         if method == "GET" and path == f"/channels/{CHANNEL}/messages/{message_id}":
@@ -153,8 +172,8 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         self.assertEqual({"parse": []}, posts[0][2]["allowed_mentions"])
         self.assertEqual({}, fake.messages, "both messages are deleted")
         methods = [call[0] for call in fake.calls]
-        self.assertEqual(["GET", "GET", "GET", "POST", "GET", "DELETE",
-                          "POST", "GET", "DELETE"], methods)
+        self.assertEqual(["GET", "GET", "GET", "GET", "POST", "GET", "DELETE",
+                          "GET", "POST", "GET", "DELETE"], methods)
         evidence = self.evidence_json()
         self.assertEqual("PASS", evidence["verdict"])
         self.assertEqual(["help", "help_topic"],
@@ -219,6 +238,26 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         self.assertEqual(2, len(fake.messages))
         evidence = self.evidence_json()
         self.assertTrue(all(row.get("cleanup_failed") for row in evidence["rows"]))
+
+    def test_timed_out_post_is_reconciled_and_removed(self):
+        # Discord committed the first post but its response timed out, so
+        # the row never learned the message id. Reconciliation against the
+        # pre-post anchor must find and delete it; the row still fails
+        # (exit 1, retryable) but nothing is left behind.
+        fake = FakeDiscord(post_timeout=True)
+        code, out = self.run_main(fake)
+        self.assertEqual(1, code)
+        self.assertIn("reconciled uncertain post", out)
+        self.assertEqual({}, fake.messages, "the timed-out post is removed")
+
+    def test_unreconciled_timed_out_post_uses_the_no_retry_exit_code(self):
+        # If reconciliation itself cannot run, a committed-but-unseen post
+        # may remain: that is the exit-3 cleanup class, never a retryable 1.
+        fake = FakeDiscord(post_timeout=True, reconcile_status=500)
+        code, out = self.run_main(fake)
+        self.assertEqual(3, code)
+        self.assertIn("could not be reconciled", out)
+        self.assertEqual(1, len(fake.messages))
 
     def test_fences_refuse_before_any_request(self):
         cases = {
