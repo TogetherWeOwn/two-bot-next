@@ -263,26 +263,29 @@ async fn discover_bots(
             None => continue,
         };
         match client.guild_member(guild_id, user_id).await {
-            Ok(response) => match response.model::<Member>().await {
-                Ok(member) if member.user.bot => {
-                    if !bots.contains(&candidate) {
-                        bots.push(candidate);
+            Ok(response) => {
+                let member: Result<Member, _> = response.model().await;
+                match member {
+                    Ok(member) if member.user.bot => {
+                        if !bots.contains(&candidate) {
+                            bots.push(candidate);
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::debug!(
+                            user_id = %candidate,
+                            "staging smoke reconcile: candidate is not a bot, skipped"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            user_id = %candidate,
+                            error = %error,
+                            "staging smoke reconcile: member unreadable, skipped"
+                        );
                     }
                 }
-                Ok(_) => {
-                    tracing::debug!(
-                        user_id = %candidate,
-                        "staging smoke reconcile: candidate is not a bot, skipped"
-                    );
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        user_id = %candidate,
-                        error = %error,
-                        "staging smoke reconcile: member unreadable, skipped"
-                    );
-                }
-            },
+            }
             Err(error) => {
                 tracing::debug!(
                     user_id = %candidate,
@@ -364,6 +367,7 @@ async fn create_channel(
     }
     let overwrites: Vec<ChannelPermissionOverwrite> = bots
         .iter()
+        .copied()
         .filter_map(Id::<UserMarker>::new_checked)
         .map(|user| ChannelPermissionOverwrite {
             allow: smoke_allow_bits(),
@@ -390,7 +394,7 @@ mod tests {
     use serde_json::json;
     use twilight_model::channel::ChannelType;
 
-    fn view(id: u64, name: &str, kind: ChannelType) -> SmokeChannelView<'static> {
+    fn view(id: u64, name: &str, kind: ChannelType) -> SmokeChannelView<'_> {
         SmokeChannelView { id, name, kind }
     }
 
