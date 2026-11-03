@@ -2628,6 +2628,25 @@ const VOICE_MOVE_SOURCE_ID: &str = "100000000000000031";
 const VOICE_MOVE_TARGET_ID: &str = "100000000000000032";
 const VOICE_MOVE_ROLE_ID: &str = "100000000000000020";
 const VOICE_MOVE_OWNER_ID: &str = "123456789012345678";
+/// One mover id per PATCH-issuing executor test: the Discord send guard is
+/// process-global and keys its learned 429 deadline by method plus full path
+/// (guild and member included), so the 429 the limited test provokes would
+/// refuse a sibling test's PATCH on the same member id when `cargo test`
+/// runs the binary in one process. Distinct ids keep every PATCH route
+/// unique however the scheduler interleaves the tests; `nextest` isolates
+/// processes and never sees this.
+const VOICE_MOVE_DENIED_ID: &str = "100000000000000043";
+const VOICE_MOVE_LIMITED_ID: &str = "100000000000000044";
+const VOICE_MOVE_STALE_ID: &str = "100000000000000045";
+
+/// Mover ids the loopback double snapshots: the seeded member plus one per
+/// PATCH-issuing executor test.
+fn voice_move_known_member(user_id: &str) -> bool {
+    matches!(
+        user_id,
+        VOICE_MOVE_MEMBER_ID | VOICE_MOVE_DENIED_ID | VOICE_MOVE_LIMITED_ID | VOICE_MOVE_STALE_ID
+    )
+}
 
 /// Gateway cache for the voice-move executor tests: the moving member sits in
 /// the source room and a second member holds the target room (so a limit of
@@ -2635,6 +2654,10 @@ const VOICE_MOVE_OWNER_ID: &str = "123456789012345678";
 /// receiver's snowflake shape gate, so this guild uses the shape-valid move
 /// fixtures above; no AFK room, so neither room reads as gone.
 fn seeded_voice_move_cache() -> Arc<DefaultInMemoryCache> {
+    seeded_voice_move_cache_for(VOICE_MOVE_MEMBER_ID)
+}
+
+fn seeded_voice_move_cache_for(member_id: &str) -> Arc<DefaultInMemoryCache> {
     let cache = voice_snapshot::new_shared_cache();
     let mut guild: Value =
         serde_json::from_str(include_str!("../../tests/fixtures/voice_guild.json"))
@@ -2646,12 +2669,12 @@ fn seeded_voice_move_cache() -> Arc<DefaultInMemoryCache> {
         voice_channel(VOICE_MOVE_TARGET_ID, 2, "alpha", 1, 0),
     ]);
     guild["members"] = serde_json::json!([
-        voice_member(VOICE_MOVE_MEMBER_ID, false),
+        voice_member(member_id, false),
         voice_member(VOICE_MOVE_SECOND_ID, false),
     ]);
     guild["voice_states"] = serde_json::json!([
         {"guild_id": staging_guild(), "channel_id": VOICE_MOVE_SOURCE_ID,
-         "user_id": VOICE_MOVE_MEMBER_ID,
+         "user_id": member_id,
          "session_id": "move-s1", "deaf": false, "mute": false,
          "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false},
         {"guild_id": staging_guild(), "channel_id": VOICE_MOVE_TARGET_ID,
@@ -2754,7 +2777,7 @@ impl MockVoiceApi {
                     }
                     let members_prefix = format!("{guild_path}/members/");
                     if let Some(user_id) = path.strip_prefix(members_prefix.as_str()) {
-                        if method == axum::http::Method::PATCH && user_id == VOICE_MOVE_MEMBER_ID {
+                        if method == axum::http::Method::PATCH && voice_move_known_member(user_id) {
                             let mut headers = HeaderMap::new();
                             if let Some(wait) = config.patch_retry_after {
                                 headers.insert(header::RETRY_AFTER, wait.parse().unwrap());
@@ -2768,7 +2791,7 @@ impl MockVoiceApi {
                         }
                         let member =
                             |id: &str| json!({"user": {"id": id}, "roles": [VOICE_MOVE_ROLE_ID]});
-                        if user_id == VOICE_MOVE_BOT_ID || user_id == VOICE_MOVE_MEMBER_ID {
+                        if user_id == VOICE_MOVE_BOT_ID || voice_move_known_member(user_id) {
                             return (StatusCode::OK, HeaderMap::new(), Json(member(user_id)));
                         }
                         return (StatusCode::NOT_FOUND, HeaderMap::new(), Json(Value::Null));
@@ -2958,9 +2981,9 @@ async fn voice_move_executor_denied_patch_is_bot_not_permitted() {
         ..MockVoiceApiConfig::default()
     })
     .await;
-    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let body = voice_move_body(VOICE_MOVE_DENIED_ID, VOICE_MOVE_TARGET_ID);
     let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
-    let receipt = voice_move_executor(&mock, seeded_voice_move_cache())
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache_for(VOICE_MOVE_DENIED_ID))
         .execute_move(&request)
         .await
         .expect("denied PATCH answers");
@@ -2976,9 +2999,9 @@ async fn voice_move_executor_limited_patch_carries_discord_wait() {
         ..MockVoiceApiConfig::default()
     })
     .await;
-    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let body = voice_move_body(VOICE_MOVE_LIMITED_ID, VOICE_MOVE_TARGET_ID);
     let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
-    let receipt = voice_move_executor(&mock, seeded_voice_move_cache())
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache_for(VOICE_MOVE_LIMITED_ID))
         .execute_move(&request)
         .await
         .expect("limited PATCH answers");
@@ -2997,9 +3020,9 @@ async fn voice_move_executor_stale_patch_regathers_to_bot_not_permitted() {
         ..MockVoiceApiConfig::default()
     })
     .await;
-    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let body = voice_move_body(VOICE_MOVE_STALE_ID, VOICE_MOVE_TARGET_ID);
     let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
-    let receipt = voice_move_executor(&mock, seeded_voice_move_cache())
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache_for(VOICE_MOVE_STALE_ID))
         .execute_move(&request)
         .await
         .expect("stale PATCH answers");

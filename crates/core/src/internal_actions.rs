@@ -4779,18 +4779,13 @@ mod tests {
         let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
         let mut buckets = TokenBuckets::new();
         let mut clock = ClockGuard::new();
-        #[allow(clippy::too_many_arguments)]
-        fn attempt(
-            member: Option<&str>,
-            nonce: &str,
-            timestamp: &str,
-            now_ms: u64,
-            keys: &KeyRing,
-            flags: &InternalFlags,
-            nonces: &mut NonceCache,
-            buckets: &mut TokenBuckets,
-            clock: &mut ClockGuard,
-        ) -> Result<AuthDecision, ActionError> {
+        // A closure, not an inner fn: it borrows the ring, flags and
+        // fences, so the helper takes four arguments and needs no waiver.
+        let mut attempt = |member: Option<&str>,
+                           nonce: &str,
+                           timestamp: &str,
+                           now_ms: u64|
+         -> Result<AuthDecision, ActionError> {
             let raw = match member {
                 Some(id) => format!(
                     r#"{{"action":"voice.move_member","discord_id":"{id}","channel_id":"123456789012345679"}}"#
@@ -4804,8 +4799,8 @@ mod tests {
             authorize(
                 &headers,
                 raw.as_bytes(),
-                keys,
-                flags,
+                &keys,
+                &flags,
                 true,
                 true,
                 SKEW_SECONDS,
@@ -4814,23 +4809,13 @@ mod tests {
                 buckets,
                 clock,
             )
-        }
+        };
         let now_ms = 1_720_000_000_000;
         let timestamp = (now_ms / 1000).to_string();
         for _ in 0..6 {
             let nonce = test_nonce();
-            let decision = attempt(
-                Some("123456789012345678"),
-                &nonce,
-                &timestamp,
-                now_ms,
-                &keys,
-                &flags,
-                &mut nonces,
-                &mut buckets,
-                &mut clock,
-            )
-            .expect("six moves fit the member budget");
+            let decision = attempt(Some("123456789012345678"), &nonce, &timestamp, now_ms)
+                .expect("six moves fit the member budget");
             assert_eq!(decision.action, "voice.move_member");
             // The audit key material travels on the decision, hex of the nonce.
             assert_eq!(decision.nonce_hash, body_hash(nonce.as_bytes()));
@@ -4840,11 +4825,6 @@ mod tests {
             &test_nonce(),
             &timestamp,
             now_ms,
-            &keys,
-            &flags,
-            &mut nonces,
-            &mut buckets,
-            &mut clock,
         )
         .expect_err("seventh move is limited");
         assert_eq!(err.code, ErrorCode::RateLimited);
@@ -4857,11 +4837,6 @@ mod tests {
             &test_nonce(),
             &timestamp,
             now_ms,
-            &keys,
-            &flags,
-            &mut nonces,
-            &mut buckets,
-            &mut clock,
         )
         .expect("member buckets are independent");
         // A full window refills the member budget.
@@ -4872,11 +4847,6 @@ mod tests {
             &test_nonce(),
             &later_ts,
             later_ms,
-            &keys,
-            &flags,
-            &mut nonces,
-            &mut buckets,
-            &mut clock,
         )
         .expect("five-minute window refills");
     }
