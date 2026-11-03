@@ -477,7 +477,7 @@ fn bound_holds_across_windows() {
                 Rejection::new(
                     ErrorCode::Replayed,
                     configured("web"),
-                    ActionLabel::new(Some(IMPLEMENTED_ACTIONS[i % 19])),
+                    ActionLabel::new(Some(IMPLEMENTED_ACTIONS[i % IMPLEMENTED_ACTIONS.len()])),
                 ),
                 now_ms,
             )

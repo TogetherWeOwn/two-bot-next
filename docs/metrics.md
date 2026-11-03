@@ -432,7 +432,7 @@ as dynamic labels.
   `crates/bot/src/internal_action_http.rs` (`announcement.post` →
   `announcement`, `event.*` → `event`, `settings.*` → `settings`,
   `moderation.*` → `moderation`, `role.assign`/`guild.add_member` →
-  `membership`, `voice.snapshot` → `voice`, everything else → `other`). `outcome` is `executed` or one
+  `membership`, `voice.snapshot`/`voice.move_member` → `voice`, everything else → `other`). `outcome` is `executed` or one
   of the bounded refusal classes (`auth_failure`, `unknown_key`,
   `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`,
   `action_disabled`, `malformed_body`, `conflict`, `upstream`, `internal`).

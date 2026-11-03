@@ -110,6 +110,22 @@ The terminal audit copies the receipt's `resource_id`, `affected` and
 guild alone as its subject — still names its Discord event and result word in
 the audit trail, and an early-stopped purge names why it stopped. Intent-phase
 audits keep those columns NULL, exactly like the uncompleted receipt they mirror.
+
+`record_voice_move` is the claimless counterpart for the self-only
+`voice.move_member` verb: the intent row starts `completed` and the log gains
+a single `terminal` row in the same transaction, with no `intent`-phase row.
+Repeats re-evaluate live voice state and converge on the `already_in_room`
+no-op, so there is no claim to replay and no idempotency key to collide on;
+the (caller, nonce) conflict refuses a second write for one delivery. The
+audit key material is `sha256_hex(nonce)` carried on `AuthDecision.nonce_hash`.
+`VoiceMoveOutcome` is the closed nine-word result set (`moved`,
+`already_in_room`, `not_connected`, `not_permitted`, `room_full`,
+`room_gone`, `bot_not_permitted`, `rate_limited`, `discord_unavailable`,
+migration `0471`): the seven domain answers audit as `success`/200 (the move
+counts `affected` 1, the rest 0), while `rate_limited`/429 and
+`discord_unavailable`/502 keep `affected` NULL like every other refusal combo.
+The move columns (`from_channel_id`, `to_channel_id`, `request_id`, migration
+`0471`) ride the same audit copy, staying NULL on every older row.
 The adapter persists the whole typed response. It intentionally accepts neither
 `serde_json::Value` nor `ActionError` (which contains free-text log details).
 Receiver/executor follow-ups must map these typed scalars to their wire envelopes

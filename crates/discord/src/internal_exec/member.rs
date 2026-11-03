@@ -20,6 +20,7 @@ pub mod store;
 
 pub const ADD_MEMBER_TIMEOUT_MS: u64 = 1500;
 pub const ROLE_TIMEOUT_MS: u64 = 2000;
+pub const VOICE_MOVE_TIMEOUT_MS: u64 = 2000;
 
 /// Keep proof of an unsent mutation until the durable caller disposes its claim.
 /// Public callers still receive the legacy scalar-only `ActionError` envelope.
@@ -76,6 +77,20 @@ impl MemberOutcome {
     }
 }
 
+/// Discord `Retry-After` seconds, defaulting to 1 and never 0: a
+/// `Retry-After: 0` invites a hot loop. Shared by the member refusal mapper
+/// and the voice-move classifier.
+fn discord_retry_after_secs(response: &RawResponse) -> u64 {
+    response
+        .retry_after_header
+        .as_deref()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .unwrap_or(1.0)
+        .ceil()
+        .max(1.0) as u64
+}
+
 /// Legacy internal/discordActions.ts throwForStatus, not moderation's body-based
 /// retry parser. Only safe status/header scalars reach the public error.
 pub fn member_status_error(response: &RawResponse) -> Option<ActionError> {
@@ -93,21 +108,13 @@ pub fn member_status_error(response: &RawResponse) -> Option<ActionError> {
         ));
     }
     if status == 429 {
-        let retry = response
-            .retry_after_header
-            .as_deref()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .filter(|s| s.is_finite() && *s >= 0.0)
-            .unwrap_or(1.0)
-            .ceil()
-            .max(1.0) as u64;
         return Some(
             ActionError::new(
                 ErrorCode::RateLimited,
                 "Discord rate-limited this request",
                 "discord_rate_limited",
             )
-            .with_retry_after(retry),
+            .with_retry_after(discord_retry_after_secs(response)),
         );
     }
     if status >= 500 {
@@ -154,22 +161,45 @@ struct RoleSnapshot {
     managed: bool,
 }
 
+/// Status-distinguishing result of the voice-move PATCH. Only the status and
+/// the Discord `Retry-After` travel back: never a provider body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceMovePatch {
+    /// Discord applied the move (2xx).
+    Moved,
+    /// 403: the local pre-checks passed but Discord refused — the bot's live
+    /// grant disagrees with the evaluated snapshot.
+    Denied,
+    /// 400/404: member or room state raced the PATCH; re-evaluate live state.
+    Stale,
+    /// 429 with the Discord-supplied wait.
+    Limited { retry_after_secs: u64 },
+    /// Anything else (5xx, redirect, transport): outcome unknown, retryable.
+    Unavailable,
+}
+
+fn move_patch_outcome(response: &RawResponse) -> VoiceMovePatch {
+    match response.status {
+        200..300 => VoiceMovePatch::Moved,
+        403 => VoiceMovePatch::Denied,
+        400 | 404 => VoiceMovePatch::Stale,
+        429 => VoiceMovePatch::Limited {
+            retry_after_secs: discord_retry_after_secs(response),
+        },
+        _ => VoiceMovePatch::Unavailable,
+    }
+}
+
 impl ActionExecutor {
     // Only building the request depends on its Twilight builder type. Keep the
-    // bounded exchange and refusal handling in one concrete async state machine.
-    #[inline(never)]
-    async fn member_request(
+    // bounded exchange in one concrete async state machine; callers own the
+    // refusal mapping (`member_request` for legacy throw-for-status, the
+    // voice-move classifier for status-distinguishing PATCH answers).
+    async fn discord_send(
         &self,
-        request: Result<Request, twilight_http::Error>,
+        request: Request,
         timeout_ms: u64,
     ) -> Result<RawResponse, MemberError> {
-        let request = request.map_err(|_| {
-            ActionError::new(
-                ErrorCode::Malformed,
-                "Invalid Discord request",
-                "discord_request_invalid",
-            )
-        })?;
         let (response, _) = self
             .send_with_timeout_for(&request, None, Duration::from_millis(timeout_ms))
             .await
@@ -186,6 +216,23 @@ impl ActionExecutor {
                     "discord_unreachable",
                 )),
             })?;
+        Ok(response)
+    }
+
+    #[inline(never)]
+    async fn member_request(
+        &self,
+        request: Result<Request, twilight_http::Error>,
+        timeout_ms: u64,
+    ) -> Result<RawResponse, MemberError> {
+        let request = request.map_err(|_| {
+            ActionError::new(
+                ErrorCode::Malformed,
+                "Invalid Discord request",
+                "discord_request_invalid",
+            )
+        })?;
+        let response = self.discord_send(request, timeout_ms).await?;
         if let Some(error) = member_status_error(&response) {
             tracing::warn!(code = error.code.as_str(), reason = %error.log_reason,
                 "internal member action refused");
@@ -365,11 +412,103 @@ impl ActionExecutor {
         response.complete().await;
         Ok(MemberOutcome::Assigned)
     }
+
+    /// PATCH /guilds/{guild}/members/{user} with `channel_id`: the whole
+    /// voice move in one bounded attempt. The receiver owns gates, ordering
+    /// and retries; this reports what Discord said, never a guess. Only a
+    /// 2xx retains its permit to the receipt boundary, like the other
+    /// mutations; every other answer drops it. Source:
+    /// <https://docs.discord.com/developers/resources/guild#modify-guild-member>
+    pub async fn move_voice_member(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+        channel_id: &str,
+    ) -> Result<VoiceMovePatch, ActionError> {
+        let mut response = self
+            .discord_send(
+                self.inner
+                    .factory
+                    .update_guild_member(
+                        numeric_id(guild_id)?.cast(),
+                        numeric_id(member_id)?.cast(),
+                    )
+                    .channel_id(Some(numeric_id(channel_id)?.cast()))
+                    .try_into_request()
+                    .map_err(|_| {
+                        ActionError::new(
+                            ErrorCode::Malformed,
+                            "Invalid Discord request",
+                            "discord_request_invalid",
+                        )
+                    })?,
+                VOICE_MOVE_TIMEOUT_MS,
+            )
+            .await
+            .map_err(MemberError::into_action_error)?;
+        let outcome = move_patch_outcome(&response);
+        if outcome == VoiceMovePatch::Moved {
+            response.complete().await;
+        }
+        Ok(outcome)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw(status: u16, retry_after: Option<&str>) -> RawResponse {
+        RawResponse {
+            status,
+            retry_after_header: retry_after.map(str::to_owned),
+            body: vec![],
+            completion: None,
+        }
+    }
+
+    #[test]
+    fn voice_move_patch_classifies_statuses() {
+        assert_eq!(move_patch_outcome(&raw(200, None)), VoiceMovePatch::Moved);
+        assert_eq!(move_patch_outcome(&raw(204, None)), VoiceMovePatch::Moved);
+        assert_eq!(move_patch_outcome(&raw(403, None)), VoiceMovePatch::Denied);
+        assert_eq!(move_patch_outcome(&raw(400, None)), VoiceMovePatch::Stale);
+        assert_eq!(move_patch_outcome(&raw(404, None)), VoiceMovePatch::Stale);
+        assert_eq!(
+            move_patch_outcome(&raw(429, Some("7"))),
+            VoiceMovePatch::Limited {
+                retry_after_secs: 7
+            }
+        );
+        assert_eq!(
+            move_patch_outcome(&raw(429, None)),
+            VoiceMovePatch::Limited {
+                retry_after_secs: 1
+            }
+        );
+        assert_eq!(
+            move_patch_outcome(&raw(429, Some("garbage"))),
+            VoiceMovePatch::Limited {
+                retry_after_secs: 1
+            }
+        );
+        assert_eq!(
+            move_patch_outcome(&raw(502, None)),
+            VoiceMovePatch::Unavailable
+        );
+        assert_eq!(
+            move_patch_outcome(&raw(301, None)),
+            VoiceMovePatch::Unavailable
+        );
+    }
+
+    #[test]
+    fn discord_retry_after_never_zero_or_nan() {
+        assert_eq!(discord_retry_after_secs(&raw(429, Some("0"))), 1);
+        assert_eq!(discord_retry_after_secs(&raw(429, Some("1.2"))), 2);
+        assert_eq!(discord_retry_after_secs(&raw(429, Some("NaN"))), 1);
+        assert_eq!(discord_retry_after_secs(&raw(429, Some("-3"))), 1);
+    }
 
     #[tokio::test]
     async fn invalid_member_request_keeps_its_redacted_error() {
