@@ -10,6 +10,7 @@ are separate operations: this command does not replace that check.
 """
 
 import argparse
+import errno
 import json
 import os
 from pathlib import Path
@@ -24,22 +25,31 @@ EXAMPLE = "generate_command_reference"
 # and never carry it.
 BOUNDED_POOL_POLICY = Path("/paperclip/.cache/two-bot-next-bounded/policy.json")
 
+# Lookup failures that mean "no policy here", as opposed to a broken lookup.
+_POLICY_ABSENT = (errno.ENOENT, errno.ENOTDIR)
+
 
 def bounded_pool_present():
-    """True when the controller's bounded Cargo pool policy exists."""
+    """True when the controller's bounded Cargo pool policy exists.
+
+    Raises OSError when the lookup itself fails, so the caller fails closed
+    instead of silently falling back to plain cargo.
+    """
     try:
         return BOUNDED_POOL_POLICY.is_file()
-    except OSError:
-        return False
+    except OSError as exc:
+        if exc.errno in _POLICY_ABSENT:
+            return False
+        raise
 
 
 def controller_selected(explicit_flag):
     """True when the generator build must go through bounded Cargo admission.
 
-    Explicit opt-in (--controller or TWO_CARGO_CONTROLLER=1) always wins, and
-    an explicit TWO_CARGO_CONTROLLER=0 always opts out. Otherwise the bounded
-    pool policy selects controller mode implicitly, except on hosted CI
-    (GITHUB_ACTIONS), which keeps running plain cargo.
+    An explicit --controller flag or TWO_CARGO_CONTROLLER=1 always wins, and
+    TWO_CARGO_CONTROLLER=0 opts out unless --controller is passed. Otherwise
+    the bounded pool policy selects controller mode implicitly, except on
+    hosted CI (GITHUB_ACTIONS), which keeps running plain cargo.
     """
     forced = os.environ.get("TWO_CARGO_CONTROLLER")
     if explicit_flag or forced == "1":
@@ -101,7 +111,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     # PAPERCLIP_RUN_ID alone never selects controller mode: other agent
     # runtimes set it but have no bounded cache pool.
-    controller = controller_selected(args.controller)
+    try:
+        controller = controller_selected(args.controller)
+    except OSError:
+        error("controller_policy_unreadable",
+              "Fix the pool policy permissions, or set TWO_CARGO_CONTROLLER "
+              "explicitly; refusing to fall back to plain cargo.")
+        return 1
     cargo = ([sys.executable, str(ROOT / "scripts/cargo_cache.py"), "run", "--"]
              if controller else ["cargo"])
     executable, status = build_executable(

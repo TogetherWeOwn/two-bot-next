@@ -117,6 +117,8 @@ with mock.patch.object(unittest.TextTestRunner, "run") as run:
             ([], {"TWO_CARGO_CONTROLLER": "1"}, True, True),
             (["--controller"], {}, False, True),
             (["--controller"], {}, True, True),
+            # An explicit flag wins over a conflicting environment opt-out.
+            (["--controller"], {"TWO_CARGO_CONTROLLER": "0"}, False, True),
             # Implicit selection follows the bounded pool policy only.
             ([], {}, False, False),
             ([], {}, True, True),
@@ -124,6 +126,7 @@ with mock.patch.object(unittest.TextTestRunner, "run") as run:
             # Hosted CI keeps plain cargo even where a pool policy exists.
             ([], {"GITHUB_ACTIONS": "true"}, True, False),
             ([], {"GITHUB_ACTIONS": "true", "TWO_CARGO_CONTROLLER": "1"}, True, True),
+            (["--controller"], {"GITHUB_ACTIONS": "true"}, True, True),
         )
         for argv, environment, pool, controller in cases:
             with self.subTest(argv=argv, environment=environment, pool=pool):
@@ -139,6 +142,33 @@ with mock.patch.object(unittest.TextTestRunner, "run") as run:
                 cargo = build.call_args.args[0]
                 self.assertEqual("scripts/cargo_cache.py" in " ".join(cargo), controller)
                 self.assertEqual(cargo == ["cargo"], not controller)
+
+    def test_unreadable_pool_policy_fails_closed(self):
+        generator = load_script("generate_command_reference")
+        clean = {key: value for key, value in os.environ.items()
+                 if key not in ("PAPERCLIP_RUN_ID", "TWO_CARGO_CONTROLLER",
+                                "GITHUB_ACTIONS")}
+        with mock.patch.dict(os.environ, clean, clear=True), \
+                mock.patch.object(generator, "bounded_pool_present",
+                                  side_effect=PermissionError(13, "denied")), \
+                mock.patch.object(generator, "build_executable") as build:
+            self.assertEqual(generator.main([]), 1)
+        build.assert_not_called()
+
+    def test_pool_probe_reads_the_filesystem(self):
+        generator = load_script("generate_command_reference")
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "policy.json"
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", missing):
+                self.assertFalse(generator.bounded_pool_present())
+            missing.write_text("{}", encoding="utf-8")
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", missing):
+                self.assertTrue(generator.bounded_pool_present())
+            denied = mock.MagicMock(spec=Path)
+            denied.is_file.side_effect = PermissionError(13, "denied")
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", denied), \
+                    self.assertRaises(PermissionError):
+                generator.bounded_pool_present()
 
     def test_consumer_census_covers_standalone_coverage_and_filtered_bot_tests(self):
         for command in (
