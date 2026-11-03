@@ -29,6 +29,8 @@ use two_bot_core::{
     SlashOutcome,
 };
 
+use crate::brand::brand_embed;
+
 /// A routed interaction: what the core router decided, with the wire
 /// identity the executor needs to answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +144,7 @@ pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
             allowed_mentions: Some(Default::default()),
-            embeds: Some(vec![Embed {
+            embeds: Some(vec![brand_embed(Embed {
                 author: None,
                 color: None,
                 description: Some(text),
@@ -156,7 +158,7 @@ pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
                 title: None,
                 url: None,
                 video: None,
-            }]),
+            })]),
             flags: Some(MessageFlags::EPHEMERAL),
             ..Default::default()
         }),
@@ -188,7 +190,7 @@ pub fn help_detail_response(detail: String) -> InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
             allowed_mentions: Some(Default::default()),
-            embeds: Some(vec![Embed {
+            embeds: Some(vec![brand_embed(Embed {
                 author: None,
                 color: None,
                 description: Some(description),
@@ -202,7 +204,7 @@ pub fn help_detail_response(detail: String) -> InteractionResponse {
                 title: None,
                 url: None,
                 video: None,
-            }]),
+            })]),
             flags: Some(MessageFlags::EPHEMERAL),
             ..Default::default()
         }),
@@ -1269,9 +1271,15 @@ mod help_response_tests {
             );
             assert!(wire["data"]["content"].is_null());
             assert_eq!(wire["data"]["embeds"].as_array().unwrap().len(), 1);
-            let description = wire["data"]["embeds"][0]["description"]
-                .as_str()
-                .expect("embed description");
+            let embed = &wire["data"]["embeds"][0];
+            assert_eq!(
+                embed["color"].as_u64(),
+                Some(crate::brand::BRAND_EMBED_COLOR as u64),
+                "help embed carries the brand color"
+            );
+            assert_eq!(embed["footer"]["text"], crate::brand::BRAND_FOOTER_TEXT);
+            assert_eq!(embed["footer"]["icon_url"], crate::brand::BRAND_ICON_URL);
+            let description = embed["description"].as_str().expect("embed description");
             assert_eq!(description, text, "no truncation at the REST boundary");
             // The RSVP note carries a copyable event-link example whose
             // slashes tokenize as path fragments, not commands; exclude it
@@ -1349,6 +1357,15 @@ mod help_response_tests {
             assert!(wire["data"]["content"].is_null());
             assert_eq!(wire["data"]["embeds"].as_array().expect("embeds").len(), 1);
             assert_eq!(wire["data"]["embeds"][0]["description"], detail);
+            assert_eq!(
+                wire["data"]["embeds"][0]["color"].as_u64(),
+                Some(crate::brand::BRAND_EMBED_COLOR as u64),
+                "detail embed carries the brand color"
+            );
+            assert_eq!(
+                wire["data"]["embeds"][0]["footer"]["icon_url"],
+                crate::brand::BRAND_ICON_URL
+            );
         }
     }
 

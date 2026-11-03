@@ -11,6 +11,7 @@ pub mod audit_mirror;
 mod automation_admission;
 pub mod automod;
 pub mod automod_activation;
+pub mod brand;
 pub mod channel_access;
 #[cfg(feature = "db")]
 pub mod channel_moderation;
