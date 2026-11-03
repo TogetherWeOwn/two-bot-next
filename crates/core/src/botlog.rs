@@ -421,7 +421,10 @@ mod tests {
             "",
             "not-base64!!",
             "cursor-0000",
-            &BotlogCursor::zero().encode()[..4],
+            // A truncated prefix of a valid token: the zero cursor encodes
+            // to exactly four chars, so the two-char slice is genuinely
+            // truncated (it decodes to "0" with no cursor separator).
+            &BotlogCursor::zero().encode()[..2],
         ] {
             assert!(
                 BotlogCursor::decode(bad).is_err(),

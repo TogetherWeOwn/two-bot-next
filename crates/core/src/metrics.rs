@@ -453,7 +453,10 @@ pub const AUTOMOD_DECISION_OUTCOMES: &[&str] = &[
 /// maps each bounded `action` verb to one family: `announcement.post` to
 /// `announcement`, `event.*` to `event`, `settings.*` to `settings`,
 /// `moderation.*` to `moderation`, `role.assign`/`guild.add_member` to
-/// `membership`, `voice.snapshot` to `voice`, `botlog.read` to `botlog`;
+/// `membership`, `voice.snapshot` to `voice`, `botlog.read` to `event`
+/// (contract §6 reads ride the event family: a dedicated family would cost
+/// twelve scrape series against the 1 KiB scrape-byte reserve guarded by
+/// `eventsub_classification_growth_fits_the_scrape_byte_budget`);
 /// anything else (including unwired catalog verbs and unknown verbs)
 /// collapses to `other`. No key id,
 /// token, body or request bytes ever become a family label.
@@ -469,7 +472,6 @@ pub const INTERNAL_ACTION_FAMILIES: &[&str] = &[
     "moderation",
     "membership",
     "voice",
-    "botlog",
     "other",
 ];
 /// Receiver outcomes for `two_bot_internal_actions_total{family,outcome}`:
@@ -3781,7 +3783,7 @@ mod tests {
         ));
         assert!(text
             .contains("two_bot_internal_actions_total{family=\"event\",outcome=\"executed\"} 0\n"));
-        // Fixed cardinality: eight families by twelve outcomes.
+        // Fixed cardinality: seven families by twelve outcomes.
         let mut series = std::collections::HashSet::new();
         for line in text.lines().filter(|line| !line.starts_with('#')) {
             let (key, value) = line.rsplit_once(' ').unwrap();

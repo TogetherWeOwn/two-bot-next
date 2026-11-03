@@ -114,10 +114,10 @@ const EVENT_GATE_WAIT: Duration = Duration::from_secs(8);
 /// Bounded receiver family for `two_bot_internal_actions_total{family,outcome}`
 /// (TOG-20119). Maps the already-bounded [`ActionLabel`] to one of
 /// `metrics::INTERNAL_ACTION_FAMILIES`: `announcement.post` to
-/// `announcement`, `event.*` to `event`, `settings.*` to `settings`,
-/// `moderation.*` to `moderation`, `role.assign`/`guild.add_member` to
-/// `membership`, `voice.snapshot` to `voice`, `botlog.read` to `botlog`;
-/// anything else (including
+/// `announcement`, `event.*` plus `botlog.read` to `event`, `settings.*` to
+/// `settings`, `moderation.*` to `moderation`,
+/// `role.assign`/`guild.add_member` to `membership`, `voice.snapshot` to
+/// `voice`; anything else (including
 /// unwired catalog verbs and unknown verbs) to `other`. Takes only the
 /// bounded label, never raw request bytes, so no secret, token, key id or
 /// body can become a metric label.
@@ -125,11 +125,10 @@ fn internal_family(action: ActionLabel) -> &'static str {
     match action {
         ActionLabel::Known(name) => match name {
             "announcement.post" => "announcement",
-            "event.read" | "event.upsert" | "event.cancel" => "event",
+            "event.read" | "event.upsert" | "event.cancel" | "botlog.read" => "event",
             "settings.get" | "settings.set" => "settings",
             "role.assign" | "guild.add_member" => "membership",
             "voice.snapshot" => "voice",
-            "botlog.read" => "botlog",
             _ if name.starts_with("moderation.") => "moderation",
             _ => "other",
         },

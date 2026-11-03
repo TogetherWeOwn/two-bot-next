@@ -21,17 +21,13 @@ test("alert input dimensions match the Rust always-emitted scrape contract", () 
 });
 
 const isOptionalLine = (line: string) => Object.hasOwn(ALERT_OPTIONAL_INPUT_LABELS, line.split(/[{ ]/)[0]!);
-// The `voice` and `botlog` internal-actions families validate when present
-// but are never required: a rolled-back pre-`voice`/pre-`botlog` container
-// must still scrape.
+// The `voice` internal-actions family validates when present but is never
+// required: a rolled-back pre-`voice` container must still scrape.
 const isVoiceFamilyLine = (line: string) =>
   line.startsWith("two_bot_internal_actions_total{") && line.includes('family="voice"');
-const isBotlogFamilyLine = (line: string) =>
-  line.startsWith("two_bot_internal_actions_total{") && line.includes('family="botlog"');
-const isRollbackTolerantFamilyLine = (line: string) => isVoiceFamilyLine(line) || isBotlogFamilyLine(line);
 
 test("every current required label combination is required, not merely one row per family", () => {
-  const lines = metricsLines().filter((line) => !isOptionalLine(line) && !isRollbackTolerantFamilyLine(line));
+  const lines = metricsLines().filter((line) => !isOptionalLine(line) && !isVoiceFamilyLine(line));
   for (let i = 0; i < lines.length; i++) {
     assert.equal(parseAlertScrape(lines.filter((_, j) => j !== i).join("\n")), null, lines[i]);
   }
@@ -41,7 +37,7 @@ test("older exposition without the voice family still parses", () => {
   const withoutVoice = metricsLines().filter((line) => !isVoiceFamilyLine(line)).join("\n");
   const samples = parseAlertScrape(withoutVoice);
   assert.ok(samples);
-  assert.equal(samples.filter((s) => s.name === "two_bot_internal_actions_total").length, 7 * 12);
+  assert.equal(samples.filter((s) => s.name === "two_bot_internal_actions_total").length, 6 * 12);
   assert.ok(parseAlertScrape(metricsBody()));
 });
 
@@ -54,24 +50,6 @@ test("a partially present voice family fails the scrape", () => {
   assert.ok(voiceIndex >= 0);
   assert.equal(parseAlertScrape(lines.filter((_, j) => j !== voiceIndex).join("\n")), null);
   assert.ok(parseAlertScrape(lines.filter((line) => !isVoiceFamilyLine(line)).join("\n")));
-});
-
-test("older exposition without the botlog family still parses", () => {
-  const withoutBotlog = metricsLines().filter((line) => !isBotlogFamilyLine(line)).join("\n");
-  const samples = parseAlertScrape(withoutBotlog);
-  assert.ok(samples);
-  assert.equal(samples.filter((s) => s.name === "two_bot_internal_actions_total").length, 7 * 12);
-  assert.ok(parseAlertScrape(metricsBody()));
-});
-
-test("a partially present botlog family fails the scrape", () => {
-  // All-or-nothing like `voice` above: eleven of twelve botlog rows is a
-  // failed scrape while zero of twelve is a rolled-back container.
-  const lines = metricsLines();
-  const botlogIndex = lines.findIndex(isBotlogFamilyLine);
-  assert.ok(botlogIndex >= 0);
-  assert.equal(parseAlertScrape(lines.filter((_, j) => j !== botlogIndex).join("\n")), null);
-  assert.ok(parseAlertScrape(lines.filter((line) => !isBotlogFamilyLine(line)).join("\n")));
 });
 
 test("older exposition without the optional gauges still parses", () => {
