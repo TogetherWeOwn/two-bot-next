@@ -12,9 +12,8 @@
 use two_bot_core::commands::{merge_commands, CustomCommand};
 use two_bot_core::custom_commands::{
     capture_prefix_args, render_template, validate_args, validate_template, ArgsError,
-    TemplateContext, TemplateError, ARGS_MALFORMED_REASON, ARGS_OPTION_NAME,
-    ARGS_TOO_LONG_REASON, ARGS_TOO_LONG_REPLY, INVALID_ARGS_REPLY, MAX_ARGS_UNITS,
-    MAX_RENDERED_CHARS,
+    TemplateContext, TemplateError, ARGS_MALFORMED_REASON, ARGS_OPTION_NAME, ARGS_TOO_LONG_REASON,
+    ARGS_TOO_LONG_REPLY, INVALID_ARGS_REPLY, MAX_ARGS_UNITS, MAX_RENDERED_CHARS,
 };
 use two_bot_core::message_safety::neutralize_mentions;
 
@@ -141,9 +140,11 @@ fn prefix_remainder_is_the_args_input_before_the_bound() {
         capture_prefix_args("!quote  keep  spacing\nand lines "),
         "keep  spacing\nand lines "
     );
-    let remainder = capture_prefix_args(&format!("!quote {}", "x".repeat(500)));
+    let boundary_input = format!("!quote {}", "x".repeat(500));
+    let remainder = capture_prefix_args(&boundary_input);
     validate_args(remainder).expect("500-unit remainder renders");
-    let overflow = capture_prefix_args(&format!("!quote {}", "x".repeat(501)));
+    let overflow_input = format!("!quote {}", "x".repeat(501));
+    let overflow = capture_prefix_args(&overflow_input);
     assert_eq!(validate_args(overflow), Err(ArgsError::TooLong));
 }
 

@@ -477,6 +477,20 @@ pub struct MergedRegistry {
     pub withheld: Vec<String>,
 }
 
+/// The published definition for one enabled custom command: the saved
+/// description plus exactly one optional `arguments` string for `{args}`
+/// (advertise-plus-enforce: `max_length` is a client UX hint only; the
+/// server-side UTF-16 unit count in `MAX_ARGS_UNITS` is authoritative and the
+/// run path refuses over-long input).
+pub fn custom_command_definition(cmd: &CustomCommand) -> CommandDefinition {
+    CommandDefinition::new(&cmd.name, &cmd.description).options(vec![CommandOption::new(
+        ARGS_OPTION_NAME,
+        "Text echoed wherever the saved response uses {args}",
+        CommandOptionType::String,
+    )
+    .max_length(MAX_ARGS_UNITS as u32)])
+}
+
 /// [`merge_commands`] with the overflow reported. Builtins always publish; a
 /// builtin set over the ceiling is a build defect and fails. Custom commands
 /// fill the remaining slots in input order (the store lists them by name), and
@@ -512,18 +526,7 @@ pub fn merge_registry(
             withheld.push(cmd.name.clone());
             continue;
         }
-        // Every custom command publishes one optional `arguments` string for
-        // `{args}` (advertise-plus-enforce: `max_length` is a client UX hint
-        // only; the server-side UTF-16 unit count in `MAX_ARGS_UNITS` is
-        // authoritative and the run path refuses over-long input).
-        merged.push(
-            CommandDefinition::new(&cmd.name, &cmd.description).options(vec![CommandOption::new(
-                ARGS_OPTION_NAME,
-                "Text echoed wherever the saved response uses {args}",
-                CommandOptionType::String,
-            )
-            .max_length(MAX_ARGS_UNITS as u32)]),
-        );
+        merged.push(custom_command_definition(cmd));
     }
     Ok(MergedRegistry {
         commands: merged,
@@ -689,7 +692,7 @@ mod tests {
             let mut expected = core_commands().into_iter().chain(builtins.iter().cloned()).collect::<Vec<_>>();
             for cmd in &custom {
                 if cmd.enabled && !expected.iter().any(|d| d.name == cmd.name) {
-                    expected.push(CommandDefinition::new(&cmd.name, &cmd.description));
+                    expected.push(custom_command_definition(cmd));
                 }
             }
             let actual = merge_registry(&[builtins, duplicates], &custom);

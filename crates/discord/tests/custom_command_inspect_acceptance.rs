@@ -1217,7 +1217,10 @@ async fn inspect_preview_renders_sample_as_args_input_without_sending_or_auditin
     );
     let draft = observe(&runtime, &mock, &draft, Some("TWO")).await;
     assert_eq!(
-        view_body(&private_content(&draft), "Draft preview — not saved or published"),
+        view_body(
+            &private_content(&draft),
+            "Draft preview — not saved or published"
+        ),
         "Echo dry"
     );
     let overflow = observe(
@@ -1228,8 +1231,7 @@ async fn inspect_preview_renders_sample_as_args_input_without_sending_or_auditin
     )
     .await;
     assert!(
-        private_content(&overflow)
-            .contains("sample arguments must be at most 500 characters"),
+        private_content(&overflow).contains("sample arguments must be at most 500 characters"),
         "existing sample bound and correction are unchanged"
     );
     let after = definitions(db.pool()).await;
