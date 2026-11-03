@@ -86,9 +86,12 @@ is a bot get the overwrite. If the setting is unset, empty, or holds no
 staging-guild bot member, the reconcile logs an error naming the setting
 and skips the overwrite while still reporting the channel.
 
-On every staging boot the reconcile emits one structured info line with
-the channel id and the outcome (`created`, `already_present` or
-`overwrite_ensured`). A channel id is a public snowflake and safe to log.
+On every successful staging reconciliation the reconcile emits one
+structured info line with the channel id and the outcome (`created`,
+`already_present` or `overwrite_ensured`). A failed or timed-out pass logs
+an error instead. A channel id is a public snowflake and safe to log. If
+database initialization fails, boot drains the in-flight pass within a
+bounded budget before exiting; the next healthy boot retries it.
 The operator reads that id from the staging boot log and places it in
 `DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID`, then sets
 `HELP_EMBED_SYNTHETIC_REQUIRED=true`.

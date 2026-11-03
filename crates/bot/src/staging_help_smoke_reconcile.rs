@@ -149,8 +149,10 @@ pub fn find_smoke_channel_id(channels: &[SmokeChannelView<'_>]) -> Option<u64> {
 
 /// Bot ids whose member overwrite is missing or wrong, given existing
 /// `(user_id, allow_bits, deny_bits)` member rows and the required bits
-/// from [`smoke_allow_bits`]. A row covers a bot only when it allows every
-/// required bit and denies none of them.
+/// from [`smoke_allow_bits`]. A row covers a bot only when it allows exactly
+/// the required bits and denies none of them: a broader pre-existing grant
+/// is rewritten to the smoke-channel contract, while an unrelated deny is
+/// never the reason to keep a row that already allows exactly the contract.
 #[must_use]
 pub fn bots_needing_overwrite(existing: &[(u64, u64, u64)], bot_ids: &[u64]) -> Vec<u64> {
     let required = smoke_allow_bits().bits();
@@ -159,21 +161,28 @@ pub fn bots_needing_overwrite(existing: &[(u64, u64, u64)], bot_ids: &[u64]) -> 
         .copied()
         .filter(|bot| {
             !existing.iter().any(|(id, allow, deny)| {
-                *id == *bot && (allow & required) == required && (deny & required) == 0
+                *id == *bot && *allow == required && (deny & required) == 0
             })
         })
         .collect()
 }
 
 /// Token-only entrypoint, called at boot after the command-registry sync.
-/// Spawns a detached background task and returns immediately, so a slow
-/// Discord never delays gateway startup or database init. Every path logs
-/// and boot continues; failures carry an `error_class` with redacted details
-/// (raw Discord errors can contain credential-bearing URLs).
-pub fn maybe_reconcile_on_boot(token: Option<String>, guild_id: Option<u64>) {
+/// Spawns a detached background task and returns its handle immediately, so
+/// a slow Discord never delays gateway startup or database init. Callers
+/// retain the handle to drain an in-flight pass within a bounded budget on
+/// startup-failure exits; dropping it leaves the detached task running.
+/// Every path logs and boot continues; failures carry an `error_class` with
+/// redacted details (raw Discord errors can contain credential-bearing URLs).
+/// A reconcile pass runs on every staging boot, so an abandoned pass is
+/// retried by the supervisor's next healthy restart.
+pub fn maybe_reconcile_on_boot(
+    token: Option<String>,
+    guild_id: Option<u64>,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !reconcile_enabled_from_env(guild_id) {
         tracing::debug!("staging help-embed smoke reconcile skipped: gate closed");
-        return;
+        return None;
     }
     let token = match token {
         Some(token) if !token.is_empty() => token,
@@ -182,7 +191,7 @@ pub fn maybe_reconcile_on_boot(token: Option<String>, guild_id: Option<u64>) {
                 error_class = "reconcile_token_missing",
                 "staging help-embed smoke reconcile skipped: DISCORD_TOKEN is missing"
             );
-            return;
+            return None;
         }
     };
     let guild = match guild_id {
@@ -192,11 +201,11 @@ pub fn maybe_reconcile_on_boot(token: Option<String>, guild_id: Option<u64>) {
                 error_class = "reconcile_guild_missing",
                 "staging help-embed smoke reconcile skipped: guild is not configured"
             );
-            return;
+            return None;
         }
     };
     let candidates = std::env::var(SYNTHETIC_IDS_VAR).ok();
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         match tokio::time::timeout(
             RECONCILE_TIMEOUT,
             reconcile_once(token.as_str(), guild, candidates.as_deref(), None),
@@ -223,7 +232,22 @@ pub fn maybe_reconcile_on_boot(token: Option<String>, guild_id: Option<u64>) {
                 );
             }
         }
-    });
+    }))
+}
+
+/// Upper bound for draining an in-flight reconcile on a startup-failure
+/// exit. The happy path never waits; only a failed boot pays this budget
+/// before the supervisor restarts and retries the pass.
+const RECONCILE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Drain an in-flight reconcile within [`RECONCILE_DRAIN_TIMEOUT`], for
+/// startup-failure exits after the detached spawn. A pass that finishes in
+/// budget is kept; anything slower is abandoned and retried on the next
+/// healthy boot. Never fails boot: drops straight through to the exit.
+pub async fn drain_reconcile_on_failure(handle: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = handle {
+        let _ = tokio::time::timeout(RECONCILE_DRAIN_TIMEOUT, handle).await;
+    }
 }
 
 /// Build the token-only REST client. `proxy_override` (or `DISCORD_API_BASE`
@@ -232,12 +256,11 @@ pub fn maybe_reconcile_on_boot(token: Option<String>, guild_id: Option<u64>) {
 /// misconfigured `DISCORD_API_BASE` can never route the bot token to an
 /// untrusted host (same fence as `HyperTransport`: loopback-only overrides).
 fn client_for(token: &str, proxy_override: Option<&str>) -> Result<TwilightClient, String> {
-    let mut builder = TwilightClient::builder()
-        .token(token.to_owned())
-        .ratelimiter(None);
+    let mut builder = TwilightClient::builder().token(token.to_owned());
     let proxy = proxy_override
         .map(str::to_owned)
         .or_else(|| std::env::var("DISCORD_API_BASE").ok());
+    let mut proxied = false;
     if let Some(base) = proxy {
         let base = base.trim().to_owned();
         if base.is_empty() {
@@ -248,9 +271,15 @@ fn client_for(token: &str, proxy_override: Option<&str>) -> Result<TwilightClien
         }
         if let Some(host) = base.strip_prefix("http://") {
             builder = builder.proxy(host.to_owned(), true);
+            proxied = true;
         } else {
             return Err("staging smoke Discord API override refused: non-loopback host".to_owned());
         }
+    }
+    if proxied {
+        // The loopback double handles its own pacing; direct Discord calls
+        // keep Twilight's default rate limiter.
+        builder = builder.ratelimiter(None);
     }
     Ok(builder.build())
 }
@@ -559,6 +588,17 @@ mod tests {
             bots_needing_overwrite(&[(10, required, 0), (11, 0, 0)], &[10, 11]),
             vec![11]
         );
+        // A broader pre-existing grant is rewritten to the exact contract.
+        assert_eq!(
+            bots_needing_overwrite(&[(10, required | 8, 0)], &[10]),
+            vec![10]
+        );
+        // An unrelated deny is preserved: exact allow plus a deny outside
+        // the contract still counts as covered, so no write clears it.
+        assert_eq!(
+            bots_needing_overwrite(&[(10, required, 8)], &[10]),
+            Vec::<u64>::new()
+        );
     }
 
     #[test]
@@ -571,8 +611,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn api_override_refuses_non_loopback_before_network() {
+    // Builds a Twilight client, which needs a Tokio runtime reactor even
+    // with the loopback-double limiter disabled: keep this async.
+    #[tokio::test]
+    async fn api_override_refuses_non_loopback_before_network() {
         assert!(client_for("fixture-token", Some("https://discord.com")).is_err());
         assert!(client_for("fixture-token", Some("https://evil.invalid")).is_err());
         assert!(client_for(
@@ -589,6 +631,13 @@ mod tests {
     fn gate_closed_boot_returns_without_network() {
         // TWO_DEPLOY_ENV is unset in test: only the debug arm runs.
         assert!(!reconcile_enabled_from_env(Some(staging_guild())));
+    }
+
+    #[test]
+    fn gate_closed_boot_spawns_no_task() {
+        // Gate closed (marker unset): no handle, no network, no token use.
+        assert!(maybe_reconcile_on_boot(None, None).is_none());
+        assert!(maybe_reconcile_on_boot(Some("fixture-token".to_owned()), None).is_none());
     }
 
     fn member_doc(user_id: &str, bot: bool) -> serde_json::Value {

@@ -348,7 +348,10 @@ async fn run(cli_args: &[String]) {
     // deployment marker and staging guild both match, and never blocks or
     // fails boot. Spawned detached so a slow Discord never delays gateway
     // startup or database init. Needs the token alone, never the database.
-    staging_help_smoke_reconcile::maybe_reconcile_on_boot(
+    // The handle is retained so a startup-failure exit below can drain an
+    // in-flight pass within a bounded budget instead of abandoning it; the
+    // happy path never waits on it, and every staging boot retries the pass.
+    let smoke_reconcile = staging_help_smoke_reconcile::maybe_reconcile_on_boot(
         config
             .discord_token
             .as_ref()
@@ -370,6 +373,11 @@ async fn run(cli_args: &[String]) {
                 Some(store)
             }
             _ => {
+                // Drain the in-flight smoke reconcile within a bounded
+                // budget so this failed boot never abandons a channel
+                // create or overwrite mid-flight; the supervisor restart
+                // retries the pass on the next healthy boot.
+                staging_help_smoke_reconcile::drain_reconcile_on_failure(smoke_reconcile).await;
                 tracing::error!(
                     startup_phase = "database_init",
                     error_class = "database_connect_failed",
