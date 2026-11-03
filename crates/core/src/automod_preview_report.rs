@@ -196,7 +196,7 @@ pub const PREVIEW_RATE_LIMITED_REPLY: &str = "Automod preview rate limit reached
 /// Generic line when the verdict is suppressed (audit failure, timeout,
 /// abandoned claim): no verdict is exposed (§6).
 pub const PREVIEW_UNAVAILABLE_REPLY: &str =
-    "Automod preview is temporarily unavailable. No verdict was recorded.";
+    "Automod preview is temporarily unavailable. No verdict can be shown.";
 
 /// Render one ephemeral verdict reply. Built only from fixed templates plus
 /// the verdict fields and the pre-rendered `currency_iso` timestamp: the
