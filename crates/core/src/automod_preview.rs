@@ -116,7 +116,7 @@ pub const AUTOMOD_PREVIEW_ATTACHMENTS_MAX_FILES: usize = 10;
 pub fn automod_preview_definition() -> CommandDefinition {
     CommandDefinition::new(
         "automod-preview",
-        "Privately preview which automod filter would decide sample text. Test the smallest synthetic phrase; do not paste real member messages containing personal data.",
+        "Preview which automod filter fires on sample text. Synthetic only; do not paste real member text.",
     )
     .permissions(PERM_MANAGE_GUILD)
     .options(vec![

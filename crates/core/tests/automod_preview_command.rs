@@ -53,6 +53,11 @@ fn definition_has_the_spec_option_shape() {
         "help warns against pasting member messages: {}",
         def.description
     );
+    assert!(
+        def.description.len() <= 100,
+        "Discord caps command descriptions at 100 chars; the publish slice ships this text: {}",
+        def.description
+    );
     assert_eq!(
         def.default_member_permissions,
         Some(PERM_MANAGE_GUILD.to_string()),
