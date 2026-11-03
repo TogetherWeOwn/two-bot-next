@@ -23,8 +23,11 @@ DM pair (`reminder.send`, `place_offer.send`, one shared allowlist flag
 `TWO_INTERNAL_ALLOW_MEMBER_NOTIFY` with a required `Idempotency-Key`: the site
 owns scheduling and waitlist state, the bot only delivers a templated DM with
 a `/e/{event_key}` deep link, the consent backstop refuses suppressed members
-before any send, and a per-member bucket (burst 3, 10/day) caps each member on
-top of the per-caller bucket), and the
+before any send, and a shared per-member budget (burst 3, at most 10 in any
+rolling 24 hours, including the initial burst) caps both verbs across callers
+on top of the per-caller bucket. Notification member IDs must be canonical,
+nonzero `u64` snowflakes: leading-zero aliases and overflow are refused before
+member-budget, consent, audit or transport use), and the
 channel-moderation verbs (`moderation.purge`, `moderation.slowmode`,
 `moderation.lockdown`, `moderation.unlock`), regardless of the core action
 catalogue's broader defaults. Every other verb stays refused by the per-effect
@@ -445,7 +448,7 @@ Success (`200` only, `result` always an object, no `error` key):
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
-| reminder.send / place_offer.send | `{outcome}` | `sent`/`dm_unavailable`; `dm_unavailable` (closed DMs, blocked bot, member not in guild, or suppressed member — a suppressed refusal carries the `suppressed` audit scalar) is a 200 that consumes no place; the wire carries no `message_id`. A per-member bucket (burst 3, 10/day, keyed `notify:<discord_id>`) answers `rate_limited` before any claim when exhausted |
+| reminder.send / place_offer.send | `{outcome}` | `sent`/`dm_unavailable`; `dm_unavailable` (closed DMs, blocked bot, member not in guild, or suppressed member — a suppressed refusal carries the `suppressed` audit scalar) is a 200 that consumes no place; the wire carries no `message_id`. A shared per-member budget (burst 3, refill 10/day and a strict ceiling of 10 admissions per rolling 24 hours, keyed `notify:<discord_id>`) answers `rate_limited` with `Retry-After` before any claim when exhausted; denied attempts charge neither member limit |
 | moderation.\* | `{outcome[, affected]}` | |
 
 Refusals keep their code, status and retry policy with the fixed message

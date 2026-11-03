@@ -385,6 +385,52 @@ async fn notify_suppressed_member_answers_dm_unavailable_without_sending() {
 }
 
 #[tokio::test]
+async fn notify_zero_padded_alias_cannot_message_a_suppressed_member() {
+    let Some(db) = database().await else { return };
+    let _flag = MEMBER_NOTIFY_FLAG_LOCK.lock().await;
+    set_member_notify_flag(true);
+    sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ($1, $2)")
+        .bind(staging_guild())
+        .bind(MEMBER)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let app = router(state(db.pool().clone(), effect.clone()));
+    for (raw, intent) in [
+        (reminder_payload(), "intent-notify-alias-reminder"),
+        (offer_payload(), "intent-notify-alias-offer"),
+    ] {
+        let mut payload: Value = serde_json::from_str(&raw).unwrap();
+        payload["discord_id"] = json!(format!("0{MEMBER}"));
+        let (status, _, refused) =
+            answer(app.clone(), signed(&payload.to_string(), "old", intent)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused["error"]["code"], "malformed");
+    }
+    assert_eq!(effect.calls(), 0, "numeric aliases never reach Discord");
+    let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM internal_idempotency")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(claims, 0, "aliases never create separate audit identities");
+    let (status, _, body) = answer(
+        app,
+        signed(
+            &offer_payload(),
+            "old",
+            "intent-notify-canonical-suppressed",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"], json!({"outcome": "dm_unavailable"}));
+    assert_eq!(effect.calls(), 0);
+    set_member_notify_flag(false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn notify_consent_lookup_releases_a_single_connection_before_finalizing() {
     let Some(db) = database().await else { return };
     let _flag = MEMBER_NOTIFY_FLAG_LOCK.lock().await;
@@ -453,11 +499,16 @@ async fn notify_member_bucket_rate_limits_after_burst() {
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let app = router(state(db.pool().clone(), effect.clone()));
     let raw = reminder_payload();
-    // Burst 3 goes through on the per-member bucket, under the caller's
-    // 20-burst key bucket.
+    // Both verbs and caller keys share one member budget, under each
+    // caller's independent 20-burst key bucket.
     for n in 0..3 {
         let intent = format!("intent-notify-burst-{n}");
-        let (status, _, body) = answer(app.clone(), signed(&raw, "old", &intent)).await;
+        let (payload, key) = if n == 1 {
+            (offer_payload(), "new")
+        } else {
+            (raw.clone(), "old")
+        };
+        let (status, _, body) = answer(app.clone(), signed(&payload, key, &intent)).await;
         assert_eq!(status, StatusCode::OK, "{intent}");
         assert_eq!(body["result"], json!({"outcome": "sent"}));
     }
@@ -473,7 +524,8 @@ async fn notify_member_bucket_rate_limits_after_burst() {
     assert_eq!(refused["error"]["retryable"], true);
     assert_eq!(effect.calls(), 3, "capped members never reach Discord");
     let claims: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM internal_idempotency WHERE action = 'reminder.send'",
+        "SELECT COUNT(*) FROM internal_idempotency \
+         WHERE action IN ('reminder.send', 'place_offer.send')",
     )
     .fetch_one(db.pool())
     .await

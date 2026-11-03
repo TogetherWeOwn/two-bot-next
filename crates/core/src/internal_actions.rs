@@ -43,7 +43,7 @@
 //! field — [`AuthDecision`] carries the parsed body to the caller and the
 //! `Seen`-style log scalars stay with the route.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use hmac::{Hmac, KeyInit, Mac as _};
 use serde_json::{Map, Value};
@@ -465,14 +465,17 @@ pub const ADD_MEMBER_BUCKET: BucketSpec = BucketSpec {
     refill_per_second: 0.5,
 };
 
-/// Member-notify DM cap (contract v2 §7): burst 3, at most 10/day, keyed
-/// `notify:<discord_id>` on top of the per-caller bucket. A repeat DM is a
-/// second message to a real member, so the budget is deliberately tight;
-/// over-limit answers `rate_limited` before any claim or Discord call.
+/// Member-notify burst and sustained rate. [`TokenBuckets::take_notify`]
+/// additionally counts the burst against a strict rolling-day ceiling.
 pub const NOTIFY_MEMBER_BUCKET: BucketSpec = BucketSpec {
     capacity: 3.0,
     refill_per_second: 10.0 / 86_400.0,
 };
+
+const NOTIFY_MEMBER_DAY_MS: u64 = 86_400_000;
+const NOTIFY_MEMBER_DAY_LIMIT: usize = 10;
+const NOTIFY_MEMBER_TOKEN_MS: u64 = NOTIFY_MEMBER_DAY_MS / NOTIFY_MEMBER_DAY_LIMIT as u64;
+const NOTIFY_MEMBER_BURST_MS: u64 = 3 * NOTIFY_MEMBER_TOKEN_MS;
 
 /// Bucket verdict. `retry_after_secs` is only meaningful when denied — and is
 /// never 0, because a `Retry-After: 0` invites a hot loop.
@@ -488,6 +491,14 @@ pub struct BucketDecision {
 #[derive(Debug, Clone, Default)]
 pub struct TokenBuckets {
     buckets: HashMap<String, BucketState>,
+    notify_buckets: HashMap<String, NotifyBucketState>,
+}
+
+#[derive(Debug, Clone)]
+struct NotifyBucketState {
+    credit_ms: u64,
+    updated_ms: u64,
+    admissions: VecDeque<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -530,6 +541,59 @@ impl TokenBuckets {
         BucketDecision {
             allowed: false,
             retry_after_secs: wait.max(1),
+        }
+    }
+
+    /// Share one burst-3, at-most-10-per-rolling-day budget across both notify
+    /// verbs and all callers. `key` is `notify:<canonical discord_id>`. Denied
+    /// attempts consume neither a burst token nor a daily admission.
+    pub fn take_notify(&mut self, key: &str, now_ms: u64) -> BucketDecision {
+        let bucket = self
+            .notify_buckets
+            .entry(key.to_owned())
+            .or_insert_with(|| NotifyBucketState {
+                credit_ms: NOTIFY_MEMBER_BURST_MS,
+                updated_ms: now_ms,
+                admissions: VecDeque::new(),
+            });
+        // Integer credits preserve exact refill boundaries even when denied
+        // attempts split one interval into many small updates.
+        bucket.credit_ms = bucket
+            .credit_ms
+            .saturating_add(now_ms.saturating_sub(bucket.updated_ms))
+            .min(NOTIFY_MEMBER_BURST_MS);
+        bucket.updated_ms = bucket.updated_ms.max(now_ms);
+        while bucket.admissions.front().is_some_and(|&admitted_ms| {
+            bucket.updated_ms.saturating_sub(admitted_ms) >= NOTIFY_MEMBER_DAY_MS
+        }) {
+            bucket.admissions.pop_front();
+        }
+        let burst_wait_ms = if bucket.credit_ms < NOTIFY_MEMBER_TOKEN_MS {
+            bucket
+                .updated_ms
+                .saturating_sub(now_ms)
+                .saturating_add(NOTIFY_MEMBER_TOKEN_MS - bucket.credit_ms)
+        } else {
+            0
+        };
+        let daily_wait_ms = if bucket.admissions.len() >= NOTIFY_MEMBER_DAY_LIMIT {
+            bucket.admissions[0]
+                .saturating_add(NOTIFY_MEMBER_DAY_MS)
+                .saturating_sub(now_ms)
+        } else {
+            0
+        };
+        if burst_wait_ms > 0 || bucket.admissions.len() >= NOTIFY_MEMBER_DAY_LIMIT {
+            return BucketDecision {
+                allowed: false,
+                retry_after_secs: burst_wait_ms.max(daily_wait_ms).div_ceil(1000).max(1),
+            };
+        }
+        bucket.credit_ms -= NOTIFY_MEMBER_TOKEN_MS;
+        bucket.admissions.push_back(bucket.updated_ms);
+        BucketDecision {
+            allowed: true,
+            retry_after_secs: 0,
         }
     }
 }
@@ -1496,6 +1560,20 @@ fn reject_notify_body(body: &Map<String, Value>) -> Result<(), ActionError> {
     Ok(())
 }
 
+/// Consent, budgets, audit and Discord must all use the same member identity.
+/// Keep notification IDs canonical rather than accepting numeric aliases.
+fn validate_notify_member(body: &Map<String, Value>) -> Result<&str, ActionError> {
+    let member = require_snowflake(body, "discord_id")?;
+    if member.starts_with('0') || member.parse::<u64>().is_err() {
+        return Err(ActionError::new(
+            ErrorCode::Malformed,
+            "\"discord_id\" must be a canonical nonzero Discord id",
+            "bad_discord_id",
+        ));
+    }
+    Ok(member)
+}
+
 /// Validated `reminder.send` facts: the member, the event key for the deep
 /// link, the v1-only kind, the normalized Zulu start, and the event name.
 /// The site owns scheduling; the bot owns only this delivery.
@@ -1510,7 +1588,7 @@ pub struct ReminderSendRequest<'a> {
 impl<'a> ReminderSendRequest<'a> {
     pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
         reject_notify_body(body)?;
-        let discord_id = require_snowflake(body, "discord_id")?;
+        let discord_id = validate_notify_member(body)?;
         let event_key = validate_notify_event_key(body)?;
         let kind = require_field_str(body, "kind")?;
         if kind != REMINDER_KIND_STARTING_SOON {
@@ -1567,7 +1645,7 @@ pub struct PlaceOfferSendRequest<'a> {
 impl<'a> PlaceOfferSendRequest<'a> {
     pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
         reject_notify_body(body)?;
-        let discord_id = require_snowflake(body, "discord_id")?;
+        let discord_id = validate_notify_member(body)?;
         let event_key = validate_notify_event_key(body)?;
         let event_name = validate_notify_event_name(body)?;
         let expires_at = require_timestamp(body, "expires_at")?;
@@ -2138,11 +2216,7 @@ fn authorize_burned(
         } else {
             PlaceOfferSendRequest::validate(&body)?.discord_id()
         };
-        let per_member = buckets.take(
-            &format!("notify:{member}"),
-            NOTIFY_MEMBER_BUCKET,
-            verified.guarded_ms,
-        );
+        let per_member = buckets.take_notify(&format!("notify:{member}"), verified.guarded_ms);
         if !per_member.allowed {
             return Err(ActionError::new(
                 ErrorCode::RateLimited,
@@ -2967,22 +3041,87 @@ mod tests {
     fn notify_member_bucket_bursts_three_then_refills_daily() {
         let mut buckets = TokenBuckets::new();
         for _ in 0..3 {
-            assert!(buckets.take("notify:123", NOTIFY_MEMBER_BUCKET, 0).allowed);
+            assert!(buckets.take_notify("notify:123", 0).allowed);
         }
-        let denied = buckets.take("notify:123", NOTIFY_MEMBER_BUCKET, 0);
+        let denied = buckets.take_notify("notify:123", 0);
         assert!(!denied.allowed);
         assert!(denied.retry_after_secs >= 1);
         // Other members keep their own budget.
-        assert!(buckets.take("notify:456", NOTIFY_MEMBER_BUCKET, 0).allowed);
+        assert!(buckets.take_notify("notify:456", 0).allowed);
         // One token refills per 8640 seconds (10/day).
+        assert!(buckets.take_notify("notify:123", 8_640_000).allowed);
+        assert!(!buckets.take_notify("notify:123", 8_640_000).allowed);
+    }
+
+    #[test]
+    fn notify_member_bucket_never_allows_more_than_ten_in_a_rolling_day() {
+        let mut buckets = TokenBuckets::new();
+        let mut allowed = 0;
+        for now_ms in std::iter::repeat_n(0, 3).chain((1..=9).map(|step| step * 8_640_000)) {
+            if buckets.take_notify("notify:123", now_ms).allowed {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 10, "the burst must count toward the daily cap");
+    }
+
+    #[test]
+    fn notify_daily_ceiling_expires_without_charging_denied_attempts() {
+        let mut buckets = TokenBuckets::new();
+        for now_ms in std::iter::repeat_n(0, 3).chain((1..=7).map(|step| step * 8_640_000)) {
+            assert!(buckets.take_notify("notify:123", now_ms).allowed);
+        }
+        let denied = buckets.take_notify("notify:123", 69_120_000);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 17_280);
+        assert!(buckets.take_notify("notify:456", 69_120_000).allowed);
+        for now_ms in [86_399_000, 86_399_001, 86_399_999] {
+            let denied = buckets.take_notify("notify:123", now_ms);
+            assert!(!denied.allowed);
+            assert_eq!(denied.retry_after_secs, 1);
+        }
+        // The initial three admissions expire exactly at the boundary. Daily
+        // refusals must not have spent any of the refilled burst tokens.
+        for _ in 0..3 {
+            assert!(
+                buckets
+                    .take_notify("notify:123", NOTIFY_MEMBER_DAY_MS)
+                    .allowed
+            );
+        }
+        let denied = buckets.take_notify("notify:123", NOTIFY_MEMBER_DAY_MS);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 8640);
+        assert_eq!(buckets.notify_buckets["notify:123"].admissions.len(), 10);
+    }
+
+    #[test]
+    fn notify_daily_ceiling_and_burst_survive_clock_rollback() {
+        let mut buckets = TokenBuckets::new();
+        for now_ms in std::iter::repeat_n(0, 3).chain((1..=7).map(|step| step * 8_640_000)) {
+            assert!(buckets.take_notify("notify:123", now_ms).allowed);
+        }
+        let denied = buckets.take_notify("notify:123", 59_480_000);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 26_920);
+        for _ in 0..3 {
+            assert!(
+                buckets
+                    .take_notify("notify:123", NOTIFY_MEMBER_DAY_MS)
+                    .allowed
+            );
+        }
+        let denied = buckets.take_notify("notify:123", NOTIFY_MEMBER_DAY_MS - 1000);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 8641);
         assert!(
-            buckets
-                .take("notify:123", NOTIFY_MEMBER_BUCKET, 8_640_000)
+            !buckets
+                .take_notify("notify:123", NOTIFY_MEMBER_DAY_MS)
                 .allowed
         );
         assert!(
-            !buckets
-                .take("notify:123", NOTIFY_MEMBER_BUCKET, 8_640_000)
+            buckets
+                .take_notify("notify:123", NOTIFY_MEMBER_DAY_MS + 8_640_000)
                 .allowed
         );
     }
@@ -3566,6 +3705,37 @@ mod tests {
                 .code,
             ErrorCode::Malformed
         );
+    }
+
+    #[test]
+    fn member_notify_requires_canonical_nonzero_u64_ids() {
+        for member in [
+            "0123456789012345678",
+            "00000000000000000",
+            "18446744073709551616",
+            "99999999999999999999",
+        ] {
+            let body = map(json!({
+                "discord_id": member,
+                "event_key": "launch:2026",
+                "kind": "starting_soon",
+                "starts_at": "2026-11-04T18:00:00Z",
+                "expires_at": "2026-11-04T18:00:00Z",
+                "event_name": "Launch Night",
+            }));
+            for result in [
+                ReminderSendRequest::validate(&body).map(|_| ()),
+                PlaceOfferSendRequest::validate(&body).map(|_| ()),
+            ] {
+                let err = result.expect_err("noncanonical or out-of-range member");
+                assert_eq!(err.code, ErrorCode::Malformed);
+                assert_eq!(err.log_reason, "bad_discord_id");
+            }
+        }
+        for member in ["123456789012345678", "18446744073709551615"] {
+            let body = map(json!({"discord_id": member}));
+            assert_eq!(validate_notify_member(&body).unwrap(), member);
+        }
     }
 
     #[test]
