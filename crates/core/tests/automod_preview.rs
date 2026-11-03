@@ -187,7 +187,11 @@ fn t2_repeat_equivalence_and_immutability() {
             verdict.filter, reference,
             "count {count}: preview/live disagree"
         );
-        assert_eq!(format!("{live:?}"), before, "count {count}: tracker mutated");
+        assert_eq!(
+            format!("{live:?}"),
+            before,
+            "count {count}: tracker mutated"
+        );
     }
     let config = config(policy());
     let mut live = RepeatTracker::default();
@@ -287,7 +291,7 @@ fn t3_preview_storm_leaves_no_streak() {
 /// hides invites.
 #[test]
 fn t4_order_masking() {
-    let config = config(policy());
+    let full_config = config(policy());
     // `match_automod` reports `bad_words` before recording a repeat row,
     // so seeding through the full policy would build no streak and the
     // masking claim below would be vacuous. Seed with bad-word matching
@@ -316,7 +320,7 @@ fn t4_order_masking() {
         Some("repeated_message"),
         "control: seeded streak is a live repeat"
     );
-    let verdict = preview_automod(&probe, 0, &config, &live);
+    let verdict = preview_automod(&probe, 0, &full_config, &live);
     assert_eq!(
         verdict.filter.map(|f| f.as_str()),
         Some("bad_words"),
@@ -325,7 +329,7 @@ fn t4_order_masking() {
     let verdict = preview_automod(
         &synthetic("join discord.gg/abc", 3_000_011),
         5,
-        &config,
+        &full_config,
         &live,
     );
     assert_eq!(
