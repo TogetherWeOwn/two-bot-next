@@ -129,7 +129,8 @@ fn unimplemented_verbs_stay_closed_until_they_land() {
         // the verb must tighten this to
         // assert_eq!(needs_idempotency_key(name), pin).
         assert!(
-            v.get("needs_idempotency_key").is_some_and(Value::is_boolean),
+            v.get("needs_idempotency_key")
+                .is_some_and(Value::is_boolean),
             "{name} pins its idempotency requirement"
         );
         let err = assert_allowed(
