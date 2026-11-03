@@ -26,7 +26,7 @@ const headers = {
   [REQUEST_ID_HEADER]: id,
 };
 const blocked = Object.entries(NOT_FORWARDED).filter(([key, reason]) =>
-  (key.startsWith("TWO_INTERNAL_ALLOW_") || key === "TWO_INTERNAL_ROLE_KEYS") && !reason.includes("test-only"))
+  (key.startsWith("TWO_INTERNAL_ALLOW_") || key === "TWO_INTERNAL_ROLE_KEYS") && !reason.includes("test-only") && !reason.includes("explicit containerEnvVars line"))
   .map(([key]) => key);
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -47,6 +47,7 @@ function startupEnv(): Record<string, string> {
       TWO_INTERNAL_ACTIONS: "1", TWO_INTERNAL_CALLERS: "fixture:website",
       TWO_INTERNAL_CHANNEL_KEYS: "fixture:123456789012345678",
       TWO_INTERNAL_KEYS: `fixture:${randomBytes(32).toString("hex")}`,
+      TWO_INTERNAL_ALLOW_VOICE_MOVE: "1",
       ...Object.fromEntries(blocked.map((key) => [key, key.endsWith("ROLE_KEYS") ? "member:123456789012345678" : "1"])),
     };
     return new TwoBotContainer(ctx as unknown as DurableObjectState, env as unknown as Env).envVars;

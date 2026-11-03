@@ -458,9 +458,10 @@ pub const ADD_MEMBER_BUCKET: BucketSpec = BucketSpec {
     refill_per_second: 0.5,
 };
 
-/// 6 moves per 5 minutes per member (`voice.move_member`): the burst is the
-/// whole budget, so a stuck retry loop burns it out in seconds and then waits
-/// out the window instead of hammering Discord's move endpoint.
+/// Per-member `voice.move_member` token bucket: burst capacity six, refilled
+/// continuously at six tokens per five minutes (one every 50 seconds). This
+/// is not a strict six-per-rolling-window counter; an exhausted bucket must
+/// wait for a token instead of hammering Discord's move endpoint.
 pub const MOVE_MEMBER_BUCKET: BucketSpec = BucketSpec {
     capacity: 6.0,
     refill_per_second: 0.02,
@@ -1421,9 +1422,10 @@ impl<'a> GuildAddMemberRequest<'a> {
     }
 }
 
-/// Validated self-only voice-move subject: exactly one member and one target
-/// room. No actor field exists by construction — the caller cannot name
-/// anyone but the subject, so a host-pull move is unrepresentable.
+/// Validated voice-move subject: one member and one target room. The trusted
+/// website signer must derive `discord_id` from its authenticated session,
+/// never browser input. HMAC binds that subject to the request; this shape
+/// validator has no end-user session and does not itself prove consent.
 #[derive(Debug, Clone, Copy)]
 pub struct VoiceMoveRequest<'a> {
     discord_id: &'a str,
@@ -2897,10 +2899,17 @@ mod tests {
         let denied = buckets.take("m", MOVE_MEMBER_BUCKET, 0);
         assert!(!denied.allowed);
         assert_eq!(denied.retry_after_secs, 50);
-        // One token refills after 50 s; the 60 s probe leaves no float
-        // doubt at the 1.0 boundary.
-        assert!(buckets.take("m", MOVE_MEMBER_BUCKET, 60_000).allowed);
-        assert!(!buckets.take("m", MOVE_MEMBER_BUCKET, 60_000).allowed);
+        let before_refill = buckets.take("m", MOVE_MEMBER_BUCKET, 25_000);
+        assert!(!before_refill.allowed);
+        assert_eq!(before_refill.retry_after_secs, 25);
+        // A seventh move is allowed after 50 s: this is a continuously
+        // refilled token bucket, not a strict rolling-window limit.
+        assert!(buckets.take("m", MOVE_MEMBER_BUCKET, 50_000).allowed);
+        assert!(!buckets.take("m", MOVE_MEMBER_BUCKET, 50_000).allowed);
+        for _ in 0..6 {
+            assert!(buckets.take("m", MOVE_MEMBER_BUCKET, 350_000).allowed);
+        }
+        assert!(!buckets.take("m", MOVE_MEMBER_BUCKET, 350_000).allowed);
     }
 
     #[test]

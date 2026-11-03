@@ -1375,8 +1375,8 @@ struct ReceiverState {
     capacity: Arc<Semaphore>,
     event_gate: tokio::sync::Mutex<()>,
     event_gate_wait: Duration,
-    /// Receiver-owned lifecycle set for receipt-finishing event-mutation
-    /// children. Every spawned child is tracked here so shutdown can join it;
+    /// Receiver-owned lifecycle set for receipt-finishing event-mutation and
+    /// voice-move children. Every child is tracked here so shutdown can join it;
     /// the set holds no result, only the join, and each spawn reaps already
     /// finished entries so steady state keeps only in-flight work.
     children: tokio::sync::Mutex<JoinSet<()>>,
@@ -1825,20 +1825,18 @@ impl BoundReceiver {
 
     /// Join tracked receipt-finishing children within `budget`, the remaining
     /// share of the shutdown deadline the Axum drain did not consume. Clean
-    /// completion needs every child reaped; a reaped failure is terminal work
-    /// (its claim fence keeps durable uncertainty), but work still in flight
-    /// at the deadline is aborted and reported unclean, never waited on past
-    /// the budget.
+    /// completion needs every child reaped. Event claims preserve uncertainty
+    /// after a child failure; claimless voice moves have no such fence, so a
+    /// failure can leave an audit gap. Work still in flight at the deadline is
+    /// aborted and reported unclean, never waited on past the budget.
     async fn drain_children(state: &ReceiverState, budget: Duration) -> bool {
         let mut children = state.children.lock().await;
         let outcome = tokio::time::timeout(budget, async {
             while let Some(finished) = children.join_next().await {
-                if let Err(join_error) = finished {
+                if finished.is_err() {
                     tracing::warn!(
                         msg = "internal_action_child_failed",
-                        error = %join_error,
-                        "receipt-finishing event mutation child failed; \
-                         its claim fence retains durable uncertainty"
+                        "receipt-finishing child failed; completion is unproven"
                     );
                 }
             }
@@ -1853,8 +1851,8 @@ impl BoundReceiver {
                     msg = "internal_action_drain_deadline",
                     pending = pending,
                     "receiver shutdown reached the drain deadline with tracked \
-                     mutation children still in flight; aborted, their claims \
-                     retain durable uncertainty"
+                     receipt-finishing children still in flight; aborted, \
+                     completion is unproven"
                 );
                 false
             }
@@ -1913,8 +1911,8 @@ async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Re
         match tokio::time::timeout(REQUEST_TIMEOUT, receive(&state, request, &id, permit)).await {
             Ok(response) => response,
             // Dropping the future retains an announcement claim (a fresh nonce sees
-            // InFlight or NeedsReconciliation); event mutations finish in their
-            // own receiver-tracked task, holding capacity to their receipt.
+            // InFlight or NeedsReconciliation); event mutations and voice moves
+            // finish in receiver-tracked tasks, holding capacity to their receipt.
             Err(_) => state.reject(
                 Failure::code(ErrorCode::UpstreamTimeout),
                 KeyLabel::Invalid,
@@ -2035,11 +2033,12 @@ async fn receive(
     if decision.action == "voice.snapshot" {
         return read_voice_snapshot(state, id, key, action).await;
     }
-    // Mutating event verbs take the same durable claim/audit path as
-    // announcements below, with their own validation and key mapping.
-    if supports_event_mutation(&decision.action) {
-        // Runs to its receipt even if the client has gone: a claimed create that
-        // was dropped mid-flight must still register its key mapping. The child
+    // Event mutations and claimless voice moves must finish their receipts
+    // even after HTTP cancellation: event creates still need their key mapping,
+    // and completed voice effects still need their terminal audit.
+    let voice_move = decision.action == "voice.move_member";
+    if supports_event_mutation(&decision.action) || voice_move {
+        // Runs to its receipt even if the client has gone. The child
         // is tracked under the receiver (never detached and ownerless) and
         // carries the admission permit with it, so capacity stays held through
         // receipt persistence and repeated timed-out clients cannot admit more
@@ -2060,19 +2059,39 @@ async fn receive(
             // Locked through `state`, not the child's clone: the guard borrows
             // while the spawned future moves its own Arc.
             let mut children = state.children.lock().await;
+            if voice_move && state.draining.load(Ordering::SeqCst) {
+                return state.reject(
+                    Failure::code(ErrorCode::DiscordUnavailable),
+                    key,
+                    action,
+                    id,
+                );
+            }
             children.spawn(
                 async move {
                     let _permit = permit;
-                    let response = mutate_event(
-                        &task_state,
-                        &task_decision,
-                        &task_raw,
-                        task_idempotency.as_deref(),
-                        &task_id,
-                        task_key,
-                        action,
-                    )
-                    .await;
+                    let response = if voice_move {
+                        execute_voice_move(
+                            &task_state,
+                            &task_decision,
+                            &task_raw,
+                            &task_id,
+                            task_key,
+                            action,
+                        )
+                        .await
+                    } else {
+                        mutate_event(
+                            &task_state,
+                            &task_decision,
+                            &task_raw,
+                            task_idempotency.as_deref(),
+                            &task_id,
+                            task_key,
+                            action,
+                        )
+                        .await
+                    };
                     let _ = done_tx.send(response);
                 }
                 .instrument(task_span),
@@ -2084,7 +2103,16 @@ async fn receive(
         }
         return match done_rx.await {
             Ok(response) => response,
-            Err(_) => state.reject(Failure::reconciliation(), key, action, id),
+            Err(_) => state.reject(
+                if voice_move {
+                    Failure::code(ErrorCode::DiscordUnavailable)
+                } else {
+                    Failure::reconciliation()
+                },
+                key,
+                action,
+                id,
+            ),
         };
     }
     if decision.action == "settings.get" {
@@ -2138,12 +2166,6 @@ async fn receive(
     // audit (`intent`/`terminal`) and replay semantics match.
     if decision.action == "role.assign" || decision.action == "guild.add_member" {
         return execute_member(state, &decision, headers.idempotency, &raw, id, key, action).await;
-    }
-    // Self-only voice move (keyless like the reads: no Idempotency-Key, the
-    // committed nonce is the replay guard). Takes the same nonce/bucket fences
-    // above; the per-member voice bucket already ran in `authorize`.
-    if decision.action == "voice.move_member" {
-        return execute_voice_move(state, &decision, &raw, id, key, action).await;
     }
     // This second fence is explicit: core phase-1 defaults are not capabilities.
     if !AnnouncementExecutor::supports(&decision.action) {

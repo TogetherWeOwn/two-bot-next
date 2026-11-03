@@ -16,8 +16,8 @@
 //! evaluation follows the Discord overwrite order (guild base, @everyone
 //! overwrite, combined role overwrites, member overwrite) using the same
 //! [`PERM_*`](two_bot_core::voice_permissions) bits as the room builder, so
-//! the member's own Connect on the target is computed bot-side from live
-//! role/overwrite state: the move can never become a private-room bypass.
+//! the member's own View Channel + Connect on the target is computed bot-side
+//! from live role/overwrite state to prevent private-room permission bypasses.
 //! The guild owner and `ADMINISTRATOR` holders pass every check, exactly like
 //! the moderation resolver.
 
@@ -89,8 +89,8 @@ pub(crate) enum VoiceMoveDecision {
 }
 
 /// Evaluate the contract's validation order over one live fact set: target is
-/// a usable voice room, member connected, member's own Connect on the target,
-/// room cap, bot's grants on source and target. `already_in_room` short-circuits
+/// a usable voice room, member connected, member's own View Channel + Connect
+/// on the target, room cap, bot's grants on both rooms. `already_in_room` short-circuits
 /// before any permission math: nothing moves, so nothing needs proving.
 pub(crate) fn decide(facts: &VoiceMoveFacts) -> VoiceMoveDecision {
     if !facts.target.is_voice || facts.target.is_afk {
@@ -113,7 +113,8 @@ pub(crate) fn decide(facts: &VoiceMoveFacts) -> VoiceMoveDecision {
         Some(perms) => perms,
         None => return VoiceMoveDecision::Incomplete,
     };
-    if member_perms & PERM_CONNECT == 0 {
+    let member_room_bits = PERM_VIEW_CHANNEL | PERM_CONNECT;
+    if member_perms & member_room_bits != member_room_bits {
         return VoiceMoveDecision::Refuse(VoiceMoveOutcome::NotPermitted);
     }
     if facts.target.user_limit > 0 && facts.target_occupants >= facts.target.user_limit {
@@ -223,11 +224,12 @@ pub(crate) fn parse_override(value: &serde_json::Value) -> Option<ChannelOverrid
 }
 
 /// Read the member's current voice channel and the target room's occupant
-/// count from the shared gateway cache. `Ok(None, 0)` when the cache holds no
-/// voice-state set for the guild: for a connected gateway Twilight drops the
-/// set when the last member leaves, so a missing set is an empty guild, not a
-/// gap. `Err(())` only on a mid-mutation race (a listed state failing lookup),
-/// which the caller fails closed into `discord_unavailable`.
+/// count from the shared gateway cache. A loaded guild and channel set plus
+/// enabled voice-state caching must prove the view first: gateway readiness
+/// alone does not prove this guild loaded. Twilight drops the voice-state set
+/// when the last member leaves, so only a proven view may interpret a missing
+/// set as empty. Cold/unavailable guilds, disabled caching and mid-mutation
+/// gaps fail closed into `discord_unavailable`.
 pub(crate) fn occupancy(
     cache: &Arc<DefaultInMemoryCache>,
     guild_id: Snowflake,
@@ -239,6 +241,24 @@ pub(crate) fn occupancy(
         Id,
     };
     let guild: Id<GuildMarker> = Id::new(guild_id);
+    if !cache
+        .config()
+        .resource_types()
+        .contains(twilight_cache_inmemory::ResourceType::VOICE_STATE)
+    {
+        return Err(());
+    }
+    let _guild = cache.guild(guild).ok_or(())?;
+    // Unavailable guilds can retain their guild entry but lose their channels.
+    let channels: Vec<_> = cache
+        .guild_channels(guild)
+        .ok_or(())?
+        .iter()
+        .copied()
+        .collect();
+    for channel in channels {
+        cache.channel(channel).ok_or(())?;
+    }
     let users: Vec<Id<UserMarker>> = match cache.guild_voice_states(guild) {
         Some(users) => users.iter().copied().collect(),
         None => return Ok((None, 0)),
@@ -372,6 +392,29 @@ mod tests {
             allow: 0,
             deny: PERM_CONNECT,
         }];
+        assert_eq!(
+            decide(&facts),
+            VoiceMoveDecision::Refuse(VoiceMoveOutcome::NotPermitted)
+        );
+    }
+
+    #[test]
+    fn hidden_target_is_not_permitted_even_when_connect_is_allowed() {
+        let mut facts = base_facts();
+        facts.target.overwrites = vec![ChannelOverride {
+            id: MEMBER,
+            kind: OverrideKind::Member,
+            allow: PERM_CONNECT,
+            deny: PERM_VIEW_CHANNEL,
+        }];
+        assert_eq!(
+            decide(&facts),
+            VoiceMoveDecision::Refuse(VoiceMoveOutcome::NotPermitted)
+        );
+        // Permission denial precedes fullness and bot grants.
+        facts.target.user_limit = 1;
+        facts.target_occupants = 1;
+        facts.bot_roles = Vec::new();
         assert_eq!(
             decide(&facts),
             VoiceMoveDecision::Refuse(VoiceMoveOutcome::NotPermitted)

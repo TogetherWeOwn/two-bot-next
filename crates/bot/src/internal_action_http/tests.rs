@@ -2332,22 +2332,180 @@ impl VoiceMoveEffect for MockVoiceMove {
     }
 }
 
-fn voice_move_app(pool: sqlx::PgPool, voice_move: Arc<MockVoiceMove>) -> Router {
+fn voice_move_state(pool: sqlx::PgPool, voice_move: Arc<MockVoiceMove>) -> ReceiverState {
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let voice_move: Arc<dyn VoiceMoveEffect> = voice_move;
-    router(Arc::new(
-        ReceiverState::new(
-            config(),
-            pool,
-            effect.clone(),
-            effect,
-            Arc::new(MockEventRead::default()),
-            Arc::new(MockEventMutate),
-            Arc::new(MockModeration::default()),
-            Arc::new(MockChannel::default()),
+    ReceiverState::new(
+        config(),
+        pool,
+        effect.clone(),
+        effect,
+        Arc::new(MockEventRead::default()),
+        Arc::new(MockEventMutate),
+        Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
+    )
+    .with_voice_move(voice_move)
+}
+
+fn voice_move_app(pool: sqlx::PgPool, voice_move: Arc<MockVoiceMove>) -> Router {
+    router(Arc::new(voice_move_state(pool, voice_move)))
+}
+
+#[tokio::test]
+async fn voice_move_cancelled_handler_keeps_capacity_and_audit_until_drain() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(true);
+    let effect = Arc::new(MockVoiceMove::receipt(
+        VoiceMoveOutcome::Moved,
+        Some(VOICE_MOVE_SOURCE_ID),
+        None,
+    ));
+    let mut receiver = voice_move_state(db.pool().clone(), effect.clone());
+    receiver.capacity = Arc::new(Semaphore::new(1));
+    let state = Arc::new(receiver);
+    // Nonce persistence is independent of these tables. The move completes,
+    // then its terminal audit waits here so cancellation hits the exact gap.
+    let mut lock = db.pool().begin().await.unwrap();
+    sqlx::query("LOCK TABLE internal_idempotency, internal_action_log IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let raw = voice_move_payload(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let mut request = signed_read(&raw, "old");
+    request.headers_mut().insert(
+        "x-request-id",
+        HeaderValue::from_static("00000000000000000000000001"),
+    );
+    let client = tokio::spawn(answer(router(state.clone()), request));
+    let blocked = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+                 WHERE NOT l.granted AND c.relname IN \
+                 ('internal_idempotency', 'internal_action_log')",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    client.abort();
+    let cancelled = client.await.unwrap_err().is_cancelled();
+    let held = state.capacity.available_permits();
+    let probe = tokio::time::timeout(
+        Duration::from_secs(1),
+        answer(router(state.clone()), signed_read(&raw, "old")),
+    )
+    .await;
+    // Start shutdown's actual join path before releasing the audit lock.
+    state.draining.store(true, Ordering::SeqCst);
+    let draining = {
+        let state = state.clone();
+        tokio::spawn(
+            async move { BoundReceiver::drain_children(&state, Duration::from_secs(3)).await },
         )
-        .with_voice_move(voice_move),
-    ))
+    };
+    tokio::task::yield_now().await;
+    let joined_early = draining.is_finished();
+    lock.rollback().await.unwrap();
+    let drained = draining.await.unwrap();
+    set_voice_move_flag(false);
+    assert!(blocked.is_ok(), "effect reached terminal persistence");
+    assert!(cancelled);
+    assert_eq!(held, 0, "client cancellation must not release capacity");
+    let (status, _, body) = probe.expect("busy probe returns without waiting for audit");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "busy");
+    assert!(!joined_early, "shutdown must wait for audit completion");
+    assert!(drained, "receipt child drains cleanly after persistence");
+    assert_eq!(state.capacity.available_permits(), 1);
+    assert_eq!(
+        effect.calls(),
+        1,
+        "busy probe never reaches the move effect"
+    );
+    let row: (String, String, String, String) = sqlx::query_as(
+        "SELECT outcome, from_channel_id, to_channel_id, request_id \
+         FROM internal_action_log WHERE action = 'voice.move_member' AND phase = 'terminal'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(row.0, "moved");
+    assert_eq!(row.1, VOICE_MOVE_SOURCE_ID);
+    assert_eq!(row.2, VOICE_MOVE_TARGET_ID);
+    assert_eq!(row.3, "00000000000000000000000001");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_move_draining_receiver_refuses_before_effect_or_audit() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(true);
+    let effect = Arc::new(MockVoiceMove::receipt(
+        VoiceMoveOutcome::Moved,
+        Some(VOICE_MOVE_SOURCE_ID),
+        None,
+    ));
+    let state = Arc::new(voice_move_state(db.pool().clone(), effect.clone()));
+    state.draining.store(true, Ordering::SeqCst);
+    let raw = voice_move_payload(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let (status, _, body) = answer(router(state.clone()), signed_read(&raw, "old")).await;
+    assert!(BoundReceiver::drain_children(&state, Duration::from_secs(1)).await);
+    set_voice_move_flag(false);
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"]["code"], "discord_unavailable");
+    assert_eq!(effect.calls(), 0);
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM internal_action_log WHERE action = 'voice.move_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows, 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_move_tampered_signed_subject_is_refused_before_effect_or_audit() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(true);
+    let effect = Arc::new(MockVoiceMove::receipt(
+        VoiceMoveOutcome::Moved,
+        Some(VOICE_MOVE_SOURCE_ID),
+        None,
+    ));
+    let app = voice_move_app(db.pool().clone(), effect.clone());
+    let raw = voice_move_payload(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let mut request = signed_read(&raw, "old");
+    // An unsigned client cannot replace the session-derived subject covered
+    // by the website's MAC. Session derivation itself belongs to that signer.
+    *request.body_mut() = Body::from(voice_move_payload(
+        VOICE_MOVE_SECOND_ID,
+        VOICE_MOVE_TARGET_ID,
+    ));
+    let (status, _, body) = answer(app, request).await;
+    set_voice_move_flag(false);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(effect.calls(), 0);
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM internal_action_log WHERE action = 'voice.move_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows, 0);
+    db.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -2658,7 +2816,13 @@ fn seeded_voice_move_cache() -> Arc<DefaultInMemoryCache> {
 }
 
 fn seeded_voice_move_cache_for(member_id: &str) -> Arc<DefaultInMemoryCache> {
-    let cache = voice_snapshot::new_shared_cache();
+    seed_voice_move_cache(voice_snapshot::new_shared_cache(), member_id)
+}
+
+fn seed_voice_move_cache(
+    cache: Arc<DefaultInMemoryCache>,
+    member_id: &str,
+) -> Arc<DefaultInMemoryCache> {
     let mut guild: Value =
         serde_json::from_str(include_str!("../../tests/fixtures/voice_guild.json"))
             .expect("voice guild fixture parses");
@@ -2951,6 +3115,80 @@ async fn voice_move_executor_disconnected_member_is_not_connected() {
         .execute_move(&request)
         .await
         .expect("disconnected member answers");
+    assert_eq!(receipt.outcome, VoiceMoveOutcome::NotConnected);
+    assert_eq!(mock.patch_calls(), 0);
+}
+
+#[tokio::test]
+async fn voice_move_executor_cold_cache_is_unavailable_not_disconnected() {
+    let mock = MockVoiceApi::start(MockVoiceApiConfig::default()).await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let error = voice_move_executor(&mock, voice_snapshot::new_shared_cache())
+        .execute_move(&request)
+        .await
+        .expect_err("REST success does not prove gateway guild completeness");
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(mock.patch_calls(), 0);
+}
+
+#[tokio::test]
+async fn voice_move_executor_unavailable_guild_is_not_disconnected() {
+    let cache = seeded_voice_move_cache();
+    let deleted = serde_json::from_value(serde_json::json!({
+        "id": staging_guild(), "unavailable": true,
+    }))
+    .expect("unavailable guild fixture parses");
+    cache.update(&Event::GuildDelete(deleted));
+    let mock = MockVoiceApi::start(MockVoiceApiConfig::default()).await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let error = voice_move_executor(&mock, cache)
+        .execute_move(&request)
+        .await
+        .expect_err("an unavailable guild cannot prove occupancy");
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(mock.patch_calls(), 0);
+}
+
+#[tokio::test]
+async fn voice_move_executor_disabled_voice_cache_is_not_disconnected() {
+    use twilight_cache_inmemory::ResourceType;
+    let cache = Arc::new(
+        DefaultInMemoryCache::builder()
+            .resource_types(ResourceType::GUILD | ResourceType::CHANNEL)
+            .build(),
+    );
+    let cache = seed_voice_move_cache(cache, VOICE_MOVE_MEMBER_ID);
+    let mock = MockVoiceApi::start(MockVoiceApiConfig::default()).await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let error = voice_move_executor(&mock, cache)
+        .execute_move(&request)
+        .await
+        .expect_err("disabled voice-state caching cannot prove occupancy");
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(mock.patch_calls(), 0);
+}
+
+#[tokio::test]
+async fn voice_move_executor_known_empty_guild_is_not_connected() {
+    let cache = seeded_voice_move_cache();
+    for member in [VOICE_MOVE_MEMBER_ID, VOICE_MOVE_SECOND_ID] {
+        cache.update(&Event::VoiceStateUpdate(Box::new(voice_state(
+            member, None,
+        ))));
+    }
+    let guild = twilight_model::id::Id::new(staging_guild().parse().unwrap());
+    assert!(cache.guild(guild).is_some());
+    assert!(cache.guild_voice_states(guild).is_none());
+    let mock = MockVoiceApi::start(MockVoiceApiConfig::default()).await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let receipt = voice_move_executor(&mock, cache)
+        .execute_move(&request)
+        .await
+        .expect("tracked empty guild proves no connection");
     assert_eq!(receipt.outcome, VoiceMoveOutcome::NotConnected);
     assert_eq!(mock.patch_calls(), 0);
 }
