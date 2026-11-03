@@ -44,6 +44,10 @@ are outside this implementation's scope.
   join/leave spans: erasure removes the erased member's rows, guild-scoped
   through the scheduled-event mirror. The channel claim row
   (`event_voice_channels`) carries no member identity and is untouched.
+  Event-window voice sessions (`event_voice_sessions`) record one row per
+  member, channel, join and leave only while a mapped event window is open —
+  never an always-on voice log. Erasure removes the erased member's rows by
+  (`guild_id`, `member_id`), and rows roll off 90 days after joining.
   Erasure removes database tracking only, never the Discord channel.
   Guild room-command controls
   (`voice_access_controls`: creation switch, required role ID, per-command role
@@ -258,7 +262,8 @@ step summary.
 
 The retention module (`two-bot-cutover::retention`, migration `0438`)
 applies rolling nominal windows when invoked: raw presence/voice rows use a
-30-day window, the audit-log cache uses 45 days, and user deletion requests
+30-day window, event-window voice sessions use a 90-day window, the audit-log
+cache uses 45 days, and user deletion requests
 complete in under 72 hours with a receipt unless a replay guard is unresolved,
 in which case the request stays pending with no receipt and is reported as
 deferred (with overdue requests older than 72 hours counted separately).

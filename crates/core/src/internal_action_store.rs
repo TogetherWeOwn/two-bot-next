@@ -5,6 +5,7 @@
 
 use sqlx::{PgPool, Row};
 use std::str::FromStr as _;
+use time::OffsetDateTime;
 
 use crate::channel_moderation::PurgeStopReason;
 use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
@@ -1019,6 +1020,128 @@ impl InternalActionStore {
         .fetch_optional(&self.pool)
         .await?)
     }
+
+    /// Persist the mapped window at `event.upsert` confirm, next to the key
+    /// mapping. Sessions only open inside a persisted window, so windows that
+    /// closed before the logger shipped answer `not_found` by construction:
+    /// no backfill, ever.
+    pub async fn put_attendance_window(
+        &self,
+        guild_id: &str,
+        event_key: &str,
+        starts_at: OffsetDateTime,
+        ends_at: OffsetDateTime,
+    ) -> Result<(), InternalStoreError> {
+        Self::check_event_key_shape(guild_id, event_key)?;
+        sqlx::query(
+            "INSERT INTO event_attendance_windows (guild_id, event_key, starts_at, ends_at) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (guild_id, event_key) DO UPDATE \
+             SET starts_at = EXCLUDED.starts_at, ends_at = EXCLUDED.ends_at, \
+                 updated_at = clock_timestamp()",
+        )
+        .bind(guild_id)
+        .bind(event_key)
+        .bind(starts_at)
+        .bind(ends_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// One mapped window by key. `Ok(None)` is an unmapped key: the attendance
+    /// read refuses `not_found` before touching sessions.
+    pub async fn attendance_window_for_key(
+        &self,
+        guild_id: &str,
+        event_key: &str,
+    ) -> Result<Option<AttendanceWindow>, InternalStoreError> {
+        Self::check_event_key_shape(guild_id, event_key)?;
+        Ok(sqlx::query_as::<_, (OffsetDateTime, OffsetDateTime)>(
+            "SELECT starts_at, ends_at FROM event_attendance_windows \
+             WHERE guild_id = $1 AND event_key = $2",
+        )
+        .bind(guild_id)
+        .bind(event_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|(starts_at, ends_at)| AttendanceWindow {
+            event_key: event_key.to_owned(),
+            starts_at,
+            ends_at,
+        }))
+    }
+
+    /// Every session row tagged with the event key, oldest first. Empty means
+    /// no attendance: the read refuses `not_found`, including mapped windows
+    /// whose sessions all predate the logger.
+    pub async fn attendance_sessions_for_event_key(
+        &self,
+        guild_id: &str,
+        event_key: &str,
+    ) -> Result<Vec<AttendanceSession>, InternalStoreError> {
+        Self::check_event_key_shape(guild_id, event_key)?;
+        Ok(sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                bool,
+                bool,
+                OffsetDateTime,
+                Option<OffsetDateTime>,
+            ),
+        >(
+            "SELECT member_id, channel_id, channel_name, is_bot, afk, \
+                    joined_at, left_at \
+             FROM event_voice_sessions \
+             WHERE guild_id = $1 AND event_keys @> ARRAY[$2] \
+             ORDER BY joined_at, id",
+        )
+        .bind(guild_id)
+        .bind(event_key)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(
+            |(member_id, channel_id, channel_name, is_bot, afk, joined_at, left_at)| {
+                AttendanceSession {
+                    member_id,
+                    channel_id,
+                    channel_name,
+                    is_bot,
+                    afk,
+                    joined_at,
+                    left_at,
+                }
+            },
+        )
+        .collect())
+    }
+}
+
+/// One mapped event window for the attendance logger, in DB time. The
+/// receiver converts to epoch millis for the read projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttendanceWindow {
+    pub event_key: String,
+    pub starts_at: OffsetDateTime,
+    pub ends_at: OffsetDateTime,
+}
+
+/// One stored attendance session row for the read projection. The receiver
+/// converts the stamps to epoch millis; corrupt snowflakes fail the read at
+/// parse time, never silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttendanceSession {
+    pub member_id: String,
+    pub channel_id: String,
+    pub channel_name: String,
+    pub is_bot: bool,
+    pub afk: bool,
+    pub joined_at: OffsetDateTime,
+    pub left_at: Option<OffsetDateTime>,
 }
 
 #[cfg(test)]

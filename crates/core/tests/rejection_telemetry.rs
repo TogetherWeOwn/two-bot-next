@@ -140,6 +140,12 @@ fn every_error_code_has_a_class() {
             ActionLabel::Unknown,
             RejectionClass::Internal,
         ),
+        (
+            ErrorCode::NotFound,
+            configured("web"),
+            known("event.attendance.read"),
+            RejectionClass::NotFound,
+        ),
     ];
     for (code, key, action, expected) in cases {
         let rejection = Rejection::new(code, key.clone(), action);
@@ -171,8 +177,8 @@ fn key_label_echoes_only_configured_ids() {
 
 #[test]
 fn action_label_echoes_only_catalog_names() {
-    // The card's 20-name catalog, pinned so a quiet addition is a loud diff.
-    assert_eq!(IMPLEMENTED_ACTIONS.len(), 20);
+    // The card's 21-name catalog, pinned so a quiet addition is a loud diff.
+    assert_eq!(IMPLEMENTED_ACTIONS.len(), 21);
     for name in IMPLEMENTED_ACTIONS {
         assert_eq!(ActionLabel::new(Some(name)), ActionLabel::Known(name));
         assert_eq!(ActionLabel::new(Some(name)).as_str(), name);
@@ -426,7 +432,7 @@ fn overflow_folds_into_other_with_bounded_memory() {
 fn flood_stays_within_documented_bound() {
     let mut tele = telemetry();
     let bound = tele.max_records_per_window();
-    // Defaults: (32 tracked + 11 overflow) * (1 sample + 1 summary) = 86.
+    // Defaults: (32 tracked + 12 overflow) * (1 sample + 1 summary) = 88.
     assert_eq!(
         bound,
         (DEFAULT_MAX_TRACKED as u64 + RejectionClass::COUNT as u64)

@@ -37,14 +37,14 @@ test("older exposition without the voice family still parses", () => {
   const withoutVoice = metricsLines().filter((line) => !isVoiceFamilyLine(line)).join("\n");
   const samples = parseAlertScrape(withoutVoice);
   assert.ok(samples);
-  assert.equal(samples.filter((s) => s.name === "two_bot_internal_actions_total").length, 6 * 12);
+  assert.equal(samples.filter((s) => s.name === "two_bot_internal_actions_total").length, 6 * 13);
   assert.ok(parseAlertScrape(metricsBody()));
 });
 
 test("a partially present voice family fails the scrape", () => {
   // All-or-nothing: a missing outcome row would undercount refusals and
-  // clear a rising-refusal streak, so eleven of twelve voice rows is a
-  // failed scrape while zero of twelve is a rolled-back container.
+  // clear a rising-refusal streak, so twelve of thirteen voice rows is a
+  // failed scrape while zero of thirteen is a rolled-back container.
   const lines = metricsLines();
   const voiceIndex = lines.findIndex(isVoiceFamilyLine);
   assert.ok(voiceIndex >= 0);

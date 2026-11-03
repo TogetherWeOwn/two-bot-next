@@ -49,6 +49,7 @@ mod drop_poison_test_serial;
 #[cfg(test)]
 mod duplicate_pool_registration_acceptance_tests;
 mod erasure_cli;
+mod event_attendance;
 mod event_cli;
 mod eventsub_delivery;
 mod eventsub_http;

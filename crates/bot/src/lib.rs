@@ -3,6 +3,12 @@
 mod voice_room_plan;
 pub mod voice_rooms;
 
+// Event-window attendance logger: the voice actor loop calls
+// `record_transition` before room handling, and the keyless
+// `event.attendance.read` verb projects through it. The binary compiles
+// this same source file as a crate-local module.
+pub mod event_attendance;
+
 // Bounded gateway reconnect schedule: the gateway receive loop paces
 // `Reconnect` failures on it, and the voice-actor load backoff shares its
 // jitter stream. The supervised episode runner stays in the binary.

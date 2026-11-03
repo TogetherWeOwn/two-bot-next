@@ -279,7 +279,7 @@ const INTERNAL_ACTION_CAP_FAMILIES: [&str; 7] = [
 /// A new receiver outcome fails here until it gets a budget row in the guard
 /// doc. Unknown outcomes collapse to the trailing `internal`, never to a
 /// dynamic label or secret.
-const INTERNAL_ACTION_CAP_OUTCOMES: [&str; 12] = [
+const INTERNAL_ACTION_CAP_OUTCOMES: [&str; 13] = [
     "executed",
     "auth_failure",
     "unknown_key",
@@ -291,6 +291,7 @@ const INTERNAL_ACTION_CAP_OUTCOMES: [&str; 12] = [
     "malformed_body",
     "conflict",
     "upstream",
+    "not_found",
     "internal",
 ];
 
@@ -608,7 +609,7 @@ fn bounded_families_stay_fixed_size_with_collapse_traps() {
     );
     assert_eq!(
         metrics::INTERNAL_ACTION_OUTCOMES.len(),
-        12,
+        13,
         "internal-action outcome family grew; update the cardinality budget and the guard doc"
     );
     assert_eq!(

@@ -8,7 +8,8 @@ listener with the durable store, announcement executor, event-read,
 voice-snapshot, event-mutation, settings, automations, moderation, membership and
 channel-moderation executors, nonce-commit authentication capability and strict
 receiver configuration. It supports `announcement.post`, the keyless `event.read`
-(behind `TWO_INTERNAL_ALLOW_EVENT_READ`), the keyless `voice.snapshot`
+(behind `TWO_INTERNAL_ALLOW_EVENT_READ`), the keyless `event.attendance.read`
+(behind `TWO_INTERNAL_ALLOW_ATTENDANCE_READ`), the keyless `voice.snapshot`
 (behind `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT`), `event.upsert` and `event.cancel`
 (cancel behind `TWO_INTERNAL_ALLOW_EVENT_CANCEL`), `settings.get`/`settings.set`
 (behind `TWO_INTERNAL_ALLOW_SETTINGS`), the automations pair
@@ -133,6 +134,7 @@ capabilities; this table is not an instruction to create or stage them.
 | --- | --- |
 | `TWO_INTERNAL_ROLE_KEYS` | No allowlisted role target; `role.assign` refuses |
 | `TWO_INTERNAL_ALLOW_ADD_MEMBER` | `guild.add_member` stays gated off |
+| `TWO_INTERNAL_ALLOW_ATTENDANCE_READ` | `event.attendance.read` stays gated off |
 | `TWO_INTERNAL_ALLOW_AUTOMATIONS` | Automation export/import stay gated off |
 | `TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE` | Automation overwrite stays gated off |
 | `TWO_INTERNAL_ALLOW_EVENT_CANCEL` | `event.cancel` stays gated off |
@@ -169,7 +171,7 @@ in `docs/production-deploy.md`).
 1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values), only under the separately authorized enablement contract; no role keys or optional capability gates travel through this Worker.
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
-4. Operator applies migrations `0423` (settings CAS) and `0424` (event outcome) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
+4. Operator applies migrations `0423` (settings CAS), `0424` (event outcome) and `0471` (event-attendance windows/sessions) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns, and `event.attendance.read` answers `internal` without its tables), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
 5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete --env staging TWO_INTERNAL_ACTIONS --message <sha>`, same precheck and stamp as above), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
 
 Migration `0424` adds the nullable `internal_idempotency.outcome` column that
@@ -417,6 +419,7 @@ Success (`200` only, `result` always an object, no `error` key):
 | announcement.post | `{message_id}` | |
 | event.upsert/cancel | `{outcome, event_id}` | `outcome` replayed from the stored receipt |
 | event.read | full observed event | behind its allowlist flag |
+| event.attendance.read | §4 attendance shape below | behind its allowlist flag; unmapped keys and mapped windows with no tagged sessions refuse `not_found` |
 | voice.snapshot | live voice-room listing | behind its allowlist flag; refuses `discord_unavailable` unless the gateway is connected, so a warm cache never serves stale occupancy mid-reconnect |
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
@@ -425,6 +428,22 @@ Success (`200` only, `result` always an object, no `error` key):
 
 Refusals keep their code, status and retry policy with the fixed message
 `request refused`:
+
+### `event.attendance.read` result shape (§4)
+
+`result` is `{v: 1, event_key, window: {starts_at, ends_at}, threshold_minutes: 10,
+peak_concurrent, rooms: [{channel_id, name_at_close}], members: [{discord_id, minutes,
+sessions, first_joined_at}], final}`. Positive list only: who was there, never an
+absence list. Members below the threshold stay listed with their minutes; the
+threshold travels in the payload. Bots never appear in `members` and never count
+toward `peak_concurrent`; AFK occupants keep their member rows but never count
+toward the peak. `rooms` carries the latest name the logger saw per channel with at
+least one human session. Still-open rows clamp at `min(now, window close)`; `final`
+is true only once the window plus its 15-minute grace has passed, and the website
+only writes an Echo from `final: true` reads. `not_found` covers unmapped keys and
+mapped windows with no tagged sessions — including every window that closed before
+the logger shipped, which has no rows by construction (no backfill). Raw sessions
+roll off 90 days after joining.
 
 | Code | Status | Retryable |
 | --- | --- | --- |

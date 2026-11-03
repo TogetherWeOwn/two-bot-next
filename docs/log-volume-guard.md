@@ -54,7 +54,7 @@ table and the test are updated together.
 | `two_bot_voice_names_total{outcome}` | 16 | 1 create + 5 template-render outcomes + 9 dispatch outcomes (including `name_blocked` for rename or custom-override refusal) + `other` |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | 2 | `pre_commit`, `commit` |
 | `two_bot_drop_poison_total{guard}` | 7 | `command_dispatch_guard`, `schedule_run`, `user_slot`, `in_flight_guard`, `ticket_supervisor`, `response_accounting`, `voice_connection_guard`; fixed vocabulary, each recovery logs one warn |
-| `two_bot_internal_actions_total{family,outcome}` | 84 | 7 families x 12 outcomes (`announcement`, `event`, `settings`, `moderation`, `membership`, `voice`, `other` x `executed` + 11 refusal classes) |
+| `two_bot_internal_actions_total{family,outcome}` | 91 | 7 families x 13 outcomes (`announcement`, `event`, `settings`, `moderation`, `membership`, `voice`, `other` x `executed` + 12 refusal classes) |
 | `two_bot_moderation_enforcements_total{verb,outcome}` | 45 | 9 verbs (`ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`, `slowmode`, `lockdown`, `unlock`) x 5 outcomes (`success`, `refused`, `discord_error`, `storage_error`, `other`) |
 | `two_bot_community_facts_drain_failures_total{reason}` | 3 | `error`, `timeout`, `other` |
 | `two_bot_presence_capture_total{outcome}` | 3 | `inserted`, `duplicate`, `rejected` |

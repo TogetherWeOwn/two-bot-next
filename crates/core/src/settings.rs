@@ -126,6 +126,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     // --- so the census stays complete and the drift test can see them) ---
     ("TWO_INTERNAL_ACTIONS", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_ADD_MEMBER", SettingClass::EnvOnly),
+    ("TWO_INTERNAL_ALLOW_ATTENDANCE_READ", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_AUTOMATIONS", SettingClass::EnvOnly),
     (
         "TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE",

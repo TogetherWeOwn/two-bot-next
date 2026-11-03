@@ -122,6 +122,7 @@ use two_bot_core::{
     AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
+use two_bot_cutover::event_attendance::{AttendanceSession, AttendanceWindow};
 use two_bot_cutover::voice_rooms::{CreateClaim, JoinGrantIntent, OwnerGrantIntent, PgRoomStore};
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, MessageRef, RoomChannelAttributes,
@@ -446,6 +447,72 @@ pub trait RoomPersistence: Send + Sync {
         let _ = (event_id, instance, present);
         async { Ok::<u64, StoreError>(0) }
     }
+    /// Mapped attendance windows for one guild, for the session logger.
+    /// Default empty for stores without the attendance tables.
+    fn attendance_windows(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<Vec<AttendanceWindow>, StoreError>> + Send {
+        let _ = guild;
+        async { Ok::<Vec<AttendanceWindow>, StoreError>(Vec::new()) }
+    }
+    /// The member's still-open attendance rows in the guild. Default empty
+    /// for stores without the attendance tables.
+    fn open_attendance_sessions(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<Vec<AttendanceSession>, StoreError>> + Send {
+        let _ = (guild, member);
+        async { Ok::<Vec<AttendanceSession>, StoreError>(Vec::new()) }
+    }
+    /// Open one attendance row; returns the new row id. Default no-op for
+    /// stores without the attendance tables.
+    fn insert_attendance_session(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        channel: Snowflake,
+        channel_name: String,
+        is_bot: bool,
+        afk: bool,
+        joined_at: OffsetDateTime,
+        event_keys: &[String],
+    ) -> impl Future<Output = Result<i64, StoreError>> + Send {
+        let _ = (
+            guild,
+            member,
+            channel,
+            channel_name,
+            is_bot,
+            afk,
+            joined_at,
+            event_keys,
+        );
+        async { Ok::<i64, StoreError>(0) }
+    }
+    /// Finalize one open attendance row; returns rows closed. Default no-op
+    /// for stores without the attendance tables.
+    fn close_attendance_session(
+        &self,
+        id: i64,
+        left_at: OffsetDateTime,
+        channel_name: String,
+        event_keys: &[String],
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send {
+        let _ = (id, left_at, channel_name, event_keys);
+        async { Ok::<u64, StoreError>(0) }
+    }
+    /// Every session tagged with one event key in the guild, for the
+    /// attendance read. Default empty for stores without the tables.
+    fn attendance_sessions_for_event_key(
+        &self,
+        guild: Snowflake,
+        event_key: &str,
+    ) -> impl Future<Output = Result<Vec<AttendanceSession>, StoreError>> + Send {
+        let _ = (guild, event_key);
+        async { Ok::<Vec<AttendanceSession>, StoreError>(Vec::new()) }
+    }
 }
 
 impl RoomPersistence for PgRoomStore {
@@ -765,6 +832,72 @@ impl RoomPersistence for PgRoomStore {
     ) -> Result<u64, StoreError> {
         let present: Vec<String> = present.iter().map(|id| id.to_string()).collect();
         self.close_event_voice_spans_absent(event_id, instance, &present)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn attendance_windows(
+        &self,
+        guild: Snowflake,
+    ) -> Result<Vec<AttendanceWindow>, StoreError> {
+        self.attendance_windows_for_guild(&guild.to_string())
+            .await
+            .map_err(store_error)
+    }
+
+    async fn open_attendance_sessions(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> Result<Vec<AttendanceSession>, StoreError> {
+        self.open_attendance_sessions(&guild.to_string(), &member.to_string())
+            .await
+            .map_err(store_error)
+    }
+
+    async fn insert_attendance_session(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        channel: Snowflake,
+        channel_name: String,
+        is_bot: bool,
+        afk: bool,
+        joined_at: OffsetDateTime,
+        event_keys: &[String],
+    ) -> Result<i64, StoreError> {
+        self.insert_attendance_session(
+            &guild.to_string(),
+            &member.to_string(),
+            &channel.to_string(),
+            &channel_name,
+            is_bot,
+            afk,
+            joined_at,
+            event_keys,
+        )
+        .await
+        .map_err(store_error)
+    }
+
+    async fn close_attendance_session(
+        &self,
+        id: i64,
+        left_at: OffsetDateTime,
+        channel_name: String,
+        event_keys: &[String],
+    ) -> Result<u64, StoreError> {
+        self.close_attendance_session(id, left_at, &channel_name, event_keys)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn attendance_sessions_for_event_key(
+        &self,
+        guild: Snowflake,
+        event_key: &str,
+    ) -> Result<Vec<AttendanceSession>, StoreError> {
+        self.attendance_sessions_for_event_key(&guild.to_string(), event_key)
             .await
             .map_err(store_error)
     }
@@ -7878,11 +8011,17 @@ enum ActorCommand {
     /// A member's voice channel changed (join, leave or move): the worker
     /// records the event-voice presence transition. Sent only on actual
     /// transitions (same-channel frames send none), alongside Join/Reconcile.
-    /// Idempotent at the store, so buffering and replays are safe.
+    /// Idempotent at the store, so buffering and replays are safe. `is_bot`
+    /// (unknown counts as human, like the snapshot) and the guild's AFK
+    /// channel ride along for the attendance logger, which has no cache
+    /// access of its own; channel names resolve from live state at the
+    /// write sites.
     EventVoicePresence {
         member_id: Snowflake,
         previous: Option<Snowflake>,
         current: Option<Snowflake>,
+        is_bot: bool,
+        afk_channel: Option<Snowflake>,
     },
     /// A new or edited creator row (`/create`, `/textchannels`): the worker
     /// swaps it in for rooms created from here on.
@@ -8829,6 +8968,7 @@ where
             member,
             channel,
             bot,
+            None,
             display,
             tokio::time::Instant::now(),
         )
@@ -8840,6 +8980,7 @@ where
         member: Snowflake,
         channel: Option<Snowflake>,
         bot: Option<bool>,
+        afk_channel: Option<Snowflake>,
         display: String,
         received: tokio::time::Instant,
     ) -> bool {
@@ -8886,6 +9027,9 @@ where
                 member_id: member,
                 previous,
                 current: channel,
+                // Unknown identity counts as human, like the snapshot.
+                is_bot: bot.unwrap_or(false),
+                afk_channel,
             });
         }
         actor.try_send_command(command)
@@ -9518,6 +9662,13 @@ where
                     member_id,
                     update.channel_id.map(|id| id.get()),
                     bot,
+                    // The AFK channel id comes from the cached guild: the
+                    // actor owns no cache handle, so dispatch captures it on
+                    // the same transition as the bot flag.
+                    cache
+                        .guild(Id::new(guild_id))
+                        .and_then(|guild| guild.afk_channel_id())
+                        .map(|id| id.get()),
                     display_name(cache, guild_id, member_id),
                     received,
                 );
@@ -10235,6 +10386,8 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             member_id,
             previous,
             current,
+            is_bot,
+            afk_channel,
         } = &command
         {
             crate::event_voice_channels::record_transition(
@@ -10243,6 +10396,31 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 *member_id,
                 *previous,
                 *current,
+            )
+            .await;
+            // Attendance sessions persist on the same transition, after the
+            // event-voice write: names resolve from the actor's latest live
+            // view so renames converge at close time.
+            let (previous_name, current_name) = {
+                let live = worker.live.read_state();
+                (
+                    previous
+                        .and_then(|id| live.channels.get(&id).and_then(|room| room.name.clone())),
+                    current
+                        .and_then(|id| live.channels.get(&id).and_then(|room| room.name.clone())),
+                )
+            };
+            crate::event_attendance::record_transition(
+                &worker.store,
+                worker.live.guild_id,
+                *member_id,
+                *previous,
+                *current,
+                *is_bot,
+                *afk_channel,
+                previous_name,
+                current_name,
+                crate::event_attendance::logger_enabled(),
             )
             .await;
         }
@@ -10305,6 +10483,8 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                     member_id,
                     previous,
                     current,
+                    is_bot,
+                    afk_channel,
                 } = &command
                 {
                     crate::event_voice_channels::record_transition(
@@ -10313,6 +10493,33 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                         *member_id,
                         *previous,
                         *current,
+                    )
+                    .await;
+                    // Attendance sessions persist on the same transition, after
+                    // the event-voice write: names resolve from the actor's
+                    // latest live view so renames converge at close time.
+                    let (previous_name, current_name) = {
+                        let live = worker.live.read_state();
+                        (
+                            previous.and_then(|id| {
+                                live.channels.get(&id).and_then(|room| room.name.clone())
+                            }),
+                            current.and_then(|id| {
+                                live.channels.get(&id).and_then(|room| room.name.clone())
+                            }),
+                        )
+                    };
+                    crate::event_attendance::record_transition(
+                        &worker.store,
+                        worker.live.guild_id,
+                        *member_id,
+                        *previous,
+                        *current,
+                        *is_bot,
+                        *afk_channel,
+                        previous_name,
+                        current_name,
+                        crate::event_attendance::logger_enabled(),
                     )
                     .await;
                 }

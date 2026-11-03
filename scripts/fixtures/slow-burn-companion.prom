@@ -468,6 +468,7 @@ two_bot_internal_actions_total{family="announcement",outcome="action_disabled"} 
 two_bot_internal_actions_total{family="announcement",outcome="malformed_body"} 0
 two_bot_internal_actions_total{family="announcement",outcome="conflict"} 0
 two_bot_internal_actions_total{family="announcement",outcome="upstream"} 0
+two_bot_internal_actions_total{family="announcement",outcome="not_found"} 0
 two_bot_internal_actions_total{family="announcement",outcome="internal"} 0
 two_bot_internal_actions_total{family="event",outcome="executed"} 0
 two_bot_internal_actions_total{family="event",outcome="auth_failure"} 0
@@ -480,6 +481,7 @@ two_bot_internal_actions_total{family="event",outcome="action_disabled"} 0
 two_bot_internal_actions_total{family="event",outcome="malformed_body"} 0
 two_bot_internal_actions_total{family="event",outcome="conflict"} 0
 two_bot_internal_actions_total{family="event",outcome="upstream"} 0
+two_bot_internal_actions_total{family="event",outcome="not_found"} 0
 two_bot_internal_actions_total{family="event",outcome="internal"} 0
 two_bot_internal_actions_total{family="settings",outcome="executed"} 0
 two_bot_internal_actions_total{family="settings",outcome="auth_failure"} 0
@@ -492,6 +494,7 @@ two_bot_internal_actions_total{family="settings",outcome="action_disabled"} 0
 two_bot_internal_actions_total{family="settings",outcome="malformed_body"} 0
 two_bot_internal_actions_total{family="settings",outcome="conflict"} 0
 two_bot_internal_actions_total{family="settings",outcome="upstream"} 0
+two_bot_internal_actions_total{family="settings",outcome="not_found"} 0
 two_bot_internal_actions_total{family="settings",outcome="internal"} 0
 two_bot_internal_actions_total{family="moderation",outcome="executed"} 0
 two_bot_internal_actions_total{family="moderation",outcome="auth_failure"} 0
@@ -504,6 +507,7 @@ two_bot_internal_actions_total{family="moderation",outcome="action_disabled"} 0
 two_bot_internal_actions_total{family="moderation",outcome="malformed_body"} 0
 two_bot_internal_actions_total{family="moderation",outcome="conflict"} 0
 two_bot_internal_actions_total{family="moderation",outcome="upstream"} 0
+two_bot_internal_actions_total{family="moderation",outcome="not_found"} 0
 two_bot_internal_actions_total{family="moderation",outcome="internal"} 0
 two_bot_internal_actions_total{family="membership",outcome="executed"} 0
 two_bot_internal_actions_total{family="membership",outcome="auth_failure"} 0
@@ -516,6 +520,7 @@ two_bot_internal_actions_total{family="membership",outcome="action_disabled"} 0
 two_bot_internal_actions_total{family="membership",outcome="malformed_body"} 0
 two_bot_internal_actions_total{family="membership",outcome="conflict"} 0
 two_bot_internal_actions_total{family="membership",outcome="upstream"} 0
+two_bot_internal_actions_total{family="membership",outcome="not_found"} 0
 two_bot_internal_actions_total{family="membership",outcome="internal"} 0
 two_bot_internal_actions_total{family="voice",outcome="executed"} 0
 two_bot_internal_actions_total{family="voice",outcome="auth_failure"} 0
@@ -528,6 +533,7 @@ two_bot_internal_actions_total{family="voice",outcome="action_disabled"} 0
 two_bot_internal_actions_total{family="voice",outcome="malformed_body"} 0
 two_bot_internal_actions_total{family="voice",outcome="conflict"} 0
 two_bot_internal_actions_total{family="voice",outcome="upstream"} 0
+two_bot_internal_actions_total{family="voice",outcome="not_found"} 0
 two_bot_internal_actions_total{family="voice",outcome="internal"} 0
 two_bot_internal_actions_total{family="other",outcome="executed"} 0
 two_bot_internal_actions_total{family="other",outcome="auth_failure"} 0
@@ -540,6 +546,7 @@ two_bot_internal_actions_total{family="other",outcome="action_disabled"} 0
 two_bot_internal_actions_total{family="other",outcome="malformed_body"} 0
 two_bot_internal_actions_total{family="other",outcome="conflict"} 0
 two_bot_internal_actions_total{family="other",outcome="upstream"} 0
+two_bot_internal_actions_total{family="other",outcome="not_found"} 0
 two_bot_internal_actions_total{family="other",outcome="internal"} 0
 two_bot_rest_guard_breaker_open 0
 two_bot_rest_guard_token_invalid 0
@@ -561,9 +568,23 @@ two_bot_eventsub_classified_total{kind="notification"} 0
 two_bot_eventsub_classified_total{kind="revocation"} 0
 two_bot_eventsub_classified_total{kind="tampered"} 0
 two_bot_eventsub_classified_total{kind="ignored"} 0
+two_bot_eventsub_classified_total{kind="invalid_secret"} 0
+two_bot_eventsub_classified_total{kind="invalid_header"} 0
+two_bot_eventsub_classified_total{kind="body_too_large"} 0
+two_bot_eventsub_classified_total{kind="bad_signature"} 0
+two_bot_eventsub_classified_total{kind="invalid_timestamp"} 0
+two_bot_eventsub_classified_total{kind="stale_timestamp"} 0
+two_bot_eventsub_classified_total{kind="invalid_body"} 0
+two_bot_eventsub_classified_total{kind="duplicate_keys"} 0
+two_bot_eventsub_classified_total{kind="wrong_subscription"} 0
+two_bot_eventsub_classified_total{kind="invalid_challenge"} 0
+two_bot_eventsub_classified_total{kind="invalid_callback"} 0
+two_bot_eventsub_classified_total{kind="invalid_broadcaster_id"} 0
+two_bot_eventsub_classified_total{kind="too_many_broadcasters"} 0
 two_bot_eventsub_classified_total{kind="other"} 0
 two_bot_event_store_consumer_lag_seconds 0
 two_bot_retention_replay_needed_total 0
+two_bot_gateway_drain_skips_total 0
 two_bot_voice_dispatch_timeouts_total 0
 two_bot_voice_watchdog_stucks_total 0
 two_bot_voice_halt_recoveries_total 0

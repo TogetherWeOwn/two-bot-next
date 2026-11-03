@@ -14,7 +14,7 @@ flood stays bounded. This is the pure core only. Wiring it into the receiver
 
 ## Classes
 
-`RejectionClass::classify` maps every `ErrorCode` to one of 11 classes, with
+`RejectionClass::classify` maps every `ErrorCode` to one of 12 classes, with
 no wildcard arm, so a new refusal variant fails to compile until it has a
 class here:
 
@@ -31,6 +31,7 @@ class here:
 | `conflict` | `version_conflict`, `in_progress` |
 | `upstream` | `discord_rejected`, `discord_unavailable`, `upstream_timeout` |
 | `internal` | `internal` |
+| `not_found` | `not_found` |
 
 Caller-visible indistinguishability is preserved: unknown key id and bad
 signature are one refusal on the wire. Only the log tells them apart.

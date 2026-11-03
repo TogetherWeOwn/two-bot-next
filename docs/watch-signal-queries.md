@@ -301,7 +301,7 @@ website-action receiver executions by bounded family and outcome).
 `membership` or `other`; `outcome` is `executed` or the refusal class
 (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`,
 `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`,
-`conflict`, `upstream` or `internal`). Every request counts once; replays
+`conflict`, `upstream`, `not_found` or `internal`). Every request counts once; replays
 count on each serve. Series contract: [metrics](metrics.md).
 
 ```promql

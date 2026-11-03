@@ -475,7 +475,8 @@ pub const INTERNAL_ACTION_FAMILIES: &[&str] = &[
 /// replays served without a second effect), otherwise the bounded refusal
 /// class matching `RejectionClass::as_str` (`auth_failure`, `unknown_key`,
 /// `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`,
-/// `action_disabled`, `malformed_body`, `conflict`, `upstream`, `internal`).
+/// `action_disabled`, `malformed_body`, `conflict`, `upstream`, `not_found`,
+/// `internal`). `internal` stays last: unknown outcomes collapse to it.
 /// Each request counts exactly once. No secret, token, key id or raw request
 /// bytes ever become an outcome label.
 pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
@@ -490,6 +491,7 @@ pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
     "malformed_body",
     "conflict",
     "upstream",
+    "not_found",
     "internal",
 ];
 /// Reasons for `two_bot_community_facts_drain_failures_total{reason}`:
