@@ -357,13 +357,18 @@ fn maximal_controls() -> AccessControls {
 #[test]
 fn registry_adds_optional_page_only_to_setup_and_access_show() {
     let defs = voice_command_set(&VoiceGates { enabled: true });
-    assert_eq!(defs.len(), 23, "includes the owner access read: {defs:?}");
+    assert_eq!(defs.len(), 24, "includes both owner reads: {defs:?}");
     assert_eq!(
         defs.iter()
             .filter(|def| def.name == "room-access-inspect")
             .count(),
         1,
         "exactly one additive owner access read"
+    );
+    assert_eq!(
+        defs.iter().filter(|def| def.name == "myroom").count(),
+        1,
+        "exactly one additive owner rooms read"
     );
     let integer = two_bot_core::commands::CommandOptionType::Integer.as_u8();
 
@@ -735,7 +740,7 @@ async fn access_show_pages_cover_every_restriction_with_maximal_roles() {
     let (_, total) = page_meta(&first).expect("page/total must be visible");
     assert!(
         total > 1,
-        "26 maximal restrictions cannot fit one bounded reply"
+        "27 maximal restrictions cannot fit one bounded reply"
     );
     let mut seen_names = Vec::new();
     let mut seen_roles: std::collections::BTreeMap<String, Vec<u64>> =

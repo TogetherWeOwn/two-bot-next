@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use super::commands::GUILD_COMMAND_LIMIT;
 use super::custom_commands::{
-    error_code, max_custom_commands, validate_put_input, CommandError, PutCommandInput,
-    StoredCommand,
+    error_code, max_custom_commands, publishable_builtin_names, validate_put_input, CommandError,
+    PutCommandInput, StoredCommand,
 };
 use super::mee6::{parse_mee6_entry, translate_export, Mee6CommandInput};
 
@@ -294,8 +294,23 @@ pub fn diff_import(
 ) -> Result<ImportDiff, CommandError> {
     let mut valid = Vec::with_capacity(parsed.entries.len());
     let mut rejected: Vec<ImportRejection> = Vec::new();
+    // A pre-existing saved row keeps the same exemption PUT and toggle use:
+    // the additive voice surface must not strand a custom `myroom` that
+    // predates it. Reimporting its edited export converges instead of
+    // reporting `ReservedName`; a fresh, colliding name is still refused.
+    // Remove it once, not per entry: a maximal import is 100 rows.
+    let grandfathered = existing.iter().any(|row| row.name == "myroom");
+    let reserved: HashSet<String> = if grandfathered {
+        builtins
+            .iter()
+            .filter(|name| name.as_str() != "myroom")
+            .cloned()
+            .collect()
+    } else {
+        builtins.clone()
+    };
     for (index, entry) in parsed.entries.iter().enumerate() {
-        match validate_put_input(entry, builtins) {
+        match validate_put_input(entry, &reserved) {
             Ok(()) => valid.push((index, entry)),
             Err(err) => rejected.push(ImportRejection {
                 name: entry.name.clone(),
@@ -303,7 +318,11 @@ pub fn diff_import(
             }),
         }
     }
-    let max = max_custom_commands(builtins.len());
+    // Capacity counts publication slots, not the wider write-reservation set
+    // in `builtins`: `templateassistant` and dark names block writes but
+    // occupy no slot, so holding their slots would reject imports that still
+    // fit under the 100-command ceiling.
+    let max = max_custom_commands(publishable_builtin_names().len());
     let mut union: HashSet<&str> = existing.iter().map(|row| row.name.as_str()).collect();
     let stored = union.len();
     for (_, entry) in &valid {
@@ -440,6 +459,32 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&doc).expect("serializes")["schedules"],
             serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_grandfathered_myroom_export_reimports_but_a_fresh_one_stays_reserved() {
+        // A saved custom `myroom` predates the voice command of the same name.
+        // Reimporting its edited export must converge (PUT and toggle already
+        // exempt the existing row); a guild that has no such row must still
+        // refuse the colliding name.
+        let rows = vec![stored("myroom", "old {user}", Some("!myroom"))];
+        let mut body = serde_json::to_value(export_document(&rows)).expect("serializes");
+        body["commands"][0]["template"] = json!("new {user}");
+        let parsed = parse(&body);
+        assert_eq!(parsed.entries.len(), 1);
+        let diff = diff_import(&rows, &parsed, &builtins(), true).expect("diff plans");
+        assert!(diff.rejected.is_empty(), "{:?}", diff.rejected);
+        assert_eq!(diff.to_update, ["myroom"]);
+
+        // No stored row: the same entry is a fresh collision, still refused.
+        let fresh = diff_import(&[], &parsed, &builtins(), true).expect("diff plans");
+        assert!(fresh.to_create.is_empty());
+        assert_eq!(fresh.rejected.len(), 1);
+        assert_eq!(fresh.rejected[0].name, "myroom");
+        assert_eq!(
+            fresh.rejected[0].code,
+            error_code(&CommandError::ReservedName("myroom".to_owned()))
         );
     }
 
@@ -647,7 +692,7 @@ mod tests {
     #[test]
     fn union_capacity_fails_the_whole_diff() {
         let builtins = builtins();
-        let max = max_custom_commands(builtins.len());
+        let max = max_custom_commands(publishable_builtin_names().len());
         let desired: Vec<PutCommandInput> = (0..=max)
             .map(|i| PutCommandInput {
                 name: format!("fresh-{i}"),
@@ -673,7 +718,7 @@ mod tests {
         // The guild saved one more row than today's budget allows, as if a
         // release added a builtin after it filled the old maximum.
         let builtins = builtins();
-        let max = max_custom_commands(builtins.len());
+        let max = max_custom_commands(publishable_builtin_names().len());
         let existing: Vec<StoredCommand> = (0..=max)
             .map(|i| stored(&format!("saved-{i:02}"), "t", None))
             .collect();

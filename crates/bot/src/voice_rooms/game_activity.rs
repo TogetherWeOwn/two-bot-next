@@ -643,6 +643,43 @@ impl GameActivityCollector {
         guilds
     }
 
+    /// Shutdown-only: re-assert every still-playing carried game at `now_ms`.
+    ///
+    /// Presence arrives only on change, so a member who kept playing since
+    /// the last flush holds nothing but a carry, and a flush sessionizes a
+    /// carry only when a fresh delta bridges it. The process is exiting and
+    /// the carry with it, so this records the same-game refresh a live frame
+    /// would have sent: the flush then bridges the carry up to `now_ms` like
+    /// any refreshed run. Stopped carries already have their stop buffered;
+    /// TTL-stale ones (which the flush drops) and ones observed after
+    /// `now_ms` are left alone, so no phantom play is credited.
+    pub fn reassert_carries_at(&self, now_ms: i64) {
+        let refreshes: Vec<(Snowflake, PresenceDelta)> = {
+            let Ok(inner) = self.inner.lock() else {
+                return;
+            };
+            inner
+                .carry
+                .iter()
+                .filter(|(_, stated)| {
+                    stated.stopped_at.is_none()
+                        && stated.last_ms <= now_ms
+                        && stated.from_ms <= now_ms
+                        && now_ms - stated.from_ms <= GAME_ACTIVITY_CARRY_TTL_MS
+                })
+                .map(|((guild, user_key), stated)| {
+                    (
+                        *guild,
+                        synthetic_delta(user_key, &stated.game, stated.is_streaming, now_ms),
+                    )
+                })
+                .collect()
+        };
+        for (guild, delta) in refreshes {
+            self.observe_presence(guild, delta);
+        }
+    }
+
     /// Remove and return one guild's buffered deltas and voice spans at
     /// `now_ms`, clipping each open span there.
     ///
@@ -1207,6 +1244,53 @@ pub async fn flush_due_guilds(
     }
 }
 
+/// Attempts per guild for the shutdown flush; there is no next tick to retry.
+const SHUTDOWN_FLUSH_ATTEMPTS: u32 = 3;
+/// Pause between shutdown flush attempts, kept far inside the drain deadline.
+const SHUTDOWN_FLUSH_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Persist whatever every guild has buffered, due or not.
+///
+/// Shutdown-only counterpart of [`flush_due_guilds`]: the final partial
+/// interval is not yet "due", so the hourly gate would skip it. Each guild
+/// goes through the same drain-then-persist path, so a guild the hourly tick
+/// already flushed contributes only what arrived since and is never counted
+/// twice. A failed persist leaves its buffers in the collector (a gate
+/// failure before the drain, a write failure after a requeue), so the guild
+/// is retried up to `SHUTDOWN_FLUSH_ATTEMPTS` times. Guilds still failing
+/// are logged as `game_activity_shutdown_flush_failed` and returned as a
+/// count: their buffered interval is lost when the process exits.
+pub async fn flush_remaining_guilds(
+    pool: &sqlx::PgPool,
+    collector: &GameActivityCollector,
+    now_ms: i64,
+    gap_timeout_ms: i64,
+) -> usize {
+    let mut failed = 0;
+    for guild in collector.guilds() {
+        let mut attempt = 1;
+        while persist_guild(pool, collector, guild, gap_timeout_ms, now_ms)
+            .await
+            .is_err()
+        {
+            if attempt == SHUTDOWN_FLUSH_ATTEMPTS {
+                failed += 1;
+                break;
+            }
+            attempt += 1;
+            tokio::time::sleep(SHUTDOWN_FLUSH_RETRY_DELAY).await;
+        }
+    }
+    if failed > 0 {
+        tracing::error!(
+            failed_guilds = failed,
+            attempts = SHUTDOWN_FLUSH_ATTEMPTS,
+            "game_activity_shutdown_flush_failed"
+        );
+    }
+    failed
+}
+
 fn now_ms() -> i64 {
     i64::try_from(
         std::time::SystemTime::now()
@@ -1220,16 +1304,31 @@ fn now_ms() -> i64 {
 /// Hourly per-guild persist loop for the voice runtime's collector.
 ///
 /// Wakes every `FLUSH_POLL_INTERVAL` and persists each guild due per
-/// [`flush_due`]. Detached on purpose: the voice sink owns no shutdown
-/// handle, and each tick persists at most once per interval, so a deploy
-/// boundary at worst drops the current partial interval — the next tick
-/// continues from drained buffers, never double-counting.
-pub async fn flush_loop(pool: sqlx::PgPool, collector: Arc<GameActivityCollector>) {
+/// [`flush_due`]. When `shutdown` latches (including before the first poll)
+/// the loop runs one trailing [`flush_remaining_guilds`] and returns, so the
+/// caller can join it. A persist already in flight is never cancelled: the
+/// latch is observed only between ticks, and the trailing flush reads the
+/// already-drained buffers, so the interval is counted once.
+///
+/// The caller must latch `shutdown` only after every producer has stopped
+/// (the gateway task joined, its voice guard closed the open spans), not on
+/// the service shutdown watch: activity written after the trailing flush
+/// would never be persisted.
+pub async fn flush_loop(
+    pool: sqlx::PgPool,
+    collector: Arc<GameActivityCollector>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     let mut last_flush_ms: HashMap<Snowflake, i64> = HashMap::new();
     let mut tick = tokio::time::interval(FLUSH_POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tick.tick().await;
+        tokio::select! {
+            biased;
+            // A dropped sender also ends the loop: nothing can latch anymore.
+            _ = shutdown.wait_for(|latched| *latched) => break,
+            _ = tick.tick() => {}
+        }
         flush_due_guilds(
             &pool,
             &collector,
@@ -1239,6 +1338,12 @@ pub async fn flush_loop(pool: sqlx::PgPool, collector: Arc<GameActivityCollector
         )
         .await;
     }
+    let now = now_ms();
+    // Silent players hold only a carry; refresh it so the final pass
+    // persists their run since the last flush instead of exiting with it.
+    collector.reassert_carries_at(now);
+    // A failure is logged inside; the count matters only to direct callers.
+    let _ = flush_remaining_guilds(&pool, &collector, now, GAME_ACTIVITY_GAP_TIMEOUT_MS).await;
 }
 
 #[cfg(test)]
@@ -1860,6 +1965,61 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_reassert_persists_a_silent_carry_since_the_last_flush() {
+        // Apex from 0 with no further presence: the 10-minute flush persists
+        // the first leg and carries the game. At shutdown (30) the carry is
+        // the only record of the next 20 minutes.
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        let rows = collector.flush(7, 15 * MIN, T0 + 10 * MIN);
+        assert_eq!(rows[0].total_play_ms, 10 * MIN);
+        assert!(
+            collector.guilds().is_empty(),
+            "a carry-only guild is invisible to the shutdown flush"
+        );
+
+        collector.reassert_carries_at(T0 + 30 * MIN);
+        assert_eq!(collector.guilds(), vec![7]);
+        let rows = collector.flush(7, 15 * MIN, T0 + 30 * MIN);
+        assert_eq!(rows.len(), 1, "the silent run persists, got {rows:?}");
+        assert_eq!(rows[0].game.as_deref(), Some("Apex"));
+        assert_eq!(rows[0].total_play_ms, 20 * MIN);
+    }
+
+    #[test]
+    fn shutdown_reassert_skips_stopped_and_stale_carries() {
+        let collector = GameActivityCollector::new();
+        // Guild 7: played then stopped in the same window; its stop is
+        // buffered, so no refresh may extend the run past it.
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        collector.observe_presence(7, presence_delta(&update(json!([])), T0 + 10 * MIN));
+        // Guild 8: a carry older than the TTL, which the flush drops.
+        collector.observe_presence(
+            8,
+            presence_delta(&update(json!([playing_activity("Zelda")])), T0),
+        );
+        let _ = collector.flush(8, 15 * MIN, T0 + MIN);
+        let late = T0 + MIN + GAME_ACTIVITY_CARRY_TTL_MS + MIN;
+
+        collector.reassert_carries_at(late);
+        assert_eq!(
+            collector.buffered_counts(7).0,
+            2,
+            "a stopped carry gets no refresh"
+        );
+        assert!(
+            collector.flush(8, 15 * MIN, late).is_empty(),
+            "a stale carry is not revived as phantom play"
+        );
+    }
+
+    #[test]
     fn stop_then_different_game_in_one_window_credits_no_phantom_play() {
         // Apex 0-10, idle, Zelda 50-60, then one flush: the stop bounds the
         // old run, so the game-change close-out must end at the stop clock
@@ -2418,6 +2578,75 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_flush_retries_then_reports_a_failed_guild_with_buffers_kept() {
+        // Unreachable database: every attempt fails at `pool.begin()`, the
+        // gate path that returns before the drain, so the buffers survive.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(50))
+            .connect_lazy("postgres://two@127.0.0.1:1/unreachable")
+            .expect("lazy pool");
+        let collector = GameActivityCollector::new();
+        collector.observe_presence(
+            7,
+            presence_delta(&update(json!([playing_activity("Apex")])), T0),
+        );
+        let before = collector.buffered_counts(7);
+        let started = tokio::time::Instant::now();
+        let failed = flush_remaining_guilds(&pool, &collector, T0, 60 * MIN).await;
+        assert_eq!(failed, 1, "the failing guild is reported, not swallowed");
+        assert_eq!(
+            collector.buffered_counts(7),
+            before,
+            "a failed shutdown persist keeps the buffered interval"
+        );
+        assert!(
+            started.elapsed() >= SHUTDOWN_FLUSH_RETRY_DELAY * (SHUTDOWN_FLUSH_ATTEMPTS - 1),
+            "every attempt after the first waits the retry delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn latched_flush_loop_persists_the_partial_interval_and_returns() {
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI must supply the guarded test database"
+            );
+            eprintln!(
+                "SKIP game-activity shutdown flush integration: TWO_TEST_DATABASE_URL is not set"
+            );
+            return;
+        };
+        let fixture = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("create migrated agent-testdb fixture");
+        let pool = fixture.pool();
+        let collector = Arc::new(GameActivityCollector::new());
+        let start = now_ms() - 30 * MIN;
+        collector.observe_presence(
+            8,
+            presence_delta(&update(json!([playing_activity("Apex")])), start),
+        );
+        // Latched before the loop starts: the first poll must not wait an
+        // interval, and the not-yet-due partial interval must still persist.
+        let (_drained, latched) = tokio::sync::watch::channel(true);
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            flush_loop(pool.clone(), Arc::clone(&collector), latched),
+        )
+        .await
+        .expect("a latched flush loop returns after its trailing flush");
+        let rows = two_bot_core::game_activity_store::read_guild_aggregates(pool, "8")
+            .await
+            .expect("trailing flush wrote");
+        assert_eq!(rows.len(), 1, "the partial interval persisted once");
+        assert_eq!(collector.buffered_counts(8).0, 0, "the buffers drained");
     }
 
     #[test]

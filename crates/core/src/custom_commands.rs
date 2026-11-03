@@ -355,6 +355,24 @@ pub fn reserved_command_names() -> HashSet<String> {
     names
 }
 
+/// Builtin names that occupy a Discord publication slot when every publish
+/// gate is on: all dispatch builtins plus the voice set (first-wins dedupe
+/// applies at merge, so voice `kick` shares moderation's slot). Excludes the
+/// squatted-but-unpublished names in [`reserved_command_names`]
+/// (`templateassistant`, dark names): they block writes but occupy no slot,
+/// so capacity math must count this set, not the reservation set, or guilds
+/// with unused slots reject custom commands they could still publish.
+#[must_use]
+pub fn publishable_builtin_names() -> HashSet<String> {
+    let mut names = builtin_command_names();
+    names.extend(
+        super::voice_rooms::voice_commands()
+            .into_iter()
+            .map(|def| def.name),
+    );
+    names
+}
+
 /// Refuse unless automations are on. Registered with `false`, the handler
 /// refuses instead of executing — the half of disable a deregister cannot
 /// cover, because an interaction can already be in flight when the DELETE
@@ -1716,9 +1734,9 @@ mod tests {
         let published: HashSet<_> = definitions.iter().map(|def| def.name.clone()).collect();
         // `templateassistant` and `lockdown-preview` are unpublished until
         // their slices land, but the names stay squatted: reservations cover
-        // the publish set plus exactly those two held names (which keep
-        // holding their guild slots in the capacity math below, so the slot
-        // count does not churn when they republish).
+        // the publish set plus exactly those two held names. Capacity math
+        // counts only the publishable set, so unused slots keep accepting
+        // custom commands; the held names rejoin the budget when published.
         assert!(published.is_subset(&reserved));
         assert_eq!(reserved.len(), published.len() + 2);
         assert!(reserved.contains("templateassistant"));
@@ -1733,7 +1751,8 @@ mod tests {
             validate_put_input(&put_input("lockdown-preview"), &reserved),
             Err(CommandError::ReservedName("lockdown-preview".to_owned()))
         );
-        let capacity = max_custom_commands(reserved.len());
+        assert_eq!(publishable_builtin_names(), published);
+        let capacity = max_custom_commands(published.len());
         let custom: Vec<_> = (0..capacity)
             .map(|index| CustomCommand {
                 name: format!("custom-{index}"),
@@ -1746,7 +1765,7 @@ mod tests {
             published.len() + capacity
         );
         assert_eq!(
-            check_capacity(capacity, true, reserved.len()),
+            check_capacity(capacity, true, published.len()),
             Err(CommandError::OverCapacity(capacity))
         );
     }

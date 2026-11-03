@@ -178,6 +178,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "public",
             "limit",
             "unlimit",
+            "myroom",
             "room-access-inspect",
         ],
         anchor: Some("textchannels"),
@@ -919,15 +920,22 @@ mod tests {
         }
         // 47 non-voice commands (7 core + 27 feature + 9 moderation + 4 reads),
         // including inspection, clone, edit, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
-        // tempban-list, purge-preview, channel-inspect and moderation-recent, plus 22 additional voice commands (voice
+        // tempban-list, purge-preview, channel-inspect and moderation-recent, plus 23 additional voice commands (voice
         // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
         // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (69 live)"));
+        assert!(text.contains("**Server commands** (70 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
         );
-        assert!(text.len() < 2000, "fits Discord's content ceiling");
+        // Bytes overstate the wire length: every `·` separator costs two
+        // UTF-8 bytes but one UTF-16 unit. Assert the ceiling with the same
+        // unit count the adapter routes on, so the full builtin set keeps its
+        // plain-content reply instead of tipping into the embed fallback.
+        assert!(
+            crate::message_safety::text_len(&text) <= crate::message_safety::CONTENT_LIMIT,
+            "fits Discord's content ceiling"
+        );
     }
 
     #[test]
@@ -955,7 +963,7 @@ mod tests {
             "**Giveaways** — needs Manage Server\n/giveaway\n",
             "**Message cleanup** — needs Manage Messages\n/purge · /purge-preview\n",
             "**Channel slowmode and locks** — needs Manage Channels\n/slowmode · /lockdown · /unlock · /channel-inspect\n",
-            "**Voice rooms**\n/setup · /ping · /invite · /reclaim · /transfer · /name · /private · /public · /limit · /unlimit · /room-access-inspect\n",
+            "**Voice rooms**\n/setup · /ping · /invite · /reclaim · /transfer · /name · /private · /public · /limit · /unlimit · /myroom · /room-access-inspect\n",
             "**Voice room admin** — needs Manage Channels\n/create · /textchannels · /access · /logging · /position · /group · /inheritpermissions · /defaultlimit · /alwaysprivate\n",
             "**Voice room settings** — needs Manage Server\n/export · /import\n",
         ] {
@@ -1052,9 +1060,9 @@ mod tests {
         // 47 non-voice names, including inspection, clone, edit, reopen, welcome-preview, pause/resume,
         // giveaway, lfg-edit, lfg-list, feed-inspect, tempban-list, purge-preview, channel-inspect
         // and moderation-recent, plus
-        // 22 additional voice names (voice `kick` shares the Kick group).
+        // 23 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 69);
+        assert_eq!(grouped.len(), 70);
         for name in [
             "rank",
             "leaderboard",

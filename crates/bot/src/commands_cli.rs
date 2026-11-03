@@ -637,7 +637,9 @@ mod tests {
         );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 69);
+        // 47 all-gate builtins plus the 23 voice names (voice `kick`
+        // loses first-wins to moderation `/kick`), `/myroom` included.
+        assert_eq!(with_voice.len(), 70);
         assert!(
             with_voice.iter().any(|def| def.name == "tempban-list"),
             "tempban-list survives the voice registry"
