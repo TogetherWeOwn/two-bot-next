@@ -46,6 +46,22 @@ pub struct AttendanceSession {
     pub event_keys: Vec<String>,
 }
 
+/// One session row to open, tagged with the windows containing the join.
+/// Owned Strings so the caller's Snowflake-to-text conversion happens once
+/// at the boundary; bundling the row keeps the insert surface under the
+/// arity lint without a checker waiver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAttendanceSession {
+    pub guild_id: String,
+    pub member_id: String,
+    pub channel_id: String,
+    pub channel_name: String,
+    pub is_bot: bool,
+    pub afk: bool,
+    pub joined_at: OffsetDateTime,
+    pub event_keys: Vec<String>,
+}
+
 /// Register (or re-point) one event window in one guild. `event.upsert` calls
 /// this only after Discord confirms the create/update the window names, next
 /// to the key-mapping registration.
@@ -180,17 +196,9 @@ pub async fn open_attendance_sessions(
 
 /// Open one session row tagged with the windows containing the join. Returns
 /// the new row id.
-#[allow(clippy::too_many_arguments)]
 pub async fn insert_attendance_session(
     pool: &sqlx::PgPool,
-    guild_id: &str,
-    member_id: &str,
-    channel_id: &str,
-    channel_name: &str,
-    is_bot: bool,
-    afk: bool,
-    joined_at: OffsetDateTime,
-    event_keys: &[String],
+    new: &NewAttendanceSession,
 ) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(
         "INSERT INTO event_voice_sessions \
@@ -199,14 +207,14 @@ pub async fn insert_attendance_session(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          RETURNING id",
     )
-    .bind(guild_id)
-    .bind(member_id)
-    .bind(channel_id)
-    .bind(channel_name)
-    .bind(is_bot)
-    .bind(afk)
-    .bind(joined_at)
-    .bind(event_keys)
+    .bind(&new.guild_id)
+    .bind(&new.member_id)
+    .bind(&new.channel_id)
+    .bind(&new.channel_name)
+    .bind(new.is_bot)
+    .bind(new.afk)
+    .bind(new.joined_at)
+    .bind(&new.event_keys)
     .fetch_one(pool)
     .await
 }
@@ -384,30 +392,11 @@ impl PgRoomStore {
     }
 
     /// [`insert_attendance_session`] over this store's pool.
-    #[allow(clippy::too_many_arguments)]
     pub async fn insert_attendance_session(
         &self,
-        guild_id: &str,
-        member_id: &str,
-        channel_id: &str,
-        channel_name: &str,
-        is_bot: bool,
-        afk: bool,
-        joined_at: OffsetDateTime,
-        event_keys: &[String],
+        new: &NewAttendanceSession,
     ) -> Result<i64, sqlx::Error> {
-        insert_attendance_session(
-            self.pool(),
-            guild_id,
-            member_id,
-            channel_id,
-            channel_name,
-            is_bot,
-            afk,
-            joined_at,
-            event_keys,
-        )
-        .await
+        insert_attendance_session(self.pool(), new).await
     }
 
     /// [`close_attendance_session`] over this store's pool.

@@ -122,7 +122,9 @@ use two_bot_core::{
     AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
-use two_bot_cutover::event_attendance::{AttendanceSession, AttendanceWindow};
+use two_bot_cutover::event_attendance::{
+    AttendanceSession, AttendanceWindow, NewAttendanceSession,
+};
 use two_bot_cutover::voice_rooms::{CreateClaim, JoinGrantIntent, OwnerGrantIntent, PgRoomStore};
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, MessageRef, RoomChannelAttributes,
@@ -468,28 +470,11 @@ pub trait RoomPersistence: Send + Sync {
     }
     /// Open one attendance row; returns the new row id. Default no-op for
     /// stores without the attendance tables.
-    #[allow(clippy::too_many_arguments)]
     fn insert_attendance_session(
         &self,
-        guild: Snowflake,
-        member: Snowflake,
-        channel: Snowflake,
-        channel_name: String,
-        is_bot: bool,
-        afk: bool,
-        joined_at: OffsetDateTime,
-        event_keys: &[String],
+        new: NewAttendanceSession,
     ) -> impl Future<Output = Result<i64, StoreError>> + Send {
-        let _ = (
-            guild,
-            member,
-            channel,
-            channel_name,
-            is_bot,
-            afk,
-            joined_at,
-            event_keys,
-        );
+        let _ = new;
         async { Ok::<i64, StoreError>(0) }
     }
     /// Finalize one open attendance row; returns rows closed. Default no-op
@@ -558,26 +543,9 @@ impl<T: RoomPersistence> crate::event_attendance::AttendanceStore for T {
     }
     fn insert_attendance_session(
         &self,
-        guild: Snowflake,
-        member: Snowflake,
-        channel: Snowflake,
-        channel_name: String,
-        is_bot: bool,
-        afk: bool,
-        joined_at: OffsetDateTime,
-        event_keys: &[String],
+        new: NewAttendanceSession,
     ) -> impl Future<Output = Result<i64, Self::Error>> + Send {
-        <T as RoomPersistence>::insert_attendance_session(
-            self,
-            guild,
-            member,
-            channel,
-            channel_name,
-            is_bot,
-            afk,
-            joined_at,
-            event_keys,
-        )
+        <T as RoomPersistence>::insert_attendance_session(self, new)
     }
     fn close_attendance_session(
         &self,
@@ -958,27 +926,11 @@ impl RoomPersistence for PgRoomStore {
 
     async fn insert_attendance_session(
         &self,
-        guild: Snowflake,
-        member: Snowflake,
-        channel: Snowflake,
-        channel_name: String,
-        is_bot: bool,
-        afk: bool,
-        joined_at: OffsetDateTime,
-        event_keys: &[String],
+        new: NewAttendanceSession,
     ) -> Result<i64, StoreError> {
-        self.insert_attendance_session(
-            &guild.to_string(),
-            &member.to_string(),
-            &channel.to_string(),
-            &channel_name,
-            is_bot,
-            afk,
-            joined_at,
-            event_keys,
-        )
-        .await
-        .map_err(store_error)
+        self.insert_attendance_session(&new)
+            .await
+            .map_err(store_error)
     }
 
     async fn close_attendance_session(
@@ -8670,6 +8622,19 @@ fn requires_guild_authority(command: &VoiceCommand) -> bool {
     )
 }
 
+/// One voice-state frame for an existing actor. The AFK channel rides
+/// alongside the frame for the attendance logger; bundling the frame keeps
+/// the feed under the arity lint without a checker waiver.
+struct VoiceFrame {
+    guild: Snowflake,
+    member: Snowflake,
+    channel: Option<Snowflake>,
+    bot: Option<bool>,
+    afk_channel: Option<Snowflake>,
+    display: String,
+    received: tokio::time::Instant,
+}
+
 pub struct VoiceRuntime<S, H> {
     make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
     tick: Duration,
@@ -9080,30 +9045,27 @@ where
         bot: Option<bool>,
         display: String,
     ) -> bool {
-        self.voice_frame_received(
+        self.voice_frame_received(VoiceFrame {
             guild,
             member,
             channel,
             bot,
-            None,
+            afk_channel: None,
             display,
-            tokio::time::Instant::now(),
-        )
+            received: tokio::time::Instant::now(),
+        })
     }
 
-    // The attendance logger needs the AFK channel and the receive instant
-    // alongside the frame, which pushes this past the default arity lint.
-    #[allow(clippy::too_many_arguments)]
-    fn voice_frame_received(
-        &self,
-        guild: Snowflake,
-        member: Snowflake,
-        channel: Option<Snowflake>,
-        bot: Option<bool>,
-        afk_channel: Option<Snowflake>,
-        display: String,
-        received: tokio::time::Instant,
-    ) -> bool {
+    fn voice_frame_received(&self, frame: VoiceFrame) -> bool {
+        let VoiceFrame {
+            guild,
+            member,
+            channel,
+            bot,
+            afk_channel,
+            display,
+            received,
+        } = frame;
         let Some(actor) = self.live_actor(guild) else {
             return false;
         };
@@ -9777,21 +9739,21 @@ where
                             .member(guild_key, user_key)
                             .map(|member| member.roles().iter().map(|id| id.get()).collect())
                     });
-                self.voice_frame_received(
-                    guild_id,
-                    member_id,
-                    update.channel_id.map(|id| id.get()),
+                self.voice_frame_received(VoiceFrame {
+                    guild: guild_id,
+                    member: member_id,
+                    channel: update.channel_id.map(|id| id.get()),
                     bot,
                     // The AFK channel id comes from the cached guild: the
                     // actor owns no cache handle, so dispatch captures it on
                     // the same transition as the bot flag.
-                    cache
+                    afk_channel: cache
                         .guild(Id::new(guild_id))
                         .and_then(|guild| guild.afk_channel_id())
                         .map(|id| id.get()),
-                    display_name(cache, guild_id, member_id),
+                    display: display_name(cache, guild_id, member_id),
                     received,
-                );
+                });
                 if let Some(actor) = self.live_actor(guild_id) {
                     actor.live.set_member_roles(member_id, roles);
                 }
@@ -10532,15 +10494,17 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             };
             crate::event_attendance::record_transition(
                 &worker.store,
-                worker.live.guild_id,
-                *member_id,
-                *previous,
-                *current,
-                *is_bot,
-                *afk_channel,
-                previous_name,
-                current_name,
-                crate::event_attendance::logger_enabled(),
+                crate::event_attendance::VoiceTransition {
+                    guild: worker.live.guild_id,
+                    member: *member_id,
+                    previous: *previous,
+                    current: *current,
+                    is_bot: *is_bot,
+                    afk_channel: *afk_channel,
+                    previous_name,
+                    current_name,
+                    enabled: crate::event_attendance::logger_enabled(),
+                },
             )
             .await;
         }
@@ -10631,15 +10595,17 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                     };
                     crate::event_attendance::record_transition(
                         &worker.store,
-                        worker.live.guild_id,
-                        *member_id,
-                        *previous,
-                        *current,
-                        *is_bot,
-                        *afk_channel,
-                        previous_name,
-                        current_name,
-                        crate::event_attendance::logger_enabled(),
+                        crate::event_attendance::VoiceTransition {
+                            guild: worker.live.guild_id,
+                            member: *member_id,
+                            previous: *previous,
+                            current: *current,
+                            is_bot: *is_bot,
+                            afk_channel: *afk_channel,
+                            previous_name,
+                            current_name,
+                            enabled: crate::event_attendance::logger_enabled(),
+                        },
                     )
                     .await;
                 }

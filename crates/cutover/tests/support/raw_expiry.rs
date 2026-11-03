@@ -1,3 +1,8 @@
+// Shared test-support module: each integration-test binary compiles this file
+// but uses only part of it, so unused items are expected here.
+// Covered by the CONSTRAINTS.md Exceptions row for `crates/*/tests/support/*.rs`.
+#![allow(dead_code)]
+
 use std::future::Future;
 
 use sqlx::PgPool;

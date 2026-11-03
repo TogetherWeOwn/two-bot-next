@@ -37,7 +37,9 @@ use std::sync::OnceLock;
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 use two_bot_core::Snowflake;
-use two_bot_cutover::event_attendance::{AttendanceSession, AttendanceWindow};
+use two_bot_cutover::event_attendance::{
+    AttendanceSession, AttendanceWindow, NewAttendanceSession,
+};
 
 /// Inbox-protection bound for each attendance statement, mirroring
 /// `voice_rooms::REVALIDATE_TIMEOUT_MS`: a slow statement must not hold room
@@ -62,17 +64,9 @@ pub trait AttendanceStore: Send + Sync {
         guild: Snowflake,
         member: Snowflake,
     ) -> impl Future<Output = Result<Vec<AttendanceSession>, Self::Error>> + Send;
-    #[allow(clippy::too_many_arguments)]
     fn insert_attendance_session(
         &self,
-        guild: Snowflake,
-        member: Snowflake,
-        channel: Snowflake,
-        channel_name: String,
-        is_bot: bool,
-        afk: bool,
-        joined_at: OffsetDateTime,
-        event_keys: &[String],
+        new: NewAttendanceSession,
     ) -> impl Future<Output = Result<i64, Self::Error>> + Send;
     fn close_attendance_session(
         &self,
@@ -260,26 +254,43 @@ pub(crate) fn logger_enabled() -> bool {
     })
 }
 
+/// One voice-channel transition (join, leave or move) for the session logger.
+/// Bundles the actor loop's frame — `is_bot` and `afk_channel` arrive from
+/// the dispatch (the cache view of the transition), the channel names are
+/// the actor's latest live view (refreshed at close so renames converge),
+/// and `enabled` is the env-only flag that also gates the read verb — so
+/// [`record_transition`] stays under the arity lint without a checker waiver.
+/// Public: the guild actor loop builds this per transition.
+#[derive(Debug, Clone)]
+pub struct VoiceTransition {
+    pub guild: Snowflake,
+    pub member: Snowflake,
+    pub previous: Option<Snowflake>,
+    pub current: Option<Snowflake>,
+    pub is_bot: bool,
+    pub afk_channel: Option<Snowflake>,
+    pub previous_name: Option<String>,
+    pub current_name: Option<String>,
+    pub enabled: bool,
+}
+
 /// Record one voice-channel transition (join, leave or move) as attendance
 /// sessions. Called by the guild actor loop before room handling; each
 /// statement is bounded by `REVALIDATE_TIMEOUT_MS` (the same inbox-protection
 /// bound as creator revalidation) so a slow statement cannot hold room
-/// handling. `is_bot` and `afk_channel` arrive from the dispatch (the cache
-/// view of the transition); the channel names are the actor's latest live
-/// view, refreshed at close so renames converge. Never fails the actor loop.
-#[allow(clippy::too_many_arguments)]
-pub async fn record_transition(
-    store: &impl AttendanceStore,
-    guild: Snowflake,
-    member: Snowflake,
-    previous: Option<Snowflake>,
-    current: Option<Snowflake>,
-    is_bot: bool,
-    afk_channel: Option<Snowflake>,
-    previous_name: Option<String>,
-    current_name: Option<String>,
-    enabled: bool,
-) {
+/// handling. Never fails the actor loop.
+pub async fn record_transition(store: &impl AttendanceStore, transition: VoiceTransition) {
+    let VoiceTransition {
+        guild,
+        member,
+        previous,
+        current,
+        is_bot,
+        afk_channel,
+        previous_name,
+        current_name,
+        enabled,
+    } = transition;
     if !enabled || previous == current {
         return;
     }
@@ -465,16 +476,16 @@ pub async fn record_transition(
     if let (Some(channel), Some(open)) = (current, &plan.open) {
         let outcome = tokio::time::timeout(
             std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS),
-            store.insert_attendance_session(
-                guild,
-                member,
-                channel,
-                current_name.unwrap_or_default(),
+            store.insert_attendance_session(NewAttendanceSession {
+                guild_id: guild.to_string(),
+                member_id: member.to_string(),
+                channel_id: channel.to_string(),
+                channel_name: current_name.unwrap_or_default(),
                 is_bot,
-                afk_channel.is_some_and(|afk| afk == channel),
-                now,
-                &open.tags,
-            ),
+                afk: afk_channel.is_some_and(|afk| afk == channel),
+                joined_at: now,
+                event_keys: open.tags.clone(),
+            }),
         )
         .await;
         match outcome {
@@ -971,14 +982,7 @@ mod tests {
 
         async fn insert_attendance_session(
             &self,
-            _guild: Snowflake,
-            _member: Snowflake,
-            _channel: Snowflake,
-            _channel_name: String,
-            _is_bot: bool,
-            _afk: bool,
-            _joined_at: OffsetDateTime,
-            _event_keys: &[String],
+            _new: NewAttendanceSession,
         ) -> Result<i64, Self::Error> {
             *self.opens.lock().expect("opens lock") += 1;
             Ok(1)
@@ -1028,60 +1032,38 @@ mod tests {
         }
     }
 
+    fn join_transition() -> VoiceTransition {
+        VoiceTransition {
+            guild: 1,
+            member: 11,
+            previous: None,
+            current: Some(7),
+            is_bot: false,
+            afk_channel: None,
+            previous_name: None,
+            current_name: Some("lobby".to_owned()),
+            enabled: true,
+        }
+    }
+
     #[tokio::test]
     async fn open_records_when_gates_pass() {
         let store = GateStore::open(false, true);
-        record_transition(
-            &store,
-            1,
-            11,
-            None,
-            Some(7),
-            false,
-            None,
-            None,
-            Some("lobby".to_owned()),
-            true,
-        )
-        .await;
+        record_transition(&store, join_transition()).await;
         assert_eq!(*store.opens.lock().expect("opens lock"), 1);
     }
 
     #[tokio::test]
     async fn suppressed_member_opens_nothing() {
         let store = GateStore::open(true, true);
-        record_transition(
-            &store,
-            1,
-            11,
-            None,
-            Some(7),
-            false,
-            None,
-            None,
-            Some("lobby".to_owned()),
-            true,
-        )
-        .await;
+        record_transition(&store, join_transition()).await;
         assert_eq!(*store.opens.lock().expect("opens lock"), 0);
     }
 
     #[tokio::test]
     async fn voice_disabled_guild_opens_nothing() {
         let store = GateStore::open(false, false);
-        record_transition(
-            &store,
-            1,
-            11,
-            None,
-            Some(7),
-            false,
-            None,
-            None,
-            Some("lobby".to_owned()),
-            true,
-        )
-        .await;
+        record_transition(&store, join_transition()).await;
         assert_eq!(*store.opens.lock().expect("opens lock"), 0);
     }
 
@@ -1089,19 +1071,7 @@ mod tests {
     async fn gate_failure_fails_closed() {
         let mut store = GateStore::open(false, true);
         store.fail_gate = true;
-        record_transition(
-            &store,
-            1,
-            11,
-            None,
-            Some(7),
-            false,
-            None,
-            None,
-            Some("lobby".to_owned()),
-            true,
-        )
-        .await;
+        record_transition(&store, join_transition()).await;
         assert_eq!(*store.opens.lock().expect("opens lock"), 0);
     }
 
@@ -1111,7 +1081,16 @@ mod tests {
         // member's seeded row finalizes on leave with no new open.
         let mut store = GateStore::open(true, true);
         store.seed_open = true;
-        record_transition(&store, 1, 11, Some(7), None, false, None, None, None, true).await;
+        record_transition(
+            &store,
+            VoiceTransition {
+                previous: Some(7),
+                current: None,
+                current_name: None,
+                ..join_transition()
+            },
+        )
+        .await;
         assert_eq!(*store.opens.lock().expect("opens lock"), 0);
         assert_eq!(*store.closes.lock().expect("closes lock"), 1);
     }
