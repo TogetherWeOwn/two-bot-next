@@ -3439,7 +3439,13 @@ pub(crate) fn publication_definitions(
         return Ok(None);
     }
     router
-        .publish_set(custom.unwrap_or_default())
+        .publish_set_capacity_deferred(custom.unwrap_or_default())
+        .map(|(defs, withheld)| {
+            if let Some(builtin) = withheld {
+                warn!(builtin, "guild command registry at Discord's 100-command ceiling; optional builtin withheld this publication (custom commands preserved)");
+            }
+            defs
+        })
         .map(Some)
         .map_err(|_| RegistrySyncError::Invalid)
 }

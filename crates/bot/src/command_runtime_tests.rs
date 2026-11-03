@@ -2357,9 +2357,9 @@ async fn leveling_interaction_fence_precedes_any_store_read() {
     mock.shutdown().await;
 }
 
-/// The 22 voice names that publish beside the builtins (`kick` is
+/// The 23 voice names that publish beside the builtins (`kick` is
 /// moderation's under first-wins).
-const VOICE_ONLY_NAMES: [&str; 22] = [
+const VOICE_ONLY_NAMES: [&str; 23] = [
     "create",
     "setup",
     "ping",
@@ -2381,6 +2381,7 @@ const VOICE_ONLY_NAMES: [&str; 22] = [
     "public",
     "limit",
     "unlimit",
+    "myroom",
     "room-access-inspect",
 ];
 

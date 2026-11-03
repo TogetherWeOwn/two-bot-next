@@ -11,10 +11,10 @@ use crate::automation_transfer::{diff_import, ImportOutcome, ParsedImport};
 use crate::custom_command_store as store;
 use crate::custom_commands::{
     adjudicate_delete, adjudicate_edit, adjudicate_put, adjudicate_toggle, builtin_command_names,
-    check_capacity, error_code, require_automations_enabled, reserved_command_names, validate_edit,
-    validate_put_input, validate_toggle_enable, AuditRecord, CommandError, DeleteDecision,
-    EditDecision, EditOutcome, EditPatch, PutCommandInput, PutDecision, StoredCommand,
-    ToggleDecision, TriggerPatch,
+    check_capacity, error_code, publishable_builtin_names, require_automations_enabled,
+    reserved_command_names, validate_edit, validate_put_input, validate_toggle_enable, AuditRecord,
+    CommandError, DeleteDecision, EditDecision, EditOutcome, EditPatch, PutCommandInput,
+    PutDecision, StoredCommand, ToggleDecision, TriggerPatch,
 };
 use crate::leveling::valid_command_name;
 
@@ -41,13 +41,26 @@ pub async fn put(
     at: &str,
 ) -> Result<PutDecision, ServiceError> {
     require_automations_enabled(enabled)?;
-    let builtins = reserved_command_names();
+    let mut builtins = reserved_command_names();
     let mut tx = pool.begin().await?;
     store::lock_command_capacity(&mut tx, guild).await?;
     let existing = store::get_command(&mut *tx, guild, &input.name).await?;
+    // The additive voice surface must not strand a pre-existing saved myroom.
+    // Same-name maintenance cannot create a collision; voice slash dispatch
+    // still takes precedence when enabled. Fresh writes stay reserved.
+    if existing.is_some() && input.name == "myroom" {
+        builtins.remove("myroom");
+    }
     let rows = store::list_commands(&mut *tx, guild).await?;
-    let validation = validate_put_input(input, &builtins)
-        .and_then(|()| check_capacity(rows.len(), existing.is_none(), builtins.len()));
+    // Capacity counts publication slots, not the wider write-reservation set:
+    // `templateassistant` and dark names block writes but occupy no slot.
+    let validation = validate_put_input(input, &builtins).and_then(|()| {
+        check_capacity(
+            rows.len(),
+            existing.is_none(),
+            publishable_builtin_names().len(),
+        )
+    });
     if let Err(err) = validation {
         let record = AuditRecord::put_rejected(guild, actor, &input.name, existing.is_some(), &err);
         store::audit(&mut *tx, &record, audit_id, at).await?;
@@ -161,7 +174,11 @@ pub async fn set_enabled(
         // Resuming republishes the definition, so the stored row must still
         // pass the write rules. Pausing only removes it from the set and
         // needs no content check. Refusals stay zero-write: no audit fact.
-        validate_toggle_enable(row, &reserved_command_names(), &builtin_command_names())?;
+        let mut reserved = reserved_command_names();
+        if row.name == "myroom" {
+            reserved.remove("myroom");
+        }
+        validate_toggle_enable(row, &reserved, &builtin_command_names())?;
     }
     store::set_command_enabled(
         &mut *tx,
@@ -214,16 +231,22 @@ pub async fn edit(
     request: &EditRequest<'_>,
 ) -> Result<EditDecision, ServiceError> {
     require_automations_enabled(automations)?;
-    let reserved = reserved_command_names();
     if !valid_command_name(request.name) {
         return Err(CommandError::InvalidName.into());
-    }
-    if reserved.contains(request.name) {
-        return Err(CommandError::ReservedName(request.name.to_owned()).into());
     }
     let mut tx = pool.begin().await?;
     store::lock_command_capacity(&mut tx, request.guild).await?;
     let existing = store::get_command(&mut *tx, request.guild, request.name).await?;
+    // The additive voice surface must not strand a pre-existing saved myroom.
+    // Same-name maintenance cannot create a collision; voice slash dispatch
+    // still takes precedence when enabled. Fresh writes stay reserved.
+    let mut reserved = reserved_command_names();
+    if existing.is_some() && request.name == "myroom" {
+        reserved.remove("myroom");
+    }
+    if reserved.contains(request.name) {
+        return Err(CommandError::ReservedName(request.name.to_owned()).into());
+    }
     let decision = adjudicate_edit(
         request.guild,
         request.actor,

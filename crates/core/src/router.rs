@@ -57,7 +57,7 @@ use std::sync::OnceLock;
 
 use super::command_permissions::command_permission;
 use super::commands::{
-    core_commands, merge_registry, CommandDefinition, CustomCommand, RegistryError,
+    core_commands, merge_registry, CommandDefinition, CustomCommand, MergedRegistry, RegistryError,
 };
 use super::feature_commands::{
     announcement_commands, automation_commands, scorecard_attendance_command, FeatureGates,
@@ -103,6 +103,15 @@ pub const MANAGE_EVENTS_REQUIRED: &str =
 pub const GUILD_RESTRICTED_REPLY: &str = "This command is restricted to the configured guild.";
 /// Announcement gate: env-gated, not a Discord role — say who enables it.
 pub const ANNOUNCEMENTS_DISABLED_REPLY: &str = "Announcements are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.";
+
+/// The one optional builtin a publication may withhold when an otherwise
+/// valid complete catalog exceeds Discord's 100-command ceiling (see
+/// [`InteractionRouter::publish_set_capacity_deferred`]). `/myroom` is
+/// additive member discovery: withholding it for one publication preserves
+/// a historical catalog's boot, and a later normal sync re-admits it when
+/// capacity allows. Nothing else is deferrable — a baseline that is itself
+/// invalid still fails publication.
+pub const OPTIONAL_CAPACITY_BUILTIN: &str = "myroom";
 /// Moderation gate: env-gated, not a Discord role — say who enables it.
 pub const MODERATION_DISABLED_REPLY: &str = "Moderation is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
 /// Scorecard gate: env-gated, not a Discord role — say who enables it.
@@ -944,6 +953,96 @@ impl InteractionRouter {
         &self,
         custom: &[CustomCommand],
     ) -> Result<Vec<CommandDefinition>, RegistryError> {
+        self.build_publish_set(custom, None)
+    }
+
+    /// [`Self::publish_set`] plus the historical-catalog transition: when the
+    /// complete baseline (gate-constrained builtins plus every persisted
+    /// enabled custom row under the existing name/precedence rules) is valid
+    /// but adding the optional [`OPTIONAL_CAPACITY_BUILTIN`] entry alone
+    /// would exceed Discord's 100-command ceiling, publish the baseline
+    /// without only that builtin. A guild whose stored catalog predates the
+    /// new builtin keeps booting instead of failing publication.
+    ///
+    /// Deferral applies only when the baseline without the optional builtin
+    /// fits every custom row: the merge reports overflow through withheld
+    /// customs as well as through [`RegistryError::BuiltinLimit`], so the
+    /// full set is compared against the baseline including withheld rows.
+    /// A baseline that still withholds customs (or fails) is not a clean
+    /// historical catalog, so the full truncated set returns with no deferral
+    /// claim instead of a successfully truncated "fallback".
+    ///
+    /// Returns the definitions actually fit for publication and the withheld
+    /// builtin name when deferral applied. No custom row is truncated,
+    /// disabled, deleted or evicted on the deferral path, and no registry
+    /// error is swallowed: a baseline that is itself invalid still returns
+    /// its own error, and the next serialized registry sync re-evaluates
+    /// from scratch (no timer, key or retry mechanism is added).
+    pub fn publish_set_capacity_deferred(
+        &self,
+        custom: &[CustomCommand],
+    ) -> Result<(Vec<CommandDefinition>, Option<&'static str>), RegistryError> {
+        match self.merged_publish_set(custom, None) {
+            Err(RegistryError::BuiltinLimit(_)) => {
+                match self.merged_publish_set(custom, Some(OPTIONAL_CAPACITY_BUILTIN)) {
+                    Ok(baseline) if baseline.withheld.is_empty() => {
+                        Ok((baseline.commands, Some(OPTIONAL_CAPACITY_BUILTIN)))
+                    }
+                    Ok(baseline) => {
+                        Self::log_withheld(self.gates.configured_guild, &baseline.withheld);
+                        Ok((baseline.commands, None))
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            Ok(full) if full.withheld.is_empty() => Ok((full.commands, None)),
+            Ok(full) => match self.merged_publish_set(custom, Some(OPTIONAL_CAPACITY_BUILTIN)) {
+                Ok(baseline) if baseline.withheld.is_empty() => {
+                    Ok((baseline.commands, Some(OPTIONAL_CAPACITY_BUILTIN)))
+                }
+                Ok(_) => {
+                    Self::log_withheld(self.gates.configured_guild, &full.withheld);
+                    Ok((full.commands, None))
+                }
+                Err(_) => {
+                    Self::log_withheld(self.gates.configured_guild, &full.withheld);
+                    Ok((full.commands, None))
+                }
+            },
+        }
+    }
+
+    fn build_publish_set(
+        &self,
+        custom: &[CustomCommand],
+        withhold_builtin: Option<&str>,
+    ) -> Result<Vec<CommandDefinition>, RegistryError> {
+        let merged = self.merged_publish_set(custom, withhold_builtin)?;
+        Self::log_withheld(self.gates.configured_guild, &merged.withheld);
+        Ok(merged.commands)
+    }
+
+    fn log_withheld(configured_guild: Option<u64>, withheld: &[String]) {
+        if withheld.is_empty() {
+            return;
+        }
+        // Operator signal for a guild whose stored custom commands no
+        // longer fit beside the builtins (for example after a release adds
+        // one). Names are validated slash names, never member content.
+        tracing::warn!(
+            target: "two_bot_core::command_registry",
+            guild_id = configured_guild.map(|id| id.to_string()),
+            withheld_count = withheld.len(),
+            withheld = ?withheld,
+            "custom_commands_withheld_over_guild_limit"
+        );
+    }
+
+    fn merged_publish_set(
+        &self,
+        custom: &[CustomCommand],
+        withhold_builtin: Option<&str>,
+    ) -> Result<MergedRegistry, RegistryError> {
         let mut extra: Vec<Vec<CommandDefinition>> = Vec::with_capacity(6);
         if self.gates.scorecard {
             extra.push(vec![scorecard_attendance_command()]);
@@ -958,7 +1057,12 @@ impl InteractionRouter {
             extra.push(super::moderation::moderation_commands());
         }
         if self.gates.voice {
-            extra.push(voice_commands());
+            extra.push(
+                voice_commands()
+                    .into_iter()
+                    .filter(|definition| Some(definition.name.as_str()) != withhold_builtin)
+                    .collect(),
+            );
             // No assistant push: the name stays reserved (see
             // `reserved_names`) and dispatch keeps shadowing it, so the
             // slice re-activates by publishing again.
@@ -977,20 +1081,7 @@ impl InteractionRouter {
         } else {
             Vec::new()
         };
-        let merged = merge_registry(&extra, &visible)?;
-        if !merged.withheld.is_empty() {
-            // Operator signal for a guild whose stored custom commands no
-            // longer fit beside the builtins (for example after a release adds
-            // one). Names are validated slash names, never member content.
-            tracing::warn!(
-                target: "two_bot_core::command_registry",
-                guild_id = self.gates.configured_guild.map(|id| id.to_string()),
-                withheld_count = merged.withheld.len(),
-                withheld = ?merged.withheld,
-                "custom_commands_withheld_over_guild_limit"
-            );
-        }
-        Ok(merged.commands)
+        merge_registry(&extra, &visible)
     }
 }
 
@@ -2048,7 +2139,7 @@ mod tests {
 
     /// The 23 voice names in published order (pinned independently in
     /// `voice_rooms::tests::voice_command_shapes_and_gates`).
-    const VOICE_NAMES: [&str; 23] = [
+    const VOICE_NAMES: [&str; 24] = [
         "create",
         "setup",
         "ping",
@@ -2071,6 +2162,7 @@ mod tests {
         "public",
         "limit",
         "unlimit",
+        "myroom",
         "room-access-inspect",
     ];
 
@@ -2101,9 +2193,9 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 46 builtins keep their order; the 22 voice names that survive
+        // 46 builtins keep their order; the 23 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 68);
+        assert_eq!(on.len(), 69);
         assert_eq!(on_names[..46], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
@@ -2156,6 +2248,47 @@ mod tests {
     }
 
     #[test]
+    fn capacity_deferred_withholds_only_myroom_when_the_baseline_fits() {
+        fn customs(count: usize) -> Vec<CustomCommand> {
+            (0..count)
+                .map(|index| CustomCommand {
+                    name: format!("zzcap{index:02}"),
+                    description: "Capacity probe".to_owned(),
+                    enabled: true,
+                })
+                .collect()
+        }
+
+        let router = InteractionRouter::new(voice_on());
+        // 69 builtins: 31 customs fit exactly (69+31=100), nothing deferred.
+        let (defs, withheld) = router
+            .publish_set_capacity_deferred(&customs(31))
+            .expect("exact fit publishes");
+        assert_eq!(withheld, None);
+        assert_eq!(defs.len(), 100);
+        assert!(defs.iter().any(|def| def.name == "myroom"));
+
+        // 32 customs: the full set would withhold one custom (69+32=101),
+        // but the baseline without /myroom fits (68+32=100), so only the
+        // optional builtin is withheld and every custom still publishes.
+        let (defs, withheld) = router
+            .publish_set_capacity_deferred(&customs(32))
+            .expect("single overflow defers myroom");
+        assert_eq!(withheld, Some(OPTIONAL_CAPACITY_BUILTIN));
+        assert_eq!(defs.len(), 100);
+        assert!(!defs.iter().any(|def| def.name == "myroom"));
+        assert!(defs.iter().any(|def| def.name == "zzcap31"));
+
+        // 33 customs: even the baseline overflows (68+33=101), so the
+        // overflow is not /myroom's alone and no deferral is claimed.
+        let (defs, withheld) = router
+            .publish_set_capacity_deferred(&customs(33))
+            .expect("double overflow truncates");
+        assert_eq!(withheld, None);
+        assert_eq!(defs.len(), 100);
+    }
+
+    #[test]
     fn templateassistant_stays_unpublished_until_its_slice_lands() {
         // No handler yet, so no publish in any gate state; the slice
         // re-activates by publishing again (dispatch keeps shadowing the
@@ -2172,12 +2305,12 @@ mod tests {
             );
         }
         // Both gates on is the full voice set without the assistant: 46
-        // builtins plus the 22 surviving voice names.
+        // builtins plus the 23 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 68);
+        assert_eq!(both.len(), 69);
     }
 
     #[test]

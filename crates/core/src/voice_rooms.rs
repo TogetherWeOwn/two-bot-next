@@ -1927,6 +1927,7 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         )
         .int_range(0, MAX_USER_LIMIT)]),
         CommandDefinition::new("unlimit", "Remove your room's user limit"),
+        CommandDefinition::new("myroom", "Show the live temporary voice rooms you own"),
         CommandDefinition::new(
             "room-access-inspect",
             "See who is blocked, granted and waiting to join your voice room",
@@ -3098,6 +3099,7 @@ mod tests {
                 "public",
                 "limit",
                 "unlimit",
+                "myroom",
                 "room-access-inspect"
             ]
         );
@@ -3289,6 +3291,12 @@ mod tests {
         let unlimit = defs.iter().find(|def| def.name == "unlimit").unwrap();
         assert_eq!(unlimit.default_member_permissions, None);
         assert!(unlimit.options.is_empty());
+        // `/myroom` is a read-only member listing: open in the definition,
+        // no options (the caller is the authenticated invoker), and the
+        // worker filters to their currently owned live rooms.
+        let myroom = defs.iter().find(|def| def.name == "myroom").unwrap();
+        assert_eq!(myroom.default_member_permissions, None);
+        assert!(myroom.options.is_empty());
         // `/name` is open to every member with no options: the panel and modal
         // carry the name, and the worker refuses everyone but the owner or an
         // admin.
@@ -3335,13 +3343,16 @@ mod tests {
         // exactly one option, an optional 1-based Integer page: removing
         // the selector or shifting its minimum must fail here, independent
         // of the rendered reference docs.
-        assert_eq!(defs[22].name, "room-access-inspect");
-        assert_eq!(defs[22].default_member_permissions, None);
-        assert_eq!(defs[22].options.len(), 1);
-        assert_eq!(defs[22].options[0].name, "page");
-        assert_eq!(defs[22].options[0].kind, CommandOptionType::Integer.as_u8());
-        assert_eq!(defs[22].options[0].required, None);
-        assert_eq!(defs[22].options[0].min_value, Some(1));
+        let inspect = defs
+            .iter()
+            .find(|def| def.name == "room-access-inspect")
+            .unwrap();
+        assert_eq!(inspect.default_member_permissions, None);
+        assert_eq!(inspect.options.len(), 1);
+        assert_eq!(inspect.options[0].name, "page");
+        assert_eq!(inspect.options[0].kind, CommandOptionType::Integer.as_u8());
+        assert_eq!(inspect.options[0].required, None);
+        assert_eq!(inspect.options[0].min_value, Some(1));
         // Merges cleanly alongside the other slices, first-wins.
         // Moderation's `kick` sorts before the voice one, so the shared
         // merge keeps the moderation definition; runtime dispatch (not the
