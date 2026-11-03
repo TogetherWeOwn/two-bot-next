@@ -41,6 +41,17 @@ test("older exposition without the voice family still parses", () => {
   assert.ok(parseAlertScrape(metricsBody()));
 });
 
+test("a partially present voice family fails the scrape", () => {
+  // All-or-nothing: a missing outcome row would undercount refusals and
+  // clear a rising-refusal streak, so eleven of twelve voice rows is a
+  // failed scrape while zero of twelve is a rolled-back container.
+  const lines = metricsLines();
+  const voiceIndex = lines.findIndex(isVoiceFamilyLine);
+  assert.ok(voiceIndex >= 0);
+  assert.equal(parseAlertScrape(lines.filter((_, j) => j !== voiceIndex).join("\n")), null);
+  assert.ok(parseAlertScrape(lines.filter((line) => !isVoiceFamilyLine(line)).join("\n")));
+});
+
 test("older exposition without the optional gauges still parses", () => {
   const older = metricsBody(3).split("\n").filter((line) => !isOptionalLine(line)).join("\n");
   const samples = parseAlertScrape(older);

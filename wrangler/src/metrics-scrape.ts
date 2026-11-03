@@ -147,10 +147,21 @@ function combinations(axes: Record<string, readonly string[]>): Record<string, s
 // starve all alert rules until the newer container returns, so the `voice`
 // rows validate when present but are never required. Every other required
 // combination keeps its fail-closed shape: exactly one row per combination.
+// A partially present `voice` family is still a failure (see below): a
+// missing outcome row would undercount refusals and clear a rising streak,
+// so the family is all-or-nothing — absent entirely, or complete.
 const REQUIRED_INPUTS = new Set(Object.entries(ALERT_INPUT_LABELS).flatMap(([name, axes]) =>
   combinations(axes)
     .filter((labels) => !(name === "two_bot_internal_actions_total" && labels["family"] === "voice"))
     .map((labels) => identity(name, labels))));
+
+// Every `voice`-family combination. When a scrape carries any of these rows
+// it must carry all of them; when it carries none the older container is
+// accepted as-is.
+const VOICE_INTERNAL_ACTIONS_INPUTS = new Set(
+  combinations(ALERT_INPUT_LABELS["two_bot_internal_actions_total"]!)
+    .filter((labels) => labels["family"] === "voice")
+    .map((labels) => identity("two_bot_internal_actions_total", labels)));
 
 // Prometheus numbers, not JavaScript's empty/hexadecimal/Infinity coercions.
 const NUMBER = "(?:[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?|NaN|[+-]?Inf)";
@@ -206,5 +217,7 @@ export function parseAlertScrape(text: string): Sample[] | null {
   }
   const incarnation = samples.filter((sample) => sample.name === "two_bot_process_incarnation");
   if (incarnation.length > 0 && processIncarnation(incarnation) === undefined) return null;
-  return [...REQUIRED_INPUTS].every((key) => seen.has(key)) ? samples : null;
+  const voiceSeen = [...VOICE_INTERNAL_ACTIONS_INPUTS].some((key) => seen.has(key));
+  const voiceComplete = !voiceSeen || [...VOICE_INTERNAL_ACTIONS_INPUTS].every((key) => seen.has(key));
+  return [...REQUIRED_INPUTS].every((key) => seen.has(key)) && voiceComplete ? samples : null;
 }
