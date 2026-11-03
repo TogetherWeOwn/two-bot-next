@@ -133,6 +133,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ),
     ("TWO_INTERNAL_ALLOW_EVENT_CANCEL", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_EVENT_READ", SettingClass::EnvOnly),
+    ("TWO_INTERNAL_ALLOW_MEMBER_NOTIFY", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_MODERATION", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_SETTINGS", SettingClass::EnvOnly),
     // Combined `IP:port` socket; the split HOST/PORT pair below is legacy.
@@ -1297,6 +1298,7 @@ mod tests {
         "TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE",
         "TWO_INTERNAL_ALLOW_EVENT_CANCEL",
         "TWO_INTERNAL_ALLOW_EVENT_READ",
+        "TWO_INTERNAL_ALLOW_MEMBER_NOTIFY",
         "TWO_INTERNAL_ALLOW_MODERATION",
         "TWO_INTERNAL_ALLOW_SETTINGS",
         "TWO_INTERNAL_BIND",

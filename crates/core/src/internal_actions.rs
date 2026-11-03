@@ -80,6 +80,14 @@ pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_MESSAGE_CHARS: usize = 2000;
 /// Discord's own event-name ceiling.
 pub const MAX_EVENT_NAME_CHARS: usize = 100;
+/// Member-notify event-key ceiling: the website's stable event identity is at
+/// most 64 characters, and the bound matters because the key lands in the
+/// audit trail beside the member and the outcome.
+pub const MAX_NOTIFY_EVENT_KEY_CHARS: usize = 64;
+/// The only `reminder.send` kind in v1: an event starting soon. Any other
+/// value is a different intent the bot has no template for, so it refuses
+/// rather than guessing.
+pub const REMINDER_KIND_STARTING_SOON: &str = "starting_soon";
 /// Discord's own event-description ceiling.
 pub const MAX_EVENT_DESCRIPTION_CHARS: usize = 1000;
 pub const MAX_EVENT_LOCATION_CHARS: usize = 100;
@@ -668,10 +676,12 @@ pub fn auth_failure(log_reason: impl Into<String>) -> ActionError {
 
 /// Every verb the endpoint will run, in legacy publish order: the card's 18
 /// plus `event.read`, the narrow mapped-event verifier that landed later
-/// (TOG-5510). Adding a verb here without deciding which side of
+/// (TOG-5510), plus the two member-notify DM verbs (`reminder.send`,
+/// `place_offer.send`), which stay dark behind their own flag. Adding a verb
+/// here without deciding which side of
 /// [`NEEDS_IDEMPOTENCY_KEY`] it falls on is the mistake that set exists to
 /// prevent.
-pub const IMPLEMENTED_ACTIONS: [&str; 19] = [
+pub const IMPLEMENTED_ACTIONS: [&str; 21] = [
     "role.assign",
     "guild.add_member",
     "announcement.post",
@@ -691,14 +701,18 @@ pub const IMPLEMENTED_ACTIONS: [&str; 19] = [
     "moderation.slowmode",
     "moderation.lockdown",
     "moderation.unlock",
+    "reminder.send",
+    "place_offer.send",
 ];
 
 /// Actions where a repeat is not harmless, so the caller must send an
 /// `Idempotency-Key` and the bot must remember the result. A settings write
 /// sits here because two deliveries of the same save are two audit rows and
 /// two version bumps — and a concurrent save landing in between would be
-/// silently reverted by the second delivery.
-pub const NEEDS_IDEMPOTENCY_KEY: [&str; 14] = [
+/// silently reverted by the second delivery. The two member-notify verbs sit
+/// here because a repeat DM is not harmless: a second delivery is a second
+/// message to the member.
+pub const NEEDS_IDEMPOTENCY_KEY: [&str; 16] = [
     "announcement.post",
     "event.upsert",
     "event.cancel",
@@ -713,6 +727,8 @@ pub const NEEDS_IDEMPOTENCY_KEY: [&str; 14] = [
     "moderation.slowmode",
     "moderation.lockdown",
     "moderation.unlock",
+    "reminder.send",
+    "place_offer.send",
 ];
 
 /// Actions that cannot run without the config store wired in. Configured-on
@@ -849,6 +865,14 @@ impl InternalFlags {
         }
         if flag("TWO_INTERNAL_ALLOW_MODERATION") && flag("TWO_MODERATION") {
             enabled.extend(MODERATION_ACTIONS.iter().map(|s| (*s).to_owned()));
+        }
+        // Member-notify DM delivery stays dark until the operator enables it
+        // for a staging-proven rollout; one flag gates both verbs because
+        // they share the DM transport and the same no-free-text template rule.
+        // Merely shipping the implementation must not widen the allowlist.
+        if flag("TWO_INTERNAL_ALLOW_MEMBER_NOTIFY") {
+            enabled.insert("reminder.send".to_owned());
+            enabled.insert("place_offer.send".to_owned());
         }
         Self {
             enabled,
@@ -1392,6 +1416,162 @@ impl<'a> GuildAddMemberRequest<'a> {
     #[must_use]
     pub fn discord_id(&self) -> &'a str {
         self.discord_id
+    }
+}
+
+/// Member-notify event-key shape: the website's stable event identity, carried
+/// only for the DM deep link (`/e/{event_key}`) and never interpreted.
+/// Deliberately tighter than [`valid_event_key`] (1-200): the site's key
+/// ceiling is 64, and the bound matters because the key lands in the audit
+/// trail beside the member and the outcome. Same charset as
+/// [`valid_idempotency_key`].
+#[must_use]
+pub fn valid_notify_event_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    (1..=MAX_NOTIFY_EVENT_KEY_CHARS).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
+/// `reminder.send` / `place_offer.send` shared fields: the member snowflake,
+/// the site event key for the deep link, and the site event name for the
+/// template. There is deliberately no `body` field: the bot renders its own
+/// template from these facts, and free-form caller text never reaches a DM.
+fn validate_notify_event_key(body: &Map<String, Value>) -> Result<&str, ActionError> {
+    let key = require_field_str(body, "event_key")?;
+    if !valid_notify_event_key(key) {
+        return Err(ActionError::new(
+            ErrorCode::Malformed,
+            format!(
+                "\"event_key\" must be 1-{MAX_NOTIFY_EVENT_KEY_CHARS} characters of [A-Za-z0-9._:-]"
+            ),
+            "bad_event_key",
+        ));
+    }
+    Ok(key)
+}
+
+/// Site event name for a notify template: non-empty, at most
+/// [`MAX_EVENT_NAME_CHARS`] UTF-16 units, like the event input validator.
+fn validate_notify_event_name(body: &Map<String, Value>) -> Result<&str, ActionError> {
+    let name = require_field_str(body, "event_name")?;
+    if utf16_len(name) > MAX_EVENT_NAME_CHARS {
+        return Err(ActionError::new(
+            ErrorCode::Malformed,
+            format!(r#""event_name" is longer than {MAX_EVENT_NAME_CHARS} characters"#),
+            "event_name_too_long",
+        ));
+    }
+    Ok(name)
+}
+
+/// Reject caller-supplied DM text on the notify verbs: the template is the
+/// bot's, rendered from validated facts. Present-but-ignored would let a
+/// caller believe its words were delivered.
+fn reject_notify_body(body: &Map<String, Value>) -> Result<(), ActionError> {
+    if body.contains_key("body") {
+        return Err(ActionError::new(
+            ErrorCode::Malformed,
+            "\"body\" must not be present; the bot renders its own template",
+            "body_not_allowed",
+        ));
+    }
+    Ok(())
+}
+
+/// Validated `reminder.send` facts: the member, the event key for the deep
+/// link, the v1-only kind, the normalized Zulu start, and the event name.
+/// The site owns scheduling; the bot owns only this delivery.
+#[derive(Debug, Clone)]
+pub struct ReminderSendRequest<'a> {
+    discord_id: &'a str,
+    event_key: &'a str,
+    starts_at: String,
+    event_name: &'a str,
+}
+
+impl<'a> ReminderSendRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        reject_notify_body(body)?;
+        let discord_id = require_snowflake(body, "discord_id")?;
+        let event_key = validate_notify_event_key(body)?;
+        let kind = require_field_str(body, "kind")?;
+        if kind != REMINDER_KIND_STARTING_SOON {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                format!("\"kind\" must be \"{REMINDER_KIND_STARTING_SOON}\""),
+                "bad_kind",
+            ));
+        }
+        let starts_at = require_timestamp(body, "starts_at")?;
+        let event_name = validate_notify_event_name(body)?;
+        Ok(Self {
+            discord_id,
+            event_key,
+            starts_at,
+            event_name,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
+
+    /// Bot-side DM template: facts only, plus the site deep link. The path is
+    /// bare (`/e/{event_key}`) on purpose — the bot never invents the site's
+    /// domain. Mention suppression happens at send time, not here.
+    #[must_use]
+    pub fn dm_text(&self) -> String {
+        format!(
+            "Reminder: {} starts at {}. Details: /e/{}",
+            self.event_name, self.starts_at, self.event_key
+        )
+    }
+}
+
+/// Validated `place_offer.send` facts: the member, the event key for the deep
+/// link, the event name, and the normalized Zulu offer expiry. A delivered DM
+/// never consumes a place on its own; the site's state machine decides on the
+/// linked page.
+#[derive(Debug, Clone)]
+pub struct PlaceOfferSendRequest<'a> {
+    discord_id: &'a str,
+    event_key: &'a str,
+    event_name: &'a str,
+    expires_at: String,
+}
+
+impl<'a> PlaceOfferSendRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        reject_notify_body(body)?;
+        let discord_id = require_snowflake(body, "discord_id")?;
+        let event_key = validate_notify_event_key(body)?;
+        let event_name = validate_notify_event_name(body)?;
+        let expires_at = require_timestamp(body, "expires_at")?;
+        Ok(Self {
+            discord_id,
+            event_key,
+            event_name,
+            expires_at,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
+
+    /// Bot-side DM template: facts only, plus the site deep link. The path is
+    /// bare (`/e/{event_key}`) on purpose — the bot never invents the site's
+    /// domain. Mention suppression happens at send time, not here.
+    #[must_use]
+    pub fn dm_text(&self) -> String {
+        format!(
+            "A place opened for {}. Claim it before {}: /e/{}",
+            self.event_name, self.expires_at, self.event_key
+        )
     }
 }
 
@@ -2042,9 +2222,11 @@ pub const ADMIN_SCOPE_ADMIN: &str = "admin";
 impl InternalFlags {
     /// Scope the admin API requires for `action` (scope map v0).
     ///
-    /// Covers the 19 verbs the endpoint runs today: 3 read, 8 moderate and
-    /// 8 admin. `role.assign` is deliberately admin (a privilege grant, not
-    /// membership tooling). Later slices extend the map with new verbs;
+    /// Covers the 21 verbs the endpoint runs today: 3 read, 8 moderate and
+    /// 10 admin. `role.assign` is deliberately admin (a privilege grant, not
+    /// membership tooling); the two member-notify verbs are deliberately
+    /// admin too (an outbound DM is irreversible once read, like a broadcast).
+    /// Later slices extend the map with new verbs;
     /// anything unmapped — including strings that can never be verbs —
     /// resolves to no scope, which every allowance check refuses.
     #[must_use]
@@ -2066,7 +2248,9 @@ impl InternalFlags {
             | "role.assign"
             | "announcement.post"
             | "settings.set"
-            | "automations.import" => Some(ADMIN_SCOPE_ADMIN),
+            | "automations.import"
+            | "reminder.send"
+            | "place_offer.send" => Some(ADMIN_SCOPE_ADMIN),
             _ => None,
         }
     }
@@ -2817,6 +3001,12 @@ mod tests {
         // Gated verbs stay dark by default.
         let err = assert_allowed("guild.add_member", &flags, true, true).expect_err("dark");
         assert_eq!(err.code, ErrorCode::ActionNotAllowed);
+        // Member-notify DM verbs stay dark by default too: a repeat DM is not
+        // harmless, so delivery needs its own reviewed flag.
+        for action in ["reminder.send", "place_offer.send"] {
+            let err = assert_allowed(action, &flags, true, true).expect_err("dark");
+            assert_eq!(err.code, ErrorCode::ActionNotAllowed, "{action}");
+        }
         // Key-requiring verbs refuse without a store instead of 500ing later.
         let mut vars = HashMap::new();
         vars.insert("TWO_INTERNAL_ALLOW_EVENT_CANCEL".to_owned(), "1".to_owned());
@@ -2840,6 +3030,11 @@ mod tests {
             InternalFlags::from_map(&vars)
         };
         assert!(on("TWO_INTERNAL_ALLOW_ADD_MEMBER").is_enabled("guild.add_member"));
+        // One flag gates both DM-delivery verbs; anything else leaves them dark.
+        let notify = on("TWO_INTERNAL_ALLOW_MEMBER_NOTIFY");
+        assert!(notify.is_enabled("reminder.send"));
+        assert!(notify.is_enabled("place_offer.send"));
+        assert!(!on("TWO_INTERNAL_ALLOW_EVENT_READ").is_enabled("reminder.send"));
         assert!(on("TWO_INTERNAL_ALLOW_EVENT_CANCEL").is_enabled("event.cancel"));
         assert!(on("TWO_INTERNAL_ALLOW_EVENT_READ").is_enabled("event.read"));
         let auto = on("TWO_INTERNAL_ALLOW_AUTOMATIONS");
@@ -3287,6 +3482,165 @@ mod tests {
                 .code,
             ErrorCode::Malformed
         );
+    }
+
+    #[test]
+    fn member_notify_validation() {
+        // A repeat DM is not harmless, so both verbs require an idempotency key.
+        assert!(needs_idempotency_key("reminder.send"));
+        assert!(needs_idempotency_key("place_offer.send"));
+        assert!(IMPLEMENTED_ACTIONS.contains(&"reminder.send"));
+        assert!(IMPLEMENTED_ACTIONS.contains(&"place_offer.send"));
+
+        let reminder = map(json!({
+            "discord_id": "123456789012345678",
+            "event_key": "launch:2026",
+            "kind": "starting_soon",
+            "starts_at": "2026-11-04T18:00:00Z",
+            "event_name": "Launch Night",
+        }));
+        let request = ReminderSendRequest::validate(&reminder).expect("valid");
+        assert_eq!(request.discord_id(), "123456789012345678");
+        // Timestamps normalize to millis Zulu; the deep link is a bare path —
+        // the bot never invents the site's domain.
+        assert_eq!(
+            request.dm_text(),
+            "Reminder: Launch Night starts at 2026-11-04T18:00:00.000Z. Details: /e/launch:2026"
+        );
+
+        let offer = map(json!({
+            "discord_id": "123456789012345678",
+            "event_key": "launch-2026",
+            "event_name": "Launch Night",
+            "expires_at": "2026-11-04T18:00:00+01:00",
+        }));
+        let request = PlaceOfferSendRequest::validate(&offer).expect("valid");
+        assert_eq!(
+            request.dm_text(),
+            "A place opened for Launch Night. Claim it before 2026-11-04T17:00:00.000Z: /e/launch-2026"
+        );
+
+        // v1 knows exactly one reminder kind.
+        let body = map(json!({
+            "discord_id": "123456789012345678",
+            "event_key": "launch:2026",
+            "kind": "sesame_street",
+            "starts_at": "2026-11-04T18:00:00Z",
+            "event_name": "Launch Night",
+        }));
+        let err = ReminderSendRequest::validate(&body).expect_err("bad kind");
+        assert_eq!(err.code, ErrorCode::Malformed);
+        assert_eq!(err.log_reason, "bad_kind");
+
+        // Free-form caller text never reaches a DM, so a present `body` is a
+        // refusal, not a silent ignore.
+        for raw in [
+            json!({
+                "discord_id": "123456789012345678",
+                "event_key": "launch:2026",
+                "kind": "starting_soon",
+                "starts_at": "2026-11-04T18:00:00Z",
+                "event_name": "Launch Night",
+                "body": "hello",
+            }),
+            json!({
+                "discord_id": "123456789012345678",
+                "event_key": "launch:2026",
+                "event_name": "Launch Night",
+                "expires_at": "2026-11-04T18:00:00Z",
+                "body": "hello",
+            }),
+        ] {
+            let body = map(raw);
+            for result in [
+                ReminderSendRequest::validate(&body).map(|_| ()),
+                PlaceOfferSendRequest::validate(&body).map(|_| ()),
+            ] {
+                let err = result.expect_err("body not allowed");
+                assert_eq!(err.code, ErrorCode::Malformed);
+                assert_eq!(err.log_reason, "body_not_allowed");
+            }
+        }
+
+        // Event key: 1-64 chars of [A-Za-z0-9._:-].
+        assert!(valid_notify_event_key("a"));
+        assert!(valid_notify_event_key(&"k".repeat(64)));
+        assert!(!valid_notify_event_key(""));
+        assert!(!valid_notify_event_key(&"k".repeat(65)));
+        assert!(!valid_notify_event_key("has space"));
+        for raw in [
+            json!({"event_key": ""}),
+            json!({"event_key": "has space"}),
+            json!({"event_key": "k".repeat(65)}),
+            json!({}),
+        ] {
+            let mut merged = map(json!({
+                "discord_id": "123456789012345678",
+                "kind": "starting_soon",
+                "starts_at": "2026-11-04T18:00:00Z",
+                "event_name": "Launch Night",
+            }));
+            for (k, v) in map(raw) {
+                merged.insert(k, v);
+            }
+            assert_eq!(
+                ReminderSendRequest::validate(&merged)
+                    .expect_err("bad key")
+                    .code,
+                ErrorCode::Malformed
+            );
+        }
+
+        // Event name: non-empty, at most 100 UTF-16 units, like event input.
+        let mut long = map(json!({
+            "discord_id": "123456789012345678",
+            "event_key": "launch:2026",
+            "kind": "starting_soon",
+            "starts_at": "2026-11-04T18:00:00Z",
+            "event_name": "n".repeat(101),
+        }));
+        let err = ReminderSendRequest::validate(&long).expect_err("too long");
+        assert_eq!(err.code, ErrorCode::Malformed);
+        assert_eq!(err.log_reason, "event_name_too_long");
+        long.insert("event_name".to_owned(), json!(""));
+        assert_eq!(
+            ReminderSendRequest::validate(&long)
+                .expect_err("empty")
+                .code,
+            ErrorCode::Malformed
+        );
+
+        // Bad member id and bad timestamps are malformed, never a Discord call.
+        for raw in [
+            json!({
+                "discord_id": "not-an-id",
+                "event_key": "launch:2026",
+                "kind": "starting_soon",
+                "starts_at": "2026-11-04T18:00:00Z",
+                "event_name": "Launch Night",
+            }),
+            json!({
+                "discord_id": "123456789012345678",
+                "event_key": "launch:2026",
+                "kind": "starting_soon",
+                "starts_at": "next Tuesday",
+                "event_name": "Launch Night",
+            }),
+            json!({
+                "discord_id": "123456789012345678",
+                "event_key": "launch:2026",
+                "event_name": "Launch Night",
+                "expires_at": "next Tuesday",
+            }),
+        ] {
+            let body = map(raw);
+            for result in [
+                ReminderSendRequest::validate(&body).map(|_| ()),
+                PlaceOfferSendRequest::validate(&body).map(|_| ()),
+            ] {
+                assert_eq!(result.expect_err("malformed").code, ErrorCode::Malformed);
+            }
+        }
     }
 
     #[test]
