@@ -443,8 +443,9 @@ the holder below uses non-blocking locks and never steals or kills.
 
 Undo (retain never ran or aborted before mutation): release the holder,
 verify `policy.json` hash, lock inodes and lease files match the pre-hold
-record, and re-probe admission behavior. No receipt means no mutation
-occurred; running workers were never touched. If `retain` mutated some slots
+record, and re-probe admission behavior. A missing receipt does not prove no
+mutation occurred; verify actual paths/outcome. Running workers were never
+touched. If `retain` mutated some slots
 and then must be rolled back, regenerable output rebuilds through the
 repaired bounded pool; source, secrets, services and archives have no
 rollback change here.
@@ -471,22 +472,176 @@ this mismatch is a finding, not evidence that the host has recovered.
 
 ## Operator handoff and rollback (one host step)
 
-Use one existing/new `Operator:` child of the remediation card for this entire
-bounded-cache/retention/monitor rollout; do not file separate cards per substep.
-Code merge is not host deployment. Execution requires the reviewed, merged SHA.
+### Evidence-first removal handoff
+
+This is a documentation/checklist contract, **not authorization for a live host
+rehearsal or removal**. Code merge is not host deployment. Use the existing
+Paperclip issue documents, native review stages and interactions; no new service,
+cleanup tool, unattended deletion or waiver. DevOps owns future handoff
+preparation, Engineering Lead independently reviews the evidence, and the
+operator alone performs separately authorized host actions. Keep host details
+and readiness packets in the restricted remediation card, not the public PR.
+
+### Applicability before preparation
+
+- Legacy `audit` covers **only immediate worktree `target/` candidates** under
+  the genuine worktrees root. It is read-only, not a deletion procedure.
+- Bounded-pool `retain` is a **separate lock-through-mutation path**. Reuse its
+  exact-slot eligibility, evidence and same-lock controls above, including its
+  bounded holder-to-`retain` transition; do not replace them with this checklist.
+  Its optional `--evidence` receipt is written after mutation, not a pre-mutation
+  audit export; a missing receipt does not prove no mutation occurred. This
+  legacy-removal contract adds no `retain` dry-run or new tool capability.
+  A slot holder is not a general hold for legacy or external writers.
+- Primary shared-workspace targets, old shared caches and arbitrary external
+  targets are **unsupported by the legacy audit**. An empty audit, terminal
+  cleanup card or absence of Cargo PIDs does not make them eligible. Preserve
+  them pending a separately reviewed, separately authorized exact-path procedure.
+  Never repoint `--worktrees`, fabricate eligibility booleans, widen tool scope
+  or use `retain` on a path outside its supported slots.
+
+### 1. PREPARE ONLY — retain a readiness packet
+
+Do not rename, delete, clear a sentinel or otherwise mutate the target. Do not
+bundle missing preparation with removal in an execution confirmation. Preparation
+is not deletion authority. Missing capability or evidence means **STOP**: retain
+the gap and no executable removal handoff.
+
+Save a revisioned readiness packet as an issue document with retained attachments
+where needed. All fields below are required; placeholders are not evidence:
+
+| Packet field | Evidence to retain |
+| --- | --- |
+| Binding | Packet revision, handoff owner, preparation time, canonical exact target path and filesystem device/inode identity; container identity, aliases and canonical host/container mount or writable-layer mapping. |
+| Executable and procedure | Reviewed **merged** executable and guard SHA, checkout/identity verification, exact applicable procedure/version and scope; explicit supported-candidate determination, not an empty-audit inference. |
+| Independent provenance | Operator's independently established exact-target `build_output_only` classification and its source evidence; tool filename heuristics cannot mint it. Preserve mixed, unknown or unclassified material. |
+| Control-plane references | Authoritative complete export and capture time covering running, queued and retry runs on all related issues, and every execution/project/shared workspace reference, including terminal cards; attribution source and results. |
+| Host visibility | Host PID namespace and complete host/container cwd, exe, fd, mmap and cmdline visibility/results, alias/device/inode checks and denied/incomplete scan results. A container-only PID view is insufficient. |
+| Bounded hold | Existing supported hold method, affected writers/admission scope, quiescence proof, owner, maximum duration, start/expiry, release/undo and verification. Prove it covers the exact procedure; no service stop, cancellation or environment/roster edit is implied. |
+| Preflight output | Complete host inventory and applicable audit output, command/procedure identity, start/end times and exit status, plus allocated-byte baseline and protected-path list. Inventory must be at most 60 seconds old both before and after scanning. |
+| Evidence retention | Durable packet/output locations and successful write/readback result, independent of the candidate; never store the only receipt inside a removal target. |
+
+A preparation hold, if separately authorized and needed to obtain a readiness
+sample, is bounded and released/allowed to expire before asynchronous review.
+Record its release. **Do not keep admission held indefinitely for review.**
+Expiry or release invalidates readiness for mutation; the packet remains review
+evidence only. Existing fail-closed rollout/admission refusals are not a blanket
+legacy-removal hold, and this checklist does not authorize changing them.
+
+### 2. REVIEW — independent evidence gate, then one confirmation
+
+Keep the executor assigned. Request Engineering Lead review of the exact packet
+revision through a native `executionPolicy.stages` review stage; the executor
+must never be its own reviewer. Preserve existing stage IDs when updating a
+policy. Missing, unsupported or ambiguous evidence returns to preparation.
+
+Only after that review passes may the handoff owner create **one**
+operator-addressed `Operator step:` execution `request_confirmation` on the
+existing handoff card. Bind its `payload.target` to the issue document's exact
+revision and name the canonical exact target, procedure and merged guard SHA.
+Use the operator's configured user identity, `resolverPolicy: human_only` and
+`continuationPolicy: wake_assignee`; do not substitute a general board response.
+No separate card is needed for each preflight substep.
+
+Acceptance is **neither execution evidence nor a waiver**, and does not supply
+missing normal authorization for host action. Never backfill a packet to imply
+an unobserved preflight occurred. A changed target, procedure or packet revision
+requires renewed independent review and a new exact-target confirmation; withdraw
+or supersede the old request through the existing interaction flow.
+
+### 3. EXECUTE — separate authorization and fresh final evidence
+
+For legacy removal, the operator proceeds only with the separate normal
+authorization, reviewed packet and exact-target confirmation. Earlier acceptance
+cannot override any STOP below. Before **ANY mutation, including rename**:
+
+1. Establish and record the supported **bounded hold** for this exact procedure:
+   method, scope/quiescence, start, expiry and undo. Revalidate that it remains
+   effective through mutation. A missing, expired or insufficiently scoped hold
+   means skip deletion; do not improvise a new admission mechanism.
+2. Revalidate the canonical exact path and device/inode identity, host/container
+   mapping, reviewed merged executable/guard, procedure applicability and
+   independent provenance. Recheck authoritative live/queued/retry and all
+   execution/project/shared references and complete host process visibility.
+3. **Re-export the complete host inventory and rerun the applicable audit
+   immediately before removal**, under that hold. Preserve the **<=60-second
+   inventory age both before and after scanning**. Old review output or an
+   accepted confirmation cannot substitute. If evidence retention or other delay
+   makes readiness stale, repeat the export/scan before considering mutation.
+4. Retain and verify the **final evidence BEFORE mutation**: exact-target binding,
+   hold record, fresh inventory, complete scan/audit output and exit status,
+   provenance/references and allocated bytes before. This ordering is required
+   for the separately authorized legacy procedure; it is not supplied by
+   `retain`'s post-mutation receipt. Pool retention follows its separate controls
+   above; never run legacy `audit` as a substitute or release its mutation lock.
+5. Only if every gate still passes, use the separately authorized exact-path
+   procedure. Missing/expired hold, stale inventory, denied/incomplete scan,
+   positive reference, unsupported path or **failed final evidence write** means
+   **STOP/skip deletion**, not rename first or confirm away the failure.
+
+Retain a completion receipt for every attempt: packet revision, confirmation and
+authorization references, actual outcome (removed, skipped, aborted or partial),
+exact paths, allocated bytes before/after and reclaimed difference, hold release
+or expiry and undo verification, and protected-path preservation results. Do not
+claim reclaimed bytes from acceptance, estimates or an absent receipt. Preserve
+source, evidence, entire workspaces, tracked files, active/shared caches, backups,
+incident-preservation archives, Docker images and services. No sentinel clearing
+is authorized by this legacy handoff; `retain` keeps its existing exact-slot rules.
+
+### Fictional tabletop — no live rehearsal
+
+These are checklist expectations, not host measurements or reconstructed incident
+evidence. For each row, assume an earlier confirmation was already accepted:
+
+| Fictional final-preflight condition | Required result |
+| --- | --- |
+| Inventory missing, or 61 seconds old before or after scanning | **STOP**; no executable removal handoff; obtain a new complete export and scan. |
+| Hold absent, expired, released or not covering the target's writers | **STOP**; no executable removal handoff; establish a supported new bounded hold and redo final preflight. |
+| Host process scan denied/incomplete, or only container PIDs visible | **STOP**; no executable removal handoff; preserve target until complete visibility is available. |
+| Live, queued, retry, execution/project or shared reference found | **STOP**; no executable removal handoff; preserve the referenced target. |
+| Provenance unclassified, mixed, unknown or derived only from filenames | **STOP**; no executable removal handoff; independent classification is required. |
+| Primary shared-workspace or arbitrary external target; audit is empty | **STOP**; no executable removal handoff; preserve pending a separately reviewed authorized exact-path procedure. |
+| Final evidence write/readback fails | **STOP**; no executable removal handoff or mutation, even with clean scan output in memory. |
+| Target identity, procedure or packet revision differs from reviewed/confirmed binding | **STOP**; no executable removal handoff; renew review and exact-target confirmation. |
+
+Fully supported fictional case: `/HOST/EXAMPLE/worktrees/closed-fixture/target`
+is an immediate ignored, untracked, nonsymlink worktree target with independently
+attested build-output-only provenance. Complete authoritative rows show terminal
+attribution, no live/queued/retry runs and no execution/project/shared references;
+complete host/container process checks are negative. DevOps retains packet R1,
+including mapped identity, merged guard SHA, applicable approved procedure,
+allocated-byte baseline, bounded hold plan and a fresh preparation audit. The
+sample hold is released before Engineering Lead independently reviews R1 through
+the native stage. Only then is one operator-addressed confirmation for R1 and
+that exact target accepted; separate normal execution authorization is recorded.
+
+Review finishes minutes later: **R1's sample is now stale and its hold released**.
+The acceptance cannot revive readiness. With the binding unchanged, the operator
+records a new supported bounded hold and exports a new inventory, scanned at age
+8 seconds before and 12 seconds after scanning. The fresh final preflight and
+successful durable write/readback are retained as execution evidence linked to
+R1 **before any mutation**. Final evidence is an appended execution receipt, not
+an edit to the reviewed packet; a material change instead goes back to review
+and confirmation. While the hold remains effective, only the separately
+authorized exact target is removed. The fictional completion receipt records
+4,096 allocated bytes before, 0 after, actual removal, hold release/undo checks
+and unchanged protected paths. No commands or host actions are run for this
+example; it is not evidence of a real removal.
+
+### Existing bounded-cache/monitor rollout and rollback
+
+The evidence gates above precede any separately authorized removal in this
+rollout; they do not expand provisioning, generator-guard or slot-recovery scope.
+Keep the existing rollout receipts on the same remediation/handoff card.
 
 1. Record `findmnt -T /home`, `findmnt -T <host TWO worktrees>`, `df -B1` and
-   `statvfs` user-available bytes. Resolve the container-to-host path mapping
-   explicitly. Do not trust the container's `/home` reading.
-2. Under a bounded TWO-only build admission hold, export the fresh inventory and
-   run the audit in the host namespace. Use the incident's already-authorized
-   target-only pruning procedure for explicitly approved candidates, with a new
-   immediate inventory/proc recheck per deletion. Record exact paths and reclaimed
-   allocated blocks. No source/evidence/worktree, tracked file, active/shared cache,
-   backup, preservation archive, Docker image or service may be removed here.
-3. Resolve and retain the container-scratch coverage evidence above. If mapping,
+   `statvfs` user-available bytes and the explicit container-to-host mapping.
+   Do not trust the container's `/home` reading.
+2. Resolve and retain the container-scratch coverage evidence above. If mapping,
    attribution, process visibility or external growth is unresolved, **stop rollout
-   and keep admission held**; successful worktree audit alone is insufficient.
+   and preserve fail-closed admission refusal**; successful worktree audit alone
+   is insufficient. Release temporary readiness holders at their recorded bound;
+   do not stretch a mutation hold across asynchronous evidence review.
    Create the **new, initially empty** pool and its two `slot-N/target` and
    `slot-N/scratch` directories plus `slot-N/lock` regular files. Do not repoint or
    migrate the old shared cache or any legacy `/tmp` output.
@@ -497,7 +652,7 @@ Code merge is not host deployment. Execution requires the reviewed, merged SHA.
    **If this filesystem lacks already-supported quotas, stop this substep and
    route the constraint to the Director of Engineering.** No global remount,
    new disk, package install or unbounded soft-only fallback is authorized here.
-4. After that evidence exists, write the pool policy:
+3. After that evidence exists, write the pool policy:
    ```json
    {"version":1,"slots":2,"slot_budget_bytes":6442450944,
     "hard_limit_bytes":17179869184,"min_available_bytes":10737418240,
@@ -507,13 +662,13 @@ Code merge is not host deployment. Execution requires the reviewed, merged SHA.
    The policy/slot count is fixed while any lease exists. It must not be writable
    by unrelated projects. Expose the new path to TWO containers using the existing
    `/paperclip` bind mount; do not change the agent roster or inherited environment.
-5. Pin the monitor script at the merged SHA in the existing host monitoring
+4. Pin the monitor script at the merged SHA in the existing host monitoring
    mechanism; test both quiet healthy output and a synthetic threshold finding by
    setting the threshold above current available bytes. Register the existing alert
    route. Adopt the repo wrapper for subsequent TWO builds; no full Rust build is
    needed for this rollout. Record slot usage, quota enforcement and zero new
    per-worktree targets for the first concurrent isolated invocations.
-6. Release the admission hold only after the guard, quota, monitor **and scratch
+5. Release the rollout admission restriction only after the guard, quota, monitor **and scratch
    coverage** are verified. Attach quota/audit/monitor/adoption/scratch receipts to
    the same Operator card. Admission tests before final policy use disposable
    offline fixture pools; never put a synthetic receipt in the real pool.
