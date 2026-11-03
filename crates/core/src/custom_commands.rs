@@ -15,8 +15,10 @@ use std::collections::HashSet;
 use super::commands::{merge_commands, CommandDefinition, CustomCommand, GUILD_COMMAND_LIMIT};
 
 /// Placeholders a custom-command template may reference (legacy
-/// `TEMPLATE_PLACEHOLDERS`).
-pub const TEMPLATE_PLACEHOLDERS: [&str; 4] = ["user", "username", "server", "channel"];
+/// `TEMPLATE_PLACEHOLDERS`, plus the bounded `{args}` invocation echo:
+/// `args` substitutes the member-supplied invocation text literally in one
+/// pass, never re-scanned, so it cannot nest or re-trigger substitution).
+pub const TEMPLATE_PLACEHOLDERS: [&str; 5] = ["user", "username", "server", "channel", "args"];
 
 /// Stored-template bound in UTF-16 units (legacy JavaScript string.length).
 pub const MAX_TEMPLATE_CHARS: usize = 2000;
@@ -31,8 +33,8 @@ pub const MAX_COMMAND_NAME_CHARS: usize = 32;
 /// `TRIGGER_PATTERN` `^![a-z0-9_-]{1,32}$`: one `!` plus a command name).
 pub const MAX_TEXT_TRIGGER_CHARS: usize = MAX_COMMAND_NAME_CHARS + 1;
 /// Placeholder-extraction bound: `placeholders_in` returns at most this many
-/// distinct keys in first-seen order, then stops scanning. Only four keys are
-/// ever known, so any five distinct keys already contain an unknown one —
+/// distinct keys in first-seen order, then stops scanning. Only five keys are
+/// ever known, so any six distinct keys already contain an unknown one —
 /// capping at 64 preserves `validate_template`'s unknown-placeholder refusal
 /// exactly while keeping hostile inputs total-bounded in time and memory.
 pub const MAX_PLACEHOLDERS: usize = 64;
@@ -55,6 +57,13 @@ pub struct TemplateContext {
     pub server: String,
     /// Channel the command ran in.
     pub channel: String,
+    /// Member-supplied invocation text for `{args}` (empty when the path
+    /// carries none). Substituted literally in the same single pass as the
+    /// other keys; never re-scanned, so braces inside render literally.
+    /// Channel-bound output still passes through `neutralize_mentions` plus
+    /// `allowed_mentions: { parse: [] }`, exactly like any other template
+    /// input, so this field grants no mention.
+    pub args: String,
 }
 
 /// Template validation/render failure (legacy `validateTemplate` /
@@ -64,7 +73,7 @@ pub enum TemplateError {
     #[error("Template must be between 1 and 2000 characters.")]
     InvalidLength,
     #[error(
-        "Unknown placeholder {{{0}}}. Supported: {{user}}, {{username}}, {{server}}, {{channel}}."
+        "Unknown placeholder {{{0}}}. Supported: {{user}}, {{username}}, {{server}}, {{channel}}, {{args}}."
     )]
     UnknownPlaceholder(String),
     #[error("Rendered command output is {0} characters; Discord's ceiling is 2000.")]
@@ -154,6 +163,7 @@ pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, 
                     "username" => ctx.username.as_str(),
                     "server" => ctx.server.as_str(),
                     "channel" => ctx.channel.as_str(),
+                    "args" => ctx.args.as_str(),
                     _ => &template[i..end],
                 };
                 if out.len() > MAX_RENDERED_CHARS * 3 {
@@ -971,10 +981,37 @@ pub fn format_command_list_page(
 }
 
 /// `/command-inspect` sample-arguments bound in UTF-16 units, matching the
-/// published `max_length`. Samples are validated for size only: the
-/// four-variable template language ignores them, so accepting a sample must
-/// never introduce `{args}` or a second interpolation pass.
+/// published `max_length`. Samples are validated for size only and stay out
+/// of the invocation render: run paths substitute the captured `{args}`
+/// input, never the sample, and there is no second interpolation pass.
 pub const MAX_INSPECT_ARGUMENT_UNITS: usize = 500;
+
+/// `{args}` capture bound in UTF-16 units (`encode_utf16().count()`),
+/// matching the inspect-sample bound so the preview sample becomes the
+/// preview input unchanged. The unit count is authoritative; byte length is
+/// total-bounded (worst case 500 BMP units × 3 bytes), so no separate byte
+/// check exists. The rendered-output bound still applies after substitution
+/// and still refuses the whole render.
+pub const MAX_ARGS_UNITS: usize = 500;
+
+/// Member-supplied `{args}` text refused before render (legacy has no throw
+/// for this; run paths answer their own correction instead). Content-free:
+/// the reason names no member text and no content-derived measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ArgsError {
+    #[error("Arguments must be at most 500 UTF-16 units.")]
+    TooLong,
+}
+
+/// Bound invocation arguments before substitution: over-long input refuses
+/// whole, never truncates into a render. Absent and empty values substitute
+/// the empty string, so templates without `{args}` behave byte-identically.
+pub fn validate_args(args: &str) -> Result<(), ArgsError> {
+    if args.encode_utf16().count() > MAX_ARGS_UNITS {
+        return Err(ArgsError::TooLong);
+    }
+    Ok(())
+}
 
 /// Which private view `/command-inspect` renders. Summary never bundles the
 /// template body or a preview: two full 2,000-unit bodies plus metadata
@@ -1361,6 +1398,16 @@ pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> Str
             );
         }
     };
+    // Previews stay truthful about delivery: a render with no message text
+    // (for example an `{args}`-only template with an empty sample) refuses
+    // at run time, so the preview says so instead of showing a blank body.
+    // Fixed copy only — the rendered text may carry member content.
+    if !crate::message_safety::has_message_text(&rendered) {
+        let shown = escape_inspect_text(&row.name);
+        return format!(
+            "Template for /{shown} renders no message text with these arguments. Add text around {{args}} with /command name:{shown} template:..."
+        );
+    }
     format_bounded_view(
         &InspectView::Preview.heading(&row.name),
         &escape_inspect_text(&rendered),
@@ -1373,10 +1420,18 @@ pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> Str
 #[must_use]
 pub fn format_draft_preview(template: &str, ctx: &TemplateContext) -> String {
     match validate_template(template).and_then(|()| render_template(template, ctx)) {
-        Ok(rendered) => format_bounded_view(
-            "Draft preview — not saved or published",
-            &escape_inspect_text(&rendered),
-        ),
+        Ok(rendered)
+            if crate::message_safety::has_message_text(&rendered) =>
+        {
+            format_bounded_view(
+                "Draft preview — not saved or published",
+                &escape_inspect_text(&rendered),
+            )
+        }
+        // A draft that renders no message text would refuse at run time, so
+        // the preview says so. Fixed copy only — never the rendered text.
+        Ok(_) => "Draft renders no message text with these arguments. Add text around {args} and retry /command-inspect draft:Hello. Nothing was saved or published."
+            .to_owned(),
         Err(error) => {
             let detail = escape_inspect_text(&error.to_string());
             let detail = if detail.encode_utf16().count() > 256 {
@@ -1540,6 +1595,7 @@ mod tests {
             username: String::new(),
             server: String::new(),
             channel: String::new(),
+            args: String::new(),
         };
         let template = "{user}".repeat(500);
         let result = render_template(&template, &ctx);
@@ -1563,17 +1619,29 @@ mod tests {
     }
 
     #[test]
-    fn template_render_substitutes_all_four() {
+    fn template_render_substitutes_all_five() {
         let ctx = TemplateContext {
             user: "<@1>".to_owned(),
             username: "one".to_owned(),
             server: "TWO".to_owned(),
             channel: "#general".to_owned(),
+            args: "extra words".to_owned(),
         };
         assert_eq!(
             render_template("hey {user} ({username}) of {server} in {channel}", &ctx),
             Ok("hey <@1> (one) of TWO in #general".to_owned())
         );
+        // `{args}` echoes the invocation text literally in the same pass.
+        assert_eq!(
+            render_template("Says {args}", &ctx),
+            Ok("Says extra words".to_owned())
+        );
+        // Absent invocation text substitutes empty, never a literal key.
+        let ctx = TemplateContext {
+            args: String::new(),
+            ..ctx
+        };
+        assert_eq!(render_template("Says {args}", &ctx), Ok("Says ".to_owned()));
     }
 
     #[test]
@@ -1583,6 +1651,7 @@ mod tests {
             username: "x".repeat(50),
             server: String::new(),
             channel: String::new(),
+            args: String::new(),
         };
         assert!(matches!(
             render_template(&format!("{{username}}{}", "x".repeat(2000)), &ctx),
@@ -1602,6 +1671,7 @@ mod tests {
             username: "😀".repeat(1001),
             server: String::new(),
             channel: String::new(),
+            args: String::new(),
         };
         assert_eq!(
             render_template("{username}", &ctx),
@@ -1622,6 +1692,7 @@ mod tests {
             username: "not substituted twice".to_owned(),
             server: "世界".to_owned(),
             channel: "#rules".to_owned(),
+            args: String::new(),
         };
         assert_eq!(
             render_template("😀 {user} {{server}} {User} {unknown}", &ctx),
@@ -2089,7 +2160,7 @@ mod tests {
         let reserved = reserved_command_names();
         let dispatch = builtin_command_names();
         let mut row = stored("faq");
-        row.template = "Imported {args}".to_owned();
+        row.template = "Imported {guild}".to_owned();
         let description_only = patch(None, Some("Fine"), TriggerPatch::Keep);
         assert!(matches!(
             validate_edit(
@@ -2152,7 +2223,7 @@ mod tests {
         }
         // Invalid stored content refuses without reactivating.
         let mut broken = valid.clone();
-        broken.template = "Unknown {args}".to_owned();
+        broken.template = "Unknown {guild}".to_owned();
         assert!(matches!(
             validate_toggle_enable(&broken, &reserved, &dispatch),
             Err(CommandError::InvalidTemplate(_))
@@ -2334,6 +2405,7 @@ mod tests {
             username: "tester".to_owned(),
             server: "TWO".to_owned(),
             channel: "<#4444>".to_owned(),
+            args: String::new(),
         }
     }
 
@@ -2683,6 +2755,42 @@ mod tests {
     }
 
     #[test]
+    fn inspect_preview_refuses_a_render_with_no_message_text() {
+        // ARG-20: an `{args}`-only template with an empty sample renders no
+        // message text, which run paths refuse — so the preview says so in
+        // fixed copy instead of showing a blank body.
+        let row = StoredCommand {
+            template: "{args}".to_owned(),
+            ..inspect_row()
+        };
+        assert_eq!(
+            format_inspect_preview(&row, &inspect_ctx()),
+            "Template for /faq renders no message text with these arguments. Add text around {args} with /command name:faq template:..."
+        );
+        // Text around the placeholder still previews normally.
+        let row = StoredCommand {
+            template: "Says {args}".to_owned(),
+            ..inspect_row()
+        };
+        assert_eq!(
+            format_inspect_preview(&row, &inspect_ctx()),
+            "Preview /faq\nSays "
+        );
+    }
+
+    #[test]
+    fn draft_preview_refuses_a_render_with_no_message_text() {
+        assert_eq!(
+            format_draft_preview("{args}", &inspect_ctx()),
+            "Draft renders no message text with these arguments. Add text around {args} and retry /command-inspect draft:Hello. Nothing was saved or published."
+        );
+        assert_eq!(
+            format_draft_preview("Says {args}", &inspect_ctx()),
+            "Draft preview — not saved or published\nSays "
+        );
+    }
+
+    #[test]
     fn draft_long_invalid_template_preserves_bounded_detail_and_correction() {
         let template = format!("{{{}}}", "a".repeat(1998));
         let view = format_draft_preview(&template, &inspect_ctx());
@@ -2708,7 +2816,7 @@ mod tests {
 
     #[test]
     fn inspect_preview_refuses_invalid_templates_with_correction() {
-        for template in ["Hello {unknown}", "{args}", &"😀".repeat(1001)] {
+        for template in ["Hello {unknown}", "{guild}", &"😀".repeat(1001)] {
             let mut row = inspect_row();
             row.template = template.to_owned();
             let view = format_inspect_preview(&row, &inspect_ctx());

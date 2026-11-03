@@ -1,7 +1,7 @@
 //! Protected behavior contract: `/command-inspect draft:<template>` previews
 //! proposed text, never a saved definition. `name` and `draft` are exclusive;
 //! draft alone defaults to preview, and explicit `view:preview` is equivalent.
-//! Rendering keeps the existing four-variable, single-pass language. The trusted
+//! Rendering keeps the existing five-variable, single-pass language. The trusted
 //! first line is `Draft preview — not saved or published`; untrusted body text
 //! uses the saved preview's Markdown escaping and UTF-16 framing policy.
 //!
@@ -180,12 +180,12 @@ async fn draft_context_is_single_pass_and_arguments_never_become_template_source
 }
 
 #[tokio::test]
-async fn draft_unknown_and_args_placeholders_refuse_before_rendering() {
+async fn draft_unknown_placeholders_refuse_before_rendering() {
     let (pool, listener) = tripwire_pool().await;
     let mock = discord().await;
     let runtime = runtime(pool.clone(), &mock, true);
     let mut observations = Vec::new();
-    for (index, key) in ["unknown", "usre", "args"].into_iter().enumerate() {
+    for (index, key) in ["unknown", "usre", "guild"].into_iter().enumerate() {
         let template = format!("DO NOT EXECUTE {{{{{key}}}}}");
         observations.push((
             key,
