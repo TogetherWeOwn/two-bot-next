@@ -98,7 +98,7 @@ impl PreviewRequest {
 /// Map one slash command's options to the strict decoder's borrowed shape.
 /// Unknown option *values* map to `Other` and refuse downstream; this mapping
 /// itself never refuses — strictness lives in
-/// [`decode_preview_input`](two_bot_core::automod_preview_input::decode_preview_input).
+/// [`decode_preview_input`].
 #[must_use]
 pub fn map_preview_options(data: &CommandData) -> Vec<(String, PreviewOptionValue<'_>)> {
     data.options
