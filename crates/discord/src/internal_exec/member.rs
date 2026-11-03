@@ -23,7 +23,9 @@ pub const ROLE_TIMEOUT_MS: u64 = 2000;
 
 /// Keep proof of an unsent mutation until the durable caller disposes its claim.
 /// Public callers still receive the legacy scalar-only `ActionError` envelope.
-enum MemberError {
+/// Shared with the member-notify DM transport, which reuses the same bounded
+/// exchange and guard mapping.
+pub(crate) enum MemberError {
     Guard(GuardError),
     Action(ActionError),
 }
@@ -35,7 +37,7 @@ impl From<ActionError> for MemberError {
 }
 
 impl MemberError {
-    fn into_action_error(self) -> ActionError {
+    pub(crate) fn into_action_error(self) -> ActionError {
         match self {
             Self::Guard(GuardError::TokenInvalid) => ActionError::new(
                 ErrorCode::DiscordUnavailable,
@@ -129,7 +131,7 @@ pub fn member_status_error(response: &RawResponse) -> Option<ActionError> {
     ))
 }
 
-fn numeric_id(value: &str) -> Result<Id<GenericMarker>, ActionError> {
+pub(crate) fn numeric_id(value: &str) -> Result<Id<GenericMarker>, ActionError> {
     value
         .parse::<u64>()
         .ok()
@@ -158,7 +160,7 @@ impl ActionExecutor {
     // Only building the request depends on its Twilight builder type. Keep the
     // bounded exchange and refusal handling in one concrete async state machine.
     #[inline(never)]
-    async fn member_request(
+    pub(crate) async fn member_request(
         &self,
         request: Result<Request, twilight_http::Error>,
         timeout_ms: u64,
