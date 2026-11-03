@@ -100,6 +100,11 @@ T0_WORDS = frozenset({
 })
 T0_PATH_PATTERNS = (
     re.compile(r"^\.github/workflows/deploy[^/]*(?:/.*)?$"),
+    # The gate itself: a PR that edits the floor or the workflow that runs it
+    # must carry an attestation, judged by the already-merged copy (the
+    # supply-chain pr-lint job imports pr_standards.py from the base branch).
+    re.compile(r"^\.github/workflows/supply-chain\.yml$"),
+    re.compile(r"^\.github/scripts/pr_standards\.py$"),
     re.compile(r"(?:^|/)wrangler(?:[.-][^/]*)?\.(?:toml|jsonc?)$"),
     re.compile(r"^crates/cutover/"),
 )

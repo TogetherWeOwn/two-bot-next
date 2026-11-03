@@ -4587,6 +4587,43 @@ class WorkflowTests(unittest.TestCase):
                          "${{ steps.changed.outputs.changed_files_file }}")
         self.assertIn("CHANGED_FILES", check["run"])
 
+    def test_pr_lint_runs_the_gate_from_the_base_branch(self):
+        # The working tree is the PR merge ref: importing pr_standards.py from
+        # it would let a PR weaken its own T0 floor and pass itself. The gate
+        # must come from the base branch (same shape as the gitleaks
+        # base-branch policy) and fail closed when that copy is missing.
+        steps = self.workflows["supply-chain.yml"]["jobs"]["pr-lint"]["steps"]
+        base = next(s for s in steps if s.get("name") == "Check out base-branch gate")
+        self.assertEqual(base["if"],
+                         "github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'")
+        self.assertTrue(str(base.get("uses", "")).startswith("actions/checkout@"))
+        self.assertEqual(base["with"]["ref"],
+                         "${{ github.event.pull_request.base.sha || 'main' }}")
+        self.assertEqual(base["with"]["path"], "base-gate")
+        self.assertEqual(base["with"]["sparse-checkout"], ".github/scripts")
+        self.assertEqual(base["with"]["persist-credentials"], "false")
+        check = next(s for s in steps if s.get("name") == "Check title, body, branch and commits")
+        self.assertLess(steps.index(base), steps.index(check))
+        self.assertIn("base-gate", check["run"])
+        self.assertIn("Base-branch gate checkout is missing", check["run"])
+
+    def test_pr_lint_runs_no_pr_controlled_code_before_the_gate(self):
+        # The unit-test and squash-parse steps execute the PR head's own files
+        # (test_pr_standards.py imports the head's pr_standards.py;
+        # commit-parse-guard.cjs runs from the head checkout). They must run
+        # only after the base-branch gate has consumed its inputs: an earlier
+        # slot runs after Resolve writes the body to the predictable
+        # $RUNNER_TEMP/pr-body.md, so a PR could rewrite that file (or poison
+        # $GITHUB_PATH/$GITHUB_ENV) and have the trusted gate validate
+        # substituted input.
+        steps = self.workflows["supply-chain.yml"]["jobs"]["pr-lint"]["steps"]
+        names = [s.get("name") for s in steps]
+        check = names.index("Check title, body, branch and commits")
+        for name in ("Unit-test the lint",
+                     "Check the squash commit parses for release notes"):
+            self.assertLess(check, names.index(name),
+                            f"{name} must run after the gate has consumed its inputs")
+
     def test_quality_gates_diff_merge_checkout_against_its_first_parent(self):
         steps = self.workflows["check.yml"]["jobs"]["check"]["steps"]
         expected_base = "${{ github.event.merge_group.base_sha || (github.event.pull_request && format('{0}^1', github.sha)) || github.event.before || 'origin/main' }}"
