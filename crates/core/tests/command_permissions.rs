@@ -238,7 +238,7 @@ fn next_only_read_permission_rows_do_not_become_mutation_policy_hooks() {
         ("tempban-list", 46, 4),
         ("moderation-recent", 47, 1_099_511_627_776),
         ("lockdown-preview", 48, 16),
-        ("automod-preview", 49, 32),
+        ("automod-preview", 51, 32),
     ] {
         let row = command_permission(name).expect("read has a permission row");
         assert_eq!(row.parity_row, number);
