@@ -47,7 +47,8 @@ class FakeDiscord:
     def __init__(self, app=TEST_BOT, bot=True, bot_guilds=(STAGING_GUILD,),
                  channel_guild=STAGING_GUILD,
                  channel_type=0, mutate_read=None, delete_status=204,
-                 me_status=200, post_timeout=False, reconcile_status=200):
+                 me_status=200, post_timeout=False, reconcile_status=200,
+                 fill_after_timeout=0):
         self.app = app
         self.bot = bot
         self.bot_guilds = bot_guilds
@@ -58,6 +59,7 @@ class FakeDiscord:
         self.me_status = me_status
         self.post_timeout = post_timeout
         self.reconcile_status = reconcile_status
+        self.fill_after_timeout = fill_after_timeout
         self._timed_out = False
         self.calls = []
         self.messages = {}
@@ -79,12 +81,15 @@ class FakeDiscord:
             from urllib.parse import parse_qs, urlparse
             query = parse_qs(urlparse(path).query)
             after = query.get("after", [None])[0]
+            before = query.get("before", [None])[0]
             limit = int(query.get("limit", ["50"])[0])
-            # The anchor read asks for 1; reconciliation asks for 10.
+            # The anchor read asks for 1; reconciliation pages at the
+            # reconciliation page size.
             if limit != 1 and self.reconcile_status != 200:
                 return self.reconcile_status, b"{}"
             listed = [m for m in self.messages.values()
-                      if after is None or int(m["id"]) > int(after)]
+                      if (after is None or int(m["id"]) > int(after))
+                      and (before is None or int(m["id"]) < int(before))]
             listed.sort(key=lambda m: int(m["id"]), reverse=True)
             return 200, json.dumps(copy.deepcopy(listed[:limit])).encode()
         if method == "POST" and path == f"/channels/{CHANNEL}/messages":
@@ -96,6 +101,11 @@ class FakeDiscord:
             if self.post_timeout and not self._timed_out:
                 # Discord committed the message but the response was lost.
                 self._timed_out = True
+                for _ in range(self.fill_after_timeout):
+                    self.next_id += 1
+                    filler = {"id": str(self.next_id), "channel_id": CHANNEL,
+                              "author": {"id": OTHER_APP}, "embeds": []}
+                    self.messages[filler["id"]] = filler
                 raise TimeoutError("response timed out after the post committed")
             return 201, json.dumps(message).encode()
         message_id = path.rsplit("/", 1)[-1]
@@ -249,6 +259,31 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertIn("reconciled uncertain post", out)
         self.assertEqual({}, fake.messages, "the timed-out post is removed")
+
+    def test_timed_out_post_behind_a_full_page_is_reconciled(self):
+        # Ten newer messages from another author fill the first
+        # reconciliation page (newest first), so the committed test-bot
+        # post sits outside it. Reconciliation must page past them, find
+        # and remove the post, and leave the other author's messages.
+        fake = FakeDiscord(post_timeout=True, fill_after_timeout=10)
+        code, out = self.run_main(fake)
+        self.assertEqual(1, code)
+        self.assertIn("reconciled uncertain post", out)
+        remaining = list(fake.messages.values())
+        self.assertEqual(10, len(remaining))
+        self.assertTrue(
+            all(m["author"]["id"] == OTHER_APP for m in remaining),
+            "the timed-out test-bot post is removed; fillers stay")
+
+    def test_reconciliation_past_the_page_bound_uses_no_retry_exit(self):
+        # If every allowed page comes back full, reconciliation cannot
+        # prove it inspected the whole range newer than the anchor, so
+        # the row is the exit-3 cleanup class, never a retryable 1.
+        fake = FakeDiscord(post_timeout=True, fill_after_timeout=10)
+        with mock.patch.object(smoke, "RECONCILE_MAX_PAGES", 1):
+            code, out = self.run_main(fake)
+        self.assertEqual(3, code)
+        self.assertIn("could not be reconciled", out)
 
     def test_unreconciled_timed_out_post_uses_the_no_retry_exit_code(self):
         # If reconciliation itself cannot run, a committed-but-unseen post
