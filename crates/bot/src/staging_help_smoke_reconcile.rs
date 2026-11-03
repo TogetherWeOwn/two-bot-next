@@ -7,7 +7,7 @@
 //! admin) reconciles the channel at boot from the token it already holds.
 //!
 //! Double-gated and idempotent: runs only when `TWO_DEPLOY_ENV` is exactly
-//! `"staging"` and the configured guild is the hard-coded staging guild.
+//! `"staging"` and the configured guild is the pinned staging guild.
 //! Every other combination logs at debug and returns, so production can
 //! never create this channel. Token-only (no database); every error is
 //! logged and boot continues.
@@ -30,11 +30,20 @@ use twilight_model::id::{
     Id,
 };
 
-/// TWO Staging guild. Hard-coded on purpose: together with the
-/// `TWO_DEPLOY_ENV` marker it makes it impossible for this reconcile to
-/// create a channel in production. Mirrors
-/// `two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID`.
-pub const STAGING_GUILD_ID: u64 = 1545644954272137297;
+/// TWO Staging guild, parsed from the allowlisted core identity constant
+/// (`two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID`). Deliberately
+/// not restated as a literal here: the source-snowflake gate rejects new
+/// deployment-id literals, and a single pinned value keeps the two fences
+/// from drifting apart. Together with the `TWO_DEPLOY_ENV` marker it makes
+/// it impossible for this reconcile to create a channel in production.
+/// `None` only if the core constant ever stops parsing as a snowflake, in
+/// which case the fence below stays closed.
+#[must_use]
+pub fn staging_guild_id() -> Option<u64> {
+    two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID
+        .parse()
+        .ok()
+}
 
 /// Channel the staging smoke posts its brand read-back messages in.
 pub const SMOKE_CHANNEL_NAME: &str = "help-embed-smoke";
@@ -69,10 +78,14 @@ impl ReconcileOutcome {
 }
 
 /// Pure fence: the staging marker exactly `"staging"` AND the configured
-/// guild exactly the staging guild. Every other combination is off.
+/// guild exactly the staging guild. Every other combination is off,
+/// including an unparseable staging constant (fail closed).
 #[must_use]
 pub fn reconcile_enabled(deploy_env: Option<&str>, guild_id: Option<u64>) -> bool {
-    deploy_env == Some("staging") && guild_id == Some(STAGING_GUILD_ID)
+    match (deploy_env, guild_id, staging_guild_id()) {
+        (Some("staging"), Some(configured), Some(staging)) => configured == staging,
+        _ => false,
+    }
 }
 
 /// The fence read once from the process environment at boot.
@@ -398,20 +411,25 @@ mod tests {
         SmokeChannelView { id, name, kind }
     }
 
+    fn staging_guild() -> u64 {
+        staging_guild_id().expect("core staging guild is a snowflake")
+    }
+
     #[test]
     fn gate_needs_staging_marker_and_staging_guild() {
+        let staging = staging_guild();
         for (deploy_env, guild_id, enabled) in [
             (None, None, false),
-            (None, Some(STAGING_GUILD_ID), false),
+            (None, Some(staging), false),
             (Some("staging"), None, false),
             (Some("staging"), Some(0), false),
             (Some("staging"), Some(1), false),
-            (Some("production"), Some(STAGING_GUILD_ID), false),
-            (Some("Staging"), Some(STAGING_GUILD_ID), false),
-            (Some("staging "), Some(STAGING_GUILD_ID), false),
-            (Some(" staging"), Some(STAGING_GUILD_ID), false),
-            (Some(""), Some(STAGING_GUILD_ID), false),
-            (Some("staging"), Some(STAGING_GUILD_ID), true),
+            (Some("production"), Some(staging), false),
+            (Some("Staging"), Some(staging), false),
+            (Some("staging "), Some(staging), false),
+            (Some(" staging"), Some(staging), false),
+            (Some(""), Some(staging), false),
+            (Some("staging"), Some(staging), true),
         ] {
             assert_eq!(
                 reconcile_enabled(deploy_env, guild_id),
@@ -426,7 +444,8 @@ mod tests {
         let core: u64 = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID
             .parse()
             .expect("core staging guild is a snowflake");
-        assert_eq!(STAGING_GUILD_ID, core);
+        assert_eq!(staging_guild_id(), Some(core));
+        assert!(core != 0);
     }
 
     #[test]
@@ -529,7 +548,7 @@ mod tests {
     #[test]
     fn gate_closed_boot_returns_without_network() {
         // TWO_DEPLOY_ENV is unset in test: only the debug arm runs.
-        assert!(!reconcile_enabled_from_env(Some(STAGING_GUILD_ID)));
+        assert!(!reconcile_enabled_from_env(Some(staging_guild())));
     }
 
     fn member_doc(user_id: &str, bot: bool) -> serde_json::Value {
@@ -556,7 +575,7 @@ mod tests {
     ) -> serde_json::Value {
         json!({
             "id": id,
-            "guild_id": STAGING_GUILD_ID.to_string(),
+            "guild_id": staging_guild().to_string(),
             "type": kind,
             "name": name,
             "permission_overwrites": overwrites,
@@ -569,6 +588,7 @@ mod tests {
         use twilight_model::guild::Permissions;
 
         let bot: u64 = 111222333444555666;
+        let guild = staging_guild();
         let mock = MockRest::start(
             vec![
                 ScriptedResponse::json(200, json!([channel_doc("111", "general", 0, json!([]))])),
@@ -580,7 +600,7 @@ mod tests {
         .await;
         let result = reconcile_once(
             "reconcile-fixture-token",
-            STAGING_GUILD_ID,
+            guild,
             Some(&bot.to_string()),
             Some(&mock.origin()),
         )
@@ -591,17 +611,17 @@ mod tests {
         assert_eq!(requests[0].method, "GET");
         assert_eq!(
             requests[0].path,
-            format!("/api/v10/guilds/{STAGING_GUILD_ID}/channels")
+            format!("/api/v10/guilds/{guild}/channels")
         );
         assert_eq!(requests[1].method, "GET");
         assert_eq!(
             requests[1].path,
-            format!("/api/v10/guilds/{STAGING_GUILD_ID}/members/{bot}")
+            format!("/api/v10/guilds/{guild}/members/{bot}")
         );
         assert_eq!(requests[2].method, "POST");
         assert_eq!(
             requests[2].path,
-            format!("/api/v10/guilds/{STAGING_GUILD_ID}/channels")
+            format!("/api/v10/guilds/{guild}/channels")
         );
         let body: serde_json::Value =
             serde_json::from_slice(&requests[2].body).expect("create body is json");
@@ -612,15 +632,12 @@ mod tests {
         assert_eq!(overwrites.len(), 1);
         assert_eq!(overwrites[0]["id"], json!(bot.to_string()));
         assert_eq!(overwrites[0]["type"], json!(1));
-        assert_eq!(
-            overwrites[0]["allow"],
-            json!(
-                Permissions::VIEW_CHANNEL.bits()
-                    | Permissions::SEND_MESSAGES.bits()
-                    | Permissions::EMBED_LINKS.bits()
-                    | Permissions::READ_MESSAGE_HISTORY.bits()
-            )
-        );
+        // Twilight serializes permission bitfields as strings on the wire.
+        let allow = Permissions::VIEW_CHANNEL.bits()
+            | Permissions::SEND_MESSAGES.bits()
+            | Permissions::EMBED_LINKS.bits()
+            | Permissions::READ_MESSAGE_HISTORY.bits();
+        assert_eq!(overwrites[0]["allow"], json!(allow.to_string()));
         mock.shutdown().await;
     }
 
@@ -643,7 +660,7 @@ mod tests {
         .await;
         let result = reconcile_once(
             "reconcile-fixture-token",
-            STAGING_GUILD_ID,
+            staging_guild(),
             Some(&bot.to_string()),
             Some(&mock.origin()),
         )
@@ -684,7 +701,7 @@ mod tests {
         .await;
         let result = reconcile_once(
             "reconcile-fixture-token",
-            STAGING_GUILD_ID,
+            staging_guild(),
             Some(&bot.to_string()),
             Some(&mock.origin()),
         )
@@ -715,7 +732,7 @@ mod tests {
         .await;
         let result = reconcile_once(
             "reconcile-fixture-token",
-            STAGING_GUILD_ID,
+            staging_guild(),
             Some(&format!("{human},{bot}")),
             Some(&mock.origin()),
         )
@@ -742,7 +759,7 @@ mod tests {
         .await;
         let result = reconcile_once(
             "reconcile-fixture-token",
-            STAGING_GUILD_ID,
+            staging_guild(),
             None,
             Some(&mock.origin()),
         )
