@@ -21,15 +21,21 @@ use std::process::ExitCode;
 
 use twilight_model::channel::message::embed::Embed;
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseData};
+use two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
 use two_bot_core::{CommandDefinition, InteractionRouter, RouterGates};
 use two_bot_discord::brand::{brand_embed, BRAND_EMBED_COLOR, BRAND_FOOTER_TEXT, BRAND_ICON_URL};
 use two_bot_discord::{help_detail_response, help_response};
 
 /// Staging guild id, so the full builtin set (every gate on) matches what
-/// staging would publish before custom rows. The value never leaves this
-/// binary: it only selects definitions, and custom rows are out of scope —
-/// the smoke proves the brand layer, not registry membership.
-const SMOKE_GUILD_ID: u64 = 1545644954272137297;
+/// staging would publish before custom rows. Reuses the canonical staging
+/// guild constant: the value never leaves this binary, it only selects
+/// definitions, and custom rows are out of scope — the smoke proves the
+/// brand layer, not registry membership.
+fn smoke_guild_id() -> u64 {
+    TWO_STAGING_GUILD_ID
+        .parse()
+        .expect("canonical staging guild id")
+}
 
 /// One rendered case: what the builder produced and what the smoke posts.
 struct RenderedCase {
@@ -42,7 +48,7 @@ struct RenderedCase {
 
 fn full_builtin_gates() -> RouterGates {
     RouterGates {
-        configured_guild: Some(SMOKE_GUILD_ID),
+        configured_guild: Some(smoke_guild_id()),
         scorecard: true,
         automations: true,
         announcements: true,
