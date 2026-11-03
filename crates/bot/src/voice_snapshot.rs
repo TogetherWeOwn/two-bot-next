@@ -116,11 +116,8 @@ fn collect_rooms(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Option<Ve
     let guild_key: Id<GuildMarker> = Id::new(guild_id);
     let guild = cache.guild(guild_key)?;
     let afk_channel: Option<Id<ChannelMarker>> = guild.afk_channel_id();
-    let channel_ids: Vec<Id<ChannelMarker>> = cache
-        .guild_channels(guild_key)?
-        .iter()
-        .map(|id| *id)
-        .collect();
+    let channel_ids: Vec<Id<ChannelMarker>> =
+        cache.guild_channels(guild_key)?.iter().copied().collect();
     let mut rooms = Vec::new();
     for channel_id in &channel_ids {
         let channel = cache.channel(*channel_id)?;

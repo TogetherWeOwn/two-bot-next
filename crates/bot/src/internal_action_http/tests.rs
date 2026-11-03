@@ -2032,7 +2032,13 @@ fn voice_app(pool: sqlx::PgPool, cache: Arc<DefaultInMemoryCache>) -> Router {
 
 #[tokio::test]
 async fn voice_snapshot_flag_off_is_refused_before_any_effect() {
-    let state = state(lazy_pool(), Arc::new(MockEffect::new(MockOutcome::Success)));
+    // The nonce burns durably before authorize, so even the flag-off refusal
+    // needs the migrated test database, like the `event.read` tests.
+    let Some(db) = database().await else { return };
+    let state = state(
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+    );
     let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_voice_snapshot_flag(false);
     // Keyless like `event.read`: no Idempotency-Key header is sent.
@@ -2042,13 +2048,19 @@ async fn voice_snapshot_flag_off_is_refused_before_any_effect() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"]["code"], "action_not_allowed");
     assert_eq!(body["error"]["retryable"], false);
+    db.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn voice_snapshot_cold_cache_is_discord_unavailable() {
     // The default state carries a cold cache: the gateway has not fed it, so
-    // the read refuses instead of reporting an empty guild.
-    let state = state(lazy_pool(), Arc::new(MockEffect::new(MockOutcome::Success)));
+    // the read refuses instead of reporting an empty guild. The nonce burn
+    // still needs the migrated test database.
+    let Some(db) = database().await else { return };
+    let state = state(
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+    );
     let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_voice_snapshot_flag(true);
     let (status, _, body) =
@@ -2057,14 +2069,16 @@ async fn voice_snapshot_cold_cache_is_discord_unavailable() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(body["error"]["code"], "discord_unavailable");
     assert_eq!(body["error"]["retryable"], true);
+    db.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn voice_snapshot_projects_the_live_cache_shape() {
+    let Some(db) = database().await else { return };
     let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_voice_snapshot_flag(true);
     let (status, headers, body) = answer(
-        voice_app(lazy_pool(), seeded_voice_cache()),
+        voice_app(db.pool().clone(), seeded_voice_cache()),
         signed_read(&voice_snapshot_payload(), "old"),
     )
     .await;
@@ -2105,6 +2119,7 @@ async fn voice_snapshot_projects_the_live_cache_shape() {
     assert_eq!(rooms[3]["member_ids"], serde_json::json!(["44"]));
     assert!(rooms[0].get("afk").is_none());
     assert_eq!(rooms[4]["member_ids"], serde_json::json!([]));
+    db.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -2116,10 +2131,11 @@ async fn voice_snapshot_empty_guild_lists_rooms_with_zero_total() {
     for user in ["41", "42", "43", "44", "45"] {
         cache.update(&Event::VoiceStateUpdate(Box::new(voice_state(user, None))));
     }
+    let Some(db) = database().await else { return };
     let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_voice_snapshot_flag(true);
     let (status, _, body) = answer(
-        voice_app(lazy_pool(), cache),
+        voice_app(db.pool().clone(), cache),
         signed_read(&voice_snapshot_payload(), "old"),
     )
     .await;
@@ -2127,6 +2143,7 @@ async fn voice_snapshot_empty_guild_lists_rooms_with_zero_total() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["result"]["total_in_voice"], 0);
     assert_eq!(body["result"]["rooms"].as_array().expect("rooms").len(), 5);
+    db.close().await.unwrap();
 }
 
 fn mutate_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
