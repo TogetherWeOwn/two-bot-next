@@ -22,7 +22,7 @@
 //! data); member ids are snowflake decimal strings only — no usernames,
 //! nicknames, presence or activity; rooms sort by position then name.
 //! `occupied_since` is the ISO-8601 UTC instant the room's current
-//! continuous occupancy began (oldest tracked join among its occupants), or
+//! continuous human occupancy began (retained until the room empties), or
 //! `null` when unknown — an empty room, or a join the gateway never
 //! witnessed (process start, reconnect reseed) is unknown, never guessed.
 //! `event_key` rides only on the room bound to a currently-windowed event's
@@ -81,102 +81,111 @@ pub(crate) struct RoomDraft {
     pub event_key: Option<String>,
 }
 
-/// In-memory join clock feeding `rooms[].occupied_since`.
-///
-/// The gateway pipeline stamps every voice session boundary through the
-/// [`VoiceTransitionObserver`](two_bot_discord::VoiceTransitionObserver)
-/// seam: joins and moves record `(guild, member) -> (channel, receipt ms)`,
-/// leaves clear the member. A room's start is the oldest stamp among its
-/// current occupants; it reads `null` when the room is empty, when any
-/// occupant's join predates tracking (process start, reconnect reseed,
-/// `GuildCreate` seeding), or when a stamp names a different channel (a move
-/// racing the read). Unknown is `null`, never a guess: the clock stores only
-/// what the gateway witnessed.
-///
-/// The read reconciles against the live snapshot before stamping, dropping
-/// this guild's entries for members the snapshot no longer lists, so
-/// unobserved leaves and reconnect reseeds heal on the next read instead of
-/// accumulating.
-///
-/// Lives beside the projector, not in the room actor: the keyless
-/// `voice.snapshot` read must work even where the room actor is gated off,
-/// and bootstrap reseeds must never fabricate join times.
+/// A room's current interval, never a per-member join history. Unknown starts
+/// remain unknown until the room empties, even if all original occupants leave.
+#[derive(Debug)]
+struct OccupiedRoom {
+    members: HashSet<Snowflake>,
+    since_ms: Option<u64>,
+}
+
+/// Memory-only continuous occupancy clock, independent of the gated room actor.
+/// The pipeline supplies the affected rooms' post-transition human rosters.
+/// A witnessed join into an empty room starts an interval; overlapping joins
+/// and leaves preserve it until empty. Reconnects and reseeds discard evidence.
+/// Reads compare rosters before using evidence, so a cache/observer race is
+/// unknown rather than a fabricated start.
 #[derive(Debug, Default)]
 pub(crate) struct VoiceOccupancyClock {
-    joins: Mutex<HashMap<(Snowflake, Snowflake), (Snowflake, u64)>>,
+    rooms: Mutex<HashMap<(Snowflake, Snowflake), OccupiedRoom>>,
 }
 
 impl VoiceOccupancyClock {
-    /// Shared handle constructor for the binary wiring.
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
-    /// Record one gateway-observed session boundary. Joins and moves stamp
-    /// the member's room; leaves — and frames whose receipt time did not
-    /// parse — clear the stamp, so the next read reports `null` for a
-    /// session it cannot prove instead of continuity it did not witness.
-    fn observe(
-        &self,
+    fn update_room(
+        rooms: &mut HashMap<(Snowflake, Snowflake), OccupiedRoom>,
         guild_id: Snowflake,
+        channel_id: Snowflake,
+        members: &[Snowflake],
         member_id: Snowflake,
-        channel_id: Option<Snowflake>,
+        joining: bool,
         occurred_at_ms: Option<u64>,
     ) {
-        let mut joins = self.joins.lock().expect("voice occupancy clock");
-        match (channel_id, occurred_at_ms) {
-            (Some(channel), Some(at_ms)) => {
-                joins.insert((guild_id, member_id), (channel, at_ms));
-            }
-            _ => {
-                joins.remove(&(guild_id, member_id));
-            }
+        let key = (guild_id, channel_id);
+        let members: HashSet<_> = members.iter().copied().collect();
+        if members.is_empty() {
+            rooms.remove(&key);
+            return;
         }
+        let mut before = members.clone();
+        if joining {
+            before.remove(&member_id);
+        } else {
+            before.insert(member_id);
+        }
+        let since_ms = match rooms.get(&key) {
+            Some(room) if room.members == before => room.since_ms,
+            _ if joining && before.is_empty() && members.contains(&member_id) => occurred_at_ms,
+            _ => None,
+        };
+        rooms.insert(key, OccupiedRoom { members, since_ms });
     }
 
-    /// Stamp `occupied_since` onto every draft from the current occupancy,
-    /// reconciling this guild's entries against the rooms first. Holds one
-    /// lock across reconcile and stamp so a concurrent frame cannot slip an
-    /// entry between the two.
-    fn stamp_rooms(&self, guild_id: Snowflake, rooms: &mut [RoomDraft]) {
-        let mut joins = self.joins.lock().expect("voice occupancy clock");
-        let mut present: HashSet<Snowflake> = HashSet::new();
-        for room in rooms.iter() {
-            present.extend(room.member_ids.iter().copied());
-        }
-        joins.retain(|(guild, member), _| *guild != guild_id || present.contains(member));
-        for room in rooms.iter_mut() {
-            let mut oldest: Option<u64> = None;
-            for member in &room.member_ids {
-                match joins.get(&(guild_id, *member)) {
-                    Some((channel, at_ms)) if *channel == room.channel_id => {
-                        oldest = Some(oldest.map_or(*at_ms, |min| min.min(*at_ms)));
-                    }
-                    // Untracked join, or a stamp for a room the member has
-                    // already left (a move racing the read): the room's start
-                    // is unprovable, not the oldest provable stamp.
-                    _ => {
-                        oldest = None;
-                        break;
-                    }
-                }
-            }
-            room.occupied_since = oldest.and_then(format_whole_second_zulu);
+    fn stamp_rooms(&self, guild_id: Snowflake, drafts: &mut [RoomDraft]) {
+        let rooms = self.rooms.lock().expect("voice occupancy clock");
+        // Drafts may predate a gateway mutation. Reads must not delete newer
+        // evidence; witnessed leaves and lifecycle resets own all pruning.
+        for draft in drafts {
+            let members: HashSet<_> = draft.member_ids.iter().copied().collect();
+            draft.occupied_since = rooms
+                .get(&(guild_id, draft.channel_id))
+                .filter(|room| room.members == members)
+                .and_then(|room| room.since_ms)
+                .and_then(format_whole_second_zulu);
         }
     }
 }
 
-/// Gateway pipeline feed: every voice session boundary the shard witnesses
-/// lands here after the funnel rows, so the clock only ever holds joins the
-/// gateway actually saw — nothing seeded, nothing backfilled.
 impl two_bot_discord::VoiceTransitionObserver for VoiceOccupancyClock {
     fn observe_voice_transition(&self, transition: two_bot_discord::VoiceTransitionObservation) {
-        self.observe(
-            transition.guild_id,
-            transition.member_id,
-            transition.current_channel_id,
-            transition.occurred_at_ms,
-        );
+        if transition.is_bot {
+            return;
+        }
+        let mut rooms = self.rooms.lock().expect("voice occupancy clock");
+        if let Some(channel) = transition.previous_channel_id {
+            Self::update_room(
+                &mut rooms,
+                transition.guild_id,
+                channel,
+                &transition.previous_channel_members,
+                transition.member_id,
+                false,
+                transition.occurred_at_ms,
+            );
+        }
+        if let Some(channel) = transition.current_channel_id {
+            Self::update_room(
+                &mut rooms,
+                transition.guild_id,
+                channel,
+                &transition.current_channel_members,
+                transition.member_id,
+                true,
+                transition.occurred_at_ms,
+            );
+        }
+    }
+
+    fn reset_voice_occupancy(&self, guild_id: Option<u64>, channel_id: Option<u64>) {
+        let mut rooms = self.rooms.lock().expect("voice occupancy clock");
+        rooms.retain(|(guild, channel), _| {
+            guild_id.is_some_and(|reset_guild| *guild != reset_guild)
+                || (guild_id.is_some()
+                    && channel_id.is_some_and(|reset_channel| *channel != reset_channel))
+        });
     }
 }
 
@@ -533,11 +542,39 @@ mod tests {
         assert_eq!(value["rooms"][1]["event_key"], json!("autumn-showcase"));
     }
 
+    fn transition(
+        member_id: u64,
+        previous: Option<(u64, &[u64])>,
+        current: Option<(u64, &[u64])>,
+        occurred_at_ms: Option<u64>,
+    ) -> two_bot_discord::VoiceTransitionObservation {
+        two_bot_discord::VoiceTransitionObservation {
+            guild_id: 9,
+            member_id,
+            previous_channel_id: previous.map(|(channel, _)| channel),
+            current_channel_id: current.map(|(channel, _)| channel),
+            previous_channel_members: previous
+                .map(|(_, members)| members.to_vec())
+                .unwrap_or_default(),
+            current_channel_members: current
+                .map(|(_, members)| members.to_vec())
+                .unwrap_or_default(),
+            is_bot: false,
+            occurred_at_ms,
+        }
+    }
+
     #[test]
     fn clock_stamps_the_oldest_tracked_join() {
+        use two_bot_discord::VoiceTransitionObserver;
         let clock = VoiceOccupancyClock::new();
-        clock.observe(9, 7, Some(10), Some(stamp_ms()));
-        clock.observe(9, 8, Some(10), Some(stamp_ms() + 60_000));
+        clock.observe_voice_transition(transition(7, None, Some((10, &[7])), Some(stamp_ms())));
+        clock.observe_voice_transition(transition(
+            8,
+            None,
+            Some((10, &[7, 8])),
+            Some(stamp_ms() + 60_000),
+        ));
         let mut rooms = vec![draft(10, "lobby", Some(0), &[7, 8], false)];
         clock.stamp_rooms(9, &mut rooms);
         assert_eq!(
@@ -554,8 +591,9 @@ mod tests {
 
     #[test]
     fn clock_out_of_range_stamp_reads_null() {
+        use two_bot_discord::VoiceTransitionObserver;
         let clock = VoiceOccupancyClock::new();
-        clock.observe(9, 7, Some(10), Some(u64::MAX));
+        clock.observe_voice_transition(transition(7, None, Some((10, &[7])), Some(u64::MAX)));
         let mut rooms = vec![draft(10, "lobby", Some(0), &[7], false)];
         clock.stamp_rooms(9, &mut rooms);
         assert_eq!(rooms[0].occupied_since, None);
@@ -563,11 +601,15 @@ mod tests {
 
     #[test]
     fn clock_moves_restamp_and_leaves_clear() {
+        use two_bot_discord::VoiceTransitionObserver;
         let clock = VoiceOccupancyClock::new();
-        clock.observe(9, 7, Some(10), Some(stamp_ms()));
-        // A move restamps the new room: the old room no longer proves the
-        // member, and the new room starts at the move, not the first join.
-        clock.observe(9, 7, Some(11), Some(stamp_ms() + 60_000));
+        clock.observe_voice_transition(transition(7, None, Some((10, &[7])), Some(stamp_ms())));
+        clock.observe_voice_transition(transition(
+            7,
+            Some((10, &[])),
+            Some((11, &[7])),
+            Some(stamp_ms() + 60_000),
+        ));
         let mut rooms = vec![
             draft(10, "lobby", Some(0), &[], false),
             draft(11, "breakout", Some(1), &[7], false),
@@ -578,43 +620,238 @@ mod tests {
             rooms[1].occupied_since.as_deref(),
             Some("2026-11-03T10:01:00Z")
         );
-        // A leave clears the stamp: a rejoin starts a new session.
-        clock.observe(9, 7, None, Some(stamp_ms() + 120_000));
+        clock.observe_voice_transition(transition(
+            7,
+            Some((11, &[])),
+            None,
+            Some(stamp_ms() + 120_000),
+        ));
         clock.stamp_rooms(9, &mut rooms);
         assert_eq!(rooms[1].occupied_since, None);
+        assert!(clock.rooms.lock().expect("clock lock").is_empty());
     }
 
     #[test]
     fn clock_unknown_stamp_or_member_reads_null() {
+        use two_bot_discord::VoiceTransitionObserver;
         let clock = VoiceOccupancyClock::new();
-        // A join the gateway witnessed but could not time (unparseable
-        // receipt stamp) clears the session: unknown, never guessed.
-        clock.observe(9, 7, Some(10), None);
-        // A member the clock never saw (process start, reseed) is unknown.
+        clock.observe_voice_transition(transition(7, None, Some((10, &[7])), None));
         let mut rooms = vec![draft(10, "lobby", Some(0), &[7, 8], false)];
         clock.stamp_rooms(9, &mut rooms);
         assert_eq!(rooms[0].occupied_since, None);
-        // A stamp for a room the member already left (a move racing the
-        // read) proves nothing about this room either.
-        clock.observe(9, 8, Some(11), Some(stamp_ms()));
+        clock.observe_voice_transition(transition(8, None, Some((11, &[8])), Some(stamp_ms())));
         clock.stamp_rooms(9, &mut rooms);
         assert_eq!(rooms[0].occupied_since, None);
     }
 
     #[test]
-    fn clock_reconcile_drops_members_who_left_unseen() {
+    fn clock_read_refuses_roster_mismatch_without_deleting_newer_evidence() {
+        use two_bot_discord::VoiceTransitionObserver;
         let clock = VoiceOccupancyClock::new();
-        clock.observe(9, 7, Some(10), Some(stamp_ms()));
-        clock.observe(9, 8, Some(10), Some(stamp_ms()));
-        // Member 8 leaves without a witnessed frame (reconnect reseed):
-        // the next read heals the clock instead of pinning a stale start.
+        clock.observe_voice_transition(transition(7, None, Some((10, &[7])), Some(stamp_ms())));
+        clock.observe_voice_transition(transition(8, None, Some((10, &[7, 8])), Some(stamp_ms())));
         let mut rooms = vec![draft(10, "lobby", Some(0), &[7], false)];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(
+            rooms[0].occupied_since, None,
+            "unwitnessed change is unknown"
+        );
+        assert_eq!(clock.rooms.lock().expect("clock lock").len(), 1);
+        // An older read may omit a newly created channel. It cannot erase
+        // an interval recorded by the gateway after collection began.
+        clock.stamp_rooms(9, &mut []);
+        rooms[0].member_ids = vec![7, 8];
         clock.stamp_rooms(9, &mut rooms);
         assert_eq!(
             rooms[0].occupied_since.as_deref(),
             Some("2026-11-03T10:00:00Z")
         );
-        assert_eq!(clock.joins.lock().expect("clock lock").len(), 1);
+        clock.reset_voice_occupancy(Some(9), Some(10));
+        assert!(clock.rooms.lock().expect("clock lock").is_empty());
+    }
+
+    #[test]
+    fn clock_retains_known_and_unknown_starts_across_overlapping_members() {
+        use two_bot_discord::VoiceTransitionObserver;
+        for witnessed_first in [false, true] {
+            let clock = VoiceOccupancyClock::new();
+            if witnessed_first {
+                clock.observe_voice_transition(transition(
+                    7,
+                    None,
+                    Some((10, &[7])),
+                    Some(stamp_ms()),
+                ));
+            }
+            clock.observe_voice_transition(transition(
+                8,
+                None,
+                Some((10, &[7, 8])),
+                Some(stamp_ms() + 60_000),
+            ));
+            // The first occupant leaves. The room never emptied, so its start
+            // cannot become B's later join (nor known if A predates startup).
+            clock.observe_voice_transition(transition(
+                7,
+                Some((10, &[8])),
+                None,
+                Some(stamp_ms() + 120_000),
+            ));
+            let mut rooms = vec![draft(10, "lobby", Some(0), &[8], false)];
+            clock.stamp_rooms(9, &mut rooms);
+            assert_eq!(
+                rooms[0].occupied_since.as_deref(),
+                witnessed_first.then_some("2026-11-03T10:00:00Z")
+            );
+            clock.observe_voice_transition(transition(
+                8,
+                Some((10, &[])),
+                None,
+                Some(stamp_ms() + 180_000),
+            ));
+            clock.observe_voice_transition(transition(
+                9,
+                None,
+                Some((10, &[9])),
+                Some(stamp_ms() + 240_000),
+            ));
+            rooms[0].member_ids = vec![9];
+            clock.stamp_rooms(9, &mut rooms);
+            assert_eq!(
+                rooms[0].occupied_since.as_deref(),
+                Some("2026-11-03T10:04:00Z")
+            );
+        }
+    }
+
+    #[test]
+    fn clock_resets_scoped_evidence_and_ignores_bots() {
+        use two_bot_discord::VoiceTransitionObserver;
+        let clock = VoiceOccupancyClock::new();
+        for channel in [10, 11] {
+            clock.observe_voice_transition(transition(
+                7,
+                None,
+                Some((channel, &[7])),
+                Some(stamp_ms()),
+            ));
+        }
+        let mut other = transition(7, None, Some((10, &[7])), Some(stamp_ms()));
+        other.guild_id = 99;
+        clock.observe_voice_transition(other);
+        clock.reset_voice_occupancy(Some(9), Some(10));
+        let mut rooms = vec![
+            draft(10, "a", Some(0), &[7], false),
+            draft(11, "b", Some(1), &[7], false),
+        ];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(rooms[0].occupied_since, None);
+        assert!(rooms[1].occupied_since.is_some());
+        clock.reset_voice_occupancy(Some(9), None);
+        assert_eq!(
+            clock.rooms.lock().expect("clock lock").len(),
+            1,
+            "other guild survives"
+        );
+        clock.reset_voice_occupancy(None, None);
+        assert!(clock.rooms.lock().expect("clock lock").is_empty());
+        let mut bot = transition(88, None, Some((10, &[])), Some(stamp_ms()));
+        bot.is_bot = true;
+        clock.observe_voice_transition(bot);
+        assert!(clock.rooms.lock().expect("clock lock").is_empty());
+    }
+
+    fn pipeline_voice(member: u64, channel: Option<u64>) -> twilight_model::gateway::event::Event {
+        twilight_model::gateway::event::Event::VoiceStateUpdate(Box::new(
+            serde_json::from_value(json!({
+                "guild_id": "100", "user_id": member.to_string(),
+                "channel_id": channel.map(|id| id.to_string()), "session_id": "fixture",
+                "deaf": false, "mute": false, "self_deaf": false,
+                "self_mute": false, "self_video": false, "suppress": false
+            }))
+            .expect("voice frame"),
+        ))
+    }
+
+    fn pipeline_guild(members: &[u64]) -> twilight_model::gateway::event::Event {
+        use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
+        let mut guild: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json"))
+                .expect("guild fixture");
+        guild["voice_states"] = Value::Array(
+            members
+                .iter()
+                .map(|member| {
+                    let Event::VoiceStateUpdate(state) = pipeline_voice(*member, Some(200)) else {
+                        unreachable!("voice fixture")
+                    };
+                    serde_json::to_value(state).expect("voice state")
+                })
+                .collect(),
+        );
+        Event::GuildCreate(Box::new(GuildCreate::Available(
+            serde_json::from_value(guild).expect("guild fixture"),
+        )))
+    }
+
+    #[test]
+    fn pipeline_clock_preserves_intervals_and_forgets_same_member_after_a_gap() {
+        use twilight_model::gateway::event::Event;
+        for reseed in [false, true] {
+            let pipeline = two_bot_discord::MemPipeline::for_replay();
+            let clock = VoiceOccupancyClock::new();
+            pipeline.set_voice_transition_observer(clock.clone());
+            pipeline.handle_at(&pipeline_guild(&[]), "2026-11-03T09:59:00Z");
+            pipeline.handle_at(&pipeline_voice(7, Some(200)), "2026-11-03T10:00:00Z");
+            pipeline.handle_at(&pipeline_voice(8, Some(200)), "2026-11-03T10:01:00Z");
+            let snapshot = || {
+                read_voice_snapshot(pipeline.cache(), &clock, 100, &HashMap::new())
+                    .expect("complete guild")
+            };
+            for member in [99, 7] {
+                // An unrelated guild departure cannot erase this interval.
+                // For an occupant, Twilight retains the voice state until the
+                // actual leave frame; that leave must still preserve overlap.
+                let removed = Event::MemberRemove(
+                    serde_json::from_value(json!({
+                        "guild_id": "100", "user": {"id": member.to_string(),
+                        "username": "fixture", "discriminator": "0", "bot": false}
+                    }))
+                    .expect("member remove"),
+                );
+                pipeline.handle_at(&removed, "2026-11-03T10:01:30Z");
+                assert_eq!(
+                    snapshot()["rooms"][0]["occupied_since"],
+                    json!("2026-11-03T10:00:00Z")
+                );
+            }
+            pipeline.handle_at(&pipeline_voice(7, None), "2026-11-03T10:02:00Z");
+            assert_eq!(
+                snapshot()["rooms"][0]["occupied_since"],
+                json!("2026-11-03T10:00:00Z")
+            );
+            let reset = if reseed {
+                pipeline_guild(&[8])
+            } else {
+                Event::Resumed
+            };
+            pipeline.handle_at(&reset, "2026-11-03T10:03:00Z");
+            assert_eq!(snapshot()["rooms"][0]["member_ids"], json!(["8"]));
+            assert_eq!(
+                snapshot()["rooms"][0]["occupied_since"],
+                Value::Null,
+                "the same cached occupant cannot prove continuity after a gap"
+            );
+            pipeline.handle_at(&pipeline_voice(9, Some(200)), "2026-11-03T10:04:00Z");
+            pipeline.handle_at(&pipeline_voice(8, None), "2026-11-03T10:05:00Z");
+            assert_eq!(snapshot()["rooms"][0]["occupied_since"], Value::Null);
+            pipeline.handle_at(&pipeline_voice(9, None), "2026-11-03T10:06:00Z");
+            pipeline.handle_at(&pipeline_voice(10, Some(200)), "2026-11-03T10:07:00Z");
+            assert_eq!(
+                snapshot()["rooms"][0]["occupied_since"],
+                json!("2026-11-03T10:07:00Z")
+            );
+        }
     }
 
     #[test]

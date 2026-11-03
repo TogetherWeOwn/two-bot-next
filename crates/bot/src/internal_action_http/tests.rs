@@ -2342,10 +2342,9 @@ async fn voice_snapshot_pipeline_witnessed_join_stamps_occupied_since() {
 
 #[tokio::test]
 async fn voice_snapshot_windowed_event_key_stamps_the_linked_room() {
-    // One bound channel per exclusion rule: room 31 rides an open-ended
-    // (`NULL ends_at`) live event and takes the key; room 32's event ended
-    // (completed mirror, so out even with no closing edge); room 33's event
-    // starts two hours out (scheduled, but outside the ±15-minute window).
+    // Room 31 has an open-ended live event, room 35 a completed event
+    // inside its finite closing grace. Unknown ends, expired grace, future,
+    // cancelled and orphaned bindings all stay out.
     let Some(db) = database().await else { return };
     let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_voice_snapshot_flag(true);
@@ -2373,6 +2372,38 @@ async fn voice_snapshot_windowed_event_key_stamps_the_linked_room() {
             "scheduled",
             "+2 hours",
             Some("+3 hours"),
+        ),
+        (
+            "100000000000000004",
+            "closing-grace",
+            "35",
+            "completed",
+            "-1 hour",
+            Some("-5 minutes"),
+        ),
+        (
+            "100000000000000005",
+            "expired",
+            "34",
+            "completed",
+            "-2 hours",
+            Some("-16 minutes"),
+        ),
+        (
+            "100000000000000006",
+            "cancelled",
+            "36",
+            "cancelled",
+            "-1 hour",
+            Some("+5 minutes"),
+        ),
+        (
+            "100000000000000007",
+            "orphaned",
+            "37",
+            "active",
+            "-1 hour",
+            Some("+5 minutes"),
         ),
     ] {
         let ends_at: Option<String> = ends_in.map(|offset| format!("NOW() + INTERVAL '{offset}'"));
@@ -2407,7 +2438,24 @@ async fn voice_snapshot_windowed_event_key_stamps_the_linked_room() {
         .execute(db.pool())
         .await
         .unwrap();
+        if event_key == "orphaned" {
+            sqlx::query("UPDATE event_voice_channels SET status = 'orphaned' WHERE event_id = $1")
+                .bind(event_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
     }
+    let keys = InternalActionStore::new(db.pool().clone())
+        .windowed_event_voice_keys(staging_guild())
+        .await
+        .unwrap();
+    assert_eq!(
+        keys.len(),
+        2,
+        "only live and finite completed grace windows"
+    );
+    assert_eq!(keys.get("35").map(String::as_str), Some("closing-grace"));
     let (status, _, body) = answer(
         voice_app(db.pool().clone(), seeded_voice_cache()),
         signed_read(&voice_snapshot_payload(), "old"),
@@ -2420,7 +2468,7 @@ async fn voice_snapshot_windowed_event_key_stamps_the_linked_room() {
     assert!(rooms[1].get("event_key").is_none());
     assert!(rooms[2].get("event_key").is_none());
     assert!(rooms[3].get("event_key").is_none());
-    assert!(rooms[4].get("event_key").is_none());
+    assert_eq!(rooms[4]["event_key"], serde_json::json!("closing-grace"));
     db.close().await.unwrap();
 }
 

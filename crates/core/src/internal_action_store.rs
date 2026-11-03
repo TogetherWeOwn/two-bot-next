@@ -1031,10 +1031,10 @@ impl InternalActionStore {
     /// claim-bind lifecycle), joined to `internal_event_keys` for the site
     /// address and to `scheduled_events` for the guild scope (neither event
     /// voice table carries a guild column) and the mirror liveness. `orphaned`
-    /// binds and non-live mirror rows (`completed`, `cancelled`) never
-    /// surface. A `NULL ends_at` beside a live mirror status (`scheduled`,
-    /// `active`) still counts as windowed — an open-ended event has no
-    /// closing edge — while a terminal status stays out even with no edge.
+    /// binds and cancelled mirror rows never surface. Completed events keep
+    /// their key through a finite closing grace window, but without a known
+    /// end they cannot prove one. A `NULL ends_at` beside a live mirror status
+    /// (`scheduled`, `active`) is open-ended, with no closing edge.
     /// Store errors propagate so the caller refuses `internal` instead of
     /// serving key-omitted rooms as if no room were linked.
     pub async fn windowed_event_voice_keys(
@@ -1053,7 +1053,8 @@ impl InternalActionStore {
                ON s.guild_id = $1 AND s.event_id = c.event_id \
              WHERE c.voice_channel_id IS NOT NULL \
              AND c.status <> 'orphaned' \
-             AND s.status IN ('scheduled', 'active') \
+             AND (s.status IN ('scheduled', 'active') \
+                  OR (s.status = 'completed' AND c.ends_at IS NOT NULL)) \
              AND c.starts_at <= NOW() + INTERVAL '15 minutes' \
              AND (c.ends_at IS NULL OR c.ends_at >= NOW() - INTERVAL '15 minutes')",
         )
