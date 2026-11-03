@@ -161,7 +161,7 @@ impl VoiceOccupancyClock {
                     }
                 }
             }
-            room.occupied_since = oldest.map(format_whole_second_zulu);
+            room.occupied_since = oldest.and_then(format_whole_second_zulu);
         }
     }
 }
@@ -222,23 +222,20 @@ fn observed_at_now() -> String {
 }
 
 /// Whole-second Zulu timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for a receipt-time
-/// millis value. Out-of-range inputs (unreachable from real receipt times;
-/// the clock stores only parsed gateway stamps) fall back to the current
-/// wall second rather than failing the read.
-fn format_whole_second_zulu(millis: u64) -> String {
-    let fallback = time::OffsetDateTime::now_utc();
+/// millis value. Out-of-range inputs leave the start unknown rather than
+/// substituting a timestamp the gateway never witnessed.
+fn format_whole_second_zulu(millis: u64) -> Option<String> {
     let at = i64::try_from(millis.div_euclid(1000))
         .ok()
-        .and_then(|secs| time::OffsetDateTime::from_unix_timestamp(secs).ok())
-        .unwrap_or(fallback);
-    format_whole_second_zulu_parts(
+        .and_then(|secs| time::OffsetDateTime::from_unix_timestamp(secs).ok())?;
+    Some(format_whole_second_zulu_parts(
         at.year(),
         u8::from(at.month()),
         at.day(),
         at.hour(),
         at.minute(),
         at.second(),
-    )
+    ))
 }
 
 fn format_whole_second_zulu_parts(
@@ -553,6 +550,15 @@ mod tests {
             value["rooms"][0]["occupied_since"],
             json!("2026-11-03T10:00:00Z")
         );
+    }
+
+    #[test]
+    fn clock_out_of_range_stamp_reads_null() {
+        let clock = VoiceOccupancyClock::new();
+        clock.observe(9, 7, Some(10), Some(u64::MAX));
+        let mut rooms = vec![draft(10, "lobby", Some(0), &[7], false)];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(rooms[0].occupied_since, None);
     }
 
     #[test]
