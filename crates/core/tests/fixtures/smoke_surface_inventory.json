@@ -1728,7 +1728,7 @@
     },
     {
       "name": "automod-preview",
-      "description": "Privately preview which automod filter would decide sample text. Test the smallest synthetic phrase; do not paste real member messages containing personal data.",
+      "description": "Preview which automod filter fires on text. Smallest synthetic phrase; do not paste personal data.",
       "family": "moderation",
       "gate": "moderation",
       "default_member_permissions": "32",
