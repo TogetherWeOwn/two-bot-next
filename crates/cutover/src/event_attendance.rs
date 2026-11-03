@@ -180,6 +180,7 @@ pub async fn open_attendance_sessions(
 
 /// Open one session row tagged with the windows containing the join. Returns
 /// the new row id.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_attendance_session(
     pool: &sqlx::PgPool,
     guild_id: &str,
@@ -191,7 +192,7 @@ pub async fn insert_attendance_session(
     joined_at: OffsetDateTime,
     event_keys: &[String],
 ) -> Result<i64, sqlx::Error> {
-    Ok(sqlx::query_scalar(
+    sqlx::query_scalar(
         "INSERT INTO event_voice_sessions \
            (guild_id, member_id, channel_id, channel_name, is_bot, afk, \
             joined_at, event_keys) \
@@ -207,7 +208,7 @@ pub async fn insert_attendance_session(
     .bind(joined_at)
     .bind(event_keys)
     .fetch_one(pool)
-    .await?)
+    .await
 }
 
 /// Finalize one open row: stamp `left_at`, refresh the channel name to the
@@ -312,12 +313,10 @@ pub async fn count_attendance_sessions_before(
     pool: &sqlx::PgPool,
     cutoff: OffsetDateTime,
 ) -> Result<i64, sqlx::Error> {
-    Ok(
-        sqlx::query_scalar("SELECT count(*) FROM event_voice_sessions WHERE joined_at < $1")
-            .bind(cutoff)
-            .fetch_one(pool)
-            .await?,
-    )
+    sqlx::query_scalar("SELECT count(*) FROM event_voice_sessions WHERE joined_at < $1")
+        .bind(cutoff)
+        .fetch_one(pool)
+        .await
 }
 
 /// Whether the pair holds a guild-scoped opt-out suppression row. The
@@ -329,13 +328,13 @@ pub async fn is_attendance_suppressed(
     guild_id: &str,
     member_id: &str,
 ) -> Result<bool, sqlx::Error> {
-    Ok(sqlx::query_scalar(
+    sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)",
     )
     .bind(guild_id)
     .bind(member_id)
     .fetch_one(pool)
-    .await?)
+    .await
 }
 
 /// Whether guild-wide voice capture is enabled. `guild_analytics_settings`
@@ -385,6 +384,7 @@ impl PgRoomStore {
     }
 
     /// [`insert_attendance_session`] over this store's pool.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_attendance_session(
         &self,
         guild_id: &str,

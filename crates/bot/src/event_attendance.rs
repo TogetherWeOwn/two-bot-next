@@ -184,11 +184,12 @@ fn overlapping_keys(windows: &[AttendanceWindowMs], from_ms: i64, to_ms: i64) ->
 /// without a database:
 ///
 /// - same-channel frames plan nothing (the caller filters them already);
-/// - closes finalize every open row: `left_at` is now when the row opened
-///   inside a currently-open window (same-event rejoin), otherwise the row's
-///   own `joined_at`, so a stale row a missed close left behind closes as a
-///   zero-length span that keeps its original tags and can never inflate a
-///   later event's minutes;
+/// - closes finalize every open row at now, except a stale row a missed
+///   close left behind: when the member's next join/move opens a new row in
+///   a window the old row never overlapped, the stale row closes at its own
+///   `joined_at` (zero length, original tags only) so it can never inflate
+///   the new event's minutes. Leaves always close at now — the member just
+///   left — as do joins/moves when no window is open;
 /// - the tag union widens to every window overlapping `[joined_at, left_at]`,
 ///   which tags campers that never transition mid-event when they finally
 ///   leave during a later window;
@@ -213,7 +214,11 @@ pub(crate) fn plan_transition(
         let same_event = open_now
             .iter()
             .any(|window| contains_ms(window.starts_ms, window.ends_ms, row.joined_ms));
-        let left_ms = if same_event { now_ms } else { row.joined_ms };
+        // Only a join/move into a newly-open window with a foreign row is
+        // stale (missed close). Leaves and out-of-window transitions close
+        // at now so campers keep their overlap tags and minutes.
+        let stale = current.is_some() && !open_now.is_empty() && !same_event;
+        let left_ms = if stale { row.joined_ms } else { now_ms };
         let mut tag_union = row.event_keys.clone();
         for key in overlapping_keys(windows, row.joined_ms, left_ms) {
             if !tag_union.contains(&key) {
