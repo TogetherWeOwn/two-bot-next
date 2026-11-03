@@ -54,6 +54,18 @@ fn definition_has_the_spec_option_shape() {
         def.description
     );
     assert!(
+        def.description.contains("personal data"),
+        "help keeps the spec privacy phrase: {}",
+        def.description
+    );
+    assert!(
+        def.description
+            .to_lowercase()
+            .contains("smallest synthetic"),
+        "help keeps the smallest-phrase guidance: {}",
+        def.description
+    );
+    assert!(
         def.description.len() <= 100,
         "Discord caps command descriptions at 100 chars; the publish slice ships this text: {}",
         def.description
