@@ -1460,7 +1460,10 @@ impl CommandRuntime {
         // Per-invocation live overlay (self-role per-dispatch pattern): the
         // live snapshot wins over the boot value the router already admitted,
         // so a stored `0` refuses with the disabled reply while an absent row
-        // executes. Refuse-only, so boot-off registration is unchanged.
+        // executes. Refuse-only, so boot-off registration is unchanged. The
+        // name-aware overlay also rewrites a live-gated permission refusal to
+        // the disabled reply while live-off, matching boot-off
+        // gate-before-permission order for unprivileged members.
         let routed = match routed {
             RoutedInteraction::Slash { name, outcome } => {
                 let guild = interaction
@@ -1471,11 +1474,12 @@ impl CommandRuntime {
                 let announcements_live =
                     crate::feed_jobs::live_announcements_with(&guild, boot, live);
                 RoutedInteraction::Slash {
-                    name,
-                    outcome: two_bot_core::live_gate_announcements_slash(
+                    outcome: two_bot_core::live_gate_announcements_slash_named(
+                        &name,
                         outcome,
                         announcements_live,
                     ),
+                    name,
                 }
             }
             other => other,

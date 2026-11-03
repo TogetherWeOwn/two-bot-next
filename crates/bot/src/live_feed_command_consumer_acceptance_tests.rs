@@ -68,7 +68,14 @@ async fn real_feed_dispatch_observes_off_on_delete_and_foreign_snapshots() {
                 .into_iter()
                 .collect(),
         });
-        for name in ["feed-add", "feed-remove", "feed-list"] {
+        for name in [
+            "feed-add",
+            "feed-remove",
+            "feed-pause",
+            "feed-resume",
+            "feed-list",
+            "feed-inspect",
+        ] {
             let before = mock.requests().len();
             let mut command = slash(name, Some(CHANNEL), Vec::new());
             command.id = Id::new(10_000 + revision as u64 * 10 + observed.len() as u64);
@@ -105,10 +112,74 @@ async fn real_feed_dispatch_observes_off_on_delete_and_foreign_snapshots() {
     assert_eq!(
         observed,
         vec![
-            true, true, true, false, false, false, false, false, false, true, true, true, false,
-            false, false,
+            true, true, true, true, true, true, false, false, false, false, false, false, false,
+            false, false, false, false, false, true, true, true, true, true, true, false, false,
+            false, false, false, false,
         ],
-        "all three real feed commands must see each settings publication"
+        "all six real feed commands must see each settings publication"
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn real_feed_dispatch_reports_disabled_not_permission_to_unprivileged_members_while_live_off()
+{
+    // Live-off gate-before-permission order: a member without Manage Server
+    // hears the disabled reply (not a permission fetch-quest) on every feed
+    // verb, matching boot-off routing. Live-on keeps the permission refusal.
+    let (runtime, mock) = fixture(true).await;
+    let (mut writer, live) = live_channel();
+    runtime.set_live_settings(live);
+    writer.publish(&SettingsSnapshot {
+        revision: 1,
+        rows: vec![announcements_row(GUILD_S, json!(0))],
+    });
+    for name in [
+        "feed-add",
+        "feed-remove",
+        "feed-pause",
+        "feed-resume",
+        "feed-list",
+        "feed-inspect",
+    ] {
+        let mut command = slash(name, Some(CHANNEL), Vec::new());
+        command
+            .member
+            .as_mut()
+            .expect("slash fixture has a member")
+            .permissions = Some(twilight_model::guild::Permissions::empty());
+        let before = mock.requests().len();
+        runtime.on_interaction(&command).await;
+        let requests = mock.requests();
+        let emitted = &requests[before..];
+        assert_eq!(emitted.len(), 1, "{name}: exactly one initial reply");
+        let body: Value = serde_json::from_slice(&emitted[0].body).expect("callback JSON");
+        assert_eq!(body["type"], 4, "{name}: no defer while live-off");
+        assert_eq!(
+            body["data"]["content"], ANNOUNCEMENTS_DISABLED_REPLY,
+            "{name}: disabled reply, not a permission refusal"
+        );
+    }
+    writer.publish(&SettingsSnapshot {
+        revision: 2,
+        rows: vec![announcements_row(GUILD_S, json!(1))],
+    });
+    let mut command = slash("feed-add", Some(CHANNEL), Vec::new());
+    command
+        .member
+        .as_mut()
+        .expect("slash fixture has a member")
+        .permissions = Some(twilight_model::guild::Permissions::empty());
+    let before = mock.requests().len();
+    runtime.on_interaction(&command).await;
+    let requests = mock.requests();
+    let emitted = &requests[before..];
+    assert_eq!(emitted.len(), 1, "live-on: exactly one initial reply");
+    let body: Value = serde_json::from_slice(&emitted[0].body).expect("callback JSON");
+    assert_eq!(
+        body["data"]["content"],
+        two_bot_core::RouterRefusal::ManageServerRequired.message(),
+        "live-on keeps the permission refusal for unprivileged members"
     );
     mock.shutdown().await;
 }

@@ -591,6 +591,16 @@ fn live_announcements_gate_is_store_first_and_fail_closed() {
             "{stored} must fail closed"
         );
     }
+    // A raw JSON null renders to `None` and never masks boot: it falls
+    // through like an absent row in both directions.
+    for boot_on in [true, false] {
+        publish(vec![row(GUILD, serde_json::Value::Null)]);
+        assert_eq!(
+            live_announcements_with(GUILD, boot_on, Some(&live)),
+            boot_on,
+            "null falls through to boot {boot_on}"
+        );
+    }
     // Another guild's row never leaks across.
     publish(vec![row("other-guild", json!(true))]);
     assert!(live_announcements_with(GUILD, true, Some(&live)));

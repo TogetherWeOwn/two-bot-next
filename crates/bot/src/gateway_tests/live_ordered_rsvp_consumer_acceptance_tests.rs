@@ -23,9 +23,15 @@ impl BaselineOrderedSettings for InteractionRuntime {
 
 #[tokio::test]
 async fn ordered_gateway_rsvp_observes_off_on_delete_and_foreign_snapshots() {
-    let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
-        eprintln!("SKIP ordered RSVP consumer acceptance: TWO_TEST_DATABASE_URL not set");
-        return;
+    // A configured setup failure must fail, not skip (CONTRIBUTING.md): only
+    // a missing variable skips. A present-but-invalid value panics.
+    let url = match std::env::var("TWO_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(std::env::VarError::NotPresent) => {
+            eprintln!("SKIP ordered RSVP consumer acceptance: TWO_TEST_DATABASE_URL not set");
+            return;
+        }
+        Err(invalid) => panic!("TWO_TEST_DATABASE_URL is set but invalid: {invalid}"),
     };
     let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
         .await

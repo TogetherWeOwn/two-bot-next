@@ -245,8 +245,10 @@ pub(crate) const ANNOUNCEMENTS_KEY: &str = "TWO_ANNOUNCEMENTS";
 
 /// Effective announcements gate: the live snapshot wins over the boot value,
 /// an absent row falls back to boot, and any rendering other than exactly
-/// `"1"` reads off (fail-closed, like `FeatureGates::from_map`). Pure for
-/// tests via `live`.
+/// `"1"` reads off (fail-closed, like `FeatureGates::from_map`). A stored JSON
+/// null renders to `None` and falls through like an absent row (the shared
+/// `to_env_string` contract: unrenderable values never mask the boot value).
+/// Pure for tests via `live`.
 pub(crate) fn live_announcements_with(
     guild: &str,
     boot_on: bool,
@@ -258,7 +260,10 @@ pub(crate) fn live_announcements_with(
     let Some(value) = live.get(guild, ANNOUNCEMENTS_KEY) else {
         return boot_on;
     };
-    two_bot_core::settings::to_env_string(&value).is_some_and(|rendered| rendered == "1")
+    match two_bot_core::settings::to_env_string(&value) {
+        None => boot_on,
+        Some(rendered) => rendered == "1",
+    }
 }
 
 /// Production reader: the poller-published snapshot, if any.
