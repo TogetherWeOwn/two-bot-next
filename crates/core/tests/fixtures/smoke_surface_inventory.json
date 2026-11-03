@@ -1,6 +1,6 @@
 {
   "source": "InteractionRouter::publish_set with all feature gates on (scorecard, automations, announcements, moderation), no custom rows",
-  "count": 46,
+  "count": 47,
   "dm_permission_all_false": true,
   "commands": [
     {
@@ -1725,6 +1725,49 @@
       "smoke": "deferred",
       "expected_response": null,
       "deferral_reason": "Next-only private staff read of saved ledger rows; covered by the offline recent-actions acceptance, outside the unchanged top-five live smoke."
+    },
+    {
+      "name": "automod-preview",
+      "description": "Preview which automod filter fires on text. Smallest synthetic phrase; do not paste personal data.",
+      "family": "moderation",
+      "gate": "moderation",
+      "default_member_permissions": "32",
+      "dm_permission": false,
+      "options": [
+        {
+          "name": "text",
+          "description": "Sample text to evaluate (1-2000 characters)",
+          "type": "string",
+          "required": true,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 2000,
+          "choices": []
+        },
+        {
+          "name": "mentions",
+          "description": "Synthetic explicit user-mention count (0-100, default 0)",
+          "type": "integer",
+          "required": false,
+          "min_value": 0,
+          "max_value": 100,
+          "max_length": null,
+          "choices": []
+        },
+        {
+          "name": "attachments",
+          "description": "Comma-separated bare filenames, at most 10 (no slashes or commas in names)",
+          "type": "string",
+          "required": false,
+          "min_value": null,
+          "max_value": null,
+          "max_length": 1000,
+          "choices": []
+        }
+      ],
+      "smoke": "deferred",
+      "expected_response": null,
+      "deferral_reason": "Next-only private staff read with no legacy counterpart, staging-scoped; verdict and audit behavior pinned by the offline preview acceptance tests rather than the live smoke five."
     }
   ]
 }

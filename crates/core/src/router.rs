@@ -625,8 +625,9 @@ impl InteractionRouter {
                 HandlerId::LockdownPreview,
                 RouterRefusal::LockdownPreviewPermission,
             )),
-            // Dark until the publication slice: routed and adjudicated like
-            // the other private reads, but with no published definition.
+            // Staging-published since slice 4 (§5.0): routed and adjudicated
+            // like the other private reads; the definition reaches only the
+            // staging guild's registry (see `preview_publishable_in`).
             "automod-preview" => Some((
                 HandlerId::AutomodPreview,
                 RouterRefusal::AutomodPreviewPermission,
@@ -1065,6 +1066,13 @@ impl InteractionRouter {
         }
         if self.gates.moderation {
             extra.push(super::moderation::moderation_commands());
+            // Staging-only preview oracle (spec §5.0, T18): the definition
+            // joins the published moderation set only when this registry is
+            // the staging guild's. The live guild never lists it, even
+            // inertly; the handler still gates evaluation on runtime/scope.
+            if super::automod_preview::preview_publishable_in(self.gates.configured_guild) {
+                extra.push(vec![super::automod_preview::automod_preview_definition()]);
+            }
         }
         if self.gates.voice {
             extra.push(

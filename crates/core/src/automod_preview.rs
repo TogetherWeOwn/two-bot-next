@@ -109,9 +109,10 @@ pub const AUTOMOD_PREVIEW_ATTACHMENTS_MAX_FILES: usize = 10;
 
 /// Slash definition for `/automod-preview` (spec slices 2–4).
 ///
-/// ManageGuild-only, guild-only, three options of §3.1. Dark until the
-/// publication slice: built here so the shape is pinned, but kept out of
-/// `publish_set` (the router still adjudicates it via the permission row).
+/// ManageGuild-only, guild-only, three options of §3.1. Staging-published
+/// since slice 4 (see [`preview_publishable_in`]): built here so the shape
+/// is pinned, the router adjudicates it via the permission row, and
+/// `publish_set` admits it only into the staging guild's registry.
 #[must_use]
 pub fn automod_preview_definition() -> CommandDefinition {
     CommandDefinition::new(
@@ -141,6 +142,22 @@ pub fn automod_preview_definition() -> CommandDefinition {
         )
         .max_length(AUTOMOD_PREVIEW_ATTACHMENTS_MAX_UTF16),
     ])
+}
+
+/// Scope condition for publication (spec §5.0, T18): the definition reaches
+/// a guild registry only when that guild is the stack's configured guild and
+/// the automod scope admits it — the staging guild only, since live approval
+/// is never supplied (see [`crate::automod_runtime::AutomodScope`]). The
+/// live guild never lists the oracle, even inertly. The handler still
+/// answers `not_evaluated` without a runtime (automod disabled at boot), so
+/// a listing outside an enabled staging deployment carries no oracle bit.
+#[must_use]
+pub fn preview_publishable_in(configured_guild: Option<u64>) -> bool {
+    configured_guild.is_some_and(|guild| {
+        crate::automod_runtime::STAGING_GUILD_ID
+            .parse::<u64>()
+            .is_ok_and(|staging| guild == staging)
+    })
 }
 
 fn preview_exemption(

@@ -1804,11 +1804,13 @@ mod tests {
         let definitions = router.publish_set(&[]).unwrap();
         let published: HashSet<_> = definitions.iter().map(|def| def.name.clone()).collect();
         // `templateassistant`, `lockdown-preview`, and `automod-preview` are
-        // unpublished until their slices land, but the names stay squatted:
+        // absent from this non-staging registry, but the names stay squatted:
         // reservations cover the publish set plus exactly those three held
         // names. Capacity math counts only the publishable set, so unused
         // slots keep accepting custom commands; the held names rejoin the
-        // budget when published.
+        // budget when published. `automod-preview` publishes only into the
+        // staging guild's registry (see `preview_publishable_in`), so it
+        // stays held here.
         assert!(published.is_subset(&reserved));
         assert_eq!(reserved.len(), published.len() + 3);
         assert!(reserved.contains("templateassistant"));
