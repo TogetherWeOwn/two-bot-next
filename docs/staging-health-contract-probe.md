@@ -39,7 +39,9 @@ with no retry, sleep, polling or grace period. Every 503 exits nonzero; liveness
 cannot replace readiness. The additive `readiness` object records:
 
 - `http_status`: the observed readiness HTTP status, or `null` for a transport
-  failure without a response. Body-cap and duplicate-JSON refusals retain status.
+  failure without a response. A body-read transport failure after headers retains
+  the observed status but no partial body. Body-cap and duplicate-JSON refusals
+  also retain status.
 - `components`: all four fixed names and their validated public state enums,
   including ready components when other components fail. A malformed or unknown
   breakdown yields `{}`, never invented `down` or `ready` states. Validated

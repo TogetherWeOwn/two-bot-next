@@ -229,6 +229,66 @@ class HealthContractProbeTests(unittest.TestCase):
                 self.assertNotIn("secret-like", json.dumps(receipt) + str(results))
                 self.assertEqual(self.requested[before:], [STAGING + "/health", STAGING + "/readyz"])
 
+    def test_transport_boundary_retains_status_only_after_headers(self):
+        for status in (None, 200, 503):
+            for error in (OSError("secret-like-error"), TimeoutError("secret-like-timeout"),
+                          probe.urllib.error.URLError("secret-like-url"),
+                          probe.http.client.IncompleteRead(b"secret-like-partial-body")):
+                with self.subTest(status=status, error=type(error).__name__):
+                    reads = []
+                    requested = []
+
+                    class Response(io.BytesIO):
+                        headers = {"secret-like-header": "secret-like-value"}
+
+                        def read(self, n=-1):
+                            reads.append(n)
+                            raise error
+
+                    response = Response(b"secret-like-body")
+                    response.status = status
+                    self.addCleanup(response.close)
+
+                    def open_response(request, timeout=None):
+                        requested.append(request.full_url)
+                        self.assertEqual(timeout, probe.TIMEOUT_SECONDS)
+                        if request.full_url == STAGING + "/health":
+                            health = io.BytesIO(b'{"status":"ok"}')
+                            health.status, health.headers = 200, {}
+                            return health
+                        self.assertEqual(request.full_url, STAGING + "/readyz")
+                        if status is None:
+                            raise error
+                        if status == 503:
+                            raise probe.urllib.error.HTTPError(
+                                request.full_url, status, "secret-like-reason",
+                                response.headers, response)
+                        return response
+
+                    opener = mock.Mock()
+                    opener.open.side_effect = open_response
+                    out = io.StringIO()
+                    with mock.patch.object(probe.urllib.request, "build_opener", return_value=opener), \
+                            mock.patch.object(probe.time, "sleep", side_effect=AssertionError("retry sleep")), \
+                            mock.patch.dict(os.environ, {}, clear=True), redirect_stdout(out):
+                        code = probe.main(["--staging-url", STAGING, "--evidence", self.evidence],
+                                          fetch_fn=probe.fetch)
+                    raw = Path(self.evidence).read_text()
+                    receipt = json.loads(raw)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(receipt["result"], "fail")
+                    self.assertEqual(receipt["readiness"], {"http_status": status,
+                                     "failure_class": "transport_failure", "components": {}})
+                    self.assertEqual(receipt["build_failure_class"], "build_identity_unavailable")
+                    self.assertIsNone(receipt["build_revision"])
+                    self.assertIsNone(receipt["build_id"])
+                    self.assertIsNone(receipt["gateway_failure_class"])
+                    self.assertIsNone(receipt["gateway_failure_root_cause"])
+                    self.assertEqual(requested, [STAGING + "/health", STAGING + "/readyz"])
+                    self.assertEqual(reads, [] if status is None else [probe.BODY_CAP + 1])
+                    self.assertLess(len(raw), 4096)
+                    self.assertNotIn("secret-like", raw + out.getvalue())
+
     def test_build_failure_is_separate_from_readiness(self):
         for value, failure_class in (
                 (dict(READY, build_revision="f" * 40), "build_mismatch"),

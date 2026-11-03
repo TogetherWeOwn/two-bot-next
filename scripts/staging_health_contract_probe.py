@@ -95,6 +95,14 @@ class ProbeError(Exception):
         self.http_status = http_status
 
 
+class TransportError(OSError):
+    """A transport failure retaining only the HTTP status, if observed."""
+
+    def __init__(self, http_status):
+        super().__init__("probe transport failure")
+        self.http_status = http_status
+
+
 class DuplicateKeyError(ValueError):
     """A JSON object repeats a key; the message never carries key/value data."""
 
@@ -157,11 +165,17 @@ def fetch(url):
     request = urllib.request.Request(url, method="GET",
                                      headers={"User-Agent": USER_AGENT,
                                               "Cache-Control": "no-cache"})
+    status = None
     try:
-        with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
-            return response.status, response.headers, response.read(BODY_CAP + 1)
-    except urllib.error.HTTPError as error:
-        return error.code, error.headers or {}, error.read(BODY_CAP + 1)
+        try:
+            with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
+                status = response.status
+                return status, response.headers, response.read(BODY_CAP + 1)
+        except urllib.error.HTTPError as error:
+            status = error.code
+            return status, error.headers or {}, error.read(BODY_CAP + 1)
+    except (OSError, http.client.HTTPException):
+        raise TransportError(status) from None
 
 
 def header(headers, name):
@@ -185,9 +199,10 @@ def get_json(fetch_fn, url, name):
     """One GET returning (status, headers, parsed JSON or None)."""
     try:
         status, headers, body = fetch_fn(url)
-    except (OSError, http.client.HTTPException):
+    except (OSError, http.client.HTTPException) as error:
         raise ProbeError(f"{name} probe did not respond (transport failure)",
-                         failure_class="transport_failure") from None
+                         failure_class="transport_failure",
+                         http_status=error.http_status if isinstance(error, TransportError) else None) from None
     if len(body) > BODY_CAP:
         raise ProbeError(f"{name} probe answered over the body cap", http_status=status)
     try:
