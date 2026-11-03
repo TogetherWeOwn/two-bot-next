@@ -4,6 +4,7 @@
 //! terminal outcome, not a new execution lease. See `docs/internal-action-store.md`.
 
 use sqlx::{PgPool, Row};
+use std::collections::HashMap;
 use std::str::FromStr as _;
 
 use crate::channel_moderation::PurgeStopReason;
@@ -1019,6 +1020,51 @@ impl InternalActionStore {
         .fetch_optional(&self.pool)
         .await?)
     }
+
+    /// Voice-channel → website event-key map for the currently-windowed
+    /// events of one guild. `voice.snapshot` stamps `rooms[].event_key` from
+    /// this so the site can join heat rows to its event metadata: one entry
+    /// per bound voice channel, only while the channel's event sits inside
+    /// `[starts_at − 15 min, ends_at + 15 min]` per contract §9.
+    ///
+    /// The window's source of truth is `event_voice_channels` (the
+    /// claim-bind lifecycle), joined to `internal_event_keys` for the site
+    /// address and to `scheduled_events` for the guild scope (neither event
+    /// voice table carries a guild column) and the mirror liveness. `orphaned`
+    /// binds and non-live mirror rows (`completed`, `cancelled`) never
+    /// surface. A `NULL ends_at` beside a live mirror status (`scheduled`,
+    /// `active`) still counts as windowed — an open-ended event has no
+    /// closing edge — while a terminal status stays out even with no edge.
+    /// Store errors propagate so the caller refuses `internal` instead of
+    /// serving key-omitted rooms as if no room were linked.
+    pub async fn windowed_event_voice_keys(
+        &self,
+        guild_id: &str,
+    ) -> Result<HashMap<String, String>, InternalStoreError> {
+        if !is_snowflake(guild_id) {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        let rows: Vec<(Option<String>, String)> = sqlx::query_as(
+            "SELECT c.voice_channel_id, k.event_key \
+             FROM event_voice_channels c \
+             JOIN internal_event_keys k \
+               ON k.guild_id = $1 AND k.event_id = c.event_id \
+             JOIN scheduled_events s \
+               ON s.guild_id = $1 AND s.event_id = c.event_id \
+             WHERE c.voice_channel_id IS NOT NULL \
+             AND c.status <> 'orphaned' \
+             AND s.status IN ('scheduled', 'active') \
+             AND c.starts_at <= NOW() + INTERVAL '15 minutes' \
+             AND (c.ends_at IS NULL OR c.ends_at >= NOW() - INTERVAL '15 minutes')",
+        )
+        .bind(guild_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(channel, key)| channel.map(|channel| (channel, key)))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -1053,6 +1099,19 @@ mod tests {
         assert_eq!(error.to_string(), "internal-action storage unavailable");
         assert_eq!(format!("{error:?}"), "Unavailable");
         assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[tokio::test]
+    async fn windowed_event_voice_keys_rejects_non_snowflake_guild_without_querying() {
+        // The shape guard runs before any query: a lazy pool that could never
+        // connect still yields `InvalidInput`, never a connection error.
+        let pool = PgPool::connect_lazy("postgres://127.0.0.1:9/unused")
+            .expect("lazy pool builds without connecting");
+        let err = InternalActionStore::new(pool)
+            .windowed_event_voice_keys("not-a-snowflake")
+            .await
+            .expect_err("shape guard runs before any query");
+        assert_eq!(err, InternalStoreError::InvalidInput);
     }
 
     #[test]

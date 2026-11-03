@@ -11,7 +11,8 @@
 //! like `event.read`):
 //! `{"v":1,"observed_at":"<Zulu whole seconds>","total_in_voice":N,
 //! "rooms":[{"channel_id":"<snowflake>","name":"...","position":N|null,
-//! "user_limit":N,"member_ids":["<snowflake>",...],"afk":true?}]}`.
+//! "user_limit":N,"member_ids":["<snowflake>",...],"afk":true?,
+//! "occupied_since":"<Zulu whole seconds>"|null,"event_key":"..."?}]}`.
 //!
 //! Projection rules: guild voice channels only (stage and text excluded);
 //! every voice channel is a room even when empty; the AFK channel carries
@@ -20,10 +21,16 @@
 //! cache has not populated counts as human (never delete on incomplete bot
 //! data); member ids are snowflake decimal strings only — no usernames,
 //! nicknames, presence or activity; rooms sort by position then name.
-//! Member ids never reach logs; the read audits through the receiver's
-//! counters only.
+//! `occupied_since` is the ISO-8601 UTC instant the room's current
+//! continuous occupancy began (oldest tracked join among its occupants), or
+//! `null` when unknown — an empty room, or a join the gateway never
+//! witnessed (process start, reconnect reseed) is unknown, never guessed.
+//! `event_key` rides only on the room bound to a currently-windowed event's
+//! voice channel and is omitted elsewhere. Member ids never reach logs; the
+//! read audits through the receiver's counters only.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use twilight_cache_inmemory::{DefaultInMemoryCache, ResourceType};
@@ -64,6 +71,113 @@ pub(crate) struct RoomDraft {
     /// Sorted ascending before serializing so the wire shape is stable.
     pub member_ids: Vec<Snowflake>,
     pub afk: bool,
+    /// Whole-second Zulu join time of the room's current continuous
+    /// occupancy (`None` = unknown: empty room, or a join the gateway never
+    /// witnessed). Always serialized: a string when proven, else JSON null.
+    pub occupied_since: Option<String>,
+    /// `internal_event_keys` key for the currently-windowed event bound to
+    /// this room's voice channel (`None` = unlinked room, omitted on the
+    /// wire).
+    pub event_key: Option<String>,
+}
+
+/// In-memory join clock feeding `rooms[].occupied_since`.
+///
+/// The gateway pipeline stamps every voice session boundary through the
+/// [`VoiceTransitionObserver`](two_bot_discord::VoiceTransitionObserver)
+/// seam: joins and moves record `(guild, member) -> (channel, receipt ms)`,
+/// leaves clear the member. A room's start is the oldest stamp among its
+/// current occupants; it reads `null` when the room is empty, when any
+/// occupant's join predates tracking (process start, reconnect reseed,
+/// `GuildCreate` seeding), or when a stamp names a different channel (a move
+/// racing the read). Unknown is `null`, never a guess: the clock stores only
+/// what the gateway witnessed.
+///
+/// The read reconciles against the live snapshot before stamping, dropping
+/// this guild's entries for members the snapshot no longer lists, so
+/// unobserved leaves and reconnect reseeds heal on the next read instead of
+/// accumulating.
+///
+/// Lives beside the projector, not in the room actor: the keyless
+/// `voice.snapshot` read must work even where the room actor is gated off,
+/// and bootstrap reseeds must never fabricate join times.
+#[derive(Debug, Default)]
+pub(crate) struct VoiceOccupancyClock {
+    joins: Mutex<HashMap<(Snowflake, Snowflake), (Snowflake, u64)>>,
+}
+
+impl VoiceOccupancyClock {
+    /// Shared handle constructor for the binary wiring.
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Record one gateway-observed session boundary. Joins and moves stamp
+    /// the member's room; leaves — and frames whose receipt time did not
+    /// parse — clear the stamp, so the next read reports `null` for a
+    /// session it cannot prove instead of continuity it did not witness.
+    fn observe(
+        &self,
+        guild_id: Snowflake,
+        member_id: Snowflake,
+        channel_id: Option<Snowflake>,
+        occurred_at_ms: Option<u64>,
+    ) {
+        let mut joins = self.joins.expect("voice occupancy clock");
+        match (channel_id, occurred_at_ms) {
+            (Some(channel), Some(at_ms)) => {
+                joins.insert((guild_id, member_id), (channel, at_ms));
+            }
+            _ => {
+                joins.remove(&(guild_id, member_id));
+            }
+        }
+    }
+
+    /// Stamp `occupied_since` onto every draft from the current occupancy,
+    /// reconciling this guild's entries against the rooms first. Holds one
+    /// lock across reconcile and stamp so a concurrent frame cannot slip an
+    /// entry between the two.
+    fn stamp_rooms(&self, guild_id: Snowflake, rooms: &mut [RoomDraft]) {
+        let mut joins = self.joins.expect("voice occupancy clock");
+        let mut present: HashSet<Snowflake> = HashSet::new();
+        for room in rooms.iter() {
+            present.extend(room.member_ids.iter().copied());
+        }
+        joins.retain(|(guild, member), _| *guild != guild_id || present.contains(member));
+        for room in rooms.iter_mut() {
+            let mut oldest: Option<u64> = None;
+            for member in &room.member_ids {
+                match joins.get(&(guild_id, *member)) {
+                    Some((channel, at_ms)) if *channel == room.channel_id => {
+                        oldest = Some(oldest.map_or(*at_ms, |min| min.min(*at_ms)));
+                    }
+                    // Untracked join, or a stamp for a room the member has
+                    // already left (a move racing the read): the room's start
+                    // is unprovable, not the oldest provable stamp.
+                    _ => {
+                        oldest = None;
+                        break;
+                    }
+                }
+            }
+            room.occupied_since = oldest.map(format_whole_second_zulu);
+        }
+    }
+}
+
+/// Gateway pipeline feed: every voice session boundary the shard witnesses
+/// lands here after the funnel rows, so the clock only ever holds joins the
+/// gateway actually saw — nothing seeded, nothing backfilled.
+impl two_bot_discord::VoiceTransitionObserver for VoiceOccupancyClock {
+    fn observe_voice_transition(&self, transition: two_bot_discord::VoiceTransitionObservation) {
+        self.observe(
+            transition.guild_id,
+            transition.member_id,
+            transition.current_channel_id,
+            transition.occurred_at_ms,
+        );
+    }
 }
 
 /// Read the §1 snapshot from the live gateway cache. `None` anywhere on the
@@ -72,22 +186,32 @@ pub(crate) struct RoomDraft {
 /// deliberate exception (a guild the cache holds whose voice-state set went
 /// missing reads as empty, not incomplete).
 ///
+/// `event_keys` carries the currently-windowed voice-channel → event-key map
+/// behind the read; each draft takes its room's key, or none when unlinked.
+/// The clock stamps `occupied_since` from the witnessed joins before
+/// projection.
+///
 /// The cache alone cannot prove freshness: a transport loss leaves the last
 /// occupancy readable, so callers gate on the supervisor's readiness first
 /// and only call this while the gateway is connected.
 pub(crate) fn read_voice_snapshot(
     cache: &DefaultInMemoryCache,
+    clock: &VoiceOccupancyClock,
     guild_id: Snowflake,
+    event_keys: &HashMap<Snowflake, String>,
 ) -> Result<Value, SnapshotRefusal> {
-    let rooms = collect_rooms(cache, guild_id).ok_or(SnapshotRefusal::CacheIncomplete)?;
+    let mut rooms = collect_rooms(cache, guild_id).ok_or(SnapshotRefusal::CacheIncomplete)?;
+    clock.stamp_rooms(guild_id, &mut rooms);
+    for room in &mut rooms {
+        room.event_key = event_keys.get(&room.channel_id).cloned();
+    }
     project(observed_at_now(), rooms)
 }
 
 /// Whole-second Zulu timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for `observed_at`.
 fn observed_at_now() -> String {
     let now = time::OffsetDateTime::now_utc();
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+    format_whole_second_zulu_parts(
         now.year(),
         u8::from(now.month()),
         now.day(),
@@ -95,6 +219,37 @@ fn observed_at_now() -> String {
         now.minute(),
         now.second(),
     )
+}
+
+/// Whole-second Zulu timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for a receipt-time
+/// millis value. Out-of-range inputs (unreachable from real receipt times;
+/// the clock stores only parsed gateway stamps) fall back to the current
+/// wall second rather than failing the read.
+fn format_whole_second_zulu(millis: u64) -> String {
+    let fallback = time::OffsetDateTime::now_utc();
+    let at = i64::try_from(millis.div_euclid(1000))
+        .ok()
+        .and_then(|secs| time::OffsetDateTime::from_unix_timestamp(secs).ok())
+        .unwrap_or(fallback);
+    format_whole_second_zulu_parts(
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+    )
+}
+
+fn format_whole_second_zulu_parts(
+    year: i32,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+) -> String {
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// Shared-cache handle constructor for the binary wiring (kept beside the
@@ -137,6 +292,10 @@ fn collect_rooms(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Option<Ve
             user_limit: channel.user_limit.unwrap_or(0),
             member_ids: Vec::new(),
             afk: Some(*channel_id) == afk_channel,
+            // Stamped by the occupancy clock and the event-key map on the
+            // read path; collection alone proves neither.
+            occupied_since: None,
+            event_key: None,
         });
     }
     let occupants: Vec<Id<UserMarker>> = match cache.guild_voice_states(guild_key) {
@@ -202,9 +361,17 @@ pub(crate) fn project(
                 "position": room.position,
                 "user_limit": room.user_limit,
                 "member_ids": room.member_ids.iter().map(Snowflake::to_string).collect::<Vec<_>>(),
+                // Always present: a proven join instant, else explicit null.
+                // Unknown occupancy is data, not an absent field.
+                "occupied_since": room.occupied_since.clone(),
             });
             if room.afk {
                 wire["afk"] = Value::Bool(true);
+            }
+            // Present only on the room bound to a currently-windowed event's
+            // voice channel; unlinked rooms omit the key entirely.
+            if let Some(key) = room.event_key.as_deref() {
+                wire["event_key"] = Value::String(key.to_owned());
             }
             wire
         })
@@ -240,7 +407,14 @@ mod tests {
             user_limit: 0,
             member_ids: member_ids.to_vec(),
             afk,
+            occupied_since: None,
+            event_key: None,
         }
+    }
+
+    /// Whole-second Zulu for a fixed instant: 2026-11-03T10:00:00Z.
+    fn stamp_ms() -> u64 {
+        1_793_700_000_000
     }
 
     fn rooms_of(value: &Value) -> Vec<(String, String, bool, Vec<String>)> {
@@ -331,6 +505,110 @@ mod tests {
         assert_eq!(value["observed_at"], json!("2026-11-03T10:00:00Z"));
         assert_eq!(value["rooms"][0]["channel_id"], json!("10"));
         assert_eq!(value["rooms"][0]["position"], json!(0));
+    }
+
+    #[test]
+    fn rooms_without_proof_read_null_occupied_since() {
+        // Collection alone proves no join: the wire carries explicit null,
+        // never an absent field and never a guess.
+        let value = project(
+            "2026-11-03T10:00:00Z".to_owned(),
+            vec![
+                draft(10, "lobby", Some(0), &[7], false),
+                draft(11, "quiet", Some(1), &[], false),
+            ],
+        )
+        .expect("small projection fits");
+        assert_eq!(value["rooms"][0]["occupied_since"], json!(null));
+        assert_eq!(value["rooms"][1]["occupied_since"], json!(null));
+    }
+
+    #[test]
+    fn event_key_rides_only_on_the_linked_room() {
+        let mut rooms = vec![
+            draft(10, "lobby", Some(0), &[7], false),
+            draft(11, "stage-linked", Some(1), &[8], false),
+        ];
+        rooms[1].event_key = Some("autumn-showcase".to_owned());
+        let value =
+            project("2026-11-03T10:00:00Z".to_owned(), rooms).expect("small projection fits");
+        assert!(value["rooms"][0].get("event_key").is_none());
+        assert_eq!(value["rooms"][1]["event_key"], json!("autumn-showcase"));
+    }
+
+    #[test]
+    fn clock_stamps_the_oldest_tracked_join() {
+        let clock = VoiceOccupancyClock::new();
+        clock.observe(9, 7, Some(10), Some(stamp_ms()));
+        clock.observe(9, 8, Some(10), Some(stamp_ms() + 60_000));
+        let mut rooms = vec![draft(10, "lobby", Some(0), &[7, 8], false)];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(
+            rooms[0].occupied_since.as_deref(),
+            Some("2026-11-03T10:00:00Z")
+        );
+        let value =
+            project("2026-11-03T10:00:00Z".to_owned(), rooms).expect("small projection fits");
+        assert_eq!(
+            value["rooms"][0]["occupied_since"],
+            json!("2026-11-03T10:00:00Z")
+        );
+    }
+
+    #[test]
+    fn clock_moves_restamp_and_leaves_clear() {
+        let clock = VoiceOccupancyClock::new();
+        clock.observe(9, 7, Some(10), Some(stamp_ms()));
+        // A move restamps the new room: the old room no longer proves the
+        // member, and the new room starts at the move, not the first join.
+        clock.observe(9, 7, Some(11), Some(stamp_ms() + 60_000));
+        let mut rooms = vec![
+            draft(10, "lobby", Some(0), &[], false),
+            draft(11, "breakout", Some(1), &[7], false),
+        ];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(rooms[0].occupied_since, None);
+        assert_eq!(
+            rooms[1].occupied_since.as_deref(),
+            Some("2026-11-03T10:01:00Z")
+        );
+        // A leave clears the stamp: a rejoin starts a new session.
+        clock.observe(9, 7, None, Some(stamp_ms() + 120_000));
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(rooms[1].occupied_since, None);
+    }
+
+    #[test]
+    fn clock_unknown_stamp_or_member_reads_null() {
+        let clock = VoiceOccupancyClock::new();
+        // A join the gateway witnessed but could not time (unparseable
+        // receipt stamp) clears the session: unknown, never guessed.
+        clock.observe(9, 7, Some(10), None);
+        // A member the clock never saw (process start, reseed) is unknown.
+        let mut rooms = vec![draft(10, "lobby", Some(0), &[7, 8], false)];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(rooms[0].occupied_since, None);
+        // A stamp for a room the member already left (a move racing the
+        // read) proves nothing about this room either.
+        clock.observe(9, 8, Some(11), Some(stamp_ms()));
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(rooms[0].occupied_since, None);
+    }
+
+    #[test]
+    fn clock_reconcile_drops_members_who_left_unseen() {
+        let clock = VoiceOccupancyClock::new();
+        clock.observe(9, 7, Some(10), Some(stamp_ms()));
+        clock.observe(9, 8, Some(10), Some(stamp_ms()));
+        // Member 8 leaves without a witnessed frame (reconnect reseed):
+        // the next read heals the clock instead of pinning a stale start.
+        let mut rooms = vec![draft(10, "lobby", Some(0), &[7], false)];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(
+            rooms[0].occupied_since.as_deref(),
+            Some("2026-11-03T10:00:00Z")
+        );
+        assert_eq!(clock.joins.expect("clock lock").len(), 1);
     }
 
     #[test]

@@ -94,4 +94,5 @@ pub use pipeline::{
     build_cache, AuditEntryObserver, AuditLogObservation, ChannelClassifier, InviteSource,
     JoinObservation, JoinObserver, MemPipeline, MessageEligibility, NoClassification, NoInvites,
     Pipeline, PipelineSnapshots, ScriptedInvites, SettingsChannelClassifier,
+    VoiceTransitionObservation, VoiceTransitionObserver,
 };

@@ -92,6 +92,34 @@ pub trait AuditEntryObserver: Send + Sync {
     fn observe_audit_entry(&self, entry: AuditLogObservation);
 }
 
+/// One voice session boundary, handed to a runtime observer after the cache
+/// and the funnel rows update. Powers the keyless `voice.snapshot`
+/// `rooms[].occupied_since` clock: joins and moves stamp the member's room,
+/// leaves clear the member, so a room's start is the oldest tracked stamp
+/// among its current occupants. Mute/deafen/camera frames never produce an
+/// observation (they are not session boundaries); anything the gateway never
+/// witnessed (process start, reconnect reseeds, `GuildCreate` seeding) never
+/// reaches the observer and reads `null` downstream, never a guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceTransitionObservation {
+    pub guild_id: u64,
+    pub member_id: u64,
+    /// The channel the member left, if any (`None` on a fresh join).
+    pub previous_channel_id: Option<u64>,
+    /// The channel the member joined, if any (`None` on a leave).
+    pub current_channel_id: Option<u64>,
+    /// Gateway receipt time of the frame that caused the transition, millis
+    /// since epoch (`None` when the receipt stamp did not parse: the clock
+    /// drops the provable session instead of stamping a guess).
+    pub occurred_at_ms: Option<u64>,
+}
+
+/// Receives voice session boundaries from the serial gateway writer.
+/// Implementations must not block or await: record the stamp and return.
+pub trait VoiceTransitionObserver: Send + Sync {
+    fn observe_voice_transition(&self, transition: VoiceTransitionObservation);
+}
+
 use crate::intents::cache_resource_types;
 
 fn user_id_key(u: u64) -> twilight_model::id::Id<twilight_model::id::marker::UserMarker> {
@@ -466,6 +494,9 @@ pub struct Pipeline<
     /// Set once at startup by the runtime that wants audit entries
     /// (containment).
     audit_entry_observer: OnceLock<Arc<dyn AuditEntryObserver>>,
+    /// Set once at startup by the runtime that wants voice session
+    /// boundaries (the `voice.snapshot` occupancy clock).
+    voice_transition_observer: OnceLock<Arc<dyn VoiceTransitionObserver>>,
     /// Whether the shard subscribed privileged `MESSAGE_CONTENT`, so
     /// `msg.content` is actually delivered for ordinary guild messages.
     /// Without it Discord sends content only for messages that mention the
@@ -563,6 +594,7 @@ impl<
             vanity_guilds: Mutex::new(HashSet::new()),
             join_observer: OnceLock::new(),
             audit_entry_observer: OnceLock::new(),
+            voice_transition_observer: OnceLock::new(),
             message_content_delivered: AtomicBool::new(true),
         }
     }
@@ -589,6 +621,13 @@ impl<
     /// Register the audit-entry observer. First registration wins, like joins.
     pub fn set_audit_entry_observer(&self, observer: Arc<dyn AuditEntryObserver>) {
         let _ = self.audit_entry_observer.set(observer);
+    }
+
+    /// Register the voice-transition observer. First registration wins, like
+    /// joins: `GuildCreate` seeding and mute frames never produce an
+    /// observation, only witnessed channel changes do.
+    pub fn set_voice_transition_observer(&self, observer: Arc<dyn VoiceTransitionObserver>) {
+        let _ = self.voice_transition_observer.set(observer);
     }
 
     /// Access the core handlers (tracker reads, replay assertions).
@@ -1041,6 +1080,21 @@ impl<
                         });
                     }
                 }
+                // Last, after the funnel rows: an observer problem must never
+                // cost the voice record it is reporting on. Mute frames return
+                // early above, so only witnessed session boundaries arrive.
+                // An unreadable receipt stamp travels as `None` so the clock
+                // drops the provable session instead of stamping a guess.
+                if let Some(observer) = self.voice_transition_observer.get() {
+                    observer.observe_voice_transition(VoiceTransitionObservation {
+                        guild_id,
+                        member_id,
+                        previous_channel_id: old_channel,
+                        current_channel_id: new_channel,
+                        occurred_at_ms: two_bot_core::parse_iso_millis(observed_at)
+                            .and_then(|ms| u64::try_from(ms).ok()),
+                    });
+                }
                 if new_channel.is_none() {
                     self.voice_chains
                         .remove_after_leave(guild_id, member_id, &chain);
@@ -1311,6 +1365,87 @@ mod tests {
             }))
             .expect("voice fixture"),
         ))
+    }
+
+    fn lifecycle_mute(guild: u64, member: u64, channel: u64) -> Event {
+        Event::VoiceStateUpdate(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "guild_id": guild.to_string(), "user_id": member.to_string(),
+                "channel_id": channel.to_string(), "session_id": "fixture",
+                "deaf": false, "mute": false, "self_deaf": false,
+                "self_mute": true, "self_video": false, "suppress": false
+            }))
+            .expect("voice fixture"),
+        ))
+    }
+
+    fn lifecycle_leave(guild: u64, member: u64) -> Event {
+        Event::VoiceStateUpdate(Box::new(
+            serde_json::from_value(serde_json::json!({
+                "guild_id": guild.to_string(), "user_id": member.to_string(),
+                "session_id": "fixture",
+                "deaf": false, "mute": false, "self_deaf": false,
+                "self_mute": false, "self_video": false, "suppress": false
+            }))
+            .expect("voice fixture"),
+        ))
+    }
+
+    struct RecordingVoiceObserver {
+        transitions: Mutex<Vec<VoiceTransitionObservation>>,
+    }
+
+    impl VoiceTransitionObserver for RecordingVoiceObserver {
+        fn observe_voice_transition(&self, transition: VoiceTransitionObservation) {
+            self.transitions.expect("observer lock").push(transition);
+        }
+    }
+
+    fn stamp_ms(observed_at: &str) -> Option<u64> {
+        u64::try_from(two_bot_core::parse_iso_millis(observed_at).expect("fixture stamp parses"))
+            .ok()
+    }
+
+    #[test]
+    fn voice_transitions_reach_the_observer_with_stamps() {
+        let p = MemPipeline::for_replay();
+        let observer = Arc::new(RecordingVoiceObserver {
+            transitions: Mutex::new(Vec::new()),
+        });
+        p.set_voice_transition_observer(Arc::clone(&observer));
+        p.handle_at(&lifecycle_voice(GUILD, 1, 10), "2026-10-19T12:00:00.000Z");
+        // A mute frame on the same channel is not a session boundary: the
+        // cache updates, but the observer hears nothing.
+        p.handle_at(&lifecycle_mute(GUILD, 1, 10), "2026-10-19T12:00:05.000Z");
+        p.handle_at(&lifecycle_voice(GUILD, 1, 11), "2026-10-19T12:00:10.000Z");
+        p.handle_at(&lifecycle_leave(GUILD, 1), "2026-10-19T12:00:20.000Z");
+        let transitions = observer.transitions.expect("observer lock");
+        assert_eq!(
+            *transitions,
+            vec![
+                VoiceTransitionObservation {
+                    guild_id: GUILD,
+                    member_id: 1,
+                    previous_channel_id: None,
+                    current_channel_id: Some(10),
+                    occurred_at_ms: stamp_ms("2026-10-19T12:00:00.000Z"),
+                },
+                VoiceTransitionObservation {
+                    guild_id: GUILD,
+                    member_id: 1,
+                    previous_channel_id: Some(10),
+                    current_channel_id: Some(11),
+                    occurred_at_ms: stamp_ms("2026-10-19T12:00:10.000Z"),
+                },
+                VoiceTransitionObservation {
+                    guild_id: GUILD,
+                    member_id: 1,
+                    previous_channel_id: Some(11),
+                    current_channel_id: None,
+                    occurred_at_ms: stamp_ms("2026-10-19T12:00:20.000Z"),
+                },
+            ]
+        );
     }
 
     fn lifecycle_delete(guild: u64, channel: Option<u64>) -> Event {
