@@ -69,12 +69,15 @@ before creating a browser build in that project's own card. The separate
   put can store a builtin trigger that execution skips and enable rejects
   (`custom_commands.rs:580-598,648-650,683-693`). Never call that trigger usable;
   preserve the validator difference rather than invent an identical-check claim.
-- Only `{user}`, `{username}`, `{server}`, `{channel}` render, in one pass
-  (`custom_commands.rs:19,144-170`). Validation rejects unknown lowercase-alpha
-  tokens such as `{guild}` or `{args}` (`:118-132`); other brace text such as
-  `{User}` stays literal (`:74-88`). The raw renderer's unknown-token literal
-  fallback is not permission to bypass validation. `{args}` is
-  [accepted for M2, conditionally](custom-command-args-spec.md) but not built. Arguments do not authorize new
+- `{user}`, `{username}`, `{server}`, `{channel}` and `{args}` render, in one
+  pass (`custom_commands.rs:19,144-170`). Validation rejects unknown
+  lowercase-alpha tokens such as `{guild}` (`:118-132`); other brace text such
+  as `{User}` stays literal (`:74-88`). The raw renderer's unknown-token
+  literal fallback is not permission to bypass validation. `{args}` echoes the
+  invocation text literally under the [conditional M2
+  contract](custom-command-args-spec.md): core render plus the 500-unit
+  argument bound are built, and run-path capture follows in the same build.
+  Arguments do not authorize new
   evaluation. No HTML, script, SQL, include, network, or nested substitution.
 
 Pending work is not a prerequisite claimed delivered: clone is open PR
