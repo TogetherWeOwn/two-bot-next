@@ -8,11 +8,11 @@ input, the published `arguments` option, and the run-path contract cases).
 Shipping reverses the `{args}` refusal in `custom_commands.rs` and in [custom
 responses](dashboard-custom-responses-spec.md), changed together in slice 1.
 Each build re-checked this spec's `file:line` seams on current `main` first. This
-acceptance is the owner intent review the original proposal waits for; its own
-technical gates, test matrix and kill rule still apply before any build PR
-merges. Original proposal: written 2026-10-24. No runtime, command, test,
-migration, permission or configuration change is included. Merging this document
-does not enable `{args}` or authorize build work. This file is the repository
+acceptance was the owner intent review the original proposal waited for; its
+technical gates, test matrix and kill rule applied before either build PR
+merged. Original proposal: written 2026-10-24, when no runtime, command, test,
+migration, permission or configuration change was included — merging the
+proposal enabled no `{args}` and authorized no build work. This file is the repository
 source of truth; card documents bind its commit and SHA-256 rather than
 maintaining a second editable contract.
 

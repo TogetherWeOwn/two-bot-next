@@ -146,7 +146,7 @@ remaining gateway/accepted-prefix work:
    `view:template` shows the saved template as stored; `view:preview` renders
    it with the invoking member/channel and explicit bounded sample arguments
    (`arguments`, at most 500 UTF-16 units — the five-variable language renders
-   them empty until run-path capture lands in the next slice). Untrusted text is Markdown-escaped, views that cannot
+   them as the `{args}` input). Untrusted text is Markdown-escaped, views that cannot
    fit carry an explicit truncation marker, and invalid saved templates refuse
    with a `/command name:<name> template:` correction. Inspection never sends
    to the channel, republishes the registry, touches cooldowns/claims, mutates
