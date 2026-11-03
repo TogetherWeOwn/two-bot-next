@@ -2335,9 +2335,11 @@ failure logs `bot_avatar_sync_disarmed` with a fixed reason and boots normally
 without the switch. The Rust fence independently requires `TWO_DEPLOY_ENV`
 exactly `"staging"` and the switch exactly `"1"`, so production refuses it.
 
-The armed SDK startup is limited to one attempt, the avatar operation has a
-15-second total deadline, and the Discord PATCH is never automatically
-replayed, including on HTTP 429. Discord rate-limits avatar changes: run the
+The SDK keeps its normal acquisition and port-readiness budgets. Only its
+first start-loop iteration receives the armed environment; any internal
+restart uses an unarmed environment. The avatar operation has a 15-second
+total deadline, and the Discord PATCH is never automatically replayed,
+including on HTTP 429. Discord rate-limits avatar changes: run the
 dispatch once, then leave the input off. The switch is not a drill flag and
 does not mark the run promotion-unclean — the served bytes are identical.
 

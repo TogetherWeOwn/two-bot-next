@@ -2872,6 +2872,27 @@ test("class defaults never carry the avatar switch, even for staging with the sw
 });
 
 for (const [name, run] of Object.entries(AVATAR_ENTRIES)) {
+  test(`avatar one-shot ${name}: transient acquisition failure keeps the normal SDK budget`, async (t) => {
+    const h = await harness(t, AVATAR_WORKER_ENV, freshValues());
+    const getTcpPort = h.runtime.getTcpPort.bind(h.runtime);
+    let probes = 0;
+    t.mock.method(h.runtime, "getTcpPort", (port: number) => {
+      const real = getTcpPort(port);
+      return {
+        fetch: async (...args: Parameters<typeof real.fetch>) => {
+          if (++probes === 1) throw new Error("synthetic transient acquisition failure");
+          return real.fetch(...args);
+        },
+      };
+    });
+    settledMonitor(t, h);
+    const result = await run(h);
+    if (result instanceof Response) assert.equal(result.status, 200);
+    assert.ok(probes >= 2, "acquisition must survive the first failed probe");
+    assert.deepEqual(h.starts.map((s) => s.env), [ARMED_ENV]);
+    assert.equal(h.values.get(AVATAR_SYNC_CONSUMED_KEY), true);
+  });
+
   test(`avatar one-shot arms exactly once via ${name}, receipt synced before process start`, async (t) => {
     const h = await harness(t, AVATAR_WORKER_ENV, freshValues());
     const events: string[] = [];
@@ -2984,13 +3005,11 @@ for (const [name, run] of Object.entries(AVATAR_ENTRIES)) {
   test(`avatar one-shot ${name}: SDK internal restart loop cannot replay an armed start`, async (t) => {
     const h = await harness(t, AVATAR_WORKER_ENV, freshValues());
     crashFirstHealthCheck(t, h);
-    if (name === "containerFetch") {
-      assert.equal((await h.bot.containerFetch(probeRequest("https://worker.invalid/health"))).status, 503);
-    } else {
-      await assert.rejects(run(h), (error: Error) => error.message.toLowerCase().includes("no container instance"));
-    }
-    assert.equal(h.starts.length, 1, "armed start must be single-flight");
-    assert.deepEqual(h.starts[0]?.env, ARMED_ENV);
+    const result = await run(h);
+    if (result instanceof Response) assert.equal(result.status, 200);
+    assert.equal(h.starts.length, 2, "normal SDK recovery must still start the replacement process");
+    assert.deepEqual(h.starts.map((s) => s.env), [ARMED_ENV, DISARMED_ENV]);
+    assert.equal(h.values.get(AVATAR_SYNC_CONSUMED_KEY), true);
   }, { timeout: 15_000 });
 
   test(`control: unarmed ${name} does replay inside the SDK restart loop`, async (t) => {
@@ -3115,7 +3134,7 @@ for (const method of ["start", "startAndWaitForPorts"] as const) {
   });
 }
 
-test("armed start passes retries 1 to the SDK and keeps caller wait options; unarmed passes them through", async (t) => {
+test("armed and unarmed start preserve caller acquisition wait options", async (t) => {
   const sdk = Object.getPrototypeOf(TwoBotContainer.prototype) as { start: (...args: unknown[]) => Promise<void> };
   const signal = new AbortController().signal;
   for (const armed of [true, false]) {
@@ -3123,13 +3142,12 @@ test("armed start passes retries 1 to the SDK and keeps caller wait options; una
     const spy = t.mock.method(sdk, "start");
     await h.bot.start(undefined, { signal, waitInterval: 50 });
     const [, wait] = spy.mock.calls[0]!.arguments as [unknown, Record<string, unknown>];
-    if (armed) assert.deepEqual(wait, { signal, waitInterval: 50, portToCheck: 8080, retries: 1 });
-    else assert.deepEqual(wait, { signal, waitInterval: 50 });
+    assert.deepEqual(wait, { signal, waitInterval: 50 });
     spy.mock.restore();
   }
 });
 
-test("armed startAndWaitForPorts uses 300ms get timeout and interval so the SDK computes one try", async (t) => {
+test("armed and unarmed startAndWaitForPorts preserve caller acquisition and readiness budgets", async (t) => {
   const sdk = Object.getPrototypeOf(TwoBotContainer.prototype) as { startAndWaitForPorts: (...args: unknown[]) => Promise<void> };
   const abort = new AbortController().signal;
   for (const armed of [true, false]) {
@@ -3138,11 +3156,7 @@ test("armed startAndWaitForPorts uses 300ms get timeout and interval so the SDK 
     await h.bot.startAndWaitForPorts({ ports: 8080, cancellationOptions: { abort, portReadyTimeoutMS: 900 } });
     const [ports, wait] = spy.mock.calls[0]!.arguments as [unknown, Record<string, unknown>];
     assert.equal(ports, 8080);
-    if (armed) {
-      assert.deepEqual(wait, { abort, portReadyTimeoutMS: 900, waitInterval: 300, instanceGetTimeoutMS: 300 });
-    } else {
-      assert.deepEqual(wait, { abort, portReadyTimeoutMS: 900 });
-    }
+    assert.deepEqual(wait, { abort, portReadyTimeoutMS: 900 });
     spy.mock.restore();
   }
 });

@@ -1413,18 +1413,27 @@ export class TwoBotContainer extends Container<Env> {
       console.warn(JSON.stringify({ event: "bot_avatar_sync_disarmed", reason: "storage_unavailable" }));
       return disarmed;
     }
-    envVars[AVATAR_SYNC_VAR] = "1";
-    return disarmed;
+    // SDK 0.3.7 reads envVars once per doStartContainer polling iteration,
+    // including iterations that restart a failed process. Spend the armed
+    // environment on its first read; later iterations retain normal startup
+    // budgets but can only start unarmed. Do not read/spread this result before
+    // passing it to the SDK. Real-SDK tests pin this boundary.
+    let first = true;
+    return {
+      ...disarmed,
+      get envVars() {
+        if (!first) return envVars;
+        first = false;
+        return { ...envVars, [AVATAR_SYNC_VAR]: "1" };
+      },
+    };
   }
 
   override async start(...args: Parameters<Container<Env>["start"]>): Promise<void> {
     return this.owned(async () => {
       const [options, wait] = args;
       const startOptions = await this.avatarStartOptions(options);
-      // SDK 0.3.7 can restart inside its polling loop. An armed call must have
-      // only one flight; subsequent calls go through durable admission again.
-      return super.start(startOptions, startOptions.envVars?.[AVATAR_SYNC_VAR] === "1"
-        ? { ...wait, portToCheck: wait?.portToCheck ?? this.defaultPort, retries: 1 } : wait);
+      return super.start(startOptions, wait);
     });
   }
 
@@ -1444,9 +1453,7 @@ export class TwoBotContainer extends Container<Env> {
         if (eventsubReceiverForwarded(this.env)) extra.push(EVENTSUB_RECEIVER_PORT);
         checked = [...new Set(extra)];
       }
-      // ceil(instanceGetTimeoutMS / waitInterval) == 1 prevents SDK replay.
-      return super.startAndWaitForPorts(checked, startOptions.envVars?.[AVATAR_SYNC_VAR] === "1"
-        ? { ...wait, waitInterval: 300, instanceGetTimeoutMS: 300 } : wait, startOptions);
+      return super.startAndWaitForPorts(checked, wait, startOptions);
     });
   }
 
