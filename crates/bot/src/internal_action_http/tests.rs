@@ -2618,11 +2618,51 @@ async fn voice_move_member_bucket_holds_six_moves_per_five_minutes() {
 use two_bot_core::voice_permissions::{PERM_CONNECT, PERM_MOVE_MEMBERS, PERM_VIEW_CHANNEL};
 
 const VOICE_MOVE_BOT_ID: &str = "777777777777777777";
-const VOICE_MOVE_MEMBER_ID: &str = "41";
-const VOICE_MOVE_SOURCE_ID: &str = "31";
-const VOICE_MOVE_TARGET_ID: &str = "32";
-const VOICE_MOVE_ROLE_ID: &str = "20";
+/// Shape-valid low-entropy fixtures: the receiver's snowflake gate needs
+/// 17–20 digits, and the secret scanner flags high-entropy digit runs, so
+/// the move ids stay in the `1000000000000000xx` family like the event ids
+/// above. The shared snapshot seeder's single-digit rooms cannot be reused.
+const VOICE_MOVE_MEMBER_ID: &str = "100000000000000041";
+const VOICE_MOVE_SECOND_ID: &str = "100000000000000042";
+const VOICE_MOVE_SOURCE_ID: &str = "100000000000000031";
+const VOICE_MOVE_TARGET_ID: &str = "100000000000000032";
+const VOICE_MOVE_ROLE_ID: &str = "100000000000000020";
 const VOICE_MOVE_OWNER_ID: &str = "123456789012345678";
+
+/// Gateway cache for the voice-move executor tests: the moving member sits in
+/// the source room and a second member holds the target room (so a limit of
+/// one reads full). The shared snapshot seeder's single-digit ids fail the
+/// receiver's snowflake shape gate, so this guild uses the shape-valid move
+/// fixtures above; no AFK room, so neither room reads as gone.
+fn seeded_voice_move_cache() -> Arc<DefaultInMemoryCache> {
+    let cache = voice_snapshot::new_shared_cache();
+    let mut guild: Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/voice_guild.json"))
+            .expect("voice guild fixture parses");
+    guild["id"] = Value::String(staging_guild().to_owned());
+    guild["afk_channel_id"] = Value::Null;
+    guild["channels"] = serde_json::json!([
+        voice_channel(VOICE_MOVE_SOURCE_ID, 2, "lobby", 0, 0),
+        voice_channel(VOICE_MOVE_TARGET_ID, 2, "alpha", 1, 0),
+    ]);
+    guild["members"] = serde_json::json!([
+        voice_member(VOICE_MOVE_MEMBER_ID, false),
+        voice_member(VOICE_MOVE_SECOND_ID, false),
+    ]);
+    guild["voice_states"] = serde_json::json!([
+        {"guild_id": staging_guild(), "channel_id": VOICE_MOVE_SOURCE_ID,
+         "user_id": VOICE_MOVE_MEMBER_ID,
+         "session_id": "move-s1", "deaf": false, "mute": false,
+         "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false},
+        {"guild_id": staging_guild(), "channel_id": VOICE_MOVE_TARGET_ID,
+         "user_id": VOICE_MOVE_SECOND_ID,
+         "session_id": "move-s2", "deaf": false, "mute": false,
+         "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false},
+    ]);
+    let guild: Guild = serde_json::from_value(guild).expect("patched guild deserializes");
+    cache.update(&Event::GuildCreate(Box::new(GuildCreate::Available(guild))));
+    cache
+}
 
 /// Loopback Discord double for the production voice-move executor: the guild
 /// snapshot, the bot identity, the member snapshots, the two room snapshots
@@ -2814,12 +2854,12 @@ fn voice_move_body(member: &str, channel: &str) -> Map<String, Value> {
 
 #[tokio::test]
 async fn voice_move_executor_moves_through_the_live_fact_set() {
-    // Member 41 sits in lobby 31 in the seeded cache; room 32 is open, so the
-    // production gather/decide/PATCH answers `moved` from 31.
+    // The member sits in the source room in the seeded cache; the target is
+    // open, so the production gather/decide/PATCH answers `moved` from source.
     let mock = MockVoiceApi::start(MockVoiceApiConfig::default()).await;
     let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
     let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
-    let receipt = voice_move_executor(&mock, seeded_voice_cache())
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache())
         .execute_move(&request)
         .await
         .expect("open move succeeds");
@@ -2841,7 +2881,7 @@ async fn voice_move_executor_gateway_not_ready_is_unavailable() {
             .unwrap();
     let executor = VoiceMoveExecutor::new(
         discord,
-        seeded_voice_cache(),
+        seeded_voice_move_cache(),
         Arc::new(tokio::sync::RwLock::new(
             crate::gateway::GatewayState::Armed,
         )),
@@ -2866,7 +2906,7 @@ async fn voice_move_executor_missing_target_is_room_gone() {
     .await;
     let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
     let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
-    let receipt = voice_move_executor(&mock, seeded_voice_cache())
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache())
         .execute_move(&request)
         .await
         .expect("gone target answers");
@@ -2876,7 +2916,7 @@ async fn voice_move_executor_missing_target_is_room_gone() {
 
 #[tokio::test]
 async fn voice_move_executor_disconnected_member_is_not_connected() {
-    let cache = seeded_voice_cache();
+    let cache = seeded_voice_move_cache();
     cache.update(&Event::VoiceStateUpdate(Box::new(voice_state(
         VOICE_MOVE_MEMBER_ID,
         None,
@@ -2894,8 +2934,8 @@ async fn voice_move_executor_disconnected_member_is_not_connected() {
 
 #[tokio::test]
 async fn voice_move_executor_full_room_refuses_before_patch() {
-    // Room 32 holds member 42 in the seeded cache; a limit of one makes it
-    // full, so the decision refuses before the PATCH.
+    // The target holds the second member in the seeded cache; a limit of one
+    // makes it full, so the decision refuses before the PATCH.
     let mock = MockVoiceApi::start(MockVoiceApiConfig {
         target_limit: 1,
         ..MockVoiceApiConfig::default()
@@ -2903,7 +2943,7 @@ async fn voice_move_executor_full_room_refuses_before_patch() {
     .await;
     let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
     let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
-    let receipt = voice_move_executor(&mock, seeded_voice_cache())
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache())
         .execute_move(&request)
         .await
         .expect("full room answers");
@@ -2920,7 +2960,7 @@ async fn voice_move_executor_denied_patch_is_bot_not_permitted() {
     .await;
     let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
     let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
-    let receipt = voice_move_executor(&mock, seeded_voice_cache())
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache())
         .execute_move(&request)
         .await
         .expect("denied PATCH answers");
@@ -2938,7 +2978,7 @@ async fn voice_move_executor_limited_patch_carries_discord_wait() {
     .await;
     let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
     let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
-    let receipt = voice_move_executor(&mock, seeded_voice_cache())
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache())
         .execute_move(&request)
         .await
         .expect("limited PATCH answers");
@@ -2959,7 +2999,7 @@ async fn voice_move_executor_stale_patch_regathers_to_bot_not_permitted() {
     .await;
     let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
     let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
-    let receipt = voice_move_executor(&mock, seeded_voice_cache())
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache())
         .execute_move(&request)
         .await
         .expect("stale PATCH answers");

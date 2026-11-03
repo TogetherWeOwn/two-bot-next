@@ -2379,12 +2379,16 @@ async fn execute_voice_move(
 /// plus `from_channel_id` on `moved`, in the same insertion order as
 /// [`member_success`] (`ok`, `result`, `request_id`).
 fn voice_move_success(from_channel_id: &str, id: &str) -> Response {
-    Json(json!({
+    let mut response = Json(json!({
         "ok": true,
         "result": {"outcome": "moved", "from_channel_id": from_channel_id},
         "request_id": id,
     }))
-    .into_response()
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Membership family: `role.assign` resolves a caller-supplied key through the
@@ -4071,10 +4075,14 @@ fn terminal_response(
 /// Insertion order (`ok`, `result`, `request_id`) matches the stored-member
 /// `success_body` wire contract.
 fn member_success(outcome: &str, id: &str) -> Response {
-    Json(json!({
+    let mut response = Json(json!({
         "ok": true, "result": {"outcome": outcome}, "request_id": id,
     }))
-    .into_response()
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// A failed write never releases the claim or resends; this only surfaces the gap.

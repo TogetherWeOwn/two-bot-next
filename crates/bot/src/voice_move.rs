@@ -381,7 +381,16 @@ mod tests {
     #[test]
     fn private_room_member_overwrite_restores_connect() {
         let mut facts = base_facts();
+        // The bot is allow-listed like in a real private room: the @everyone
+        // deny strips its base Connect, so its own member overwrite carries
+        // the grant back. First so the sanity pop below drops the member's.
         facts.target.overwrites = vec![
+            ChannelOverride {
+                id: BOT,
+                kind: OverrideKind::Member,
+                allow: PERM_CONNECT,
+                deny: 0,
+            },
             ChannelOverride {
                 id: GUILD,
                 kind: OverrideKind::Role,
@@ -426,6 +435,13 @@ mod tests {
                 kind: OverrideKind::Role,
                 allow: 0,
                 deny: PERM_CONNECT,
+            },
+            // The bot's own allow-listing rides the member pass like above.
+            ChannelOverride {
+                id: BOT,
+                kind: OverrideKind::Member,
+                allow: PERM_CONNECT,
+                deny: 0,
             },
         ];
         assert_eq!(
@@ -497,12 +513,22 @@ mod tests {
         let mut facts = base_facts();
         facts.member_id = 1; // guild owner
         facts.member_roles = Vec::new();
-        facts.target.overwrites = vec![ChannelOverride {
-            id: GUILD,
-            kind: OverrideKind::Role,
-            allow: 0,
-            deny: PERM_CONNECT,
-        }];
+        // The owner bypasses the member check, but the bot still needs its
+        // own Connect grant on the denied target to earn the move.
+        facts.target.overwrites = vec![
+            ChannelOverride {
+                id: GUILD,
+                kind: OverrideKind::Role,
+                allow: 0,
+                deny: PERM_CONNECT,
+            },
+            ChannelOverride {
+                id: BOT,
+                kind: OverrideKind::Member,
+                allow: PERM_CONNECT,
+                deny: 0,
+            },
+        ];
         assert_eq!(
             decide(&facts),
             VoiceMoveDecision::Proceed {

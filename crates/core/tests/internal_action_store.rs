@@ -2012,7 +2012,9 @@ async fn voice_move_records_completed_intent_and_terminal_audit() {
             .await
             .unwrap();
         assert!(intent_id > 0);
-        let row: (
+        // Named alias: the fifteen-column row trips `type_complexity` as an
+        // inline annotation.
+        type VoiceMoveTerminalRow = (
             String,
             String,
             String,
@@ -2028,7 +2030,8 @@ async fn voice_move_records_completed_intent_and_terminal_audit() {
             Option<String>,
             String,
             String,
-        ) = sqlx::query_as(
+        );
+        let row: VoiceMoveTerminalRow = sqlx::query_as(
             "SELECT state, action, caller_hash, key_hash, guild_id, actor_id, target_id, \
              response_code, http_status, resource_id, affected, outcome, \
              from_channel_id, to_channel_id, request_id \
