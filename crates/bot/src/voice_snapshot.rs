@@ -123,7 +123,7 @@ impl VoiceOccupancyClock {
         channel_id: Option<Snowflake>,
         occurred_at_ms: Option<u64>,
     ) {
-        let mut joins = self.joins.expect("voice occupancy clock");
+        let mut joins = self.joins.lock().expect("voice occupancy clock");
         match (channel_id, occurred_at_ms) {
             (Some(channel), Some(at_ms)) => {
                 joins.insert((guild_id, member_id), (channel, at_ms));
@@ -139,7 +139,7 @@ impl VoiceOccupancyClock {
     /// lock across reconcile and stamp so a concurrent frame cannot slip an
     /// entry between the two.
     fn stamp_rooms(&self, guild_id: Snowflake, rooms: &mut [RoomDraft]) {
-        let mut joins = self.joins.expect("voice occupancy clock");
+        let mut joins = self.joins.lock().expect("voice occupancy clock");
         let mut present: HashSet<Snowflake> = HashSet::new();
         for room in rooms.iter() {
             present.extend(room.member_ids.iter().copied());
@@ -608,7 +608,7 @@ mod tests {
             rooms[0].occupied_since.as_deref(),
             Some("2026-11-03T10:00:00Z")
         );
-        assert_eq!(clock.joins.expect("clock lock").len(), 1);
+        assert_eq!(clock.joins.lock().expect("clock lock").len(), 1);
     }
 
     #[test]

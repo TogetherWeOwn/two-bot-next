@@ -759,7 +759,7 @@ async fn run(cli_args: &[String]) {
                     // `rooms[].occupied_since`. Always on and ungated like the
                     // cache writes themselves — tracking is memory-only, and
                     // unwitnessed occupancy still reads `null`.
-                    pipeline.set_voice_transition_observer(Arc::clone(&voice_clock));
+                    pipeline.set_voice_transition_observer(voice_clock.clone());
                     // Community voice + message capture: arm the Postgres
                     // facts sink only when the scorecard job is enabled, so a
                     // staging-gated rollout captures exactly while it scores.

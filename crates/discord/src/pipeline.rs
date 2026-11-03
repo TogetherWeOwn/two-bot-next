@@ -1397,7 +1397,10 @@ mod tests {
 
     impl VoiceTransitionObserver for RecordingVoiceObserver {
         fn observe_voice_transition(&self, transition: VoiceTransitionObservation) {
-            self.transitions.expect("observer lock").push(transition);
+            self.transitions
+                .lock()
+                .expect("observer lock")
+                .push(transition);
         }
     }
 
@@ -1412,14 +1415,14 @@ mod tests {
         let observer = Arc::new(RecordingVoiceObserver {
             transitions: Mutex::new(Vec::new()),
         });
-        p.set_voice_transition_observer(Arc::clone(&observer));
+        p.set_voice_transition_observer(observer.clone());
         p.handle_at(&lifecycle_voice(GUILD, 1, 10), "2026-10-19T12:00:00.000Z");
         // A mute frame on the same channel is not a session boundary: the
         // cache updates, but the observer hears nothing.
         p.handle_at(&lifecycle_mute(GUILD, 1, 10), "2026-10-19T12:00:05.000Z");
         p.handle_at(&lifecycle_voice(GUILD, 1, 11), "2026-10-19T12:00:10.000Z");
         p.handle_at(&lifecycle_leave(GUILD, 1), "2026-10-19T12:00:20.000Z");
-        let transitions = observer.transitions.expect("observer lock");
+        let transitions = observer.transitions.lock().expect("observer lock");
         assert_eq!(
             *transitions,
             vec![

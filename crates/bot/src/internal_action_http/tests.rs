@@ -2287,9 +2287,9 @@ async fn voice_snapshot_unwitnessed_rooms_read_null_without_event_keys() {
 
 #[tokio::test]
 async fn voice_snapshot_pipeline_witnessed_join_stamps_occupied_since() {
-    // The gateway witnessed member 46 join the lobby after boot (a member the
-    // seed never listed), so the lobby proves a start while the empty rooms
-    // stay null. Same cache handle feeds the pipeline and the read.
+    // The gateway witnessed member 46 join the empty quiet room after boot
+    // (a member the seed never listed), so that room proves a start. The
+    // preoccupied lobby stays unknown. Same cache feeds pipeline and read.
     use two_bot_discord::{NoInvites, OrderedLevelingPipeline, PipelineSnapshots};
 
     let Some(db) = database().await else { return };
@@ -2304,7 +2304,7 @@ async fn voice_snapshot_pipeline_witnessed_join_stamps_occupied_since() {
         PipelineSnapshots::new(),
         Arc::clone(&cache),
     );
-    pipeline.set_voice_transition_observer(Arc::clone(&clock));
+    pipeline.set_voice_transition_observer(clock.clone());
     pipeline
         .handle(&seeded_guild_event())
         .await
@@ -2312,7 +2312,7 @@ async fn voice_snapshot_pipeline_witnessed_join_stamps_occupied_since() {
     pipeline
         .handle(&Event::VoiceStateUpdate(Box::new(voice_state(
             "46",
-            Some("31"),
+            Some("35"),
         ))))
         .await
         .expect("pipeline observes the witnessed join");
@@ -2325,15 +2325,18 @@ async fn voice_snapshot_pipeline_witnessed_join_stamps_occupied_since() {
     assert_eq!(status, StatusCode::OK);
     let rooms = body["result"]["rooms"].as_array().expect("rooms array");
     let lobby = &rooms[0];
-    assert_eq!(lobby["member_ids"], serde_json::json!(["41", "46"]));
-    let since = lobby["occupied_since"].as_str().expect("witnessed start");
+    assert_eq!(lobby["member_ids"], serde_json::json!(["41"]));
+    assert_eq!(lobby["occupied_since"], serde_json::Value::Null);
+    let quiet = &rooms[4];
+    assert_eq!(quiet["member_ids"], serde_json::json!(["46"]));
+    let since = quiet["occupied_since"].as_str().expect("witnessed start");
     assert!(
         since.len() == 20 && since.ends_with('Z') && since.contains('T'),
         "whole-second Zulu shape: {since}"
     );
     assert_eq!(rooms[1]["occupied_since"], serde_json::Value::Null);
-    assert_eq!(rooms[4]["member_ids"], serde_json::json!([]));
-    assert_eq!(rooms[4]["occupied_since"], serde_json::Value::Null);
+    assert_eq!(rooms[2]["member_ids"], serde_json::json!([]));
+    assert_eq!(rooms[2]["occupied_since"], serde_json::Value::Null);
     db.close().await.unwrap();
 }
 
