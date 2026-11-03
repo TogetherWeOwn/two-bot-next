@@ -254,6 +254,13 @@ mod tests {
             limiter.check_and_admit("actor-new", GUILD, 1, 5 * HOUR_MS),
             PreviewRateDecision::RateLimited
         );
+        // A returning actor takes the existing-bucket branch: its own hour
+        // window has rolled off and its day count (30) is under cap, so only
+        // the shared guild-day budget can refuse it.
+        assert_eq!(
+            limiter.check_and_admit("actor-0", GUILD, 999, 5 * HOUR_MS),
+            PreviewRateDecision::RateLimited
+        );
     }
 
     #[test]
