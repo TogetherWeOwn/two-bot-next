@@ -61,18 +61,19 @@ pub struct PreviewRequest {
     pub interaction_id: u64,
 }
 
-/// Modern `channel` first, legacy `channel_id` fallback — the same
-/// precedence as `channel_moderation::invoking_channel_id`, duplicated so
-/// this module compiles on every feature combination (that helper lives in
-/// the `db`-gated moderation module).
+/// Modern `channel` only, so this module compiles on every feature
+/// combination (the shared helper lives in the `db`-gated moderation
+/// module). `/automod-preview` is a new command, and Discord always sends
+/// `channel` for it — the legacy `channel_id` field is deprecated in the
+/// Discord API, so there is no fallback to it here. A missing `channel`
+/// yields `None`, and the caller answers unavailable without touching
+/// decode, the limiter, or the database.
 #[cfg(not(feature = "db"))]
-#[allow(deprecated)]
 fn invoking_channel_id(interaction: &Interaction) -> Option<String> {
     interaction
         .channel
         .as_ref()
         .map(|channel| channel.id.to_string())
-        .or_else(|| interaction.channel_id.map(|id| id.to_string()))
 }
 
 impl PreviewRequest {
