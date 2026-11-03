@@ -2373,11 +2373,15 @@ pub async fn build_persistent_pipeline(
     guild_id: Snowflake,
     token: String,
     leveling: Option<LevelingRuntime>,
+    cache: Arc<twilight_cache_inmemory::DefaultInMemoryCache>,
 ) -> Result<GatewayPipeline<HttpInvites>, sqlx::Error> {
     tokio::time::timeout(CHECKPOINT_IO_MAX, async {
         let buffer = GatewayFunnelBuffer::from_milestones(store.milestones().await?);
         buffer.seed_snapshots(guild_id, store.invite_snapshots().await?);
-        Ok(OrderedLevelingPipeline::with_snapshots(
+        // The shared gateway cache: the same handle the internal-actions
+        // receiver projects `voice.snapshot` from, so the read sees the live
+        // voice states this pipeline feeds.
+        Ok(OrderedLevelingPipeline::with_shared_cache(
             buffer.clone(),
             leveling,
             HttpInvites {
@@ -2385,6 +2389,7 @@ pub async fn build_persistent_pipeline(
                 handle: tokio::runtime::Handle::current(),
             },
             buffer,
+            cache,
         ))
     })
     .await

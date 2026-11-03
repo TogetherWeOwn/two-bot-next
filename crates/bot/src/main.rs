@@ -157,6 +157,7 @@ mod tracing_capture;
 // file is not loaded as two modules (clippy::duplicate_mod).
 #[cfg(test)]
 mod tuning_test_support;
+mod voice_snapshot;
 mod website_jobs;
 #[cfg(test)]
 mod website_roster_cap_acceptance_tests;
@@ -415,6 +416,14 @@ async fn run(cli_args: &[String]) {
         }
     }
 
+    // Shared gateway voice-state cache: the receiver binds against it below
+    // and the gateway pipeline writes through it, so `voice.snapshot` reads
+    // live occupancy. Discord exposes no REST voice-state list; a receiver
+    // split from these writes answers `discord_unavailable`, never invented
+    // data. The receiver also binds the supervisor's gateway state below, so
+    // a warm cache while the gateway is disconnected (not `Connected`)
+    // refuses instead of serving stale occupancy with a fresh timestamp.
+    let voice_cache = voice_snapshot::new_shared_cache();
     // Capture the authoritative pool before the gateway's async move owns it.
     // Bind privately before starting tasks; enabled failures never fall back.
     let receiver = match receiver_config {
@@ -427,15 +436,21 @@ async fn run(cli_args: &[String]) {
                 .pool()
                 .clone();
             Some(
-                internal_action_http::bind(receiver_config, pool, token)
-                    .await
-                    .unwrap_or_else(|_| {
-                        tracing::error!(
-                            error_class = "receiver_bind_failed",
-                            "internal-action startup refused"
-                        );
-                        std::process::exit(1);
-                    }),
+                internal_action_http::bind(
+                    receiver_config,
+                    pool,
+                    token,
+                    Arc::clone(&voice_cache),
+                    Arc::clone(&gateway),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::error!(
+                        error_class = "receiver_bind_failed",
+                        "internal-action startup refused"
+                    );
+                    std::process::exit(1);
+                }),
             )
         }
         None => None,
@@ -577,6 +592,7 @@ async fn run(cli_args: &[String]) {
         let failure_slot = state.failure.clone();
         let state = Arc::clone(&gateway);
         let slot = Arc::clone(&automod_slot);
+        let voice_cache = Arc::clone(&voice_cache);
         let self_roles = self_roles.clone();
         let member = member.clone();
         let linger_stop = stopping.clone();
@@ -717,15 +733,21 @@ async fn run(cli_args: &[String]) {
                     };
                     let leveling = runtime.as_ref().map(|runtime| runtime.leveling());
                     let pipeline = Arc::new(
-                        build_persistent_pipeline(&store, guild_id, token.clone(), leveling)
-                            .await
-                            .map_err(|error| {
-                                step_failure(
-                                    FailureClass::MilestonesLoadFailed,
-                                    "milestones_load",
-                                    error,
-                                )
-                            })?,
+                        build_persistent_pipeline(
+                            &store,
+                            guild_id,
+                            token.clone(),
+                            leveling,
+                            voice_cache,
+                        )
+                        .await
+                        .map_err(|error| {
+                            step_failure(
+                                FailureClass::MilestonesLoadFailed,
+                                "milestones_load",
+                                error,
+                            )
+                        })?,
                     );
                     // Community voice + message capture: arm the Postgres
                     // facts sink only when the scorecard job is enabled, so a

@@ -27,7 +27,7 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
   two_bot_gateway_checkpoint_failures_total: { stage: ["pre_commit", "commit"] },
   two_bot_dispatch_drops_total: { lane: ["messages", "interactions", "registry", "privileged", "busy", "reactions"] },
   two_bot_internal_actions_total: {
-    family: ["announcement", "event", "settings", "moderation", "membership", "other"],
+    family: ["announcement", "event", "settings", "moderation", "membership", "voice", "other"],
     outcome: ["executed", "auth_failure", "unknown_key", "clock_skew", "nonce_replay", "rate_limit", "unknown_action", "action_disabled", "malformed_body", "conflict", "upstream", "internal"],
   },
   // Gateway transport and job-run family. Always emitted on the same render
@@ -141,8 +141,27 @@ function combinations(axes: Record<string, readonly string[]>): Record<string, s
   return rows;
 }
 
+// The `voice` internal-actions family postdates older containers: a
+// rolled-back container emits the other six families but no `voice` rows.
+// Requiring them would turn every otherwise-valid scrape into a failure and
+// starve all alert rules until the newer container returns, so the `voice`
+// rows validate when present but are never required. Every other required
+// combination keeps its fail-closed shape: exactly one row per combination.
+// A partially present `voice` family is still a failure (see below): a
+// missing outcome row would undercount refusals and clear a rising streak,
+// so the family is all-or-nothing — absent entirely, or complete.
 const REQUIRED_INPUTS = new Set(Object.entries(ALERT_INPUT_LABELS).flatMap(([name, axes]) =>
-  combinations(axes).map((labels) => identity(name, labels))));
+  combinations(axes)
+    .filter((labels) => !(name === "two_bot_internal_actions_total" && labels["family"] === "voice"))
+    .map((labels) => identity(name, labels))));
+
+// Every `voice`-family combination. When a scrape carries any of these rows
+// it must carry all of them; when it carries none the older container is
+// accepted as-is.
+const VOICE_INTERNAL_ACTIONS_INPUTS = new Set(
+  combinations(ALERT_INPUT_LABELS["two_bot_internal_actions_total"]!)
+    .filter((labels) => labels["family"] === "voice")
+    .map((labels) => identity("two_bot_internal_actions_total", labels)));
 
 // Prometheus numbers, not JavaScript's empty/hexadecimal/Infinity coercions.
 const NUMBER = "(?:[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?|NaN|[+-]?Inf)";
@@ -198,5 +217,7 @@ export function parseAlertScrape(text: string): Sample[] | null {
   }
   const incarnation = samples.filter((sample) => sample.name === "two_bot_process_incarnation");
   if (incarnation.length > 0 && processIncarnation(incarnation) === undefined) return null;
-  return [...REQUIRED_INPUTS].every((key) => seen.has(key)) ? samples : null;
+  const voiceSeen = [...VOICE_INTERNAL_ACTIONS_INPUTS].some((key) => seen.has(key));
+  const voiceComplete = !voiceSeen || [...VOICE_INTERNAL_ACTIONS_INPUTS].every((key) => seen.has(key));
+  return [...REQUIRED_INPUTS].every((key) => seen.has(key)) && voiceComplete ? samples : null;
 }

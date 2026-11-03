@@ -18,7 +18,7 @@ order this document requires.
 settings verbs without HTTP. Settings run via the settings store in the receiver,
 never via this transport. Every other action is refused without HTTP, including
 other core phase-1 defaults. The receiver must intersect its enabled/authorized
-actions with this capability; the core's 19-verb catalogue is not executor parity.
+actions with this capability; the core's 20-verb catalogue is not executor parity.
 
 Pass the body `authorize` returned (or `parse_body_object` output); never
 re-parse the signed bytes with a lenient parser. That parser refuses a JSON
