@@ -2918,10 +2918,13 @@ mod tests {
         );
         // Leave room for other counters to grow without relaxing any consumer's
         // 64 KiB cap. This fixture saturates EventSub, pool and guard samples,
-        // not every process metric simultaneously.
+        // not every process metric simultaneously. The 13th internal-action
+        // outcome (`not_found`, one series per family) deliberately spent
+        // about half the old 1 KiB headroom; the outcome vocabulary stays
+        // fixed, so the next outcome addition revisits this pin again.
         assert!(
-            full.len() < 65_536 - 1_024,
-            "{} bytes leaves less than 1 KiB of scrape headroom",
+            full.len() < 65_536 - 512,
+            "{} bytes leaves less than 512 B of scrape headroom",
             full.len()
         );
         let series = |text: &str| -> Vec<String> {

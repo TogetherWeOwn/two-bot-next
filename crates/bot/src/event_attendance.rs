@@ -50,7 +50,9 @@ const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
 /// library (blanket impl for every `RoomPersistence` in `voice_rooms.rs`) and
 /// the binary (which never compiles `voice_rooms` and only uses the pure
 /// projection half). Bounds match the `RoomPersistence` attendance defaults.
-pub(crate) trait AttendanceStore: Send + Sync {
+/// Public: [`record_transition`] is public, and the binary-only read half
+/// needs the rest visible on the shared module.
+pub trait AttendanceStore: Send + Sync {
     type Error: std::fmt::Display;
     fn attendance_windows(
         &self,
@@ -61,6 +63,7 @@ pub(crate) trait AttendanceStore: Send + Sync {
         guild: Snowflake,
         member: Snowflake,
     ) -> impl Future<Output = Result<Vec<AttendanceSession>, Self::Error>> + Send;
+    #[allow(clippy::too_many_arguments)]
     fn insert_attendance_session(
         &self,
         guild: Snowflake,
@@ -102,16 +105,18 @@ pub(crate) trait AttendanceStore: Send + Sync {
 /// Recording grace on each side of `[starts_at, ends_at]`, in millis.
 pub(crate) const ATTENDANCE_GRACE_MS: i64 = 15 * 60 * 1_000;
 /// Minutes of in-window voice that mark an attendee. Travels in the payload;
-/// members below it stay listed with their minutes.
-pub(crate) const ATTENDANCE_THRESHOLD_MINUTES: i64 = 10;
+/// members below it stay listed with their minutes. Public: the read
+/// projection (used by the binary) sends it on the wire.
+pub const ATTENDANCE_THRESHOLD_MINUTES: i64 = 10;
 /// Relayed-answer budget for the serialized `result` object, mirroring
 /// `voice_snapshot`: the Worker refuses bodies over its 64 KiB bound, so the
 /// 512-byte reserve covers the `{"ok","result","request_id"}` envelope.
 const MAX_ATTENDANCE_RESULT_BYTES: usize = 64 * 1024 - 512;
 
-/// One mapped event window, in epoch millis.
+/// One mapped event window, in epoch millis. Public: the read projection
+/// takes it, and the binary builds it from stored windows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AttendanceWindowMs {
+pub struct AttendanceWindowMs {
     pub event_key: String,
     pub starts_ms: i64,
     pub ends_ms: i64,
@@ -506,8 +511,9 @@ pub(crate) fn datetime_of(millis: i64) -> OffsetDateTime {
 // ---------------------------------------------------------------------------
 
 /// One stored session row for the read projection, in epoch millis.
+/// Public: the binary builds these from stored rows for the projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SessionMs {
+pub struct SessionMs {
     pub member_id: Snowflake,
     pub channel_id: Snowflake,
     pub channel_name: String,
@@ -518,8 +524,9 @@ pub(crate) struct SessionMs {
 }
 
 /// Why the attendance read refuses. Both map to existing refusal codes only.
+/// Public: the binary matches on it to pick the refusal code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AttendanceRefusal {
+pub enum AttendanceRefusal {
     /// No mapped window, or a mapped window with no tagged sessions: the
     /// read answers `not_found` (404, not retryable) by construction, which
     /// is also the pre-enable answer since windows only persist after the
@@ -538,8 +545,9 @@ pub(crate) enum AttendanceRefusal {
 /// members stay listed with their minutes; rooms carry the latest name the
 /// logger saw (`name_at_close`) for channels with at least one human
 /// session; still-open rows clamp at `min(now, window close)`; `final` is
-/// true once the window plus grace has passed.
-pub(crate) fn project_attendance(
+/// true once the window plus grace has passed. Public: the binary-only
+/// `event.attendance.read` verb projects through it.
+pub fn project_attendance(
     event_key: &str,
     window: &AttendanceWindowMs,
     sessions: &[SessionMs],

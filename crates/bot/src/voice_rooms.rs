@@ -468,6 +468,7 @@ pub trait RoomPersistence: Send + Sync {
     }
     /// Open one attendance row; returns the new row id. Default no-op for
     /// stores without the attendance tables.
+    #[allow(clippy::too_many_arguments)]
     fn insert_attendance_session(
         &self,
         guild: Snowflake,
@@ -9091,6 +9092,9 @@ where
         )
     }
 
+    // The attendance logger needs the AFK channel and the receive instant
+    // alongside the frame, which pushes this past the default arity lint.
+    #[allow(clippy::too_many_arguments)]
     fn voice_frame_received(
         &self,
         guild: Snowflake,
