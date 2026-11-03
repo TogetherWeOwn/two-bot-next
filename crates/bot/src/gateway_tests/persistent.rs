@@ -131,9 +131,15 @@ async fn persistent_pipeline_hydrates_invites_and_stages_bot_departure_on_restar
         )
         .await
         .unwrap();
-    let pipeline = crate::gateway::build_persistent_pipeline(&db.store, 2222, TOKEN.into(), None)
-        .await
-        .unwrap();
+    let pipeline = crate::gateway::build_persistent_pipeline(
+        &db.store,
+        2222,
+        TOKEN.into(),
+        None,
+        crate::voice_snapshot::new_shared_cache(),
+    )
+    .await
+    .unwrap();
     assert_eq!(pipeline.handlers().store().load(2222)[0].uses, 7);
     assert!(
         pipeline
@@ -173,9 +179,15 @@ async fn persistent_pipeline_hydrates_invites_and_stages_bot_departure_on_restar
         .await
         .unwrap();
     assert!(bot);
-    let restarted = crate::gateway::build_persistent_pipeline(&db.store, 2222, TOKEN.into(), None)
-        .await
-        .unwrap();
+    let restarted = crate::gateway::build_persistent_pipeline(
+        &db.store,
+        2222,
+        TOKEN.into(),
+        None,
+        crate::voice_snapshot::new_shared_cache(),
+    )
+    .await
+    .unwrap();
     assert_eq!(restarted.handlers().store().load(2222)[0].uses, 7);
     db.close().await;
 }

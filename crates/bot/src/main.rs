@@ -148,6 +148,7 @@ mod self_role_runtime;
 mod shutdown;
 #[cfg(test)]
 mod smoke_error_contract_tests;
+mod staging_help_smoke_reconcile;
 #[cfg(test)]
 mod ticket_component_admission_acceptance_tests;
 mod ticket_runtime;
@@ -158,6 +159,7 @@ mod tracing_capture;
 // file is not loaded as two modules (clippy::duplicate_mod).
 #[cfg(test)]
 mod tuning_test_support;
+mod voice_snapshot;
 mod website_jobs;
 #[cfg(test)]
 mod website_roster_cap_acceptance_tests;
@@ -342,9 +344,25 @@ async fn run(cli_args: &[String]) {
         }
     }
 
+    // Staging-only boot reconcile for the /help embed smoke channel: uses
+    // the token the process already holds, runs only when the staging
+    // deployment marker and staging guild both match, and never blocks or
+    // fails boot. Spawned detached so a slow Discord never delays gateway
+    // startup or database init. Needs the token alone, never the database.
+    // The handle is retained so a startup-failure exit below can drain an
+    // in-flight pass within a bounded budget instead of abandoning it; the
+    // happy path never waits on it, and every staging boot retries the pass.
+    let smoke_reconcile = staging_help_smoke_reconcile::maybe_reconcile_on_boot(
+        config
+            .discord_token
+            .as_ref()
+            .map(|secret| secret.expose().clone()),
+        config.guild_id,
+    );
+
     // One-shot staging bot avatar sync (Icon 1): uses the token the process
     // already holds, runs only when the generated staging config armed it,
-    // and never blocks boot. Needs the token alone, never the database.
+    // and a sync failure never prevents boot. Needs no database.
     avatar_sync::maybe_sync_on_boot(
         config
             .discord_token
@@ -367,6 +385,11 @@ async fn run(cli_args: &[String]) {
                 Some(store)
             }
             _ => {
+                // Drain the in-flight smoke reconcile within a bounded
+                // budget so this failed boot never abandons a channel
+                // create or overwrite mid-flight; the supervisor restart
+                // retries the pass on the next healthy boot.
+                staging_help_smoke_reconcile::drain_reconcile_on_failure(smoke_reconcile).await;
                 tracing::error!(
                     startup_phase = "database_init",
                     error_class = "database_connect_failed",
@@ -427,6 +450,14 @@ async fn run(cli_args: &[String]) {
         }
     }
 
+    // Shared gateway voice-state cache: the receiver binds against it below
+    // and the gateway pipeline writes through it, so `voice.snapshot` reads
+    // live occupancy. Discord exposes no REST voice-state list; a receiver
+    // split from these writes answers `discord_unavailable`, never invented
+    // data. The receiver also binds the supervisor's gateway state below, so
+    // a warm cache while the gateway is disconnected (not `Connected`)
+    // refuses instead of serving stale occupancy with a fresh timestamp.
+    let voice_cache = voice_snapshot::new_shared_cache();
     // Capture the authoritative pool before the gateway's async move owns it.
     // Bind privately before starting tasks; enabled failures never fall back.
     let receiver = match receiver_config {
@@ -439,15 +470,21 @@ async fn run(cli_args: &[String]) {
                 .pool()
                 .clone();
             Some(
-                internal_action_http::bind(receiver_config, pool, token)
-                    .await
-                    .unwrap_or_else(|_| {
-                        tracing::error!(
-                            error_class = "receiver_bind_failed",
-                            "internal-action startup refused"
-                        );
-                        std::process::exit(1);
-                    }),
+                internal_action_http::bind(
+                    receiver_config,
+                    pool,
+                    token,
+                    Arc::clone(&voice_cache),
+                    Arc::clone(&gateway),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::error!(
+                        error_class = "receiver_bind_failed",
+                        "internal-action startup refused"
+                    );
+                    std::process::exit(1);
+                }),
             )
         }
         None => None,
@@ -589,6 +626,7 @@ async fn run(cli_args: &[String]) {
         let failure_slot = state.failure.clone();
         let state = Arc::clone(&gateway);
         let slot = Arc::clone(&automod_slot);
+        let voice_cache = Arc::clone(&voice_cache);
         let self_roles = self_roles.clone();
         let member = member.clone();
         let linger_stop = stopping.clone();
@@ -729,15 +767,21 @@ async fn run(cli_args: &[String]) {
                     };
                     let leveling = runtime.as_ref().map(|runtime| runtime.leveling());
                     let pipeline = Arc::new(
-                        build_persistent_pipeline(&store, guild_id, token.clone(), leveling)
-                            .await
-                            .map_err(|error| {
-                                step_failure(
-                                    FailureClass::MilestonesLoadFailed,
-                                    "milestones_load",
-                                    error,
-                                )
-                            })?,
+                        build_persistent_pipeline(
+                            &store,
+                            guild_id,
+                            token.clone(),
+                            leveling,
+                            voice_cache,
+                        )
+                        .await
+                        .map_err(|error| {
+                            step_failure(
+                                FailureClass::MilestonesLoadFailed,
+                                "milestones_load",
+                                error,
+                            )
+                        })?,
                     );
                     // Community voice + message capture: arm the Postgres
                     // facts sink only when the scorecard job is enabled, so a

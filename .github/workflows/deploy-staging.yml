@@ -661,6 +661,21 @@ jobs:
     secrets:
       TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
 
+  # Live /help embed smoke against staging (docs/staging-help-embed-smoke.md):
+  # the dedicated test bot posts both help builders' embeds to a staging test
+  # channel and the read-back must carry the brand colour/footer/icon. A
+  # failure fails this workflow run and certify-promotion needs it, so a
+  # brand regression cannot reach production. While its bindings are
+  # unprovisioned the called workflow notice-passes (see its header).
+  help-embed-synthetic:
+    needs: deploy
+    permissions:
+      contents: read
+    uses: ./.github/workflows/help-embed-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
+    # By name, not `inherit`: only the test bot token crosses the boundary.
+    secrets:
+      TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
+
   # Promotion prerequisite (docs/synthetic-user-flow.md): the same read-only
   # user-flow probe the five-minute synthetic runs, pinned to the exact SHA
   # this run deployed. A failure fails this run, certify-promotion needs it,
@@ -742,7 +757,7 @@ jobs:
   # run that passed every downstream gate can publish these immutable bytes.
   certify-promotion:
     name: certify immutable staging bytes
-    needs: [deploy, voice-synthetic, user-flow-synthetic, pinned-history-guard]
+    needs: [deploy, voice-synthetic, help-embed-synthetic, user-flow-synthetic, pinned-history-guard]
     if: success() && needs.deploy.outputs.promotion_clean == 'true' && vars.VOICE_SYNTHETIC_REQUIRED != 'false'
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'certify-promotion') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 5

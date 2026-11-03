@@ -139,8 +139,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-13: 14 — `/command`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /command name:soak-faq template:"{user} {username} {server} {channel}" description:soak text-trigger:soakfaq as manager; repeat as normal member.
-- **Expected:** Template stored and published only for manager; unsupported tokens/names rejected; runtime covered separately.
+- **Action:** Invoke /command name:soak-faq template:"{user} {username} {server} {channel} {args}" description:soak text-trigger:soakfaq as manager; repeat as normal member.
+- **Expected:** Template stored and published only for manager; unsupported tokens/names rejected; `{args}` accepted as the fifth token; runtime covered separately.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-14: 15 — `/command-remove`
@@ -775,14 +775,15 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Owen/1.0 UA, public-IP SSRF guard and MAX_FEED_BYTES enforced; one relay per item.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
-### s6-05: Website → bot `POST /internal/actions` (HMAC-SHA256 `sha256=` over `POST\npath\nts\nnonce\nsha256(body)`; `TWO_INTERNAL_KEYS`; skew+nonce replay guard; buckets 20 burst/1/s, `guild.add_member` 10/0.5s; 19 actions: `role.assign`, `guild.add_member`, `announcement.post`, `event.upsert/cancel/read`, `automations.import/export`, `settings.get/set` (`settings.set` carries compare-and-set via `expected_version`), `moderation.*` ×9) — web callbacks incl. `identify guilds.join` auto-join path
+### s6-05: Website → bot `POST /internal/actions` (HMAC-SHA256 `sha256=` over `POST\npath\nts\nnonce\nsha256(body)`; `TWO_INTERNAL_KEYS`; skew+nonce replay guard; buckets 20 burst/1/s, `guild.add_member` 10/0.5s; 20 actions: `role.assign`, `guild.add_member`, `announcement.post`, `event.upsert/cancel/read`, `automations.import/export`, `settings.get/set` (`settings.set` carries compare-and-set via `expected_version`), `moderation.*` ×9, `voice.snapshot`) — web callbacks incl. `identify guilds.join` auto-join path
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** In local mock/CI replay all 19 signed internal actions plus bad signature, stale timestamp, reused nonce and rate-bound fixtures; do not call live mutation endpoints.
+- **Action:** In local mock/CI replay all 20 signed internal actions plus bad signature, stale timestamp, reused nonce and rate-bound fixtures; do not call live mutation endpoints.
 - **Expected:** POST canonical HMAC, replay/skew rejection, durable idempotency; 20 burst/1s and add_member 10/0.5s buckets; nine moderation actions keep protection.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s6-06: `go.two.gg` redirect (`GET /<slug>` → `invite_click` → 302; unknown → fallback code) — ~450-line server + campaigns
 

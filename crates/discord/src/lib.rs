@@ -34,6 +34,7 @@ pub use channel_moderation::{
     register_channel_handlers, ChannelModerationRuntime, ChannelReply, ChannelResponseError,
     ChannelRuntimeError,
 };
+pub mod help_embed_smoke;
 pub mod intents;
 pub mod interactions;
 pub mod internal_actions;
