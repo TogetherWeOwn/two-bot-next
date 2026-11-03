@@ -1856,10 +1856,10 @@ async fn read_event_attendance(
         Ok(sessions) => sessions,
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
-    let window_ms = crate::event_attendance::AttendanceWindowMs {
+    let window_ms = two_bot::event_attendance::AttendanceWindowMs {
         event_key: window.event_key.clone(),
-        starts_ms: crate::event_attendance::millis_of(window.starts_at),
-        ends_ms: crate::event_attendance::millis_of(window.ends_at),
+        starts_ms: two_bot::event_attendance::millis_of(window.starts_at),
+        ends_ms: two_bot::event_attendance::millis_of(window.ends_at),
     };
     let mut rows = Vec::with_capacity(sessions.len());
     for session in &sessions {
@@ -1872,28 +1872,28 @@ async fn read_event_attendance(
             (Ok(member), Ok(channel)) => (member, channel),
             _ => return reject(Failure::code(ErrorCode::Internal)),
         };
-        rows.push(crate::event_attendance::SessionMs {
+        rows.push(two_bot::event_attendance::SessionMs {
             member_id,
             channel_id,
             channel_name: session.channel_name.clone(),
             is_bot: session.is_bot,
             afk: session.afk,
-            joined_ms: crate::event_attendance::millis_of(session.joined_at),
-            left_ms: session.left_at.map(crate::event_attendance::millis_of),
+            joined_ms: two_bot::event_attendance::millis_of(session.joined_at),
+            left_ms: session.left_at.map(two_bot::event_attendance::millis_of),
         });
     }
     let now_ms = i64::try_from(now_ms()).unwrap_or(i64::MAX);
-    match crate::event_attendance::project_attendance(&event_key, &window_ms, &rows, now_ms) {
+    match two_bot::event_attendance::project_attendance(&event_key, &window_ms, &rows, now_ms) {
         Ok(result) => {
             metrics::global().internal_action(internal_family(action), "executed");
             event_read_response(result, id)
         }
         // No tagged sessions (including every pre-enable window): the key
         // names nothing the logger saw.
-        Err(crate::event_attendance::AttendanceRefusal::NoRecord) => {
+        Err(two_bot::event_attendance::AttendanceRefusal::NoRecord) => {
             reject(Failure::from_action(unmapped_event_key(&event_key)))
         }
-        Err(crate::event_attendance::AttendanceRefusal::OverBudget) => {
+        Err(two_bot::event_attendance::AttendanceRefusal::OverBudget) => {
             reject(Failure::code(ErrorCode::Internal))
         }
     }
@@ -2633,8 +2633,8 @@ async fn mutate_event(
             two_bot_core::funnel::parse_iso_millis(&validated.ends_at),
         ) {
             (Some(starts_ms), Some(ends_ms)) => Some((
-                crate::event_attendance::datetime_of(starts_ms),
-                crate::event_attendance::datetime_of(ends_ms),
+                two_bot::event_attendance::datetime_of(starts_ms),
+                two_bot::event_attendance::datetime_of(ends_ms),
             )),
             _ => return reject(Failure::code(ErrorCode::Internal)),
         }

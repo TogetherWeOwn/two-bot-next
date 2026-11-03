@@ -539,9 +539,8 @@ pub trait RoomPersistence: Send + Sync {
 }
 
 /// Every `RoomPersistence` store satisfies the attendance logger's narrow
-/// surface by forwarding. `event_attendance` stays shared with the binary
-/// (which never compiles this module); the binary only uses its pure
-/// projection half, so it needs no impl.
+/// surface by forwarding. The binary reaches the pure projection half through
+/// `two_bot::event_attendance`, so it needs no impl.
 impl<T: RoomPersistence> crate::event_attendance::AttendanceStore for T {
     type Error = StoreError;
     fn attendance_windows(

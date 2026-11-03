@@ -2054,6 +2054,23 @@ mod ledger_tests {
         assert!(audit_condition.contains("$2"), "{audit_condition}");
         assert_eq!(audit_days, AUDIT_CACHE_RETENTION_DAYS);
 
+        // Attendance sessions roll off 90 days after `joined_at` through the
+        // same time-window stage, so the projection excludes them with the
+        // same window.
+        let (attendance_condition, attendance_days) =
+            guild_projection_time_exclusions("event_voice_sessions", 2)
+                .into_iter()
+                .next()
+                .expect("event_voice_sessions needs a projection exclusion");
+        assert!(
+            attendance_condition.contains("$2"),
+            "{attendance_condition}"
+        );
+        assert_eq!(
+            attendance_days,
+            crate::event_attendance::ATTENDANCE_SESSION_RETENTION_DAYS
+        );
+
         let mut without_exclusion: Vec<String> = crate::member_erasure::plan()
             .tables
             .iter()
@@ -2061,7 +2078,10 @@ mod ledger_tests {
             .collect();
         without_exclusion.push("presence_probe".to_owned());
         for table in without_exclusion {
-            if table == "events" || table == "operational_audit_log" {
+            if table == "events"
+                || table == "operational_audit_log"
+                || table == "event_voice_sessions"
+            {
                 continue;
             }
             assert!(

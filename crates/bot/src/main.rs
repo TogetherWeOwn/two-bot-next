@@ -49,7 +49,8 @@ mod drop_poison_test_serial;
 #[cfg(test)]
 mod duplicate_pool_registration_acceptance_tests;
 mod erasure_cli;
-mod event_attendance;
+// `event_attendance` is lib-only: the binary reaches it through
+// `two_bot::event_attendance` (same shape as `voice_rooms`).
 mod event_cli;
 mod eventsub_delivery;
 mod eventsub_http;

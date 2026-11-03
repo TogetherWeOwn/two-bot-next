@@ -5,8 +5,8 @@ pub mod voice_rooms;
 
 // Event-window attendance logger: the voice actor loop calls
 // `record_transition` before room handling, and the keyless
-// `event.attendance.read` verb projects through it. The binary compiles
-// this same source file as a crate-local module.
+// `event.attendance.read` verb projects through it. The binary reaches this
+// module through `two_bot::event_attendance` (lib-only, like `voice_rooms`).
 pub mod event_attendance;
 
 // Bounded gateway reconnect schedule: the gateway receive loop paces

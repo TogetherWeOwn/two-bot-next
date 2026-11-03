@@ -41,17 +41,16 @@ use two_bot_cutover::event_attendance::{AttendanceSession, AttendanceWindow};
 
 /// Inbox-protection bound for each attendance statement, mirroring
 /// `voice_rooms::REVALIDATE_TIMEOUT_MS`: a slow statement must not hold room
-/// handling. Duplicated — not imported — so the binary shares this file as a
-/// crate-local module without compiling `voice_rooms` (lib-only).
+/// handling. Duplicated — not imported — so this module stays independent of
+/// the room actor.
 const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
 
 /// Store surface the session logger needs. Narrower than
-/// `voice_rooms::RoomPersistence` so this file stays shared between the
-/// library (blanket impl for every `RoomPersistence` in `voice_rooms.rs`) and
-/// the binary (which never compiles `voice_rooms` and only uses the pure
-/// projection half). Bounds match the `RoomPersistence` attendance defaults.
-/// Public: [`record_transition`] is public, and the binary-only read half
-/// needs the rest visible on the shared module.
+/// `voice_rooms::RoomPersistence`, which forwards every store through a
+/// blanket impl (see `voice_rooms.rs`). Bounds match the `RoomPersistence`
+/// attendance defaults. Public: [`record_transition`] is public, and the
+/// binary-only read half needs the projection items visible through
+/// `two_bot::event_attendance`.
 pub trait AttendanceStore: Send + Sync {
     type Error: std::fmt::Display;
     fn attendance_windows(
@@ -497,11 +496,16 @@ pub async fn record_transition(
     }
 }
 
-pub(crate) fn millis_of(instant: OffsetDateTime) -> i64 {
+/// Epoch millis of an instant. Public: the binary-only read verb builds its
+/// projection rows through `two_bot::event_attendance`.
+pub fn millis_of(instant: OffsetDateTime) -> i64 {
     instant.unix_timestamp().saturating_mul(1_000) + i64::from(instant.millisecond())
 }
 
-pub(crate) fn datetime_of(millis: i64) -> OffsetDateTime {
+/// Instant of epoch millis, clamped to the epoch on overflow. Public: the
+/// binary-only read verb renders window bounds through
+/// `two_bot::event_attendance`.
+pub fn datetime_of(millis: i64) -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
