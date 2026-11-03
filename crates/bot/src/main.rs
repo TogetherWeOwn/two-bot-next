@@ -147,6 +147,7 @@ mod self_role_runtime;
 mod shutdown;
 #[cfg(test)]
 mod smoke_error_contract_tests;
+mod staging_help_smoke_reconcile;
 #[cfg(test)]
 mod ticket_component_admission_acceptance_tests;
 mod ticket_runtime;
@@ -341,6 +342,19 @@ async fn run(cli_args: &[String]) {
             std::process::exit(1);
         }
     }
+
+    // Staging-only boot reconcile for the /help embed smoke channel: uses
+    // the token the process already holds, runs only when the staging
+    // deployment marker and staging guild both match, and never blocks or
+    // fails boot. Needs the token alone, never the database.
+    staging_help_smoke_reconcile::maybe_reconcile_on_boot(
+        config
+            .discord_token
+            .as_ref()
+            .map(|secret| secret.expose().as_str()),
+        config.guild_id,
+    )
+    .await;
 
     let store = match gateway_prerequisites(&config).ok().map(|(_, url, _)| url) {
         Some(url) => match tokio::time::timeout(
