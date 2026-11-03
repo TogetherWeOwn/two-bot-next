@@ -1,7 +1,6 @@
 # Docs map
 
-Rows: `- [Purpose](relative.md)`. Run `python3 scripts/check_docs_index.py --json`.
-Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
+Format: `- [Purpose](relative.md)`. Budgets: index <12,000 B; docs <=65,536 B exc. LARGE_DOCS.
 
 ## References
 
@@ -239,6 +238,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [E2E record](staging-e2e-run-record.md)
 - [Fixture census](staging-fixture-census.md)
 - [Health probe](staging-health-contract-probe.md)
+- [Help embed smoke](help-embed-smoke.md)
 - [Migration claim](staging-migrate-claim.md)
 - [Rollout gate](staging-rollout-gate.md)
 - [Slash smoke](staging-slash-smoke.md)

@@ -23,7 +23,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ("check.yml", "nightly.yml", "pipeline-benchmark.yml", "reusable-rust-nextest.yml")
 CONTAINER_WORKFLOWS = {
-    "deploy-staging.yml": ("schema-gate", "roles-gate"),
+    "deploy-staging.yml": ("schema-gate", "roles-gate", "help-embed-smoke"),
     "staging-migrate.yml": ("plan", "apply"),
     "deploy-production.yml": ("schema-gate", "roles-gate"),
     "production-migrate.yml": ("plan", "apply"),

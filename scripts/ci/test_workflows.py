@@ -52,7 +52,7 @@ JOB_INVENTORY = {
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
                               "promotion-skipped", "production"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "user-flow-synthetic",
-                           "pinned-history-guard", "certify-promotion"},
+                           "help-embed-smoke", "pinned-history-guard", "certify-promotion"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"},
@@ -1065,6 +1065,86 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
     certify = jobs.get("certify-promotion") or {}
     if "user-flow-synthetic" not in (certify.get("needs") or []):
         errors.append(f"{name}:certify-promotion: must need the user-flow synthetic")
+    return errors
+
+
+def help_embed_smoke_errors(workflow, name="deploy-staging.yml"):
+    """The staged help-embed brand proof posts real embeds, read back by the bot.
+
+    One job runs after the deploy with the `help-embed-smoke` environment
+    binding (the dedicated test bot token) and no write grant: it builds the
+    renderer from the reviewed workflow head, posts the builder payloads into
+    the staging test channel, reads both messages back, and asserts the brand
+    members see. The token crosses by name only, like the voice synthetic.
+    certify-promotion does not need it: a red run is never staging history, so
+    a broken brand blocks promotion on its own.
+    """
+    errors = []
+    jobs = workflow.get("jobs") or {}
+    job = jobs.get("help-embed-smoke") or {}
+    if job.get("name") != "staging help embed smoke (brand proof)":
+        errors.append(f"{name}:help-embed-smoke: job identity changed")
+    if job.get("needs") != "deploy":
+        errors.append(f"{name}:help-embed-smoke: must run after the deploy")
+    if job.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:help-embed-smoke: must keep contents:read only")
+    if job.get("environment") != "help-embed-smoke":
+        errors.append(f"{name}:help-embed-smoke: must bind the help-embed-smoke environment")
+    if not runner_allowed("help-embed-smoke", job.get("runs-on")):
+        errors.append(f"{name}:help-embed-smoke: must use the routed runner expression "
+                      "for job 'help-embed-smoke'")
+    if str(job.get("timeout-minutes")) != "30":
+        errors.append(f"{name}:help-embed-smoke: timeout must stay 30 minutes")
+    for key in ("if", "uses", "services", "env",
+                "continue-on-error", "strategy", "concurrency"):
+        if key in job:
+            errors.append(f"{name}:help-embed-smoke: must not set {key} "
+                          "(bindings stay step-scoped)")
+    secret_refs = re.findall(r"secrets\.([A-Za-z0-9_]+)", str(job))
+    if secret_refs != ["TWO_HELP_EMBED_SMOKE_BOT_TOKEN"]:
+        errors.append(f"{name}:help-embed-smoke: only the dedicated test bot token "
+                      "may cross by name")
+    text = str(job).lower()
+    if any(marker in text for marker in DEPLOY_MARKERS):
+        errors.append(f"{name}:help-embed-smoke: must never deploy or probe the worker")
+    steps = job.get("steps") or []
+    checkouts = [step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")]
+    if len(checkouts) != 1 or (checkouts[0].get("with") or {}).get("ref") != "${{ github.sha }}" \
+            or (checkouts[0].get("with") or {}).get("persist-credentials") != "false" \
+            or (checkouts[0].get("with") or {}).get("fetch-depth") != "1":
+        errors.append(f"{name}:help-embed-smoke: must check out the reviewed workflow head without credentials")
+    builds = [step for step in steps
+              if "cargo build -p two-bot-discord --bin help-embed-smoke --locked" in str(step.get("run", ""))]
+    if len(builds) != 1 or any(key in builds[0] for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:help-embed-smoke: must build the renderer bin in exactly one unconditional step")
+    renders = [step for step in steps if "./target/debug/help-embed-smoke" in str(step.get("run", ""))]
+    if len(renders) != 1 or any(key in renders[0] for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:help-embed-smoke: must render the payloads in exactly one unconditional step")
+    smokes = [step for step in steps
+              if "scripts/staging_help_embed_smoke.py" in str(step.get("run", ""))]
+    if len(smokes) != 1 or any(key in smokes[0] for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:help-embed-smoke: must run the smoke in exactly one unconditional step")
+    else:
+        probe = smokes[0]
+        run = str(probe.get("run", ""))
+        if probe.get("env") != {
+                "TWO_HELP_EMBED_SMOKE_BOT_TOKEN": "${{ secrets.TWO_HELP_EMBED_SMOKE_BOT_TOKEN }}",
+                "HELP_EMBED_SMOKE_CHANNEL_ID": "${{ vars.HELP_EMBED_SMOKE_CHANNEL_ID }}",
+                "HELP_EMBED_SMOKE_REQUIRED": "${{ vars.HELP_EMBED_SMOKE_REQUIRED }}",
+                "RUN_ID": "${{ github.run_id }}"}:
+            errors.append(f"{name}:help-embed-smoke: smoke step must bind exactly the test token "
+                          "by name plus the channel, required-flag and run-id bindings")
+        if "--payloads" not in run or "--evidence" not in run or "set -euo pipefail" not in run:
+            errors.append(f"{name}:help-embed-smoke: smoke step must render payloads to evidence under pipefail")
+        if run.count("attempt in 1 2 3") != 1 or "sleep 60" not in run or run.count("exit 1") < 1:
+            errors.append(f"{name}:help-embed-smoke: smoke step must retry transient REST hiccups, then fail")
+    uploads = [step for step in steps if "help-embed-smoke-${{ github.run_id }}" in str((step.get("with") or {}))]
+    if len(uploads) != 1 or (uploads[0].get("if") or "") != "always()":
+        errors.append(f"{name}:help-embed-smoke: must always upload the smoke evidence")
+    certify = jobs.get("certify-promotion") or {}
+    if "help-embed-smoke" in (certify.get("needs") or []):
+        errors.append(f"{name}:certify-promotion: must not need the help-embed smoke "
+                      "(the red run itself blocks promotion)")
     return errors
 
 
@@ -3999,6 +4079,7 @@ def workflow_policy_errors(workflows):
             errors.extend(soak_hold_errors(workflow))
             errors.extend(pinned_history_guard_errors(workflow))
             errors.extend(user_flow_synthetic_errors(workflow))
+            errors.extend(help_embed_smoke_errors(workflow))
             errors.extend(schema_gate_errors(workflow))
             errors.extend(roles_gate_errors(workflow))
         if name == "release.yml":
@@ -4102,6 +4183,8 @@ def workflow_policy_errors(workflows):
                 continue  # pinned-drill verdict: pinned by pinned_history_guard_errors above
             if name == "deploy-staging.yml" and job_id == "user-flow-synthetic":
                 continue  # read-only exact-SHA probe: pinned by user_flow_synthetic_errors above
+            if name == "deploy-staging.yml" and job_id == "help-embed-smoke":
+                continue  # staged brand proof: pinned by help_embed_smoke_errors above
             else:
                 # Retargeting a known CI job must not create an unapproved
                 # deploy/probe route outside the deploy workflows.
