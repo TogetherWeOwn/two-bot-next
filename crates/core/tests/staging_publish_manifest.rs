@@ -120,8 +120,8 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         enabled: true,
     };
     let names = published_names(&router, &[faq]);
-    // 46 all-on builtins minus 13 automation-gated commands, including
-    // command-inspect, pause/resume, edit and giveaway; announcements-gated lfg-edit and
+    // 47 all-on builtins minus 14 automation-gated commands, including
+    // command-inspect, clone, pause/resume, edit and giveaway; announcements-gated lfg-edit and
     // feed-inspect still publish, and read-only current-channel discovery
     // lfg-list stays published. welcome-preview is core-always and survives too.
     // The stored dynamic row stays unpublished:
@@ -161,6 +161,7 @@ fn automations_off_withholds_automation_builtins_and_all_dynamics() {
         "command-remove",
         "command-list",
         "command-inspect",
+        "command-clone",
         "command-disable",
         "command-enable",
         "command-edit",

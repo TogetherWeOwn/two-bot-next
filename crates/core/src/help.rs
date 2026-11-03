@@ -85,6 +85,7 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "command-remove",
             "command-list",
             "command-inspect",
+            "command-clone",
             "command-disable",
             "command-enable",
             "command-edit",
@@ -218,7 +219,6 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
     let live: HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     let mut out = String::new();
     let _ = writeln!(out, "**Server commands** ({} live)", live.len(),);
-    out.push_str("Gated commands need permission.\n");
     let mut rendered: HashSet<&str> = HashSet::new();
     for group in HELP_GROUPS {
         if group.anchor.is_some_and(|anchor| !live.contains(anchor)) {
@@ -918,12 +918,12 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 46 non-voice commands (7 core + 26 feature + 9 moderation + 4 reads),
-        // including inspection, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
+        // 47 non-voice commands (7 core + 27 feature + 9 moderation + 4 reads),
+        // including inspection, clone, edit, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
         // tempban-list, purge-preview, channel-inspect and moderation-recent, plus 23 additional voice commands (voice
         // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
         // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (69 live)"));
+        assert!(text.contains("**Server commands** (70 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
@@ -1057,12 +1057,12 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 46 non-voice names, including inspection, reopen, welcome-preview, pause/resume,
+        // 47 non-voice names, including inspection, clone, edit, reopen, welcome-preview, pause/resume,
         // giveaway, lfg-edit, lfg-list, feed-inspect, tempban-list, purge-preview, channel-inspect
         // and moderation-recent, plus
         // 23 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 69);
+        assert_eq!(grouped.len(), 70);
         for name in [
             "rank",
             "leaderboard",
@@ -1077,6 +1077,7 @@ mod tests {
             "command-enable",
             "command-edit",
             "command-inspect",
+            "command-clone",
             "schedule-list",
             "sticky-remove",
             "rsvp",

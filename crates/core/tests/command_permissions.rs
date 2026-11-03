@@ -104,27 +104,27 @@ fn documented_legacy_rows_equal_parity_section1() {
     // `/tempban-list` saved expiry inspection (46), and the staff ledger
     // read `/moderation-recent` (47), the dark private lockdown preview
     // `/lockdown-preview` (48, unpublished until its publication slice),
-    // and in-place `/command-edit` (49).
+    // in-place `/command-edit` (49), plus `/command-clone` (50).
     // No Next-only row appears in the legacy §1 table above;
     // the registry-equality test below covers every published builtin instead.
-    // 50 entries: 49 contiguous parity rows plus the `/lfg-edit` companion
+    // 51 entries: 50 contiguous parity rows plus the `/lfg-edit` companion
     // sharing LFG row 26.
-    assert_eq!(COMMAND_PERMISSIONS.len(), 50);
+    assert_eq!(COMMAND_PERMISSIONS.len(), 51);
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.command)
             .collect::<HashSet<_>>()
             .len(),
-        50
+        51
     );
     assert_eq!(
         COMMAND_PERMISSIONS
             .iter()
             .map(|row| row.parity_row)
             .collect::<HashSet<_>>(),
-        (1..=49).collect::<HashSet<_>>(),
-        "parity rows are contiguous 1..=49"
+        (1..=50).collect::<HashSet<_>>(),
+        "parity rows are contiguous 1..=50"
     );
     for (name, parity_row, required_permissions) in
         [("command-inspect", 33, 1 << 5), ("lfg-list", 38, 1 << 33)]
@@ -190,6 +190,11 @@ fn documented_legacy_rows_equal_parity_section1() {
     assert_eq!(preview.required_permissions, PERM_MANAGE_GUILD);
     assert_eq!(preview.surface, CommandSurface::BuiltinSlash);
     assert_eq!(preview.policy_hook, None);
+    let clone = command_permission("command-clone").expect("clone has a permission row");
+    assert_eq!(clone.parity_row, 50);
+    assert_eq!(clone.required_permissions, 32, "ManageGuild bit");
+    assert_eq!(clone.surface, CommandSurface::BuiltinSlash);
+    assert_eq!(clone.policy_hook, None);
 }
 
 #[test]
@@ -256,7 +261,7 @@ fn permission_table_equals_the_complete_published_registry() {
         .iter()
         .filter(|row| row.surface == CommandSurface::BuiltinSlash)
         .collect();
-    assert_eq!(builtins.len(), 47);
+    assert_eq!(builtins.len(), 48);
     // Routed-but-unpublished commands stay dark: adjudicated by the router
     // and permission table, absent from the publish set. The publication
     // slice removes the entry here when it ships the definition.
@@ -397,7 +402,7 @@ fn every_routed_builtin_name_has_a_permission_row() {
             other => panic!("{name} is published or retained but does not route: {other:?}"),
         }
     }
-    assert_eq!(routed, 47, "every retained builtin routes");
+    assert_eq!(routed, 48, "every retained builtin routes");
 }
 
 #[test]

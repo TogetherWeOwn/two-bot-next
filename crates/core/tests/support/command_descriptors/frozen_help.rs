@@ -57,10 +57,7 @@ pub fn voice_names() -> impl Iterator<Item = &'static str> {
 /// Custom names. Do not pass names obtained from the actual rendered reply.
 pub fn expected_help_text(names: &[&str]) -> String {
     let live: BTreeSet<&str> = names.iter().copied().collect();
-    let mut out = format!(
-        "**Server commands** ({} live)\nGated commands need permission.\n",
-        live.len()
-    );
+    let mut out = format!("**Server commands** ({} live)\n", live.len());
     let voice = live.contains("textchannels");
     let groups = HELP_LAYOUT
         .iter()

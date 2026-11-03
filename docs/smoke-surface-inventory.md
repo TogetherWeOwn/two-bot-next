@@ -9,8 +9,8 @@ verdicts in `docs/smoke-run-record.md`.
 
 - Registry: `InteractionRouter::publish_set` with all feature gates on
   (scorecard, automations, announcements, moderation), no custom rows.
-- Rendered reference: `docs/commands.md` — the 46 compiled built-ins plus the voice set
-  (69 with the voice gates on, `/myroom` included), registry bounds,
+- Rendered reference: `docs/commands.md` — the 47 compiled built-ins plus the voice set
+  (70 with the voice gates on, `/myroom` included), registry bounds,
   DMs false on every row (guild-only, legacy `setDMPermission(false)`).
 - Merge order (first definition wins, Discord 100-command ceiling):
   core → scorecard → automations → announcements → moderation.
@@ -63,6 +63,7 @@ handler family with a covered command.
 | `/command-remove` | automations | Destructive admin op; excluded from the read-only smoke. |
 | `/command-list` | automations | Needs DB-backed custom rows, which the no-DB rule excludes; the list is empty in the smoke guild. |
 | `/command-inspect` | automations | Needs a named DB-backed custom row to inspect, which the no-DB rule excludes; read-only views are pinned by the disposable-database acceptance instead. |
+| `/command-clone` | automations | Requires a saved source and writes a new definition plus audit, then republishes the registry; excluded from the read-only smoke. Disposable-database acceptance covers cloning and its failure/race paths. |
 | `/command-disable` | automations | Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke. |
 | `/command-enable` | automations | Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke. |
 | `/command-edit` | automations | Mutates a saved DB-backed definition and republishes the full guild registry; covered by disposable-database acceptance, not the read-only smoke. |

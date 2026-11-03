@@ -746,7 +746,7 @@ impl InteractionRouter {
                 gate: RowGate::Scorecard,
                 permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
-            "command" | "command-remove" | "command-list" | "command-inspect"
+            "command" | "command-remove" | "command-list" | "command-inspect" | "command-clone"
             | "command-disable" | "command-enable" | "command-edit" | "schedule"
             | "schedule-remove" | "schedule-list" | "sticky" | "sticky-remove" => Row {
                 handler: HandlerId::AutomationAdmin,
@@ -1168,6 +1168,7 @@ mod tests {
             ("command-remove", HandlerId::AutomationAdmin),
             ("command-list", HandlerId::AutomationAdmin),
             ("command-inspect", HandlerId::AutomationAdmin),
+            ("command-clone", HandlerId::AutomationAdmin),
             ("command-disable", HandlerId::AutomationAdmin),
             ("command-enable", HandlerId::AutomationAdmin),
             ("command-edit", HandlerId::AutomationAdmin),
@@ -1190,7 +1191,7 @@ mod tests {
             ("feed-list", HandlerId::FeedList),
             ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 47, "all 47 handler-owned builtins covered");
+        assert_eq!(cases.len(), 48, "all 48 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1808,9 +1809,9 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 7 core + 1 scorecard + 13 automation + 12 announcements + 9 moderation
-        // + 4 reads + 1 custom = 47, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 47);
+        // 7 core + 1 scorecard + 14 automation + 12 announcements + 9 moderation
+        // + 4 reads + 1 custom = 48, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 48);
         assert_eq!(
             &names[..8],
             [
@@ -1825,14 +1826,16 @@ mod tests {
             ]
         );
         assert_eq!(names[11], "command-inspect");
-        assert_eq!(names[14], "command-edit");
-        assert_eq!(&names[19..22], ["sticky-remove", "giveaway", "rsvp"]);
+        assert_eq!(names[12], "command-clone");
+        assert_eq!(&names[13..15], ["command-disable", "command-enable"]);
+        assert_eq!(names[15], "command-edit");
+        assert_eq!(&names[20..23], ["sticky-remove", "giveaway", "rsvp"]);
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
-        assert_eq!(names[25], "lfg-edit");
-        assert_eq!(names[26], "lfg-list");
+        assert_eq!(names[26], "lfg-edit");
+        assert_eq!(names[27], "lfg-list");
         assert_eq!(
-            &names[27..33],
+            &names[28..34],
             [
                 "feed-add",
                 "feed-remove",
@@ -1843,7 +1846,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            &names[33..43],
+            &names[34..44],
             [
                 "ban",
                 "tempban",
@@ -1858,10 +1861,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            &names[43..46],
+            &names[44..47],
             ["purge-preview", "channel-inspect", "moderation-recent"]
         );
-        assert_eq!(names[46], "faq");
+        assert_eq!(names[47], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1874,6 +1877,7 @@ mod tests {
             "command-remove",
             "command-list",
             "command-inspect",
+            "command-clone",
             "command-disable",
             "command-enable",
             "command-edit",
@@ -2183,7 +2187,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 46);
+        assert_eq!(off.len(), 47);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -2193,16 +2197,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 46 builtins keep their order; the 23 voice names that survive
+        // 47 builtins keep their order; the 23 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 69);
-        assert_eq!(on_names[..46], off_names[..]);
+        assert_eq!(on.len(), 70);
+        assert_eq!(on_names[..47], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[46..], expected[..]);
+        assert_eq!(on_names[47..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -2260,29 +2264,29 @@ mod tests {
         }
 
         let router = InteractionRouter::new(voice_on());
-        // 69 builtins: 31 customs fit exactly (69+31=100), nothing deferred.
+        // 70 builtins: 30 customs fit exactly (70+30=100), nothing deferred.
         let (defs, withheld) = router
-            .publish_set_capacity_deferred(&customs(31))
+            .publish_set_capacity_deferred(&customs(30))
             .expect("exact fit publishes");
         assert_eq!(withheld, None);
         assert_eq!(defs.len(), 100);
         assert!(defs.iter().any(|def| def.name == "myroom"));
 
-        // 32 customs: the full set would withhold one custom (69+32=101),
-        // but the baseline without /myroom fits (68+32=100), so only the
+        // 31 customs: the full set would withhold one custom (70+31=101),
+        // but the baseline without /myroom fits (69+31=100), so only the
         // optional builtin is withheld and every custom still publishes.
         let (defs, withheld) = router
-            .publish_set_capacity_deferred(&customs(32))
+            .publish_set_capacity_deferred(&customs(31))
             .expect("single overflow defers myroom");
         assert_eq!(withheld, Some(OPTIONAL_CAPACITY_BUILTIN));
         assert_eq!(defs.len(), 100);
         assert!(!defs.iter().any(|def| def.name == "myroom"));
-        assert!(defs.iter().any(|def| def.name == "zzcap31"));
+        assert!(defs.iter().any(|def| def.name == "zzcap30"));
 
-        // 33 customs: even the baseline overflows (68+33=101), so the
+        // 32 customs: even the baseline overflows (69+32=101), so the
         // overflow is not /myroom's alone and no deferral is claimed.
         let (defs, withheld) = router
-            .publish_set_capacity_deferred(&customs(33))
+            .publish_set_capacity_deferred(&customs(32))
             .expect("double overflow truncates");
         assert_eq!(withheld, None);
         assert_eq!(defs.len(), 100);
@@ -2304,13 +2308,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 46
+        // Both gates on is the full voice set without the assistant: 47
         // builtins plus the 23 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 69);
+        assert_eq!(both.len(), 70);
     }
 
     #[test]
