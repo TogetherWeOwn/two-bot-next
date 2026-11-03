@@ -191,14 +191,20 @@ with mock.patch.object(unittest.TextTestRunner, "run") as run:
                 with self.assertRaises(OSError) as caught:
                     generator.bounded_pool_present()
                 self.assertEqual(caught.exception.errno, errno.ELOOP)
-            # A non-regular policy path also fails closed, end to end: the
-            # generator refuses to build instead of falling back to plain
-            # cargo.
+            # A directory at the policy path is not a regular file: the probe
+            # raises EINVAL, and end to end the generator refuses to build
+            # instead of falling back to plain cargo.
+            directory = Path(tmp) / "policy-dir"
+            directory.mkdir()
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", directory):
+                with self.assertRaises(OSError) as caught:
+                    generator.bounded_pool_present()
+                self.assertEqual(caught.exception.errno, errno.EINVAL)
             clean = {key: value for key, value in os.environ.items()
                      if key not in ("PAPERCLIP_RUN_ID", "TWO_CARGO_CONTROLLER",
                                     "GITHUB_ACTIONS")}
             with mock.patch.dict(os.environ, clean, clear=True), \
-                    mock.patch.object(generator, "BOUNDED_POOL_POLICY", broken), \
+                    mock.patch.object(generator, "BOUNDED_POOL_POLICY", directory), \
                     mock.patch.object(generator, "build_executable") as build:
                 self.assertEqual(generator.main([]), 1)
             build.assert_not_called()
