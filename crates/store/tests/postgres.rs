@@ -119,7 +119,7 @@ async fn migrations_contract_and_checksum_guard() {
     .fetch_one(&f.pool)
     .await
     .unwrap();
-    assert_eq!(version, "1.0");
+    assert_eq!(version, "1.1");
     let counts: (Option<i32>, Option<i32>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT human_member_count, online_count FROM {web}.live_counts"
     )))
@@ -143,6 +143,15 @@ async fn migrations_contract_and_checksum_guard() {
     .await
     .unwrap();
     assert_eq!(ladder, 5);
+    // Contract 1.1 addition: the voice-heat grid always carries 168 cells,
+    // empty before the first sampler flush, with the insufficient label.
+    let heat: (i64, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*), min(source) FROM {web}.voice_heat"
+    )))
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(heat, (168, "insufficient".to_owned()));
     // Corrupt only this test's ledger: a deployed checksum mismatch must fail.
     sqlx::query(
         "UPDATE _two_bot_migrations SET checksum = decode('00', 'hex') WHERE version = 400",

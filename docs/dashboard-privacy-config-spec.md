@@ -54,11 +54,13 @@ the narrowed read-only page.
   receiver at all, and `settings.get` returns stored value plus CAS only
   (`crates/cutover/src/settings.rs:132-144`), never runtime state.
 - No web read path exists: the embedded contract
-  (`crates/store/sql/web_v1.sql:109`) defines ten views and none is
+  (`crates/store/sql/web_v1.sql:109`) defines eleven views and none is
   privacy-related (machine-checked below). `two_web_reader` holds SELECT on the
-  ten reviewed views and no bot-table access (`docs/database-roles.md:16`), while
+  eleven reviewed views and no bot-table access (`docs/database-roles.md:16`), while
   the three opt-out tables are ordinary runtime tables with no reader grant
-  (`docs/database-roles.md:56`).
+  (`docs/database-roles.md:56`). The eleventh view (`web_v1.voice_heat`) is a
+  guild-aggregate occupancy grid over `voice_heat_hours`, which carries no
+  member id, channel id or per-room split by construction.
 
 ### Suppression and receipts: member IDs in every row
 
@@ -459,7 +461,7 @@ require re-inventory, not a waiver.
 >>> assert "unwrap_or((true, true, true))" in priv.split("pub async fn analytics_settings", 1)[1].split("pub async fn set_analytics_settings", 1)[0]
 >>> assert "privacy" not in pathlib.Path("crates/core/src/internal_settings.rs").read_text().lower()
 >>> views = [l for l in pathlib.Path("crates/store/sql/web_v1.sql").read_text().splitlines() if l.startswith("CREATE OR REPLACE VIEW")]
->>> assert len(views) == 10 and not any("rivacy" in v.lower() for v in views)
+>>> assert len(views) == 11 and not any("rivacy" in v.lower() for v in views)
 >>> assert all(isinstance(r["retryable"], bool) and r["next_action"] for r in m["reasons"].values())
 >>> assert set(m["reasons"]) == set(re.findall(r'^\| `([A-Z_]+)` \|', doc, re.M))
 >>> assert len(set(re.findall(r'^\| `(PV-F\d+)` \|', doc, re.M))) == 12

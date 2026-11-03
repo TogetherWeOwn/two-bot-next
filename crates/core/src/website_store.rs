@@ -38,11 +38,11 @@ use super::scheduled_events::{ScheduledEvent, ScheduledEventsSkip};
 
 /// The contract version this build implements. Must match the row seeded in
 /// migration 0300 and the changelog in `sql/web_v1.sql`.
-pub const WEB_CONTRACT_VERSION: &str = "1.0";
+pub const WEB_CONTRACT_VERSION: &str = "1.1";
 
 /// Every view in the contract, in `sql/web_v1.sql` order. The website reads
 /// exactly these; a view added here needs a `web_v1` edit, not a migration.
-pub const WEB_CONTRACT_VIEWS: [&str; 10] = [
+pub const WEB_CONTRACT_VIEWS: [&str; 11] = [
     "contract_meta",
     "live_counts",
     "rank_counts",
@@ -53,6 +53,7 @@ pub const WEB_CONTRACT_VIEWS: [&str; 10] = [
     "next_event",
     "funnel_daily",
     "funnel_by_source",
+    "voice_heat",
 ];
 
 /// The `web_v1` contract DDL. `include_str!` (not a runtime file read) so the

@@ -193,7 +193,7 @@ async fn intervals_are_the_contract_values() {
     assert_eq!(LIVE_COUNTER_INTERVAL_MS, 60_000);
     assert_eq!(RANK_SNAPSHOT_INTERVAL_MS, 600_000);
     assert_eq!(SCHEDULED_EVENTS_INTERVAL_MS, 10 * 60 * 1000);
-    assert_eq!(WEB_CONTRACT_VIEWS.len(), 10);
+    assert_eq!(WEB_CONTRACT_VIEWS.len(), 11);
 }
 
 #[tokio::test]
@@ -215,7 +215,7 @@ async fn migrations_seed_ladder_version_and_views() {
             .fetch_one(&pool)
             .await
             .expect("meta row");
-    assert_eq!(version, "1.0");
+    assert_eq!(version, "1.1");
     assert_eq!(guild, None);
 
     let views: Vec<String> =
@@ -1420,7 +1420,7 @@ async fn contract_meta_pins_version_and_view_shapes() {
     let fixture = connect().await;
     let pool = fixture.pool().clone();
 
-    assert_eq!(WEB_CONTRACT_VERSION, "1.0");
+    assert_eq!(WEB_CONTRACT_VERSION, "1.1");
     let (version, _guild): (String, Option<String>) =
         sqlx::query_as("SELECT contract_version, guild_id FROM web_contract_meta")
             .fetch_one(&pool)
@@ -1435,7 +1435,7 @@ async fn contract_meta_pins_version_and_view_shapes() {
             .fetch_one(&pool)
             .await
             .expect("contract_meta");
-    assert_eq!(meta, ("1.0".to_owned(), None));
+    assert_eq!(meta, ("1.1".to_owned(), None));
 
     // Exact column shapes in ordinal order. CREATE OR REPLACE VIEW already
     // refuses renames/removes/retypes at deploy time; this pins appends too.
@@ -1507,6 +1507,18 @@ async fn contract_meta_pins_version_and_view_shapes() {
             "upcoming_events",
             &["event_id", "name", "starts_at", "channel_id", "description"],
         ),
+        (
+            "voice_heat",
+            &[
+                "dow",
+                "hour",
+                "avg_in_voice",
+                "sample_days",
+                "coverage",
+                "measured_through",
+                "source",
+            ],
+        ),
     ];
     assert_eq!(by_view.len(), expected.len(), "view count drift");
     for &(view, columns) in expected {
@@ -1516,6 +1528,112 @@ async fn contract_meta_pins_version_and_view_shapes() {
             "shape drift: {view}"
         );
     }
+
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn voice_heat_empty_grid_reports_insufficient() {
+    // No flushed hours: all 168 cells present with NULL averages, zero
+    // provenance, NULL measured_through, and the insufficient label.
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+
+    let rows: Vec<(i32, i32, Option<f64>, i64, f64, Option<String>, String)> =
+        sqlx::query_as("SELECT dow, hour, avg_in_voice, sample_days, coverage, measured_through, source FROM web_v1.voice_heat")
+            .fetch_all(&pool)
+            .await
+            .expect("voice_heat grid");
+    assert_eq!(rows.len(), 168, "the grid always carries all 7x24 cells");
+    for (dow, hour, avg, days, coverage, through, source) in &rows {
+        assert!((0..7).contains(dow), "dow in range: {dow}");
+        assert!((0..24).contains(hour), "hour in range: {hour}");
+        assert!(avg.is_none(), "empty cells average nothing, never zero");
+        assert_eq!(*days, 0);
+        assert_eq!(*coverage, 0.0);
+        assert!(through.is_none());
+        assert_eq!(source, "insufficient");
+    }
+
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn voice_heat_sparse_samples_stay_insufficient() {
+    // A handful of flushed hours fills its cells but keeps the window-global
+    // provenance below both gates: the label never flips on a sparse grid.
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+
+    sqlx::query(
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum)
+         SELECT date_trunc('day', now() AT TIME ZONE 'UTC') - interval '2 days' + (g || ' hours')::interval, 12, 60
+         FROM generate_series(0, 5) AS g",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed sparse hours");
+
+    let probe: (i64, f64, String) =
+        sqlx::query_as("SELECT sample_days, coverage, source FROM web_v1.voice_heat LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("voice_heat provenance");
+    assert_eq!(probe.0, 1, "one distinct UTC day sampled");
+    assert!(
+        probe.1 < 0.8,
+        "sparse coverage stays under gate: {}",
+        probe.1
+    );
+    assert_eq!(probe.2, "insufficient");
+
+    // The seeded cells average 5.0; unseeded cells stay NULL.
+    let filled: Vec<(i32, i32, Option<f64>)> = sqlx::query_as(
+        "SELECT dow, hour, avg_in_voice FROM web_v1.voice_heat WHERE avg_in_voice IS NOT NULL",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("filled cells");
+    assert!(!filled.is_empty(), "seeded hours surface in their cells");
+    for (_, _, avg) in &filled {
+        assert_eq!(avg.unwrap(), 5.0);
+    }
+
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn voice_heat_dense_window_reports_measured() {
+    // Twenty-eight full UTC days at 12 samples/hour clear both gates
+    // (sample_days 28 >= 14, coverage 1.0 >= 0.8): the label flips to
+    // measured with a non-null measured_through.
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+
+    sqlx::query(
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum)
+         SELECT day + (h || ' hours')::interval, 12, 48
+         FROM generate_series(
+                date_trunc('day', now() AT TIME ZONE 'UTC') - interval '28 days',
+                date_trunc('day', now() AT TIME ZONE 'UTC') - interval '1 day',
+                interval '1 day'
+              ) AS day
+         CROSS JOIN generate_series(0, 23) AS h",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed dense window");
+
+    let probe: (i64, f64, Option<String>, String) = sqlx::query_as(
+        "SELECT sample_days, coverage, measured_through, source FROM web_v1.voice_heat LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("voice_heat provenance");
+    assert_eq!(probe.0, 28);
+    assert!((probe.1 - 1.0).abs() < 1e-9, "full coverage: {}", probe.1);
+    assert!(probe.2.is_some(), "measured_through pins after flushes");
+    assert_eq!(probe.3, "measured");
 
     fixture.close().await.expect("drop test database");
 }

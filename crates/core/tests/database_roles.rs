@@ -404,6 +404,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "next_event",
         "funnel_daily",
         "funnel_by_source",
+        "voice_heat",
     ] {
         as_role(pool, &roles[2], &format!("SELECT * FROM web_v1.{view}")).await?;
     }

@@ -589,3 +589,122 @@ async fn runtime_schema_gap_defers_deletions_and_guild_purges_and_retries_after_
     assert_eq!(queued, 0, "repaired run must purge the deferred guild");
     db.close().await.unwrap();
 }
+
+fn voice_heat_expiry_line(logs: &str) -> &str {
+    let events: Vec<_> = logs
+        .lines()
+        .filter(|line| {
+            line.contains("voice_heat_expiry") && !line.contains("voice_heat_expiry_failed")
+        })
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "one voice-heat expiry event per sweep, even with zero stale rows: {logs}"
+    );
+    events[0]
+}
+
+fn voice_heat_expiry_failure_line(logs: &str) -> &str {
+    let failures: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("voice_heat_expiry_failed"))
+        .collect();
+    assert_eq!(
+        failures.len(),
+        1,
+        "one voice-heat expiry failure event per failed tick: {logs}"
+    );
+    failures[0]
+}
+
+#[tokio::test]
+async fn voice_heat_expiry_counts_in_dry_run_and_deletes_in_execute() {
+    let _serial = RUNTIME_LOCK.lock().await;
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    sqlx::query(
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum)
+         VALUES (now() - make_interval(days => 40), 12, 30),
+                (now() - make_interval(days => 10), 12, 24)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    // Dry run previews the same stale row execute will delete, and deletes
+    // nothing: both rows survive.
+    let (result, logs) = tick(pool, mode_from_setting(None).unwrap().unwrap()).await;
+    result.unwrap();
+    let preview = voice_heat_expiry_line(&logs);
+    field(preview, "stale_rows", 1);
+    field(preview, "horizon_days", 35);
+    assert!(
+        preview.contains("mode=DryRun") || preview.contains("mode=\"DryRun\""),
+        "dry run must tag its preview: {preview}"
+    );
+    // The game-aggregate sweep still emits its own event on the same tick.
+    let _ = expiry_line(&logs);
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, 2, "dry run deletes nothing");
+    // Execute deletes the stale row and keeps the fresh one.
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    result.unwrap();
+    let swept = voice_heat_expiry_line(&logs);
+    field(swept, "stale_rows", 1);
+    assert!(
+        swept.contains("mode=Execute") || swept.contains("mode=\"Execute\""),
+        "execute must tag its sweep: {swept}"
+    );
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, 1, "fresh rows survive");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_heat_expiry_failure_keeps_report_and_retries() {
+    let _serial = RUNTIME_LOCK.lock().await;
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    sqlx::query(
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum)
+         VALUES (now() - make_interval(days => 40), 12, 30)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql("CREATE FUNCTION voice_heat_runtime_refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic voice-heat refusal'; END $$; CREATE TRIGGER voice_heat_runtime_refuse BEFORE DELETE ON voice_heat_hours FOR EACH ROW EXECUTE FUNCTION voice_heat_runtime_refuse();").execute(pool).await.unwrap();
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    assert!(
+        matches!(result, Err(ErrorClass::Database)),
+        "a blocked voice-heat delete fails the tick as database, retryable"
+    );
+    // The committed core report still emits exactly once, with distinct text.
+    let report = report_line(&logs);
+    assert!(report.starts_with("WARN "));
+    assert_no_completed_line(&logs);
+    assert_classified_db_error(voice_heat_expiry_failure_line(&logs));
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        kept, 1,
+        "failed delete keeps the stale row for a later retry"
+    );
+    sqlx::raw_sql("DROP TRIGGER voice_heat_runtime_refuse ON voice_heat_hours; DROP FUNCTION voice_heat_runtime_refuse();").execute(pool).await.unwrap();
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    result.unwrap();
+    field(voice_heat_expiry_line(&logs), "stale_rows", 1);
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, 0, "repaired run must expire the deferred row");
+    db.close().await.unwrap();
+}

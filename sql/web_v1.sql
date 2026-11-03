@@ -286,3 +286,75 @@ LEFT JOIN members m ON m.guild_id = e.guild_id AND m.member_id = e.member_id
 WHERE e.event_type = 'member_join'
   AND NOT COALESCE(m.is_bot, FALSE)
 GROUP BY to_char(e.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD'), e.source;
+
+-- ---------------------------------------------------------------------------
+-- voice_heat - guild voice occupancy by hour-of-week, trailing 28 days
+-- ---------------------------------------------------------------------------
+--
+-- Contract v2 B5 (1.1 addition): the sampler persists guild-wide
+-- `total_in_voice` per UTC hour in `voice_heat_hours`; this view folds the
+-- trailing 28 complete UTC days into the 7x24 grid the site's Now Line
+-- shades. One row per (dow, hour) cell, always all 168 rows.
+--
+--   dow              0-6, Monday = 0 (ISODOW - 1)
+--   hour             0-23 UTC
+--   avg_in_voice     mean occupancy for the cell, NULL when the cell holds
+--                    no samples (a gap is a gap, never a zero)
+--   sample_days      distinct UTC days contributing samples to the window
+--   coverage         samples present / samples expected (28*24*12 = 8064)
+--   measured_through ISO-8601 UTC text of the last flushed hour, NULL before
+--                    the first flush
+--   source           measured when sample_days >= 14 AND coverage >= 0.8,
+--                    else insufficient
+--
+-- sample_days, coverage, measured_through and source are window-global
+-- provenance: every row carries the same values. Per-cell day counts would
+-- be unusable as a label (each weekday occurs only four times in 28 days).
+-- A measured grid that goes stale (>48 h without a successful pull) drops
+-- back to the "estimate" label site-side; that staleness rule lives with
+-- the consumer, not here.
+CREATE OR REPLACE VIEW web_v1.voice_heat AS
+WITH bounds AS (
+  SELECT
+    date_trunc('day', now() AT TIME ZONE 'UTC') - interval '28 days' AS window_start,
+    date_trunc('day', now() AT TIME ZONE 'UTC') AS window_end
+),
+scoped AS (
+  SELECT h.hour_start_utc, h.samples, h.occupancy_sum
+  FROM voice_heat_hours h, bounds b
+  WHERE h.hour_start_utc >= b.window_start
+    AND h.hour_start_utc < b.window_end
+),
+provenance AS (
+  SELECT
+    (SELECT count(DISTINCT (hour_start_utc AT TIME ZONE 'UTC')::date) FROM scoped) AS sample_days,
+    COALESCE((SELECT sum(samples) FROM scoped), 0) AS samples_present,
+    (SELECT max(hour_start_utc) FROM scoped) AS measured_through_ts
+),
+cells AS (
+  SELECT
+    ((EXTRACT(ISODOW FROM hour_start_utc AT TIME ZONE 'UTC'))::int - 1) AS dow,
+    (EXTRACT(HOUR FROM hour_start_utc AT TIME ZONE 'UTC'))::int AS hour,
+    sum(occupancy_sum)::double precision / NULLIF(sum(samples), 0) AS avg_in_voice
+  FROM scoped
+  GROUP BY 1, 2
+),
+grid AS (
+  SELECT days.dow, hours.hour
+  FROM generate_series(0, 6) AS days(dow)
+  CROSS JOIN generate_series(0, 23) AS hours(hour)
+)
+SELECT
+  grid.dow,
+  grid.hour,
+  cells.avg_in_voice,
+  provenance.sample_days,
+  (provenance.samples_present::double precision / 8064.0) AS coverage,
+  web_v1._iso(provenance.measured_through_ts) AS measured_through,
+  CASE WHEN provenance.sample_days >= 14
+         AND (provenance.samples_present::double precision / 8064.0) >= 0.8
+       THEN 'measured' ELSE 'insufficient' END AS source
+FROM grid
+LEFT JOIN cells ON cells.dow = grid.dow AND cells.hour = grid.hour
+CROSS JOIN provenance
+ORDER BY grid.dow, grid.hour;

@@ -288,8 +288,9 @@ fn admission_pool(url: &str) -> Result<PgPool, String> {
     admission_pool_with_tls(url, tls).map_err(|_| "invalid admission authority".to_owned())
 }
 
-/// Boot-composed single call: the eight parameters are the full supervised
-/// surface (config, listener, gateway, shutdown plus one slot per consumer).
+/// Boot-composed single call: the ten parameters are the full supervised
+/// surface (config, listener, gateway, shutdown, voice cache plus one slot
+/// per consumer).
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     config: &Config,
@@ -301,6 +302,7 @@ pub async fn serve(
     receiver: Option<crate::internal_action_http::BoundReceiver>,
     eventsub_receiver: Option<crate::eventsub_http::BoundEventsubReceiver>,
     member: Option<Arc<MemberRuntime>>,
+    voice_cache: Arc<twilight_cache_inmemory::DefaultInMemoryCache>,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
     let mut parked = Vec::new();
@@ -403,6 +405,14 @@ pub async fn serve(
                 } else {
                     parked.push(crate::lfg_jobs::NAME);
                 }
+                // Voice-heat sampler: gateway-gated, DB-backed, no REST or
+                // feature gate. Skipped ticks record nothing; completed hours
+                // flush to `voice_heat_hours` for the `web_v1.voice_heat` grid.
+                registered.push(crate::voice_heat::job(
+                    context.clone(),
+                    voice_cache.clone(),
+                    gateway.gateway.clone(),
+                ));
                 // Repeat-history expiry rides the shared supervisor.
                 if crate::automod_gateway::enabled() {
                     registered.push(crate::automod_gateway::expiry_job(automod));
@@ -530,7 +540,7 @@ async fn registered_statuses(
     parked: &[&str],
 ) -> Result<jobs::SharedStatus, jobs::UnregisteredJob> {
     // NAMES already carries the DB-only settings poll alongside the
-    // REST-backed domains, so the status map lists all sixteen jobs.
+    // REST-backed domains, so the status map lists all seventeen jobs.
     let mut names: Vec<&'static str> = NAMES
         .into_iter()
         .chain(community_jobs::NAMES)
@@ -542,6 +552,7 @@ async fn registered_statuses(
         .chain([crate::giveaway_runtime::REFRESH_JOB])
         .chain([crate::giveaway_runtime::DRAW_JOB])
         .chain([crate::lfg_jobs::NAME])
+        .chain([crate::voice_heat::NAME])
         .chain([crate::retention_jobs::NAME])
         .collect();
     if crate::automod_gateway::enabled() {
