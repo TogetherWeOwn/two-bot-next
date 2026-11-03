@@ -4805,9 +4805,9 @@ mod tests {
                 true,
                 SKEW_SECONDS,
                 now_ms,
-                nonces,
-                buckets,
-                clock,
+                &mut nonces,
+                &mut buckets,
+                &mut clock,
             )
         };
         let now_ms = 1_720_000_000_000;
