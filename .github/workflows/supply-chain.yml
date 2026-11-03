@@ -207,9 +207,6 @@ jobs:
               delimiter = uuid.uuid4().hex
               output.write(f"body_file<<{delimiter}\n{body_path}\n{delimiter}\n")
 
-      - name: Unit-test the lint
-        run: python3 -m unittest discover -s .github/scripts -p 'test_pr_standards.py'
-
       # Changed paths feed the T0 attestation floor in pr_standards.py. Read-only:
       # the PR files API under the job's pull-requests: read grant. Renames emit
       # both the new and the previous name (deleting or moving a T0 file stays
@@ -303,6 +300,15 @@ jobs:
                   with open(files_path, encoding="utf-8") as handle:
                       os.environ["CHANGED_FILES"] = handle.read()
           sys.exit(pr_standards.main())
+
+      # The lint's own unit tests execute the PR head's files
+      # (test_pr_standards.py imports the head's pr_standards.py), so they run
+      # only after the base-branch gate above has consumed its inputs. An
+      # earlier slot would let a PR rewrite the resolved body file or poison
+      # the step environment and have the trusted gate validate substituted
+      # input; scripts/ci/test_workflows.py pins this ordering.
+      - name: Unit-test the lint
+        run: python3 -m unittest discover -s .github/scripts -p 'test_pr_standards.py'
 
       # release-please silently drops a commit its strict parser rejects, so the
       # squash commit this PR becomes (title + body) must parse. Same library
