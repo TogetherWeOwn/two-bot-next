@@ -11,10 +11,11 @@
 use std::collections::HashMap;
 
 use serde_json::{Map, Value};
+use two_bot_core::community_snapshots::RankKey;
 use two_bot_core::internal_actions::{
-    assert_allowed, is_implemented, is_snowflake, needs_idempotency_key, require_snowflake,
-    require_timestamp, utf16_len, valid_event_key, valid_idempotency_key, validate_idempotency_key,
-    ErrorCode, InternalFlags, MAX_EVENT_NAME_CHARS,
+    assert_allowed, is_implemented, is_request_id, is_snowflake, needs_idempotency_key,
+    require_snowflake, require_timestamp, utf16_len, valid_event_key, valid_idempotency_key,
+    validate_idempotency_key, ErrorCode, InternalFlags, MAX_EVENT_NAME_CHARS,
 };
 
 const IDEMPOTENCY_REQUIREMENTS: [(&str, bool); 6] = [
@@ -144,9 +145,42 @@ fn snapshot_results_share_one_additive_tolerant_shape() {
             }
         }
     }
-    let refusal = &results["refusal"];
-    assert_eq!(refusal["ok"], false);
-    assert_eq!(refusal["error"]["code"], "discord_unavailable");
+    let request_id = verb(&fx, "voice.snapshot")["request_id"]
+        .as_str()
+        .expect("forwarded request id");
+    assert!(snapshot_refusal_matches(&results["refusal"], request_id));
+}
+
+fn snapshot_refusal_matches(refusal: &Value, request_id: &str) -> bool {
+    is_request_id(request_id)
+        && refusal["request_id"].as_str() == Some(request_id)
+        && refusal["ok"] == false
+        && refusal["error"]["code"] == "discord_unavailable"
+        && refusal["error"]["message"] == "request refused"
+        && refusal["error"]["retryable"] == true
+        && refusal.get("result").is_none()
+}
+
+#[test]
+fn snapshot_refusals_require_matching_valid_correlation_ids() {
+    let fx = fixture();
+    let snapshot = verb(&fx, "voice.snapshot");
+    let request_id = snapshot["request_id"]
+        .as_str()
+        .expect("forwarded request id");
+    let refusal = &snapshot["results"]["refusal"];
+    let mut missing = refusal.clone();
+    missing
+        .as_object_mut()
+        .expect("refusal object")
+        .remove("request_id");
+    assert!(!snapshot_refusal_matches(&missing, request_id));
+    let mut mismatched = refusal.clone();
+    mismatched["request_id"] = Value::String("00000000000000000000000002".to_owned());
+    assert!(!snapshot_refusal_matches(&mismatched, request_id));
+    let mut malformed = refusal.clone();
+    malformed["request_id"] = Value::String("not-a-request-id".to_owned());
+    assert!(!snapshot_refusal_matches(&malformed, "not-a-request-id"));
 }
 
 #[test]
@@ -313,26 +347,65 @@ fn attendance_read_shapes_hold() {
     assert_eq!(v["results"]["not_found"]["outcome"], "not_found");
 }
 
+fn botlog_rank_detail_is_valid(entry: &Value) -> bool {
+    entry["kind"] != "rank.assigned" || entry["detail"].as_str().and_then(RankKey::parse).is_some()
+}
+
 #[test]
-fn botlog_read_shapes_hold() {
+fn botlog_rank_details_reject_unknown_missing_or_malformed_keys() {
     let fx = fixture();
-    let v = verb(&fx, "botlog.read");
-    let request = body(&v["request"]);
+    let mut entry = verb(&fx, "botlog.read")["results"]["page"]["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .find(|entry| entry["kind"] == "rank.assigned")
+        .expect("rank golden")
+        .clone();
+    assert!(botlog_rank_detail_is_valid(&entry));
+    entry["detail"] = Value::String("ember-3".to_owned());
+    assert!(!botlog_rank_detail_is_valid(&entry));
+    entry["detail"] = Value::Bool(true);
+    assert!(!botlog_rank_detail_is_valid(&entry));
+    entry
+        .as_object_mut()
+        .expect("entry object")
+        .remove("detail");
+    assert!(!botlog_rank_detail_is_valid(&entry));
+}
+
+fn botlog_cursor_shape_is_valid(cursor: Option<&Value>) -> bool {
+    match cursor {
+        Some(Value::Null) => true,
+        Some(Value::String(cursor)) => !cursor.is_empty(),
+        _ => false,
+    }
+}
+
+#[test]
+fn botlog_cursors_require_explicit_null_or_nonempty_string() {
+    assert!(botlog_cursor_shape_is_valid(Some(&Value::Null)));
+    assert!(botlog_cursor_shape_is_valid(Some(&Value::String(
+        "test-publication-origin".to_owned()
+    ))));
+    assert!(!botlog_cursor_shape_is_valid(None));
+    for invalid in [
+        Value::String(String::new()),
+        Value::Bool(false),
+        Value::from(0),
+        Value::Array(Vec::new()),
+        Value::Object(Map::new()),
+    ] {
+        assert!(!botlog_cursor_shape_is_valid(Some(&invalid)));
+    }
+}
+
+fn assert_botlog_page(request: &Map<String, Value>, page: &Value) {
     assert_eq!(request["action"], "botlog.read");
-    assert!(!request["after"].as_str().expect("after str").is_empty());
+    assert!(botlog_cursor_shape_is_valid(request.get("after")));
     let limit = request["limit"].as_u64().expect("limit number");
     assert!((1..=200).contains(&limit), "limit fits the 200-entry cap");
-    let kinds: Vec<&str> = v["kinds"]
-        .as_array()
-        .expect("kinds array")
-        .iter()
-        .map(|k| k.as_str().expect("kind str"))
-        .collect();
-    assert_eq!(kinds, BOTLOG_KINDS, "only bot-origin kinds are on the wire");
-    let page = &v["results"]["page"];
     assert_eq!(page["v"], 1);
     let entries = page["entries"].as_array().expect("entries array");
-    assert!(!entries.is_empty());
     assert!((entries.len() as u64) <= limit);
     for entry in entries {
         assert!(!entry["seq"].as_str().expect("seq str").is_empty());
@@ -341,17 +414,59 @@ fn botlog_read_shapes_hold() {
         assert_timestamp_field(&owned, "at");
         let kind = entry["kind"].as_str().expect("kind str");
         assert!(BOTLOG_KINDS.contains(&kind), "{kind} is a bot-wire kind");
+        assert!(
+            botlog_rank_detail_is_valid(entry),
+            "rank detail uses the closed ladder"
+        );
         if let Some(subject) = entry.get("subject_id") {
             assert!(is_snowflake(subject.as_str().expect("subject_id str")));
         }
     }
-    assert!(!page["next"].as_str().expect("next str").is_empty());
-    assert_eq!(page["next"], entries.last().expect("non-empty page")["seq"]);
-    let empty = &v["results"]["empty"];
-    assert_eq!(empty["v"], 1);
-    assert!(empty["entries"].as_array().expect("empty page").is_empty());
-    assert_eq!(
-        empty["next"], request["after"],
-        "empty page retains position"
-    );
+    if let Some(last) = entries.last() {
+        assert!(!page["next"].as_str().expect("next str").is_empty());
+        assert_eq!(page.get("next"), Some(&last["seq"]));
+    } else {
+        assert_eq!(
+            page.get("next"),
+            request.get("after"),
+            "empty page retains position"
+        );
+    }
+}
+
+#[test]
+fn botlog_read_shapes_hold() {
+    let fx = fixture();
+    let v = verb(&fx, "botlog.read");
+    let kinds: Vec<&str> = v["kinds"]
+        .as_array()
+        .expect("kinds array")
+        .iter()
+        .map(|k| k.as_str().expect("kind str"))
+        .collect();
+    assert_eq!(kinds, BOTLOG_KINDS, "only bot-origin kinds are on the wire");
+    let initial = body(&v["initial_request"]);
+    assert_eq!(initial.get("after"), Some(&Value::Null));
+    let continuation = body(&v["request"]);
+    assert!(!continuation["after"]
+        .as_str()
+        .expect("after str")
+        .is_empty());
+    for (request, page_key, expect_empty) in [
+        (&initial, "first_page", false),
+        (&initial, "initially_empty", true),
+        (&continuation, "page", false),
+        (&continuation, "empty", true),
+    ] {
+        let page = &v["results"][page_key];
+        assert_eq!(
+            page["entries"]
+                .as_array()
+                .expect("entries array")
+                .is_empty(),
+            expect_empty
+        );
+        assert_botlog_page(request, page);
+    }
+    assert_eq!(v["results"]["first_page"]["next"], continuation["after"]);
 }
