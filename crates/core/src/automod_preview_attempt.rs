@@ -230,6 +230,7 @@ mod tests {
     use crate::automod::AutomodFilter;
     use crate::automod_preview::{deciding_knobs, PreviewResult};
     use crate::automod_preview_report::{audit_reason_for_verdict, preview_audit_outcome};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Clone, Default)]
@@ -337,8 +338,19 @@ mod tests {
         }
     }
 
-    fn must_not_evaluate() -> impl FnOnce() -> PreviewVerdict {
-        || panic!("refusals and replays must evaluate nothing")
+    /// Evaluator that must never run: refusals and replays evaluate nothing.
+    /// Returns the closure plus a called-flag the test asserts afterwards, so
+    /// an evaluation shows up as an assertion failure instead of a panic.
+    fn must_not_evaluate() -> (impl FnOnce() -> PreviewVerdict, Arc<AtomicBool>) {
+        let called = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&called);
+        (
+            move || {
+                flag.store(true, Ordering::SeqCst);
+                matched_verdict()
+            },
+            called,
+        )
     }
 
     #[tokio::test]
@@ -346,13 +358,18 @@ mod tests {
         let refused = decoded(9);
         let (store, calls) = FakeStore::fresh(None, "2026-11-02 08:00:00+00");
         let mut limiter = PreviewRateLimiter::new();
+        let (evaluate, evaluated) = must_not_evaluate();
         let result = attempt_preview(
             input(Err(PreviewInputRefusal::TextBounds)),
             &mut limiter,
             store,
-            must_not_evaluate(),
+            evaluate,
         )
         .await;
+        assert!(
+            !evaluated.load(Ordering::SeqCst),
+            "refusal must evaluate nothing"
+        );
         assert_eq!(result.reply, PreviewInputRefusal::TextBounds.message());
         assert_eq!(result.metric, None);
         assert!(!result.evaluated);
@@ -368,7 +385,12 @@ mod tests {
         let mut limiter = PreviewRateLimiter::new();
         let mut attempt = input(Ok(&gate));
         attempt.automod_enabled = false;
-        let result = attempt_preview(attempt, &mut limiter, store, must_not_evaluate()).await;
+        let (evaluate, evaluated) = must_not_evaluate();
+        let result = attempt_preview(attempt, &mut limiter, store, evaluate).await;
+        assert!(
+            !evaluated.load(Ordering::SeqCst),
+            "gate refusal must evaluate nothing"
+        );
         assert_eq!(
             result.reply,
             crate::automod_preview_report::PREVIEW_NOT_EVALUATED_REPLY
@@ -429,13 +451,12 @@ mod tests {
         let mut limiter = PreviewRateLimiter::new();
         limiter.check_and_admit("actor-1", "guild-1", 6, 1_000_000);
         let replaying = decoded(12);
-        let result = attempt_preview(
-            input(Ok(&replaying)),
-            &mut limiter,
-            store,
-            must_not_evaluate(),
-        )
-        .await;
+        let (evaluate, evaluated) = must_not_evaluate();
+        let result = attempt_preview(input(Ok(&replaying)), &mut limiter, store, evaluate).await;
+        assert!(
+            !evaluated.load(Ordering::SeqCst),
+            "replay must evaluate nothing"
+        );
         assert!(!result.evaluated);
         assert_eq!(result.reply, render_preview_reply(&verdict, created_at));
         assert_eq!(result.metric, None);
@@ -451,13 +472,12 @@ mod tests {
         let mut limiter = PreviewRateLimiter::new();
         // Min-interval saturation: the second attempt inside 5 s refuses.
         limiter.check_and_admit("actor-1", "guild-1", 6, 1_000_000);
-        let result = attempt_preview(
-            input(Ok(&limited)),
-            &mut limiter,
-            store,
-            must_not_evaluate(),
-        )
-        .await;
+        let (evaluate, evaluated) = must_not_evaluate();
+        let result = attempt_preview(input(Ok(&limited)), &mut limiter, store, evaluate).await;
+        assert!(
+            !evaluated.load(Ordering::SeqCst),
+            "rate refusal must evaluate nothing"
+        );
         assert!(!result.evaluated);
         assert_eq!(result.reply, PREVIEW_RATE_LIMITED_REPLY);
         assert_eq!(
@@ -497,8 +517,12 @@ mod tests {
         let (mut store, calls) = FakeStore::fresh(None, "2026-11-02 08:00:00+00");
         store.fail_claim = Some("lock timeout".to_owned());
         let mut limiter = PreviewRateLimiter::new();
-        let result =
-            attempt_preview(input(Ok(&gated)), &mut limiter, store, must_not_evaluate()).await;
+        let (evaluate, evaluated) = must_not_evaluate();
+        let result = attempt_preview(input(Ok(&gated)), &mut limiter, store, evaluate).await;
+        assert!(
+            !evaluated.load(Ordering::SeqCst),
+            "claim failure must evaluate nothing"
+        );
         assert!(!result.evaluated);
         assert_eq!(result.reply, PREVIEW_UNAVAILABLE_REPLY);
         assert_eq!(result.metric, Some(metric_unavailable(Some(true))));
@@ -531,13 +555,12 @@ mod tests {
         };
         let (store, _) = FakeStore::fresh(Some(row), "2026-11-02 08:00:00+00");
         let mut limiter = PreviewRateLimiter::new();
-        let result = attempt_preview(
-            input(Ok(&malformed)),
-            &mut limiter,
-            store,
-            must_not_evaluate(),
-        )
-        .await;
+        let (evaluate, evaluated) = must_not_evaluate();
+        let result = attempt_preview(input(Ok(&malformed)), &mut limiter, store, evaluate).await;
+        assert!(
+            !evaluated.load(Ordering::SeqCst),
+            "malformed row must evaluate nothing"
+        );
         assert_eq!(result.reply, PREVIEW_UNAVAILABLE_REPLY);
         assert_eq!(result.metric, Some(metric_unavailable(Some(true))));
     }
