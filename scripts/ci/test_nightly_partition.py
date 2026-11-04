@@ -1,6 +1,8 @@
 """Offline contracts for target-qualified, fail-closed nightly partitioning."""
 import importlib.util
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -61,6 +63,45 @@ class InventoryTests(unittest.TestCase):
         nightly.check_execution(good, ["tests::rejects_input"])
         with self.assertRaises(ValueError):
             nightly.check_execution(good, ["tests::other"])
+
+    def test_child_process_output_can_split_a_serial_libtest_result(self):
+        name = "backup_cli::tests::upload_helper_nonzero_exit_reports_status_without_args"
+        # Match hosted libtest: its prefix is flushed before inherited child
+        # stdout/stderr, and its final status is printed only after the child.
+        script = """
+import subprocess
+import sys
+print('test ' + sys.argv[1] + ' ... ', end='', flush=True)
+subprocess.run([sys.executable, '-I', '-c',
+                "print('fixture-remote-output-marker')"], check=True)
+print('ok')
+print('test tests::rejects_input - should panic ... child diagnostic')
+print('second child diagnostic')
+print('ok')
+print('test tests::ordinary ... ok')
+print('test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.01s')
+"""
+        output = subprocess.check_output([sys.executable, "-I", "-c", script, name], text=True)
+        self.assertIn(f"test {name} ... fixture-remote-output-marker\nok\n", output)
+        nightly.check_execution(output, [name, "tests::rejects_input", "tests::ordinary"])
+
+    def test_split_results_still_require_exact_complete_success(self):
+        good = ("test tests::one ... child diagnostic\nok\n"
+                "test tests::two ... ok\n"
+                "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n")
+        nightly.check_execution(good, ["tests::one", "tests::two"])
+        for bad in [good.replace("diagnostic\nok", "diagnostic"),
+                    good.replace("diagnostic\nok", "diagnostic\nFAILED"),
+                    good.replace("diagnostic\nok", "diagnostic\nignored"),
+                    good.replace("diagnostic\nok", "diagnostic\nok\nok"),
+                    good.replace("tests::one", "unknown"),
+                    good.replace("tests::two", "tests::one"),
+                    good.replace("2 passed", "1 passed"),
+                    good.replace("0 ignored", "1 ignored"),
+                    good + "test tests::pending ... unfinished\n",
+                    good + "test tests::one ... ok\n"]:
+            with self.subTest(output=bad), self.assertRaises(ValueError):
+                nightly.check_execution(bad, ["tests::one", "tests::two"])
 
 
 class AggregateTests(unittest.TestCase):

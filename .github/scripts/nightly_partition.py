@@ -63,12 +63,29 @@ def parse_list(output):
 
 
 def check_execution(output, expected):
-    completed = [name.removesuffix(" - should panic")
-                 for name in re.findall(r"(?m)^test (.+) \.\.\. ok$", output)]
+    completed, pending = [], None
+    for line in output.splitlines():
+        match = re.fullmatch(r"test (.+) \.\.\. (.*)", line)
+        if match:
+            if pending is not None:
+                raise ValueError("libtest started another test before completing the previous one")
+            pending = match[1].removesuffix(" - should panic")
+            line = match[2]
+        # Child processes inherit stdout/stderr outside libtest's capture and
+        # can insert diagnostics after its flushed prefix, before the final ok.
+        # Only a matched test prefix plus its explicit success counts; the exact
+        # identities, summary and process exit code remain required.
+        if line == "ok":
+            if pending is None:
+                raise ValueError("libtest success without a pending test")
+            completed.append(pending)
+            pending = None
+        elif line in {"FAILED", "ignored"}:
+            raise ValueError("libtest reported a failed or ignored test")
     summaries = re.findall(
         r"(?m)^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured;", output
     )
-    if (not expected or sorted(completed) != sorted(expected)
+    if (not expected or pending is not None or sorted(completed) != sorted(expected)
             or summaries != [(str(len(expected)), "0", "0", "0")]):
         raise ValueError("execution differs from non-empty expected inventory")
 
