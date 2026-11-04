@@ -1532,6 +1532,18 @@ async fn contract_meta_pins_version_and_view_shapes() {
     fixture.close().await.expect("drop test database");
 }
 
+/// One `web_v1.voice_heat` row, in view column order.
+#[derive(sqlx::FromRow)]
+struct VoiceHeatCell {
+    dow: i32,
+    hour: i32,
+    avg_in_voice: Option<f64>,
+    sample_days: i64,
+    coverage: f64,
+    measured_through: Option<String>,
+    source: String,
+}
+
 #[tokio::test]
 async fn voice_heat_empty_grid_reports_insufficient() {
     // No flushed hours: all 168 cells present with NULL averages, zero
@@ -1539,20 +1551,24 @@ async fn voice_heat_empty_grid_reports_insufficient() {
     let fixture = connect().await;
     let pool = fixture.pool().clone();
 
-    let rows: Vec<(i32, i32, Option<f64>, i64, f64, Option<String>, String)> =
-        sqlx::query_as("SELECT dow, hour, avg_in_voice, sample_days, coverage, measured_through, source FROM web_v1.voice_heat")
-            .fetch_all(&pool)
-            .await
-            .expect("voice_heat grid");
+    let rows: Vec<VoiceHeatCell> = sqlx::query_as(
+        "SELECT dow, hour, avg_in_voice, sample_days, coverage, measured_through, source FROM web_v1.voice_heat",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("voice_heat grid");
     assert_eq!(rows.len(), 168, "the grid always carries all 7x24 cells");
-    for (dow, hour, avg, days, coverage, through, source) in &rows {
-        assert!((0..7).contains(dow), "dow in range: {dow}");
-        assert!((0..24).contains(hour), "hour in range: {hour}");
-        assert!(avg.is_none(), "empty cells average nothing, never zero");
-        assert_eq!(*days, 0);
-        assert_eq!(*coverage, 0.0);
-        assert!(through.is_none());
-        assert_eq!(source, "insufficient");
+    for cell in &rows {
+        assert!((0..7).contains(&cell.dow), "dow in range: {}", cell.dow);
+        assert!((0..24).contains(&cell.hour), "hour in range: {}", cell.hour);
+        assert!(
+            cell.avg_in_voice.is_none(),
+            "empty cells average nothing, never zero"
+        );
+        assert_eq!(cell.sample_days, 0);
+        assert_eq!(cell.coverage, 0.0);
+        assert!(cell.measured_through.is_none());
+        assert_eq!(cell.source, "insufficient");
     }
 
     fixture.close().await.expect("drop test database");
@@ -1635,6 +1651,67 @@ async fn voice_heat_dense_window_reports_measured() {
     assert!(probe.2.is_some(), "measured_through pins after flushes");
     assert_eq!(probe.3, "measured");
 
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn voice_heat_uses_utc_bounds_and_sample_weighted_cells() {
+    let fixture = connect().await;
+    let mut tx = fixture.pool().begin().await.expect("transaction");
+    // UTC midnight must mean the same instant on every database connection.
+    sqlx::query("SET LOCAL TIME ZONE 'Pacific/Auckland'")
+        .execute(&mut *tx)
+        .await
+        .expect("non-UTC session");
+    let today: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("UTC midnight");
+    let start = today - time::Duration::days(28);
+    // Two occurrences of the same hour-of-week with unequal sample counts.
+    // The row just before the window and today's row must be excluded.
+    for (at, samples, sum) in [
+        (start - time::Duration::hours(1), 12i32, 1200i64),
+        (start, 12, 24),
+        (start + time::Duration::days(7), 6, 36),
+        (today, 12, 1200),
+    ] {
+        sqlx::query("INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum) VALUES ($1, $2, $3)")
+            .bind(at).bind(samples).bind(sum).execute(&mut *tx).await.expect("seed hour");
+    }
+    let rows: Vec<VoiceHeatCell> =
+        sqlx::query_as("SELECT * FROM web_v1.voice_heat ORDER BY dow, hour")
+            .fetch_all(&mut *tx)
+            .await
+            .expect("grid");
+    assert_eq!(rows.len(), 168);
+    let filled: Vec<&VoiceHeatCell> = rows
+        .iter()
+        .filter(|cell| cell.avg_in_voice.is_some())
+        .collect();
+    assert_eq!(
+        filled.len(),
+        1,
+        "excluded boundary hours must not leak into cells"
+    );
+    let cell = filled[0];
+    assert_eq!(
+        cell.dow,
+        i32::from(start.weekday().number_days_from_monday())
+    );
+    assert_eq!(cell.hour, 0);
+    assert!((cell.avg_in_voice.expect("measured average") - 60.0 / 18.0).abs() < 1e-9);
+    assert_eq!(cell.sample_days, 2);
+    assert!((cell.coverage - 18.0 / 8064.0).abs() < 1e-9);
+    assert_eq!(cell.source, "insufficient");
+    let through: String = sqlx::query_scalar("SELECT web_v1._iso($1)")
+        .bind(start + time::Duration::days(7))
+        .fetch_one(&mut *tx)
+        .await
+        .expect("UTC timestamp");
+    assert_eq!(cell.measured_through.as_deref(), Some(through.as_str()));
+    tx.rollback().await.expect("rollback fixture");
     fixture.close().await.expect("drop test database");
 }
 

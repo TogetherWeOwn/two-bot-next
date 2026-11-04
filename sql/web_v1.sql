@@ -316,8 +316,8 @@ GROUP BY to_char(e.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD'), e.source;
 CREATE OR REPLACE VIEW web_v1.voice_heat AS
 WITH bounds AS (
   SELECT
-    date_trunc('day', now() AT TIME ZONE 'UTC') - interval '28 days' AS window_start,
-    date_trunc('day', now() AT TIME ZONE 'UTC') AS window_end
+    (date_trunc('day', now() AT TIME ZONE 'UTC') - interval '28 days') AT TIME ZONE 'UTC' AS window_start,
+    date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS window_end
 ),
 scoped AS (
   SELECT h.hour_start_utc, h.samples, h.occupancy_sum

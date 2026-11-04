@@ -11,9 +11,10 @@
 //! Skip semantics: a disconnected gateway, an incomplete cache or an
 //! over-budget projection records nothing — gaps are gaps, never zeros. Only
 //! completed hours flush (`ON CONFLICT DO NOTHING` claims each hour, so a
-//! retried flush after a drained accumulator writes nothing). A transient
-//! database failure keeps the unsent buckets in memory and returns
-//! [`ErrorClass::Database`] for a bounded retry.
+//! retried flush writes nothing). Completed buckets stay buffered until a
+//! successful flush, including across connection failures and cancelled ticks.
+//! A transient database failure returns [`ErrorClass::Database`] for a bounded
+//! retry.
 
 use std::{
     collections::BTreeMap,
@@ -74,47 +75,25 @@ impl Accumulator {
         }
     }
 
-    /// Drain every hour strictly before the current UTC hour. The live hour
-    /// keeps accumulating; completed hours flush exactly once.
-    pub(crate) fn take_completed(&mut self, now: time::OffsetDateTime) -> Vec<HourBucket> {
+    /// Snapshot every hour strictly before the current UTC hour. Keep the
+    /// rows buffered across every await: the supervisor may cancel a tick.
+    pub(crate) fn completed(&self, now: time::OffsetDateTime) -> Vec<HourBucket> {
         let current = voice_heat_store::truncate_to_hour(now);
-        let ready: Vec<time::OffsetDateTime> = self
-            .buckets
-            .keys()
-            .copied()
-            .take_while(|hour| *hour < current)
-            .collect();
-        ready
-            .into_iter()
-            .filter_map(|hour| {
-                self.buckets.remove(&hour).map(|(samples, sum)| HourBucket {
-                    hour_start: hour,
-                    samples,
-                    occupancy_sum: sum,
-                })
+        self.buckets
+            .range(..current)
+            .map(|(&hour_start, &(samples, occupancy_sum))| HourBucket {
+                hour_start,
+                samples,
+                occupancy_sum,
             })
             .collect()
     }
 
-    /// Return unsent buckets after a transient database failure, preserving
-    /// the original per-hour counts (no double-count on the next flush).
-    pub(crate) fn requeue(&mut self, buckets: &[HourBucket]) {
+    /// Forget only successfully flushed buckets. A partial write is safe to
+    /// retry because the store claims each hour with ON CONFLICT DO NOTHING.
+    pub(crate) fn acknowledge(&mut self, buckets: &[HourBucket]) {
         for bucket in buckets {
-            let entry = self.buckets.entry(bucket.hour_start).or_insert((0, 0));
-            entry.0 = entry.0.saturating_add(bucket.samples.max(0));
-            entry.1 = entry.1.saturating_add(bucket.occupancy_sum.max(0));
-        }
-        if self.buckets.len() > MAX_BUFFERED_HOURS {
-            let drop = self.buckets.len() - MAX_BUFFERED_HOURS;
-            let oldest: Vec<time::OffsetDateTime> =
-                self.buckets.keys().copied().take(drop).collect();
-            for hour in oldest {
-                self.buckets.remove(&hour);
-            }
-            tracing::warn!(
-                job = NAME,
-                "voice-heat buffer full; dropping oldest hour, retryable"
-            );
+            self.buckets.remove(&bucket.hour_start);
         }
     }
 
@@ -153,7 +132,7 @@ pub fn job(
 
 /// One sampler tick: gate on the live gateway, read the snapshot total,
 /// record the sample, and flush completed hours. Skips record nothing;
-/// database failures requeue and read as [`ErrorClass::Database`].
+/// database failures keep buffered buckets and read as [`ErrorClass::Database`].
 async fn tick(
     context: &Arc<Context>,
     cache: &Arc<DefaultInMemoryCache>,
@@ -182,17 +161,13 @@ async fn tick(
     let buckets = {
         let mut guard = accumulator.lock().map_err(|_| ErrorClass::Database)?;
         guard.record(now, total);
-        guard.take_completed(now)
+        guard.completed(now)
     };
     if buckets.is_empty() {
         return Ok(());
     }
     let pool = context.pool().await?.clone();
     if let Err(err) = voice_heat_store::flush_hour_buckets(&pool, &buckets).await {
-        accumulator
-            .lock()
-            .map_err(|_| ErrorClass::Database)?
-            .requeue(&buckets);
         let reason = match &err {
             voice_heat_store::VoiceHeatStoreError::Db(inner) => crate::db_log::db_class(inner),
         };
@@ -203,6 +178,10 @@ async fn tick(
         );
         return Err(ErrorClass::Database);
     }
+    accumulator
+        .lock()
+        .map_err(|_| ErrorClass::Database)?
+        .acknowledge(&buckets);
     Ok(())
 }
 
@@ -215,40 +194,84 @@ mod tests {
     }
 
     #[test]
-    fn completed_hours_drain_and_live_hour_stays() {
+    fn completed_hours_acknowledge_and_live_hour_stays() {
         let mut acc = Accumulator::default();
         acc.record(hour(10) + time::Duration::minutes(5), 4);
         acc.record(hour(10) + time::Duration::minutes(10), 6);
         acc.record(hour(11) + time::Duration::minutes(2), 3);
-        let drained = acc.take_completed(hour(11) + time::Duration::minutes(30));
+        let drained = acc.completed(hour(11) + time::Duration::minutes(30));
         assert_eq!(drained.len(), 1, "only the completed hour flushes");
         assert_eq!(drained[0].hour_start, hour(10));
         assert_eq!((drained[0].samples, drained[0].occupancy_sum), (2, 10));
+        assert_eq!(acc.len(), 2, "in-flight rows stay buffered");
+        acc.acknowledge(&drained);
         assert_eq!(acc.len(), 1, "the live hour keeps accumulating");
         // A later tick completes the next hour too.
-        let drained = acc.take_completed(hour(12));
+        let drained = acc.completed(hour(12));
         assert_eq!(drained.len(), 1);
         assert_eq!((drained[0].samples, drained[0].occupancy_sum), (1, 3));
+        acc.acknowledge(&drained);
         assert_eq!(acc.len(), 0);
     }
 
     #[test]
-    fn requeue_preserves_unsent_counts_without_double_count() {
+    fn failed_flush_preserves_unsent_counts_without_double_count() {
         let mut acc = Accumulator::default();
         acc.record(hour(9) + time::Duration::minutes(5), 4);
-        let drained = acc.take_completed(hour(10));
-        assert_eq!(drained.len(), 1);
-        acc.requeue(&drained);
-        let retry = acc.take_completed(hour(10));
-        assert_eq!(retry.len(), 1, "failed flush retries the same counts");
+        let pending = acc.completed(hour(10));
+        assert_eq!(pending.len(), 1);
+        // A failed connection/flush never acknowledges the snapshot.
+        let retry = acc.completed(hour(10));
+        assert_eq!(retry, pending, "failed flush retries the same counts");
         assert_eq!((retry[0].samples, retry[0].occupancy_sum), (1, 4));
+        acc.acknowledge(&retry);
+        assert!(acc.completed(hour(10)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_flush_keeps_completed_hours_buffered() {
+        let accumulator = Arc::new(Mutex::new(Accumulator::default()));
+        accumulator.lock().expect("accumulator").record(hour(9), 4);
+        let attempt = async {
+            let buckets = accumulator.lock().expect("accumulator").completed(hour(10));
+            std::future::pending::<()>().await;
+            accumulator
+                .lock()
+                .expect("accumulator")
+                .acknowledge(&buckets);
+        };
+        assert!(tokio::time::timeout(Duration::from_millis(1), attempt)
+            .await
+            .is_err());
+        let retry = accumulator.lock().expect("accumulator").completed(hour(10));
+        assert_eq!(
+            retry,
+            vec![HourBucket {
+                hour_start: hour(9),
+                samples: 1,
+                occupancy_sum: 4
+            }]
+        );
+    }
+
+    #[test]
+    fn missing_hours_stay_gaps_across_the_week_boundary() {
+        let mut acc = Accumulator::default();
+        // Unix day 3 is Sunday; day 4 starts Monday.
+        acc.record(hour(95) + time::Duration::minutes(55), 4);
+        acc.record(hour(98), 0);
+        let pending = acc.completed(hour(99));
+        assert_eq!(pending.len(), 2, "no rows invented for missing hours");
+        assert_eq!(pending[0].hour_start, hour(95));
+        assert_eq!(pending[1].hour_start, hour(98));
+        assert_eq!((pending[1].samples, pending[1].occupancy_sum), (1, 0));
     }
 
     #[test]
     fn negative_samples_clamp_and_buffer_stays_bounded() {
         let mut acc = Accumulator::default();
         acc.record(hour(3), -7);
-        let drained = acc.take_completed(hour(4));
+        let drained = acc.completed(hour(4));
         assert_eq!((drained[0].samples, drained[0].occupancy_sum), (1, 0));
         for h in 0..(MAX_BUFFERED_HOURS as i64 + 5) {
             acc.record(hour(100 + h), 1);
