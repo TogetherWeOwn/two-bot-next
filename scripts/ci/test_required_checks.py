@@ -224,7 +224,7 @@ class RequiredChecksReportTests(unittest.TestCase):
                     self.assertEqual(len(consumed), 1, f"{name}: {needed} result is not mapped into the gate")
                     self.assertIn(consumed[0], script, f"{name}: {needed} result is mapped but never read")
 
-    def run_aggregator(self, name, results, selected="true"):
+    def run_aggregator(self, name, results, selected="true", security_required="true"):
         _, env, script = self.aggregator(name)
         environ = {key: "" for key in env}
         for key, value in env.items():
@@ -233,6 +233,7 @@ class RequiredChecksReportTests(unittest.TestCase):
                 environ[key] = results.get(needed[1], "success")
             elif value.startswith("${{ needs.job-inputs.outputs."):
                 environ[key] = selected
+        environ["SECURITY_REQUIRED"] = security_required
         environ["JOB_INPUTS_RESULT"] = results.get("job-inputs", "success")
         run = subprocess.run([sys.executable, "-c", script], env={**os.environ, **environ},
                              capture_output=True, text=True)
@@ -275,6 +276,17 @@ class RequiredChecksReportTests(unittest.TestCase):
                         self.run_aggregator(name, {**skipped, always_run: "skipped"}, selected="false"), 1,
                         f"{always_run} is an always-run gate and may never skip",
                     )
+
+    def test_security_result_is_fail_closed_independent_of_heavy_lane_selection(self):
+        for selected in ("true", "false"):
+            for result in ("success", "failure", "cancelled", "skipped", "", "pending"):
+                for required in ("true", "false", "", "unknown"):
+                    with self.subTest(selected=selected, result=result, required=required):
+                        expected = 0 if (required, result) in {
+                            ("true", "success"), ("false", "skipped")} else 1
+                        self.assertEqual(self.run_aggregator(
+                            "ci-ok", {"public-pr-security": result}, selected=selected,
+                            security_required=required), expected)
 
     def test_gitleaks_runs_whatever_pr_lint_concluded(self):
         self.assertIn("!cancelled()", self.workflows["supply-chain.yml"]["jobs"]["gitleaks"]["if"])

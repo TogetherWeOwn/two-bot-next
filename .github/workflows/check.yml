@@ -53,6 +53,18 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  public-pr-security:
+    name: Public PR security
+    # Only public PRs: no scan on push, schedule, dispatch, merge queue or private repos.
+    # The existing workflow concurrency cancels superseded PR heads.
+    if: github.event_name == 'pull_request' && github.event.repository.private == false
+    # Required by the nested OSV reusable; other CI jobs keep their own grants.
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@feb1e0e2111da007f38ca75ee95c6f6944723d36
+
   supply-chain:
     name: PR SBOM dry-run
     # Same inventory and gates as releases, but no publishing job or secrets.
@@ -3703,7 +3715,7 @@ jobs:
     name: ci-ok
     permissions:
       contents: read
-    needs: [job-inputs, container-inputs, supply-chain, check, rust-tests, coverage-plan, coverage-shard, patch-coverage, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db, fuzz-compile, nextest]
+    needs: [job-inputs, container-inputs, supply-chain, check, rust-tests, coverage-plan, coverage-shard, patch-coverage, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db, fuzz-compile, nextest, public-pr-security]
     # A skipped or cancelled dependency must not read as green.
     if: ${{ always() }}
     # Runner routing: see the note on the first job above.
@@ -3735,6 +3747,8 @@ jobs:
           MODERATION_DB_RESULT: ${{ needs.moderation-db.result }}
           FUZZ_COMPILE_RESULT: ${{ needs.fuzz-compile.result }}
           NEXTEST_RESULT: ${{ needs.nextest.result }}
+          SECURITY_REQUIRED: ${{ github.event_name == 'pull_request' && github.event.repository.private == false }}
+          SECURITY_RESULT: ${{ needs.public-pr-security.result }}
         run: |
           python3 - <<'PY'
           import os
@@ -3784,6 +3798,14 @@ jobs:
                   result = os.environ.get(var, "")
                   if result != "success":
                       failures.append(f"{job}: result={result!r} (always-run gate)")
+
+          security_required = os.environ.get("SECURITY_REQUIRED", "")
+          security_result = os.environ.get("SECURITY_RESULT", "")
+          if security_required not in ("true", "false"):
+              failures.append("public-pr-security: missing or invalid event selection")
+          elif security_result != ("success" if security_required == "true" else "skipped"):
+              failures.append(
+                  f"public-pr-security: result={security_result!r} required={security_required}")
 
           if failures:
               print("ci-ok FAILED:")

@@ -76,8 +76,12 @@ verdict fail independently),
 cargo-nextest with one retry, JUnit and a flake ledger) and two database lanes,
 `ignored db (stores)` and `ignored db (runtime)`. The single `ci-ok` aggregate waits on both selectors
 (`job-inputs` and `container-inputs`), every selected lane, `worker check`, the
-SBOM dry-run and standalone database jobs. Both selectors and lint must always
-succeed; a heavy lane may skip only when selection explicitly deselects it.
+SBOM dry-run, standalone database jobs and the public-PR security reusable.
+The security caller runs only on public pull requests and requires success there;
+only other events or private repositories permit its skip. See
+[CI security](docs/ci-security.md#public-pr-security-pilot) for permissions,
+scanner coverage and the immutable adoption pin. Both selectors and lint must
+always succeed; a heavy lane may skip only when selection explicitly deselects it.
 A job added to `check.yml` must go into `ci-ok`'s `needs:`, result env and result
 evaluation, or carry a reviewed `# ci-ok: exempt <reason>` marker with a pin
 in `scripts/ci/test_required_checks.py`. Only advisory `container smoke` is

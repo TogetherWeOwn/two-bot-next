@@ -48,7 +48,7 @@ JOB_INVENTORY = {
                   "fuzz-compile",
                   # Promoted nextest lane (shared reusable), gated by ci-ok
                   # like the Rust lanes.
-                  "nextest"},
+                  "nextest", "public-pr-security"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
                               "promotion-skipped", "production"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "help-embed-synthetic",
@@ -131,6 +131,7 @@ JOB_INVENTORY = {
 # Reusable-workflow calls are allowed only to these non-deploy workflows.
 # TOG-10893 registers the read-only sbom.yml calls alongside the benchmark one.
 REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
+                   ("check.yml", "public-pr-security"): "TogetherWeOwn/.github/.github/workflows/public-pr-security.yml@feb1e0e2111da007f38ca75ee95c6f6944723d36",
                    ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
                    ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                    # After every staging deploy; its failure fails deploy-staging (promotion gate).
@@ -9667,6 +9668,9 @@ class WorkflowTests(unittest.TestCase):
                         # Read workflow/job history to debounce alerts and detect
                         # recovery; open, comment on and close the incident issue.
                         expected = {"contents": "read", "actions": "read", "issues": "write"}
+                    elif (name, job_id) == ("check.yml", "public-pr-security"):
+                        # Exact grant required by the nested OSV PR reusable.
+                        expected = {"contents": "read", "actions": "read", "security-events": "write"}
                     elif (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):

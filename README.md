@@ -173,7 +173,9 @@ require `ci-ok`, `gitleaks`, `pr-lint`, `CodeRabbit` and `Devin Review` on the e
 head commit, with no approving review. The single
 `ci-ok` aggregate gates both selectors, lint (`check`: fmt, clippy -D warnings,
 cargo-deny), all selected `rust tests` and `ignored db` lanes, and `worker check`
-(including the runbook command-drift test). The agent that did the work
+(including the runbook command-drift test), plus the
+[public-only PR security reusable](docs/ci-security.md#public-pr-security-pilot)
+on public pull requests. The agent that did the work
 squash-merges once every required check is green and each review finding is fixed
 or answered with evidence. A merge to `main` that touches a path outside the
 `paths-ignore` list in `deploy-staging.yml` (CI scripts and workflows included)

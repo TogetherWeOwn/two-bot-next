@@ -13,6 +13,40 @@ an ephemeral Git credential helper for that one command, not a persisted token.
 Untrusted PR metadata remains in environment variables, never interpolated into
 shell source. The deploy job does not restore caches from PR checks.
 
+## Public PR security pilot
+
+`check.yml` calls the public-only
+[org security reusable](https://github.com/TogetherWeOwn/.github/blob/feb1e0e2111da007f38ca75ee95c6f6944723d36/PUBLIC-PR-SECURITY.md)
+at reviewed merge `feb1e0e2111da007f38ca75ee95c6f6944723d36`. Its caller job runs
+only for `pull_request` in a public repository. It inherits the existing `check`
+concurrency group and cancels superseded PR heads. Pushes, schedules, dispatches,
+merge groups and private repositories never run this scanner job. Existing CI
+and reviewers remain unchanged; the call inherits no secrets. Only this caller
+gets `actions: read`, `contents: read` and `security-events: write`, as required by
+the nested OSV reusable. All other jobs retain their existing grants.
+
+The existing required `ci-ok` aggregate consumes the reusable's fail-closed
+verdict: a public PR requires success, even for docs-only changes. A skipped,
+failed, cancelled or missing result fails the aggregate. Only an explicitly
+non-public-PR event permits the caller to skip; an absent selection value fails.
+This keeps the security verdict on the existing required-check path without a
+new ruleset context that could remain pending on other events.
+
+OSV compares base/head for **new** vulnerabilities and validates its artifacts.
+Applicable Rust/Go scanners audit the full current inventory, not just the diff;
+workflow policy runs online zizmor and `pinact --check --verify-comment` across
+all tracked workflows/actions. Vendored-tree metadata inspection runs even for
+docs-only changes. Only successful trusted detection/inspection can exempt an
+inapplicable scanner inside the reusable. A skipped Go check is not an executed
+Go scan. Scanner failures, network errors and missing evidence stay failures;
+existing findings must be fixed or tracked as bounded adoption blockers, not
+suppressed. The linked adoption guide documents toolchain and inventory limits.
+
+The existing `github-actions` Dependabot entry at `/` remains grouped weekly on
+Monday at 06:00 UTC, with security updates ungrouped. That is a dependency-update
+cadence, not a scheduled vulnerability scan. Offline caller, permission,
+Dependabot and aggregation regressions run in the existing source-level CI suite.
+
 ## Staging deployment (active)
 
 AUTOMATED staging deployment is ACTIVE (TOG-12856, unblocking the TOG-12852
