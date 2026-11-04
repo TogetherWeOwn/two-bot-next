@@ -395,18 +395,27 @@ mod tests {
         let observer = TestDatabase::create(&raw, &sqlx::migrate::Migrator::DEFAULT)
             .await
             .unwrap();
-        sqlx::raw_sql("SELECT 'pipeline-accounting-start'")
-            .execute(db.pool())
+        // Broad ignored/coverage sweeps log only this synthetic connection,
+        // not every statement in their unrelated database suites.
+        let mut writer = db.pool().acquire().await.unwrap();
+        sqlx::raw_sql("SET log_min_duration_statement = 0")
+            .execute(&mut *writer)
             .await
             .unwrap();
-        sqlx::raw_sql("SELECT 42").execute(db.pool()).await.unwrap();
+        sqlx::raw_sql("SELECT 'pipeline-accounting-start'")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        sqlx::raw_sql("SELECT 42")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
         // Model the collector delivering the final record after the reader's
-        // first EOF, without stopping a server process or changing its settings.
-        let writer = db.pool().clone();
+        // first EOF, without stopping a server process.
         let stop = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
             sqlx::raw_sql("SELECT 'pipeline-accounting-stop'")
-                .execute(&writer)
+                .execute(&mut *writer)
                 .await
         });
         let profile = completed_statement_profile(observer.pool(), db.name()).await;

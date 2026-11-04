@@ -55,6 +55,23 @@ class RevisionTests(unittest.TestCase):
         self.assertEqual((self.root / "pipeline-benchmark-revision.txt").read_text(), "")
         self.assertFalse((self.root / "pipeline-benchmark-pr-head.txt").exists())
 
+    def test_benchmark_and_ignored_sweeps_provide_disposable_log_collectors(self):
+        for filename, job in [("pipeline-benchmark.yml", "benchmark"),
+                              ("check.yml", "coverage-shard"), ("nightly.yml", "sweep")]:
+            workflow = (ROOT / ".github/workflows" / filename).read_text()
+            service = workflow.split(f"  {job}:\n", 1)[1].split("    services:\n", 1)[1]
+            service = service.split("    steps:\n", 1)[0]
+            with self.subTest(workflow=filename, job=job):
+                self.assertIn("POSTGRES_INITDB_ARGS:", service)
+                self.assertIn("-c logging_collector=on -c log_destination=jsonlog", service)
+                self.assertIn("-c log_rotation_age=0 -c log_rotation_size=0", service)
+                if job == "benchmark":
+                    self.assertIn("-c autovacuum=off", service)
+                    self.assertIn("-c log_min_duration_statement=0", service)
+                else:
+                    self.assertNotIn("-c autovacuum=off", service)
+                    self.assertNotIn("-c log_min_duration_statement=0", service)
+
     def test_workflow_runs_regressions_and_uploads_both_receipts(self):
         workflow = (ROOT / ".github/workflows/pipeline-benchmark.yml").read_text()
         self.assertIn("-p 'test*pipeline_bench*.py'", workflow)

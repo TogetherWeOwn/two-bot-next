@@ -193,7 +193,10 @@ Log reading is streamed in 128 KiB chunks, with 64 MiB total, 64 KiB line and
 the reader follows appended bytes for at most 10 seconds until the complete stop
 marker arrives, rather than treating the first EOF as final. Regression tests
 cover a delayed stop marker and awaited first-fixture cleanup when observer
-setup fails. Only fingerprints/counts are published. Full raw
+setup fails. Broad nightly/coverage ignored sweeps provide a JSON collector too,
+but retain maintenance defaults and enable completion logging only on the
+log-reader test's single synthetic connection, not across unrelated suites.
+Only fingerprints/counts are published. Full raw
 logs may contain parameter values and remain inside the disposable server;
 never upload them. Missing instrumentation is INVALID/NOT RUN, not a score.
 
