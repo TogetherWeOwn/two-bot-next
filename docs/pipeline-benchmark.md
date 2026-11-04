@@ -10,8 +10,8 @@ It is not a full-bot or real-guild soak, and cannot authorize a production resiz
 The non-required **pipeline benchmark** workflow runs on changes to its driver,
 comparator or baseline, supports `workflow_dispatch` once merged, and is called
 by the existing **nightly** workflow. It is not part of required `check`.
-It follows the shared runner routing (hosted `ubuntu-latest` while the repo is public,
-`[self-hosted, two-selfhosted]` when private; see `check.yml`) with an ephemeral Rust job container and
+It selects standard GitHub-hosted `ubuntu-latest` explicitly under the
+[public runner contract](ci-security.md#public-hosted-runner-contract), with an ephemeral Rust job container and
 job-private Postgres service DNS, without publishing host ports; never staging/production.
 The workflow uploads the JSON report and tested head SHA, including on failure.
 

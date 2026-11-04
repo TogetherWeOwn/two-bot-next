@@ -2,7 +2,7 @@
 
 Deterministic CI gates (no reviewer needed). WARN reports without failing;
 HARD fails the PR. Gates run in their designated lanes in `check.yml` on the
-existing routed runner. Patch coverage is sharded: `coverage-plan` selects the
+standard GitHub-hosted `ubuntu-latest` runner. Patch coverage is sharded: `coverage-plan` selects the
 legs, the `coverage-shard` matrix runs them alongside per-shard disposable
 Postgres services, and `patch-coverage` merges and gates — rather than the
 lint-only `check` lane.
