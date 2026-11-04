@@ -46,7 +46,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Incident](production-incident-2026-10-15-postmortem.md)
 - [Audit reads](ops-control.md)
 
-## Storage and internal actions
+## Storage
 
 - [Event store](event-store.md)
 - [Database roles](database-roles.md)
@@ -72,7 +72,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Member executors](internal-member-execution.md)
 - [Moderation executor](internal-member-moderation.md)
 
-## Commands, moderation and community
+## Features
 
 - [Publication](command-publish.md)
 - [Restoration](command-restoration.md)
@@ -241,6 +241,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Health probe](staging-health-contract-probe.md)
 - [Migration claim](staging-migrate-claim.md)
 - [Rollout gate](staging-rollout-gate.md)
+- [Candidate](announcement-candidate-runtime.md)
 - [Slash smoke](staging-slash-smoke.md)
 - [Help embeds](staging-help-embed-smoke.md)
 - [Voice checks](staging-voice-event-verification.md)
@@ -280,7 +281,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Signal dry run](watch-signal-dry-run.md)
 - [Error-budget alerts](error-budget-alerts.md)
 
-## Engineering and security
+## Engineering
 
 - [Quality gates](quality-gates.md)
 - [CI security](ci-security.md)
