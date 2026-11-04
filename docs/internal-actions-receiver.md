@@ -434,8 +434,9 @@ Success (`200` only, `result` always an object, no `error` key):
 `{v:1,entries:[{seq,at,kind,subject_id?,event_key?,detail?}],next}` with
 `Cache-Control: no-store`. `after` is an opaque base64url cursor over
 `(created_at, audit_id)`; a missing `after` starts at the head, a malformed
-`after` is refused `malformed`, and `limit` defaults to 200 and is clamped
-to 1–200. Ordering is strictly ascending; the site stores `next` and resumes
+`after` is refused `malformed`. `limit` defaults to 200 when omitted; a supplied
+value must be an integer in 1–200 or is refused `malformed`, not clamped.
+Ordering is strictly ascending; the site stores `next` and resumes
 from it, deduping replays on `seq`. An empty tail echoes the request cursor.
 
 The page is a closed projection, filtered in SQL over terminal successes
