@@ -131,6 +131,12 @@ rerun producers replace their own artifact, and SHA/plan-digest checks still app
 Native test processes
 retain their package working directory; the partition helper does not use
 nextest's per-test process isolation or llvm-cov's failure-tolerance flags.
+Each invocation uses a fresh libtest `--logfile` for exact status/name evidence,
+independent of inherited child stdout/stderr. Console diagnostics still stream
+unchanged; the successful summary/counts and process exit remain mandatory.
+Missing, empty, duplicate, failed, ignored or unknown result records fail closed.
+The pinned Rust 1.99.1 supports this deprecated flag; recheck its protocol when
+upgrading the toolchain rather than falling back to parsing mixed console output.
 
 Verify a change with an actual executing `pull_request` run on its exact head,
 record each heavy job's time and headroom, and aim for at most 35 minutes per

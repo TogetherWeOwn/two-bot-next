@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -62,30 +63,21 @@ def parse_list(output):
     return sorted(names)
 
 
-def check_execution(output, expected):
-    completed, pending = [], None
-    for line in output.splitlines():
-        match = re.fullmatch(r"test (.+) \.\.\. (.*)", line)
-        if match:
-            if pending is not None:
-                raise ValueError("libtest started another test before completing the previous one")
-            pending = match[1].removesuffix(" - should panic")
-            line = match[2]
-        # Child processes inherit stdout/stderr outside libtest's capture and
-        # can insert diagnostics after its flushed prefix, before the final ok.
-        # Only a matched test prefix plus its explicit success counts; the exact
-        # identities, summary and process exit code remain required.
-        if line == "ok":
-            if pending is None:
-                raise ValueError("libtest success without a pending test")
-            completed.append(pending)
-            pending = None
-        elif line in {"FAILED", "ignored"}:
-            raise ValueError("libtest reported a failed or ignored test")
+def check_execution(output, expected, results):
+    # Rust 1.99.1's ConsoleTestState::write_log_result writes only status/name
+    # records here, not captured output or inherited child stdout/stderr. Its
+    # supported (deprecated) --logfile flag avoids parsing mixed console bytes.
+    completed = []
+    for line in results.splitlines():
+        match = re.fullmatch(r"ok (.+)", line)
+        if not match:
+            raise ValueError("libtest result log contains a failed, ignored or unknown record")
+        completed.append(match[1])
     summaries = re.findall(
         r"(?m)^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured;", output
     )
-    if (not expected or pending is not None or sorted(completed) != sorted(expected)
+    if (not expected or len(set(completed)) != len(completed)
+            or sorted(completed) != sorted(expected)
             or summaries != [(str(len(expected)), "0", "0", "0")]):
         raise ValueError("execution differs from non-empty expected inventory")
 
@@ -193,23 +185,26 @@ def run_partition(plan, index, test_args, receipt, sha):
         if actual != sorted(names):
             raise ValueError("exact selected inventory differs before execution")
         print(f"::group::{key}: {len(names)} tests (partition {index})", flush=True)
-        output = []
-        # Stream progress; do not hide a hung test behind a buffered summary.
-        # The workflow's event-bound job timeout is the outer process-tree cap.
-        with subprocess.Popen(args, cwd=target["cwd"], env=target["env"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
-            for line in process.stdout:
-                print(line, end="", flush=True)
-                output.append(line)
-            code = process.wait()
-        print("::endgroup::", flush=True)
-        try:
-            if code:
-                raise ValueError(f"libtest exit {code}")
-            check_execution("".join(output), names)
-        except ValueError as error:
-            failures.append(f"{key}: {error}")
-        else:
-            executed.extend([key, name] for name in names)
+        # Fresh per-invocation evidence cannot reuse another target's results.
+        with tempfile.TemporaryDirectory(prefix="nightly-libtest-") as scratch:
+            results = Path(scratch) / "results.log"
+            output = []
+            # Stream diagnostics unchanged; only the result file supplies names.
+            # The event-bound workflow timeout remains the outer process-tree cap.
+            with subprocess.Popen(args + ["--logfile", str(results)], cwd=target["cwd"], env=target["env"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    output.append(line)
+                code = process.wait()
+            print("::endgroup::", flush=True)
+            try:
+                if code:
+                    raise ValueError(f"libtest exit {code}")
+                check_execution("".join(output), names, results.read_text())
+            except (ValueError, OSError) as error:
+                failures.append(f"{key}: {error}")
+            else:
+                executed.extend([key, name] for name in names)
     if failures:
         raise ValueError("; ".join(failures))
     if sorted(executed) != sorted(selected):

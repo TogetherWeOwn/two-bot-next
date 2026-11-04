@@ -1,5 +1,7 @@
 """Exercise the production planner/runner with offline Cargo/libtest executables."""
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -18,7 +20,7 @@ SPEC.loader.exec_module(nightly)
 # The log records what really executes (including working directory/manifest),
 # independently of the planner's claimed inventory and completion receipts.
 BINARY = '''#!/usr/bin/env python3
-import json, os, sys
+import json, os, subprocess, sys
 from pathlib import Path
 config = json.loads(Path(__file__).with_suffix('.json').read_text())
 names = config['names']
@@ -36,14 +38,23 @@ if '--list' in args:
 assert '--test-threads=1' in args and '--include-ignored' in args and '--exact' in args
 with open(os.environ['FAKE_LOG'], 'a') as log:
     log.write(json.dumps({'target': config['target'], 'names': selected,
-        'cwd': os.getcwd(), 'manifest': os.environ['CARGO_MANIFEST_DIR']}) + '\\n')
+        'cwd': os.getcwd(), 'manifest': os.environ['CARGO_MANIFEST_DIR'],
+        'results': args[args.index('--logfile') + 1] if '--logfile' in args else None}) + '\\n')
 if os.environ.get('FAKE_FAIL_TARGET') == config['target']:
     print('test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured;')
     sys.exit(1)
 for name in selected:
     annotation = ' - should panic' if name == 'rejects_input' else ''
-    print('test ' + name + annotation + ' ... ok')
-print('test result: ok. %d passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s' % len(selected))
+    print('test ' + name + annotation + ' ... ', end='', flush=True)
+    if os.environ.get('FAKE_CHILD_OUTPUT'):
+        subprocess.run([sys.executable, '-I', '-c',
+            'import sys; sys.stdout.write(sys.argv[1])', os.environ['FAKE_CHILD_OUTPUT']], check=True)
+    print('ok')
+if '--logfile' in args and os.environ.get('FAKE_MISSING_RESULTS') not in ['1', config['target']]:
+    results = os.environ.get('FAKE_RESULTS', ''.join('ok ' + name + '\\n' for name in selected))
+    Path(args[args.index('--logfile') + 1]).write_text(results)
+print(os.environ.get('FAKE_SUMMARY', 'test result: ok. %d passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s' % len(selected)))
+sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
 '''
 CARGO = '''#!/usr/bin/env python3
 import json, os, sys
@@ -129,6 +140,9 @@ class ExecutionTests(unittest.TestCase):
         actual = [(record['target'], name) for record in executed for name in record['names']]
         self.assertEqual(set(actual), self.expected)
         self.assertEqual(len(actual), len(self.expected))
+        result_paths = [record['results'] for record in executed]
+        self.assertEqual(len(set(result_paths)), len(result_paths))
+        self.assertTrue(all(path and not Path(path).parent.exists() for path in result_paths))
         for record in executed:
             package = record['target'].split('|')[0]
             self.assertEqual(record['cwd'], str(self.root / package))
@@ -147,6 +161,41 @@ class ExecutionTests(unittest.TestCase):
                 self.assertNotIn(narrowed, cmd)
         self.assertIn('core|example|tested_example', plan['inventory'])
         self.assertNotIn('core|example|ordinary_example', plan['inventory'])
+
+    def test_child_diagnostic_without_newline_does_not_corrupt_results(self):
+        plan = self.plan()
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {'FAKE_CHILD_OUTPUT': 'child diagnostic'}), contextlib.redirect_stdout(output):
+            receipt = self.root / 'receipt.json'
+            nightly.run_partition(plan, 0, self.args, receipt, 'fixture-sha')
+        self.assertIn(' ... child diagnosticok\n', output.getvalue())
+        self.assertEqual(json.loads(receipt.read_text())['executed'], plan['partitions'][0])
+
+    def test_child_bare_ok_does_not_complete_a_pending_result(self):
+        plan = self.plan()
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {'FAKE_CHILD_OUTPUT': 'ok\n'}), contextlib.redirect_stdout(output):
+            receipt = self.root / 'receipt.json'
+            nightly.run_partition(plan, 0, self.args, receipt, 'fixture-sha')
+        self.assertIn(' ... ok\nok\n', output.getvalue())
+        self.assertEqual(json.loads(receipt.read_text())['executed'], plan['partitions'][0])
+
+    def test_good_console_cannot_replace_bad_or_missing_isolated_evidence(self):
+        plan = self.plan()
+        records = ''.join('ok ' + name + '\n' for target, name in plan['partitions'][0] if target == 'bot|bin|bot')
+        for env in [{'FAKE_MISSING_RESULTS': '1'},
+                    {'FAKE_MISSING_RESULTS': 'core|example|tested_example'},
+                    {'FAKE_RESULTS': ''}, {'FAKE_RESULTS': records + records},
+                    {'FAKE_RESULTS': records.replace('ok ', 'failed ', 1)},
+                    {'FAKE_RESULTS': records.replace('ok ', 'ignored ', 1)},
+                    {'FAKE_RESULTS': records.replace('ok ', 'child diagnosticok ', 1)},
+                    {'FAKE_RESULTS': records + 'ok unknown\n'},
+                    {'FAKE_RESULTS': '\n'.join(records.splitlines()[1:])},
+                    {'FAKE_SUMMARY': ''}, {'FAKE_EXIT': '1'}]:
+            receipt = self.root / 'bad.json'
+            with self.subTest(env=env), mock.patch.dict(os.environ, env), self.assertRaises(ValueError):
+                nightly.run_partition(plan, 0, self.args, receipt, 'fixture-sha')
+            self.assertFalse(receipt.exists())
 
     def test_failing_binary_never_writes_a_success_receipt(self):
         plan = self.plan()
