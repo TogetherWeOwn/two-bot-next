@@ -7,11 +7,16 @@ binary wheel without dependencies and runs with `--offline --strict-collection`;
 it needs no GitHub token. All workflows default to `permissions: {}` and declare
 job-specific grants. Every checkout sets `persist-credentials: false`.
 
-The release job retains contents/PR write to publish and reconcile releases;
-only the dispatch job gets actions write. The existing release-branch push uses
-an ephemeral Git credential helper for that one command, not a persisted token.
-Untrusted PR metadata remains in environment variables, never interpolated into
-shell source. The deploy job does not restore caches from PR checks.
+The daily digest job holds `contents: write` to tag and publish its release,
+`deployments: read` to resolve the live production commit, and `actions: write`
+to dispatch the SBOM workflow. That workflow keeps script execution read-only;
+only `attach-sbom` holds `contents: write` to upload verified release assets.
+Untrusted PR metadata and selector event names travel through environment
+variables, never interpolated into shell source. The deploy job does not restore
+caches from PR checks. The two inline Python metadata guards use supported Bash
+steps with isolated Python (`python3 -I -`) and quoted heredocs, preserving their
+base-branch gate provenance without importing modules from the PR checkout.
+The PR-lint sparse checkout includes the isolated parser fixture explicitly.
 
 ## Staging deployment (active)
 
@@ -411,11 +416,12 @@ branch protection. The existing advisory ownership policy is unchanged.
 
 ## Static audit exceptions
 
-The `release-please@17.6.0` commit-parser fixture install (commit-parse guard)
-has one inline `adhoc-packages` suppression. The direct package is pinned; lifecycle scripts are disabled and its check job has
-no write grant. Transitive dependencies remain unlocked. A future fixture
-lockfile can remove this exception; it is not an exception for deployment
-package installation.
+Both commit-parser consumers stage the reviewed manifest and lockfile from
+`scripts/fixtures/commit-parser/` into their own `RUNNER_TEMP` directories and run
+`npm ci --ignore-scripts --no-audit --no-fund`. The exact `release-please` version
+remains 17.6.0; transitive registry tarballs carry integrity hashes. The fixture
+has no lifecycle scripts or application dependencies, and neither install has an
+`adhoc-packages` suppression. This installation is not a dependency audit.
 
 `deploy-production.yml` carries two inline suppressions for its automatic
 promotion trigger. `dangerous-triggers` on the `workflow_run` notifier: the
@@ -431,6 +437,18 @@ The former `if: ${{ false }}` staging suspension (and its narrow
 carries no such suppression. The offline regression now requires the deploy
 job to carry no job condition at all.
 
-Pedantic zizmor may report informational `superfluous-actions` advisories for
-existing pinned Rust toolchain Actions. They are intentionally retained; all
-existing Action SHAs and pin comments are preserved.
+## Native Rust setup
+
+All 18 former Rust setup action calls now execute
+`.github/scripts/install-rust-toolchain.sh` with an exact `RUST_TOOLCHAIN` and
+explicit `RUST_COMPONENTS`. Stable lanes match `rust-toolchain.toml`; the three
+libFuzzer lanes retain `nightly-2026-10-01` and `rust-src`. The setup installs the
+minimal profile without self-update, selects the same default, and verifies the
+explicit toolchain. Existing fail-closed retry steps and their conditions remain.
+No lane requested extra targets or a directory override, and no lane consumed
+the former action's outputs. The Cargo incremental/color defaults are preserved.
+
+Hosted Ubuntu and the pinned Rust job containers must supply `rustup`, `cargo`
+and `rustc` on PATH. Missing tools fail explicitly; setup never runs a downloaded
+bootstrap or silently uses the image's moving default. Offline shim tests prove
+argument boundaries and failures, not hosted tool availability or compilation.
