@@ -21,7 +21,11 @@ can carry risk without shipping in the bot.
 
 Both gates run in the `image` job and use SHA-pinned Trivy Action 0.36.0 with
 Trivy v0.69.3 (see the `uses: aquasecurity/trivy-action@... # 0.36.0` pins
-and `version: v0.69.3` in [`sbom.yml`](../.github/workflows/sbom.yml)). They
+and `version: v0.69.3` in [`sbom.yml`](../.github/workflows/sbom.yml)). The
+linux/amd64 tool archive is downloaded directly from its GitHub release and
+SHA-256-verified before extracting the binary; every action invocation skips
+its installer, avoiding the `get.trivy.dev` redirect. The job removes the
+private binary directory and temporary download scratch. Both gates still
 fail on HIGH/CRITICAL in OS and library dependencies,
 **including unfixed findings**. A fresh vulnerability DB is downloaded by Trivy
 on every run. No shared cache is written or read: the BuildKit GitHub-Actions

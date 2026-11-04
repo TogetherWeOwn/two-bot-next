@@ -39,6 +39,20 @@ jobs:
           python3 scripts/test-runtime-image-evidence.py
           python3 scripts/test_runtime_image_inspect_acceptance.py
           python3 scripts/test-vulnerability-preflight.py
+      # The setup action redirects through get.trivy.dev, which can fail DNS.
+      # Install the same version directly, verifying before extracting any code.
+      - name: Install verified Trivy from its GitHub release
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/trivy-bin"
+          scratch=$(mktemp -d "$RUNNER_TEMP/trivy-download.XXXXXX")
+          trap 'rm -rf "$scratch"' EXIT
+          curl --fail --location --silent --show-error --max-time 120 \
+            https://github.com/aquasecurity/trivy/releases/download/v0.69.3/trivy_0.69.3_Linux-64bit.tar.gz \
+            -o "$scratch/tool.tar.gz"
+          printf '%s  %s\n' 1816b632dfe529869c740c0913e36bd1629cb7688bd5634f4a858c1d57c88b75 "$scratch/tool.tar.gz" | sha256sum --check
+          tar -xzf "$scratch/tool.tar.gz" -C "$RUNNER_TEMP/trivy-bin" trivy
+          printf '%s\n' "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
       # Keep the workflow's validation tools while inventorying a historical
       # release tag that may predate those tools.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -70,6 +84,7 @@ jobs:
           version: v0.69.3
           cache: false
           cache-dir: ${{ runner.temp }}/trivy-cache
+          skip-setup-trivy: true
           scan-type: fs
           scan-ref: ${{ runner.temp }}/rust-workspace
           scanners: vuln
@@ -150,6 +165,10 @@ jobs:
           if docker image inspect "$IMAGE" > /dev/null 2>&1; then
             docker image rm "$IMAGE"
           fi
+
+      - name: Remove this job's Trivy binary
+        if: ${{ always() }}
+        run: rm -rf "$RUNNER_TEMP/trivy-bin"
 
   # Validation, evidence and preflight never check out inputs.ref: they run
   # the trusted root scripts against the sbom-partial artifact (Cargo.lock,

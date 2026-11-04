@@ -337,6 +337,65 @@ class ScannerTests(unittest.TestCase):
         self.assertFalse((out / "runtime-crates.syft.json").exists())
 
 
+class TrivyInstallerTests(unittest.TestCase):
+    def installer(self):
+        text = (ROOT / ".github/workflows/sbom.yml").read_text()
+        title = "      - name: Install verified Trivy from its GitHub release\n"
+        self.assertIn(title, text)
+        step = text.split(title, 1)[1].split("\n      - ", 1)[0]
+        return "\n".join(line[10:] for line in step.split("        run: |\n", 1)[1].splitlines()
+                         if line.startswith("          "))
+
+    def run_installer(self, download_status=0, checksum_status=0):
+        script = self.installer()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = root / "tools"
+            tools.mkdir()
+            for command, body in {
+                    "curl": 'printf "curl %s\\n" "$*" >> "$LOG"; exit "$DOWNLOAD_STATUS"',
+                    "sha256sum": 'while IFS= read -r line; do printf "sha256sum %s\\n" "$line" >> "$LOG"; done; exit "$CHECKSUM_STATUS"',
+                    "tar": 'printf "tar %s\\n" "$*" >> "$LOG"'}.items():
+                path = tools / command
+                path.write_text("#!/bin/bash\n" + body + "\n")
+                path.chmod(0o755)
+            env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
+            env.update(PATH=f"{tools}:{os.environ['PATH']}", RUNNER_TEMP=tmp,
+                       GITHUB_PATH=str(root / "github-path"), LOG=str(root / "calls"),
+                       DOWNLOAD_STATUS=str(download_status), CHECKSUM_STATUS=str(checksum_status))
+            result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
+                                    env=env, text=True, capture_output=True, timeout=10)
+            self.assertTrue((root / "calls").exists(), result.stderr)
+            calls = (root / "calls").read_text()
+            published = (root / "github-path").exists()
+            self.assertFalse(list(root.glob("trivy-download.*")))
+            return result, calls, published
+
+    def test_verified_direct_download_is_published_after_checksum_and_extraction(self):
+        result, calls, published = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(published)
+        self.assertIn("https://github.com/aquasecurity/trivy/releases/download/v0.69.3/trivy_0.69.3_Linux-64bit.tar.gz", calls)
+        self.assertIn("1816b632dfe529869c740c0913e36bd1629cb7688bd5634f4a858c1d57c88b75", calls)
+        self.assertLess(calls.index("sha256sum"), calls.index("tar "))
+        script = self.installer()
+        self.assertLess(script.index("tar -xzf"), script.index('>> "$GITHUB_PATH"'))
+        self.assertNotIn("get.trivy.dev", script)
+
+    def test_download_failure_is_not_extracted_or_published(self):
+        result, calls, published = self.run_installer(download_status=6)
+        self.assertEqual(result.returncode, 6)
+        self.assertNotIn("sha256sum", calls)
+        self.assertNotIn("tar ", calls)
+        self.assertFalse(published)
+
+    def test_checksum_failure_is_not_extracted_or_published(self):
+        result, calls, published = self.run_installer(checksum_status=1)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("tar ", calls)
+        self.assertFalse(published)
+
+
 class StaticWiringTests(unittest.TestCase):
     def setUp(self):
         self.scanner = SCANNER.read_text()
@@ -400,6 +459,14 @@ class StaticWiringTests(unittest.TestCase):
         # Nothing local is executed after the untrusted checkout in this job.
         self.assertNotIn("python3 scripts/", image[image.index("inputs.ref"):])
         self.assertNotIn("bash scripts/", image[image.index("inputs.ref"):])
+
+    def test_workflow_installs_trivy_before_untrusted_checkout_and_skips_redirect(self):
+        image, _ = self.workflow_jobs()
+        image = self.code(image)
+        self.assertLess(image.index("name: Install verified Trivy"), image.index("inputs.ref"))
+        self.assertEqual(image.count("skip-setup-trivy: true"), 4)
+        self.assertIn("name: Remove this job's Trivy binary\n        if: ${{ always() }}\n"
+                      '        run: rm -rf "$RUNNER_TEMP/trivy-bin"', image)
 
     def test_workflow_scan_and_validator_run_only_in_trusted_verify_job(self):
         image, verify = self.workflow_jobs()
