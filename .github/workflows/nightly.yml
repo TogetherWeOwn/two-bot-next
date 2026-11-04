@@ -447,6 +447,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Download exact-run inventory plan
+        id: plan
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: nightly-plan
       - name: Job-container prerequisites (job-private loopback forward)
         run: |
           apt-get update -qq
@@ -490,10 +495,6 @@ jobs:
       - name: Generate command reference before workspace compilation
         run: python3 scripts/generate_command_reference.py
 
-      - name: Download exact-run inventory plan
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
-        with:
-          name: nightly-plan
       - name: Execute exact serial partition and prove its inventory
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly
@@ -774,6 +775,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Download exact-run inventory plan
+        id: plan
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: nightly-plan
       - name: Job-container prerequisites (job-private loopback forward)
         run: |
           apt-get update -qq
@@ -817,10 +823,6 @@ jobs:
       - name: Generate command reference before workspace compilation
         run: python3 scripts/generate_command_reference.py
 
-      - name: Download exact-run inventory plan
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
-        with:
-          name: nightly-plan
       - name: Workspace doctests with original ignored-test and skip semantics
         env:
           TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly
@@ -829,7 +831,7 @@ jobs:
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/nightly-workspace
         run: python3 .github/scripts/nightly_partition.py docs
       - name: cargo doc -D warnings
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.plan.outcome == 'success' }}
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps --locked

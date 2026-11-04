@@ -501,6 +501,43 @@ class NightlyPartitionWorkflow(unittest.TestCase):
         self.assertIn("-D warnings", step[0]["env"]["RUSTDOCFLAGS"])
         self.assertIn("!cancelled()", step[0].get("if", ""))
 
+    def test_plan_download_precedes_all_expensive_setup(self):
+        for name in ("sweep-partition", "sweep-docs"):
+            with self.subTest(job=name):
+                steps = self.job(name)["steps"]
+                self.assertIn("actions/checkout@", steps[0]["uses"])
+                download = steps[1]
+                self.assertEqual(download.get("name"), "Download exact-run inventory plan")
+                self.assertEqual(download.get("id"), "plan")
+                self.assertEqual(download.get("uses"),
+                                 "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333")
+                self.assertEqual(download.get("with"), {"name": "nightly-plan"})
+                self.assertNotIn("if", download)
+                self.assertNotIn("continue-on-error", download)
+
+    def test_missing_plan_skips_setup_and_every_compiling_step(self):
+        for name in ("sweep-partition", "sweep-docs"):
+            for step in self.job(name)["steps"]:
+                run = step.get("run", "")
+                expensive = ("apt-get" in run or "createdb" in run
+                             or "generate_command_reference.py" in run
+                             or HELPER in run or "cargo " in run
+                             or "rust-toolchain@" in step.get("uses", "")
+                             or "actions/cache@" in step.get("uses", ""))
+                if not expensive:
+                    continue
+                with self.subTest(job=name, step=step.get("name")):
+                    if "cargo doc" in run:
+                        # A status function avoids implicit success(): docs still
+                        # run after doctest failure, but not a missing plan or cancellation.
+                        self.assertEqual(step.get("if"),
+                                         "${{ !cancelled() && steps.plan.outcome == 'success' }}")
+                    else:
+                        # The runner's implicit success() skips all setup/test work
+                        # after the early download fails; no failure-path override.
+                        self.assertNotIn("if", step)
+                    self.assertNotIn("continue-on-error", step)
+
     # --- helper source: the executable chain ------------------------------
     def helper_tree(self):
         return ast.parse(HELPER_PATH.read_text())
