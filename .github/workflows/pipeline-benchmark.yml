@@ -41,6 +41,7 @@ jobs:
             -c logging_collector=on -c log_destination=jsonlog
             -c log_min_duration_statement=0
             -c log_rotation_age=0 -c log_rotation_size=0
+            -c autovacuum=off
         options: >-
           --health-cmd "pg_isready -U agent_test -d two_bot_test_pipeline_bench"
           --health-interval 5s --health-timeout 5s --health-retries 12

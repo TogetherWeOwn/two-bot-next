@@ -37,6 +37,7 @@ settings (Postgres 18):
 -c logging_collector=on -c log_destination=jsonlog
 -c log_min_duration_statement=0
 -c log_rotation_age=0 -c log_rotation_size=0
+-c autovacuum=off
 ```
 
 Never enable these settings on a shared staging/production server for a benchmark.
@@ -152,6 +153,14 @@ All server observations come from a **second disposable database**, filtered to
 the unique measured database. Observer reads cannot add transactions or SQLx
 queries to the replay window. Flush setup statistics on each writer connection
 before the first snapshot; close writer backends before the final snapshot.
+`pg_stat_database` includes autovacuum/autoanalyze transactions, which are not
+client dispatches. Initialize this fresh disposable server with `autovacuum=off`;
+both snapshots reject an enabled setting. This excludes unrelated maintenance
+from the fixture, not dispatch work from the metric. CI initially observed 935
+commits for 900 dispatches with maintenance enabled; a disposable reproduction
+with a one-second maintenance cadence observed 1135 commits. No guessed offset
+or tolerance is subtracted. Never disable maintenance on staging/production.
+The existing negative accounting tests still reject every extra transaction.
 
 - `server_xact_commit` is the `pg_stat_database` commit delta minus **exactly two
   known observer transactions**. These are simple-query start/stop marker

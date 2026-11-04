@@ -263,6 +263,17 @@ impl ServerSnapshot {
     /// view installed in the observer fixture. Never silently substitute client
     /// counts when server instrumentation is unavailable.
     pub async fn read(observer: &PgPool, measured_database: &str) -> Result<Self> {
+        // pg_stat_database includes maintenance transactions, not just client
+        // work. The newly initialized disposable server must disable autovacuum;
+        // never infer/subtract its contributions from a mismatched result.
+        let autovacuum: bool = sqlx::query_scalar("SELECT current_setting('autovacuum')::boolean")
+            .fetch_one(observer)
+            .await
+            .context("read disposable server maintenance configuration")?;
+        ensure!(
+            !autovacuum,
+            "independent transaction accounting requires autovacuum=off on the disposable server"
+        );
         sqlx::query("SELECT pg_stat_clear_snapshot()")
             .execute(observer)
             .await
@@ -404,6 +415,35 @@ mod tests {
         observer.close().await.unwrap();
         stopped.unwrap();
         assert_eq!(profile.unwrap().values().sum::<i64>(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable test database with pg_stat_statements"]
+    async fn server_snapshots_require_disabled_autovacuum() {
+        let raw = std::env::var("TWO_TEST_DATABASE_URL").unwrap();
+        let db = TestDatabase::create(&raw, &sqlx::migrate::Migrator::DEFAULT)
+            .await
+            .unwrap();
+        let (db, observer) = add_observer(&raw, db).await.unwrap();
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+            .execute(observer.pool())
+            .await
+            .unwrap();
+        let autovacuum: bool = sqlx::query_scalar("SELECT current_setting('autovacuum')::boolean")
+            .fetch_one(observer.pool())
+            .await
+            .unwrap();
+        let snapshot = ServerSnapshot::read(observer.pool(), db.name()).await;
+        db.close().await.unwrap();
+        observer.close().await.unwrap();
+        if autovacuum {
+            assert!(
+                snapshot.unwrap_err().to_string().contains("autovacuum"),
+                "background maintenance transactions must invalidate server accounting"
+            );
+        } else {
+            snapshot.unwrap();
+        }
     }
 
     #[tokio::test]
