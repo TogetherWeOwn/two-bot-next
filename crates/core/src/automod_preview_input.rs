@@ -8,12 +8,15 @@
 //! carry fixed messages only — never the submitted text or any normalized,
 //! matched, or digested form of it.
 //!
-//! Commas separate attachment entries, so no single entry can contain one:
-//! `safe.exe,txt` as an option value is unambiguously two bare names. An
-//! empty entry (leading, trailing, or doubled comma) refuses instead of
-//! silently dropping, and [`build_preview_message`] re-validates every name
-//! (including a comma check) so a comma-bearing name can never reach the
-//! matcher through this path.
+//! Only comma followed by one ASCII space separates attachment entries:
+//! `safe.exe, txt` decodes to `safe.exe` and `txt`; `safe.exe,txt` refuses.
+//! The delimiter consumes exactly those two characters; extra spaces and
+//! every other filename character are preserved, with no trimming or CSV
+//! quoting/escaping. Empty entries and residual commas refuse the entire
+//! option. [`build_preview_message`] re-validates names as defense in depth.
+//! Raw and decoded inputs redact submitted content in all Debug output.
+
+use std::fmt;
 
 use crate::automod::{normalize_content, AutomodMessage};
 
@@ -30,11 +33,21 @@ pub const PREVIEW_FILENAME_MAX_UTF16: usize = 255;
 /// `CommandOptionValue` onto this shape (`String` → `Text`,
 /// `Integer` → `Integer`, anything else → `Other`); core never sees Discord
 /// types, so these decoders stay testable offline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PreviewOptionValue<'a> {
     Text(&'a str),
     Integer(i64),
     Other,
+}
+
+impl fmt::Debug for PreviewOptionValue<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(_) => f.write_str("Text([REDACTED])"),
+            Self::Integer(value) => f.debug_tuple("Integer").field(value).finish(),
+            Self::Other => f.write_str("Other"),
+        }
+    }
 }
 
 /// Strict-decode refusal. Every [`message`](PreviewInputRefusal::message) is a
@@ -75,10 +88,10 @@ impl PreviewInputRefusal {
             }
             Self::TooManyAttachments => "Supply at most 10 attachment filenames.",
             Self::EmptyFilename => {
-                "Attachment filenames must be non-empty; check commas separate exactly the intended names."
+                "Attachment filenames must be non-empty; separate names only with comma followed by ASCII space."
             }
             Self::BadFilename => {
-                "Attachment filenames must be bare names without slashes or control characters."
+                "Use bare filenames without slashes, commas or controls; separate names only with comma followed by ASCII space."
             }
             Self::BlankText => {
                 "Blank text alone has no postable form; add mentions or attachments, or supply visible text."
@@ -89,12 +102,23 @@ impl PreviewInputRefusal {
 
 /// Strictly decoded `/automod-preview` options, ready for gating and
 /// evaluation. `text_len_utf16` feeds the content-free audit length bucket.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DecodedPreviewInput {
     pub text: String,
     pub text_len_utf16: u32,
     pub mention_count: usize,
     pub attachment_names: Vec<String>,
+}
+
+impl fmt::Debug for DecodedPreviewInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecodedPreviewInput")
+            .field("text", &format_args!("[REDACTED]"))
+            .field("text_len_utf16", &self.text_len_utf16)
+            .field("mention_count", &self.mention_count)
+            .field("attachment_names", &format_args!("[REDACTED]"))
+            .finish()
+    }
 }
 
 fn utf16_len(value: &str) -> usize {
@@ -104,19 +128,19 @@ fn utf16_len(value: &str) -> usize {
 fn valid_filename(name: &str) -> bool {
     let len = utf16_len(name);
     (1..=PREVIEW_FILENAME_MAX_UTF16).contains(&len)
-        && !name.bytes().any(|b| b == b'/' || b == b'\\')
+        && !name.bytes().any(|b| b == b'/' || b == b'\\' || b == b',')
         && !name.chars().any(|c| c.is_control())
 }
 
-/// Strictly decode one attachments option value into bare filenames. Empty
-/// entries refuse (no silent boundary normalization); entries with slashes
-/// or control characters refuse. Commas cannot survive inside an entry —
-/// they are the separator — and the message builder re-checks that.
+/// Strictly decode one attachments option using only comma + ASCII space
+/// as the delimiter. Preserve every other character, including extra spaces.
+/// Empty entries, slashes, control characters and residual commas refuse the
+/// whole option; there is no quoting, escaping, trimming or prefix salvage.
 pub fn parse_attachment_list(value: &str) -> Result<Vec<String>, PreviewInputRefusal> {
     if utf16_len(value) > PREVIEW_ATTACHMENTS_OPTION_MAX_UTF16 {
         return Err(PreviewInputRefusal::AttachmentsBounds);
     }
-    let names: Vec<&str> = value.split(',').collect();
+    let names: Vec<&str> = value.split(", ").collect();
     if names.len() > PREVIEW_ATTACHMENTS_MAX_FILES {
         return Err(PreviewInputRefusal::TooManyAttachments);
     }
@@ -227,7 +251,7 @@ pub fn build_preview_message(
     if input
         .attachment_names
         .iter()
-        .any(|name| name.contains(',') || !valid_filename(name))
+        .any(|name| !valid_filename(name))
     {
         return Err(PreviewInputRefusal::BadFilename);
     }
