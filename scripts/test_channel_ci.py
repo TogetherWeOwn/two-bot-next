@@ -1,4 +1,4 @@
-"""Offline checks for guarded channel suites and self-hosted nightly isolation."""
+"""Offline checks for guarded channel suites and public-hosted nightly isolation."""
 
 import os
 import re
@@ -20,11 +20,11 @@ class ChannelCiTests(unittest.TestCase):
         self.workflow = (ROOT / ".github/workflows/nightly.yml").read_text()
 
     def assert_isolated(self, workflow):
-        # Public-repo routing (TOG-12339): the shared fromJSON expression
-        # selects ubuntu-latest for public repos, so the literal appears in
-        # the expression. What isolation forbids is a hardcoded runner.
-        self.assertNotIn("runs-on: ubuntu-latest", workflow)
-        self.assertIn("!github.event.repository.private", workflow)
+        # Host selection is explicit; database isolation still comes from
+        # the job container and service network, not private runner labels.
+        self.assertEqual(len(re.findall(r"(?m)^    runs-on: ubuntu-latest$", workflow)), 3)
+        self.assertNotIn("CI_OVERFLOW_", workflow)
+        self.assertNotIn("!github.event.repository.private", workflow)
         self.assertNotIn("        ports:", workflow)
         self.assertIn("    container:\n      image: rust:1.99-trixie@sha256:", workflow)
         prepare = step(workflow, "Prepare isolated test databases")

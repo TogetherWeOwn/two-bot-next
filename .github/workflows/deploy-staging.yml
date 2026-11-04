@@ -103,10 +103,9 @@ jobs:
     name: soak hold (defer push deploys while armed)
     permissions:
       contents: read # the minimal-grants test requires an explicit grant; the job uses no token
-    # Runner routing: same expression as every job in every workflow; see the
-    # note on `check` in check.yml. A bare self-hosted label would queue
-    # forever on the public repo.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'soak-hold') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
+    # note on `check` in check.yml.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Defer the push while the soak hold is armed
@@ -158,10 +157,9 @@ jobs:
     # this gate never runs; dispatches and unheld pushes proceed unchanged.
     needs: soak-hold
     environment: staging-migrate-plan
-    # Runner routing: same expression as every job in every workflow; see the
-    # note on `check` in check.yml. A bare self-hosted label would queue
-    # forever on the public repo.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'schema-gate') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
+    # note on `check` in check.yml.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
       image: rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137
@@ -228,10 +226,9 @@ jobs:
     # this gate never runs; dispatches and unheld pushes proceed unchanged.
     needs: soak-hold
     environment: staging-migrate-plan
-    # Runner routing: same expression as every job in every workflow; see the
-    # note on `check` in check.yml. A bare self-hosted label would queue
-    # forever on the public repo.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'roles-gate') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
+    # note on `check` in check.yml.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
       image: rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137
@@ -287,7 +284,7 @@ jobs:
       contents: read # checkout only; the deploy authenticates with `staging` environment secrets
       deployments: write # derive the deploy ID from today's staging Deployments, then record this one
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'deploy') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     # TOG-11143: STAGING_OWNERSHIP_CONTROL_TOKEN is a `staging` environment
     # secret (TOG-12030); the job must declare the environment to read it.
     environment: staging
@@ -669,7 +666,7 @@ jobs:
     permissions:
       contents: read
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'user-flow-synthetic') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -714,10 +711,9 @@ jobs:
     needs: voice-synthetic
     permissions:
       contents: read # the minimal-grants test requires an explicit grant; the job uses no token
-    # Runner routing: same expression as every job in every workflow; see the
-    # note on `check` in check.yml. A bare self-hosted label would queue
-    # forever on the public repo.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'pinned-history-guard') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
+    # note on `check` in check.yml.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Fail the run when the drill deployed a pin below the head
@@ -738,7 +734,7 @@ jobs:
     name: certify immutable staging bytes
     needs: [deploy, voice-synthetic, help-embed-synthetic, user-flow-synthetic, pinned-history-guard]
     if: success() && needs.deploy.outputs.promotion_clean == 'true' && vars.VOICE_SYNTHETIC_REQUIRED != 'false'
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'certify-promotion') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read

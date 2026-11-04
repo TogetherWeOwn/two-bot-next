@@ -27,9 +27,9 @@ jobs:
     name: affected paths
     permissions:
       contents: read
-    # Runner routing (TOG-12339): public repo -> GitHub-hosted, private ->
-    # CI_OVERFLOW_* switch for this named job, then the self-hosted pool.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'changes') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: explicit standard GitHub-hosted ubuntu-latest; this is
+    # a public repository.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
@@ -132,7 +132,7 @@ jobs:
     # PRs. The required nextest lane now reports through check.yml.
     if: always()
     # Runner routing: see the note on `changes`.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'report') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
