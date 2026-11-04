@@ -73,12 +73,16 @@ def check_execution(output, expected, results):
         if not match:
             raise ValueError("libtest result log contains a failed, ignored or unknown record")
         completed.append(match[1])
-    summaries = re.findall(
-        r"(?m)^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured;", output
+    # The serial harness closes with its summary after test/child diagnostics.
+    # Earlier summary-looking lines are diagnostics, not extra harness results.
+    lines = output.rstrip().splitlines()
+    summary = re.match(
+        r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured;",
+        lines[-1] if lines else "",
     )
     if (not expected or len(set(completed)) != len(completed)
             or sorted(completed) != sorted(expected)
-            or summaries != [(str(len(expected)), "0", "0", "0")]):
+            or summary is None or summary.groups() != (str(len(expected)), "0", "0", "0")):
         raise ValueError("execution differs from non-empty expected inventory")
 
 
@@ -191,16 +195,17 @@ def run_partition(plan, index, test_args, receipt, sha):
             output = []
             # Stream diagnostics unchanged; only the result file supplies names.
             # The event-bound workflow timeout remains the outer process-tree cap.
-            with subprocess.Popen(args + ["--logfile", str(results)], cwd=target["cwd"], env=target["env"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+            with subprocess.Popen(args + ["--logfile", str(results)], cwd=target["cwd"], env=target["env"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
                 for line in process.stdout:
-                    print(line, end="", flush=True)
+                    sys.stdout.buffer.write(line)
+                    sys.stdout.buffer.flush()
                     output.append(line)
                 code = process.wait()
             print("::endgroup::", flush=True)
             try:
                 if code:
                     raise ValueError(f"libtest exit {code}")
-                check_execution("".join(output), names, results.read_text())
+                check_execution(b"".join(output).decode("utf-8", errors="replace"), names, results.read_text())
             except (ValueError, OSError) as error:
                 failures.append(f"{key}: {error}")
             else:

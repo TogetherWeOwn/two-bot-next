@@ -49,6 +49,9 @@ for name in selected:
     if os.environ.get('FAKE_CHILD_OUTPUT'):
         subprocess.run([sys.executable, '-I', '-c',
             'import sys; sys.stdout.write(sys.argv[1])', os.environ['FAKE_CHILD_OUTPUT']], check=True)
+    if os.environ.get('FAKE_CHILD_BYTES'):
+        subprocess.run([sys.executable, '-I', '-c',
+            'import os, sys; os.write(1, bytes.fromhex(sys.argv[1]))', os.environ['FAKE_CHILD_BYTES']], check=True)
     print('ok')
 if '--logfile' in args and os.environ.get('FAKE_MISSING_RESULTS') not in ['1', config['target']]:
     results = os.environ.get('FAKE_RESULTS', ''.join('ok ' + name + '\\n' for name in selected))
@@ -164,20 +167,53 @@ class ExecutionTests(unittest.TestCase):
 
     def test_child_diagnostic_without_newline_does_not_corrupt_results(self):
         plan = self.plan()
-        output = io.StringIO()
+        output = io.TextIOWrapper(io.BytesIO(), encoding='utf-8')
+        self.addCleanup(output.close)
         with mock.patch.dict(os.environ, {'FAKE_CHILD_OUTPUT': 'child diagnostic'}), contextlib.redirect_stdout(output):
             receipt = self.root / 'receipt.json'
             nightly.run_partition(plan, 0, self.args, receipt, 'fixture-sha')
-        self.assertIn(' ... child diagnosticok\n', output.getvalue())
+        self.assertIn(' ... child diagnosticok\n', output.buffer.getvalue().decode('utf-8'))
         self.assertEqual(json.loads(receipt.read_text())['executed'], plan['partitions'][0])
 
     def test_child_bare_ok_does_not_complete_a_pending_result(self):
         plan = self.plan()
-        output = io.StringIO()
+        output = io.TextIOWrapper(io.BytesIO(), encoding='utf-8')
+        self.addCleanup(output.close)
         with mock.patch.dict(os.environ, {'FAKE_CHILD_OUTPUT': 'ok\n'}), contextlib.redirect_stdout(output):
             receipt = self.root / 'receipt.json'
             nightly.run_partition(plan, 0, self.args, receipt, 'fixture-sha')
-        self.assertIn(' ... ok\nok\n', output.getvalue())
+        self.assertIn(' ... ok\nok\n', output.buffer.getvalue().decode('utf-8'))
+        self.assertEqual(json.loads(receipt.read_text())['executed'], plan['partitions'][0])
+
+    def test_child_summary_diagnostics_do_not_replace_enclosing_summary(self):
+        plan = self.plan()
+        child = '\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;\n'
+        output = io.TextIOWrapper(io.BytesIO(), encoding='utf-8')
+        self.addCleanup(output.close)
+        with mock.patch.dict(os.environ, {'FAKE_CHILD_OUTPUT': child}), contextlib.redirect_stdout(output):
+            receipt = self.root / 'receipt.json'
+            nightly.run_partition(plan, 0, self.args, receipt, 'fixture-sha')
+        output.flush()
+        self.assertIn(child.encode(), output.buffer.getvalue())
+        self.assertEqual(json.loads(receipt.read_text())['executed'], plan['partitions'][0])
+        for summary in ['', 'test result: FAILED. 1 passed; 0 failed; 0 ignored; 0 measured;',
+                        'test result: ok. 999 passed; 0 failed; 0 ignored; 0 measured;',
+                        'test result: ok. 1 passed; 1 failed; 0 ignored; 0 measured;']:
+            bad = self.root / 'bad.json'
+            with self.subTest(summary=summary), mock.patch.dict(os.environ, {
+                    'FAKE_CHILD_OUTPUT': child, 'FAKE_SUMMARY': summary}), self.assertRaises(ValueError):
+                nightly.run_partition(plan, 0, self.args, bad, 'fixture-sha')
+            self.assertFalse(bad.exists())
+
+    def test_non_utf8_child_diagnostics_stream_verbatim(self):
+        plan = self.plan()
+        output = io.TextIOWrapper(io.BytesIO(), encoding='utf-8', errors='surrogateescape')
+        self.addCleanup(output.close)
+        with mock.patch.dict(os.environ, {'FAKE_CHILD_BYTES': 'fffe00'}), contextlib.redirect_stdout(output):
+            receipt = self.root / 'receipt.json'
+            nightly.run_partition(plan, 0, self.args, receipt, 'fixture-sha')
+        output.flush()
+        self.assertIn(b' ... \xff\xfe\x00ok\n', output.buffer.getvalue())
         self.assertEqual(json.loads(receipt.read_text())['executed'], plan['partitions'][0])
 
     def test_good_console_cannot_replace_bad_or_missing_isolated_evidence(self):

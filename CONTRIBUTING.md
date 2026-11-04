@@ -132,8 +132,10 @@ Native test processes
 retain their package working directory; the partition helper does not use
 nextest's per-test process isolation or llvm-cov's failure-tolerance flags.
 Each invocation uses a fresh libtest `--logfile` for exact status/name evidence,
-independent of inherited child stdout/stderr. Console diagnostics still stream
-unchanged; the successful summary/counts and process exit remain mandatory.
+independent of inherited child stdout/stderr. Console diagnostic bytes still stream
+unchanged, including non-UTF-8 output. Only the closing harness summary supplies
+summary/count evidence; earlier summary-looking child lines are diagnostics.
+The successful closing summary/counts and process exit remain mandatory.
 Missing, empty, duplicate, failed, ignored or unknown result records fail closed.
 The pinned Rust 1.99.1 supports this deprecated flag; recheck its protocol when
 upgrading the toolchain rather than falling back to parsing mixed console output.

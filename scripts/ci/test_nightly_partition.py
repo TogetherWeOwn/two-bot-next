@@ -99,6 +99,10 @@ print('test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 7 filtered ou
                 "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n")
         results = "ok tests::one\nok tests::two\n"
         nightly.check_execution(good, ["tests::one", "tests::two"], results)
+        # Even a diagnostic copy of the full console is not result evidence.
+        nightly.check_execution(good + good, ["tests::one", "tests::two"], results)
+        with self.assertRaises(ValueError):
+            nightly.check_execution(good + good, ["tests::one", "tests::two"], results + results)
         # Console diagnostics, even status-looking bytes, cannot supply results.
         for records in ["", results.replace("ok tests::one\n", ""),
                         results.replace("ok tests::one", "failed tests::one"),
@@ -111,7 +115,7 @@ print('test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 7 filtered ou
                 nightly.check_execution(good, ["tests::one", "tests::two"], records)
         for output in [good.replace("2 passed", "1 passed"), good.replace("0 ignored", "1 ignored"),
                        good.replace("0 failed", "1 failed"), good.replace("0 measured", "1 measured"),
-                       good.replace("test result: ok.", "test result: FAILED."), good + good]:
+                       good.replace("test result: ok.", "test result: FAILED."), good + "not a closing summary\n"]:
             with self.subTest(output=output), self.assertRaises(ValueError):
                 nightly.check_execution(output, ["tests::one", "tests::two"], results)
 
