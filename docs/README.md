@@ -1,6 +1,6 @@
 # Docs map
 
-Rows: `- [Purpose](relative.md)`. Run `python3 scripts/check_docs_index.py --json`.
+Rows: `- [Purpose](relative.md)`.
 Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## References
@@ -283,6 +283,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 ## Engineering and security
 
 - [Quality gates](quality-gates.md)
+- [Review roles](review-panel-roles.md)
 - [CI security](ci-security.md)
 - [CI speed rollout](ci-speed-rollout.md)
 - [Delivery](dora-metrics.md)
