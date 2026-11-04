@@ -152,8 +152,10 @@ The `supply-chain` Actions artifact includes:
   a new severity gate;
 - `runtime-crates-check.json`: source SHA, immutable local image ID, native
   config digest (`config_id`), SHA-256 of the lockfile and both native reports,
-  runtime/match counts and explicitly
-  listed `lockfile_only` name/version tuples;
+  runtime/locked/match counts, separate `runtime_crate_tuples` (R) and complete
+  `locked_crate_tuples` (L) name/version views, and the explicit `lockfile_only`
+  complement (O). `runtime_completeness: "not_proven"` distinguishes accounting
+  from an independent completeness claim;
 - `runtime-crates.sha256`: separate checksums for these diagnostic JSON files
   and the source SHA/image ID. The release `SHA256SUMS` contract is unchanged;
   these diagnostic files are not uploaded as release assets.
@@ -172,13 +174,26 @@ locations or unmatched tuples fail closed. Missing metadata in an older image
 also fails validation; rebuilding a historical tag does not retrofit the new
 Dockerfile into that tag.
 
-This is **subset reconciliation, not equality with Cargo.lock**: workspace,
-optional, build, development and other-target packages need not ship. Native
-metadata is not function-level reachability and may conservatively include
-unused runtime dependencies. Missing or partial scan evidence is unknown, not
-proof that a crate is absent. Lockfile-only entries are never suppressed from
-the existing dependency gate or treated as free of development/CI or
-supply-chain risk. The check always records `suppressed_count: 0`.
+This is **exact partition accounting, not equality with Cargo.lock**. R and L
+are unique name/version tuples, O = L − R, R ⊆ L, R ∩ O = ∅ and R ∪ O = L.
+The receipt enumerates all three sets deterministically, without inserting
+lockfile-only tuples into the native Syft inventory. Counts come from this
+build, not fixed acceptance constants. Workspace, optional, build, development
+and other-target packages need not ship; those possibilities do not classify
+any particular tuple. Label O **lockfile-only / not reported in this native
+runtime inventory**, never dev-only, safe, unreachable or absent from the
+executable without package-specific evidence.
+
+Partition accounting and the three required crate names are sanity checks,
+not proof that R contains every runtime dependency. A negative runtime-exposure
+or VEX conclusion requires independent, relevant completeness evidence first.
+Native metadata is not function-level reachability and may conservatively
+include unused runtime dependencies. Missing or partial scan evidence is
+unknown, not proof that a crate is absent. Lockfile-only status or absence from
+R never automatically suppresses a finding, discards development/CI or
+supply-chain risk, or accepts a vulnerability. The complete lockfile gate,
+severity thresholds and treatment of unfixed findings are unchanged. The check
+always records `suppressed_count: 0`.
 
 After downloading an artifact into a fresh run-owned directory:
 

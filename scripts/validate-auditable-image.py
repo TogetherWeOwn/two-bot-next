@@ -36,6 +36,10 @@ def package_tuple(package):
     return name, version
 
 
+def tuple_records(tuples):
+    return [dict(name=name, version=version) for name, version in sorted(tuples)]
+
+
 def validate(directory):
     image_id = sbom.read_capped_text(directory / "image-id.txt", 100).strip()
     source_sha = sbom.read_capped_text(directory / "source-sha.txt", 100).strip()
@@ -71,7 +75,7 @@ def validate(directory):
             raise ValueError("Crate evidence did not come from the runtime binary")
         crates.add(package_tuple(package))
     if not {"two-bot", "tokio", "libc"}.issubset({name for name, _ in crates}):
-        raise ValueError("Empty or incomplete runtime crate inventory")
+        raise ValueError("Empty runtime crate inventory or missing required crate names")
     if crates - locked:
         raise ValueError("Runtime inventory contains crates absent from Cargo.lock")
 
@@ -92,9 +96,12 @@ def validate(directory):
         checksums[name] = hashlib.sha256((directory / name).read_bytes()).hexdigest()
     return {
         "source_sha": source_sha, "image_id": image_id, "config_id": config_id, "sha256": checksums,
-        "runtime_crates": len(crates), "grype_matches": len(report["matches"]),
-        "lockfile_only": [dict(name=name, version=version) for name, version in sorted(locked - crates)],
-        "suppressed_count": 0,
+        "runtime_crates": len(crates), "locked_crates": len(locked),
+        "grype_matches": len(report["matches"]),
+        "runtime_crate_tuples": tuple_records(crates),
+        "locked_crate_tuples": tuple_records(locked),
+        "lockfile_only": tuple_records(locked - crates),
+        "runtime_completeness": "not_proven", "suppressed_count": 0,
     }
 
 

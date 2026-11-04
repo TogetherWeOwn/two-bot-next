@@ -105,6 +105,53 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual(set(result["sha256"]), {
             "Cargo.lock", "runtime-crates.syft.json", "runtime-crates.grype.json"})
 
+    def assert_partition(self, result, runtime, locked):
+        def tuples(rows):
+            return {(row["name"], row["version"]) for row in rows}
+
+        r = tuples(result["runtime_crate_tuples"])
+        l = tuples(result["locked_crate_tuples"])
+        o = tuples(result["lockfile_only"])
+        self.assertEqual(r, runtime)
+        self.assertEqual(l, locked)
+        self.assertLessEqual(r, l)
+        self.assertEqual(o, l - r)
+        self.assertFalse(r & o)
+        self.assertEqual(r | o, l)
+        self.assertEqual(result["runtime_crates"], len(r))
+        self.assertEqual(result["locked_crates"], len(l))
+        self.assertEqual(result["runtime_completeness"], "not_proven")
+        for key in ("runtime_crate_tuples", "locked_crate_tuples", "lockfile_only"):
+            rows = [(row["name"], row["version"]) for row in result[key]]
+            self.assertEqual(rows, sorted(set(rows)))
+
+    def test_receipt_preserves_exact_separate_runtime_and_lockfile_views(self):
+        runtime = {("two-bot", "0.1.0"), ("tokio", "1.40.0"), ("libc", "0.2.150")}
+        self.assert_partition(module.validate(self.dir), runtime,
+                              runtime | {("dev-only-crate", "9.9.9")})
+
+    def test_partition_deduplicates_tuples_but_preserves_multiple_versions(self):
+        inv = inventory()
+        inv["artifacts"].extend([artifact("tokio", "1.40.0"), artifact("tokio", "1.39.0")])
+        self.write(inv)
+        (self.dir / "Cargo.lock").write_text(LOCK + '\n[[package]]\nname = "tokio"\n'
+                                           'version = "1.39.0"\n\n[[package]]\n'
+                                           'name = "tokio"\nversion = "1.40.0"\n')
+        runtime = {("two-bot", "0.1.0"), ("tokio", "1.40.0"), ("tokio", "1.39.0"),
+                   ("libc", "0.2.150")}
+        self.assert_partition(module.validate(self.dir), runtime,
+                              runtime | {("dev-only-crate", "9.9.9")})
+
+    def test_empty_complement_is_valid_but_does_not_prove_runtime_completeness(self):
+        inv = inventory()
+        inv["artifacts"].append(artifact("dev-only-crate", "9.9.9"))
+        self.write(inv)
+        locked = {("two-bot", "0.1.0"), ("tokio", "1.40.0"), ("libc", "0.2.150"),
+                  ("dev-only-crate", "9.9.9")}
+        result = module.validate(self.dir)
+        self.assert_partition(result, locked, locked)
+        self.assertEqual(result["lockfile_only"], [])
+
     def test_containerd_manifest_id_binds_to_native_config_digest(self):
         inv, rep = inventory(), report()
         config_id = "sha256:" + "c" * 64
