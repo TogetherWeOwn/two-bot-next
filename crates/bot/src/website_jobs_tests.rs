@@ -15,6 +15,33 @@ use crate::tracing_capture;
 mod website_event_age_acceptance_tests;
 
 #[test]
+fn raw_event_carries_confirmed_end_null_and_rejects_malformed_types() {
+    let event = |end: Option<Value>| {
+        let mut value = json!({
+            "id": "100000000000000001",
+            "guild_id": "100000000000000002",
+            "name": "Night",
+            "scheduled_start_time": "2026-09-06T18:00:00Z",
+            "status": 1,
+        });
+        if let Some(end) = end {
+            value["scheduled_end_time"] = end;
+        }
+        raw_event(&value, "100000000000000002")
+    };
+    let confirmed = event(Some(json!("2026-09-06T20:00:00Z"))).unwrap();
+    assert_eq!(
+        confirmed.scheduled_end_time.as_deref(),
+        Some("2026-09-06T20:00:00Z")
+    );
+    assert_eq!(event(Some(Value::Null)).unwrap().scheduled_end_time, None);
+    assert_eq!(event(None).unwrap().scheduled_end_time, None);
+    assert!(event(Some(json!(5))).is_err());
+    let malformed = event(Some(json!("not-a-date"))).unwrap();
+    assert!(two_bot_core::scheduled_events::normalize_event(&malformed).is_none());
+}
+
+#[test]
 fn admission_lazy_pool_rejects_query_secrets_before_sqlx_logging() {
     let capture = tracing_capture::Capture::default();
     tracing::subscriber::with_default(capture.clone(), || {

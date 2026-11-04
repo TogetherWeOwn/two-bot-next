@@ -342,6 +342,7 @@ fn one_malformed_poll_row_rejects_the_snapshot() {
         id: Some("event-1".to_owned()),
         name: Some("Game night".to_owned()),
         scheduled_start_time: Some("2026-09-06T18:00:00.000Z".to_owned()),
+        scheduled_end_time: None,
         channel_id: None,
         description: None,
         status: Some(1),

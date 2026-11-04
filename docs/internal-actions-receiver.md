@@ -423,6 +423,28 @@ Success (`200` only, `result` always an object, no `error` key):
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
 | moderation.\* | `{outcome[, affected]}` | |
 
+Snapshot event links use accepted, non-member `event_instance_windows`
+evidence (migration 0472), not channel-claim dates or the continued existence
+of a mirror row. Poll swaps and confirmed action responses synchronize it in
+the mirror transaction. Rescheduling updates the window, never the immutable
+instance identity. A completed event with a confirmed end retains only its
+original end + 15 minutes after ordinary mirror omission; omission of a live
+or unknown event does not manufacture completion. The committed guild snapshot
+epoch fences stale/equal liveness replays, even for a never-mirrored legacy
+binding. Ordinary omission records a separate `omitted_at` fence for ordering
+and rollback recency without advancing the last confirmed lifecycle stamp:
+a delayed terminal observation newer than that stamp still applies to an
+established instance. Confirmed completion with a finite end proves grace;
+cancellation or confirmed deletion revokes it, even if a compatibility-only
+mirror replay has a newer stamp. Ambiguous instances or multiple site aliases omit
+`event_key`; database failure still refuses the snapshot. Legacy bindings
+alone never backfill live evidence. This does not add end times to `event.read`,
+change v1, persist occupancy or require a new privileged gateway intent.
+Confirmed deletion has a transactional store seam; no gateway deletion consumer
+or additional gateway intent is added here. An ordinary missing poll row is
+never treated as a confirmed deletion.
+The production snapshot flag remains off pending separate rollout acceptance.
+
 Refusals keep their code, status and retry policy with the fixed message
 `request refused`:
 

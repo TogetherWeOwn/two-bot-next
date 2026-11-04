@@ -2454,17 +2454,6 @@ async fn voice_snapshot_windowed_event_key_stamps_the_linked_room() {
         ),
     ] {
         sqlx::query(
-            "INSERT INTO scheduled_events (guild_id, event_id, name, starts_at, channel_id, status, updated_at) \
-             VALUES ($1, $2, 'fixture', '2026-11-03T10:00:00.000Z', $3, $4, '2026-11-03T10:00:00.000Z')",
-        )
-        .bind(staging_guild())
-        .bind(event_id)
-        .bind(channel)
-        .bind(status)
-        .execute(db.pool())
-        .await
-        .unwrap();
-        sqlx::query(
             "INSERT INTO internal_event_keys (guild_id, event_key, event_id) VALUES ($1, $2, $3)",
         )
         .bind(staging_guild())
@@ -2482,6 +2471,37 @@ async fn voice_snapshot_windowed_event_key_stamps_the_linked_room() {
         .bind(starts_in)
         .bind(ends_in)
         .execute(db.pool())
+        .await
+        .unwrap();
+        let (starts_at, ends_at): (String, Option<String>) = sqlx::query_as(
+            "SELECT to_char(starts_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+                    to_char(ends_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+             FROM event_voice_channels WHERE event_id = $1",
+        )
+        .bind(event_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let event = two_bot_core::scheduled_events::ScheduledEvent {
+            id: event_id.to_owned(),
+            name: "fixture".to_owned(),
+            starts_at,
+            ends_at,
+            channel_id: Some(channel.to_owned()),
+            description: None,
+            status: match status {
+                "completed" => two_bot_core::scheduled_events::EventStatus::Completed,
+                "active" => two_bot_core::scheduled_events::EventStatus::Active,
+                "cancelled" => two_bot_core::scheduled_events::EventStatus::Cancelled,
+                _ => two_bot_core::scheduled_events::EventStatus::Scheduled,
+            },
+        };
+        two_bot_core::website_store::upsert_event(
+            db.pool(),
+            staging_guild(),
+            "2026-11-03T10:00:00.000Z",
+            &event,
+        )
         .await
         .unwrap();
         if event_key == "orphaned" {

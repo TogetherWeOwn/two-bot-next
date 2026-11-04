@@ -1027,14 +1027,12 @@ impl InternalActionStore {
     /// per bound voice channel, only while the channel's event sits inside
     /// `[starts_at − 15 min, ends_at + 15 min]` per contract §9.
     ///
-    /// The window's source of truth is `event_voice_channels` (the
-    /// claim-bind lifecycle), joined to `internal_event_keys` for the site
-    /// address and to `scheduled_events` for the guild scope (neither event
-    /// voice table carries a guild column) and the mirror liveness. `orphaned`
-    /// binds and cancelled mirror rows never surface. Completed events keep
-    /// their key through a finite closing grace window, but without a known
-    /// end they cannot prove one. A `NULL ends_at` beside a live mirror status
-    /// (`scheduled`, `active`) is open-ended, with no closing edge.
+    /// Accepted `event_instance_windows` evidence supplies the window, guild
+    /// and lifecycle; `event_voice_channels` supplies only the exact-instance
+    /// binding. Missing, revoked, ambiguous and orphaned rows never surface.
+    /// Positively completed events with a known end keep their finite grace
+    /// even after ordinary exact-mirror omission. Unknown ends cannot prove
+    /// completed grace; scheduled/active evidence may be open-ended.
     /// A channel with more than one site key has no canonical address, so it
     /// is omitted rather than choosing an arbitrary alias. Store errors
     /// propagate so the caller refuses `internal` instead of serving
@@ -1051,14 +1049,19 @@ impl InternalActionStore {
              FROM event_voice_channels c \
              JOIN internal_event_keys k \
                ON k.guild_id = $1 AND k.event_id = c.event_id \
-             JOIN scheduled_events s \
-               ON s.guild_id = $1 AND s.event_id = c.event_id \
+             JOIN event_instance_windows w \
+               ON w.guild_id = $1 AND w.event_id = c.event_id \
+              AND w.instance_starts_at = c.instance_starts_at \
              WHERE c.voice_channel_id IS NOT NULL \
              AND c.status <> 'orphaned' \
-             AND (s.status IN ('scheduled', 'active') \
-                  OR (s.status = 'completed' AND c.ends_at IS NOT NULL)) \
-             AND c.starts_at <= NOW() + INTERVAL '15 minutes' \
-             AND (c.ends_at IS NULL OR c.ends_at >= NOW() - INTERVAL '15 minutes') \
+             AND w.is_current AND NOT w.identity_ambiguous AND w.revoked_at IS NULL \
+             AND NOT EXISTS (SELECT 1 FROM event_voice_channels other \
+                             WHERE other.event_id = c.event_id \
+                               AND other.instance_starts_at <> w.instance_starts_at) \
+             AND (w.status IN ('scheduled', 'active') \
+                  OR (w.status = 'completed' AND w.ends_at IS NOT NULL)) \
+             AND w.starts_at <= NOW() + INTERVAL '15 minutes' \
+             AND (w.ends_at IS NULL OR w.ends_at >= NOW() - INTERVAL '15 minutes') \
              GROUP BY c.voice_channel_id HAVING COUNT(*) = 1",
         )
         .bind(guild_id)

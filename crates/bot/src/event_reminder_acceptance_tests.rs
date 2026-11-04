@@ -84,6 +84,7 @@ fn raw_event(
         id: Some(id.to_owned()),
         name: Some(name.to_owned()),
         scheduled_start_time: Some(format_iso_millis(start_ms as i64)),
+        scheduled_end_time: None,
         channel_id: channel.map(str::to_owned),
         description: Some("Fixture event.".to_owned()),
         status: Some(status),
