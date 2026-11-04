@@ -563,7 +563,14 @@ async fn notify_claim_pins_bounded_event_key_through_release_and_suppression() {
             .unwrap_err(),
         InternalStoreError::InvalidInput
     );
-    for verb in ["reminder.send", "place_offer.send"] {
+    for (verb, member) in [
+        ("reminder.send", "345678901234567890"),
+        ("place_offer.send", "456789012345678901"),
+    ] {
+        let subject = AuditSubject {
+            target_id: Some(DiscordId::new(member).unwrap()),
+            ..subject.clone()
+        };
         let id = identity(&format!("notify-{verb}:123"), verb, b"payload");
         for invalid in ["".to_owned(), "has space".to_owned(), "k".repeat(65)] {
             assert_eq!(
@@ -636,6 +643,225 @@ async fn notify_claim_pins_bounded_event_key_through_release_and_suppression() {
         .await
         .unwrap();
     assert_eq!(intents, 2, "invalid claims never persist");
+    db.cleanup().await;
+}
+
+fn notify_subject() -> AuditSubject {
+    AuditSubject {
+        target_id: Some(DiscordId::new("345678901234567890").unwrap()),
+        ..subject()
+    }
+}
+
+#[tokio::test]
+async fn notify_budget_serializes_callers_and_survives_store_restart() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let second_pool = db.independent_pool().await;
+    let other = InternalActionStore::new(second_pool.clone());
+    let subject = notify_subject();
+    let a = identity("notify-concurrent-a", "reminder.send", b"a");
+    let b = RequestIdentity::new(
+        "other-caller",
+        "notify-concurrent-b",
+        "place_offer.send",
+        b"b",
+    )
+    .unwrap();
+    let c = identity("notify-concurrent-c", "place_offer.send", b"c");
+    let d = identity("notify-concurrent-d", "reminder.send", b"d");
+    let results = tokio::join!(
+        store.claim_notify(&a, &subject, "launch"),
+        other.claim_notify(&b, &subject, "launch"),
+        store.claim_notify(&c, &subject, "launch"),
+        other.claim_notify(&d, &subject, "launch"),
+    );
+    let mut owners = Vec::new();
+    let mut denied = 0;
+    for (id, result) in [&a, &b, &c, &d]
+        .into_iter()
+        .zip([results.0, results.1, results.2, results.3])
+    {
+        match result {
+            Ok(InternalClaim::Claimed(claim)) => owners.push((id, claim)),
+            Err(InternalStoreError::NotifyRateLimited { retry_after_secs }) => {
+                assert!(retry_after_secs > 0);
+                denied += 1;
+            }
+            other => panic!("unexpected claim result: {other:?}"),
+        }
+    }
+    assert_eq!(owners.len(), 3);
+    assert_eq!(denied, 1);
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM internal_idempotency), \
+         (SELECT count(*) FROM internal_action_log), \
+         (SELECT count(*) FROM internal_notify_budgets)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        counts,
+        (3, 3, 1),
+        "denial rolls back tentative claim and audit"
+    );
+    let before: (i64, i64, Vec<i64>) =
+        sqlx::query_as("SELECT credit_ms, updated_ms, admissions FROM internal_notify_budgets")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(before.2.len(), 3);
+    // Receipt, in-flight and mismatch reads still work with no allowance left.
+    let (owner_id, owner) = &owners[0];
+    assert!(matches!(
+        store
+            .claim_notify(owner_id, &subject, "launch")
+            .await
+            .unwrap(),
+        InternalClaim::InFlight
+    ));
+    assert!(matches!(
+        store
+            .claim_notify(owner_id, &subject, "changed")
+            .await
+            .unwrap(),
+        InternalClaim::Mismatch
+    ));
+    store.finish_suppressed(owner).await.unwrap();
+    for _ in 0..5 {
+        assert!(matches!(
+            other
+                .claim_notify(owner_id, &subject, "launch")
+                .await
+                .unwrap(),
+            InternalClaim::Replay(_)
+        ));
+    }
+    let after: (i64, i64, Vec<i64>) =
+        sqlx::query_as("SELECT credit_ms, updated_ms, admissions FROM internal_notify_budgets")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "non-executing reads never update allowance");
+    second_pool.close().await;
+    let restarted_pool = db.independent_pool().await;
+    let restarted = InternalActionStore::new(restarted_pool.clone());
+    let fresh = identity("notify-after-restart", "reminder.send", b"fresh");
+    assert!(matches!(
+        restarted.claim_notify(&fresh, &subject, "launch").await,
+        Err(InternalStoreError::NotifyRateLimited { .. })
+    ));
+    restarted_pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn notify_budget_preserves_daily_history_and_clock_high_water() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let subject = notify_subject();
+    let id = identity("notify-clock-seed", "reminder.send", b"seed");
+    claimed(store.claim_notify(&id, &subject, "launch").await.unwrap());
+    // Full credits cannot bypass a persisted ten-admission rolling window.
+    // A future high-water simulates database clock rollback without changing clocks.
+    sqlx::query(
+        "UPDATE internal_notify_budgets SET credit_ms = 25920000, \
+         updated_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint + 60000, \
+         admissions = array_fill(floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint, ARRAY[10])",
+    ).execute(&db.pool).await.unwrap();
+    let next = identity("notify-clock-next", "place_offer.send", b"next");
+    assert!(
+        matches!(store.claim_notify(&next, &subject, "launch").await, Err(InternalStoreError::NotifyRateLimited { retry_after_secs }) if retry_after_secs > 86000)
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_idempotency")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    // Rollback must not mint refill credits either, even with no daily ceiling.
+    sqlx::query("UPDATE internal_notify_budgets SET credit_ms = 0, admissions = '{}'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        matches!(store.claim_notify(&next, &subject, "launch").await, Err(InternalStoreError::NotifyRateLimited { retry_after_secs }) if retry_after_secs > 8640)
+    );
+    // Once all ten admissions are older than 24h, a new process may admit again.
+    sqlx::query(
+        "UPDATE internal_notify_budgets SET credit_ms = 25920000, \
+         updated_ms = floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint, \
+         admissions = array_fill(floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint - 86400001, ARRAY[10])",
+    ).execute(&db.pool).await.unwrap();
+    let restarted = db.store();
+    claimed(
+        restarted
+            .claim_notify(&next, &subject, "launch")
+            .await
+            .unwrap(),
+    );
+    let admissions: Vec<i64> = sqlx::query_scalar("SELECT admissions FROM internal_notify_budgets")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        admissions.len(),
+        1,
+        "expired rolling history is replaced atomically"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn notify_unsent_retries_count_and_denied_reacquisition_stays_released() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let subject = notify_subject();
+    let id = identity("notify-unsent-budget", "reminder.send", b"payload");
+    for _ in 0..3 {
+        let owner = claimed(store.claim_notify(&id, &subject, "launch").await.unwrap());
+        store.release_proven_not_sent(owner).await.unwrap();
+    }
+    assert!(matches!(
+        store.claim_notify(&id, &subject, "launch").await,
+        Err(InternalStoreError::NotifyRateLimited { .. })
+    ));
+    let state: String = sqlx::query_scalar("SELECT state FROM internal_idempotency")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        state, "not_sent",
+        "denial rolls back tentative reacquisition"
+    );
+    let admissions: Vec<i64> = sqlx::query_scalar("SELECT admissions FROM internal_notify_budgets")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(admissions.len(), 3);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn notify_budget_storage_failure_rolls_back_intent_and_audit() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    sqlx::query("DROP TABLE internal_notify_budgets")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let id = identity("notify-unavailable", "reminder.send", b"payload");
+    assert_eq!(
+        store
+            .claim_notify(&id, &notify_subject(), "launch")
+            .await
+            .unwrap_err(),
+        InternalStoreError::Unavailable
+    );
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM internal_idempotency), (SELECT count(*) FROM internal_action_log)",
+    ).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(counts, (0, 0));
     db.cleanup().await;
 }
 

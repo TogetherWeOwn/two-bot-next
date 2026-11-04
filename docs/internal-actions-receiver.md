@@ -25,6 +25,7 @@ owns scheduling and waitlist state, the bot only delivers a templated DM with
 a `/e/{event_key}` deep link, the consent backstop refuses suppressed members
 before any send, and a shared per-member budget (burst 3, at most 10 in any
 rolling 24 hours, including the initial burst) caps both verbs across callers
+and survives restarts, charged durably with each new claim (see the verb table)
 on top of the per-caller bucket. Notification member IDs must be canonical,
 nonzero `u64` snowflakes: leading-zero aliases and overflow are refused before
 member-budget, consent, audit or transport use), and the
@@ -180,7 +181,7 @@ in `docs/production-deploy.md`).
 1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values), only under the separately authorized enablement contract; no role keys or optional capability gates travel through this Worker.
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
-4. Operator applies migrations `0423` (settings CAS), `0424` (event outcome), and `0471` (member-notify idempotency verbs) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
+4. Operator applies migrations `0423` (settings CAS), `0424` (event outcome), and `0471` (member-notify idempotency verbs and the durable member budget table) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
 5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete --env staging TWO_INTERNAL_ACTIONS --message <sha>`, same precheck and stamp as above), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
 
 Migration `0424` adds the nullable `internal_idempotency.outcome` column that
@@ -209,6 +210,20 @@ compatible. For rollback, disable the receiver and deploy the previous binary;
 leave the additive columns and widened constraints in place so notification
 receipts remain available. Restoring the old constraints requires separately
 handling retained notification rows, not deleting their evidence.
+
+`0471` also creates `internal_notify_budgets`, the durable per-member limiter.
+Its primary key is the lowercase SHA-256 hex of `notify:<canonical discord_id>`
+(CHECK `^[a-f0-9]{64}$`), so no member ID, event name or DM text is stored. The
+other columns are numeric only: `credit_ms` (0 to 25,920,000, the 3-admission
+burst), `updated_ms` and `admissions` (a `BIGINT[]` of at most 10 rolling-window
+admission times, enforced by CHECK). The two widened CHECKs (`action` and
+`evidence_code`) are added `NOT VALID` and then `VALIDATE`d, so existing rows are
+checked without a long exclusive scan. The previous binary ignores the table, so
+rollback keeps it in place; dropping it resets every member's allowance, which
+is an operator decision and not part of rollback. Reapply the reviewed database
+role plan before enabling notifications: runtime needs SELECT/INSERT/UPDATE on
+the budget table, but cannot DELETE/TRUNCATE its history. Backup format v16
+preserves that history and the limiter's high-water; older archives predate it.
 
 TOG-16851 proved a loopback-only receiver never becomes healthy: the Containers
 port check and `containerFetch` cannot reach it, so the container waited on 8091
@@ -448,7 +463,7 @@ Success (`200` only, `result` always an object, no `error` key):
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
-| reminder.send / place_offer.send | `{outcome}` | `sent`/`dm_unavailable`; `dm_unavailable` (closed DMs, blocked bot, member not in guild, or suppressed member — a suppressed refusal carries the `suppressed` audit scalar) is a 200 that consumes no place; the wire carries no `message_id`. A shared per-member budget (burst 3, refill 10/day and a strict ceiling of 10 admissions per rolling 24 hours, keyed `notify:<discord_id>`) answers `rate_limited` with `Retry-After` before any claim when exhausted; denied attempts charge neither member limit |
+| reminder.send / place_offer.send | `{outcome}` | `sent`/`dm_unavailable`; `dm_unavailable` (closed DMs, blocked bot, member not in guild, or suppressed member — a suppressed refusal carries the `suppressed` audit scalar) is a 200 that consumes no place; the wire carries no `message_id`. A shared durable per-member budget (burst 3, exact integer refill of 10/day, strict ceiling of 10 admissions in any rolling 24 hours) is stored in `internal_notify_budgets` under the SHA-256 of `notify:<canonical discord_id>`. In the same transaction as a new claim, `claim_notify` locks that row and charges it only when the claim is `Claimed`; the charge, intent and audit commit together. An exhausted budget rolls back the tentative claim and audit and answers `rate_limited` with `Retry-After` (internal log reason `rate_limited_notify`). Replays, mismatches and in-flight answers are never charged. Every committed new claim counts, including suppressed or closed-DM refusals and proven-unsent 429 retries; denied and replayed requests do not. State persists across processes and restarts. `authorize` only applies the caller limit and validates the facts |
 | moderation.\* | `{outcome[, affected]}` | |
 
 Refusals keep their code, status and retry policy with the fixed message

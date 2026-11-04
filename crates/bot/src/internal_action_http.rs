@@ -2106,8 +2106,8 @@ async fn execute_member(
 /// `suppressed` audit scalar. A 429 proves no effect, so the claim is
 /// released and the same key may retry; every other post-claim failure
 /// (timeout, transport, unreadable receipt, suppression-lookup error)
-/// retains the claim as `unknown`. The per-member notify bucket fires in
-/// `authorize`, before the claim.
+/// retains the claim as `unknown`. The store charges the durable per-member
+/// budget atomically with a new claim, so replays never spend allowance.
 async fn execute_notify(
     state: &ReceiverState,
     decision: &AuthDecision,
@@ -2173,6 +2173,16 @@ async fn execute_notify(
         .claim_notify(&identity, &subject, event_key)
         .await
     {
+        Err(InternalStoreError::NotifyRateLimited { retry_after_secs }) => {
+            return reject(Failure::from_action(
+                ActionError::new(
+                    ErrorCode::RateLimited,
+                    "Rate limit exceeded for member notifications",
+                    "rate_limited_notify",
+                )
+                .with_retry_after(retry_after_secs),
+            ));
+        }
         Ok(InternalClaim::Claimed(claim)) => claim,
         Ok(InternalClaim::Replay(response)) => {
             return state.terminal(response, true, id, key.clone(), action);
@@ -3784,6 +3794,7 @@ fn unknown_persist_class(error: InternalStoreError) -> &'static str {
         InternalStoreError::InvalidInput => "invalid_input",
         InternalStoreError::Unavailable => "storage_unavailable",
         InternalStoreError::TransitionRefused => "transition_refused",
+        InternalStoreError::NotifyRateLimited { .. } => "rate_limited_notify",
     }
 }
 

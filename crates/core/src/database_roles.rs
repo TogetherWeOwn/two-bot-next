@@ -177,7 +177,9 @@ mod tests {
                         .to_owned();
                     let kind = if matches!(
                         name.as_str(),
-                        "discord_send_admission" | "voice_create_reservations"
+                        "discord_send_admission"
+                            | "voice_create_reservations"
+                            | "internal_notify_budgets"
                     ) {
                         "admission"
                     } else if name == "member_erasure_audit" || name == "invite_campaigns" {

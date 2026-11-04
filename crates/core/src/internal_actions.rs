@@ -495,10 +495,10 @@ pub struct TokenBuckets {
 }
 
 #[derive(Debug, Clone)]
-struct NotifyBucketState {
-    credit_ms: u64,
-    updated_ms: u64,
-    admissions: VecDeque<u64>,
+pub(crate) struct NotifyBucketState {
+    pub(crate) credit_ms: u64,
+    pub(crate) updated_ms: u64,
+    pub(crate) admissions: VecDeque<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -551,11 +551,22 @@ impl TokenBuckets {
         let bucket = self
             .notify_buckets
             .entry(key.to_owned())
-            .or_insert_with(|| NotifyBucketState {
-                credit_ms: NOTIFY_MEMBER_BURST_MS,
-                updated_ms: now_ms,
-                admissions: VecDeque::new(),
-            });
+            .or_insert_with(|| NotifyBucketState::new(now_ms));
+        bucket.take(now_ms)
+    }
+}
+
+impl NotifyBucketState {
+    pub(crate) fn new(now_ms: u64) -> Self {
+        Self {
+            credit_ms: NOTIFY_MEMBER_BURST_MS,
+            updated_ms: now_ms,
+            admissions: VecDeque::new(),
+        }
+    }
+
+    pub(crate) fn take(&mut self, now_ms: u64) -> BucketDecision {
+        let bucket = self;
         // Integer credits preserve exact refill boundaries even when denied
         // attempts split one interval into many small updates.
         bucket.credit_ms = bucket
@@ -2207,23 +2218,12 @@ fn authorize_burned(
     }
 
     if action == "reminder.send" || action == "place_offer.send" {
-        // Contract v2 §7 per-member notify bucket: burst 3, at most 10/day,
-        // keyed `notify:<discord_id>` on top of the per-caller bucket above.
-        // Validate all facts before charging the member, so malformed
-        // requests cannot consume a real member's notification budget.
-        let member = if action == "reminder.send" {
-            ReminderSendRequest::validate(&body)?.discord_id()
+        // Validate before any durable claim. The store charges the shared
+        // member budget atomically with a new claim, never on receipt replay.
+        if action == "reminder.send" {
+            ReminderSendRequest::validate(&body)?;
         } else {
-            PlaceOfferSendRequest::validate(&body)?.discord_id()
-        };
-        let per_member = buckets.take_notify(&format!("notify:{member}"), verified.guarded_ms);
-        if !per_member.allowed {
-            return Err(ActionError::new(
-                ErrorCode::RateLimited,
-                "Rate limit exceeded for member notifications",
-                "rate_limited_notify",
-            )
-            .with_retry_after(per_member.retry_after_secs));
+            PlaceOfferSendRequest::validate(&body)?;
         }
     }
 
@@ -3898,7 +3898,7 @@ mod tests {
     }
 
     #[test]
-    fn notify_verbs_take_a_per_member_bucket_on_top_of_the_caller_bucket() {
+    fn notify_authorization_validates_but_leaves_member_accounting_to_durable_claims() {
         let mut vars = HashMap::new();
         vars.insert(
             "TWO_INTERNAL_ALLOW_MEMBER_NOTIFY".to_owned(),
@@ -3943,7 +3943,8 @@ mod tests {
                 clock,
             )
         };
-        // Burst 3 for one member, all under the caller's 20-burst key bucket.
+        // Replays are not distinguished until the durable claim. Authorization
+        // must not spend member allowance, but still applies the caller limit.
         let capped = body_for("123456789012345678");
         let mut malformed: Value = serde_json::from_str(&capped).unwrap();
         malformed["kind"] = json!("unsupported");
@@ -3957,17 +3958,16 @@ mod tests {
             .expect_err("malformed facts do not consume the member budget");
             assert_eq!(err.code, ErrorCode::Malformed);
         }
-        for _ in 0..3 {
-            attempt(&capped, &mut nonces, &mut buckets, &mut clock).expect("burst");
+        for _ in 0..16 {
+            attempt(&capped, &mut nonces, &mut buckets, &mut clock)
+                .expect("durable claim decides member accounting");
         }
+        assert!(buckets.notify_buckets.is_empty());
         let err = attempt(&capped, &mut nonces, &mut buckets, &mut clock)
-            .expect_err("member bucket caps at burst 3");
+            .expect_err("all attempts still charge the caller bucket");
         assert_eq!(err.code, ErrorCode::RateLimited);
-        assert_eq!(err.log_reason, "rate_limited_notify");
+        assert_eq!(err.log_reason, "rate_limited_key");
         assert!(err.retry_after_secs.is_some());
-        // Another member keeps its own budget on the same caller key.
-        let other = body_for("876543210987654321");
-        attempt(&other, &mut nonces, &mut buckets, &mut clock).expect("per-member keying");
     }
 
     #[test]

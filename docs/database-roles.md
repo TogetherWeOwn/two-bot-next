@@ -30,11 +30,15 @@ privileges, so a plan run can never change data or schema. Migrator-only tables
 stay unreadable to it, exactly as for runtime and reader.
 
 Existing append-only audit triggers continue to constrain
-DML; a grant does not disable those controls. Both `discord_send_admission` and
-`voice_create_reservations` are restricted admission lanes: runtime has SELECT,
+DML; a grant does not disable those controls. `discord_send_admission`,
+`voice_create_reservations` and `internal_notify_budgets` are restricted admission
+lanes: runtime has SELECT,
 INSERT and UPDATE only, never DELETE/TRUNCATE. The reservation rows preserve
 accepted room-create history across rollback, deletion and restart; runtime can
-settle a hold but cannot erase that durable history. Reader and PUBLIC receive
+settle a hold but cannot erase that durable history. Notification budget rows
+likewise retain rolling admissions and clock high-water across receiver restarts;
+reapply the reviewed role plan after migration `0471` before enabling member
+notifications. Reader and PUBLIC receive
 no admission-lane access. The verifier requires these three runtime privileges,
 read-only SELECT for the migrator-plan role, and rejects extra erase or public access.
 Member erasure is the operator-only path that writes the migrator-only audit

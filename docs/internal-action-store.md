@@ -58,7 +58,19 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
   claim fence for the two DM verbs and pins the validated 1–64-character event-key
   scalar on the intent and every audit phase (migration `0471`). A changed event
   key refuses as a mismatch, including when reclaiming a proven-unsent intent.
-  Event names, timestamps and rendered DM text are never persisted.
+  It also owns the durable per-member limiter: in the claim transaction it locks
+  the `internal_notify_budgets` row (key: SHA-256 of `notify:<canonical
+  discord_id>`; numeric `credit_ms`, `updated_ms` and at most 10 `admissions`)
+  and charges it only when the outcome is `Claimed`. Burst 3, exact integer
+  refill of 10/day and a strict rolling-24-hour maximum of 10 are unchanged. When
+  the budget is exhausted the transaction rolls back the tentative claim and
+  audit and returns `NotifyRateLimited { retry_after_secs }`. Replay, mismatch,
+  in-flight and reconciliation answers never charge. Every committed new claim
+  counts, including suppression, closed DMs and proven-unsent 429 retries; denials
+  and replays do not. The state is shared by both verbs and all callers and
+  persists across processes and restarts.
+  Payload event names, schedule/expiry timestamps and rendered DM text are never
+  persisted; the limiter stores only its own numeric admission times.
 - `release_proven_not_sent(ExecutionClaim)` requires owning-executor proof that
   the mutation was never dispatched. It consumes the opaque, non-Clone claim on
   every return path, atomically records a `released`/`proven_not_sent` audit and

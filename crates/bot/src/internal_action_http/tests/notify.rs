@@ -233,13 +233,16 @@ async fn reminder_send_succeeds_with_sent_envelope_and_audit_scalars() {
         "wire carries the outcome word, not the message id"
     );
     assert_eq!(effect.calls(), 1);
-    // Same intent, fresh nonce: idempotent replay without a second effect.
-    let (status, headers, replay) =
-        answer(app.clone(), signed(&raw, "new", "intent-notify-reminder")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers["idempotent-replay"], "true");
-    assert_eq!(replay["result"], json!({"outcome": "sent"}));
-    assert_eq!(effect.calls(), 1);
+    // Fresh nonces replay the receipt without spending member allowance.
+    // More replays than the entire burst must still return the same receipt.
+    for _ in 0..5 {
+        let (status, headers, replay) =
+            answer(app.clone(), signed(&raw, "new", "intent-notify-reminder")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["idempotent-replay"], "true");
+        assert_eq!(replay["result"], json!({"outcome": "sent"}));
+        assert_eq!(effect.calls(), 1);
+    }
     // Stored receipt: completed success with the message-id scalar, the
     // member/event linkage, and no DM text.
     let rows: Vec<StoredReceiptRow> = sqlx::query_as(
@@ -513,7 +516,9 @@ async fn notify_member_bucket_rate_limits_after_burst() {
         assert_eq!(body["result"], json!({"outcome": "sent"}));
     }
     assert_eq!(effect.calls(), 3);
-    // The 4th send to the same member is a 429 before any claim or effect.
+    // A restarted receiver must not refill the member's burst.
+    let app = router(state(db.pool().clone(), effect.clone()));
+    // The 4th send is a 429 with no committed claim or delivery effect.
     let (status, _, refused) = answer(
         app.clone(),
         signed(&raw, "old", "intent-notify-burst-capped"),
@@ -530,7 +535,7 @@ async fn notify_member_bucket_rate_limits_after_burst() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(claims, 3, "authorize refuses before the claim");
+    assert_eq!(claims, 3, "budget denial rolls back the tentative claim");
     // Another member keeps its own budget on the same caller key.
     let mut other: Value = serde_json::from_str(&raw).unwrap();
     other["discord_id"] = json!("222222222222222222");

@@ -10,8 +10,8 @@ use crate::channel_moderation::PurgeStopReason;
 use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
 use crate::internal_actions::{
     body_hash, is_implemented, is_snowflake, valid_event_key, valid_idempotency_key,
-    valid_nonce_format, valid_notify_event_key, within_skew, CLAIM_STALE_SECONDS, MAX_BODY_BYTES,
-    NONCE_TTL_SECONDS, SKEW_SECONDS,
+    valid_nonce_format, valid_notify_event_key, within_skew, NotifyBucketState,
+    CLAIM_STALE_SECONDS, MAX_BODY_BYTES, NONCE_TTL_SECONDS, SKEW_SECONDS,
 };
 
 /// Clock domain for the durable nonce high-water mark. One guard per clock
@@ -33,6 +33,8 @@ pub enum InternalStoreError {
     Unavailable,
     #[error("internal-action transition refused")]
     TransitionRefused,
+    #[error("member notification rate limited")]
+    NotifyRateLimited { retry_after_secs: u64 },
 }
 
 impl From<sqlx::Error> for InternalStoreError {
@@ -586,8 +588,76 @@ impl InternalActionStore {
                 }
             }
         };
+        if event_key.is_some() && matches!(result, InternalClaim::Claimed(_)) {
+            let member = subject
+                .target_id
+                .as_ref()
+                .ok_or(InternalStoreError::InvalidInput)?;
+            Self::take_notify_budget(&mut tx, member).await?;
+        }
         tx.commit().await?;
         Ok(result)
+    }
+
+    // Serialize the shared member budget in the same transaction as the new
+    // claim. A denial rolls both back; replays, mismatches and in-flight reads
+    // never charge. Conservatively count all committed attempts, including
+    // suppressed/closed DMs and proven-unsent 429s, to bound retry pressure.
+    async fn take_notify_budget(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        member: &DiscordId,
+    ) -> Result<(), InternalStoreError> {
+        let bucket_key = body_hash(format!("notify:{}", member.as_str()).as_bytes());
+        sqlx::query(
+            "INSERT INTO internal_notify_budgets (bucket_key) VALUES ($1) \
+             ON CONFLICT (bucket_key) DO NOTHING",
+        )
+        .bind(&bucket_key)
+        .execute(&mut **tx)
+        .await?;
+        let row = sqlx::query(
+            "SELECT credit_ms, updated_ms, admissions FROM internal_notify_budgets \
+             WHERE bucket_key = $1 FOR UPDATE",
+        )
+        .bind(&bucket_key)
+        .fetch_one(&mut **tx)
+        .await?;
+        // Read the database clock after any lock wait. Persist the bucket's
+        // high-water mark so a receiver restart or clock rollback cannot refill it.
+        let now_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        let nonnegative =
+            |value: i64| u64::try_from(value).map_err(|_| InternalStoreError::InvalidInput);
+        let admissions: Vec<i64> = row.try_get("admissions")?;
+        let mut bucket = NotifyBucketState {
+            credit_ms: nonnegative(row.try_get("credit_ms")?)?,
+            updated_ms: nonnegative(row.try_get("updated_ms")?)?,
+            admissions: admissions
+                .into_iter()
+                .map(nonnegative)
+                .collect::<Result<_, _>>()?,
+        };
+        let decision = bucket.take(nonnegative(now_ms)?);
+        if !decision.allowed {
+            return Err(InternalStoreError::NotifyRateLimited {
+                retry_after_secs: decision.retry_after_secs,
+            });
+        }
+        let admissions: Vec<i64> = bucket.admissions.into_iter().map(|ms| ms as i64).collect();
+        sqlx::query(
+            "UPDATE internal_notify_budgets SET credit_ms = $2, updated_ms = $3, admissions = $4 \
+             WHERE bucket_key = $1",
+        )
+        .bind(&bucket_key)
+        .bind(bucket.credit_ms as i64)
+        .bind(bucket.updated_ms as i64)
+        .bind(admissions)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 
     /// Release only when the caller proves the mutation was never dispatched.
