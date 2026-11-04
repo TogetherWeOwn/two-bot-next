@@ -129,11 +129,15 @@ metadata survives the stripped release profile. Only the bot executable reaches
 the unchanged distroless runtime; the inventory tools do not ship in it.
 
 After loading the saved linux/amd64 image in the trusted `verify` job,
-`scripts/scan-auditable-image.sh` uses **Syft v1.56.0** with only
-`cargo-auditable-binary-cataloger`, then **Grype v0.121.1** against that native
-Syft JSON. Both Linux amd64 tool archives have explicit SHA-256 pins in the
-script. Downloads and scans have timeouts, tools use fresh per-run extraction
-and cache directories, and cleanup removes that scratch on exit. No container
+`scripts/scan-auditable-image.sh` uses **Syft v1.56.0** with
+`--override-default-catalogers cargo-auditable-binary-cataloger`, then
+**Grype v0.121.1** against that native Syft JSON. The override selects only
+that package cataloger (Syft also keeps its file metadata catalogers). Both
+scanners receive a fresh explicit empty YAML config: `/dev/null` has no format
+suffix and is rejected by their config loader. Both Linux amd64 tool archives
+have explicit SHA-256 pins in the script. Downloads and scans have timeouts,
+tools use fresh per-run extraction and cache directories, and cleanup removes
+that scratch on exit. No container
 is started. Grype downloads its vulnerability database into that disposable
 cache; the native report retains scanner and database provenance.
 
@@ -142,16 +146,22 @@ The `supply-chain` Actions artifact includes:
 - `runtime-crates.syft.json`: native runtime crate inventory and image metadata;
 - `runtime-crates.grype.json`: every native Grype match, without ignore rules or
   a new severity gate;
-- `runtime-crates-check.json`: source SHA, immutable local image ID, SHA-256 of
-  the lockfile and both native reports, runtime/match counts and explicitly
+- `runtime-crates-check.json`: source SHA, immutable local image ID, native
+  config digest (`config_id`), SHA-256 of the lockfile and both native reports,
+  runtime/match counts and explicitly
   listed `lockfile_only` name/version tuples;
 - `runtime-crates.sha256`: separate checksums for these diagnostic JSON files
   and the source SHA/image ID. The release `SHA256SUMS` contract is unchanged;
   these diagnostic files are not uploaded as release assets.
 
 `scripts/validate-auditable-image.py` requires the pinned scanner identities,
-the expected linux/amd64 image ID, and native crate locations at
-`/home/nonroot/two-bot`. Every reported runtime crate must match a name/version
+the expected immutable linux/amd64 image input, and native crate locations at
+`/home/nonroot/two-bot`. Classic Docker identifies images by config digest;
+the containerd image store can report a manifest digest as `.Id`. The exact
+requested digest must match Syft's native `userInput` and either its config
+`imageID` or a native `repoDigests` entry. Grype must preserve the same config
+digest and immutable input. A mutable tag is never an identity fallback.
+Every reported runtime crate must match a name/version
 in the selected source's Cargo.lock; every Grype match must belong to that
 runtime inventory. Empty inventory, missing sentinel crates, unexpected
 locations or unmatched tuples fail closed. Missing metadata in an older image

@@ -56,7 +56,8 @@ def artifact(name, version, **over):
 def inventory():
     return {
         "source": {"type": "image", "metadata": {
-            "imageID": IMAGE_ID, "os": "linux", "architecture": "amd64"}},
+            "imageID": IMAGE_ID, "userInput": IMAGE_ID,
+            "os": "linux", "architecture": "amd64"}},
         "descriptor": {"name": "syft", "version": "1.56.0"},
         "artifacts": [artifact("two-bot", "0.1.0"), artifact("tokio", "1.40.0"),
                       artifact("libc", "0.2.150")],
@@ -66,7 +67,7 @@ def inventory():
 def report(matches=()):
     return {
         "descriptor": {"name": "grype", "version": "0.121.1"},
-        "source": {"type": "image", "target": {"imageID": IMAGE_ID}},
+        "source": {"type": "image", "target": {"imageID": IMAGE_ID, "userInput": IMAGE_ID}},
         "matches": list(matches), "ignoredMatches": [],
     }
 
@@ -94,6 +95,7 @@ class ValidatorTests(unittest.TestCase):
     def test_valid_binds_provenance_and_keeps_dev_only_lockfile_extra(self):
         result = module.validate(self.dir)
         self.assertEqual(result["image_id"], IMAGE_ID)
+        self.assertEqual(result["config_id"], IMAGE_ID)
         self.assertEqual(result["source_sha"], SOURCE_SHA)
         self.assertEqual(result["runtime_crates"], 3)
         self.assertEqual(result["grype_matches"], 0)
@@ -102,6 +104,29 @@ class ValidatorTests(unittest.TestCase):
                          [{"name": "dev-only-crate", "version": "9.9.9"}])
         self.assertEqual(set(result["sha256"]), {
             "Cargo.lock", "runtime-crates.syft.json", "runtime-crates.grype.json"})
+
+    def test_containerd_manifest_id_binds_to_native_config_digest(self):
+        inv, rep = inventory(), report()
+        config_id = "sha256:" + "c" * 64
+        inv["source"]["metadata"].update(
+            imageID=config_id, repoDigests=["two-bot-next@" + IMAGE_ID])
+        rep["source"]["target"]["imageID"] = config_id
+        self.write(inv, rep)
+        result = module.validate(self.dir)
+        self.assertEqual(result["image_id"], IMAGE_ID)
+        self.assertEqual(result["config_id"], config_id)
+        for over in ({"repoDigests": []}, {"repoDigests": ["other@" + config_id]},
+                     {"repoDigests": ["not-a-digest"]}, {"repoDigests": IMAGE_ID},
+                     {"userInput": config_id}, {"imageID": "invalid"}):
+            with self.subTest(over=over):
+                wrong = copy.deepcopy(inv)
+                wrong["source"]["metadata"].update(over)
+                self.write(wrong, rep)
+                self.fails()
+        self.write(inv, rep)
+        rep["source"]["target"]["imageID"] = IMAGE_ID
+        self.write(rep=rep)
+        self.fails()
 
     def test_synthetic_advisory_matches_runtime_tuple_without_suppression(self):
         match = {"vulnerability": {"id": "SYNTHETIC-0001"},
@@ -133,6 +158,10 @@ class ValidatorTests(unittest.TestCase):
         self.write(rep=rep)
         self.fails()
         rep = report()
+        rep["source"]["target"]["userInput"] = "mutable-tag:latest"
+        self.write(rep=rep)
+        self.fails()
+        rep = report()
         rep["source"] = {"type": "sbom-file", "target": "/x/runtime-crates.syft.json"}
         self.write(rep=rep)
         self.fails()
@@ -152,6 +181,7 @@ class ValidatorTests(unittest.TestCase):
             "empty": lambda i: i.update(artifacts=[]),
             "incomplete": lambda i: i.update(artifacts=i["artifacts"][:2]),
             "wrong image": lambda i: i["source"]["metadata"].update(imageID="sha256:" + "c" * 64),
+            "wrong input": lambda i: i["source"]["metadata"].update(userInput="mutable:latest"),
             "not image": lambda i: i["source"].update(type="directory"),
             "wrong arch": lambda i: i["source"]["metadata"].update(architecture="arm64"),
             "wrong os": lambda i: i["source"]["metadata"].update(os="windows"),
@@ -247,11 +277,18 @@ class ScannerTests(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
         env.update(PATH=f"{bin_dir}:{os.environ['PATH']}",
                    RUNNER_TEMP=str(root / "tmp"))
+        # Both native tools infer the config format from its filename suffix.
+        config_check = (
+            'config=""; prev=""; for a in "$@"; do '
+            '[ "$prev" = --config ] && config=$a; prev=$a; done\n'
+            '[[ "$config" = *.yaml ]] && grep -Fxq "{}" "$config" || exit 64\n'
+            'printf "%s\\n" "$config" >> "$STUB_CONFIG_LOG"\n')
+        env["STUB_CONFIG_LOG"] = str(root / "config-paths")
         # Stub bodies: syft writes the -o target; grype prints JSON.
-        env["STUB_SYFT"] = (
+        env["STUB_SYFT"] = config_check + (
             'for a in "$@"; do case $a in syft-json=*) echo "{}" > "${a#syft-json=}";; esac; done; '
             f"exit {syft_rc}")
-        env["STUB_GRYPE"] = f"echo '{{}}'; exit {grype_rc}"
+        env["STUB_GRYPE"] = config_check + f"echo '{{}}'; exit {grype_rc}"
         (root / "tmp").mkdir()
         return env
 
@@ -273,6 +310,17 @@ class ScannerTests(unittest.TestCase):
         self.assertTrue((out / "runtime-crates.syft.json").is_file())
         self.assertTrue((out / "runtime-crates.grype.json").is_file())
         self.assertEqual(list((root / "tmp").iterdir()), [])
+
+    def test_scanners_receive_explicit_empty_yaml_configuration(self):
+        done, _, root = self.run_scan()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        configs = (root / "config-paths").read_text().splitlines()
+        self.assertEqual(len(configs), 2)
+        self.assertEqual(configs[0], configs[1])
+        config = Path(configs[0])
+        self.assertEqual(config.suffix, ".yaml")
+        self.assertEqual(config.parent.parent, root / "tmp")
+        self.assertFalse(config.exists())
 
     def test_syft_failure_propagates_and_skips_grype(self):
         done, out, _ = self.run_scan(syft_rc=7)
@@ -300,8 +348,8 @@ class StaticWiringTests(unittest.TestCase):
                 "1c2493cfcf52d3367d6cb25780d9190c111c2219c34c820574c43e8bae15c528",
                 "grype/releases/download/v0.121.1/grype_0.121.1_linux_amd64.tar.gz",
                 "bc3ea3f9e6fd56ac781c08c6c5e614271b79f438200757f6932085c19b0a4657",
-                "--select-catalogers cargo-auditable-binary-cataloger",
-                "--config /dev/null", "set -euo pipefail", "sha256sum --check"):
+                "--override-default-catalogers cargo-auditable-binary-cataloger",
+                '--config "$scratch/config.yaml"', "set -euo pipefail", "sha256sum --check"):
             self.assertIn(needle, self.scanner)
         code = "\n".join(l for l in self.scanner.splitlines() if not l.lstrip().startswith("#"))
         for forbidden in ("--fail-on", "--ignore", "ignore-states"):

@@ -47,7 +47,18 @@ def validate(directory):
     inventory = read_json(directory / "runtime-crates.syft.json")
     source = inventory["source"]
     metadata = source["metadata"]
-    if (source["type"] != "image" or metadata["imageID"] != image_id
+    config_id = metadata["imageID"]
+    repo_digests = metadata.get("repoDigests", [])
+    if (not isinstance(config_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", config_id)
+            or not isinstance(repo_digests, list)
+            or any(not isinstance(digest, str) or not re.fullmatch(
+                r"[^@\s]+@sha256:[0-9a-f]{64}", digest) for digest in repo_digests)):
+        raise ValueError("Invalid native image identity")
+    # Docker's containerd store reports a manifest digest as .Id; Syft's imageID
+    # is the config digest. Require the exact immutable input and a native digest
+    # binding, never a mutable tag, while retaining both identities in the receipt.
+    identities = {config_id} | {digest.rsplit("@", 1)[1] for digest in repo_digests}
+    if (source["type"] != "image" or metadata["userInput"] != image_id or image_id not in identities
             or metadata["os"] != "linux" or metadata["architecture"] != "amd64"):
         raise ValueError("Runtime crate inventory is not for this linux/amd64 image ID")
     if inventory["descriptor"]["name"] != "syft" or inventory["descriptor"]["version"] != "1.56.0":
@@ -68,7 +79,8 @@ def validate(directory):
     if report["descriptor"]["name"] != "grype" or report["descriptor"]["version"] != "0.121.1":
         raise ValueError("Unexpected matching tool")
     # Grype preserves the native Syft image source when reading a Syft SBOM.
-    if report["source"]["type"] != "image" or report["source"]["target"]["imageID"] != image_id:
+    if (report["source"]["type"] != "image" or report["source"]["target"]["imageID"] != config_id
+            or report["source"]["target"]["userInput"] != image_id):
         raise ValueError("Grype did not match this runtime image inventory")
     if not isinstance(report["matches"], list) or report.get("ignoredMatches"):
         raise ValueError("Invalid or suppressed Grype matches")
@@ -79,7 +91,7 @@ def validate(directory):
     for name in ("Cargo.lock", "runtime-crates.syft.json", "runtime-crates.grype.json"):
         checksums[name] = hashlib.sha256((directory / name).read_bytes()).hexdigest()
     return {
-        "source_sha": source_sha, "image_id": image_id, "sha256": checksums,
+        "source_sha": source_sha, "image_id": image_id, "config_id": config_id, "sha256": checksums,
         "runtime_crates": len(crates), "grype_matches": len(report["matches"]),
         "lockfile_only": [dict(name=name, version=version) for name, version in sorted(locked - crates)],
         "suppressed_count": 0,

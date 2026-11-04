@@ -23,10 +23,12 @@ tar -xzf "$scratch/grype/tool.tar.gz" -C "$scratch/grype" grype
 
 export SYFT_CHECK_FOR_APP_UPDATE=false GRYPE_CHECK_FOR_APP_UPDATE=false
 export XDG_CACHE_HOME="$scratch/cache" GRYPE_DB_CACHE_DIR="$scratch/cache/grype"
-timeout 180 "$scratch/syft/syft" scan "docker:$image_id" --config /dev/null \
-  --select-catalogers cargo-auditable-binary-cataloger \
+# Explicit YAML avoids repository config discovery; /dev/null has no format suffix.
+printf '{}\n' > "$scratch/config.yaml"
+timeout 180 "$scratch/syft/syft" scan "docker:$image_id" --config "$scratch/config.yaml" \
+  --override-default-catalogers cargo-auditable-binary-cataloger \
   -o "syft-json=$output/runtime-crates.syft.json"
 # Keep every match; the existing lockfile and image gates remain authoritative.
 # No --fail-on here: this report proves inventory/matching, not a new exception.
 timeout 300 "$scratch/grype/grype" "sbom:$output/runtime-crates.syft.json" \
-  --config /dev/null -o json > "$output/runtime-crates.grype.json"
+  --config "$scratch/config.yaml" -o json > "$output/runtime-crates.grype.json"
