@@ -363,6 +363,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_argparse_refusal_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_negative_spellings.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_intake_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_pipeline_bench_profile.py' -v
       - name: SBOM intake refusal acceptance (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_validate_sbom_intake_refusal_acceptance.py' -v
@@ -2664,6 +2665,11 @@ jobs:
 
       - name: cutover reward ladder lib regression (CI service container only)
         run: cargo test -p two-bot-cutover --locked --lib -- --ignored
+
+      - name: Pipeline kill/restart durability (disposable CI database)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
+        run: timeout 120s cargo test -p two-bot-cutover --locked --test pipeline_durability -- --ignored --test-threads=1
 
       - name: Gateway restart and transaction tests (CI service only)
         run: cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
