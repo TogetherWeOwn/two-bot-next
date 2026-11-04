@@ -21,7 +21,8 @@ NEXTEST_WORKFLOW = (
 NEXTEST_WORKFLOW_TEXT = NEXTEST_WORKFLOW.read_text()
 # The four Rust test lanes (rust-tests, coverage-shard, ignored-db-stores,
 # ignored-db-runtime) each run their own copy of this service; the first one
-# in the file is the reference and the others must match it exactly.
+# in the file is the storage reference. Coverage also needs a JSON collector
+# for the ignored log-reader regression; pin that exact instrumentation below.
 SERVICES = [part.split("    steps:\n", 1)[0] for part in WORKFLOW_TEXT.split("      agent-testdb:\n")[1:]]
 SERVICE = SERVICES[0]
 TOKENS = shlex.split(SERVICE.split("        options: >-\n", 1)[1])
@@ -83,19 +84,59 @@ class PostgresStorageTests(unittest.TestCase):
         self.assertEqual(OPTIONS["--tmpfs"], "/var/lib/postgresql:rw,size=1073741824")
         self.assertEqual(OPTIONS["--memory"], "2147483648")
         self.assertEqual(OPTIONS["--memory-swap"], OPTIONS["--memory"])
-        # One bounded service per lane, byte-identical: the lanes must keep
-        # sharing the config the single `check` job had.
+        # One bounded service per lane. All bytes must match the reference,
+        # with only coverage's exact collector configuration added. Compare
+        # complete services so a storage/durability change still fails.
         self.assertEqual(WORKFLOW_TEXT.count("--tmpfs /var/lib/postgresql:"), 4)
         self.assertEqual(WORKFLOW_TEXT.count("image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722"), 4)
         bounded = [service for service in SERVICES if "--tmpfs" in service]
         self.assertEqual(len(bounded), 4)
-        self.assertEqual(len(set(bounded)), 1, "the lanes' Postgres services drifted apart")
+        collector = (
+            "          # The ignored log-reader regression enables completion logging only\n"
+            "          # on its own synthetic connection; unrelated suites remain unlogged.\n"
+            "          POSTGRES_INITDB_ARGS: >-\n"
+            "            -c logging_collector=on -c log_destination=jsonlog\n"
+            "            -c log_rotation_age=0 -c log_rotation_size=0\n"
+        )
+        coverage_service = SERVICE.replace(
+            "        # PG18 places data and WAL below this volume.",
+            collector + "        # PG18 places data and WAL below this volume.",
+        ).replace(
+            "checkpoint I/O from shared-host disk; keep PostgreSQL defaults intact.",
+            "checkpoint I/O from shared-host disk; retain maintenance defaults.",
+        )
+        self.assertNotEqual(coverage_service, SERVICE)
+        self.assertEqual(
+            bounded,
+            [coverage_service if lane == "coverage-shard" else SERVICE for lane in POSTGRES_LANES],
+            "the lanes' Postgres services drifted from their pinned configurations",
+        )
         self.assertNotIn("/var/lib/postgresql/data", SERVICE)
         self.assertNotIn("PGDATA:", SERVICE)
         self.assertNotIn("POSTGRES_INITDB_ARGS:", SERVICE)
         self.assertEqual(OPTIONS["--health-interval"], "5s")
         self.assertEqual(OPTIONS["--health-timeout"], "5s")
         self.assertEqual(OPTIONS["--health-retries"], "12")
+
+    def test_service_contract_rejects_storage_or_collector_drift(self):
+        mutations = [
+            (1, "size=1073741824", "size=2147483648"),
+            (1, "--memory 2147483648", "--memory 4294967296"),
+            (1, "log_destination=jsonlog", "log_destination=stderr"),
+            (1, "log_rotation_size=0", "log_rotation_size=10MB"),
+            (1, "-c logging_collector=on", "-c logging_collector=on -c fsync=off"),
+            (2, "POSTGRES_HOST_AUTH_METHOD: trust", "POSTGRES_HOST_AUTH_METHOD: trust\n          POSTGRES_INITDB_ARGS: -c logging_collector=on"),
+        ]
+        for index, old, new in mutations:
+            with self.subTest(index=index, old=old):
+                self.assertIn(old, SERVICES[index])
+                services = list(SERVICES)
+                services[index] = services[index].replace(old, new, 1)
+                with (
+                    mock.patch(f"{__name__}.SERVICES", services),
+                    self.assertRaises(AssertionError),
+                ):
+                    self.test_only_the_rust_test_lanes_get_bounded_pg18_storage()
 
     def test_health_requires_actual_pgdata_tmpfs_and_a_ready_server(self):
         command = OPTIONS["--health-cmd"]

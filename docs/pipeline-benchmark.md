@@ -200,7 +200,8 @@ Only fingerprints/counts are published. Full raw
 logs may contain parameter values and remain inside the disposable server;
 never upload them. Missing instrumentation is INVALID/NOT RUN, not a score.
 
-For two new, independently qualified same-workload reports:
+For two new reports from independently executed same-workload development
+replays (ordinary instrument validation, not qualified evaluation):
 
 ```sh
 python3 scripts/compare_pipeline_bench.py after.json
@@ -220,11 +221,15 @@ not the old comparator failure limit of 10.562.
 These are executable correctness checks, not proof of author write exclusion,
 held-out secrecy, distinct GitHub principals, confined read-only reviewers or
 trusted result provenance. Same-UID worktrees, hashes, role prompts and native
-review alone do not enforce those boundaries. Ordinary instrument development
-may proceed through its normal independent review/CI/release gates; optimization
-and held-out results remain unqualified until independently enforced evaluator
-admission, containment, exact-head binding and negative access tests are proved.
-Never claim that this PR establishes those missing controls.
+review alone do not enforce those boundaries. This deliverable is limited to
+ordinary, unqualified durability/accounting instrumentation. Its independent
+review must confirm applicability to that scope before normal QA/CI/release
+gates; shipment neither qualifies a panel nor reopens an optimization programme.
+Optimization/climbing, blind panel use, held-out evaluation and trusted
+model/provenance claims are excluded. Qualified use requires separately
+authorized work proving enforced evaluator admission, containment, exact-head
+binding and negative access tests. Never claim that this PR establishes those
+missing controls or that development measurements are qualified scores.
 
 ## Ratchet
 
