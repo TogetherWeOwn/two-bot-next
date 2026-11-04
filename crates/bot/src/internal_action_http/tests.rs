@@ -2331,6 +2331,7 @@ async fn botlog_read_malformed_cursor_and_limit_refuse() {
         serde_json::json!({"action": "botlog.read", "limit": "200"}),
         serde_json::json!({"action": "botlog.read", "after": ""}),
         serde_json::json!({"action": "botlog.read", "after": "cursor-0000"}),
+        serde_json::json!({"action": "botlog.read", "after": "A".repeat(53)}),
     ] {
         let (status, _, body) =
             answer(router(state.clone()), signed_read(&raw.to_string(), "old")).await;

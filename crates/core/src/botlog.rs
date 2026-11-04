@@ -55,6 +55,8 @@ pub const BOTLOG_RESULT_VERSION: i64 = 1;
 pub const BOTLOG_PAGE_LIMIT_MAX: i64 = 200;
 /// Limit when the request names none.
 pub const BOTLOG_PAGE_LIMIT_DEFAULT: i64 = 200;
+/// Two non-negative i64 values and one separator: 39 raw bytes, base64url.
+pub const BOTLOG_CURSOR_MAX_BYTES: usize = 52;
 
 /// One publishable log line, in contract §6 vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +112,8 @@ impl BotlogCursor {
         URL_SAFE_NO_PAD.encode(format!("{}:{}", self.after_micros, self.after_audit_id))
     }
 
-    /// Fail closed on any malformed cursor: the grammar is two integers.
+    /// Fail closed before decoding oversized tokens. Accept only the canonical
+    /// encoding of two non-negative integers, bounding empty-tail echoes too.
     pub fn decode(cursor: &str) -> Result<Self, ActionError> {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let malformed = || {
@@ -120,13 +123,20 @@ impl BotlogCursor {
                 "bad_after",
             )
         };
+        if cursor.len() > BOTLOG_CURSOR_MAX_BYTES {
+            return Err(malformed());
+        }
         let raw = URL_SAFE_NO_PAD.decode(cursor).map_err(|_| malformed())?;
         let text = std::str::from_utf8(&raw).map_err(|_| malformed())?;
         let (micros, audit) = text.split_once(':').ok_or_else(malformed)?;
-        Ok(Self {
+        let parsed = Self {
             after_micros: micros.parse().map_err(|_| malformed())?,
             after_audit_id: audit.parse().map_err(|_| malformed())?,
-        })
+        };
+        if parsed.after_micros < 0 || parsed.after_audit_id < 0 || parsed.encode() != cursor {
+            return Err(malformed());
+        }
+        Ok(parsed)
     }
 }
 
@@ -437,6 +447,37 @@ mod tests {
         assert!(BotlogCursor::decode(&outside).is_err());
         let text = URL_SAFE_NO_PAD.encode("soon:late");
         assert!(BotlogCursor::decode(&text).is_err());
+    }
+
+    #[test]
+    fn cursor_bounds_and_canonical_grammar() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        // Two non-negative i64 values need at most 39 decoded bytes or 52
+        // base64url bytes. Check the boundary without a large allocation.
+        let largest = BotlogCursor {
+            after_micros: i64::MAX,
+            after_audit_id: i64::MAX,
+        };
+        let encoded = largest.encode();
+        assert_eq!(encoded.len(), 52);
+        assert_eq!(BotlogCursor::decode(&encoded).unwrap(), largest);
+        assert!(BotlogCursor::decode(&"A".repeat(53)).is_err());
+        let padded = URL_SAFE_NO_PAD.encode(format!("{}:1", "0".repeat(39)));
+        assert!(padded.len() > BOTLOG_CURSOR_MAX_BYTES);
+        assert!(BotlogCursor::decode(&padded).is_err());
+        for text in ["01:2", "+1:2", "-1:2", "1:-2", "1:02", "1:+2"] {
+            let after = URL_SAFE_NO_PAD.encode(text);
+            let body = serde_json::from_value(serde_json::json!({"after": after})).unwrap();
+            assert!(validate_botlog_read(&body).is_err());
+        }
+        let request = validate_botlog_read(
+            &serde_json::from_value(serde_json::json!({"after": encoded})).unwrap(),
+        )
+        .unwrap();
+        let page = assemble_botlog_page(vec![], &channels(), &request);
+        assert_eq!(page.next, encoded);
+        assert_eq!(page.next.len(), 52);
     }
 
     #[test]

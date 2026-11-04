@@ -433,8 +433,11 @@ Success (`200` only, `result` always an object, no `error` key):
 `{"action":"botlog.read","after":"<cursor>","limit":200}` returns
 `{v:1,entries:[{seq,at,kind,subject_id?,event_key?,detail?}],next}` with
 `Cache-Control: no-store`. `after` is an opaque base64url cursor over
-`(created_at, audit_id)`; a missing `after` starts at the head, a malformed
-`after` is refused `malformed`. `limit` defaults to 200 when omitted; a supplied
+`(created_at, audit_id)`, using the canonical encoding of two non-negative
+64-bit integers (at most 52 bytes). A missing `after` starts at the head;
+a malformed, noncanonical or oversized `after` is refused `malformed` before
+the feed query, with the size checked before decoding. `limit` defaults to 200
+when omitted; a supplied
 value must be an integer in 1–200 or is refused `malformed`, not clamped.
 Ordering is strictly ascending; the site stores `next` and resumes
 from it, deduping replays on `seq`. An empty tail echoes the request cursor.
