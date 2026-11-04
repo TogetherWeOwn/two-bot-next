@@ -18,8 +18,8 @@ mod website_event_age_acceptance_tests;
 fn raw_event_carries_confirmed_end_null_and_rejects_malformed_types() {
     let event = |end: Option<Value>| {
         let mut value = json!({
-            "id": "100000000000000001",
-            "guild_id": "100000000000000002",
+            "id": "3201",
+            "guild_id": "2222",
             "name": "Night",
             "scheduled_start_time": "2026-09-06T18:00:00Z",
             "status": 1,
@@ -27,7 +27,7 @@ fn raw_event_carries_confirmed_end_null_and_rejects_malformed_types() {
         if let Some(end) = end {
             value["scheduled_end_time"] = end;
         }
-        raw_event(&value, "100000000000000002")
+        raw_event(&value, "2222")
     };
     let confirmed = event(Some(json!("2026-09-06T20:00:00Z"))).unwrap();
     assert_eq!(
