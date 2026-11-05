@@ -30,8 +30,8 @@ ALTER TABLE internal_action_log VALIDATE CONSTRAINT internal_log_rank_key;
 
 -- Replays and reconciliation may not enrich a previously consumed audit row.
 -- Authorized erasure still DELETEs rows; this is not a blanket append-only gate.
-CREATE FUNCTION internal_audit_identity_immutable() RETURNS trigger
-LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION public.internal_audit_identity_immutable() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, public AS $body$
 BEGIN
     IF TG_TABLE_NAME = 'internal_action_log' THEN
         IF NEW IS DISTINCT FROM OLD THEN
@@ -46,7 +46,8 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$;
+$body$;
+REVOKE ALL ON FUNCTION public.internal_audit_identity_immutable() FROM PUBLIC;
 CREATE TRIGGER internal_log_identity_immutable BEFORE UPDATE ON internal_action_log
     FOR EACH ROW EXECUTE FUNCTION internal_audit_identity_immutable();
 CREATE TRIGGER internal_intent_identity_immutable BEFORE UPDATE ON internal_idempotency

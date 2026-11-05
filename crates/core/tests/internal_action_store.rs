@@ -13,6 +13,9 @@ use two_bot_core::secret::Secret;
 use two_bot_core::{body_hash, CLAIM_STALE_SECONDS, NONCE_TTL_SECONDS, SKEW_SECONDS};
 use two_bot_testsupport::TestDatabase;
 
+#[path = "support/internal_audit_order.rs"]
+mod audit_order;
+
 struct TestDb {
     fixture: TestDatabase,
     pool: PgPool,

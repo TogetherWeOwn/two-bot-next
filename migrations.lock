@@ -2,8 +2,8 @@
   "version": 1,
   "migrations": {
     "crates/cutover/migrations/0471_internal_audit_identity.sql": {
-      "sha256": "8d482bee7ae00442d5642f6b0dd12178cd6b99f30f365d6fcab77efae8134e48",
-      "justification": "Freeze validated event keys and authoritative rank identities in internal intents and immutable audits without guessing legacy names."
+      "sha256": "0f8230630516a2a2d5b634f02113cedef903da6447e2b82dc3c05ed7212ac95e",
+      "justification": "Unshipped expansion: freeze validated audit names; use the real private invoker definition in explicit pre-bootstrap preparation and the migration without changing deployed history."
     },
     "crates/store/migrations/0458_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
@@ -536,6 +536,10 @@
     "crates/cutover/migrations/0470_voice_creation_gates_authority.sql": {
       "sha256": "eb1feb5257b747b8d114923f32a40a032929dd4437c61329b1c62d1c1dd1ad8b",
       "justification": "Expand step: copy the imported voice creation switch and guild-wide command role from voice_guild_settings into voice_access_controls, the columns the runtime gates enforce, tightening only (creation off wins, an enforced role wins) and syncing the legacy columns as a mirror for the previous binary until a contract migration drops them; data copy only, no DDL."
+    },
+    "crates/cutover/migrations/0472_internal_audit_order.sql": {
+      "sha256": "6639e960899774ee9f5debcbbbb084e561b68566fff347129266c252f5ee7f4d",
+      "justification": "Expand step: drain audit writers, seed a protected singleton above committed maxima and allocate every inserted tuple under its transaction-held row fence; preserve old tuples and nullable old-image writes."
     }
   }
 }

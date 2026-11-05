@@ -631,6 +631,13 @@ async fn cmd_restore(args: &[String]) -> i32 {
                 }
             );
             for table in &report.manifest.tables {
+                if let Some(count) = report.preserved_tables.get(&table.name) {
+                    println!(
+                        "  {:17} preserved installed state ({count} rows), not restored",
+                        table.name
+                    );
+                    continue;
+                }
                 let got = report.restored.get(&table.name).copied().unwrap_or(0);
                 println!(
                     "  {:17} manifest {:7}  restored {:7}  {}",

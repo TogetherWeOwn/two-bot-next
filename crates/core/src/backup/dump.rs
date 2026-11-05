@@ -30,8 +30,9 @@ use thiserror::Error;
 
 use super::dump_file::{
     cell_input, inspect, is_destination_owned, is_dump_table, DumpContents, DumpError,
-    DumpManifest, DumpTableInfo, DumpWriter, SequenceMark, DUMP_TABLES, DUMP_VERSION,
-    OPTIONAL_LEGACY_TABLES,
+    DumpManifest, DumpTableInfo, DumpWriter, SequenceMark, AUDIT_LOG_TABLE,
+    AUDIT_ORDER_TRIGGER_INSTALLED_SQL, DUMP_TABLES, DUMP_VERSION, OPTIONAL_LEGACY_TABLES,
+    RESTORE_PRESERVED_TABLES,
 };
 use super::guild_config::unix_now_iso;
 
@@ -44,6 +45,32 @@ pub enum DbDumpError {
     Db(#[from] sqlx::Error),
     #[error("{0}")]
     Refused(String),
+    /// The archive carries audit rows but the target's ordering trigger would
+    /// rewrite their identity (`audit_id`, `created_at`). Offline
+    /// identity-preserving recovery is not qualified, so nothing was changed.
+    #[error(
+        "refusing to restore {rows} internal_action_log rows: the target has the audit ordering trigger installed, which would rewrite their audit_id/created_at; identity-preserving audit recovery is not qualified, nothing was changed"
+    )]
+    AuditOrderingInstalled { rows: u64 },
+}
+
+/// Refuse an import that carries `audit_rows` audit rows into a target whose
+/// ordering trigger is installed. Read-only. A failed catalog query is a
+/// database error, never a silent pass or a false refusal.
+async fn guard_audit_identity_import(
+    conn: &mut sqlx::PgConnection,
+    audit_rows: u64,
+) -> Result<(), DbDumpError> {
+    if audit_rows == 0 {
+        return Ok(());
+    }
+    let installed: bool = sqlx::query_scalar(AUDIT_ORDER_TRIGGER_INSTALLED_SQL)
+        .fetch_one(&mut *conn)
+        .await?;
+    if installed {
+        return Err(DbDumpError::AuditOrderingInstalled { rows: audit_rows });
+    }
+    Ok(())
 }
 
 /// Total, locale-independent order even for composite keys or tables without
@@ -430,6 +457,8 @@ pub async fn dump(pool: &PgPool, out_path: &Path) -> Result<DumpManifest, DbDump
 pub struct RestoreReport {
     pub manifest: DumpManifest,
     pub restored: BTreeMap<String, u64>,
+    /// Installed target state left untouched, not restored from the archive.
+    pub preserved_tables: BTreeMap<String, u64>,
     pub dropped_columns: BTreeMap<String, Vec<String>>,
     /// Schema-required baseline rows initialized when absent from an old dump.
     pub initialized_tables: BTreeMap<String, u64>,
@@ -527,6 +556,13 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     )))
     .execute(&mut *tx)
     .await?;
+    // Audit identity fence: still read-only, and under the lock above so the
+    // trigger cannot be installed concurrently. Audit-free archives pass.
+    let archived_audit_rows = contents
+        .buffers
+        .get(AUDIT_LOG_TABLE)
+        .map_or(0, |rows| rows.len() as u64);
+    guard_audit_identity_import(&mut tx, archived_audit_rows).await?;
     // Moderation history fence: overwriting destination evidence could forget
     // a post-backup PUT/DELETE or a newer permanent ban. Refuse while the
     // lock is held so no concurrent writer slips evidence in after the check.
@@ -575,7 +611,13 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     // A single explicit truncate covers all FK dependencies, without CASCADE
     // touching foreign/website tables. No RESTART IDENTITY: that would discard
     // the target's own high-water mark, which the restarts below preserve.
-    sqlx::query(audited(format!("TRUNCATE {}", target_tables.join(", "))))
+    // Preserved allocator state is never truncated.
+    let truncated: Vec<&str> = target_tables
+        .iter()
+        .copied()
+        .filter(|t| !RESTORE_PRESERVED_TABLES.contains(t))
+        .collect();
+    sqlx::query(audited(format!("TRUNCATE {}", truncated.join(", "))))
         .execute(&mut *tx)
         .await?;
     // Cooldowns are intentionally not archived; discard stale target throttles.
@@ -618,6 +660,9 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
                 "manifest table {:?} is not a dump table",
                 table.name
             )));
+        }
+        if RESTORE_PRESERVED_TABLES.contains(&table.name.as_str()) {
+            continue;
         }
         let empty = Vec::new();
         let rows = contents.buffers.get(&table.name).unwrap_or(&empty);
@@ -975,6 +1020,9 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         .iter()
         .any(|(name, _)| name == "retry_generation");
     for &table in &target_tables {
+        if RESTORE_PRESERVED_TABLES.contains(&table) {
+            continue;
+        }
         for (column, sequence) in table_sequences(&mut tx, table).await? {
             if is_destination_owned(table, &column) {
                 continue;
@@ -1001,6 +1049,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     let mut report = RestoreReport {
         manifest,
         restored: BTreeMap::new(),
+        preserved_tables: BTreeMap::new(),
         dropped_columns,
         initialized_tables,
         missing_member_ban_ownership,
@@ -1016,6 +1065,10 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             .fetch_one(pool)
             .await?;
         let count = row.0 as u64;
+        if RESTORE_PRESERVED_TABLES.contains(table) {
+            report.preserved_tables.insert((*table).to_owned(), count);
+            continue;
+        }
         if count != report.expected_count(table) {
             report.ok = false;
         }
@@ -1052,6 +1105,7 @@ mod tests {
                 sequence_marks: Vec::new(),
             },
             restored: BTreeMap::new(),
+            preserved_tables: BTreeMap::new(),
             dropped_columns: BTreeMap::new(),
             initialized_tables: BTreeMap::from([("guild_settings_revision".to_owned(), 1)]),
             missing_member_ban_ownership: false,

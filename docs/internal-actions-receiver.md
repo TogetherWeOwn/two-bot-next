@@ -478,8 +478,25 @@ Event and rank names no longer come from the mutable `rank_ladder` or
 - On `internal_action_log`, an UPDATE cannot change the identity or publication
   facts once written. The authorized erasure DELETE remains.
 
-Feed ordering is unchanged by this naming change; a commit-order allocator for
-the cursor is not implemented yet.
+Migration `0472` establishes commit-visible ordering for every audit INSERT,
+including old images and direct SQL. Under a draining write-conflicting table
+lock it seeds one global `internal_audit_order` row above the committed maxima,
+leaves historical tuples unchanged and attaches the insert trigger atomically.
+The trigger locks that row through outer commit/rollback, then samples the
+clock, clamps time to the prior high water and increments the ID. A later
+writer cannot allocate ahead of an uncommitted earlier row. Timestamp ties,
+clock retreat and aborted writers do not lose entries. Missing/exhausted state
+refuses; the singleton cannot be deleted, truncated or moved backwards.
+
+The lock order is intent/map locks, then audit INSERT/fence, then commit. No
+REST, timer waits, pool acquisition or unrelated intent locks follow the fence.
+Ordinary image rollback leaves the expanded schema, triggers and state in
+place; old-shaped writes remain valid, with unproven event/rank names suppressed.
+Audit-bearing backup restore and rollback-delta import refuse before mutation:
+identity-preserving offline recovery is not yet qualified ([backup boundary](backup.md#audit-identity-recovery-boundary)).
+Keep the flag OFF until separately approved staging/production rollout. A
+prototype consumer that advanced on the unfenced implementation needs an
+explicit earlier-cursor replay; existing omissions are not repaired by renumbering.
 A membership subject present in `privacy_opt_outs` keeps its entry but omits
 `subject_id`; the relay ceiling stays scalar (no message text, tokens or
 request bytes leave the Worker).

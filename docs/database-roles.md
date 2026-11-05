@@ -254,8 +254,17 @@ and revoking grants; do not copy a credential from another service if it fails.
 The plan is transactional and refuses unsafe existing groups instead of changing
 their login status or silently removing memberships. It contains no passwords.
 
-1. For the first bootstrap, the order is fixed: (a) the authorized
-   provisioning identity applies the rendered bootstrap phase
+1. For the first bootstrap, the order is fixed: first apply `sql/web_v1.sql`
+   as described below. Then the existing authorized provisioning identity
+   prints/reviews/applies `sql/internal_audit_bootstrap_helpers.sql` before
+   either introducing audit migration (0471/0472) is recorded. This explicit
+   artifact installs only the three real, private SECURITY INVOKER trigger
+   definitions; it installs no columns, triggers, state or ledger entries.
+   It refuses definition/security/ownership/ACL drift, overloads, dependencies
+   or a recorded introducing migration; an identical unactivated preparation
+   may be repeated. It cannot repair missing post-migration functions and is
+   never invoked by startup, a plan or verification. No new credential or grant
+   is needed. Next: (a) the authorized provisioning identity applies the rendered bootstrap phase
    (`two-bot db roles plan --phase bootstrap`), which transfers the existing
    allowlisted objects and skips relations/sequences the pending migrations
    have not created yet; (b) the operator provisions the dedicated migrator
@@ -264,7 +273,9 @@ their login status or silently removing memberships. It contains no passwords.
    migrations with `SET ROLE two_bot_migrator`, so new objects are
    migrator-owned from creation; (e) the provisioning identity applies the
    full phase (`two-bot db roles plan`, the default), idempotently; (f) verify
-   reads 0 findings. For later migrations, the order is fixed: (a) dispatch the
+   reads 0 findings. For later migrations, do not run the bootstrap artifact:
+   the ordinary self-contained migrations create the same private helpers and
+   activate them as the migrator. The order is fixed: (a) dispatch the
    matching migration workflow plan (`staging-migrate.yml` with
    `--target staging` for staging, `production-migrate.yml` with
    `--target production` for PlanetScale main `two_bot`, passing
