@@ -11,9 +11,10 @@ import hashlib
 import json
 
 from announcement_runtime_schema import (
-    ARCHIVE_LIMIT, Array, CONTROL, DOCUMENT, GATE_NAMES, Integer, MANIFEST,
-    PRINCIPAL, REF, REFERENCE_LIMIT, RUN, SERVICE_ID, SERVED_PAIR, SHA, SHA256,
-    TOKEN_FREE_PATH, UTC, UUID, VERSION, WORKER, _validate, enum,
+    ARCHIVE_LIMIT, Array, AUTHORITY, AUTHORITY_READ, CONTROL, DECISION, DOCUMENT,
+    GATE_NAMES, IMAGE, Integer, MANIFEST, PRINCIPAL, REF, REFERENCE_LIMIT, RUN,
+    SCOPE, SERVICE_ID, SERVED_PAIR, SHA, SHA256, TOKEN_FREE_PATH, UTC, UUID,
+    VERSION, WORKER, _validate, enum,
     parse_bounded_json, require,
 )
 
@@ -57,6 +58,65 @@ PROVENANCE_RECORDS = {
 }
 
 
+# These schemas describe claims about authority, NEVER provision an authority
+# root. In particular there is no endpoint, key, plugin or adapter input.
+AUTHORITY_RECORDS = {
+    "principal_binding": {"principal": PRINCIPAL,
+        "roles": Array(enum("author", "executor", "caller", "security", "qa",
+                            "controller", "verifier"), 1, 7)},
+    "authority_consumer": {"principal": PRINCIPAL, "role": enum("controller", "verifier"),
+                           "provisioning_ref": REF},
+    "authority_source": {"repository": SCOPE["repository"], "policy": DOCUMENT,
+                         "principal_mapping_sha256": SHA256,
+                         "principal_refs": Array(REF, 7, 7),
+                         "controller_ref": REF, "verifier_ref": REF,
+                         "installation_mapping_ref": REF, "history_ref": REF,
+                         "stage_bindings": Array({"purpose": enum("runtime", "installation"),
+                             "role": enum("security", "qa"), "principal_ref": REF,
+                             "stage_id": UUID, "participant_id": UUID}, 4, 4)},
+    "authority_scope": {"scope": SCOPE, "control": CONTROL, "policy": DOCUMENT,
+                        "source_sha256": SHA256, "consumers_sha256": SHA256,
+                        "implementation": MANIFEST, "resource_plan": DOCUMENT,
+                        "identity_map": DOCUMENT, "inventory_manifest": MANIFEST,
+                        "components_manifest": MANIFEST, "image_digest": IMAGE,
+                        "budgets_sha256": SHA256, "epoch": SERVICE_ID,
+                        "resource_epoch": SERVICE_ID, "principal_refs": Array(REF, 7, 7)},
+    "authority_decision": {"claim": DECISION, "source_ref": REF,
+                           "security_round": Integer(1), "generation": SERVICE_ID},
+    "authority_read": {"claim": AUTHORITY_READ, "history_ref": REF, "consumer_ref": REF},
+    "authority_history": {"source_ref": REF, "scope_sha256": SHA256,
+        "epoch": SERVICE_ID, "resource_epoch": SERVICE_ID, "generation": SERVICE_ID,
+        "effective_decision_refs": Array(REF, 2, 2),
+        "started_at": UTC, "ended_at": UTC, "first_sequence": Integer(1),
+        "last_sequence": Integer(), "coverage": enum("complete", "gap", "unknown"),
+        "events": Array({"sequence": Integer(1),
+            "kind": enum("push", "scope_change", "policy_change", "resource_change",
+                         "revoke", "dismiss"),
+            "observed_at": UTC, "scope_sha256": SHA256,
+            "invalidated_decision_refs": Array(REF, 0)}, 0)},
+    "installation_approval": {"source_ref": REF, "mapping_ref": REF,
+        "policy": DOCUMENT, "implementation": MANIFEST, "control": VERSION,
+        "epoch": SERVICE_ID, "scope_sha256": SHA256, "security_round": Integer(1),
+        "decisions": Array(DECISION, 2, 2),
+        "history_ref": REF, "controller_read_ref": REF, "verifier_read_ref": REF,
+        "checked_at": UTC},
+    "execution_authority": {"claim": AUTHORITY["execution"], "source_ref": REF,
+        "scope_sha256": SHA256, "epoch": SERVICE_ID, "resource_epoch": SERVICE_ID,
+        "generation": SERVICE_ID, "installation_approval_refs": Array(REF)},
+    "nonce_consumption": {"source_ref": REF, "execution_ref": REF, "nonce_ref": REF,
+        "run": RUN, "owner_ref": REF, "consumed_at": UTC,
+        "authority_epoch": SERVICE_ID, "resource_epoch": SERVICE_ID,
+        "outcome": enum("consumed", "replayed", "unknown")},
+    "mutation_fence": {"source_ref": REF, "execution_ref": REF, "checkpoint_ref": REF,
+        "run": RUN, "phase": enum("credentials", "setup", "rollout", "transition",
+                                     "effect_batch", "final"),
+        "authority_epoch": SERVICE_ID, "resource_epoch": SERVICE_ID,
+        "nonce_ref": REF, "consumption_ref": REF, "observed_at": UTC, "valid_until": UTC,
+        "boundary": enum("external_atomic", "application_flag", "unknown")},
+}
+EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS}
+
+
 def canonical_digest(value):
     """SHA-256 of canonical inert JSON, not a signature or authority decision."""
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
@@ -85,10 +145,10 @@ class EvidenceIndex:
             record = parse_bounded_json(raw)
             require(type(record) is dict, "evidence_record")
             kind = record.get("kind")
-            require(type(kind) is str and kind in PROVENANCE_RECORDS, "evidence_kind")
+            require(type(kind) is str and kind in EVIDENCE_RECORDS, "evidence_kind")
             _validate(record, {"schema": enum(EVIDENCE_SCHEMA), "ref": REF,
                                "kind": enum(kind), "run": RUN,
-                               "data": PROVENANCE_RECORDS[kind]})
+                               "data": EVIDENCE_RECORDS[kind]})
             ref = record["ref"]
             require(path == "evidence/" + ref + ".json", "evidence_path")
             require(record["run"] == self._run, "evidence_attempt")
@@ -97,7 +157,7 @@ class EvidenceIndex:
 
     def resolve(self, ref, kind):
         _validate(ref, REF)
-        require(kind in PROVENANCE_RECORDS, "evidence_kind")
+        require(kind in EVIDENCE_RECORDS, "evidence_kind")
         record = self._records.get(ref)
         require(record is not None, "unresolved_reference")
         require(record["kind"] == kind, "reference_kind")

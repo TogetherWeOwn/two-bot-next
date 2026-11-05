@@ -53,6 +53,30 @@ not canonical staging qualification or production promotion.
   producer, isolation boundary, observer or manifest contents. The opaque
   observer provisioning reference remains an explicitly unsupported external
   requirement, not a root selected from a sidecar.
+- `scripts/announcement_runtime_authority.py` adds offline typed authority-claim
+  resolution. The content-bound scope compares exact source/control/code/policy,
+  resource/identity/operation-plan pins, image/components, epochs and the full
+  principal/source/consumer mapping. Seven distinct subjects have fixed role
+  claims; runtime and installation decisions bind separate native stage and
+  participant mappings, ordered Security→QA, exact scope and Security round.
+  Both consumers must claim separate provisioning and matching complete
+  effective decision histories at each mandatory checkpoint. History snapshots
+  are contiguous, time-bound, prefix-consistent and cannot revive an invalidated
+  approval after a push/revert, revocation, dismissal or scope change. Reusable
+  installation approval is separately scoped and rechecked at every checkpoint;
+  its decisions cannot drift behind the epoch. The one-attempt execution and
+  nonce-consumption claims bind the run, owner, epochs, time and exact scope.
+  Credential/setup/rollout/transition/effect-batch/final checkpoints are required;
+  each resolves an exact-phase external-atomic-fence claim with at most 60-second
+  validity. Rollout starts and recorded effect attempts must fall inside their
+  matching checkpoint windows; final authority is fresh against the verifier
+  clock. These are consistency predicates, **not** actual native API reads,
+  provisioning, nonce consumption, current revocation protection or enforcement.
+  There is no authority endpoint, key, adapter or enable input. A coherent
+  fabricated graph still returns no capability and cannot qualify runtime.
+  Resource transitions and complete lifecycle mutation-to-checkpoint binding
+  remain unfinished; composition with provenance/all-used accounting does not
+  replace those or any remaining acceptance predicate.
 - `scripts/announcement_runtime_policy.py` checks offline lease/freshness,
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
@@ -119,8 +143,8 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
    approved T/actual served-S provenance, build isolation and packaging checks.
    The local full-tree/delta collector and offline topology predicates do not
    establish independent review or any of those external facts.
-2. Extend the typed provenance resolver to every authority, resource, state,
-   input, effect, telemetry and lifecycle reference; close the remaining
+2. Extend typed resolution beyond the provenance and authority-claim graphs to
+   every resource, state, input, effect, telemetry and lifecycle reference; close the remaining
    cross-object comparisons. Implement exact resource/profile budgets, stored
    off/on/replay/final-off semantics, atomic RSVP/audit evidence, owned CAS
    cleanup and independently verified restoration. Provenance consistency alone
