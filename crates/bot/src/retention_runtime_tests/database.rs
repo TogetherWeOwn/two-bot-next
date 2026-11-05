@@ -608,7 +608,10 @@ fn voice_heat_expiry_line(logs: &str) -> &str {
 fn voice_heat_expiry_failure_line(logs: &str) -> &str {
     let failures: Vec<_> = logs
         .lines()
-        .filter(|line| line.contains("voice_heat_expiry_failed"))
+        .filter(|line| {
+            line.contains("message=voice_heat_expiry_failed")
+                || line.contains("message=\"voice_heat_expiry_failed\"")
+        })
         .collect();
     assert_eq!(
         failures.len(),
@@ -616,6 +619,22 @@ fn voice_heat_expiry_failure_line(logs: &str) -> &str {
         "one voice-heat expiry failure event per failed tick: {logs}"
     );
     failures[0]
+}
+
+#[test]
+fn voice_heat_expiry_failure_selection_ignores_summary_flags() {
+    for message in [
+        "message=voice_heat_expiry_failed",
+        "message=\"voice_heat_expiry_failed\"",
+    ] {
+        let diagnostic = format!("WARN two_bot::retention_jobs {message} reason=\"database\"");
+        for failed in [false, true] {
+            let logs = format!(
+                "WARN two_bot::retention_jobs message=\"retention_run\" voice_heat_expiry_failed={failed}\n{diagnostic}\n"
+            );
+            assert_eq!(voice_heat_expiry_failure_line(&logs), diagnostic);
+        }
+    }
 }
 
 #[tokio::test]
