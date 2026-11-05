@@ -14,7 +14,12 @@ not canonical staging qualification or production promotion.
   duplicate/unknown keys, invalid Unicode, impossible UTC timestamps, float/bool
   counts, unsupported enum values, unsafe module paths and unresolved sentinel
   values. Bounds are 1 MiB per receipt, depth 12, scalar text 4,096 UTF-8 bytes,
-  reference lists 256 and individual effect/transition ledgers 512.
+  reference lists 256 and individual effect/transition ledgers 512. Literal
+  Discord resource application/guild/object IDs and interaction-plan
+  interaction/application IDs additionally fit `1..=2**64-1` at intake;
+  matching oversized decimal claims cannot become a valid resource identity.
+  Generic service IDs and authority epochs retain their separate syntax. This
+  does not authenticate any ID, allocate a resource or enable runtime admission.
 - `scripts/announcement_runtime_archive.py` inspects, but never extracts or
   executes, an exact inventory of `candidate-receipt.json` and bounded
   `evidence/<reference>.json` members. Compressed and expanded archive bounds

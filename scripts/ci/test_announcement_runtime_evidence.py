@@ -41,6 +41,27 @@ class TypedEvidence(unittest.TestCase):
         with self.assertRaisesRegex(Refusal, "unsupported"):
             runtime_preflight()
 
+    def test_interaction_plan_ids_fit_nonzero_u64_at_sidecar_intake(self):
+        interaction = {"case_id": "off-rsvp", "command": "rsvp", "phase": "off",
+            "interaction_id": "1", "application_id": "2", "actor_ref": "actor",
+            "channel_ref": "channel", "event_ref": "event", "request_sha256": D1,
+            "ack_count": 1, "edit_count": 0, "followup_count": 0, "ephemeral": True,
+            "maximum_wire_attempts": 1}
+        for field in ("interaction_id", "application_id"):
+            for value in ("1", str(2**64 - 1), str(2**64), "99999999999999999999"):
+                with self.subTest(field=field, value=value):
+                    record = sidecar("interaction-plan")
+                    record.update(kind="interaction_plan", data={
+                        "interactions": [{**interaction, field: value}],
+                        "exchanges": {"ref": "exchanges", "sha256": D1}})
+                    if int(value) < 2**64:
+                        index = evidence.EvidenceIndex(files(record), run())
+                        actual = index.resolve("interaction-plan", "interaction_plan")
+                        self.assertEqual(value, actual["interactions"][0][field])
+                    else:
+                        with self.assertRaisesRegex(Refusal, "discord_id$"):
+                            evidence.EvidenceIndex(files(record), run())
+
     def test_manifest_and_document_are_not_interchangeable(self):
         record = sidecar("manifest-one")
         record.update(kind="manifest", data={"revision": H1, "sha256": D1})

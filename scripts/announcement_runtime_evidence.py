@@ -14,7 +14,7 @@ from announcement_runtime_schema import (
     ARCHIVE_LIMIT, Array, AUTHORITY, AUTHORITY_READ, CONTROL, DECISION, DOCUMENT,
     COUNT, COVERAGE, GATE_NAMES, IDENTITY, IMAGE, Integer, LEDGER_LIMIT, LOCK, MANIFEST, OPERATIONS,
     PRINCIPAL, REF, REFERENCE_LIMIT, RESOURCE, RUN, SCOPE, SERVICE_ID, SERVED_PAIR,
-    SHA, SHA256, STATE, TOKEN_FREE_PATH, UTC, UUID, COMMAND_GATES,
+    SHA, SHA256, STATE, TOKEN_FREE_PATH, UTC, UUID, COMMAND_GATES, DISCORD_ID,
     Text, TRANSITION, Union, VERSION, WORKER, _validate, enum,
     parse_bounded_json, require,
 )
@@ -161,7 +161,7 @@ CONTENT_PIN = {"ref": REF, "sha256": SHA256}
 INTERACTION = {
     "case_id": REF, "command": enum(*sorted(COMMAND_GATES)),
     "phase": enum("off", "on", "replay", "negative", "final_off"),
-    "interaction_id": SERVICE_ID, "application_id": SERVICE_ID,
+    "interaction_id": DISCORD_ID, "application_id": DISCORD_ID,
     "actor_ref": REF, "channel_ref": REF, "event_ref": REF,
     "request_sha256": SHA256, "ack_count": Integer(1, 1),
     "edit_count": Integer(0, 1), "followup_count": enum(0), "ephemeral": enum(True),

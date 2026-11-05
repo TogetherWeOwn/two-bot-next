@@ -215,6 +215,24 @@ class ScalarTests(Base):
         self.refused_doc(mutated(size, schema.ARCHIVE_LIMIT + 1), "integer")
         self.refused_doc(mutated(size, 0), "integer")
 
+    def test_discord_resource_ids_fit_nonzero_u64_without_narrowing_service_ids(self):
+        identity = {"kind": "discord", "application_id": "1", "guild_id": "2",
+                    "object_id": "3", "object_type": "channel",
+                    "permissions_sha256": "a" * 64, "membership_sha256": "b" * 64}
+        for field in ("application_id", "guild_id", "object_id"):
+            for value in (str(2**64), "99999999999999999999"):
+                with self.subTest(field=field, oversized=value):
+                    doc = fx.receipt()
+                    doc["resources"]["entries"][0]["identity"] = {**identity, field: value}
+                    self.refused_doc(doc, "discord_id")
+            for value in ("1", str(2**64 - 1)):
+                with self.subTest(field=field, boundary=value):
+                    doc = fx.receipt()
+                    doc["resources"]["entries"][0]["identity"] = {**identity, field: value}
+                    schema.parse_receipt(encode(doc))
+        # Epochs are not Discord snowflakes: retain the existing generic syntax.
+        schema.parse_receipt(encode(mutated(["authority", "epoch"], "99999999999999999999")))
+
     def test_non_json_numbers_and_syntax(self):
         for literal in (b"NaN", b"Infinity", b"-Infinity"):
             with self.subTest(literal=literal):

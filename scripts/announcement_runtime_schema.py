@@ -170,6 +170,8 @@ def _validate(value, spec):
         require(value.casefold() not in {
             "unbound", "unknown", "todo", "tbd", "null", "none", "all", "hold",
         }, "unresolved_symbol")
+        if spec is DISCORD_ID:
+            require(int(value) <= 2**64 - 1, "discord_id")
         if spec is UTC:
             try:
                 datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
@@ -211,6 +213,9 @@ def refs(minimum=1):
 
 REF = Text(r"[a-z][a-z0-9_-]{0,95}")
 SERVICE_ID = Text(r"[1-9][0-9]{0,19}")
+# A distinct spec preserves generic service/epoch syntax while bounding the
+# literal Discord resource and interaction identities before graph comparison.
+DISCORD_ID = Text(r"[1-9][0-9]{0,19}")
 UUID = Text(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SHA = Text(r"[0-9a-f]{40}")
 SHA256 = Text(r"[0-9a-f]{64}")
@@ -315,8 +320,8 @@ SERVED = {"samples": Array(SERVED_PAIR)}
 
 # Identity variants are fixed by trusted code, never caller-defined objects.
 IDENTITY = Union("kind", {
-    "discord": {"kind": enum("discord"), "application_id": SERVICE_ID,
-                "guild_id": SERVICE_ID, "object_id": SERVICE_ID,
+    "discord": {"kind": enum("discord"), "application_id": DISCORD_ID,
+                "guild_id": DISCORD_ID, "object_id": DISCORD_ID,
                 "object_type": enum("application", "actor", "channel", "event", "message",
                                     "interaction", "command_set"),
                 "permissions_sha256": SHA256, "membership_sha256": SHA256},
