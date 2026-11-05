@@ -65,7 +65,9 @@ class ArchiveComposition(unittest.TestCase):
             "check_lifecycle_ledger_claims", "check_drain_claims", "check_interaction_exchange_claims",
             "check_feed_exchange_claims", "check_delivery_trace_claims", "check_rsvp_storage_claims",
             "check_recovery_plan_claims", "check_recovery_grant_claims", "check_recovery_read_claims",
+            "check_recovery_fence_claims", "check_recovery_installation_claims",
             "check_lifecycle_phase_claims"])
+        self.assertEqual(len(checker.CLAIM_CHECKS), len(set(checker.CLAIM_CHECKS)))
 
     def test_same_index_and_clock_flow_through_every_comparison(self):
         raw, inventory = packet()
@@ -75,9 +77,9 @@ class ArchiveComposition(unittest.TestCase):
             calls.append((receipt, evidence, now))
             evidence.resolve("check-doc", "document")
 
-        with mock.patch.object(checker, "CLAIM_CHECKS", (compare,) * 21):
+        with mock.patch.object(checker, "CLAIM_CHECKS", (compare,) * 23):
             self.assertIsNone(checker.check_archive_claims(raw, inventory, now=NOW))
-        self.assertEqual(len(calls), 21)
+        self.assertEqual(len(calls), 23)
         self.assertTrue(all(r is calls[0][0] and e is calls[0][1] and n is NOW
                             for r, e, n in calls))
         self.assertIs(calls[0][0]["promotable"], False)
@@ -156,6 +158,71 @@ class ArchiveComposition(unittest.TestCase):
         for now in (None, "2026-01-01T00:25:00Z", NOW.replace(tzinfo=None)):
             with self.subTest(now=now), self.assertRaisesRegex(Refusal, "clock$"):
                 checker.check_archive_claims(raw, inventory, now=now)
+
+
+class RecoveryArchiveComposition(unittest.TestCase):
+    """Isolate the registered recovery block, NOT a complete qualifying graph.
+
+    Earlier non-recovery comparisons are deliberately not exercised by this
+    partial fixture. Archive intake and final all-used accounting remain real;
+    neither a fabricated approval nor successful recovery comparisons can pass.
+    """
+
+    def inspect_recovery(self, receipt, records, now, *, lifecycle=None):
+        raw, inventory = packet(receipt, evidence_files(records))
+        start = checker.CLAIM_CHECKS.index(checker.check_recovery_plan_claims)
+        checks = checker.CLAIM_CHECKS[start:-1]
+        if lifecycle is not None:
+            checks += (lifecycle,)
+        with mock.patch.object(checker, "CLAIM_CHECKS", checks):
+            checker.check_archive_claims(raw, inventory, now=now)
+
+    def test_coherent_recovery_block_still_requires_complete_packet_accounting(self):
+        from test_announcement_runtime_recovery_installations import install_fixture
+
+        for prior in ("absent", "present"):
+            receipt, records, now = install_fixture(prior)
+            with self.subTest(prior=prior), self.assertRaisesRegex(Refusal, "unreferenced_evidence$"):
+                self.inspect_recovery(receipt, records, now)
+
+    def test_each_registered_recovery_fence_refuses_drift(self):
+        from test_announcement_runtime_recovery_installations import install_fixture
+
+        for phase in (0, 1):
+            receipt, records, now = install_fixture()
+            entry = records["runtime-recovery-fences"]["data"]["entries"][phase]
+            records[entry["fence_ref"]]["data"]["resource_epoch"] = "999"
+            with self.subTest(phase=phase), self.assertRaisesRegex(Refusal, "recovery_fence_binding$"):
+                self.inspect_recovery(receipt, records, now)
+
+    def test_each_registered_recovery_installation_refuses_read_role_drift(self):
+        from test_announcement_runtime_recovery_installations import install_fixture
+
+        for phase in (0, 1):
+            receipt, records, now = install_fixture()
+            entry = records["runtime-recovery-installations"]["data"]["entries"][phase]
+            approval = records[entry["installation_ref"]]["data"]
+            records[approval["controller_read_ref"]]["data"]["claim"]["consumer"] = "verifier"
+            with self.subTest(phase=phase), self.assertRaisesRegex(Refusal, "recovery_installation_read$"):
+                self.inspect_recovery(receipt, records, now)
+
+    def test_missing_recovery_inventories_refuse_at_archive_entry_point(self):
+        from test_announcement_runtime_recovery_installations import install_fixture
+
+        for ref in ("runtime-recovery-fences", "runtime-recovery-installations"):
+            receipt, records, now = install_fixture()
+            del records[ref]
+            with self.subTest(ref=ref), self.assertRaisesRegex(Refusal, "unresolved_reference$"):
+                self.inspect_recovery(receipt, records, now)
+
+    def test_recovery_comparisons_cannot_replace_real_lifecycle_refusal(self):
+        from test_announcement_runtime_recovery_installations import install_fixture
+
+        receipt, records, now = install_fixture()
+        phase = mock.Mock(wraps=checker.check_lifecycle_phase_claims)
+        with self.assertRaises(Refusal):
+            self.inspect_recovery(receipt, records, now, lifecycle=phase)
+        phase.assert_called_once()
 
 
 class CliHold(unittest.TestCase):

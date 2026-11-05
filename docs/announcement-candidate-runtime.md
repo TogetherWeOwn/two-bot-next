@@ -504,8 +504,9 @@ not canonical staging qualification or production promotion.
   checkpoint clock. Its exclusive validity ends no later than 60 seconds after
   checking or grant expiry; the named cleanup timestamp or final verifier clock
   must be inside it. This library comparison neither acquires nor enforces an
-  atomic fence and is not yet registered in the CLI.
-  Standalone `check_recovery_installation_claims` composes those checks with a
+  atomic fence. The offline CLI explicitly registers this comparison after the
+  recovery reads and before the separate installation comparison.
+  `check_recovery_installation_claims` composes those checks with a
   closed fixed `runtime-recovery-installations` inventory. Every named recovery
   checkpoint requires a distinct `installation_approval` and fresh controller/
   verifier `authority_read` records, never reused runtime/recovery reads. The
@@ -518,8 +519,9 @@ not canonical staging qualification or production promotion.
   compares reusable installation claims, **not legitimate installation or current
   authenticated authority**. Full runtime authority checks remain mandatory
   upstream; this standalone checker does not validate their entire inventory or
-  enforce an installation epoch fence. Neither new library comparison is in the
-  CLI yet. Coordinated authority/state-chain/lifecycle consumption remains
+  enforce an installation epoch fence. The offline CLI explicitly registers
+  both comparisons before the mandatory lifecycle-phase refusal and final
+  all-used accounting. Coordinated authority/state-chain/lifecycle consumption remains
   unfinished. Actual ownership/
   CAS tokens, full-row state, process/Worker restoration and final verification
   remain unfinished. The mandatory lifecycle-phase checker still refuses cleanup,
@@ -632,7 +634,7 @@ must not be called as a substitute for any canonical admission control.
 ## Offline claim-checking entry point
 
 `scripts/announcement_runtime_check.py` composes bounded archive intake,
-closed same-run typed sidecars, all twenty-one existing public claim comparisons
+closed same-run typed sidecars, all twenty-three existing public claim comparisons
 and final all-used sidecar accounting. It is **not an independently provisioned
 verifier, receipt producer or runtime admission path**. The local Git topology
 collector is not invoked; authenticated source/service inventories, complete
