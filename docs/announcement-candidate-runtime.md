@@ -196,6 +196,27 @@ not canonical staging qualification or production promotion.
   and final all-used accounting remain mandatory separate checks. No observer,
   credential, DB transaction, external fence or public serializer is created.
   Consistent fabricated telemetry still cannot pass runtime admission.
+- `scripts/announcement_runtime_serialization.py` composes provenance and resource
+  comparisons with three closed serialization plan/participant/lock sidecar kinds.
+  The resource-plan content digest binds the complete declared job graph, writer
+  list, parent pointers, acquisition names and witness references. Every declared
+  job has exactly one node. A single controller orchestrator holds `deploy-staging`
+  for the entire attempt; writer paths include a distinct `staging-lifecycle`
+  leaf, and observers/credential-free builds cannot acquire either lock. Cycles,
+  missing parents/jobs/writers, same-lock ancestor acquisitions, parallel leaf
+  reacquisition, interference, stale/mismatched fences and uncovered intervals
+  refuse. Standalone synthetic writers cannot bypass the declared leaf path.
+  The verifier-bound observer job must span the entire attempt; its subject cannot
+  overlap any candidate/control producer, controller, author, executor or caller.
+  Each participant interval must fit every ancestor and held lock, and each lock must match its
+  acquiring controller job's entire interval. Multiple/reacquired leaves remain
+  unsupported in this narrow model. **This is a comparison of declared graphs,
+  not installed distributed locking, authenticated writer inventory or actual
+  all-writer coverage.** The graph cannot establish that an omitted external
+  writer honors the fence, map every operation to its actual producer, prove
+  lifecycle phase completion, or resolve queues/drain/cleanup/restoration. Those
+  remain mandatory. No workflow concurrency, canonical gate or installer changes
+  are made and coherent fabricated witnesses grant no runtime capability.
 - `scripts/announcement_runtime_policy.py` checks offline lease/freshness,
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified

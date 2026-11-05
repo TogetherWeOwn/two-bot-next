@@ -12,7 +12,7 @@ import json
 
 from announcement_runtime_schema import (
     ARCHIVE_LIMIT, Array, AUTHORITY, AUTHORITY_READ, CONTROL, DECISION, DOCUMENT,
-    COUNT, COVERAGE, GATE_NAMES, IDENTITY, IMAGE, Integer, LEDGER_LIMIT, MANIFEST, OPERATIONS,
+    COUNT, COVERAGE, GATE_NAMES, IDENTITY, IMAGE, Integer, LEDGER_LIMIT, LOCK, MANIFEST, OPERATIONS,
     PRINCIPAL, REF, REFERENCE_LIMIT, RESOURCE, RUN, SCOPE, SERVICE_ID, SERVED_PAIR,
     SHA, SHA256, STATE, TOKEN_FREE_PATH, UTC, UUID, COMMAND_GATES,
     Text, TRANSITION, Union, VERSION, WORKER, _validate, enum,
@@ -139,7 +139,8 @@ RESOURCE_RECORDS = {
     "resource_plan_content": {"slots": RESOURCE_SLOTS, "entries": Array(RESOURCE),
         "states": Array(STATE), "identity_map": DOCUMENT, "inventory_manifest": MANIFEST,
         "operation_budgets": Array(OPERATION_BUDGET, 1, LEDGER_LIMIT),
-        "input_plan_sha256": SHA256, "not_before": UTC, "expires_at": UTC},
+        "input_plan_sha256": SHA256, "serialization_plan_sha256": SHA256,
+        "not_before": UTC, "expires_at": UTC},
     "feed_item": {"source_ref": REF, "feed_ref": REF, "item_ref": REF,
         "source_content_sha256": SHA256, "item_content_sha256": SHA256, "nonce_ref": REF},
 }
@@ -256,9 +257,26 @@ TELEMETRY_RECORDS = {
     "db_transition": {"claim": TRANSITION, "transaction_ref": REF,
                       "method": enum("db_insert", "db_cas", "db_delete_owned")},
 }
+# Lock graph observations are claims, NOT an acquired distributed fence. A plan
+# digest in the resource scope binds every participant and its acquisition path.
+LOCK_NAME = enum("deploy-staging", "staging-lifecycle")
+SERIALIZATION_RECORDS = {
+    "serialization_plan": {"inventory_manifest": MANIFEST,
+        "nodes": Array({"ref": REF, "job_ref": REF, "parent_refs": Array(REF, 0, 1),
+            "role": enum("orchestrator", "writer", "observer", "credential_free_build"),
+            "acquires": Array(LOCK_NAME, 0, 2), "witness_ref": REF}),
+        "writer_refs": Array(REF)},
+    "serialization_participant": {"node_ref": REF, "job_ref": REF,
+        "observer_ref": REF, "started_at": UTC, "ended_at": UTC,
+        "held_lock_refs": Array(REF, 0, 2), "other_writer_refs": Array(REF, 0),
+        "outcome": enum("exclusive", "interference", "unknown")},
+    "serialization_lock": {"claim": LOCK,
+        "node_ref": REF, "observer_ref": REF, "boundary": enum("all_writers_external",
+            "workflow_only", "application_only", "unknown")},
+}
 EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS,
                     **INPUT_RECORDS, **SCHEDULER_RECORDS, **SOURCE_RECORDS,
-                    **TELEMETRY_RECORDS}
+                    **TELEMETRY_RECORDS, **SERIALIZATION_RECORDS}
 
 
 def canonical_digest(value):
