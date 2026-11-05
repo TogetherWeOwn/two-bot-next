@@ -21,12 +21,19 @@ No fallback authorizes a full suite, CI mirror or heavy raw-host build. If the
 focused/local limit cannot be met, defer to Actions or route the prerequisite.
 
 Only for an approved non-heavy focused controller reproduction/fallback, use
-the repository cache wrapper from your isolated workspace, with a failing test
-filter, for example:
+the repository cache wrapper from your isolated workspace, with the fully
+qualified failing test name from the failing Actions job, for example:
 
 ```sh
-python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib <failing-test-filter> -- --exact
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib <fully-qualified-failing-test-name> -- --exact
 ```
+
+Keep the complete module path (for example,
+`internal_actions::tests::event_key_names_a_key_never_a_snowflake`), not just the
+short function name. Retain `--exact` to bound reproduction and confirm the
+result reports **exactly one test ran**. Zero tests is not a successful
+reproduction; correct the name/target against the failing job rather than
+broadening the selector.
 
 Do not run `local_testdb.py test`, a copied `bin/local-ci.sh` recipe or a sequence
 of crate commands that reconstructs CI. Never create per-worktree Docker Rust

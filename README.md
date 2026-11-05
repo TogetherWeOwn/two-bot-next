@@ -142,7 +142,9 @@ Rust-selected check run. CI generates it explicitly before compiling workspace
 tests or all-targets Clippy. The generator validates tracked configuration first and
 never rewrites it or the saved publication fixtures.
 
-Use the exact-head Actions artifact for ordinary verification; CI runs
+Use the exact-head Actions artifact when Rust is selected; docs-only runs may
+have no command artifact. For those runs, use exact-head `ci-ok`, selector results
+and selected jobs as CI evidence, not local generation. CI runs
 `python3 scripts/generate_command_reference.py` and read-only reference tests. Local execution is only for focused
 reproduction of one failing test or crate under the
 [verification policy](CONTRIBUTING.md#focused-failure-reproduction-only), not a
