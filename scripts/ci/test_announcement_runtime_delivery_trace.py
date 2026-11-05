@@ -30,7 +30,9 @@ from announcement_provenance_fixtures import at, envelope, evidence_index
 from announcement_runtime_check import CLAIM_CHECKS
 from announcement_runtime_delivery_trace import check_delivery_trace_claims
 from announcement_runtime_evidence import canonical_digest
+from announcement_runtime_feed_exchange import check_feed_exchange_claims
 from announcement_runtime_policy import runtime_preflight
+from announcement_runtime_rsvp_storage import check_rsvp_storage_claims
 from announcement_runtime_schema import REFERENCE_LIMIT, Refusal
 from announcement_runtime_source_inputs import SOURCE_PLAN_REF
 from announcement_source_input_fixtures import source_input_fixture
@@ -90,8 +92,16 @@ class Golden(DeliveryTrace):
         with self.assertRaisesRegex(Refusal, "unreferenced_evidence$"):
             index.require_all_used()
 
-    def test_checker_runs_last_and_composes_the_feed_exchange_check(self):
-        self.assertIs(check_delivery_trace_claims, CLAIM_CHECKS[-1])
+    def test_checker_order_and_composed_feed_exchange_refusal(self):
+        checks = (check_feed_exchange_claims, check_delivery_trace_claims,
+                  check_rsvp_storage_claims)
+        for check in checks:
+            with self.subTest(check=check.__name__):
+                self.assertEqual(1, CLAIM_CHECKS.count(check))
+        self.assertLess(CLAIM_CHECKS.index(check_feed_exchange_claims),
+                        CLAIM_CHECKS.index(check_delivery_trace_claims))
+        self.assertLess(CLAIM_CHECKS.index(check_delivery_trace_claims),
+                        CLAIM_CHECKS.index(check_rsvp_storage_claims))
         self.reject(lambda r, rec: rec[EXCHANGE]["data"]["response"]["message"].update(content="x"),
                     "feed_exchange_message")
 
