@@ -68,6 +68,9 @@ const EXPECTED_DISPOSITIONS: &[(&str, &str)] = &[
     ("voice_creators", ACCEPT_WITH_REASON),
     ("voice_game_aliases", ACCEPT_WITH_REASON),
     ("voice_guild_settings", ACCEPT_WITH_REASON),
+    // Derived calibration has observation timestamps, not write times; backup
+    // recovery deliberately re-samples rather than restoring this history.
+    ("voice_heat_hours", ACCEPT_WITH_REASON),
     ("voice_logging", ACCEPT_WITH_REASON),
     ("voice_logging_mention_members", ACCEPT_WITH_REASON),
     ("voice_logging_mention_roles", ACCEPT_WITH_REASON),
