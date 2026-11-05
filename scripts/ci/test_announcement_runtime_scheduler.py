@@ -8,7 +8,9 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from announcement_provenance_fixtures import at, evidence_index
 from announcement_scheduler_fixtures import scheduler_fixture, repin_scheduler
+from announcement_runtime_authority import check_authority_graph_claims
 from announcement_runtime_evidence import SCHEDULER_RECORDS
+from announcement_runtime_provenance import check_provenance_claims
 from announcement_runtime_policy import runtime_preflight
 from announcement_runtime_scheduler import check_scheduler_graph_claims
 from announcement_runtime_schema import Refusal
@@ -32,7 +34,11 @@ class SchedulerGraph(unittest.TestCase):
 
     def test_consistent_claims_and_same_replay_snapshot_never_admit_runtime(self):
         receipt, records, now = scheduler_fixture()
-        self.assertIsNone(self.check(receipt, records, now))
+        index = evidence_index(records)
+        self.assertIsNone(check_scheduler_graph_claims(receipt, index, now))
+        self.assertIsNone(check_authority_graph_claims(receipt, index, now))
+        self.assertIsNone(check_provenance_claims(receipt, index, now))
+        index.require_all_used()
         with self.assertRaisesRegex(Refusal, "unsupported"):
             runtime_preflight()
 
@@ -88,10 +94,19 @@ class SchedulerGraph(unittest.TestCase):
             r["fixtures"]["setting_boundaries"][0])), "scheduler_inventory")
 
     def test_gaps_overlaps_short_windows_and_uncovered_tail_refuse(self):
+        def change_window(receipt, records, index, changes):
+            window = data(records)["windows"][index]
+            window.update(changes)
+            # Keep cases contained so continuity/tail, not case containment,
+            # decides this adversary. The separate case test covers overruns.
+            if "ended_at" in changes:
+                for case in receipt["observations"]["cases"]:
+                    if case["phase"] == window["phase"]:
+                        case["ended_at"] = changes["ended_at"]
         for changes in ({"started_at": at("00:05:01")}, {"ended_at": at("00:05:59")},
                         {"ended_at": at("00:07:01")}, {"ended_at": at("00:06:59")}):
-            self.reject(lambda r, s: data(s)["windows"][0].update(changes), "scheduler_window")
-        self.reject(lambda r, s: data(s)["windows"][-1].update(ended_at=at("00:14:59")),
+            self.reject(lambda r, s: change_window(r, s, 0, changes), "scheduler_window")
+        self.reject(lambda r, s: change_window(r, s, -1, {"ended_at": at("00:14:59")}),
                     "scheduler_window")
 
     def test_observation_must_follow_rollout_and_stay_within_twenty_minutes(self):

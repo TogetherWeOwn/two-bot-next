@@ -27,6 +27,14 @@ def scheduler_fixture():
         records[ref] = envelope(ref, kind, copy.deepcopy(data))
         return {"ref": ref, "sha256": canonical_digest(data)}
 
+    # The extended final-off case needs an independently claimed trailing sample,
+    # matching the existing provenance check's before/after bracketing rule.
+    for sample in receipt["served"]["samples"]:
+        if sample["ref"] == "served-two":
+            sample["observed_at"] = at("00:15:00")
+    for record in records.values():
+        if record["kind"] == "external_served" and record["data"]["sample"]["ref"] == "served-two":
+            record["data"]["sample"]["observed_at"] = at("00:15:00")
     fixtures, attempt = receipt["fixtures"], receipt["attempt"]
     plan = {"candidate": copy.deepcopy(receipt["scope"]["candidate"]),
         "feed_ref": "feed", "item_ref": fixtures["item_ref"], "setting_ref": "setting",
