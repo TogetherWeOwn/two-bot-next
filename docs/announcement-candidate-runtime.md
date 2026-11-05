@@ -129,6 +129,24 @@ not canonical staging qualification or production promotion.
   artifacts; no public producer exists yet. Scheduler/transitive inventory,
   source URL/content, stored cases, actual wire/DB records and lifecycle remain
   mandatory separate checks. Consistent fabricated records return no capability.
+- `scripts/announcement_runtime_scheduler.py` compares four closed, content-bound
+  scheduler/activation/setting-reader/poll claim kinds. The scheduler plan hashes
+  through the restricted input plan into resource/authority scope. Declared
+  unchanged feed cadence is store-first (60–86,400 seconds) or an explicit absent
+  interval row falling back to boot, not a boot-multiple approximation. The
+  contiguous off/on/replay/final-off windows must cover the observation window,
+  stay within 20 minutes and allow at least one normal poll interval each. A
+  too-long cadence refuses; no interval mutation, grace or lease extension exists.
+  Activation claims precede rollout and cover the attempt with the declared
+  external fence/epoch and registered boot-enabled feed job. Stored announcement
+  reads must be explicit strings, match row/version/snapshot/cadence and bind an
+  eligible-item poll and candidate served pair. Null/absent rows cannot prove off.
+  Changed values need advancing row/snapshot generations; replay can retain the
+  unchanged snapshot. Cases must fit their phase's boundary and window. These
+  comparisons do **not** authenticate an activation fence, stored read, normal
+  cadence, eligible poll, send/suppression or any observation. Full source,
+  transitive/synthetic inventory, operation telemetry and lifecycle resolution
+  remain mandatory. Runtime admission is still unconditionally unsupported.
 - `scripts/announcement_runtime_policy.py` checks offline lease/freshness,
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
@@ -198,7 +216,8 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
 2. Complete typed input, effect, telemetry and lifecycle resolution beyond the
    provenance/authority, resource and scoped restricted-input claim comparisons.
    Authenticate restricted literal keys, consent and identity maps; bind complete
-   transitive inventory, source URL/content and scheduler/synthetic-cleanup plans.
+   transitive inventory, source URL/content and synthetic-cleanup plans. The
+   scheduler comparison is scoped offline consistency, not a stored-data proof.
    Resolve exact interaction request contents and actual ACK/edit wire records;
    live interaction replay remains explicitly unsupported. Implement full stored
    off/on/replay/final-off semantics and negatives, atomic RSVP/audit evidence,
@@ -223,6 +242,11 @@ not itself authorize bootstrap, candidate admission, credentials, binding change
 resource setup, probes, sends, database operations, staging execution or merge.
 
 ## Hermetic checks
+
+Full suites run on GitHub Actions in the existing discovery lane. The following
+commands describe that CI coverage, not permission to mirror it on the shared
+controller. Local execution is limited to one focused failing-test/crate
+reproduction under the current build policy.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_announcement_runtime_*.py' -v

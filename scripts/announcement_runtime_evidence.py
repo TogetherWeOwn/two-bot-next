@@ -175,13 +175,43 @@ INPUT_RECORDS = {
         "outcome": enum("granted", "revoked", "unknown")},
     "interaction_plan": {"interactions": Array(INTERACTION)},
     "input_plan_content": {"keys": Array({"resource_ref": REF, "key": CONTENT_PIN}),
-        "consent": CONTENT_PIN, "interactions": CONTENT_PIN,
+        "consent": CONTENT_PIN, "interactions": CONTENT_PIN, "scheduler_plan_sha256": SHA256,
         "feed": {"resource_ref": REF, "guild_id": SERVICE_ID, "channel_id": SERVICE_ID,
                  "source_ref": REF, "item_key": ROW_ID, "nonce_ref": REF},
         "rsvp": {"resource_ref": REF, "status": enum("going", "interested", "declined"),
                  "interaction_id": SERVICE_ID, "audit_ref": REF}},
 }
-EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS, **INPUT_RECORDS}
+# C's feed cadence is store-first with boot fallback, never an inferred constant.
+# Missing/null announcements settings are deliberately not admissible off proof.
+CADENCE = Union("source", {
+    "stored": {"source": enum("stored"), "stored_seconds": Integer(60, 86400)},
+    "boot": {"source": enum("boot"), "row_presence": enum("absent")},
+})
+SCHEDULER_RECORDS = {
+    "scheduler_plan_content": {"candidate": VERSION, "feed_ref": REF, "item_ref": REF,
+        "setting_ref": REF, "activation_fence": CONTENT_PIN,
+        "boot_poll_seconds": Integer(60, 86400), "cadence": CADENCE,
+        "windows": Array({"phase": enum("off", "on", "replay", "final_off"),
+            "boundary_ref": REF, "reader": CONTENT_PIN, "poll": CONTENT_PIN,
+            "started_at": UTC, "ended_at": UTC}, 4, 4)},
+    "feed_activation_fence": {"execution_ref": REF, "nonce_ref": REF,
+        "enforcement_epoch": SERVICE_ID, "observed_at": UTC, "valid_until": UTC,
+        "boundary": enum("external_atomic", "application_only", "unknown"),
+        "boot_announcements": enum(True), "job": enum("feeds"),
+        "registration": enum("registered", "absent", "unknown")},
+    "stored_setting_read": {"boundary_ref": REF, "setting_ref": REF,
+        "row_presence": enum("stored_string", "absent", "null", "unknown"),
+        "stored_value": enum("0", "1"), "row_version": SERVICE_ID,
+        "snapshot_value": enum("0", "1"), "snapshot_generation": SERVICE_ID,
+        "read_at": UTC, "served_ref": REF, "cadence": CADENCE},
+    "feed_poll": {"boundary_ref": REF, "feed_ref": REF, "item_ref": REF,
+        "setting_ref": REF, "snapshot_generation": SERVICE_ID, "served_ref": REF,
+        "observed_at": UTC, "eligible_item": enum(True),
+        "effective_poll_seconds": Integer(60, 86400),
+        "decision": enum("suppressed", "admitted", "reconciled", "unknown")},
+}
+EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS,
+                    **INPUT_RECORDS, **SCHEDULER_RECORDS}
 
 
 def canonical_digest(value):
