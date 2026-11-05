@@ -414,10 +414,25 @@ not canonical staging qualification or production promotion.
   completion is unknown. They stop at the first refusal and are **not full-window
   telemetry or final real-effect totals**. This is a narrower qualification model
   than C's recovery logic, not an implementation of that recovery. It has no
-  receipt/CLI integration, authority, persistence, external fence or transport.
-  Reconstructing a new object grants no new attempt or nonce use. Stored row values,
-  actual history/response-loss reconciliation and full-window effects remain
-  mandatory independent work; successful model completion never grants admission.
+  authority, persistence, external fence or transport. Reconstructing a new object
+  grants no new attempt or nonce use; successful completion never grants admission.
+- `scripts/announcement_runtime_delivery_trace.py` connects that model to a closed,
+  source-plan-content-bound restricted `feed_delivery_trace` sidecar, composed as
+  the sixteenth explicit CLI comparison. It requires the same literal delivery-key
+  reference, nonce and fresh-claim operation, and compares each model event with
+  an actual-effect **claim** in the on/replay cases. Acceptance names the same
+  post/response/message; completion and replay declare identical partial delivered
+  row projections. Replay needs a separately budgeted delivery `db_read` operation,
+  not merely an idle poll or history miss. Observer/time and full-window sequence
+  comparisons reject substitutions and intervening delivery writes, including
+  release/reclaim before replay. Up to sixteen closed events are parsed; only the
+  exact five-event successful model sequence can complete. Extra/missing/reordered
+  events refuse, as do unknown outcomes in the upstream ledger.
+  These pending/delivered projections contain only state, literal nonce and (when
+  delivered) message ID. They are **not complete stored rows or authenticated SQL
+  results**; claim-token fencing, before/after value correspondence, actual replay
+  reads/history/response-loss reconciliation and later cleanup/restoration remain
+  mandatory independent work. No new read or mutation is performed or authorized.
 - `scripts/announcement_runtime_source.py` observes complete local Git-object
   inventories without checkout, fetch, import, filter or build execution. It
   verifies raw commit/tree/blob hashes and validates raw canonical tree modes
@@ -453,7 +468,7 @@ must not be called as a substitute for any canonical admission control.
 ## Offline claim-checking entry point
 
 `scripts/announcement_runtime_check.py` composes bounded archive intake,
-closed same-run typed sidecars, all fifteen existing public claim comparisons
+closed same-run typed sidecars, all sixteen existing public claim comparisons
 and final all-used sidecar accounting. It is **not an independently provisioned
 verifier, receipt producer or runtime admission path**. The local Git topology
 collector is not invoked; authenticated source/service inventories, complete

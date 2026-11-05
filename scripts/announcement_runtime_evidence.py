@@ -221,6 +221,7 @@ SOURCE_RECORDS = {
     "source_plan_content": {"candidate": VERSION, "source_ref": REF, "feed_ref": REF,
         "item_ref": REF, "target": SOURCE_TARGET, "stored_feed": CONTENT_PIN,
         "body": CONTENT_PIN, "selection": CONTENT_PIN, "post_exchange": CONTENT_PIN,
+        "delivery_trace": CONTENT_PIN,
         "maximum_response_bytes": Integer(1, 4096),
         "maximum_wire_attempts": Integer(1, LEDGER_LIMIT),
         "redirects": enum("deny"), "content_encoding": enum("identity")},
@@ -361,11 +362,30 @@ WORK_RECORDS = {
         "drained_snapshot_ref": REF, "started_at": UTC, "ended_at": UTC,
         "unknown_operation_refs": Array(REF, 0), "outcome": enum("resolved", "unknown")},
 }
+# Partial delivery-row projections are RESTRICTED claims, not complete SQL rows,
+# claim-token proof, actual read results or permission to recover an unknown send.
+DELIVERY_NONCE = Text(r"[0-9a-f]{24}")
+DELIVERY_ROW = Union("state", {
+    "pending": {"state": enum("pending"), "nonce": DELIVERY_NONCE},
+    "delivered": {"state": enum("delivered"), "nonce": DELIVERY_NONCE,
+                  "message_id": SERVICE_ID},
+})
+DELIVERY_EVENT = {"operation_id": REF, "observed_at": UTC, "observer_ref": REF}
+DELIVERY_RECORDS = {
+    "feed_delivery_trace": {"key_ref": REF, "nonce_ref": REF, "claim_ref": REF,
+        "events": Array(Union("kind", {
+            "claim": {"kind": enum("claim"), **DELIVERY_EVENT, "row": DELIVERY_ROW},
+            "wire_attempt": {"kind": enum("wire_attempt"), **DELIVERY_EVENT},
+            "accepted": {"kind": enum("accepted"), **DELIVERY_EVENT, "message_id": SERVICE_ID},
+            "committed": {"kind": enum("committed"), **DELIVERY_EVENT, "row": DELIVERY_ROW},
+            "replay": {"kind": enum("replay"), **DELIVERY_EVENT, "row": DELIVERY_ROW},
+        }), 1, 16)},
+}
 EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS,
                     **INPUT_RECORDS, **SCHEDULER_RECORDS, **SOURCE_RECORDS,
                     **TELEMETRY_RECORDS, **SERIALIZATION_RECORDS, **TRANSITION_RECORDS,
                     **SETTING_RECORDS, **WORK_RECORDS, **INTERACTION_EXCHANGES,
-                    **FEED_EXCHANGE_RECORDS}
+                    **FEED_EXCHANGE_RECORDS, **DELIVERY_RECORDS}
 
 
 def canonical_digest(value):

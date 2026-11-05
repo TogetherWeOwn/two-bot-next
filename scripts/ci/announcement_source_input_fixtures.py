@@ -86,9 +86,10 @@ def source_input_fixture():
             records[state_ref]["data"]["identity_sha256"] = canonical_digest(entry["identity"])
     plan = {"candidate": receipt["scope"]["candidate"], "source_ref": "source", "feed_ref": "feed",
         "item_ref": "item-ref", "target": target, "maximum_response_bytes": 4096,
-        # Placeholder: the offline feed-exchange fixture supplies and repins the
-        # record. Source-only tests never resolve it, so it is not admissible.
+        # Placeholders: the exchange/trace fixtures supply and repin these
+        # records. Source-only tests do not resolve them and are not admissible.
         "post_exchange": {"ref": "feed-post-exchange", "sha256": "d" * 64},
+        "delivery_trace": {"ref": "feed-delivery-trace", "sha256": "e" * 64},
         "maximum_wire_attempts": 3, "redirects": "deny", "content_encoding": "identity",
         "stored_feed": add("stored-source", "stored_feed_source", {
             "feed_ref": "feed", "key_ref": "key-feed", "guild_id": "200", "channel_id": "500",
