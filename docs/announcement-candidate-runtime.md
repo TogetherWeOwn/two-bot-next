@@ -232,11 +232,34 @@ not canonical staging qualification or production promotion.
   separately observed DB states must match the chain's full terminal state,
   including version, not just its value digest. **These are claim comparisons,
   not actual CAS, authentication, phase completion or verified restoration.**
-  Setting/business value semantics, setup/cleanup phase assignment, separately
-  scoped recovery authority, actual desired restoration postconditions and
+  Business value semantics, actual setting persistence, setup/cleanup phase
+  assignment, separately scoped recovery authority, actual desired restoration postconditions and
   queue/drain evidence remain mandatory. The synthetic fixture intentionally
   leaves every effect at one instant, not a successful lifecycle. Runtime
   admission remains unsupported and no SQL or live adapter is introduced.
+- `scripts/announcement_runtime_settings.py` composes the transition and scheduler
+  comparisons with two closed restricted setting-plan/value-projection sidecars.
+  The input-plan digest binds four exact setting operation IDs and six distinct
+  before/intermediate/final value projections, each tied to the literal K key.
+  Absent or explicit JSON string-bit (`"0"`/`"1"`) prior values are the only
+  supported baseline projections; null, numeric/boolean and other prior values
+  refuse, never become boot fallback or a guessed restoration target. Present
+  state value digests must equal the canonical JSON **string** value digest.
+  The baseline, enable and disable values must be exactly zero/one/zero; the
+  restored and separately observed final value/presence must equal the original
+  projection without resetting a present row's advancing version. All four
+  mutation IDs/methods/order and the latest committed state/version at each
+  off/on/replay/final-off reader must agree. A value change before the claimed
+  poll finishes cannot borrow an earlier snapshot as suppression evidence.
+  **This is not persistence, full-row restoration, actual SQL CAS or stored-case
+  proof.** Positive row versions here describe legacy row-version claims, not C's
+  distinct negative database-owned `cas_version` tokens. Settings audit/revision
+  trigger effects, actual SQL/reader snapshots, mutation-phase assignment,
+  separately scoped cleanup/recovery authority and full business/lifecycle
+  acceptance remain mandatory. Only setting writes are spread across the new
+  fabricated timeline; other effects still occupy one instant and the baseline
+  shares rollout's timestamp. No successful lifecycle is claimed. No value
+  projection is a trust root or runtime permission; admission stays unsupported.
 - `scripts/announcement_runtime_policy.py` checks offline lease/freshness,
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
@@ -316,8 +339,10 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
    compares wire/platform/transaction correspondence and RSVP/audit grouping,
    but does not authenticate observation, prove SQL atomicity or resolve the
    full lifecycle semantics. The transition checker now resolves DB state chains,
-   exact ownership witness claims and each write's effect-batch authority reference,
-   but does not establish real CAS or desired restoration. Implement setup/cleanup
+   exact ownership witness claims and each write's effect-batch authority reference.
+   The setting checker compares a narrow value projection, mutation order and
+   reader/poll state correspondence; neither establishes real CAS, full SQL row
+   restoration or actual stored-data acceptance. Implement setup/cleanup
    phase assignment, independently verified restoration and separately scoped
    recovery authority. Bind every actual mutation to its correct lifecycle-phase
    authority checkpoint. The scoped resource graph and

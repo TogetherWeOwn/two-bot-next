@@ -76,6 +76,7 @@ def input_fixture():
         "expires_at": at("00:40:00"), "outcome": "granted"})
     add("runtime-input-plan", "input_plan_content", {"keys": bindings,
         "scheduler_plan_sha256": "a" * 64, "source_plan_sha256": "b" * 64,
+        "setting_plan_sha256": "c" * 64,
         "consent": {"ref": "consent-ref", "sha256": "a" * 64},
         "interactions": {"ref": "interaction-plan-ref", "sha256": "b" * 64},
         "feed": {"resource_ref": "feed", "guild_id": "200", "channel_id": "500",

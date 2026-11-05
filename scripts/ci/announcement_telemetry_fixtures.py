@@ -70,9 +70,9 @@ def repin_telemetry(receipt, records):
         "operation_ids": [x["operation_id"] for x in observations["actual_effects"]]}
 
 
-def telemetry_fixture():
-    """Return (receipt, {ref: sidecar}, now) with complete fabricated telemetry."""
-    receipt, records, now = resource_fixture()
+def telemetry_fixture(base=None):
+    """Add fabricated telemetry to the default resource or supplied input graph."""
+    receipt, records, now = resource_fixture() if base is None else base
     observations = receipt["observations"]
     entries = _entries(receipt)
     nonce = receipt["fixtures"]["nonce_ref"]

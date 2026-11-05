@@ -177,7 +177,7 @@ INPUT_RECORDS = {
     "interaction_plan": {"interactions": Array(INTERACTION)},
     "input_plan_content": {"keys": Array({"resource_ref": REF, "key": CONTENT_PIN}),
         "consent": CONTENT_PIN, "interactions": CONTENT_PIN, "scheduler_plan_sha256": SHA256,
-        "source_plan_sha256": SHA256,
+        "source_plan_sha256": SHA256, "setting_plan_sha256": SHA256,
         "feed": {"resource_ref": REF, "guild_id": SERVICE_ID, "channel_id": SERVICE_ID,
                  "source_ref": REF, "item_key": ROW_ID, "nonce_ref": REF},
         "rsvp": {"resource_ref": REF, "status": enum("going", "interested", "declined"),
@@ -287,9 +287,22 @@ TRANSITION_RECORDS = {
         "boundary": enum("external_compare_and_match", "application_only", "unknown"),
         "outcome": enum("matched", "conflict", "unknown")},
 }
+# Restricted setting VALUE projections, not full SQL rows or CAS tokens. The
+# narrow profile supports absent or explicit string-bit baselines only. Other
+# prior JSON values need a separately implemented closed projection; no fallback.
+SETTING_RECORDS = {
+    "setting_value": {"state_ref": REF, "key_ref": REF, "value": Union("presence", {
+        "absent": {"presence": enum("absent")},
+        "present": {"presence": enum("present"), "stored_value": enum("0", "1")},
+    })},
+    "setting_plan_content": {"setting_ref": REF, "key": CONTENT_PIN,
+        "values": Array(CONTENT_PIN, 6, 6),
+        "operations": {phase: REF for phase in ("baseline", "enable", "disable", "restore")}},
+}
 EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS,
                     **INPUT_RECORDS, **SCHEDULER_RECORDS, **SOURCE_RECORDS,
-                    **TELEMETRY_RECORDS, **SERIALIZATION_RECORDS, **TRANSITION_RECORDS}
+                    **TELEMETRY_RECORDS, **SERIALIZATION_RECORDS, **TRANSITION_RECORDS,
+                    **SETTING_RECORDS}
 
 
 def canonical_digest(value):

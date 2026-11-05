@@ -70,8 +70,8 @@ def add_late_effect_checkpoint(receipt, records):
     return mapping[checkpoint["ref"]]
 
 
-def transition_fixture():
-    receipt, records, now = telemetry_fixture()
+def transition_fixture(base=None):
+    receipt, records, now = telemetry_fixture() if base is None else base
     entries = {x["ref"]: x for x in receipt["resources"]["entries"]}
     prior = {ref: entry["before_state_ref"] for ref, entry in entries.items()
              if entry["identity"]["kind"] == "database"}
