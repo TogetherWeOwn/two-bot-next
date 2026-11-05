@@ -301,18 +301,17 @@ GROUP BY to_char(e.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD'), e.source;
 --   avg_in_voice     mean occupancy for the cell, NULL when the cell holds
 --                    no samples (a gap is a gap, never a zero)
 --   sample_days      distinct UTC days contributing samples to the window
---   coverage         samples present / samples expected (28*24*12 = 8064)
---   measured_through ISO-8601 UTC text of the last flushed hour, NULL before
---                    the first flush
---   source           measured when sample_days >= 14 AND coverage >= 0.8,
---                    else insufficient
+--   coverage         per-cell valid samples / 48 expected five-minute slots
+--   measured_through ISO-8601 UTC text of the latest included observation,
+--                    NULL iff the window has no valid observations
+--   source           measured when sample_days >= 14 AND every cell has
+--                    coverage >= 0.8 (at least 39/48 slots), else insufficient
 --
--- sample_days, coverage, measured_through and source are window-global
--- provenance: every row carries the same values. Per-cell day counts would
--- be unusable as a label (each weekday occurs only four times in 28 days).
--- A measured grid that goes stale (>48 h without a successful pull) drops
--- back to the "estimate" label site-side; that staleness rule lives with
--- the consumer, not here.
+-- sample_days, measured_through and source are window-global provenance.
+-- Coverage is per cell, with a fixed denominator over all 28 complete days.
+-- Valid zero occupancy counts; zero-sample rows and missing hours are gaps.
+-- The consumer falls back to estimates when the observation watermark is
+-- stale (>48 h); fetching an unchanged grid does not refresh that watermark.
 CREATE OR REPLACE VIEW web_v1.voice_heat AS
 WITH bounds AS (
   SELECT
@@ -320,22 +319,23 @@ WITH bounds AS (
     date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS window_end
 ),
 scoped AS (
-  SELECT h.hour_start_utc, h.samples, h.occupancy_sum
+  SELECT h.hour_start_utc, h.samples, h.occupancy_sum, h.last_observed_at
   FROM voice_heat_hours h, bounds b
   WHERE h.hour_start_utc >= b.window_start
     AND h.hour_start_utc < b.window_end
+    AND h.samples > 0
 ),
 provenance AS (
   SELECT
     (SELECT count(DISTINCT (hour_start_utc AT TIME ZONE 'UTC')::date) FROM scoped) AS sample_days,
-    COALESCE((SELECT sum(samples) FROM scoped), 0) AS samples_present,
-    (SELECT max(hour_start_utc) FROM scoped) AS measured_through_ts
+    (SELECT max(last_observed_at) FROM scoped) AS measured_through_ts
 ),
 cells AS (
   SELECT
     ((EXTRACT(ISODOW FROM hour_start_utc AT TIME ZONE 'UTC'))::int - 1) AS dow,
     (EXTRACT(HOUR FROM hour_start_utc AT TIME ZONE 'UTC'))::int AS hour,
-    sum(occupancy_sum)::double precision / NULLIF(sum(samples), 0) AS avg_in_voice
+    sum(occupancy_sum)::double precision / NULLIF(sum(samples), 0) AS avg_in_voice,
+    sum(samples)::double precision / 48.0 AS coverage
   FROM scoped
   GROUP BY 1, 2
 ),
@@ -349,10 +349,10 @@ SELECT
   grid.hour,
   cells.avg_in_voice,
   provenance.sample_days,
-  (provenance.samples_present::double precision / 8064.0) AS coverage,
+  COALESCE(cells.coverage, 0.0) AS coverage,
   web_v1._iso(provenance.measured_through_ts) AS measured_through,
   CASE WHEN provenance.sample_days >= 14
-         AND (provenance.samples_present::double precision / 8064.0) >= 0.8
+         AND (SELECT count(*) FROM cells WHERE coverage >= 0.8) = 168
        THEN 'measured' ELSE 'insufficient' END AS source
 FROM grid
 LEFT JOIN cells ON cells.dow = grid.dow AND cells.hour = grid.hour

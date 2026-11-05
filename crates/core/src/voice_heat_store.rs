@@ -27,6 +27,9 @@ pub struct HourBucket {
     pub samples: i64,
     /// Summed `total_in_voice` across those samples.
     pub occupancy_sum: i64,
+    /// Latest actual valid observation included in the hour, not flush time.
+    /// Present iff `samples > 0`, including true zero-occupancy observations.
+    pub last_observed_at: Option<OffsetDateTime>,
 }
 
 /// How long flushed hourly rows survive: 35 rolling days, so the 28-day
@@ -70,13 +73,14 @@ pub async fn flush_hour_buckets(
     for bucket in buckets {
         written = written.saturating_add(
             sqlx::query(
-                "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum)
-                 VALUES ($1, $2, $3)
+                "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
+                 VALUES ($1, $2, $3, $4)
                  ON CONFLICT (hour_start_utc) DO NOTHING",
             )
             .bind(bucket.hour_start)
-            .bind(bucket.samples.max(0))
-            .bind(bucket.occupancy_sum.max(0))
+            .bind(bucket.samples)
+            .bind(bucket.occupancy_sum)
+            .bind(bucket.last_observed_at)
             .execute(pool)
             .await?
             .rows_affected(),

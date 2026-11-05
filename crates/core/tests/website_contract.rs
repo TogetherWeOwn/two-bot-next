@@ -350,7 +350,7 @@ async fn contract_refuses_a_missing_or_unsafe_current_schema_before_ddl() {
             .fetch_one(&public)
             .await
             .expect("public preserved");
-    assert_eq!(public_views, 10);
+    assert_eq!(public_views, WEB_CONTRACT_VIEWS.len() as i64);
     sqlx::raw_sql("DROP SCHEMA \"tog10090-unsafe\" CASCADE;")
         .execute(&public)
         .await
@@ -1532,7 +1532,9 @@ async fn contract_meta_pins_version_and_view_shapes() {
     fixture.close().await.expect("drop test database");
 }
 
-/// One `web_v1.voice_heat` row, in view column order.
+/// One `web_v1.voice_heat` row, in view column order. `coverage` is the
+/// per-cell figure (valid samples / 48); the other provenance columns are
+/// grid-wide and identical on every row.
 #[derive(sqlx::FromRow)]
 struct VoiceHeatCell {
     dow: i32,
@@ -1544,6 +1546,123 @@ struct VoiceHeatCell {
     source: String,
 }
 
+/// `[UTC midnight - 28 days, UTC midnight)`, read from the database clock.
+async fn window_bounds(pool: &Pool<Postgres>) -> (time::OffsetDateTime, time::OffsetDateTime) {
+    let end: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'")
+            .fetch_one(pool)
+            .await
+            .expect("UTC midnight");
+    (end - time::Duration::days(28), end)
+}
+
+async fn heat_grid(pool: &Pool<Postgres>) -> Vec<VoiceHeatCell> {
+    let rows: Vec<VoiceHeatCell> = sqlx::query_as(
+        "SELECT dow, hour, avg_in_voice, sample_days, coverage, measured_through, source
+         FROM web_v1.voice_heat ORDER BY dow, hour",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("voice_heat grid");
+    assert_eq!(rows.len(), 168, "the grid always carries all 7x24 cells");
+    rows
+}
+
+/// Which hours `seed_window` writes. Every window hour gets `samples` (12
+/// max) unless overridden; occupancy averages 4 per sample.
+#[derive(Default)]
+struct WindowSeed {
+    samples: i32,
+    /// One hour that gets a different sample count.
+    short_hour: Option<(time::OffsetDateTime, i32)>,
+    /// `(dow, hour)` of a cell that gets no rows at all.
+    omit_cell: Option<(i32, i32)>,
+    /// Hours before this instant are gap rows (zero samples).
+    gap_before: Option<time::OffsetDateTime>,
+}
+
+/// Seed one `voice_heat_hours` row per window hour. Rows with samples > 0 are
+/// observed 55 minutes into their hour; zero-sample rows are gaps with a NULL
+/// `last_observed_at`.
+async fn seed_window(pool: &Pool<Postgres>, seed: WindowSeed) {
+    let (start, end) = window_bounds(pool).await;
+    let (short_at, short_samples) = seed.short_hour.unzip();
+    let (omit_dow, omit_hour) = seed.omit_cell.unzip();
+    sqlx::query(
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
+         SELECT hs, s, s::bigint * 4, CASE WHEN s > 0 THEN hs + interval '55 minutes' END
+         FROM (
+           SELECT hs,
+                  CASE WHEN hs < $1::timestamptz THEN 0
+                       WHEN hs = $2::timestamptz THEN $3::int
+                       ELSE $4::int END AS s
+           FROM generate_series($5::timestamptz, $6::timestamptz - interval '1 hour', interval '1 hour') AS hs
+           WHERE $7::int IS NULL OR NOT (
+             (EXTRACT(ISODOW FROM hs AT TIME ZONE 'UTC')::int - 1) = $7::int
+             AND EXTRACT(HOUR FROM hs AT TIME ZONE 'UTC')::int = $8::int
+           )
+         ) t",
+    )
+    .bind(seed.gap_before)
+    .bind(short_at)
+    .bind(short_samples)
+    .bind(seed.samples)
+    .bind(start)
+    .bind(end)
+    .bind(omit_dow)
+    .bind(omit_hour)
+    .execute(pool)
+    .await
+    .expect("seed window hours");
+}
+
+async fn insert_hour(
+    pool: &Pool<Postgres>,
+    at: time::OffsetDateTime,
+    samples: i32,
+    sum: i64,
+    observed: Option<time::OffsetDateTime>,
+) {
+    sqlx::query(
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(at)
+    .bind(samples)
+    .bind(sum)
+    .bind(observed)
+    .execute(pool)
+    .await
+    .expect("seed hour");
+}
+
+async fn iso_of(pool: &Pool<Postgres>, at: time::OffsetDateTime) -> String {
+    sqlx::query_scalar("SELECT web_v1._iso($1)")
+        .bind(at)
+        .fetch_one(pool)
+        .await
+        .expect("UTC timestamp text")
+}
+
+/// Every row must carry the same grid-wide provenance.
+fn assert_shared(rows: &[VoiceHeatCell], days: i64, source: &str, through: Option<&str>) {
+    for cell in rows {
+        assert_eq!(
+            cell.sample_days, days,
+            "sample_days at {}/{}",
+            cell.dow, cell.hour
+        );
+        assert_eq!(cell.source, source, "source at {}/{}", cell.dow, cell.hour);
+        assert_eq!(
+            cell.measured_through.as_deref(),
+            through,
+            "measured_through at {}/{}",
+            cell.dow,
+            cell.hour
+        );
+    }
+}
+
 #[tokio::test]
 async fn voice_heat_empty_grid_reports_insufficient() {
     // No flushed hours: all 168 cells present with NULL averages, zero
@@ -1551,13 +1670,7 @@ async fn voice_heat_empty_grid_reports_insufficient() {
     let fixture = connect().await;
     let pool = fixture.pool().clone();
 
-    let rows: Vec<VoiceHeatCell> = sqlx::query_as(
-        "SELECT dow, hour, avg_in_voice, sample_days, coverage, measured_through, source FROM web_v1.voice_heat",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("voice_heat grid");
-    assert_eq!(rows.len(), 168, "the grid always carries all 7x24 cells");
+    let rows = heat_grid(&pool).await;
     for cell in &rows {
         assert!((0..7).contains(&cell.dow), "dow in range: {}", cell.dow);
         assert!((0..24).contains(&cell.hour), "hour in range: {}", cell.hour);
@@ -1565,54 +1678,45 @@ async fn voice_heat_empty_grid_reports_insufficient() {
             cell.avg_in_voice.is_none(),
             "empty cells average nothing, never zero"
         );
-        assert_eq!(cell.sample_days, 0);
         assert_eq!(cell.coverage, 0.0);
-        assert!(cell.measured_through.is_none());
-        assert_eq!(cell.source, "insufficient");
     }
+    assert_shared(&rows, 0, "insufficient", None);
 
     fixture.close().await.expect("drop test database");
 }
 
 #[tokio::test]
 async fn voice_heat_sparse_samples_stay_insufficient() {
-    // A handful of flushed hours fills its cells but keeps the window-global
-    // provenance below both gates: the label never flips on a sparse grid.
+    // A handful of flushed hours fills its cells but never lets the
+    // grid-wide label flip: most cells have no samples at all.
     let fixture = connect().await;
     let pool = fixture.pool().clone();
 
-    sqlx::query(
-        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum)
-         SELECT date_trunc('day', now() AT TIME ZONE 'UTC') - interval '2 days' + (g || ' hours')::interval, 12, 60
-         FROM generate_series(0, 5) AS g",
-    )
-    .execute(&pool)
-    .await
-    .expect("seed sparse hours");
+    let (_, end) = window_bounds(&pool).await;
+    let base = end - time::Duration::days(2);
+    for g in 0..6 {
+        let at = base + time::Duration::hours(g);
+        insert_hour(&pool, at, 12, 60, Some(at + time::Duration::minutes(40))).await;
+    }
 
-    let probe: (i64, f64, String) =
-        sqlx::query_as("SELECT sample_days, coverage, source FROM web_v1.voice_heat LIMIT 1")
-            .fetch_one(&pool)
-            .await
-            .expect("voice_heat provenance");
-    assert_eq!(probe.0, 1, "one distinct UTC day sampled");
-    assert!(
-        probe.1 < 0.8,
-        "sparse coverage stays under gate: {}",
-        probe.1
-    );
-    assert_eq!(probe.2, "insufficient");
-
-    // The seeded cells average 5.0; unseeded cells stay NULL.
-    let filled: Vec<(i32, i32, Option<f64>)> = sqlx::query_as(
-        "SELECT dow, hour, avg_in_voice FROM web_v1.voice_heat WHERE avg_in_voice IS NOT NULL",
+    let rows = heat_grid(&pool).await;
+    let through = iso_of(
+        &pool,
+        base + time::Duration::hours(5) + time::Duration::minutes(40),
     )
-    .fetch_all(&pool)
-    .await
-    .expect("filled cells");
-    assert!(!filled.is_empty(), "seeded hours surface in their cells");
-    for (_, _, avg) in &filled {
-        assert_eq!(avg.unwrap(), 5.0);
+    .await;
+    assert_shared(&rows, 1, "insufficient", Some(&through));
+    let filled: Vec<&VoiceHeatCell> = rows.iter().filter(|c| c.avg_in_voice.is_some()).collect();
+    assert_eq!(filled.len(), 6, "each seeded hour fills exactly its cell");
+    for cell in &rows {
+        match cell.avg_in_voice {
+            // The seeded cells average 5.0 from 12 of 48 expected samples.
+            Some(avg) => {
+                assert_eq!(avg, 5.0);
+                assert!((cell.coverage - 12.0 / 48.0).abs() < 1e-9);
+            }
+            None => assert_eq!(cell.coverage, 0.0),
+        }
     }
 
     fixture.close().await.expect("drop test database");
@@ -1620,36 +1724,322 @@ async fn voice_heat_sparse_samples_stay_insufficient() {
 
 #[tokio::test]
 async fn voice_heat_dense_window_reports_measured() {
-    // Twenty-eight full UTC days at 12 samples/hour clear both gates
-    // (sample_days 28 >= 14, coverage 1.0 >= 0.8): the label flips to
-    // measured with a non-null measured_through.
+    // Twenty-eight full UTC days at 12 samples/hour: every cell holds 48/48,
+    // sample_days is 28, and the label flips to measured. Hours outside
+    // [UTC midnight - 28d, UTC midnight) never move the watermark.
     let fixture = connect().await;
     let pool = fixture.pool().clone();
 
-    sqlx::query(
-        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum)
-         SELECT day + (h || ' hours')::interval, 12, 48
-         FROM generate_series(
-                date_trunc('day', now() AT TIME ZONE 'UTC') - interval '28 days',
-                date_trunc('day', now() AT TIME ZONE 'UTC') - interval '1 day',
-                interval '1 day'
-              ) AS day
-         CROSS JOIN generate_series(0, 23) AS h",
+    let (start, end) = window_bounds(&pool).await;
+    seed_window(
+        &pool,
+        WindowSeed {
+            samples: 12,
+            ..WindowSeed::default()
+        },
     )
-    .execute(&pool)
-    .await
-    .expect("seed dense window");
+    .await;
+    // Excluded by the window: the hour before it and the current (incomplete)
+    // UTC day, whose observation is later than anything inside the window.
+    let before = start - time::Duration::hours(1);
+    insert_hour(
+        &pool,
+        before,
+        12,
+        999,
+        Some(before + time::Duration::minutes(50)),
+    )
+    .await;
+    insert_hour(&pool, end, 12, 999, Some(end + time::Duration::minutes(10))).await;
 
-    let probe: (i64, f64, Option<String>, String) = sqlx::query_as(
-        "SELECT sample_days, coverage, measured_through, source FROM web_v1.voice_heat LIMIT 1",
+    let rows = heat_grid(&pool).await;
+    let through = iso_of(
+        &pool,
+        end - time::Duration::hours(1) + time::Duration::minutes(55),
     )
-    .fetch_one(&pool)
-    .await
-    .expect("voice_heat provenance");
-    assert_eq!(probe.0, 28);
-    assert!((probe.1 - 1.0).abs() < 1e-9, "full coverage: {}", probe.1);
-    assert!(probe.2.is_some(), "measured_through pins after flushes");
-    assert_eq!(probe.3, "measured");
+    .await;
+    assert_shared(&rows, 28, "measured", Some(&through));
+    for cell in &rows {
+        assert!(
+            (cell.coverage - 1.0).abs() < 1e-9,
+            "full coverage: {}",
+            cell.coverage
+        );
+        assert_eq!(
+            cell.avg_in_voice,
+            Some(4.0),
+            "excluded rows must not leak in"
+        );
+    }
+
+    fixture.close().await.expect("drop test database");
+}
+
+/// Seed a full window where the first occurrence of the cell five hours
+/// after the window start holds only `short` samples (the other three hold
+/// 12 each), and return the grid.
+async fn short_cell_grid(short: i32) -> Vec<VoiceHeatCell> {
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+    let (start, _) = window_bounds(&pool).await;
+    seed_window(
+        &pool,
+        WindowSeed {
+            samples: 12,
+            short_hour: Some((start + time::Duration::hours(5), short)),
+            ..WindowSeed::default()
+        },
+    )
+    .await;
+    let rows = heat_grid(&pool).await;
+    fixture.close().await.expect("drop test database");
+    rows
+}
+
+#[tokio::test]
+async fn voice_heat_cell_gate_is_39_of_48() {
+    // 36 + 3 = 39/48 clears the per-cell gate everywhere; 36 + 2 = 38/48
+    // makes a single thin cell refuse the whole shared source.
+    let at_gate = short_cell_grid(3).await;
+    let thin: Vec<&VoiceHeatCell> = at_gate.iter().filter(|c| c.coverage < 1.0).collect();
+    assert_eq!(thin.len(), 1, "exactly one cell is short");
+    assert!((thin[0].coverage - 39.0 / 48.0).abs() < 1e-9);
+    assert_shared(
+        &at_gate,
+        28,
+        "measured",
+        at_gate[0].measured_through.as_deref(),
+    );
+    assert!(at_gate[0].measured_through.is_some());
+
+    let under_gate = short_cell_grid(2).await;
+    let thin: Vec<&VoiceHeatCell> = under_gate.iter().filter(|c| c.coverage < 1.0).collect();
+    assert_eq!(thin.len(), 1, "exactly one cell is short");
+    assert!((thin[0].coverage - 38.0 / 48.0).abs() < 1e-9);
+    assert!(
+        thin[0].avg_in_voice.is_some(),
+        "a thin cell still reports its average"
+    );
+    assert_shared(
+        &under_gate,
+        28,
+        "insufficient",
+        under_gate[0].measured_through.as_deref(),
+    );
+    // The watermark is a property of the included hours, not of the label.
+    assert!(under_gate[0].measured_through.is_some());
+}
+
+#[tokio::test]
+async fn voice_heat_missing_cell_refuses_measured() {
+    // Every other cell is full and 28 days are sampled, but one hour-of-week
+    // has no rows at all: coverage 0 for it and an insufficient grid.
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+    seed_window(
+        &pool,
+        WindowSeed {
+            samples: 12,
+            omit_cell: Some((2, 5)),
+            ..WindowSeed::default()
+        },
+    )
+    .await;
+
+    let rows = heat_grid(&pool).await;
+    let missing = rows
+        .iter()
+        .find(|c| c.dow == 2 && c.hour == 5)
+        .expect("cell");
+    assert!(missing.avg_in_voice.is_none());
+    assert_eq!(missing.coverage, 0.0);
+    assert_eq!(rows.iter().filter(|c| c.coverage == 0.0).count(), 1);
+    assert_shared(
+        &rows,
+        28,
+        "insufficient",
+        rows[0].measured_through.as_deref(),
+    );
+
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn voice_heat_gap_rows_are_never_samples() {
+    // All-gap rows (samples 0, NULL observation) fill nothing: no averages,
+    // no sampled days, no watermark.
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+    seed_window(&pool, WindowSeed::default()).await;
+    let rows = heat_grid(&pool).await;
+    for cell in &rows {
+        assert!(cell.avg_in_voice.is_none(), "a gap is never a zero average");
+        assert_eq!(cell.coverage, 0.0);
+    }
+    assert_shared(&rows, 0, "insufficient", None);
+    fixture.close().await.expect("drop test database");
+
+    // One whole gap day among 27 sampled days: that date is not counted and
+    // its weekday's cells fall to 36/48, so the grid cannot be measured.
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+    let (start, _) = window_bounds(&pool).await;
+    seed_window(
+        &pool,
+        WindowSeed {
+            samples: 12,
+            gap_before: Some(start + time::Duration::days(1)),
+            ..WindowSeed::default()
+        },
+    )
+    .await;
+    let rows = heat_grid(&pool).await;
+    assert_shared(
+        &rows,
+        27,
+        "insufficient",
+        rows[0].measured_through.as_deref(),
+    );
+    assert!(rows[0].measured_through.is_some());
+    let thin = rows
+        .iter()
+        .filter(|c| (c.coverage - 36.0 / 48.0).abs() < 1e-9)
+        .count();
+    assert_eq!(thin, 24, "the gap day's 24 cells each lose one occurrence");
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn voice_heat_valid_zero_occupancy_advances_watermark() {
+    // An observed-but-empty hour (samples 12, sum 0) is a real measurement:
+    // it averages 0.0, counts toward coverage and moves measured_through,
+    // unlike a gap row sitting after it.
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+    let (_, end) = window_bounds(&pool).await;
+    let last = end - time::Duration::hours(1);
+    let zero_hour = last - time::Duration::hours(1);
+    let observed = zero_hour + time::Duration::minutes(5);
+    insert_hour(&pool, zero_hour, 12, 0, Some(observed)).await;
+    insert_hour(&pool, last, 0, 0, None).await;
+
+    let rows = heat_grid(&pool).await;
+    let through = iso_of(&pool, observed).await;
+    assert_shared(&rows, 1, "insufficient", Some(&through));
+    let zero: Vec<&VoiceHeatCell> = rows
+        .iter()
+        .filter(|c| c.avg_in_voice == Some(0.0))
+        .collect();
+    assert_eq!(zero.len(), 1, "the empty hour averages 0.0, not NULL");
+    assert!((zero[0].coverage - 12.0 / 48.0).abs() < 1e-9);
+    assert_eq!(
+        rows.iter()
+            .filter(|c| c.coverage == 0.0 && c.avg_in_voice.is_none())
+            .count(),
+        167,
+        "the gap hour and all unobserved cells are gaps, not zero occupancy"
+    );
+
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn voice_heat_watermark_follows_observation_time_not_counts() {
+    // Two hours with identical samples and occupancy differ only in
+    // last_observed_at; the watermark is the latest observation timestamp.
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+    let (start, _) = window_bounds(&pool).await;
+    let early_hour = start + time::Duration::hours(3);
+    let late_hour = start + time::Duration::hours(9);
+    insert_hour(
+        &pool,
+        early_hour,
+        12,
+        60,
+        Some(early_hour + time::Duration::minutes(10)),
+    )
+    .await;
+    insert_hour(
+        &pool,
+        late_hour,
+        12,
+        60,
+        Some(late_hour + time::Duration::minutes(20)),
+    )
+    .await;
+    let first = iso_of(&pool, late_hour + time::Duration::minutes(20)).await;
+    assert_shared(&heat_grid(&pool).await, 1, "insufficient", Some(&first));
+
+    // Re-observe the later hour later within that same hour: counts never
+    // change, the watermark does.
+    sqlx::query("UPDATE voice_heat_hours SET last_observed_at = $1 WHERE hour_start_utc = $2")
+        .bind(late_hour + time::Duration::minutes(50))
+        .bind(late_hour)
+        .execute(&pool)
+        .await
+        .expect("move observation within hour");
+    let second = iso_of(&pool, late_hour + time::Duration::minutes(50)).await;
+    assert_ne!(first, second);
+    assert_shared(&heat_grid(&pool).await, 1, "insufficient", Some(&second));
+
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn voice_heat_hours_constraints_bind_observation_to_samples() {
+    // last_observed_at is NULL iff samples = 0; samples cap at 12; the
+    // timestamp lies inside its UTC hour; zero samples carry a zero sum.
+    let fixture = connect().await;
+    let pool = fixture.pool().clone();
+    let (start, _) = window_bounds(&pool).await;
+    let base = start + time::Duration::hours(2);
+    let minute = time::Duration::minutes(1);
+    let cases: [(&str, i32, i64, Option<time::OffsetDateTime>, bool); 8] = [
+        (
+            "valid sample",
+            12,
+            30,
+            Some(base + time::Duration::minutes(59)),
+            true,
+        ),
+        ("valid gap", 0, 0, None, true),
+        ("samples without observation", 5, 10, None, false),
+        ("gap with observation", 0, 0, Some(base + minute), false),
+        ("over twelve samples", 13, 10, Some(base + minute), false),
+        (
+            "observation before hour",
+            5,
+            10,
+            Some(base - time::Duration::seconds(1)),
+            false,
+        ),
+        (
+            "observation after hour",
+            5,
+            10,
+            Some(base + time::Duration::hours(1)),
+            false,
+        ),
+        ("zero samples with sum", 0, 3, None, false),
+    ];
+    for (name, samples, sum, observed, ok) in cases {
+        sqlx::query("DELETE FROM voice_heat_hours")
+            .execute(&pool)
+            .await
+            .expect("reset");
+        let result = sqlx::query(
+            "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(base)
+        .bind(samples)
+        .bind(sum)
+        .bind(observed)
+        .execute(&pool)
+        .await;
+        assert_eq!(result.is_ok(), ok, "{name}: {result:?}");
+    }
 
     fixture.close().await.expect("drop test database");
 }
@@ -1669,22 +2059,43 @@ async fn voice_heat_uses_utc_bounds_and_sample_weighted_cells() {
             .await
             .expect("UTC midnight");
     let start = today - time::Duration::days(28);
+    let minutes = |n: i64| time::Duration::minutes(n);
     // Two occurrences of the same hour-of-week with unequal sample counts.
-    // The row just before the window and today's row must be excluded.
-    for (at, samples, sum) in [
-        (start - time::Duration::hours(1), 12i32, 1200i64),
-        (start, 12, 24),
-        (start + time::Duration::days(7), 6, 36),
-        (today, 12, 1200),
+    // The row just before the window and today's row must be excluded (their
+    // observations are the latest and earliest timestamps, so a leak would
+    // show in the watermark too). A gap row on another date counts nowhere.
+    for (at, samples, sum, observed) in [
+        (
+            start - time::Duration::hours(1),
+            12i32,
+            1200i64,
+            Some(start - minutes(1)),
+        ),
+        (start, 12, 24, Some(start + minutes(20))),
+        (
+            start + time::Duration::days(3) + time::Duration::hours(3),
+            0,
+            0,
+            None,
+        ),
+        (
+            start + time::Duration::days(7),
+            6,
+            36,
+            Some(start + time::Duration::days(7) + minutes(30)),
+        ),
+        (today, 12, 1200, Some(today + minutes(10))),
     ] {
-        sqlx::query("INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum) VALUES ($1, $2, $3)")
-            .bind(at).bind(samples).bind(sum).execute(&mut *tx).await.expect("seed hour");
+        sqlx::query("INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at) VALUES ($1, $2, $3, $4)")
+            .bind(at).bind(samples).bind(sum).bind(observed).execute(&mut *tx).await.expect("seed hour");
     }
-    let rows: Vec<VoiceHeatCell> =
-        sqlx::query_as("SELECT * FROM web_v1.voice_heat ORDER BY dow, hour")
-            .fetch_all(&mut *tx)
-            .await
-            .expect("grid");
+    let rows: Vec<VoiceHeatCell> = sqlx::query_as(
+        "SELECT dow, hour, avg_in_voice, sample_days, coverage, measured_through, source
+         FROM web_v1.voice_heat ORDER BY dow, hour",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .expect("grid");
     assert_eq!(rows.len(), 168);
     let filled: Vec<&VoiceHeatCell> = rows
         .iter()
@@ -1702,15 +2113,21 @@ async fn voice_heat_uses_utc_bounds_and_sample_weighted_cells() {
     );
     assert_eq!(cell.hour, 0);
     assert!((cell.avg_in_voice.expect("measured average") - 60.0 / 18.0).abs() < 1e-9);
-    assert_eq!(cell.sample_days, 2);
-    assert!((cell.coverage - 18.0 / 8064.0).abs() < 1e-9);
+    assert_eq!(
+        cell.sample_days, 2,
+        "grid-wide distinct dates with samples > 0"
+    );
+    assert!((cell.coverage - 18.0 / 48.0).abs() < 1e-9);
     assert_eq!(cell.source, "insufficient");
     let through: String = sqlx::query_scalar("SELECT web_v1._iso($1)")
-        .bind(start + time::Duration::days(7))
+        .bind(start + time::Duration::days(7) + minutes(30))
         .fetch_one(&mut *tx)
         .await
         .expect("UTC timestamp");
-    assert_eq!(cell.measured_through.as_deref(), Some(through.as_str()));
+    for row in &rows {
+        assert_eq!(row.sample_days, 2);
+        assert_eq!(row.measured_through.as_deref(), Some(through.as_str()));
+    }
     tx.rollback().await.expect("rollback fixture");
     fixture.close().await.expect("drop test database");
 }

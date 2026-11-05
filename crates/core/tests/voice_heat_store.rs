@@ -21,10 +21,12 @@ async fn connect() -> TestDatabase {
 }
 
 fn bucket(hours_ago: i64, samples: i64, sum: i64) -> HourBucket {
+    let hour_start = truncate_to_hour(OffsetDateTime::now_utc() - Duration::hours(hours_ago));
     HourBucket {
-        hour_start: truncate_to_hour(OffsetDateTime::now_utc() - Duration::hours(hours_ago)),
+        hour_start,
         samples,
         occupancy_sum: sum,
+        last_observed_at: (samples > 0).then_some(hour_start + Duration::minutes(55)),
     }
 }
 
@@ -39,7 +41,15 @@ async fn schema_contains_only_hourly_aggregate_columns() {
     .fetch_all(fixture.pool())
     .await
     .expect("aggregate schema");
-    assert_eq!(columns, ["hour_start_utc", "samples", "occupancy_sum"]);
+    assert_eq!(
+        columns,
+        [
+            "hour_start_utc",
+            "samples",
+            "occupancy_sum",
+            "last_observed_at"
+        ]
+    );
     fixture.close().await.expect("drop test database");
 }
 
@@ -66,6 +76,19 @@ async fn flush_is_idempotent_and_empty_writes_nothing() {
             .expect("retry flush"),
         0
     );
+    let changed = HourBucket {
+        samples: 1,
+        occupancy_sum: 99,
+        last_observed_at: Some(buckets[0].hour_start + Duration::minutes(1)),
+        ..buckets[0]
+    };
+    assert_eq!(
+        flush_hour_buckets(&pool, &[changed])
+            .await
+            .expect("conflicting replay"),
+        0,
+        "a changed replay cannot overwrite the immutable count, sum or timestamp"
+    );
     let mut stored: Vec<(i32, i64)> =
         sqlx::query_as("SELECT samples, occupancy_sum FROM voice_heat_hours")
             .fetch_all(&pool)
@@ -73,6 +96,16 @@ async fn flush_is_idempotent_and_empty_writes_nothing() {
             .expect("read rows");
     stored.sort_unstable();
     assert_eq!(stored, vec![(11, 22), (12, 48)]);
+    for bucket in &buckets {
+        let observed: Option<OffsetDateTime> = sqlx::query_scalar(
+            "SELECT last_observed_at FROM voice_heat_hours WHERE hour_start_utc = $1",
+        )
+        .bind(bucket.hour_start)
+        .fetch_one(&pool)
+        .await
+        .expect("stored observation time");
+        assert_eq!(observed, bucket.last_observed_at);
+    }
 
     fixture.close().await.expect("drop test database");
 }
@@ -82,14 +115,9 @@ async fn prune_keeps_fresh_rows_and_counts_stale_ones() {
     let fixture = connect().await;
     let pool = fixture.pool().clone();
 
-    sqlx::query(
-        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum)
-         VALUES (now() - make_interval(days => 40), 12, 30),
-                (now() - make_interval(days => 10), 12, 24)",
-    )
-    .execute(&pool)
-    .await
-    .expect("seed rows");
+    flush_hour_buckets(&pool, &[bucket(40 * 24, 12, 30), bucket(10 * 24, 12, 24)])
+        .await
+        .expect("seed rows");
     assert_eq!(
         count_stale_voice_heat(&pool, VOICE_HEAT_RETENTION_DAYS)
             .await

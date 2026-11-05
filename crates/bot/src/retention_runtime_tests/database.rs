@@ -624,9 +624,9 @@ async fn voice_heat_expiry_counts_in_dry_run_and_deletes_in_execute() {
     let Some(db) = database().await else { return };
     let pool = db.pool();
     sqlx::query(
-        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum)
-         VALUES (now() - make_interval(days => 40), 12, 30),
-                (now() - make_interval(days => 10), 12, 24)",
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
+         VALUES (now() - make_interval(days => 40), 12, 30, now() - make_interval(days => 40)),
+                (now() - make_interval(days => 10), 12, 24, now() - make_interval(days => 10))",
     )
     .execute(pool)
     .await
@@ -672,8 +672,8 @@ async fn voice_heat_expiry_failure_keeps_report_and_retries() {
     let Some(db) = database().await else { return };
     let pool = db.pool();
     sqlx::query(
-        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum)
-         VALUES (now() - make_interval(days => 40), 12, 30)",
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
+         VALUES (now() - make_interval(days => 40), 12, 30, now() - make_interval(days => 40))",
     )
     .execute(pool)
     .await

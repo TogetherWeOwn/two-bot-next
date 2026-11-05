@@ -53,18 +53,36 @@ const MAX_BUFFERED_HOURS: usize = 336;
 /// gateway cache or a database.
 #[derive(Debug, Default)]
 pub(crate) struct Accumulator {
-    buckets: BTreeMap<time::OffsetDateTime, (i64, i64)>,
+    buckets: BTreeMap<time::OffsetDateTime, BufferedHour>,
+}
+
+#[derive(Debug, Default)]
+struct BufferedHour {
+    slots: u16,
+    occupancy_sum: i64,
+    last_observed_at: Option<time::OffsetDateTime>,
 }
 
 impl Accumulator {
-    /// Record one sample at `sample_at`. Negative totals clamp to zero; a
-    /// full buffer evicts the oldest hour with a warn, never an unbounded
-    /// grow.
+    /// Record the first valid observation in each UTC five-minute slot.
+    /// Retries in that slot cannot change its count, sum or actual observation
+    /// timestamp. Negative totals clamp to zero; a full buffer evicts the
+    /// oldest hour with a warn, never an unbounded grow.
     pub(crate) fn record(&mut self, sample_at: time::OffsetDateTime, total: i64) {
         let hour = voice_heat_store::truncate_to_hour(sample_at);
-        let entry = self.buckets.entry(hour).or_insert((0, 0));
-        entry.0 = entry.0.saturating_add(1);
-        entry.1 = entry.1.saturating_add(total.max(0));
+        let slot = (sample_at.unix_timestamp() - hour.unix_timestamp()) / 300;
+        let mask = 1u16 << slot;
+        let entry = self.buckets.entry(hour).or_default();
+        if entry.slots & mask != 0 {
+            return;
+        }
+        entry.slots |= mask;
+        entry.occupancy_sum = entry.occupancy_sum.saturating_add(total.max(0));
+        entry.last_observed_at = Some(
+            entry
+                .last_observed_at
+                .map_or(sample_at, |at| at.max(sample_at)),
+        );
         if self.buckets.len() > MAX_BUFFERED_HOURS {
             let oldest = *self.buckets.keys().next().expect("non-empty buffer");
             self.buckets.remove(&oldest);
@@ -81,10 +99,11 @@ impl Accumulator {
         let current = voice_heat_store::truncate_to_hour(now);
         self.buckets
             .range(..current)
-            .map(|(&hour_start, &(samples, occupancy_sum))| HourBucket {
+            .map(|(&hour_start, entry)| HourBucket {
                 hour_start,
-                samples,
-                occupancy_sum,
+                samples: i64::from(entry.slots.count_ones()),
+                occupancy_sum: entry.occupancy_sum,
+                last_observed_at: entry.last_observed_at,
             })
             .collect()
     }
@@ -249,7 +268,8 @@ mod tests {
             vec![HourBucket {
                 hour_start: hour(9),
                 samples: 1,
-                occupancy_sum: 4
+                occupancy_sum: 4,
+                last_observed_at: Some(hour(9)),
             }]
         );
     }
@@ -265,6 +285,56 @@ mod tests {
         assert_eq!(pending[0].hour_start, hour(95));
         assert_eq!(pending[1].hour_start, hour(98));
         assert_eq!((pending[1].samples, pending[1].occupancy_sum), (1, 0));
+    }
+
+    #[test]
+    fn retries_count_each_five_minute_slot_only_once() {
+        let mut acc = Accumulator::default();
+        let first = hour(10) + time::Duration::seconds(3);
+        acc.record(first, 4);
+        acc.record(first + time::Duration::minutes(4), 99);
+        let next = hour(10) + time::Duration::minutes(5);
+        acc.record(next, 0);
+        acc.record(next + time::Duration::seconds(30), 99);
+        let pending = acc.completed(hour(11));
+        assert_eq!(pending[0].samples, 2);
+        assert_eq!(pending[0].occupancy_sum, 4);
+        assert_eq!(pending[0].last_observed_at, Some(next));
+    }
+
+    #[test]
+    fn hour_has_twelve_slots_and_keeps_actual_latest_observation() {
+        let mut acc = Accumulator::default();
+        for minute in (0..60).rev() {
+            acc.record(hour(10) + time::Duration::minutes(minute), 2);
+        }
+        let pending = acc.completed(hour(11));
+        assert_eq!(pending[0].samples, 12);
+        assert_eq!(pending[0].occupancy_sum, 24);
+        assert_eq!(
+            pending[0].last_observed_at,
+            Some(hour(10) + time::Duration::minutes(59))
+        );
+        // The first observation in the next hour belongs to a new slot.
+        acc.record(hour(11), 0);
+        let pending = acc.completed(hour(12));
+        assert_eq!(pending[1].samples, 1);
+        assert_eq!(pending[1].last_observed_at, Some(hour(11)));
+    }
+
+    #[test]
+    fn equal_counts_and_sums_preserve_different_observation_times() {
+        let mut early = Accumulator::default();
+        let mut late = Accumulator::default();
+        early.record(hour(10), 0);
+        late.record(hour(10) + time::Duration::minutes(4), 0);
+        let early = early.completed(hour(11))[0];
+        let late = late.completed(hour(11))[0];
+        assert_eq!(
+            (early.samples, early.occupancy_sum),
+            (late.samples, late.occupancy_sum)
+        );
+        assert_ne!(early.last_observed_at, late.last_observed_at);
     }
 
     #[test]
