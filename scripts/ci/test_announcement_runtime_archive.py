@@ -125,6 +125,44 @@ class CandidateArchive(unittest.TestCase):
         with self.assertRaisesRegex(Refusal, "archive_expanded_size"):
             archive.inspect_archive(package(files), inventory(files))
 
+    def test_deflate_member_must_consume_its_complete_declared_payload(self):
+        files = contents()
+        original = package(files)
+        parsed, inert = archive.inspect_archive(original, inventory(files))
+        self.assertEqual(parsed, fixtures.receipt())
+        self.assertEqual(inert, files)
+        with zipfile.ZipFile(io.BytesIO(original)) as zipped:
+            members = zipped.infolist()
+        for selected in members:
+            for suffix in (b"\x00", b"inert-unlisted-tail"):
+                with self.subTest(member=selected.filename, suffix=suffix):
+                    # Keep every ZIP offset/size consistent while declaring
+                    # extra compressed payload. Expanded bytes, CRC and the
+                    # complete approved file inventory stay unchanged.
+                    raw = bytearray(original)
+                    local = selected.header_offset
+                    name_size = struct.unpack_from("<H", raw, local + 26)[0]
+                    end = local + 30 + name_size + selected.compress_size
+                    directory = struct.unpack_from("<I", raw, len(raw) - 6)[0]
+                    raw[end:end] = suffix
+                    delta = len(suffix)
+                    struct.pack_into("<I", raw, local + 18, selected.compress_size + delta)
+                    central = directory + delta
+                    for member in members:
+                        if member is selected:
+                            struct.pack_into("<I", raw, central + 20, member.compress_size + delta)
+                        if member.header_offset >= end:
+                            struct.pack_into("<I", raw, central + 42, member.header_offset + delta)
+                        central += 46 + len(member.filename)
+                    struct.pack_into("<I", raw, len(raw) - 6, directory + delta)
+                    # Show that the packet is a readable ZIP with exact files;
+                    # refusal must come from complete stream consumption.
+                    with zipfile.ZipFile(io.BytesIO(raw)) as zipped:
+                        self.assertEqual({name: zipped.read(name) for name in files}, files)
+                    with self.assertRaisesRegex(Refusal, "archive_format") as ctx:
+                        archive.inspect_archive(bytes(raw), inventory(files))
+                    self.assertIsNone(ctx.exception.__cause__)
+
     def test_invalid_deflate_stream_is_a_constant_refusal(self):
         raw = bytearray(package())
         name_size = struct.unpack_from("<H", raw, 26)[0]

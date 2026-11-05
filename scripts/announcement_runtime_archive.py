@@ -102,9 +102,20 @@ def inspect_archive(raw, inventory):
                         "archive_layout")
                 local_end = payload_start + compressed
                 require(local_end <= offset, "archive_layout")
-                with archive.open(info) as stream:
-                    data = stream.read(item["size"] + 1)
+                payload = raw[payload_start:local_end]
+                if compression == zipfile.ZIP_DEFLATED:
+                    # ZipExtFile accepts unused bytes after a complete stream.
+                    # Require one complete stream and account for every declared
+                    # compressed byte, with the same bounded output ceiling.
+                    inflater = zlib.decompressobj(-zlib.MAX_WBITS)
+                    data = inflater.decompress(payload, item["size"] + 1)
+                    require(len(data) <= item["size"], "archive_member_size")
+                    require(inflater.eof and not inflater.unused_data and
+                            not inflater.unconsumed_tail, "archive_format")
+                else:
+                    data = payload
                 require(len(data) == item["size"], "archive_member_size")
+                require(zlib.crc32(data) == info.CRC, "archive_format")
                 require(hashlib.sha256(data).hexdigest() == item["sha256"], "archive_digest")
                 files[info.filename] = data
             require(local_end == offset == archive.start_dir, "archive_layout")

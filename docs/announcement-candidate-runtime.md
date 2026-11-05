@@ -26,7 +26,10 @@ not canonical staging qualification or production promotion.
   are both 32 MiB. It rejects unlisted/missing/replaced/duplicate members,
   canonical-promotion filenames, traversal, links, executable modes, encrypted
   entries, alternate compression, comments and inconsistent local/central ZIP
-  layouts. Non-receipt evidence stays **unverified inert bytes** until a
+  layouts. Each DEFLATE member must contain exactly one complete stream with no
+  unused compressed suffix or unconsumed input; bounded expansion, exact size,
+  CRC and inventory content hashes are all required. Non-receipt evidence stays
+  **unverified inert bytes** until a
   separate typed resolver is invoked; its filename or hash is not acceptance.
 - `scripts/announcement_runtime_evidence.py` resolves closed, same-attempt
   provenance sidecars. Each has exactly `schema`, `ref`, `kind`, `run`, `data`;
