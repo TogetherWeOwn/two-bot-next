@@ -20,6 +20,14 @@ def _unique(values, code):
     require(len(values) == len(set(values)), code)
 
 
+def _mutation_reads_current(checkpoint, installation, evidence, observed):
+    # Scope/history/consumer binding is checked by the authority graph first.
+    # A fresh checkpoint plus a valid fence cannot extend either read's age.
+    return all(timedelta(0) <= observed - utc(evidence.resolve(
+        record[role + "_read_ref"], "authority_read")["claim"]["read_at"]) <= timedelta(seconds=60)
+        for record in (checkpoint, installation) for role in ("controller", "verifier"))
+
+
 def budget_claims(receipt):
     """The exact finite plan being compared, not permission for its effects."""
     fixtures = receipt["fixtures"]
@@ -260,7 +268,6 @@ def check_authority_graph_claims(receipt, evidence, now):
             "boundary": "external_atomic"}, "mutation_fence")
         require(checked < utc(fence["valid_until"]) <= min(expiry, checked + timedelta(seconds=60)),
                 "mutation_fence_time")
-        fences.append(fence)
         install = evidence.resolve(install_ref, "installation_approval")
         require(install["source_ref"] == source_ref and install["mapping_ref"] ==
                 control["installation"]["mapping_ref"] and install["policy"] == authority["policy"]
@@ -288,10 +295,15 @@ def check_authority_graph_claims(receipt, evidence, now):
             install_reads.append(read)
         require(install_reads[0]["history_sha256"] == install_reads[1]["history_sha256"],
                 "authority_disagreement")
+        fences.append((checkpoint, fence, install))
     def mutation_checkpoint(phase, timestamp):
         observed = utc(timestamp)
-        require(any(fence["phase"] == phase and utc(fence["observed_at"]) <= observed <
-                    utc(fence["valid_until"]) for fence in fences), "mutation_without_checkpoint")
+        matching = [(checkpoint, install) for checkpoint, fence, install in fences
+                    if fence["phase"] == phase and utc(fence["observed_at"]) <= observed <
+                    utc(fence["valid_until"])]
+        require(matching, "mutation_without_checkpoint")
+        require(any(_mutation_reads_current(checkpoint, install, evidence, observed)
+                    for checkpoint, install in matching), "stale_mutation_read")
 
     mutation_checkpoint("rollout", receipt["rollout"]["started_at"])
     for effect in receipt["observations"]["actual_effects"]:

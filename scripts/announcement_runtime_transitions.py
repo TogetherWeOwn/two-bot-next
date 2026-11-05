@@ -6,7 +6,7 @@ root. Literal values, stored cases, phase completion and actual restoration
 remain mandatory separate checks. runtime_preflight() always refuses.
 """
 
-from announcement_runtime_authority import check_authority_graph_claims
+from announcement_runtime_authority import _mutation_reads_current, check_authority_graph_claims
 from announcement_runtime_evidence import canonical_digest
 from announcement_runtime_provenance import _index, _unique_refs
 from announcement_runtime_schema import require, utc
@@ -84,6 +84,11 @@ def check_transition_claims(receipt, evidence, now):
         fence = evidence.resolve(checkpoint["mutation_fence_ref"], "mutation_fence")
         require(utc(fence["observed_at"]) <= observed < utc(fence["valid_until"]),
                 "transition_authority_time")
+        checkpoint_index = attempt["checkpoints"].index(checkpoint)
+        installation = evidence.resolve(authority["installation_approval_refs"][checkpoint_index],
+                                        "installation_approval")
+        require(_mutation_reads_current(checkpoint, installation, evidence, observed),
+                "stale_mutation_read")
         witness_ref = claim["ownership_match_ref"]
         witness = evidence.resolve(witness_ref, "ownership_match")
         require(witness == {"operation_id": effect["operation_id"],

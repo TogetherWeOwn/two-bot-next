@@ -315,6 +315,40 @@ class AuthorityGraph(unittest.TestCase):
                 r["observations"][ledger][0]["observed_at"] = at("00:08:31")
         self.reject(late_effect, "mutation_without_checkpoint")
 
+    def test_rollout_reads_cannot_age_past_sixty_seconds_inside_valid_fence(self):
+        self.check_boundary_read_age(2, "00:02:00", "00:03:00", "00:03:01")
+
+    def test_effect_reads_cannot_age_past_sixty_seconds_inside_valid_fence(self):
+        self.check_boundary_read_age(4, "00:07:00", "00:08:00", "00:08:01")
+
+    def check_boundary_read_age(self, checkpoint_index, read_clock, exact_clock, stale_clock):
+        # Repin both consumers' history/read copies coherently. The original
+        # checkpoint and fence stay valid, isolating the boundary read age.
+        for prefix in ("runtime", "install"):
+            for clock, stale in ((exact_clock, False), (stale_clock, True)):
+                with self.subTest(prefix=prefix, clock=clock):
+                    receipt, records, now = authority_fixture()
+                    for role in ("controller", "verifier"):
+                        ref = prefix + "-read-" + role + "-" + str(checkpoint_index)
+                        records[ref]["data"]["claim"]["read_at"] = at(read_clock)
+                        for read in receipt["authority"]["reads"]:
+                            if read["ref"] == ref:
+                                read["read_at"] = at(read_clock)
+                    history = prefix + "-history-" + str(checkpoint_index)
+                    records[history]["data"]["ended_at"] = at(read_clock)
+                    rehash_history(receipt, records, history)
+                    if checkpoint_index == 2:
+                        receipt["rollout"]["started_at"] = at(clock)
+                    else:
+                        for ledger in ("expected_effects", "actual_effects"):
+                            for effect in receipt["observations"][ledger]:
+                                effect["observed_at"] = at(clock)
+                    if stale:
+                        with self.assertRaisesRegex(Refusal, "stale_mutation_read$"):
+                            self.check(receipt, records, now)
+                    else:
+                        self.assertIsNone(self.check(receipt, records, now))
+
     def test_installation_decisions_do_not_change_behind_one_epoch(self):
         def changed(r, s):
             install = s["installation-approval-5"]["data"]

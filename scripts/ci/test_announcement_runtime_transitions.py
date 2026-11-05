@@ -19,6 +19,7 @@ from announcement_resource_fixtures import repin_authority, repin_resources
 from announcement_transition_fixtures import (
     add_late_effect_checkpoint, repin_ownership, transition_fixture,
 )
+from announcement_runtime_evidence import canonical_digest
 from announcement_runtime_policy import runtime_preflight
 from announcement_runtime_schema import Refusal
 from announcement_runtime_transitions import check_transition_claims
@@ -300,6 +301,46 @@ class Authority(Transitions):
         match(records, FEED_INS)["checkpoint_ref"] = late
         with self.assertRaisesRegex(Refusal, "transition_authority_time$"):
             self.check(receipt, records, now)
+
+    def test_another_fresh_checkpoint_cannot_repair_named_stale_reads(self):
+        for prefix in ("runtime", "install"):
+            with self.subTest(prefix=prefix):
+                receipt, records, now = transition_fixture()
+                extra_ref = add_late_effect_checkpoint(receipt, records)
+                attempt, authority = receipt["attempt"], receipt["authority"]
+                index = next(i for i, c in enumerate(attempt["checkpoints"])
+                             if c["ref"] == extra_ref)
+                checkpoint = attempt["checkpoints"].pop(index)
+                install_ref = authority["installation_approval_refs"].pop(index)
+                # Reuse the complete clone as an EARLIER checkpoint. Its fence
+                # covers 08:00, but one family of paired reads is 61 seconds old.
+                checkpoint["checked_at"] = at("00:07:59")
+                attempt["checkpoints"].insert(index - 1, checkpoint)
+                authority["installation_approval_refs"].insert(index - 1, install_ref)
+                install = records[install_ref]["data"]
+                install["checked_at"] = at("00:07:59")
+                records[checkpoint["mutation_fence_ref"]]["data"]["observed_at"] = at("00:07:59")
+                for group, record in (("runtime", checkpoint), ("install", install)):
+                    clock = "00:06:59" if group == prefix else "00:07:59"
+                    for role in ("controller", "verifier"):
+                        read = records[record[role + "_read_ref"]]["data"]
+                        read["claim"]["read_at"] = at(clock)
+                        history = records[read["history_ref"]]["data"]
+                        history["ended_at"] = at(clock)
+                        read["claim"]["history_sha256"] = canonical_digest(history)
+                receipt["control"]["installation"]["authority_receipt_refs"] = copy.deepcopy(
+                    authority["installation_approval_refs"])
+                records[authority["execution"]["ref"]]["data"]["installation_approval_refs"] = (
+                    copy.deepcopy(authority["installation_approval_refs"]))
+                records["runtime-authority-scope"]["data"]["control"] = copy.deepcopy(receipt["control"])
+                repin_authority(receipt, records)
+                # The unchanged 08:00 checkpoint independently covers the whole
+                # ledger. Check that control BEFORE naming the stale checkpoint.
+                self.assertIsNone(self.check(receipt, records, now))
+                claim(records, FEED_INS)["authority_ref"] = extra_ref
+                match(records, FEED_INS)["checkpoint_ref"] = extra_ref
+                with self.assertRaisesRegex(Refusal, "stale_mutation_read$"):
+                    self.check(receipt, records, now)
 
     def test_every_write_needs_the_effect_batch_authority(self):
         for operation in WRITES:

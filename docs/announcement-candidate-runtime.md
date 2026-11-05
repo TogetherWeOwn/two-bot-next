@@ -76,8 +76,13 @@ not canonical staging qualification or production promotion.
   Credential/setup/rollout/transition/effect-batch/final checkpoints are required;
   each resolves an exact-phase external-atomic-fence claim with at most 60-second
   validity. Rollout starts and recorded effect attempts must fall inside their
-  matching checkpoint windows; final runtime and installation reads are fresh
-  against the verifier clock, not just the checkpoint time. These are consistency predicates, **not** actual native API reads,
+  matching checkpoint windows. Both runtime and installation controller/verifier
+  reads must additionally remain at most 60 seconds old at the claimed rollout or
+  effect time; a checkpoint/fence cannot extend their freshness. A DB transition's
+  named checkpoint must independently meet that bound, even when a different fresh
+  checkpoint covers the same operation. Exactly 60 seconds is permitted. Final
+  runtime and installation reads are fresh against the verifier clock, not just
+  the checkpoint time. These are consistency predicates, **not** actual native API reads,
   provisioning, nonce consumption, current revocation protection or enforcement.
   There is no authority endpoint, key, adapter or enable input. A coherent
   fabricated graph still returns no capability and cannot qualify runtime.
