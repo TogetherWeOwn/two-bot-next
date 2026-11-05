@@ -8,6 +8,9 @@ on:
     paths:
       - '.github/workflows/pipeline-benchmark.yml'
       - 'crates/discord/examples/pipeline_bench.rs'
+      - 'crates/testsupport/src/pipeline_integrity.rs'
+      - 'crates/testsupport/tests/pipeline_integrity.rs'
+      - 'crates/cutover/tests/pipeline_durability.rs'
       - 'scripts/*pipeline_bench*'
       - 'docs/pipeline-benchmark-baseline.json'
 
@@ -34,6 +37,12 @@ jobs:
           POSTGRES_USER: agent_test
           POSTGRES_DB: two_bot_test_pipeline_bench
           POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: >-
+            -c shared_preload_libraries=pg_stat_statements
+            -c logging_collector=on -c log_destination=jsonlog
+            -c log_min_duration_statement=0
+            -c log_rotation_age=0 -c log_rotation_size=0
+            -c autovacuum=off
         options: >-
           --health-cmd "pg_isready -U agent_test -d two_bot_test_pipeline_bench"
           --health-interval 5s --health-timeout 5s --health-retries 12
@@ -66,13 +75,18 @@ jobs:
       - name: Benchmark fixture and guard regressions (CI job container only)
         run: |
           cargo test -p two-bot-discord --example pipeline_bench --locked
-          cargo test -p two-bot-testsupport --lib --locked
+          cargo test -p two-bot-testsupport --lib --locked -- --test-threads=1
+          cargo test -p two-bot-testsupport --test pipeline_integrity --locked -- --test-threads=1
+          cargo test -p two-bot-cutover --test pipeline_durability --locked --no-run
+          timeout 120s cargo test -p two-bot-cutover --test pipeline_durability --locked -- --test-threads=1
       - name: Build benchmark (CI job container only)
         run: cargo build -p two-bot-discord --example pipeline_bench --locked
       - name: Measure bounded synthetic pipeline
         run: |
           timeout 240s target/debug/examples/pipeline_bench > pipeline-benchmark.json
           python3 -m json.tool pipeline-benchmark.json
+      - name: Validate independent counter and profile evidence
+        run: python3 scripts/pipeline_bench_profile.py pipeline-benchmark.json pipeline-benchmark.json
       - name: Compare committed baseline
         # The first evidence run bootstraps the measured baseline; no invented numbers.
         if: hashFiles('docs/pipeline-benchmark-baseline.json') != ''

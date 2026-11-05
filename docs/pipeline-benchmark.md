@@ -28,6 +28,24 @@ containers are the measurement path while the controller pool rollout is deferre
 
 With an authorized disposable `agent-testdb` container, pre-create an empty
 `two_bot_test_pipeline_bench` bootstrap DB owned by passwordless `agent_test`.
+The disposable server must preload `pg_stat_statements` and enable completed
+statement JSON logging. The workflow supplies these **disposable-only** initdb
+settings (Postgres 18):
+
+```text
+-c shared_preload_libraries=pg_stat_statements
+-c logging_collector=on -c log_destination=jsonlog
+-c log_min_duration_statement=0
+-c log_rotation_age=0 -c log_rotation_size=0
+-c autovacuum=off
+```
+
+Never enable these settings on a shared staging/production server for a benchmark.
+The passwordless fixture principal needs permission to create the extension in
+its own observer fixture and read that disposable server's log. Do not grant
+production roles log access. Missing capabilities invalidate the measurement;
+there is no client-only fallback. The bootstrap database is never migrated.
+
 Then the measured command is:
 
 ```sh
@@ -70,12 +88,17 @@ A larger profile needs its own baseline; unlike workloads are never compared.
 ## Measurement definitions
 
 - **Peak RSS (MiB):** Linux process-lifetime `VmHWM` from `/proc/self/status`,
-  after replay and row verification. Includes driver, mock server, SQLx,
-  migrations, cache and latency samples. No cgroup cap is claimed.
+  after replay and row/journal/checkpoint verification, before completion-log
+  buffering/JSON decoding. Includes driver, mock server, SQLx, migrations, cache
+  and latency samples. All evidence checks still run before a report is emitted;
+  the new log reader must not inflate the historical workload RSS sample.
+  No cgroup cap is claimed.
 - **Handler p50/p99 (microseconds):** exact nearest-rank quantiles of
   `handle_at` + buffer drain + awaited dispatch transaction. Includes cache,
   lock/read/write/projection/checkpoint/commit, excludes synthetic JSON parsing,
-  schedule sleep and REST fixture calls. All 900 load events contribute.
+  schedule sleep and REST fixture calls. Only the newly added expected-key
+  generation/set insertion interval is subtracted from the handler timer; all
+  original handler and persistence operations remain timed. All 900 load events contribute.
 - **DB round-trips/event:** logical completed SQL exchanges, not packet-level
   transport RTTs. Count SQLx 0.9 `sqlx::query` completion diagnostics during replay
   plus one `BEGIN` per successful dispatch. SQLx logs `COMMIT` but queues `BEGIN`
@@ -98,6 +121,129 @@ instrumented development baseline. Do not compare it to release/production or
 infer whole-bot RSS. Leveling/facts hooks, command runtimes/background jobs,
 gateway/TLS reconnect buffers, guild-role/chunk payloads and multiple guilds
 are not modeled. Member/channel cache population is asserted, not inferred.
+
+## Independent durability and accounting guards
+
+Before persistence, retain the expected idempotency keys of every staged funnel
+event (seed included). After all serial dispatch commits have completed, close
+the writer pool and wait for its database backends to exit. Reopen an independent
+verification pool: its event key set must equal the expected set, every event
+must have exactly one valid insert journal entry, and no event journal entry may
+be orphaned. Comparing surviving event/journal counts alone cannot detect lost
+work. One accepted gateway dispatch is **not** necessarily one new event row:
+messages after funnel milestones can produce activity touches only. This guard
+covers the benchmark's funnel events, not absent production feature-job queues.
+
+`crates/cutover/tests/pipeline_durability.rs` drives the public dispatch seam in a
+child process. A fixture-only AFTER INSERT trigger blocks the second row of a
+three-row batch. The parent kills the writer process, observes backend exit,
+requires the previous committed event/journal/checkpoint to survive with no
+partial batch, restarts through a fresh pool, and replays the unacknowledged
+batch. It verifies complete durability after drain and duplicate replay. Real
+fixture corruption (missing row/journal or duplicate journal) must fail the same
+oracle. The normal workspace integration lane and benchmark workflow run this
+non-ignored test; it never kills a production database process. The benchmark
+job builds it before applying the 120-second execution timeout.
+
+```sh
+cargo test -p two-bot-cutover --test pipeline_durability --locked
+```
+
+Use the bounded wrapper for controller compilation, as above. The existing full
+suite, classifier/automod golden corpora, RSS gate and advisory p99 remain intact.
+No benchmark pass substitutes for those checks.
+
+### Transactions, completed exchanges and statistics profiles
+
+All server observations come from a **second disposable database**, filtered to
+the unique measured database. Observer reads cannot add transactions or SQLx
+queries to the replay window. Flush setup statistics on each writer connection
+before the first snapshot; close writer backends before the final snapshot.
+`pg_stat_database` includes autovacuum/autoanalyze transactions, which are not
+client dispatches. Initialize this fresh disposable server with `autovacuum=off`;
+both snapshots reject an enabled setting. This excludes unrelated maintenance
+from the fixture, not dispatch work from the metric. CI initially observed 935
+commits for 900 dispatches with maintenance enabled; a disposable reproduction
+with a one-second maintenance cadence observed 1135 commits. No guessed offset
+or tolerance is subtracted. Never disable maintenance on staging/production.
+The existing negative accounting tests still reject every extra transaction.
+
+- `server_xact_commit` is the `pg_stat_database` commit delta minus **exactly two
+  known observer transactions**. These are simple-query start/stop marker
+  statements outside the measured client window, not prepared statements with
+  separate Parse transactions. Both markers must occur exactly once in the
+  server completion log. Require one workload commit per dispatch and zero
+  rollbacks; report the observer count separately.
+- `server_statement_calls` counts completed Execute/simple-query records between
+  those markers in the server's JSON log. Parse/Bind records, seed, observer and
+  verification are excluded. Errors, missing/duplicate markers, truncation,
+  rotation, malformed records, unavailable logs or counter resets fail closed.
+  Require exact equality to `sqlx_statements + begin_exchanges`, with no tolerance
+  or empirical correction factor. The original metric formula is unchanged.
+- `pg_stat_statements_profile` is a **distinct mechanism observation**, not a
+  substitute for the completion count. On the tested Postgres 18.6/SQLx 0.9 path,
+  repeated prepared utility statements are under-reported. A short 30-dispatch
+  probe observed 439 top-level calls versus 540 logical exchanges. Equating
+  those counters is invalid; neither a guessed offset nor SQLx utility counts
+  supplies independent missing server evidence. The completed server log covers
+  those utility exchanges independently. Reset/eviction invalidates the profile.
+- `server_statement_profile` groups completed statements by PostgreSQL
+  `hashtextextended(statement, 0)` fingerprint; bind-value log details never
+  enter fingerprints or reports. Compare on the same PostgreSQL/toolchain
+  environment. `event_statement_profile` reports observed dispatch counts and
+  SQLx-plus-BEGIN exchanges by event family. Fingerprints identify mechanisms;
+  they are not an isolation/security boundary.
+
+Log reading is streamed in 128 KiB chunks, with a 64 MiB total budget, a 64 KiB
+line cap inside the measured database/window and a 1024 distinct-statement cap.
+Unrelated or earlier setup records are not subject to the measured line cap;
+a partial JSON record remains bounded by the total budget until it can be scoped.
+Because the logging collector is asynchronous, the reader follows appended bytes
+for at most 10 seconds until the complete stop marker arrives, rather than treating
+the first EOF as final. Regression tests cover oversized setup records spanning
+chunks, rejection of oversized measured records, a delayed stop marker and awaited
+first-fixture cleanup when observer setup fails. These database regressions live
+in the non-ignored `testsupport/tests/pipeline_integrity.rs` integration target.
+Normal integration, nightly and coverage sweeps provide a JSON collector, retain
+maintenance defaults and enable completion logging only on the log-reader test's
+single synthetic connection, not across unrelated suites.
+Only fingerprints/counts are published. Full raw
+logs may contain parameter values and remain inside the disposable server;
+never upload them. Missing instrumentation is INVALID/NOT RUN, not a score.
+
+For two new reports from independently executed same-workload development
+replays (ordinary instrument validation, not qualified evaluation):
+
+```sh
+python3 scripts/compare_pipeline_bench.py after.json
+python3 scripts/pipeline_bench_profile.py before.json after.json
+```
+
+The second command validates counter identities, complete durability evidence,
+profile totals and metric arithmetic before reporting changed statement
+fingerprints, per-family deltas and total exchange delta. Observed message/voice
+family counts must equal duration times the declared rates in each report;
+changing the observed mix cannot masquerade as an efficiency improvement under
+an unchanged workload declaration. Zero-rate families are absent from the profile.
+It refuses the historical baseline as a mechanism reference because that report predates the
+independent counters. It creates no new target, tolerance or baseline ratchet.
+The historic raw observation remains `(11417 + 900) / 900 = 13.685555555555556`,
+not the old comparator failure limit of 10.562.
+
+### Evaluator qualification is separate
+
+These are executable correctness checks, not proof of author write exclusion,
+held-out secrecy, distinct GitHub principals, confined read-only reviewers or
+trusted result provenance. Same-UID worktrees, hashes, role prompts and native
+review alone do not enforce those boundaries. This deliverable is limited to
+ordinary, unqualified durability/accounting instrumentation. Its independent
+review must confirm applicability to that scope before normal QA/CI/release
+gates; shipment neither qualifies a panel nor reopens an optimization programme.
+Optimization/climbing, blind panel use, held-out evaluation and trusted
+model/provenance claims are excluded. Qualified use requires separately
+authorized work proving enforced evaluator admission, containment, exact-head
+binding and negative access tests. Never claim that this PR establishes those
+missing controls or that development measurements are qualified scores.
 
 ## Ratchet
 
@@ -122,7 +268,8 @@ Driver fixture/percentile/bounds tests and database guard tests run in CI job co
 
 ```sh
 cargo test -p two-bot-discord --example pipeline_bench --locked
-cargo test -p two-bot-testsupport --lib --locked
+cargo test -p two-bot-testsupport --lib --locked -- --test-threads=1
+cargo test -p two-bot-testsupport --test pipeline_integrity --locked -- --test-threads=1
 ```
 
 The journaled baseline uses [run 39637827461](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39637827461)

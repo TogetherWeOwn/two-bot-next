@@ -2387,6 +2387,7 @@ name = "two-bot-testsupport"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "serde_json",
  "sqlx",
  "tokio",
  "url",
