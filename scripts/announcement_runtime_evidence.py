@@ -1,9 +1,9 @@
-"""Bounded typed provenance-sidecar resolution, not authenticated evidence.
+"""Bounded typed provenance/authority claim resolution, not authentication.
 
-These records are inert claims. Neither a sidecar's kind, filename, digest nor
-successful resolution selects a trust root or proves independent observation.
-The remaining authority/resource/lifecycle records have no permissive fallback:
-unimplemented kinds refuse, and runtime admission remains unsupported.
+Neither a sidecar's kind, filename, digest nor successful resolution selects a
+trust root or proves authority or independent observation. Remaining resource
+and lifecycle kinds have no permissive fallback: unimplemented kinds refuse,
+and runtime admission remains unsupported.
 """
 
 import copy

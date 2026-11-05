@@ -321,6 +321,64 @@ class AuthorityGraph(unittest.TestCase):
             install["decisions"][1]["round"] = 3
         self.reject(changed, "installation_decision_drift")
 
+    def test_effective_qa_decision_must_exist_at_runtime_and_installation_read(self):
+        for prefix in ("runtime", "install"):
+            def mutate(r, s):
+                if prefix == "runtime":
+                    r["authority"]["decisions"][1]["decided_at"] = at("00:00:09")
+                    s["runtime-qa"]["data"]["claim"] = copy.deepcopy(r["authority"]["decisions"][1])
+                else:
+                    for i in range(6):
+                        s["installation-approval-" + str(i)]["data"]["decisions"][1]["decided_at"] = at("00:00:09")
+                for role in ("controller", "verifier"):
+                    ref = prefix + "-read-" + role + "-0"
+                    s[ref]["data"]["claim"]["read_at"] = at("00:00:08")
+                    for read in r["authority"]["reads"]:
+                        if read["ref"] == ref:
+                            read["read_at"] = at("00:00:08")
+                ref = prefix + "-history-0"
+                s[ref]["data"]["ended_at"] = at("00:00:08")
+                rehash_history(r, s, ref)
+            with self.subTest(prefix=prefix):
+                self.reject(mutate, "authority_history_time")
+
+    def test_final_installation_read_is_fresh_at_verification_not_only_checkpoint(self):
+        def mutate(r, s):
+            for role in ("controller", "verifier"):
+                s["install-read-" + role + "-5"]["data"]["claim"]["read_at"] = at("00:23:00")
+            s["install-history-5"]["data"]["ended_at"] = at("00:23:00")
+            rehash_history(r, s, "install-history-5")
+        self.reject(mutate, "stale_read")
+
+    def test_final_installation_read_at_exact_sixty_second_age_is_consistent(self):
+        r, s, now = authority_fixture()
+        for role in ("controller", "verifier"):
+            s["install-read-" + role + "-5"]["data"]["claim"]["read_at"] = at("00:23:30")
+        s["install-history-5"]["data"]["ended_at"] = at("00:23:30")
+        rehash_history(r, s, "install-history-5")
+        self.assertIsNone(self.check(r, s, now))
+
+    def test_qa_decision_at_exact_read_time_is_consistent(self):
+        r, s, now = authority_fixture()
+        r["authority"]["decisions"][1]["decided_at"] = at("00:00:10")
+        s["runtime-qa"]["data"]["claim"] = copy.deepcopy(r["authority"]["decisions"][1])
+        for i in range(6):
+            s["installation-approval-" + str(i)]["data"]["decisions"][1]["decided_at"] = at("00:00:10")
+        self.assertIsNone(self.check(r, s, now))
+
+    def test_later_history_cannot_backdate_an_event_missing_from_complete_snapshot(self):
+        for prefix in ("runtime", "install"):
+            def mutate(r, s):
+                ref = prefix + "-history-5"
+                history = s[ref]["data"]
+                history["events"].append({"sequence": 2, "kind": "push",
+                    "observed_at": "2025-12-31T23:40:30Z", "scope_sha256": "1" * 64,
+                    "invalidated_decision_refs": ["other-spent-decision"]})
+                history["last_sequence"] = 2
+                rehash_history(r, s, ref)
+            with self.subTest(prefix=prefix):
+                self.reject(mutate, "authority_history_backfill")
+
     def test_constant_refusals_do_not_expose_rejected_authority_data(self):
         r, s, now = authority_fixture()
         s["authority-source"]["data"]["private_error"] = "private-synthetic-sentinel"

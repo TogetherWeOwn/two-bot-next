@@ -181,7 +181,8 @@ def check_authority_graph_claims(receipt, evidence, now):
     histories = {}
     used_reads = set()
 
-    def read_claim(ref, expected, checked, digest, epoch, approved, expected_generation=None):
+    def read_claim(ref, expected, checked, digest, epoch, approved, expected_generation=None,
+                   freshness_at=None):
         record = evidence.resolve(ref, "authority_read")
         read = record["claim"]
         require(read["ref"] == ref and (expected is None or read == expected) and
@@ -189,8 +190,9 @@ def check_authority_graph_claims(receipt, evidence, now):
         require(read["source_ref"] == source_ref and read["scope_sha256"] == digest and
                 read["epoch"] == epoch and read["resource_epoch"] == resource_epoch and
                 read["effective_decision_refs"] == [x["ref"] for x in approved], "read_scope")
-        require(start <= utc(read["read_at"]) <= checked and
-                checked - utc(read["read_at"]) <= timedelta(seconds=60), "stale_read")
+        freshness_at = checked if freshness_at is None else freshness_at
+        require(start <= utc(read["read_at"]) <= checked <= freshness_at and
+                freshness_at - utc(read["read_at"]) <= timedelta(seconds=60), "stale_read")
         history = evidence.resolve(record["history_ref"], "authority_history")
         require(canonical_digest(history) == read["history_sha256"] and
                 history["source_ref"] == source_ref and history["scope_sha256"] == digest and
@@ -205,7 +207,9 @@ def check_authority_graph_claims(receipt, evidence, now):
                 [x["sequence"] for x in events] == list(range(1, len(events) + 1)),
                 "authority_history_gap")
         lower, upper = utc(history["started_at"]), utc(history["ended_at"])
-        require(lower < utc(approved[0]["decided_at"]) <= upper, "authority_history_time")
+        require(lower < utc(approved[0]["decided_at"]) and
+                all(utc(decision["decided_at"]) <= upper for decision in approved),
+                "authority_history_time")
         times = [x["observed_at"] for x in events]
         require(times == sorted(times), "authority_history_time")
         for event in events:
@@ -234,11 +238,13 @@ def check_authority_graph_claims(receipt, evidence, now):
     for checkpoint, install_ref in zip(checkpoints, install_refs):
         checked = utc(checkpoint["checked_at"])
         require(attempt_start <= checked <= attempt_end, "checkpoint_time")
-        check_authority_claims(authority, checkpoint, now if checkpoint is checkpoints[-1] else checked)
+        freshness_at = now if checkpoint is checkpoints[-1] else checked
+        check_authority_claims(authority, checkpoint, freshness_at)
         for role in ("controller", "verifier"):
             ref = checkpoint[role + "_read_ref"]
             read, history_ref = read_claim(ref, reads.get(ref), checked, authority["scope_sha256"],
-                                          authority["epoch"], decisions, generation)
+                                          authority["epoch"], decisions, generation,
+                                          freshness_at=freshness_at)
             require(ref in reads and read["consumer"] == role and ref not in used_reads,
                     "consumer_read")
             used_reads.add(ref)
@@ -275,7 +281,8 @@ def check_authority_graph_claims(receipt, evidence, now):
         install_reads = []
         for role in ("controller", "verifier"):
             read, history_ref = read_claim(install[role + "_read_ref"], None, checked,
-                install["scope_sha256"], install["epoch"], install["decisions"])
+                install["scope_sha256"], install["epoch"], install["decisions"],
+                freshness_at=freshness_at)
             require(read["consumer"] == role and history_ref == install["history_ref"],
                     "installation_read")
             install_reads.append(read)
@@ -299,3 +306,6 @@ def check_authority_graph_claims(receipt, evidence, now):
                     previous["generation"] == current["generation"] and
                     previous["events"] == current["events"][:len(previous["events"])] and
                     len(previous["events"]) <= len(current["events"]), "authority_history_rewrite")
+            require(all(utc(event["observed_at"]) > utc(previous["ended_at"])
+                        for event in current["events"][len(previous["events"]):]),
+                    "authority_history_backfill")

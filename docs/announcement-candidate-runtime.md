@@ -60,17 +60,19 @@ not canonical staging qualification or production promotion.
   claims; runtime and installation decisions bind separate native stage and
   participant mappings, ordered Security→QA, exact scope and Security round.
   Both consumers must claim separate provisioning and matching complete
-  effective decision histories at each mandatory checkpoint. History snapshots
-  are contiguous, time-bound, prefix-consistent and cannot revive an invalidated
-  approval after a push/revert, revocation, dismissal or scope change. Reusable
+  effective decision histories at each mandatory checkpoint. Every effective
+  decision must already exist at its read/history timestamp. History snapshots
+  are contiguous, time-bound and prefix-consistent; later snapshots cannot
+  backdate omitted events into an earlier complete interval or revive an
+  invalidated approval after push/revert, revocation, dismissal or scope change. Reusable
   installation approval is separately scoped and rechecked at every checkpoint;
   its decisions cannot drift behind the epoch. The one-attempt execution and
   nonce-consumption claims bind the run, owner, epochs, time and exact scope.
   Credential/setup/rollout/transition/effect-batch/final checkpoints are required;
   each resolves an exact-phase external-atomic-fence claim with at most 60-second
   validity. Rollout starts and recorded effect attempts must fall inside their
-  matching checkpoint windows; final authority is fresh against the verifier
-  clock. These are consistency predicates, **not** actual native API reads,
+  matching checkpoint windows; final runtime and installation reads are fresh
+  against the verifier clock, not just the checkpoint time. These are consistency predicates, **not** actual native API reads,
   provisioning, nonce consumption, current revocation protection or enforcement.
   There is no authority endpoint, key, adapter or enable input. A coherent
   fabricated graph still returns no capability and cannot qualify runtime.
