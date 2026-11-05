@@ -4,9 +4,10 @@
 -- website-job sampler writes through the cutover pool, so the table must
 -- exist in this chain too. Same `{hour_start_utc, samples, occupancy_sum, last_observed_at}`
 -- shape, aggregate-only by construction (no member id, channel id or
--- per-room split), completed-hour-only flushes, 35-day retention, and the
--- same conditional 1.0 -> 1.1 `web_contract_meta` bump for the new
--- `web_v1.voice_heat` view. Additive only; `IF NOT EXISTS` throughout so
+-- per-room split), completed-hour-only flushes and 35-day retention. The
+-- 1.0 -> 1.1 `web_contract_meta` bump for the new `web_v1.voice_heat` view is
+-- not done here; it is published atomically at the end of `web_v1.sql`, after
+-- the views install. Additive only; `IF NOT EXISTS` throughout so
 -- cross-running both chains in either order converges. Rollback is
 -- `DROP TABLE IF EXISTS voice_heat_hours`.
 -- Bot schema range: 0001-0999. Database tests use test containers only.
@@ -25,7 +26,3 @@ CREATE TABLE IF NOT EXISTS voice_heat_hours (
         AND last_observed_at < hour_start_utc + interval '1 hour')
   )
 );
-
-UPDATE web_contract_meta
-   SET contract_version = '1.1'
- WHERE singleton AND contract_version = '1.0';

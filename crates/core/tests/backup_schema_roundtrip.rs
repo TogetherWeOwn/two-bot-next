@@ -1445,6 +1445,127 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
 }
 
 #[tokio::test]
+async fn historical_contract_archive_preserves_installed_capability_and_restores_guild() {
+    let Some(target) = database().await else {
+        return;
+    };
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("configured bootstrap");
+    let mut historical = sqlx::migrate!("../cutover/migrations");
+    historical.migrations = std::borrow::Cow::Owned(
+        historical
+            .iter()
+            .filter(|m| m.version < 472)
+            .cloned()
+            .collect(),
+    );
+    let source = TestDatabase::create(&url, &historical).await.unwrap();
+    sqlx::query("UPDATE web_contract_meta SET guild_id = '100000000000000001'")
+        .execute(source.pool())
+        .await
+        .unwrap();
+    let directory = ArchiveDirectory::new();
+    let archive = directory.path("contract-1.0.ndjson.gz");
+    dump(source.pool(), &archive).await.unwrap();
+    let contents = inspect(&archive).unwrap();
+    assert_eq!(
+        contents.buffers["web_contract_meta"][0]["contract_version"],
+        json!("1.0")
+    );
+    two_bot_core::apply_web_contract(target.pool())
+        .await
+        .unwrap();
+    let ledger = snapshot(target.pool(), &["_sqlx_migrations".to_owned()]).await;
+    for version in ["1.1", "2.0"] {
+        sqlx::query("UPDATE web_contract_meta SET contract_version = $1, guild_id = 'destination'")
+            .bind(version)
+            .execute(target.pool())
+            .await
+            .unwrap();
+        assert!(restore(target.pool(), &archive).await.unwrap().ok);
+        let meta: (String, Option<String>) =
+            sqlx::query_as("SELECT contract_version, guild_id FROM web_v1.contract_meta")
+                .fetch_one(target.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            meta,
+            (version.to_owned(), Some("100000000000000001".to_owned()))
+        );
+        two_bot_core::apply_web_contract(target.pool())
+            .await
+            .unwrap();
+        let reapplied: String =
+            sqlx::query_scalar("SELECT contract_version FROM web_v1.contract_meta")
+                .fetch_one(target.pool())
+                .await
+                .unwrap();
+        assert_eq!(reapplied, version);
+        assert_eq!(
+            snapshot(target.pool(), &["_sqlx_migrations".to_owned()]).await,
+            ledger
+        );
+    }
+    let before = snapshot(target.pool(), &["web_contract_meta".to_owned()]).await;
+    let mut broken = copy_contents(&contents);
+    broken.buffers.get_mut("web_contract_meta").unwrap()[0]
+        .insert("contract_version".to_owned(), Value::Null);
+    let bad_archive = directory.path("invalid-contract.ndjson.gz");
+    write_archive(&bad_archive, &broken);
+    assert!(restore(target.pool(), &bad_archive).await.is_err());
+    assert_eq!(
+        snapshot(target.pool(), &["web_contract_meta".to_owned()]).await,
+        before,
+        "a failed restore rolls back both installed version and guild metadata"
+    );
+    for version in [3, DUMP_VERSION] {
+        let mut empty_meta = copy_contents(&contents);
+        empty_meta.manifest.version = version;
+        if version == 3 {
+            empty_meta.manifest.sequence_marks.clear();
+            empty_meta
+                .manifest
+                .tables
+                .retain(|t| DUMP_TABLES.iter().take(22).any(|name| *name == t.name));
+            empty_meta
+                .buffers
+                .retain(|name, _| DUMP_TABLES.iter().take(22).any(|t| *t == name));
+        } else {
+            empty_meta
+                .manifest
+                .tables
+                .iter_mut()
+                .find(|t| t.name == "web_contract_meta")
+                .unwrap()
+                .count = 0;
+            empty_meta
+                .buffers
+                .get_mut("web_contract_meta")
+                .unwrap()
+                .clear();
+        }
+        empty_meta.rows = empty_meta.manifest.tables.iter().map(|t| t.count).sum();
+        let path = directory.path(&format!("empty-contract-v{version}.ndjson.gz"));
+        write_archive(&path, &empty_meta);
+        let report = restore(target.pool(), &path).await.unwrap();
+        assert!(report.ok, "preserved capability baseline must be counted");
+        assert_eq!(report.initialized_tables["web_contract_meta"], 1);
+        assert_eq!(report.expected_count("web_contract_meta"), 1);
+        let meta: (String, Option<String>) =
+            sqlx::query_as("SELECT contract_version, guild_id FROM web_v1.contract_meta")
+                .fetch_one(target.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            meta,
+            ("2.0".to_owned(), None),
+            "keep capability, never stale destination guild data"
+        );
+    }
+    source.close().await.unwrap();
+    target.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn post_0469_archive_restores_voice_stores_verbatim() {
     let Some(db) = database().await else {
         return;

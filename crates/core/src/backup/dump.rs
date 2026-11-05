@@ -481,6 +481,9 @@ impl RestoreReport {
                 archived.saturating_sub(self.translated_voice_command_role_members)
             }
             "voice_access_controls" => archived + self.voice_access_controls_added,
+            "web_contract_meta" => {
+                archived.max(self.initialized_tables.get(table).copied().unwrap_or(0))
+            }
             _ => archived,
         }
     }
@@ -501,6 +504,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         tracing::warn!(version = manifest.version, tables = ?missing, "old dump lacks tables; restore clears them (settings revision singleton resets to zero)");
     }
     let mut dropped_columns: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut initialized_tables = BTreeMap::new();
 
     let mut tx = pool.begin().await?;
     let mut target_tables = Vec::new();
@@ -540,6 +544,25 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     )))
     .execute(&mut *tx)
     .await?;
+    // A published contract describes the destination's installed views, not
+    // archived guild data. Keep its version under the same exclusive lock;
+    // an older archive may still restore the guild without downgrading the
+    // capability (including a future installed version). An unpublished
+    // historical target retains the archive's metadata until view installation.
+    let published: bool = sqlx::query_scalar(
+        "SELECT to_regclass(format('%I.contract_meta',
+             CASE WHEN current_schema() = 'public' THEN 'web_v1'
+                  ELSE current_schema() || '_web_v1' END)) IS NOT NULL",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let installed_contract: Option<String> = if published {
+        sqlx::query_scalar("SELECT contract_version FROM web_contract_meta WHERE singleton")
+            .fetch_optional(&mut *tx)
+            .await?
+    } else {
+        None
+    };
     // Moderation history fence: overwriting destination evidence could forget
     // a post-backup PUT/DELETE or a newer permanent ban. Refuse while the
     // lock is held so no concurrent writer slips evidence in after the check.
@@ -726,6 +749,23 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             }
             query.execute(&mut *tx).await?;
         }
+    }
+
+    if let Some(version) = installed_contract {
+        if !manifest
+            .tables
+            .iter()
+            .any(|t| t.name == "web_contract_meta" && t.count > 0)
+        {
+            initialized_tables.insert("web_contract_meta".to_owned(), 1);
+        }
+        sqlx::query(
+            "INSERT INTO web_contract_meta (singleton, contract_version) VALUES (TRUE, $1)
+             ON CONFLICT (singleton) DO UPDATE SET contract_version = EXCLUDED.contract_version",
+        )
+        .bind(version)
+        .execute(&mut *tx)
+        .await?;
     }
 
     // Even a matching accepted snapshot intent cannot prove current remote
@@ -945,7 +985,6 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     // v3 predates the required singleton. Clearing stale target data is not
     // enough: settings writes would subsequently fail without this baseline.
     // Never synthesize application settings/history or replace an archived row.
-    let mut initialized_tables = BTreeMap::new();
     if missing.contains(&"guild_settings_revision") {
         let columns = columns_of(&mut tx, "guild_settings_revision").await?;
         if columns.iter().any(|(name, _)| name == "singleton")

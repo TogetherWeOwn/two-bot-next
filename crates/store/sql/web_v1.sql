@@ -356,3 +356,16 @@ FROM grid
 LEFT JOIN cells ON cells.dow = grid.dow AND cells.hour = grid.hour
 CROSS JOIN provenance
 ORDER BY grid.dow, grid.hour;
+
+-- ---------------------------------------------------------------------------
+-- contract version publication - must stay the LAST statement
+-- ---------------------------------------------------------------------------
+--
+-- 1.0 -> 1.1 is published only here, after every view above (including
+-- `voice_heat`) exists. The applier runs this whole file as one atomic unit,
+-- so a failed view install rolls the bump back and the recorded version never
+-- claims views that are not installed. Guarded and idempotent: only the exact
+-- `1.0` seed moves; a newer recorded version is never touched or lowered.
+UPDATE web_contract_meta
+   SET contract_version = '1.1'
+ WHERE singleton AND contract_version = '1.0';

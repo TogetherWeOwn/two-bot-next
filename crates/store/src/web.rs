@@ -44,5 +44,5 @@ pub async fn apply_web_contract(pool: &Pool<Postgres>) -> Result<(), sqlx::Error
 }
 
 /// Contract version this build implements (seeded in migration 0003,
-/// bumped to 1.1 by migration 0471 for `web_v1.voice_heat`).
+/// bumped to 1.1 at the end of `web_v1.sql` once `web_v1.voice_heat` is installed).
 pub const CONTRACT_VERSION: &str = "1.1";

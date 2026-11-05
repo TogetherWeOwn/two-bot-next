@@ -9,11 +9,11 @@
 -- gaps, never zeros. Retention prunes rows older than 35 days; the
 -- `web_v1.voice_heat` view publishes the trailing 28 complete days.
 --
--- Also bumps `web_contract_meta.contract_version` 1.0 -> 1.1 for the new
--- `web_v1.voice_heat` view. The update is conditional and idempotent, so
--- cross-running the store and cutover chains in either order converges.
--- Additive only: one new table plus a guarded version bump, no changes to
--- existing tables. `IF NOT EXISTS` throughout, matching the S6 convention.
+-- The `web_contract_meta.contract_version` 1.0 -> 1.1 bump for the new
+-- `web_v1.voice_heat` view is NOT done here: it is published atomically at
+-- the end of `web_v1.sql`, after the views install, so a migration alone never
+-- claims views that do not exist yet.
+-- Additive only: one new table, no changes to existing tables. `IF NOT EXISTS` throughout, matching the S6 convention.
 -- Rollback is `DROP TABLE IF EXISTS voice_heat_hours`.
 -- Bot schema range: 0001-0999. Database tests use test containers only.
 
@@ -31,7 +31,3 @@ CREATE TABLE IF NOT EXISTS voice_heat_hours (
         AND last_observed_at < hour_start_utc + interval '1 hour')
   )
 );
-
-UPDATE web_contract_meta
-   SET contract_version = '1.1'
- WHERE singleton AND contract_version = '1.0';

@@ -267,7 +267,12 @@ Migration ledgers (`_sqlx_migrations`, `schema_migrations` and the store
 chain's `_two_bot_migrations`) describe target DDL and are never restored.
 Replay guards, idempotency records, gateway sessions, lease-bearing durable
 tables and audit history are **not** ephemeral exclusions. Derived `web_v1`
-views contain no independent table data; the website service's own separate
+views contain no independent table data. When the destination has an installed
+contract publication, restore keeps its `contract_version` under the same
+transaction/lock while restoring the archived `guild_id`; an older archive
+cannot downgrade the destination's installed capability. Unpublished targets
+retain archived metadata until view installation reconciles the version. A
+failed restore rolls back both fields. The website service's own separate
 database is out of scope. The migration-backed coverage test compares real
 tables against these classifications, so adding an unclassified table to
 either chain fails CI: the cutover chain is migrated for real, and the store

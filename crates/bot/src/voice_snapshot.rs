@@ -83,6 +83,25 @@ pub(crate) fn read_voice_snapshot(
     project(observed_at_now(), rooms)
 }
 
+/// Read the same complete-cache, bot/AFK-excluded total without building an
+/// HTTP response. The relay byte budget applies only to the room listing,
+/// never to the sampler's scalar. Callers still gate gateway freshness.
+pub(crate) fn read_voice_total(
+    cache: &DefaultInMemoryCache,
+    guild_id: Snowflake,
+) -> Result<usize, SnapshotRefusal> {
+    let rooms = collect_rooms(cache, guild_id).ok_or(SnapshotRefusal::CacheIncomplete)?;
+    Ok(total_in_voice(&rooms))
+}
+
+fn total_in_voice(rooms: &[RoomDraft]) -> usize {
+    rooms
+        .iter()
+        .filter(|room| !room.afk)
+        .map(|room| room.member_ids.len())
+        .sum()
+}
+
 /// Whole-second Zulu timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for `observed_at`.
 fn observed_at_now() -> String {
     let now = time::OffsetDateTime::now_utc();
@@ -188,11 +207,7 @@ pub(crate) fn project(
             b.channel_id,
         ))
     });
-    let total_in_voice: usize = rooms
-        .iter()
-        .filter(|room| !room.afk)
-        .map(|room| room.member_ids.len())
-        .sum();
+    let total_in_voice = total_in_voice(&rooms);
     let wire_rooms: Vec<Value> = rooms
         .iter()
         .map(|room| {

@@ -36,8 +36,8 @@ use super::community_snapshots::{window_bounds, CommunitySnapshot, RaidWindow, R
 use super::funnel::{format_iso_millis, parse_iso_millis};
 use super::scheduled_events::{ScheduledEvent, ScheduledEventsSkip};
 
-/// The contract version this build implements. Must match the row seeded in
-/// migration 0300 and the changelog in `sql/web_v1.sql`.
+/// The contract version this build publishes with the views in `sql/web_v1.sql`.
+/// Migration 0300 seeds 1.0; only successful view installation advances it.
 pub const WEB_CONTRACT_VERSION: &str = "1.1";
 
 /// Every view in the contract, in `sql/web_v1.sql` order. The website reads

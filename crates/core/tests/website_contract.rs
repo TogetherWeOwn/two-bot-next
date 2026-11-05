@@ -1412,6 +1412,98 @@ async fn upcoming_and_next_serve_scheduled_and_active_only_as_utc() {
     fixture.close().await.expect("drop test database");
 }
 
+/// A database with the cutover migrations only: no `web_v1` views applied.
+async fn connect_migrations_only() -> TestDatabase {
+    let url = std::env::var("TWO_TEST_DATABASE_URL")
+        .expect("TWO_TEST_DATABASE_URL is required (disposable test bootstrap)");
+    TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated test database")
+}
+
+async fn recorded_version(pool: &Pool<Postgres>) -> String {
+    sqlx::query_scalar("SELECT contract_version FROM web_contract_meta")
+        .fetch_one(pool)
+        .await
+        .expect("meta row")
+}
+
+async fn web_v1_view_count(pool: &Pool<Postgres>) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM pg_views WHERE schemaname = 'web_v1'")
+        .fetch_one(pool)
+        .await
+        .expect("view count")
+}
+
+#[tokio::test]
+async fn migrations_alone_leave_contract_version_at_1_0() {
+    let fixture = connect_migrations_only().await;
+    let pool = fixture.pool().clone();
+
+    // The voice-heat table exists (0472) but no view claims it yet.
+    assert_eq!(recorded_version(&pool).await, "1.0");
+    assert_eq!(web_v1_view_count(&pool).await, 0);
+
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn successful_view_install_publishes_1_1_and_is_idempotent() {
+    let fixture = connect_migrations_only().await;
+    let pool = fixture.pool().clone();
+
+    apply_web_contract(&pool).await.expect("first apply");
+    assert_eq!(recorded_version(&pool).await, WEB_CONTRACT_VERSION);
+    assert_eq!(
+        web_v1_view_count(&pool).await,
+        WEB_CONTRACT_VIEWS.len() as i64
+    );
+
+    apply_web_contract(&pool).await.expect("second apply");
+    assert_eq!(recorded_version(&pool).await, "1.1");
+
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn failed_view_install_rolls_back_and_keeps_1_0() {
+    let fixture = connect_migrations_only().await;
+    let pool = fixture.pool().clone();
+
+    // `voice_heat` is the last view; without its table every earlier view in
+    // the file installs and then the whole unit must roll back.
+    sqlx::query("DROP TABLE voice_heat_hours")
+        .execute(&pool)
+        .await
+        .expect("drop voice heat table");
+    apply_web_contract(&pool)
+        .await
+        .expect_err("voice_heat install must fail without its table");
+
+    assert_eq!(recorded_version(&pool).await, "1.0");
+    assert_eq!(web_v1_view_count(&pool).await, 0);
+
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn view_install_never_moves_future_or_unknown_versions() {
+    for recorded in ["1.2", "2.0", "1.10"] {
+        let fixture = connect_migrations_only().await;
+        let pool = fixture.pool().clone();
+
+        sqlx::query("UPDATE web_contract_meta SET contract_version = $1")
+            .bind(recorded)
+            .execute(&pool)
+            .await
+            .expect("set version");
+        apply_web_contract(&pool).await.expect("apply");
+        assert_eq!(recorded_version(&pool).await, recorded);
+
+        fixture.close().await.expect("drop test database");
+    }
+}
+
 #[tokio::test]
 async fn contract_meta_pins_version_and_view_shapes() {
     // Any view-shape change is a contract version bump: update

@@ -111,6 +111,63 @@ async fn flush_is_idempotent_and_empty_writes_nothing() {
 }
 
 #[tokio::test]
+async fn timed_out_backlog_retry_reaches_tail_without_rewriting_committed_prefix() {
+    let fixture = connect().await;
+    let pool = fixture.pool();
+    let backlog: Vec<_> = (1..=335).map(|h| bucket(h, 12, h)).collect();
+    // A previous attempt committed this prefix before cancellation.
+    assert_eq!(flush_hour_buckets(pool, &backlog[..3]).await.unwrap(), 3);
+    sqlx::raw_sql(
+        "CREATE FUNCTION slow_heat_statement() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN PERFORM pg_sleep(0.5); RETURN NULL; END $$;
+         CREATE TRIGGER slow_heat_statement AFTER INSERT ON voice_heat_hours
+         FOR EACH STATEMENT EXECUTE FUNCTION slow_heat_statement()",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        flush_hour_buckets(pool, &backlog)
+    )
+    .await
+    .is_err());
+    // Replay deliberately changed prefix values: immutable hours must retain
+    // their original sums even when a retry needs to drain the remaining tail.
+    let mut retry = backlog.clone();
+    for row in &mut retry[..3] {
+        row.occupancy_sum = 9999;
+    }
+    let written = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        flush_hour_buckets(pool, &retry),
+    )
+    .await
+    .expect("bulk retry advances within budget")
+    .unwrap();
+    assert!(
+        written <= 332,
+        "the timed-out statement may have committed; prefix is never rewritten"
+    );
+    let stored: Vec<(time::OffsetDateTime, i32, i64, Option<time::OffsetDateTime>)> = sqlx::query_as(
+        "SELECT hour_start_utc, samples, occupancy_sum, last_observed_at FROM voice_heat_hours ORDER BY hour_start_utc DESC",
+    ).fetch_all(pool).await.unwrap();
+    assert_eq!(
+        stored,
+        backlog
+            .iter()
+            .map(|b| (
+                b.hour_start,
+                b.samples as i32,
+                b.occupancy_sum,
+                b.last_observed_at
+            ))
+            .collect::<Vec<_>>()
+    );
+    fixture.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn prune_keeps_fresh_rows_and_counts_stale_ones() {
     let fixture = connect().await;
     let pool = fixture.pool().clone();

@@ -8,8 +8,9 @@
 //! module: only the guild aggregate crosses into storage, so the heat grid is
 //! aggregate-legal for the `web_v1` publication.
 //!
-//! Skip semantics: a disconnected gateway, an incomplete cache or an
-//! over-budget projection records nothing — gaps are gaps, never zeros. Only
+//! Skip semantics: a disconnected gateway or incomplete cache records
+//! nothing — gaps are gaps, never zeros. The HTTP listing budget does not
+//! constrain scalar observations. Skips still flush completed buckets. Only
 //! completed hours flush (`ON CONFLICT DO NOTHING` claims each hour, so a
 //! retried flush writes nothing). Completed buckets stay buffered until a
 //! successful flush, including across connection failures and cancelled ticks.
@@ -174,24 +175,19 @@ async fn tick(
     gateway: &Arc<RwLock<GatewayState>>,
     accumulator: &Arc<Mutex<Accumulator>>,
 ) -> Result<(), ErrorClass> {
-    if !matches!(*gateway.read().await, GatewayState::Connected) {
-        return Ok(());
-    }
-    let total = match voice_snapshot::read_voice_snapshot(cache, context.guild) {
-        Ok(value) => value
-            .get("total_in_voice")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|total| i64::try_from(total).ok())
-            .ok_or(ErrorClass::Rest)?,
-        Err(
-            voice_snapshot::SnapshotRefusal::CacheIncomplete
-            | voice_snapshot::SnapshotRefusal::OverBudget,
-        ) => return Ok(()),
+    let total = if matches!(*gateway.read().await, GatewayState::Connected) {
+        voice_snapshot::read_voice_total(cache, context.guild).ok()
+    } else {
+        None
     };
     let now = time::OffsetDateTime::now_utc();
     let buckets = {
         let mut guard = accumulator.lock().map_err(|_| ErrorClass::Database)?;
-        guard.record(now, total);
+        if let Some(total) = total {
+            guard.record(now, i64::try_from(total).map_err(|_| ErrorClass::Rest)?);
+        }
+        // Eligibility gates only this observation. Previously valid completed
+        // hours must persist even while the gateway/cache is unavailable.
         guard.completed(now)
     };
     if buckets.is_empty() {
@@ -397,6 +393,111 @@ mod tests {
             .unwrap();
         assert!(context.pool.get().is_none(), "skips never open the DB");
         assert_eq!(accumulator.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn skipped_observations_still_persist_completed_hours() {
+        let url = match std::env::var("TWO_TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(std::env::VarError::NotPresent) => return,
+            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+        };
+        let fixture = two_bot_testsupport::TestDatabase::create(
+            &url,
+            &sqlx::migrate!("../cutover/migrations"),
+        )
+        .await
+        .expect("disposable database");
+        let context = Arc::new(Context {
+            url: "unused: pool already initialized".to_owned(),
+            pool: OnceCell::from(fixture.pool().clone()),
+            guild: 2222,
+        });
+        let cache = voice_snapshot::new_shared_cache();
+        let gateway = Arc::new(RwLock::new(GatewayState::Armed));
+        let accumulator = Arc::new(Mutex::new(Accumulator::default()));
+        let now = time::OffsetDateTime::now_utc();
+        let start = voice_heat_store::truncate_to_hour(now) - time::Duration::hours(2);
+        for (offset, state) in [(0, GatewayState::Armed), (1, GatewayState::Connected)] {
+            *gateway.write().await = state;
+            accumulator
+                .lock()
+                .unwrap()
+                .record(start + time::Duration::hours(offset), 4);
+            tick(&context, &cache, &gateway, &accumulator)
+                .await
+                .unwrap();
+            assert_eq!(
+                accumulator.lock().unwrap().len(),
+                0,
+                "skips flush completed samples without inventing a new observation"
+            );
+        }
+        let rows: Vec<(time::OffsetDateTime, i32, i64)> = sqlx::query_as(
+            "SELECT hour_start_utc, samples, occupancy_sum FROM voice_heat_hours ORDER BY hour_start_utc",
+        ).fetch_all(fixture.pool()).await.unwrap();
+        assert_eq!(
+            rows,
+            vec![(start, 1, 4), (start + time::Duration::hours(1), 1, 4)]
+        );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn over_budget_snapshot_still_records_the_eligible_scalar() {
+        use serde_json::json;
+        use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
+        let mut guild: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json")).unwrap();
+        guild["id"] = json!("2222");
+        guild["afk_channel_id"] = json!("34");
+        guild["channels"] = json!([31, 34, 35].map(|id| json!({
+            "id": id.to_string(), "guild_id": "2222", "type": if id == 35 { 13 } else { 2 },
+            "name": "voice", "permission_overwrites": []
+        })));
+        guild["members"] = json!([{
+            "user": {"id": "43", "username": "fixture", "discriminator": "0", "bot": true},
+            "roles": [], "deaf": false, "mute": false,
+            "joined_at": "2026-09-30T00:00:00.000000+00:00", "flags": 0
+        }]);
+        // Unknown identities remain humans, plus one bot, one AFK occupant,
+        // and one stage speaker that must not enter the aggregate.
+        let mut states: Vec<_> = (1..=5000)
+            .map(|n| (100_000_000_000_000_000u64 + n, 31))
+            .collect();
+        states.extend([(43, 31), (44, 34), (45, 35)]);
+        guild["voice_states"] =
+            json!(states.into_iter().map(|(user, channel)| json!({
+            "guild_id": "2222", "channel_id": channel.to_string(), "user_id": user.to_string(),
+            "session_id": "fixture", "deaf": false, "mute": false,
+            "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false
+        })).collect::<Vec<_>>());
+        let cache = voice_snapshot::new_shared_cache();
+        cache.update(&Event::GuildCreate(Box::new(GuildCreate::Available(
+            serde_json::from_value(guild).unwrap(),
+        ))));
+        assert_eq!(
+            voice_snapshot::read_voice_snapshot(&cache, 2222),
+            Err(voice_snapshot::SnapshotRefusal::OverBudget),
+            "HTTP limit remains enforced"
+        );
+        let context = Arc::new(Context {
+            url: "not a database URL".to_owned(),
+            pool: OnceCell::new(),
+            guild: 2222,
+        });
+        let gateway = Arc::new(RwLock::new(GatewayState::Connected));
+        let accumulator = Arc::new(Mutex::new(Accumulator::default()));
+        tick(&context, &cache, &gateway, &accumulator)
+            .await
+            .unwrap();
+        let pending = accumulator
+            .lock()
+            .unwrap()
+            .completed(time::OffsetDateTime::now_utc() + time::Duration::hours(1));
+        assert_eq!(pending.len(), 1);
+        assert_eq!((pending[0].samples, pending[0].occupancy_sum), (1, 5000));
+        assert!(context.pool.get().is_none(), "open hour needs no database");
     }
 
     #[test]

@@ -69,23 +69,25 @@ pub async fn flush_hour_buckets(
     if buckets.is_empty() {
         return Ok(0);
     }
-    let mut written = 0u64;
-    for bucket in buckets {
-        written = written.saturating_add(
-            sqlx::query(
-                "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (hour_start_utc) DO NOTHING",
-            )
-            .bind(bucket.hour_start)
-            .bind(bucket.samples)
-            .bind(bucket.occupancy_sum)
-            .bind(bucket.last_observed_at)
-            .execute(pool)
-            .await?
-            .rows_affected(),
-        );
-    }
+    // One atomic statement, not one round trip per hour. The bounded sampler
+    // backlog must drain inside its tick budget even after an ambiguous timeout
+    // committed an earlier prefix. Parallel arrays keep SQL and bind count fixed.
+    let hours: Vec<_> = buckets.iter().map(|b| b.hour_start).collect();
+    let samples: Vec<_> = buckets.iter().map(|b| b.samples).collect();
+    let sums: Vec<_> = buckets.iter().map(|b| b.occupancy_sum).collect();
+    let observed: Vec<_> = buckets.iter().map(|b| b.last_observed_at).collect();
+    let written = sqlx::query(
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
+         SELECT * FROM UNNEST($1::timestamptz[], $2::bigint[], $3::bigint[], $4::timestamptz[])
+         ON CONFLICT (hour_start_utc) DO NOTHING",
+    )
+    .bind(hours)
+    .bind(samples)
+    .bind(sums)
+    .bind(observed)
+    .execute(pool)
+    .await?
+    .rows_affected();
     Ok(written)
 }
 
