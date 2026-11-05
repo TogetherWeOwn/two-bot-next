@@ -306,7 +306,9 @@ not canonical staging qualification or production promotion.
   response text in an original-response edit. Negative/replay/pasted-link or
   changed-response profiles remain unsupported. Readback projections bind the
   exact application/channel/content/ephemeral flag/platform ID; ACK and edit must
-  concern the same original message. The initial deferred readback requires
+  concern the same original message. Its claimed message ID must fit the canonical
+  nonzero u64 range; equal out-of-range ledger/readback IDs do not qualify.
+  The initial deferred readback requires
   `EPHEMERAL | LOADING` (192), while the outbound callback, completed edit and
   immediate refusals require only `EPHEMERAL` (64). Request-received time and
   observer must fit the case/full-window observer claims and precede the ACK.

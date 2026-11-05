@@ -175,6 +175,10 @@ def check_interaction_exchange_claims(receipt, evidence, now):
             _body(raw, effect["method"], positive, inputs["rsvp"]["status"])
             platform = platforms[operation]
             readback = response["readback"]
+            # Matching decimal strings alone can exceed Discord's u64 range.
+            # Closed sidecar intake already enforces canonical nonzero syntax.
+            require(0 < int(readback["message_id"]) <= 2**64 - 1,
+                    "interaction_message_identity")
             require(platform["platform_ids"] == [readback["message_id"]] and
                     readback["application_id"] == request["application_id"] and
                     readback["channel_id"] == channel and

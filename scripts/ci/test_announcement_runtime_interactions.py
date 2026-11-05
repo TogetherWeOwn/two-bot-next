@@ -460,6 +460,21 @@ class Readbacks(Interactions):
         self.reject(lambda r, s: response_of(s, "on-rsvp", "original_response")["readback"].update(
             message_id="7"), "interaction_readback")
 
+    def test_matching_platform_and_readback_ids_must_fit_nonzero_u64(self):
+        def change(case_id, identifier):
+            def mutate(receipt, records):
+                for response in exchange_of(records, case_id)["responses"]:
+                    set_platform_id(receipt, records, response["operation_id"], identifier)
+                    response["readback"]["message_id"] = identifier
+            return mutate
+        for case_id in ("off-feed-add", "on-rsvp"):
+            for identifier in (str(2**64), "99999999999999999999"):
+                with self.subTest(case_id=case_id, identifier=identifier):
+                    self.reject(change(case_id, identifier), "interaction_message_identity")
+            for identifier in ("1", str(2**64 - 1)):
+                with self.subTest(case_id=case_id, identifier=identifier):
+                    self.accept(change(case_id, identifier))
+
     def test_edit_must_target_the_same_original_message_as_the_ack(self):
         def split(receipt, records):
             edit = response_of(records, "on-rsvp", "original_response")
