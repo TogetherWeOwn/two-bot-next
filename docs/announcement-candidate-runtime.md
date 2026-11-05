@@ -21,8 +21,38 @@ not canonical staging qualification or production promotion.
   are both 32 MiB. It rejects unlisted/missing/replaced/duplicate members,
   canonical-promotion filenames, traversal, links, executable modes, encrypted
   entries, alternate compression, comments and inconsistent local/central ZIP
-  layouts. Non-receipt evidence stays **unverified inert bytes** for later
-  typed resolution; its filename or hash is not acceptance.
+  layouts. Non-receipt evidence stays **unverified inert bytes** until a
+  separate typed resolver is invoked; its filename or hash is not acceptance.
+- `scripts/announcement_runtime_evidence.py` resolves closed, same-attempt
+  provenance sidecars. Each has exactly `schema`, `ref`, `kind`, `run`, `data`;
+  `schema` is `two.bot.announcement-evidence.v1`, the filename must match its
+  reference, and each supported kind has a fixed field inventory. Document and
+  manifest pins compare both revision and SHA-256. Job/step/check/producer,
+  build/isolation, external-served/observer, gate-sample/assertion, installation
+  mapping and artifact records have distinct types; references cannot alias
+  another type. Unsupported kinds, missing references and unconsumed extra
+  evidence refuse. Intake shares receipt JSON limits, permits at most 256
+  sidecars and bounds their combined bytes to 32 MiB. Resolved records are
+  isolated copies, not mutable caller objects. This is typed **claim**
+  resolution, not authenticated root acquisition or a complete resource graph.
+- `scripts/announcement_runtime_provenance.py` checks frozen source identity,
+  run/control/attempt equality, manifest revision pins, installation mapping
+  consistency, candidate build/image/Worker modules, credential-free build
+  claims, rollout ordering, external served-pair claims and exact gate
+  job/sample/assertion relationships. Candidate observations must be bracketed
+  by matching candidate served samples. Served-before and restoration samples
+  retain their own identities rather than being inferred from main or C;
+  baseline/restoration may use S, and schema/role checks must precede rollout
+  rather than falsely claim C is already served. The merge-base commit and tree
+  are both frozen. C and its source PR cannot be the reviewed installation head
+  or PR. Snapshot, candidate and restoration must concern the same application;
+  each immutable Worker version must have one consistent package definition.
+  The attempt must fit an unexpired
+  at-most-60-minute lease and its observation window at most 20 minutes.
+  These checks perform no service read and authenticate no installation,
+  producer, isolation boundary, observer or manifest contents. The opaque
+  observer provisioning reference remains an explicitly unsupported external
+  requirement, not a root selected from a sidecar.
 - `scripts/announcement_runtime_policy.py` checks offline lease/freshness,
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
@@ -89,10 +119,12 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
    approved T/actual served-S provenance, build isolation and packaging checks.
    The local full-tree/delta collector and offline topology predicates do not
    establish independent review or any of those external facts.
-2. Closed typed resolution of every evidence reference, full cross-object and
-   same-attempt identity comparisons, exact resource/profile budgets, stored
+2. Extend the typed provenance resolver to every authority, resource, state,
+   input, effect, telemetry and lifecycle reference; close the remaining
+   cross-object comparisons. Implement exact resource/profile budgets, stored
    off/on/replay/final-off semantics, atomic RSVP/audit evidence, owned CAS
-   cleanup and independently verified restoration.
+   cleanup and independently verified restoration. Provenance consistency alone
+   is not a complete receipt-verification result.
 3. Strict receipt production and independently provisioned verification,
    including authenticated current service artifact/job/producer inventories,
    post-upload immutable artifact binding and final authority/identity rereads.

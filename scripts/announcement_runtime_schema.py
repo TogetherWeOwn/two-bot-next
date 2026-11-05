@@ -87,11 +87,11 @@ def _bounds(value, depth=1):
         require(value is None or type(value) in (bool, int), "scalar_type")
 
 
-def parse_receipt(raw):
-    """Parse UTF-8 bytes without leaking rejected data or accepting extensions.
+def parse_bounded_json(raw):
+    """Parse inert JSON with the receipt bounds, without authenticating it.
 
-    Parsing and schema checking are deliberately separate from authenticated
-    independent verification. No parsed dictionary is an admission capability.
+    Receipt and typed sidecar intake share duplicate-key, Unicode, size and depth
+    limits. The caller must additionally apply its closed, trusted schema.
     """
     require(type(raw) is bytes and 0 < len(raw) <= RECEIPT_LIMIT, "receipt_size")
     # Bound container depth before the recursive decoder allocates nested data.
@@ -120,6 +120,12 @@ def parse_receipt(raw):
     except (UnicodeError, json.JSONDecodeError, RecursionError, OverflowError):
         raise Refusal("json") from None
     _bounds(value)
+    return value
+
+
+def parse_receipt(raw):
+    """Check bounded receipt syntax only, never independent acceptance."""
+    value = parse_bounded_json(raw)
     validate_receipt_shape(value)
     return value
 

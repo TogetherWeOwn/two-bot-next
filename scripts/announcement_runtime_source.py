@@ -22,6 +22,7 @@ CANDIDATE_TREE = "deeb6095e05a2538f3cc485cac4a94adbe260534"
 RECORDED_BASE = "4469ca165f03555535295ec71509dc08be173ca9"
 RECORDED_BASE_TREE = "24396e678fdd4c27ee57feb045d388a57848ec3d"
 MERGE_BASE = "a81ee58f46d69478bc435028c728fc782db94809"
+MERGE_BASE_TREE = "33b77639411230b6c3e87b9ef170bc6a2b058295"
 ENTRY_LIMIT = 16384
 OBJECT_LIMIT = 32 * 1024 * 1024
 TREE_BYTES_LIMIT = 256 * 1024 * 1024
@@ -364,7 +365,8 @@ def collect_source_comparisons(repo, *, control, served_before):
     manifests = {sha: source.manifest(sha) for sha in dict.fromkeys(
         (MERGE_BASE, RECORDED_BASE, CANDIDATE, control, served_before))}
     require(manifests[CANDIDATE].tree == CANDIDATE_TREE and
-            manifests[RECORDED_BASE].tree == RECORDED_BASE_TREE, "source_identity")
+            manifests[RECORDED_BASE].tree == RECORDED_BASE_TREE and
+            manifests[MERGE_BASE].tree == MERGE_BASE_TREE, "source_identity")
     require(source.merge_bases(CANDIDATE, RECORDED_BASE) == [MERGE_BASE] and
             source.merge_bases(CANDIDATE, control) == [MERGE_BASE], "topology")
     for descendant in (CANDIDATE, RECORDED_BASE, control):

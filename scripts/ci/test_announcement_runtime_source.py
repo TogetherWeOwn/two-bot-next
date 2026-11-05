@@ -366,6 +366,20 @@ class LocalInventoryTests(unittest.TestCase):
             self.assertEqual(argv[:5], ["/usr/bin/prlimit", "--as=536870912", "--cpu=30", "--", "/usr/bin/git"])
             self.assertNotIn("GIT_CONFIG_COUNT", call.kwargs["env"])
 
+    def test_comparisons_bind_every_frozen_tree_including_merge_base(self):
+        first_tree = self.git("rev-parse", self.first + "^{tree}").decode()
+        second_tree = self.git("rev-parse", self.second + "^{tree}").decode()
+        with patch.multiple(source, CANDIDATE=self.second, CANDIDATE_TREE=second_tree,
+                            RECORDED_BASE=self.first, RECORDED_BASE_TREE=first_tree,
+                            MERGE_BASE=self.first, MERGE_BASE_TREE=first_tree):
+            comparisons = source.collect_source_comparisons(
+                self.repo, control=self.first, served_before=self.first)
+            self.assertEqual(comparisons["manifests"][self.first].tree, first_tree)
+            with patch.object(source, "MERGE_BASE_TREE", "0" * 40):
+                with self.assertRaisesRegex(Refusal, "source_identity"):
+                    source.collect_source_comparisons(
+                        self.repo, control=self.first, served_before=self.first)
+
     def test_wrong_frozen_candidate_objects_refuse(self):
         with self.assertRaises(Refusal):
             source.collect_source_comparisons(self.repo, control=self.second, served_before=self.first)
