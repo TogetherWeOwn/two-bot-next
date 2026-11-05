@@ -40,6 +40,14 @@ def _sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def rss_post_content(item):
+    """C's post text for the validated narrow ASCII RSS profile only."""
+    title = item["title"].replace("-", "\\-")
+    post = "New feed item: **" + title + "**\n" + item["url"]
+    require(len(post) <= 2000, "source_post")
+    return post
+
+
 def _target(target):
     # No parsing/resolving of arbitrary URLs. Canonical DNS spelling and an exact
     # query-free path are a narrower supported profile, not a safe-egress proof.
@@ -142,9 +150,7 @@ def check_source_input_claims(receipt, evidence, now):
     item_key = _sha(item["key"])
     require(inputs["feed"]["item_key"] == item_key and
             selected["nonce"] == _sha(key["id"] + "\0" + item_key)[:24], "source_nonce")
-    title = item["title"].replace("-", "\\-")
-    post = "New feed item: **" + title + "**\n" + item["url"]
-    require(len(post) <= 2000 and selected["post_content_sha256"] == _sha(post), "source_post")
+    require(selected["post_content_sha256"] == _sha(rss_post_content(item)), "source_post")
     # Full document matching rejects hidden extra items/fields, DTD/entities,
     # CDATA, comments, processing instructions, namespaces and malformed XML
     # without invoking an XML engine or resolving any external input.

@@ -220,7 +220,7 @@ SOURCE_TARGET = {"origin": Text(r"https://[a-z0-9.-]+"),
 SOURCE_RECORDS = {
     "source_plan_content": {"candidate": VERSION, "source_ref": REF, "feed_ref": REF,
         "item_ref": REF, "target": SOURCE_TARGET, "stored_feed": CONTENT_PIN,
-        "body": CONTENT_PIN, "selection": CONTENT_PIN,
+        "body": CONTENT_PIN, "selection": CONTENT_PIN, "post_exchange": CONTENT_PIN,
         "maximum_response_bytes": Integer(1, 4096),
         "maximum_wire_attempts": Integer(1, LEDGER_LIMIT),
         "redirects": enum("deny"), "content_encoding": enum("identity")},
@@ -256,6 +256,18 @@ TELEMETRY_RECORDS = {
         "outcome": enum("committed", "rolled_back", "unknown")},
     "db_transition": {"claim": TRANSITION, "transaction_ref": REF,
                       "method": enum("db_insert", "db_cas", "db_delete_owned")},
+}
+# A restricted post/response projection, not authenticated transport or readback.
+FEED_EXCHANGE_RECORDS = {
+    "feed_post_exchange": {"operation_id": REF, "origin": enum("https://discord.com"),
+        "http_method": enum("POST"), "path": Text(r"/channels/[1-9][0-9]*/messages"),
+        "body_utf8": Text(r"[\s\S]+"), "response": {
+            "http_status": Integer(100, 599), "received_at": UTC, "observer_ref": REF,
+            "message": {"id": SERVICE_ID, "channel_id": SERVICE_ID,
+                "author_id": SERVICE_ID, "content": Text(r"[\s\S]+"),
+                "nonce": Text(r"[0-9a-f]{24}"), "flags": Integer(),
+                "mentions": Array(SERVICE_ID, 0), "mention_roles": Array(SERVICE_ID, 0),
+                "mention_everyone": enum(False), "attachments": enum([])}}},
 }
 # Token-free request/route and original-message projections stay RESTRICTED.
 # They are claims, not raw authenticated Discord envelopes or transport proof.
@@ -352,7 +364,8 @@ WORK_RECORDS = {
 EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS,
                     **INPUT_RECORDS, **SCHEDULER_RECORDS, **SOURCE_RECORDS,
                     **TELEMETRY_RECORDS, **SERIALIZATION_RECORDS, **TRANSITION_RECORDS,
-                    **SETTING_RECORDS, **WORK_RECORDS, **INTERACTION_EXCHANGES}
+                    **SETTING_RECORDS, **WORK_RECORDS, **INTERACTION_EXCHANGES,
+                    **FEED_EXCHANGE_RECORDS}
 
 
 def canonical_digest(value):

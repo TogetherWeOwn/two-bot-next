@@ -22,8 +22,12 @@ def resequence(receipt, records):
     repin_telemetry(receipt, records)
 
 
-def case_fixture():
-    receipt, records, now = telemetry_fixture(scheduler_fixture())
+def case_fixture(seed=None):
+    """Optionally build on a scheduler-compatible (receipt, records, now) seed.
+
+    The default stays scheduler_fixture(); a source seed adds only its claims.
+    """
+    receipt, records, now = telemetry_fixture(scheduler_fixture() if seed is None else seed)
     cases = {case["case_id"]: case for case in receipt["observations"]["cases"]}
     effects = receipt["observations"]["actual_effects"]
     by_method = {}

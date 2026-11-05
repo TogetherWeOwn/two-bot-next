@@ -12,10 +12,19 @@ def sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def repin_source_inputs(receipt, records):
+def repin_source_inputs(receipt, records, *, exchange=True):
+    """Refresh the plan's content pins and the input/scheduler chain.
+
+    The mandatory post_exchange pin is refreshed only when its record exists
+    (this partial fixture carries a placeholder pin and no exchange record) and
+    exchange is true; exchange=False deliberately leaves it stale.
+    """
     plan = records["runtime-source-plan"]["data"]
     for field in ("stored_feed", "body", "selection"):
         pin = plan[field]
+        pin["sha256"] = canonical_digest(records[pin["ref"]]["data"])
+    pin = plan["post_exchange"]
+    if exchange and pin["ref"] in records:
         pin["sha256"] = canonical_digest(records[pin["ref"]]["data"])
     records["runtime-input-plan"]["data"]["source_plan_sha256"] = canonical_digest(plan)
     repin_scheduler(receipt, records)
@@ -77,6 +86,9 @@ def source_input_fixture():
             records[state_ref]["data"]["identity_sha256"] = canonical_digest(entry["identity"])
     plan = {"candidate": receipt["scope"]["candidate"], "source_ref": "source", "feed_ref": "feed",
         "item_ref": "item-ref", "target": target, "maximum_response_bytes": 4096,
+        # Placeholder: the offline feed-exchange fixture supplies and repins the
+        # record. Source-only tests never resolve it, so it is not admissible.
+        "post_exchange": {"ref": "feed-post-exchange", "sha256": "d" * 64},
         "maximum_wire_attempts": 3, "redirects": "deny", "content_encoding": "identity",
         "stored_feed": add("stored-source", "stored_feed_source", {
             "feed_ref": "feed", "key_ref": "key-feed", "guild_id": "200", "channel_id": "500",

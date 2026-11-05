@@ -335,6 +335,33 @@ not canonical staging qualification or production promotion.
   response may be serialized into these records. No restricted record may be
   serialized into public artifacts. Unsupported serializers
   refuse rather than gain an extension object. Runtime remains HOLD.
+- `scripts/announcement_runtime_feed_exchange.py` adds one closed restricted
+  `feed_post_exchange` sidecar, content-pinned by the source plan's mandatory
+  `post_exchange` pin, for the single RSS feed post. It composes the source and
+  case comparisons, then requires exactly one `feed_post` operation (no borrowed
+  or unknown operation), a fixed `POST https://discord.com/channels/<feed
+  channel>/messages` route and a raw JSON body whose bytes hash to the effect
+  and platform payload digest. The body must be exactly source-derived content
+  (C's hyphen-escaped bold title plus URL), the selection nonce, boolean
+  `enforce_nonce`, and the complete empty `allowed_mentions` policy; duplicate,
+  unknown, missing or extra fields and bool/int/string/null confusion refuse.
+  The projected response must be HTTP 200 with the same message ID as the
+  accepted platform claim, author equal to the application ID, the feed channel,
+  the same content and nonce, zero flags and no mentions or attachments. Channel,
+  application and projected message IDs must fit the nonzero `u64` range, not
+  merely a 20-digit service-ID pattern; oversized mutation receipts are not
+  successful C responses. This narrow projection supports HTTP 200 only, not
+  every success status accepted by C. Its received time must equal the platform
+  observation, lie between the post
+  and the delivery completion CAS and before the case end, and its observer
+  must be the coverage observer. These are unauthenticated projections: no
+  request is sent, no message is read back, and response loss, ambiguous
+  history, retry and repost remain unproved or unsupported. The profile covers
+  only the validated one-item ASCII RSS grammar; components, embeds, polls,
+  attachments, replies and other formats are unsupported. The checker is
+  composed as the fifteenth explicit claim comparison, returns no capability and
+  the source-only fixture keeps a placeholder pin, so partial packets still do
+  not satisfy all-evidence-used accounting. Runtime remains HOLD.
 - `scripts/announcement_runtime_lifecycle.py` compares the existing setup/cleanup
   DB ledgers to exact typed transition claims and operation sequence. Setup must
   follow the served-before snapshot and precede rollout; cleanup follows the
@@ -408,7 +435,7 @@ must not be called as a substitute for any canonical admission control.
 ## Offline claim-checking entry point
 
 `scripts/announcement_runtime_check.py` composes bounded archive intake,
-closed same-run typed sidecars, all fourteen existing public claim comparisons
+closed same-run typed sidecars, all fifteen existing public claim comparisons
 and final all-used sidecar accounting. It is **not an independently provisioned
 verifier, receipt producer or runtime admission path**. The local Git topology
 collector is not invoked; authenticated source/service inventories, complete
@@ -498,6 +525,9 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
    restoration or actual stored-data acceptance. The lifecycle-ledger comparison
    adds setup/cleanup operation assignment and prior-value projection checks,
    not independently verified restoration or separately scoped recovery authority.
+   The feed-exchange comparison adds only the restricted post/response
+   projection above; real transport, response-loss and repost reconciliation,
+   authenticated Discord evidence and all-path enforcement are still missing.
    The drain comparison adds declared finite-surface/empty-snapshot and closed-fence
    correspondence, not a complete source-to-surface inventory or actual quiescence.
    Complete the remaining lifecycle phases and bind every actual mutation to its correct lifecycle-phase
