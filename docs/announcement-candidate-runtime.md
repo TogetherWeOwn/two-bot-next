@@ -79,6 +79,33 @@ not canonical staging qualification or production promotion.
   Resource transitions and complete lifecycle mutation-to-checkpoint binding
   remain unfinished; composition with provenance/all-used accounting does not
   replace those or any remaining acceptance predicate.
+- `scripts/announcement_runtime_resources.py` compares content-bound resource,
+  identity-map, ownership, state, isolation and per-method budget **claims**.
+  Six new closed sidecar kinds carry those records and the feed-item binding.
+  The fixed `runtime-resource-plan` and `runtime-identity-map` contents must hash
+  to the exact document pins; entries/states must match the receipt without
+  aliases, extra slots or unresolved resource references. Resource kinds have
+  method ceilings, not a generic caller allowlist; per-method finite budgets
+  must sum to the per-resource totals and at most 512 attempted operations.
+  The prospective positive profile binds one feed post, one RSVP insertion and
+  audit, one delivery claim/completion, and four separately counted setting
+  mutations. Expected setting mutations cannot disappear behind larger maxima.
+  Discord object types, one application/guild, DB table/key digests and a common
+  DB endpoint/role/grants/trigger boundary are compared. Prior delivery/RSVP/audit
+  claims must be absent; existing Discord/source objects must be present.
+  Owner records bind the controller, attempt execution and nonce; state records
+  bind their resource/identity/owner and before/after windows. Isolation claims
+  must precede rollout, deny production memberships/raw credentials/application
+  flags and use the resource epoch. Their observer claims bind the separate
+  verifier provisioning/principal, same-attempt successful independent job and
+  producer. Synthetic dependency objects must be finite and disjoint from the
+  announcement fixtures. Both effect ledgers must have the exact method counts.
+  **This is not containment, literal-key authentication or complete effect
+  verification.** It performs no service read, authenticates no test IDs, and
+  does not resolve consent, scheduler/interaction/synthetic-cleanup plans,
+  transitive inventories, operation contents, wire/DB receipts, stored-case or
+  full restoration semantics. Coherent fabricated graphs still return no
+  capability. The fixtures explicitly omit those qualifications.
 - `scripts/announcement_runtime_policy.py` checks offline lease/freshness,
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
@@ -145,12 +172,14 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
    approved T/actual served-S provenance, build isolation and packaging checks.
    The local full-tree/delta collector and offline topology predicates do not
    establish independent review or any of those external facts.
-2. Extend typed resolution beyond the provenance and authority-claim graphs to
-   every resource, state, input, effect, telemetry and lifecycle reference; close the remaining
-   cross-object comparisons. Implement exact resource/profile budgets, stored
-   off/on/replay/final-off semantics, atomic RSVP/audit evidence, owned CAS
-   cleanup and independently verified restoration. Provenance consistency alone
-   is not a complete receipt-verification result.
+2. Complete typed input, effect, telemetry and lifecycle resolution beyond the
+   provenance/authority and resource/state/budget claim comparisons. Authenticate
+   restricted literal keys and identity-map comparisons; bind complete transitive
+   inventory contents and consent/scheduler/interaction/synthetic-cleanup plans.
+   Implement stored off/on/replay/final-off semantics, atomic RSVP/audit evidence,
+   owned CAS cleanup and independently verified restoration. Bind every actual
+   mutation to its correct authority checkpoint. The scoped resource graph and
+   method-count checks alone are not a complete receipt-verification result.
 3. Strict receipt production and independently provisioned verification,
    including authenticated current service artifact/job/producer inventories,
    post-upload immutable artifact binding and final authority/identity rereads.

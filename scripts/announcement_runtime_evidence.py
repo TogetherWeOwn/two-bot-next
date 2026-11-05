@@ -1,4 +1,4 @@
-"""Bounded typed provenance/authority claim resolution, not authentication.
+"""Bounded typed provenance/authority/resource claims, not authentication.
 
 Neither a sidecar's kind, filename, digest nor successful resolution selects a
 trust root or proves authority or independent observation. Remaining resource
@@ -12,8 +12,9 @@ import json
 
 from announcement_runtime_schema import (
     ARCHIVE_LIMIT, Array, AUTHORITY, AUTHORITY_READ, CONTROL, DECISION, DOCUMENT,
-    GATE_NAMES, IMAGE, Integer, MANIFEST, PRINCIPAL, REF, REFERENCE_LIMIT, RUN,
-    SCOPE, SERVICE_ID, SERVED_PAIR, SHA, SHA256, TOKEN_FREE_PATH, UTC, UUID,
+    COUNT, GATE_NAMES, IDENTITY, IMAGE, Integer, LEDGER_LIMIT, MANIFEST, OPERATIONS,
+    PRINCIPAL, REF, REFERENCE_LIMIT, RESOURCE, RUN, SCOPE, SERVICE_ID, SERVED_PAIR,
+    SHA, SHA256, STATE, TOKEN_FREE_PATH, UTC, UUID,
     VERSION, WORKER, _validate, enum,
     parse_bounded_json, require,
 )
@@ -114,7 +115,35 @@ AUTHORITY_RECORDS = {
         "nonce_ref": REF, "consumption_ref": REF, "observed_at": UTC, "valid_until": UTC,
         "boundary": enum("external_atomic", "application_flag", "unknown")},
 }
-EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS}
+# Content hashes bind these offline resource claims to the plan/document pins.
+# They are not independently obtained literal-resource or containment proofs.
+RESOURCE_SLOTS = {
+    key: REF for key in ("application_ref", "actor_ref", "control_channel_ref",
+        "feed_channel_ref", "event_ref", "feed_ref", "delivery_ref", "setting_ref",
+        "rsvp_ref", "rsvp_audit_ref", "source_ref")
+}
+OPERATION_BUDGET = {"ref": REF, "resource_ref": REF, "method": enum(*OPERATIONS),
+                    "expected_count": COUNT, "maximum_count": COUNT}
+RESOURCE_RECORDS = {
+    "resource_owner": {"principal": PRINCIPAL, "execution_ref": REF, "nonce_ref": REF},
+    "resource_state": {"claim": STATE, "resource_ref": REF, "identity_sha256": SHA256,
+                       "owner_ref": REF, "observer_ref": REF, "observed_at": UTC},
+    "resource_isolation": {"resource_ref": REF, "identity_sha256": SHA256,
+        "owner_ref": REF, "observer_ref": REF, "observed_at": UTC,
+        "resource_epoch": SERVICE_ID, "purpose": enum("existing_isolated_test"),
+        "boundary": enum("all_paths_external", "application_only", "unknown"),
+        "credential_exposure": enum("mediated_only", "raw", "unknown"),
+        "production_memberships": Array(SERVICE_ID, 0)},
+    "identity_map_content": {"bindings": Array({"resource_ref": REF, "identity": IDENTITY,
+        "owner_ref": REF, "isolation_ref": REF})},
+    "resource_plan_content": {"slots": RESOURCE_SLOTS, "entries": Array(RESOURCE),
+        "states": Array(STATE), "identity_map": DOCUMENT, "inventory_manifest": MANIFEST,
+        "operation_budgets": Array(OPERATION_BUDGET, 1, LEDGER_LIMIT),
+        "not_before": UTC, "expires_at": UTC},
+    "feed_item": {"source_ref": REF, "feed_ref": REF, "item_ref": REF,
+        "source_content_sha256": SHA256, "item_content_sha256": SHA256, "nonce_ref": REF},
+}
+EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS}
 
 
 def canonical_digest(value):
