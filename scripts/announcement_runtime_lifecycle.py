@@ -19,8 +19,8 @@ def check_lifecycle_phase_claims(receipt, evidence, now):
 
     Compose with the authority, state-chain and ledger checkers: this narrower
     comparison neither authenticates reads nor replaces their scope/history and
-    ownership checks. The schema has no separately scoped recovery checkpoint.
-    Cleanup therefore explicitly refuses, even with a fresh effect-batch fence;
+    ownership checks. Recovery checkpoint claims do not yet bind separate
+    installation revalidation or a recovery fence. Cleanup explicitly refuses,
     no complete lifecycle can pass this layer until recovery is implemented.
     """
     validate_receipt_shape(receipt)

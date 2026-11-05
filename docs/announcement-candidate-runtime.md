@@ -427,10 +427,10 @@ not canonical staging qualification or production promotion.
   checkpoint/run/time correspondence, exclusive expiry and all four runtime/
   installation read ages are compared at the operation time. Unassigned startup,
   drain or restoration operations have no default phase. Cleanup explicitly
-  refuses `unsupported_recovery_authority`: the current schema has no separately
-  scoped recovery checkpoint, and an ordinary fresh effect-batch/final fence
-  cannot substitute for it. This layer does not authenticate authority or prove
-  phase completion. Authority and state-chain comparisons now share the exact
+  refuses `unsupported_recovery_authority`: recovery read/checkpoint claims do
+  not yet bind separate installation revalidation or a recovery boundary fence;
+  an ordinary fresh effect-batch/final fence cannot substitute for them. This
+  layer does not authenticate authority or prove phase completion. Authority and state-chain comparisons now share the exact
   setup-write classifier with this layer: one matching setup entry, no duplicate
   or cleanup overlap, identical complete transition claim, insert/CAS method and
   a snapshot-to-rollout timestamp are required. Such a write uses its named
@@ -487,8 +487,18 @@ not canonical staging qualification or production promotion.
   lease; nothing actually consumes trusted state. Runtime nonce records cannot
   substitute by relabeling their reference. This is **partial grant consistency,
   not a separate authenticated recovery authority graph**. Runtime scope checks
-  remain mandatory upstream; recovery current reads/history, installation
-  revalidation and mutation-boundary fences are still missing. Actual ownership/
+  remain mandatory upstream. `check_recovery_read_claims` resolves a separate
+  fixed `runtime-recovery-checkpoints` inventory and closed `recovery_read` /
+  `recovery_history` kinds. Every cleanup operation names one unique recovery
+  checkpoint, never a runtime checkpoint; the final checkpoint equals attempt
+  end. Both declared independent consumers bind the same complete, gap-free,
+  scope/epoch/generation-pinned decision history. Snapshots must be append-only
+  without backfilled events or invalidation of effective decisions. Reads must
+  remain at most 60 seconds old at the actual cleanup timestamp and final
+  verifier clock, not merely checkpoint creation; expiry remains exclusive.
+  These are inert claim comparisons, not authenticated reads or enforceable
+  checkpoints. Installation revalidation, boundary fences and the coordinated
+  authority/state-chain/lifecycle consumers remain unimplemented. Actual ownership/
   CAS tokens, full-row state, process/Worker restoration and final verification
   remain unfinished. The mandatory lifecycle-phase checker still refuses cleanup,
   and the CLI/runtime stay unconditional HOLD. Retrospective grant consistency
@@ -600,7 +610,7 @@ must not be called as a substitute for any canonical admission control.
 ## Offline claim-checking entry point
 
 `scripts/announcement_runtime_check.py` composes bounded archive intake,
-closed same-run typed sidecars, all twenty existing public claim comparisons
+closed same-run typed sidecars, all twenty-one existing public claim comparisons
 and final all-used sidecar accounting. It is **not an independently provisioned
 verifier, receipt producer or runtime admission path**. The local Git topology
 collector is not invoked; authenticated source/service inventories, complete

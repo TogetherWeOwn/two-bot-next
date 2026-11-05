@@ -406,6 +406,16 @@ DELIVERY_RECORDS = {
 # Recovery scope/grant/consumption claims are distinct from runtime grants.
 # Neither these records nor a plan authenticates authority or supplies a fence.
 RECOVERY_RECORDS = {
+    "recovery_read": {"recovery_ref": REF, "claim": AUTHORITY_READ,
+                      "history_ref": REF, "consumer_ref": REF},
+    "recovery_history": {"recovery_ref": REF, **AUTHORITY_RECORDS["authority_history"]},
+    "recovery_checkpoints": {
+        "recovery_ref": REF, "run": RUN,
+        "checkpoints": Array({"ref": REF, "phase": enum("cleanup", "final"),
+            "operation_id_refs": Array(REF, 0), "checked_at": UTC,
+            "authority_epoch": SERVICE_ID, "resource_epoch": SERVICE_ID,
+            "controller_read_ref": REF, "verifier_read_ref": REF}, 2),
+    },
     "recovery_scope": {
         "purpose": enum("owned_recovery_only"), "runtime_scope_sha256": SHA256,
         "source_sha256": SHA256, "consumers_sha256": SHA256,
