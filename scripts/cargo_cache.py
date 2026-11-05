@@ -940,6 +940,33 @@ def _lock_path_identity(lock_path):
     return (info.st_dev, info.st_ino)
 
 
+def directory_metadata(path):
+    """Capture an existing output root, never invent a replacement's owner/mode."""
+    info = path.lstat()
+    mode = stat.S_IMODE(info.st_mode)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid < 0 or info.st_gid < 0
+            or not any((mode >> shift) & 0o3 == 0o3 for shift in (0, 3, 6))):
+        raise Refusal(f'invalid writable directory metadata: {path}')
+    return info.st_uid, info.st_gid, mode
+
+
+def recreate_output_directory(path, metadata):
+    """Restore ownership before mode (chown can clear setgid), under the slot lock."""
+    path.mkdir(mode=0o700)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        uid, gid, mode = metadata
+        info = os.fstat(fd)
+        if (info.st_uid, info.st_gid) != (uid, gid):
+            os.fchown(fd, uid, gid)
+        os.fchmod(fd, mode)
+        info = os.fstat(fd)
+        if (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != metadata:
+            raise Refusal(f'directory metadata restoration did not persist: {path}')
+    finally:
+        os.close(fd)
+
+
 def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
                        _before_mutation=None):
     """Reclaim over-budget shared-pool slots with lock held through mutation.
@@ -1160,6 +1187,9 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
             scratch = pending[name]['scratch']
             before_bytes = pending[name]['before_bytes']
             _slot, fd = held[name]
+            mutation_started = False
+            completed_steps = []
+            lease_removed = False
             try:
                 if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
                     results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
@@ -1177,28 +1207,49 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
                     results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
                                      'reason': 'slot path escape; skipped, lease kept'}
                     continue
-                shutil.rmtree(target)
-                shutil.rmtree(scratch)
+                # Capture BOTH roots before touching either. Invalid/unreadable
+                # metadata is not permission to recreate with the caller's defaults.
+                metadata = {path: directory_metadata(path) for path in (target, scratch)}
+                if now - captured + time.monotonic() - started > max_age:
+                    raise Refusal('retain took too long; capture a new inventory')
+                mutation_started = True  # even a failing rmtree may remove some output
+                for path in (target, scratch):
+                    shutil.rmtree(path)
+                    completed_steps.append(f'{path.name}_removed')
+                for path in (target, scratch):
+                    recreate_output_directory(path, metadata[path])
+                    completed_steps.append(f'{path.name}_restored')
+                if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
+                    raise Refusal(f'lock file replaced during mutation: {name}')
+                # Keep the crash sentinel until both roots are usable again.
                 lease = slot / 'lease.json'
                 try:
                     lease.unlink()
+                    lease_removed = True
                 except FileNotFoundError:
                     pass
-                target.mkdir()
-                scratch.mkdir()
-                if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
-                    raise Refusal(f'lock file replaced during mutation: {name}')
                 after_bytes = usage(slot)
                 results[name] = {'slot': name, 'path': str(slot), 'eligible': True,
                                  'reason': 'retained; exact slot output reclaimed',
                                  'before_bytes': before_bytes, 'after_bytes': after_bytes,
                                  'reclaimed_bytes': before_bytes - after_bytes,
+                                 'directory_metadata_preserved': True,
                                  'lock_held_through_mutation': True}
-            except Refusal:
-                raise
-            except (OSError, ValueError) as error:
+            except (Refusal, OSError, ValueError) as error:
                 results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
-                                 'reason': f'mutation failed ({error}); skipped'}
+                                 'reason': (f'retain failed ({error}); '
+                                            + ('output may be partially mutated; STOP'
+                                               if mutation_started else 'no mutation; lease kept')),
+                                 'mutation_failed': True, 'mutation_started': mutation_started,
+                                 'completed_steps': completed_steps, 'lease_removed': lease_removed,
+                                 'before_bytes': before_bytes}
+                # Do not continue mutating other slots after a failed lifecycle.
+                for remaining in pending.keys() - results.keys():
+                    results[remaining] = {'slot': remaining,
+                                          'path': str(pending[remaining]['slot']),
+                                          'eligible': False,
+                                          'reason': 'earlier retain failure; skipped, lease kept'}
+                break
         for name in sorted(results):
             ordered.append(results[name])
         return {'version': 1, 'retain': True, 'mutation': True,
@@ -1489,6 +1540,41 @@ def filesystem_finding(path, backing_path, floor):
     return None
 
 
+def retain_with_evidence(pool, inventory, proc_root, evidence):
+    """Prove a new external receipt is writable before any retention mutation.
+
+    This is not the Operator's lease archive or transcript. A prepared record
+    without a final receipt means the outcome is unknown, NOT no mutation.
+    """
+    pool = real_directory(pool)
+    evidence = Path(os.path.abspath(evidence))
+    real_directory(evidence.parent)
+    if evidence.resolve().is_relative_to(pool):
+        raise Refusal('retain evidence must be outside the pool')
+    fd = os.open(evidence, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        stream.write(json.dumps({'version': 1, 'state': 'prepared', 'pool': str(pool),
+                                 'outcome': 'unknown until final receipt',
+                                 'captured_at_unix': inventory.get('captured_at_unix')}))
+        stream.flush()
+        os.fsync(stream.fileno())
+        parent_fd = os.open(evidence.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        result = shared_pool_retain(pool, inventory, proc_root=proc_root)
+        try:
+            stream.seek(0)
+            stream.write(json.dumps(result, sort_keys=True))
+            stream.truncate()
+            stream.flush()
+            os.fsync(stream.fileno())
+        except OSError as error:
+            raise Refusal(f'final evidence write failed; retention may have mutated output: {error}')
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
@@ -1519,10 +1605,11 @@ def main():
         if args.command == 'audit':
             result = retention_audit(args.worktrees, json.loads(args.inventory.read_text()))
         elif args.command == 'retain':
-            result = shared_pool_retain(args.pool, json.loads(args.inventory.read_text()),
-                                        proc_root=args.proc_root)
-            if args.evidence is not None:
-                args.evidence.write_text(json.dumps(result, sort_keys=True))
+            inventory = json.loads(args.inventory.read_text())
+            if args.evidence is None:
+                result = shared_pool_retain(args.pool, inventory, proc_root=args.proc_root)
+            else:
+                result = retain_with_evidence(args.pool, inventory, args.proc_root, args.evidence)
         else:
             if args.min_available_bytes <= 0:
                 raise Refusal('available-byte floor must be positive')
@@ -1530,6 +1617,8 @@ def main():
             if result is None:
                 return 0  # Healthy monitoring is silent.
         print(json.dumps(result, sort_keys=True))
+        if args.command == 'retain' and any(row.get('mutation_failed') for row in result['slots']):
+            return 75
         return 1 if args.command == 'filesystem' else 0
     except (Refusal, OSError, ValueError, KeyError, IndexError, subprocess.CalledProcessError) as error:
         print(json.dumps({'finding': 'refused', 'reason': str(error)}), file=sys.stderr)

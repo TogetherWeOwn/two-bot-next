@@ -1253,6 +1253,269 @@ class SharedPoolRetainTests(unittest.TestCase):
                              (locks_before[number].st_dev, locks_before[number].st_ino))
         self.assertEqual((self.pool / 'policy.json').read_bytes(), policy_before)
 
+    def test_blocked_idle_stale_exact_slot_preserves_excluded_slot_and_lease_evidence(self):
+        slot = self.pool / 'slot-1'
+        (slot / 'scratch' / 'retained').write_bytes(b'x' * self.policy['slot_budget_bytes'])
+        self.assertGreater(cache.usage(slot), self.policy['slot_budget_bytes'])
+        row = self.row('slot-1') | {'status': 'blocked', 'idle_stale': True}
+        self.inventory['slots'] = [row]
+        excluded = self.pool / 'slot-0'
+        excluded_lease = (excluded / 'lease.json').read_bytes()
+        excluded_bytes = cache.usage(excluded)
+        original = (slot / 'lease.json').read_bytes()
+        archive = self.root / 'original-lease.json'
+        archive.write_bytes(original)
+        digest = cache.hashlib.sha256(original).hexdigest()
+        evidence = self.root / 'receipt.json'
+        receipt = cache.retain_with_evidence(self.pool, self.inventory, self.proc, evidence)
+        self.assertTrue(self.by_slot(receipt)['slot-1']['eligible'])
+        self.assertFalse(self.by_slot(receipt)['slot-0']['eligible'])
+        self.assertEqual(row['status'], 'blocked')
+        self.assertEqual((excluded / 'lease.json').read_bytes(), excluded_lease)
+        self.assertEqual(cache.usage(excluded), excluded_bytes)
+        self.assertFalse((slot / 'lease.json').exists())
+        self.assertEqual(archive.read_bytes(), original)
+        self.assertEqual(cache.hashlib.sha256(archive.read_bytes()).hexdigest(), digest)
+        self.assertEqual(json.loads(evidence.read_text()), receipt)
+
+    def test_blocked_without_true_idle_stale_keeps_output_and_lease(self):
+        self.inventory['slots'] = [self.row('slot-1') | {'status': 'blocked'}]
+        slot = self.pool / 'slot-1'
+        original = (slot / 'lease.json').read_bytes()
+        for flag in ({}, {'idle_stale': False}):
+            with self.subTest(flag=flag):
+                self.inventory['slots'][0].update(flag)
+                row = self.by_slot(self.retain())['slot-1']
+                self.assertFalse(row['eligible'])
+                self.assertIn('nonterminal', row['reason'])
+                self.assertEqual((slot / 'lease.json').read_bytes(), original)
+                self.assertTrue((slot / 'target' / 'debug' / 'fixture').exists())
+
+    def test_ownership_modes_and_original_lock_held_until_lease_unlink(self):
+        self.inventory['slots'] = [self.row('slot-1')]
+        slot = self.pool / 'slot-1'
+        lock_identity = cache._lock_path_identity(slot / 'lock')
+        expected = {}
+        for name, mode in (('target', 0o2770), ('scratch', 0o1770)):
+            path = slot / name
+            if os.geteuid() == 0:
+                os.chown(path, 1001, 1002)
+            path.chmod(mode)
+            expected[path] = cache.directory_metadata(path)
+        calls = []
+
+        def check_lock():
+            self.assertEqual(cache._lock_path_identity(slot / 'lock'), lock_identity)
+            probe = os.open(slot / 'lock', os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+
+        real_rmtree, real_restore, real_unlink = shutil.rmtree, cache.recreate_output_directory, Path.unlink
+
+        def remove(path):
+            check_lock()
+            self.assertTrue((slot / 'lease.json').exists())
+            calls.append(f'remove:{path.name}')
+            return real_rmtree(path)
+
+        def restore(path, metadata):
+            check_lock()
+            self.assertTrue((slot / 'lease.json').exists())
+            result = real_restore(path, metadata)
+            self.assertEqual(cache.directory_metadata(path), expected[path])
+            calls.append(f'restore:{path.name}')
+            return result
+
+        def unlink(path, *args, **kwargs):
+            if path == slot / 'lease.json':
+                check_lock()
+                self.assertEqual(calls, ['remove:target', 'remove:scratch',
+                                         'restore:target', 'restore:scratch'])
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(cache.shutil, 'rmtree', side_effect=remove), \
+                patch.object(cache, 'recreate_output_directory', side_effect=restore), \
+                patch.object(Path, 'unlink', unlink):
+            result = self.by_slot(self.retain())['slot-1']
+        self.assertTrue(result['directory_metadata_preserved'])
+        for path in expected:
+            self.assertEqual(cache.directory_metadata(path), expected[path])
+
+    def test_blocked_idle_stale_still_vetoes_live_references_and_foreign_output(self):
+        slot = self.pool / 'slot-1'
+        (slot / 'scratch' / 'retained').write_bytes(b'x' * self.policy['slot_budget_bytes'])
+        row = self.row('slot-1') | {'status': 'blocked', 'idle_stale': True}
+        self.inventory['slots'] = [row]
+        original = (slot / 'lease.json').read_bytes()
+        for kind in ('running', 'queued', 'retry', 'exact-slot-alias'):
+            with self.subTest(kind=kind):
+                key = 'referenced' if kind == 'exact-slot-alias' else 'live_run'
+                row[key] = True
+                try:
+                    self.assertFalse(self.by_slot(self.retain())['slot-1']['eligible'])
+                finally:
+                    row[key] = False
+                self.assertEqual((slot / 'lease.json').read_bytes(), original)
+        for name in ('target', 'scratch'):
+            with self.subTest(name=name):
+                foreign = slot / name / 'source.rs'
+                foreign.write_text('preserve this source')
+                try:
+                    self.assertFalse(self.by_slot(self.retain())['slot-1']['eligible'])
+                    self.assertEqual(foreign.read_text(), 'preserve this source')
+                    self.assertEqual((slot / 'lease.json').read_bytes(), original)
+                finally:
+                    foreign.unlink()
+        row['target_provenance'] = 'mixed'
+        self.assertFalse(self.by_slot(self.retain())['slot-1']['eligible'])
+        self.assertEqual((slot / 'lease.json').read_bytes(), original)
+
+    def test_owner_restore_is_attempted_before_mode_without_root(self):
+        path = self.root / 'replacement'
+        initial = self.root.stat()
+        metadata = (initial.st_uid + 1, initial.st_gid + 1, 0o2770)
+        fields = list(initial)
+        fields[0], fields[4], fields[5] = 0o42770, metadata[0], metadata[1]
+        restored = os.stat_result(fields)
+        order = []
+        with patch.object(cache.os, 'fstat', side_effect=[initial, restored]), \
+                patch.object(cache.os, 'fchown', side_effect=lambda *a: order.append('owner')), \
+                patch.object(cache.os, 'fchmod', side_effect=lambda *a: order.append('mode')):
+            cache.recreate_output_directory(path, metadata)
+        self.assertEqual(order, ['owner', 'mode'])
+
+    def test_invalid_or_unreadable_metadata_stops_before_either_removal(self):
+        slot = self.pool / 'slot-0'
+        scratch = slot / 'scratch'
+        real_metadata = cache.directory_metadata
+        for failure in ('invalid', 'unreadable'):
+            with self.subTest(failure=failure):
+                def metadata(path):
+                    if path == scratch and failure == 'unreadable':
+                        raise PermissionError('synthetic metadata denial')
+                    return real_metadata(path)
+
+                if failure == 'invalid':
+                    scratch.chmod(0o500)
+                try:
+                    with patch.object(cache, 'directory_metadata', side_effect=metadata):
+                        row = self.by_slot(self.retain())['slot-0']
+                finally:
+                    scratch.chmod(0o700)
+                self.assertFalse(row['mutation_started'])
+                self.assertTrue((slot / 'target' / 'debug' / 'fixture').exists())
+                self.assertTrue((slot / 'lease.json').exists())
+                self.assertFalse(row['lease_removed'])
+
+    def test_restore_failure_reports_partial_mutation_and_keeps_lease(self):
+        slot = self.pool / 'slot-0'
+        original = (slot / 'lease.json').read_bytes()
+        with patch.object(cache.os, 'fchmod', side_effect=PermissionError('synthetic chmod denial')):
+            receipt = self.retain()
+        row = self.by_slot(receipt)['slot-0']
+        self.assertFalse(row['eligible'])
+        self.assertTrue(row['mutation_started'])
+        self.assertTrue(row['mutation_failed'])
+        self.assertIn('partially mutated', row['reason'])
+        self.assertEqual(row['completed_steps'], ['target_removed', 'scratch_removed'])
+        self.assertFalse(row['lease_removed'])
+        self.assertEqual((slot / 'lease.json').read_bytes(), original)
+        self.assertFalse((slot / 'target' / 'debug' / 'fixture').exists())
+        self.assertFalse(self.by_slot(receipt)['slot-1']['eligible'])
+        self.assertTrue((self.pool / 'slot-1' / 'target' / 'debug' / 'fixture').exists())
+
+    def test_owner_restore_denial_and_ineffective_mode_fail_closed(self):
+        for failure in ('chown', 'mode-not-restored'):
+            with self.subTest(failure=failure):
+                path = self.root / failure
+                uid = self.root.stat().st_uid
+                gid = self.root.stat().st_gid
+                if failure == 'chown':
+                    with patch.object(cache.os, 'fchown', side_effect=PermissionError('denied')):
+                        with self.assertRaises(PermissionError):
+                            cache.recreate_output_directory(path, (uid + 1, gid + 1, 0o770))
+                else:
+                    with patch.object(cache.os, 'fchmod'):
+                        with self.assertRaisesRegex(cache.Refusal, 'did not persist'):
+                            cache.recreate_output_directory(path, (uid, gid, 0o770))
+
+    def test_cli_partial_failure_is_nonzero_and_receipt_is_honest(self):
+        inventory = self.root / 'inventory.json'
+        inventory.write_text(json.dumps(self.inventory))
+        evidence = self.root / 'receipt.json'
+        argv = [str(SCRIPT), 'retain', '--pool', str(self.pool), '--inventory', str(inventory),
+                '--proc-root', str(self.proc), '--evidence', str(evidence)]
+        stdout = io.StringIO()
+        with patch.object(sys, 'argv', argv), contextlib.redirect_stdout(stdout), \
+                patch.object(cache.os, 'fchmod', side_effect=PermissionError('denied')):
+            self.assertEqual(cache.main(), 75)
+        receipt = json.loads(stdout.getvalue())
+        self.assertTrue(self.by_slot(receipt)['slot-0']['mutation_started'])
+        self.assertEqual(json.loads(evidence.read_text()), receipt)
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_evidence_prepared_and_synced_before_mutation(self):
+        evidence = self.root / 'receipt.json'
+        real_remove, real_fsync = shutil.rmtree, os.fsync
+        fsyncs = []
+
+        def fsync(fd):
+            fsyncs.append(fd)
+            real_fsync(fd)
+
+        def remove(path):
+            self.assertEqual(json.loads(evidence.read_text())['state'], 'prepared')
+            self.assertGreaterEqual(len(fsyncs), 2)  # file and parent directory durable
+            return real_remove(path)
+
+        with patch.object(cache.os, 'fsync', side_effect=fsync), \
+                patch.object(cache.shutil, 'rmtree', side_effect=remove):
+            cache.retain_with_evidence(self.pool, self.inventory, self.proc, evidence)
+        self.assertEqual(len(fsyncs), 3)
+        self.assertTrue(json.loads(evidence.read_text())['retain'])
+
+    def test_failed_evidence_preflight_never_calls_retain(self):
+        for evidence in (self.pool / 'slot-0' / 'scratch' / 'receipt.json',
+                         self.root / 'missing' / 'receipt.json', self.pool / 'policy.json'):
+            with self.subTest(evidence=evidence), patch.object(cache, 'shared_pool_retain') as retain:
+                with self.assertRaises((cache.Refusal, OSError)):
+                    cache.retain_with_evidence(self.pool, self.inventory, self.proc, evidence)
+                retain.assert_not_called()
+        for failure_call in (1, 2):
+            evidence = self.root / f'failed-{failure_call}.json'
+            calls = 0
+
+            def fsync(_fd):
+                nonlocal calls
+                calls += 1
+                if calls == failure_call:
+                    raise OSError('synthetic evidence fsync failure')
+
+            with patch.object(cache.os, 'fsync', side_effect=fsync), \
+                    patch.object(cache, 'shared_pool_retain') as retain:
+                with self.assertRaises(OSError):
+                    cache.retain_with_evidence(self.pool, self.inventory, self.proc, evidence)
+                retain.assert_not_called()
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_final_evidence_failure_does_not_claim_no_mutation(self):
+        evidence = self.root / 'receipt.json'
+        calls = 0
+
+        def fsync(_fd):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError('synthetic final evidence failure')
+
+        with patch.object(cache.os, 'fsync', side_effect=fsync):
+            with self.assertRaisesRegex(cache.Refusal, 'may have mutated'):
+                cache.retain_with_evidence(self.pool, self.inventory, self.proc, evidence)
+        self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
+
     def test_lock_held_through_mutation(self):
         seen = {}
 
