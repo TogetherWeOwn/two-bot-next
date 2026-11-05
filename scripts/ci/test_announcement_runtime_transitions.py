@@ -206,9 +206,23 @@ class SetupCheckpoints(unittest.TestCase):
         with self.assertRaisesRegex(Refusal, "unsupported"):
             runtime_preflight()
 
+    def competing_fixture(self):
+        # Setup and the extra effect fence share the rollout boundary. Preserve
+        # credentials/setup/rollout ordering instead of inserting a test batch
+        # before rollout and accidentally testing checkpoint_inventory.
+        receipt, records, now = setup_fixture("00:03:00")
+        receipt["attempt"]["checkpoints"][1]["checked_at"] = at("00:02:59")
+        records["fence-1"]["data"].update(observed_at=at("00:02:59"),
+                                         valid_until=at("00:03:29"))
+        records["installation-approval-1"]["data"]["checked_at"] = at("00:02:59")
+        for prefix in ("runtime", "install"):
+            self.set_reads(receipt, records, prefix, "00:02:59")
+        ref = add_checkpoint(receipt, records, "00:03:00")
+        self.check(receipt, records, now)
+        return receipt, records, now, ref
+
     def test_setup_cannot_name_effect_authority_even_with_covering_fresh_reads(self):
-        receipt, records, now = setup_fixture()
-        ref = add_checkpoint(receipt, records, "00:02:00")
+        receipt, records, now, ref = self.competing_fixture()
         claim(records, FEED_INS)["authority_ref"] = ref
         receipt["lifecycle"]["setup"][0]["authority_ref"] = ref
         match(records, FEED_INS)["checkpoint_ref"] = ref
@@ -267,9 +281,8 @@ class SetupCheckpoints(unittest.TestCase):
     def test_setup_cannot_borrow_a_fresh_effect_fence_for_stale_named_reads(self):
         for prefix in ("runtime", "install"):
             with self.subTest(prefix=prefix):
-                receipt, records, now = setup_fixture("00:02:20")
-                add_checkpoint(receipt, records, "00:02:20")
-                self.set_reads(receipt, records, prefix, "00:01:00")
+                receipt, records, now, _ = self.competing_fixture()
+                self.set_reads(receipt, records, prefix, "00:01:59")
                 self.reject(receipt, records, now, "stale_mutation_read")
 
     def test_setup_runtime_and_installation_reads_accept_exactly_sixty_seconds(self):
