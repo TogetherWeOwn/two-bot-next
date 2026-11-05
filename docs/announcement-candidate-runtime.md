@@ -76,9 +76,10 @@ not canonical staging qualification or production promotion.
   provisioning, nonce consumption, current revocation protection or enforcement.
   There is no authority endpoint, key, adapter or enable input. A coherent
   fabricated graph still returns no capability and cannot qualify runtime.
-  Resource transitions and complete lifecycle mutation-to-checkpoint binding
-  remain unfinished; composition with provenance/all-used accounting does not
-  replace those or any remaining acceptance predicate.
+  The transition checker below adds scoped DB state/ownership/checkpoint claim
+  binding; complete lifecycle mutation-to-checkpoint assignment remains unfinished.
+  Composition with provenance/all-used accounting does not replace that or any
+  remaining acceptance predicate.
 - `scripts/announcement_runtime_resources.py` compares content-bound resource,
   identity-map, ownership, state, isolation and per-method budget **claims**.
   Six new closed sidecar kinds carry those records and the feed-item binding.
@@ -217,6 +218,25 @@ not canonical staging qualification or production promotion.
   lifecycle phase completion, or resolve queues/drain/cleanup/restoration. Those
   remain mandatory. No workflow concurrency, canonical gate or installer changes
   are made and coherent fabricated witnesses grant no runtime capability.
+- `scripts/announcement_runtime_transitions.py` composes authority and telemetry
+  comparisons with a closed `ownership_match` sidecar and existing typed resource
+  state records. Every DB write must extend the preceding complete state in exact
+  operation sequence, including intermediate presence/version/value claims.
+  Insert requires absence, CAS requires presence and an advancing version, and
+  owned deletion requires presence. Intermediate state refs and compare-and-match
+  witnesses cannot be reused. Each witness compares the exact operation, key,
+  identity, owner, execution/nonce/epochs, method, snapshot hashes, independent
+  full-window observer and timestamp. The transition must reference its own
+  declared effect-batch checkpoint and fall inside that checkpoint's validated
+  external-atomic fence; an unrelated fresh checkpoint is insufficient. Final
+  separately observed DB states must match the chain's full terminal state,
+  including version, not just its value digest. **These are claim comparisons,
+  not actual CAS, authentication, phase completion or verified restoration.**
+  Setting/business value semantics, setup/cleanup phase assignment, separately
+  scoped recovery authority, actual desired restoration postconditions and
+  queue/drain evidence remain mandatory. The synthetic fixture intentionally
+  leaves every effect at one instant, not a successful lifecycle. Runtime
+  admission remains unsupported and no SQL or live adapter is introduced.
 - `scripts/announcement_runtime_policy.py` checks offline lease/freshness,
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
@@ -295,9 +315,12 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
    off/on/replay/final-off semantics and negatives. The scoped telemetry checker
    compares wire/platform/transaction correspondence and RSVP/audit grouping,
    but does not authenticate observation, prove SQL atomicity or resolve the
-   transition state/ownership/authority references. Implement owned CAS cleanup
-   and independently verified restoration. Bind every actual
-   mutation to its correct authority checkpoint. The scoped resource graph and
+   full lifecycle semantics. The transition checker now resolves DB state chains,
+   exact ownership witness claims and each write's effect-batch authority reference,
+   but does not establish real CAS or desired restoration. Implement setup/cleanup
+   phase assignment, independently verified restoration and separately scoped
+   recovery authority. Bind every actual mutation to its correct lifecycle-phase
+   authority checkpoint. The scoped resource graph and
    method-count checks alone are not a complete receipt-verification result.
 3. Strict receipt production and independently provisioned verification,
    including authenticated current service artifact/job/producer inventories,

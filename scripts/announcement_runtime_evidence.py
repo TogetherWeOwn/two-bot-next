@@ -274,9 +274,22 @@ SERIALIZATION_RECORDS = {
         "node_ref": REF, "observer_ref": REF, "boundary": enum("all_writers_external",
             "workflow_only", "application_only", "unknown")},
 }
+# Compare-and-match witnesses bind restricted, exact state snapshots and keys.
+# A witness is still a claim, not an external CAS operation or authority root.
+TRANSITION_RECORDS = {
+    "ownership_match": {"operation_id": REF, "resource_ref": REF,
+        "identity_sha256": SHA256, "key_sha256": SHA256, "owner_ref": REF,
+        "execution_ref": REF, "nonce_ref": REF, "authority_epoch": SERVICE_ID,
+        "resource_epoch": SERVICE_ID, "checkpoint_ref": REF,
+        "method": enum("db_insert", "db_cas", "db_delete_owned"),
+        "before_state_sha256": SHA256, "after_state_sha256": SHA256,
+        "observer_ref": REF, "observed_at": UTC,
+        "boundary": enum("external_compare_and_match", "application_only", "unknown"),
+        "outcome": enum("matched", "conflict", "unknown")},
+}
 EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS,
                     **INPUT_RECORDS, **SCHEDULER_RECORDS, **SOURCE_RECORDS,
-                    **TELEMETRY_RECORDS, **SERIALIZATION_RECORDS}
+                    **TELEMETRY_RECORDS, **SERIALIZATION_RECORDS, **TRANSITION_RECORDS}
 
 
 def canonical_digest(value):
