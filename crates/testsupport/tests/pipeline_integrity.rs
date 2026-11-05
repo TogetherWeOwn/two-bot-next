@@ -22,10 +22,14 @@ async fn completion_reader_accepts_a_stop_marker_appended_after_initial_eof() {
         .unwrap();
     // Setup can exceed both the measured line cap and one reader chunk.
     // It must not invalidate the later bounded measurement window.
-    sqlx::raw_sql(&format!("SELECT '{}'", "x".repeat(128 * 1024)))
-        .execute(&mut *writer)
-        .await
-        .unwrap();
+    // Only a fixed synthetic character is interpolated; no external input.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "SELECT '{}'",
+        "x".repeat(128 * 1024)
+    )))
+    .execute(&mut *writer)
+    .await
+    .unwrap();
     sqlx::raw_sql("SELECT 'pipeline-accounting-start'")
         .execute(&mut *writer)
         .await
