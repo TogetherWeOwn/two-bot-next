@@ -296,18 +296,36 @@ def check_authority_graph_claims(receipt, evidence, now):
         require(install_reads[0]["history_sha256"] == install_reads[1]["history_sha256"],
                 "authority_disagreement")
         fences.append((checkpoint, fence, install))
-    def mutation_checkpoint(phase, timestamp):
+    def mutation_checkpoint(phase, timestamp, named_ref=None):
         observed = utc(timestamp)
-        matching = [(checkpoint, install) for checkpoint, fence, install in fences
-                    if fence["phase"] == phase and utc(fence["observed_at"]) <= observed <
-                    utc(fence["valid_until"])]
-        require(matching, "mutation_without_checkpoint")
+        candidates = [(checkpoint, fence, install) for checkpoint, fence, install in fences
+                      if checkpoint["phase"] == phase and
+                      (named_ref is None or checkpoint["ref"] == named_ref)]
+        if named_ref is not None:
+            require(candidates, "transition_authority")
+        matching = [(checkpoint, install) for checkpoint, fence, install in candidates
+                    if utc(fence["observed_at"]) <= observed < utc(fence["valid_until"])]
+        require(matching, "mutation_without_checkpoint" if named_ref is None else
+                "transition_authority_time")
         require(any(_mutation_reads_current(checkpoint, install, evidence, observed)
                     for checkpoint, install in matching), "stale_mutation_read")
 
     mutation_checkpoint("rollout", receipt["rollout"]["started_at"])
     for effect in receipt["observations"]["actual_effects"]:
-        mutation_checkpoint("effect_batch", effect["observed_at"])
+        named_ref = None
+        # Missing transition evidence still refuses in the telemetry/state-chain
+        # layers. When supplied here it cannot be ignored or borrow another fence.
+        if (effect["method"].startswith("db_") and effect["method"] != "db_read" and
+                effect["db_transition_refs"]):
+            require(len(effect["db_transition_refs"]) == 1, "mutation_transition_inventory")
+            transition = evidence.resolve(effect["db_transition_refs"][0], "db_transition")
+            claim = transition["claim"]
+            require(transition["method"] == effect["method"] and
+                    claim["operation_id"] == effect["operation_id"] and
+                    claim["resource_ref"] == effect["resource_ref"] and
+                    claim["observed_at"] == effect["observed_at"], "mutation_transition_binding")
+            named_ref = claim["authority_ref"]
+        mutation_checkpoint("effect_batch", effect["observed_at"], named_ref)
     _unique(fence_refs, "mutation_fence_replay")
     require(used_reads == reads.keys(), "unreferenced_authority_read")
     require(final_histories == [source["history_ref"], source["history_ref"]], "current_history")

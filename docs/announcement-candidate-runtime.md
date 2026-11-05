@@ -83,7 +83,12 @@ not canonical staging qualification or production promotion.
   reads must additionally remain at most 60 seconds old at the claimed rollout or
   effect time; a checkpoint/fence cannot extend their freshness. A DB transition's
   named checkpoint must independently meet that bound, even when a different fresh
-  checkpoint covers the same operation. Exactly 60 seconds is permitted. Final
+  checkpoint covers the same operation. When a DB write supplies a transition
+  reference, the authority graph also resolves its exact method/operation/resource/
+  timestamp binding and checks that named checkpoint rather than an unrelated
+  covering fence. This narrower graph still does not require missing transition
+  evidence: the separately composed telemetry/state-chain checks do, and all
+  remain mandatory. Exactly 60 seconds is permitted. Final
   runtime and installation reads are fresh against the verifier clock, not just
   the checkpoint time. These are consistency predicates, **not** actual native API reads,
   provisioning, nonce consumption, current revocation protection or enforcement.

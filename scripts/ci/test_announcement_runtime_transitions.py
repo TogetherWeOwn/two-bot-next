@@ -19,6 +19,7 @@ from announcement_resource_fixtures import repin_authority, repin_resources
 from announcement_transition_fixtures import (
     add_late_effect_checkpoint, repin_ownership, transition_fixture,
 )
+from announcement_runtime_authority import check_authority_graph_claims
 from announcement_runtime_evidence import canonical_digest
 from announcement_runtime_policy import runtime_preflight
 from announcement_runtime_schema import Refusal
@@ -297,8 +298,11 @@ class Authority(Transitions):
         index = evidence_index(records)
         self.assertIsNone(check_transition_claims(receipt, index, now))
         index.require_all_used()
+        self.assertIsNone(check_authority_graph_claims(receipt, evidence_index(records), now))
         claim(records, FEED_INS)["authority_ref"] = late
         match(records, FEED_INS)["checkpoint_ref"] = late
+        with self.assertRaisesRegex(Refusal, "transition_authority_time$"):
+            check_authority_graph_claims(receipt, evidence_index(records), now)
         with self.assertRaisesRegex(Refusal, "transition_authority_time$"):
             self.check(receipt, records, now)
 
@@ -337,10 +341,48 @@ class Authority(Transitions):
                 # The unchanged 08:00 checkpoint independently covers the whole
                 # ledger. Check that control BEFORE naming the stale checkpoint.
                 self.assertIsNone(self.check(receipt, records, now))
+                self.assertIsNone(check_authority_graph_claims(receipt, evidence_index(records), now))
                 claim(records, FEED_INS)["authority_ref"] = extra_ref
                 match(records, FEED_INS)["checkpoint_ref"] = extra_ref
                 with self.assertRaisesRegex(Refusal, "stale_mutation_read$"):
+                    check_authority_graph_claims(receipt, evidence_index(records), now)
+                with self.assertRaisesRegex(Refusal, "stale_mutation_read$"):
                     self.check(receipt, records, now)
+
+    def test_authority_graph_binds_supplied_transition_to_the_exact_write(self):
+        changes = ({"operation_id": FEED_DEL}, {"resource_ref": "delivery"},
+                   {"observed_at": at("00:08:01")})
+        for change in changes:
+            with self.subTest(change=change):
+                receipt, records, now = transition_fixture()
+                self.assertIsNone(check_authority_graph_claims(receipt, evidence_index(records), now))
+                claim(records, FEED_INS).update(change)
+                with self.assertRaisesRegex(Refusal, "mutation_transition_binding$"):
+                    check_authority_graph_claims(receipt, evidence_index(records), now)
+        receipt, records, now = transition_fixture()
+        records["transition-" + FEED_INS]["data"]["method"] = "db_cas"
+        with self.assertRaisesRegex(Refusal, "mutation_transition_binding$"):
+            check_authority_graph_claims(receipt, evidence_index(records), now)
+
+    def test_authority_graph_does_not_ignore_multiple_or_wrong_typed_transitions(self):
+        for refs, code in ((["transition-" + FEED_INS, "transition-" + FEED_DEL],
+                            "mutation_transition_inventory"),
+                           (["match-" + FEED_INS], "reference_kind")):
+            with self.subTest(refs=refs):
+                receipt, records, now = transition_fixture()
+                effect = next(x for x in receipt["observations"]["actual_effects"]
+                              if x["operation_id"] == FEED_INS)
+                effect["db_transition_refs"] = refs
+                with self.assertRaisesRegex(Refusal, code + "$"):
+                    check_authority_graph_claims(receipt, evidence_index(records), now)
+
+    def test_authority_graph_cannot_borrow_for_an_unknown_or_wrong_phase_checkpoint(self):
+        for ref in ("missing-checkpoint", "execution-ref", *OTHER_PHASES):
+            with self.subTest(ref=ref):
+                receipt, records, now = transition_fixture()
+                claim(records, FEED_INS)["authority_ref"] = ref
+                with self.assertRaisesRegex(Refusal, "transition_authority$"):
+                    check_authority_graph_claims(receipt, evidence_index(records), now)
 
     def test_every_write_needs_the_effect_batch_authority(self):
         for operation in WRITES:

@@ -146,7 +146,7 @@ def telemetry_fixture(base=None):
                     "actual_after_state_ref": resource["after_state_ref"],
                     "expected_count": 1, "actual_count": 1,
                     "observed_at": effect["observed_at"],
-                    "authority_ref": "execution-ref", "ownership_match_ref": "resource-owner",
+                    "authority_ref": "checkpoint-4", "ownership_match_ref": "resource-owner",
                     "outcome": "matched"}})
             transitions.append(transition_ref)
         add(ref, "db_transaction", {"transaction_id": _uuid(number), "observer_ref": observer,
