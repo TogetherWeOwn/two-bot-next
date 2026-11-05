@@ -1360,6 +1360,39 @@ pub fn validate_guild_add_member(body: &Map<String, Value>) -> Result<(), Action
     Ok(())
 }
 
+/// Exactly the legacy result object, without a provider response or secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberOutcome {
+    Added,
+    AlreadyMember,
+    Assigned,
+    AlreadyHeld,
+}
+
+impl MemberOutcome {
+    #[must_use]
+    pub fn result(self) -> serde_json::Value {
+        serde_json::json!({"outcome": self})
+    }
+
+    /// Legacy successBody insertion order is part of the website wire contract.
+    #[must_use]
+    pub fn success_body(self, request_id: &str) -> serde_json::Value {
+        serde_json::json!({"ok": true, "result": self.result(), "request_id": request_id})
+    }
+}
+
+/// Local executor evidence, never deserialized from the signed request. The rank
+/// is resolved from the same authoritative Discord snapshot used for hierarchy.
+/// Raw role names are transient and never enter this report or the durable audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleAssignmentReport {
+    pub outcome: MemberOutcome,
+    pub resolved_role_id: String,
+    pub rank_key: Option<crate::community_snapshots::RankKey>,
+}
+
 /// Resolved allowlisted role assignment. No caller can supply an arbitrary role ID.
 #[derive(Debug, Clone, Copy)]
 pub struct RoleAssignRequest<'a> {

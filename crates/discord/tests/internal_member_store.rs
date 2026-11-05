@@ -53,6 +53,96 @@ fn executor(mock: &MockRest) -> ActionExecutor {
 }
 
 #[tokio::test]
+async fn botlog_rank_grant_before_snapshot_freezes_authoritative_identity() {
+    let db = TestDb::new().await;
+    let store = InternalActionStore::new(db.pool.clone());
+    let keys = HashMap::from([("arbitrary-allowlist-key".into(), ROLE.into())]);
+    let unfilled: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM rank_ladder WHERE role_id IS NULL")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(unfilled, 5);
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::json(200, json!({"roles":[]})),
+            ScriptedResponse::json(200, json!({"roles":[BOT_ROLE]})),
+            ScriptedResponse::json(
+                200,
+                json!([
+                    {"id":GUILD,"name":"everyone","position":0,"managed":false},
+                    {"id":ROLE,"name":"Prospect","position":1,"managed":false},
+                    {"id":"100000000000000006","name":"Member","position":2,"managed":false},
+                    {"id":"100000000000000007","name":"Soldier","position":3,"managed":false},
+                    {"id":"100000000000000008","name":"Veteran","position":4,"managed":false},
+                    {"id":"100000000000000009","name":"Legend","position":5,"managed":false},
+                    {"id":BOT_ROLE,"name":"bot","position":10,"managed":true}
+                ]),
+            ),
+            ScriptedResponse::status(204),
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let exec = executor(&mock);
+    let payload =
+        json!({"action":"role.assign","discord_id":USER,"role_key":"arbitrary-allowlist-key"})
+            .to_string();
+    let result = exec
+        .execute_stored_member(
+            &store,
+            "website",
+            "botlog-rank-before-snapshot",
+            payload.as_bytes(),
+            &config(&keys),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, MemberOutcome::Assigned);
+    let page = || async {
+        two_bot_core::botlog::assemble_botlog_page(
+            store.list_botlog_page(GUILD, 0, 0, 200).await.unwrap(),
+            &HashMap::new(),
+            &two_bot_core::botlog::validate_botlog_read(&serde_json::Map::new()).unwrap(),
+        )
+    };
+    let first = serde_json::to_value(page().await).unwrap();
+    assert_eq!(first["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(first["entries"][0]["kind"], "rank.assigned");
+    assert_eq!(first["entries"][0]["detail"], json!("prospect"));
+    sqlx::query("UPDATE rank_ladder SET role_id = $1 WHERE rank_key = 'legend'")
+        .bind(ROLE)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(serde_json::to_value(page().await).unwrap(), first);
+    let changed_keys = HashMap::from([("arbitrary-allowlist-key".into(), BOT_ROLE.into())]);
+    let replay = exec
+        .execute_stored_member(
+            &store,
+            "website",
+            "botlog-rank-before-snapshot",
+            payload.as_bytes(),
+            &config(&changed_keys),
+        )
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.outcome.result(), result.outcome.result());
+    assert_eq!(serde_json::to_value(page().await).unwrap(), first);
+    assert_eq!(
+        mock.requests().len(),
+        4,
+        "three existing reads and exactly one mutation; replay is REST-free"
+    );
+    let persisted: Vec<String> = sqlx::query_scalar("SELECT row_to_json(i)::text FROM internal_idempotency i UNION ALL SELECT row_to_json(a)::text FROM internal_action_log a").fetch_all(&db.pool).await.unwrap();
+    assert!(persisted
+        .iter()
+        .all(|row| !row.contains("Prospect") && !row.contains("arbitrary-allowlist-key")));
+    db.cleanup().await;
+}
+
+#[tokio::test]
 #[ignore = "requires agent-testdb; CI explicitly runs this suite"]
 async fn guard_refused_member_actions_retry_same_key_after_cooldown() {
     use std::{sync::Arc, time::Duration};

@@ -454,8 +454,32 @@ publish nothing), and an effective `guild.add_member` names `member.joined`
 (`voice.move_member`, `reminder.send`, `place_offer.send`), every
 `moderation.*`/`settings.*`/`automations.*` verb, failures, refusals and
 in-flight rows never publish. Rows that no longer resolve to a configured
-channel key, event key or rank rung are dropped in Rust while still advancing
-`next`, so config drift cannot leak raw snowflakes or stall resumption.
+channel key are dropped in Rust while still advancing `next`, so config drift
+cannot leak raw snowflakes or stall resumption.
+
+Event and rank names no longer come from the mutable `rank_ladder` or
+`internal_event_keys` tables. Migration `0471` adds nullable
+`audit_event_key` and `audit_rank_key` to `internal_idempotency` and
+`internal_action_log`, and the feed reads those pinned columns:
+
+- The validated event request key is pinned when the claim is taken and copied
+  into the terminal audit. Reconciliation must match a non-null pinned key
+  when repairing its mapping. A legacy NULL intent may still have its operational
+  mapping repaired, but its audit stays unnamed; there is no reverse-map fallback.
+- The rank key comes from the Discord hierarchy role snapshot the executor
+  already reads, matched against the whole ladder with `match_rank_roles`. The
+  typed `RoleAssignmentReport` is retained across the role PUT and persisted
+  atomically with the terminal row by `finish_role_assignment`. This adds no
+  REST call and changes neither the wire result nor replay.
+- A missing or ambiguous ladder, or a grant of a non-rank role, is authorized
+  as before but pins no rank key and publishes no rank line. `already_held`
+  performs no extra reads and publishes nothing. A crash or lost local proof,
+  and a legacy or reconciled row, keeps a NULL rank key and stays suppressed.
+- On `internal_action_log`, an UPDATE cannot change the identity or publication
+  facts once written. The authorized erasure DELETE remains.
+
+Feed ordering is unchanged by this naming change; a commit-order allocator for
+the cursor is not implemented yet.
 A membership subject present in `privacy_opt_outs` keeps its entry but omits
 `subject_id`; the relay ceiling stays scalar (no message text, tokens or
 request bytes leave the Worker).

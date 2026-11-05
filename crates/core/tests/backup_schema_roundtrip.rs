@@ -437,8 +437,8 @@ async fn triggers(pool: &PgPool) -> Vec<(String, String, String, String)> {
     .unwrap()
 }
 
-/// Migrated settings triggers. Restore suspends only the two guards; the CAS
-/// allocator stays enabled so restored rows receive fresh tokens.
+/// Migrated triggers. Restore suspends only the two settings guards; the CAS
+/// allocator and immutable internal-audit guards stay enabled.
 fn assert_settings_triggers(triggers: &[(String, String, String, String)]) {
     assert_eq!(
         triggers
@@ -452,8 +452,10 @@ fn assert_settings_triggers(triggers: &[(String, String, String, String)]) {
                 "guild_settings_audit",
                 "trg_guild_settings_audit_append_only"
             ),
+            ("internal_action_log", "internal_log_identity_immutable"),
+            ("internal_idempotency", "internal_intent_identity_immutable"),
         ],
-        "every migrated settings trigger exists"
+        "every migrated trigger exists"
     );
 }
 

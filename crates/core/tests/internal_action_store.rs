@@ -464,6 +464,7 @@ fn subject() -> AuditSubject {
         actor_id: Some(DiscordId::new("234567890123456789").unwrap()),
         target_id: None,
         resolved_role_id: None,
+        ..AuditSubject::default()
     }
 }
 
@@ -1185,14 +1186,20 @@ async fn purge_stop_reason_columns_reject_unknown_words() {
     store.finish(&claim, &receipt).await.unwrap();
     for table in ["internal_idempotency", "internal_action_log"] {
         for invalid in ["bogus", "", "Refused", "rate-limited", "refused "] {
-            let error = sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE {table} SET stop_reason = $1 WHERE intent_id = $2",
-            )))
-            .bind(invalid)
-            .bind(claim.intent_id())
-            .execute(&db.pool)
-            .await
-            .expect_err("closed vocabulary must reject invalid stored reasons");
+            let query = if table == "internal_action_log" {
+                // Audit UPDATEs are independently refused as immutable. Exercise
+                // the vocabulary constraint at INSERT, not that earlier guard.
+                "INSERT INTO internal_action_log (intent_id, phase, caller_hash, action, stop_reason) \
+                 SELECT intent_id, 'unknown', caller_hash, action, $1 FROM internal_idempotency WHERE intent_id = $2".to_owned()
+            } else {
+                format!("UPDATE {table} SET stop_reason = $1 WHERE intent_id = $2")
+            };
+            let error = sqlx::query(sqlx::AssertSqlSafe(query))
+                .bind(invalid)
+                .bind(claim.intent_id())
+                .execute(&db.pool)
+                .await
+                .expect_err("closed vocabulary must reject invalid stored reasons");
             assert_eq!(
                 error
                     .as_database_error()
@@ -1590,6 +1597,7 @@ fn event_subject(guild: &str) -> AuditSubject {
         actor_id: None,
         target_id: None,
         resolved_role_id: None,
+        ..AuditSubject::default()
     }
 }
 
@@ -1969,6 +1977,7 @@ async fn botlog_page_projects_only_the_closed_publishable_kinds() {
             actor_id: Some(DiscordId::new("234567890123456789").unwrap()),
             target_id: target.map(|id| DiscordId::new(id).unwrap()),
             resolved_role_id: role.map(|id| DiscordId::new(id).unwrap()),
+            ..AuditSubject::default()
         }
     }
 
@@ -1993,7 +2002,11 @@ async fn botlog_page_projects_only_the_closed_publishable_kinds() {
         response: &TerminalResponse,
     ) {
         let id = identity(key, action, b"botlog-fixture");
-        let claim = claimed(store.claim(&id, subject).await.unwrap());
+        let mut subject = subject.clone();
+        if matches!(action, "event.upsert" | "event.cancel") {
+            subject.audit_event_key = Some(EVENT_KEY.to_owned());
+        }
+        let claim = claimed(store.claim(&id, &subject).await.unwrap());
         store.finish(&claim, response).await.unwrap();
     }
 
@@ -2057,14 +2070,27 @@ async fn botlog_page_projects_only_the_closed_publishable_kinds() {
         &receipt(None, 1, None),
     )
     .await;
-    terminal(
-        &store,
-        "botlog:rank-grant",
-        "role.assign",
-        &log_subject(Some(MEMBER), Some(RANK_ROLE)),
-        &receipt(None, 1, None),
-    )
-    .await;
+    let rank_claim = claimed(
+        store
+            .claim(
+                &identity("botlog:rank-grant", "role.assign", b"botlog-fixture"),
+                &log_subject(Some(MEMBER), Some(RANK_ROLE)),
+            )
+            .await
+            .unwrap(),
+    );
+    store
+        .finish_role_assignment(
+            &rank_claim,
+            &receipt(None, 1, None),
+            &two_bot_core::internal_actions::RoleAssignmentReport {
+                outcome: two_bot_core::internal_actions::MemberOutcome::Assigned,
+                resolved_role_id: RANK_ROLE.to_owned(),
+                rank_key: Some(two_bot_core::RankKey::Soldier),
+            },
+        )
+        .await
+        .unwrap();
     // Idempotent no-ops publish nothing: no arrival happened.
     terminal(
         &store,

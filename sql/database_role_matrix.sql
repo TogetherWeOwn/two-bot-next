@@ -139,6 +139,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'guild_settings_assign_version()', 'function'),
     ('public', 'guild_settings_advance_revision()', 'function'),
     ('public', 'guild_settings_audit_append_only()', 'function'),
+    ('public', 'internal_audit_identity_immutable()', 'function'),
     ('web_v1', 'contract_meta', 'view'),
     ('web_v1', 'live_counts', 'view'),
     ('web_v1', 'rank_counts', 'view'),

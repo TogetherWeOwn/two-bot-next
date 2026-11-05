@@ -95,6 +95,7 @@ fn event_subject() -> AuditSubject {
         actor_id: None,
         target_id: None,
         resolved_role_id: None,
+        ..AuditSubject::default()
     }
 }
 

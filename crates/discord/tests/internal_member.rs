@@ -32,6 +32,116 @@ fn role_body() -> Map<String, Value> {
 fn keys() -> HashMap<String, String> {
     HashMap::from([("member".into(), ROLE.into())])
 }
+#[tokio::test]
+async fn rank_report_uses_only_a_complete_unambiguous_authoritative_ladder() {
+    let ladder = json!([
+        {"id":GUILD,"name":"everyone","position":0,"managed":false},
+        {"id":ROLE,"name":"Prospect","position":1,"managed":false},
+        {"id":"100000000000000006","name":"Member","position":2,"managed":false},
+        {"id":"100000000000000007","name":"Soldier","position":3,"managed":false},
+        {"id":"100000000000000008","name":"Veteran","position":4,"managed":false},
+        {"id":"100000000000000009","name":"Legend","position":5,"managed":false},
+        {"id":BOT_ROLE,"name":"bot","position":10,"managed":true}
+    ]);
+    for case in [
+        "complete",
+        "missing",
+        "ambiguous",
+        "null-name",
+        "nonstring-name",
+        "absent-name",
+        "nonrank",
+        "malformed-id",
+        "duplicate-id",
+    ] {
+        let mut snapshot = ladder.clone();
+        match case {
+            "missing" => {
+                snapshot.as_array_mut().unwrap().remove(5);
+            }
+            "ambiguous" => {
+                snapshot[5]["name"] = json!("prospect");
+            }
+            "null-name" => {
+                snapshot[5]["name"] = Value::Null;
+            }
+            "nonstring-name" => {
+                snapshot[5]["name"] = json!(42);
+            }
+            "absent-name" => {
+                snapshot[5].as_object_mut().unwrap().remove("name");
+            }
+            "nonrank" => {
+                snapshot[1]["name"] = json!("Ordinary Role");
+                snapshot.as_array_mut().unwrap().push(json!({"id":"100000000000000011","name":"Prospect","position":1,"managed":false}));
+            }
+            "malformed-id" => {
+                snapshot[5]["id"] = json!("not-an-id");
+            }
+            "duplicate-id" => {
+                snapshot[5]["id"] = json!(ROLE);
+            }
+            _ => {}
+        }
+        let mock = MockRest::start(
+            vec![
+                ScriptedResponse::json(200, json!({"roles":[]})),
+                ScriptedResponse::json(200, json!({"roles":[BOT_ROLE]})),
+                ScriptedResponse::json(200, snapshot),
+                ScriptedResponse::status(204),
+            ],
+            ScriptedResponse::status(500),
+        )
+        .await;
+        let exec = executor(&mock);
+        let body = role_body();
+        let keys = keys();
+        let request = RoleAssignRequest::validate(&body, &keys).unwrap();
+        let result = exec.assign_internal_role_report(GUILD, BOT, &request).await;
+        if matches!(case, "malformed-id" | "duplicate-id") {
+            assert_eq!(result.unwrap_err().code, ErrorCode::DiscordUnavailable);
+            assert_eq!(
+                mock.requests().len(),
+                3,
+                "malformed policy refuses before mutation"
+            );
+        } else {
+            let report = result.unwrap();
+            assert_eq!(report.outcome, MemberOutcome::Assigned);
+            assert_eq!(report.resolved_role_id, ROLE);
+            assert_eq!(
+                report.rank_key,
+                (case == "complete").then_some(two_bot_core::RankKey::Prospect)
+            );
+            assert!(!format!("{report:?}").contains("Ordinary Role"));
+            assert_eq!(
+                mock.requests().len(),
+                4,
+                "metadata adds no read or mutation"
+            );
+        }
+    }
+    let mock = MockRest::start(
+        vec![ScriptedResponse::json(200, json!({"roles":[ROLE]}))],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let exec = executor(&mock);
+    let body = role_body();
+    let keys = keys();
+    let report = exec
+        .assign_internal_role_report(
+            GUILD,
+            BOT,
+            &RoleAssignRequest::validate(&body, &keys).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.outcome, MemberOutcome::AlreadyHeld);
+    assert_eq!(report.rank_key, None);
+    assert_eq!(mock.requests().len(), 1, "no-op needs no role fetch");
+}
+
 fn roles(position: i64, managed: bool) -> ScriptedResponse {
     ScriptedResponse::json(
         200,

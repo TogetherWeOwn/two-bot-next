@@ -83,7 +83,7 @@ use two_bot_core::{
     ModerationAction, ModerationActor, ModerationGates, ModerationPolicy, ModerationTarget,
 };
 use two_bot_cutover::{internal_settings::execute_settings, settings::SettingsStore};
-use two_bot_discord::executor::member::MemberOutcome;
+use two_bot_discord::executor::member::{MemberOutcome, RoleAssignmentReport};
 use two_bot_discord::internal_actions::{
     supports_event_mutation, AnnouncementExecutor, ExecutionOutcome, Refusal,
 };
@@ -211,7 +211,7 @@ trait MemberEffect: Send + Sync {
         guild_id: &'a str,
         bot_user_id: &'a str,
         request: &'a RoleAssignRequest<'a>,
-    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>>;
+    ) -> BoxFuture<'a, Result<RoleAssignmentReport, ActionError>>;
     fn execute_add<'a>(
         &'a self,
         guild_id: &'a str,
@@ -227,9 +227,9 @@ impl MemberEffect for ActionExecutor {
         guild_id: &'a str,
         bot_user_id: &'a str,
         request: &'a RoleAssignRequest<'a>,
-    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>> {
+    ) -> BoxFuture<'a, Result<RoleAssignmentReport, ActionError>> {
         Box::pin(async move {
-            self.assign_internal_role(guild_id, bot_user_id, request)
+            self.assign_internal_role_report(guild_id, bot_user_id, request)
                 .await
         })
     }
@@ -1951,6 +1951,7 @@ async fn execute_member(
             target_id: Some(target),
             actor_id: None,
             resolved_role_id: role,
+            ..AuditSubject::default()
         }
     };
     let Some(caller) = state.config.caller_for(&decision.key_id) else {
@@ -2013,6 +2014,7 @@ async fn execute_member(
                 .member
                 .execute_assign(guild_id, &bot_user_id, &request)
                 .await
+                .map(|report| (report.outcome, Some(report)))
         }
         Validated::Add { .. } => {
             let request = match GuildAddMemberRequest::validate(&decision.body) {
@@ -2063,11 +2065,11 @@ async fn execute_member(
             let result = state.member.execute_add(guild_id, &request, &token).await;
             // Drop the secret at once; the `String` lives only for this call.
             drop(token);
-            result
+            result.map(|outcome| (outcome, None))
         }
     };
     match outcome {
-        Ok(member_outcome) => {
+        Ok((member_outcome, role_report)) => {
             let affected = u32::from(matches!(
                 member_outcome,
                 MemberOutcome::Added | MemberOutcome::Assigned
@@ -2078,7 +2080,15 @@ async fn execute_member(
                 outcome: None,
                 stop_reason: None,
             };
-            if let Err(finish_error) = state.store.finish(&claim, &response).await {
+            let finished = if let Some(report) = role_report {
+                state
+                    .store
+                    .finish_role_assignment(&claim, &response, &report)
+                    .await
+            } else {
+                state.store.finish(&claim, &response).await
+            };
+            if let Err(finish_error) = finished {
                 log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
@@ -2631,6 +2641,7 @@ async fn mutate_event(
     let subject = AuditSubject {
         guild_id: Some(DiscordId::new(guild_id).expect("staging guild ID")),
         target_id,
+        audit_event_key: Some(event_key.clone()),
         ..AuditSubject::default()
     };
     let Some(caller) = state.config.caller_for(&decision.key_id) else {

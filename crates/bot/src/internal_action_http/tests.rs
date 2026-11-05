@@ -165,12 +165,16 @@ impl MemberEffect for MockEffect {
         &'a self,
         _: &'a str,
         _: &'a str,
-        _: &'a RoleAssignRequest<'a>,
-    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>> {
+        request: &'a RoleAssignRequest<'a>,
+    ) -> BoxFuture<'a, Result<RoleAssignmentReport, ActionError>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self.outcome {
-                MockOutcome::Success | MockOutcome::Wait => Ok(MemberOutcome::Assigned),
+                MockOutcome::Success | MockOutcome::Wait => Ok(RoleAssignmentReport {
+                    outcome: MemberOutcome::Assigned,
+                    resolved_role_id: request.role_id().to_owned(),
+                    rank_key: None,
+                }),
                 MockOutcome::NoEffect => Err(ActionError::new(
                     ErrorCode::DiscordRejected,
                     "Discord refused the request",
@@ -2253,6 +2257,80 @@ async fn voice_snapshot_empty_guild_lists_rooms_with_zero_total() {
 // Keyless `botlog.read` (public-log projection over the internal audit)
 // ---------------------------------------------------------------------------
 
+#[tokio::test]
+async fn botlog_rank_identity_crosses_the_real_signed_member_receiver() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_botlog_read_flag(true);
+    let role = "222222222222222222";
+    let bot_role = "100000000000000010";
+    let api = MockEventApi::start_scripted(vec![
+        ScriptedEvent {
+            status: StatusCode::OK,
+            body: json!({"id":"999999999999999999","bot":true}),
+        },
+        ScriptedEvent {
+            status: StatusCode::OK,
+            body: json!({"roles":[]}),
+        },
+        ScriptedEvent {
+            status: StatusCode::OK,
+            body: json!({"roles":[bot_role]}),
+        },
+        ScriptedEvent {
+            status: StatusCode::OK,
+            body: json!([
+                {"id":staging_guild(),"name":"everyone","position":0,"managed":false},
+                {"id":role,"name":"Prospect","position":1,"managed":false},
+                {"id":"100000000000000006","name":"Member","position":2,"managed":false},
+                {"id":"100000000000000007","name":"Soldier","position":3,"managed":false},
+                {"id":"100000000000000008","name":"Veteran","position":4,"managed":false},
+                {"id":"100000000000000009","name":"Legend","position":5,"managed":false},
+                {"id":bot_role,"name":"bot","position":10,"managed":true}
+            ]),
+        },
+        ScriptedEvent {
+            status: StatusCode::NO_CONTENT,
+            body: Value::Null,
+        },
+    ])
+    .await;
+    let member = Arc::new(
+        ActionExecutor::with_proxy("fixture-token".into(), Some(api.origin.clone())).unwrap(),
+    );
+    let app = router(Arc::new(ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+        member,
+        Arc::new(MockEventRead::default()),
+        Arc::new(MockEventMutate),
+        Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
+    )));
+    let raw = r#"{"action":"role.assign","discord_id":"111111111111111111","role_key":"member"}"#;
+    let (status, _, first) = answer(app.clone(), signed(raw, "old", "rank-before-snapshot")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["result"], json!({"outcome":"assigned"}));
+    let (status, _, feed) = answer(app.clone(), signed_read(&botlog_payload(), "old")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(feed["result"]["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        feed["result"]["entries"][0]["detail"], "prospect",
+        "the caller's member key is not rank identity"
+    );
+    let (status, _, replay) = answer(app, signed(raw, "old", "rank-before-snapshot")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["result"], replay["result"]);
+    assert_eq!(
+        api.count(),
+        5,
+        "the real receiver adds only its existing bot identity read"
+    );
+    set_botlog_read_flag(false);
+    db.close().await.unwrap();
+}
+
 fn botlog_payload() -> String {
     serde_json::json!({"action": "botlog.read"}).to_string()
 }
@@ -2266,7 +2344,7 @@ fn set_botlog_read_flag(on: bool) {
 }
 
 /// Seed one terminal success the projection can name: an event create (named
-/// through the reverse key map), an announcement (named by its channel key)
+/// by its immutable request key), an announcement (named by its channel key)
 /// or a membership arrival.
 async fn seed_botlog_row(pool: &sqlx::PgPool, key: &str, action: &str, target: Option<&str>) {
     let store = InternalActionStore::new(pool.clone());
@@ -2276,6 +2354,7 @@ async fn seed_botlog_row(pool: &sqlx::PgPool, key: &str, action: &str, target: O
         actor_id: Some(DiscordId::new("234567890123456789").unwrap()),
         target_id: target.map(|id| DiscordId::new(id).unwrap()),
         resolved_role_id: None,
+        audit_event_key: (action == "event.upsert").then(|| "launch".to_owned()),
     };
     let claim = match store.claim(&identity, &subject).await.unwrap() {
         InternalClaim::Claimed(claim) => claim,
