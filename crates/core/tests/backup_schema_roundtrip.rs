@@ -828,8 +828,37 @@ async fn dirty_target(pool: &PgPool) {
          UPDATE guild_settings SET updated_by = 'target-only'; \
          UPDATE guild_settings_revision SET revision = 9999; \
          INSERT INTO guild_settings_audit (id, guild_id, key, actor) VALUES (5000, 'target-only', 'target-only', 'target-only'); \
-         INSERT INTO internal_discord_events (event_hash) VALUES (repeat('9', 64));",
+         INSERT INTO internal_discord_events (event_hash) VALUES (repeat('9', 64)); \
+         INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at) \
+             SELECT h, 3, 6, h + interval '10 minutes' \
+             FROM generate_series(date_trunc('hour', now()) - interval '72 hours', \
+                                  date_trunc('hour', now()) - interval '70 hours', \
+                                  interval '1 hour') AS h;",
     ).execute(pool).await.unwrap();
+}
+
+/// `voice_heat_hours` is excluded from archives, so restore must clear the
+/// target's stale rows: the grid then degrades to 168 gap cells, not a mix of
+/// pre-restore hours and fresh samples.
+async fn assert_voice_heat_cleared(pool: &PgPool) {
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "restore clears excluded voice_heat_hours");
+    two_bot_core::apply_web_contract(pool).await.unwrap();
+    let grid: Vec<(Option<f64>, Option<String>, String)> =
+        sqlx::query_as("SELECT avg_in_voice, measured_through, source FROM web_v1.voice_heat")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(grid.len(), 168, "the grid always has every cell");
+    assert!(
+        grid.iter().all(|(avg, through, source)| avg.is_none()
+            && through.is_none()
+            && source == "insufficient"),
+        "cleared heat is all gaps, never measured"
+    );
 }
 
 fn store_inventory_command() -> Command {
@@ -1325,6 +1354,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         .await
         .unwrap();
     assert_eq!(cooldowns, 0, "excluded throttles are not replayed");
+    assert_voice_heat_cleared(pool).await;
     assert_guards_work(pool).await;
 
     let mut reversed = copy_contents(&contents);
@@ -1370,6 +1400,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
             "reversed complete rows: {revision_mode}/{audit_mode}"
         );
         assert_fresh_cas_tokens(pool, cas_before).await;
+        assert_voice_heat_cleared(pool).await;
         assert_eq!(
             triggers(pool).await,
             modes_before,
@@ -2014,6 +2045,14 @@ async fn restore_sql_failures_and_late_sequence_exhaustion_roll_back_data_guards
                 snapshot(pool, &tables).await,
                 before,
                 "rollback every table including cooldowns/ledgers"
+            );
+            let heat: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                heat, 3,
+                "failed restore keeps the target's excluded heat rows"
             );
             assert_eq!(
                 triggers(pool).await,

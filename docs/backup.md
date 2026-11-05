@@ -253,8 +253,10 @@ queue bound to a gateway session), `automation_command_registry_resync`
 the complete custom-command set on boot regardless) and `voice_heat_hours`
 (short-lived derived rolling calibration; a recovered process re-samples from
 the live gateway cache, and the heat grid degrades honestly to "estimate" on
-gaps). The store chain's `rollback_journal` and
-`rollback_watermarks` are excluded too: the journal is append-only
+gaps). Restore truncates the target's `voice_heat_hours` in the same locked
+transaction as the archived tables (skipped when absent, never CASCADE), so
+`web_v1.voice_heat` starts as 168 gap cells; a failed restore keeps the rows.
+The store chain's `rollback_journal` and `rollback_watermarks` are excluded too: the journal is append-only
 cutover evidence (the `PgFunnelStore` funnel append and the production
 gateway batch writer in `crates/cutover/src/gateway_session.rs` journal each
 `events` insert inside the primary transaction under a savepoint best-effort

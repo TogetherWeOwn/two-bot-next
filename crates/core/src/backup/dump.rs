@@ -46,6 +46,10 @@ pub enum DbDumpError {
     Refused(String),
 }
 
+/// Excluded from archives but owned by no restored row: restore truncates them
+/// so stale derived rows cannot mix with the recovered process's fresh samples.
+const CLEARED_EXCLUDED_TABLES: &[&str] = &["voice_heat_hours"];
+
 /// Total, locale-independent order even for composite keys or tables without
 /// a primary key. Text output is the archive's representation; equal sort keys
 /// therefore mean identical archived rows (including JSON and binary columns).
@@ -516,6 +520,15 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             target_tables.push(*name);
         }
     }
+    // Excluded-but-cleared tables join the same lock/truncate set so a restore
+    // never leaves stale target rows beside re-sampled data. Absent on historical
+    // targets: skip, never CASCADE.
+    let mut cleared_tables = target_tables.clone();
+    for name in CLEARED_EXCLUDED_TABLES {
+        if !columns_of(&mut tx, name).await?.is_empty() {
+            cleared_tables.push(*name);
+        }
+    }
     // Lock before changing guards. Only two named application triggers are
     // suspended, never FK/check constraints or session_replication_role. ALTER
     // TABLE is transactional: error/cancellation rolls back data AND guards.
@@ -523,7 +536,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     // https://www.postgresql.org/docs/16/sql-altertable.html
     sqlx::query(audited(format!(
         "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
-        target_tables.join(", ")
+        cleared_tables.join(", ")
     )))
     .execute(&mut *tx)
     .await?;
@@ -575,7 +588,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     // A single explicit truncate covers all FK dependencies, without CASCADE
     // touching foreign/website tables. No RESTART IDENTITY: that would discard
     // the target's own high-water mark, which the restarts below preserve.
-    sqlx::query(audited(format!("TRUNCATE {}", target_tables.join(", "))))
+    sqlx::query(audited(format!("TRUNCATE {}", cleared_tables.join(", "))))
         .execute(&mut *tx)
         .await?;
     // Cooldowns are intentionally not archived; discard stale target throttles.

@@ -44,6 +44,10 @@ pub const NAMES: [&str; 4] = [
 mod tests;
 
 #[cfg(test)]
+#[path = "voice_heat_boot_tests.rs"]
+mod voice_heat_boot_tests;
+
+#[cfg(test)]
 #[path = "website_snapshot_tests.rs"]
 mod snapshot_tests;
 
@@ -313,6 +317,14 @@ pub async fn serve(
         // The settings poll is DB-only: register it before REST construction
         // so a bad DISCORD_API_BASE cannot park hot reload.
         registered.push(crate::settings_jobs::job(url));
+        // Heat sampling also needs no REST executor or feature gate. A bad
+        // REST origin must not prevent cache observations or hourly DB flushes.
+        registered.push(crate::voice_heat::job(
+            url,
+            guild,
+            voice_cache.clone(),
+            gateway.gateway.clone(),
+        ));
         // Lazy connection preserves parked/startup behavior; every wire attempt
         // still fails closed on this same runtime database authority.
         let rest = admission_pool(url).and_then(|pool| {
@@ -405,14 +417,6 @@ pub async fn serve(
                 } else {
                     parked.push(crate::lfg_jobs::NAME);
                 }
-                // Voice-heat sampler: gateway-gated, DB-backed, no REST or
-                // feature gate. Skipped ticks record nothing; completed hours
-                // flush to `voice_heat_hours` for the `web_v1.voice_heat` grid.
-                registered.push(crate::voice_heat::job(
-                    context.clone(),
-                    voice_cache.clone(),
-                    gateway.gateway.clone(),
-                ));
                 // Repeat-history expiry rides the shared supervisor.
                 if crate::automod_gateway::enabled() {
                     registered.push(crate::automod_gateway::expiry_job(automod));

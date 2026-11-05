@@ -14,7 +14,10 @@
 //! retried flush writes nothing). Completed buckets stay buffered until a
 //! successful flush, including across connection failures and cancelled ticks.
 //! A transient database failure returns [`ErrorClass::Database`] for a bounded
-//! retry.
+//! retry. The contract's hourly buffer is deliberately process-local: restart
+//! loses unflushed observations, including the open hour. Those remain coverage
+//! gaps (not invented zeros); a lost hour can make the shared grid insufficient
+//! until it leaves the 28-day window. This is not a durable sampling journal.
 
 use std::{
     collections::BTreeMap,
@@ -22,7 +25,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::RwLock;
+use tokio::sync::{OnceCell, RwLock};
 use twilight_cache_inmemory::DefaultInMemoryCache;
 use two_bot_core::voice_heat_store::{self, HourBucket};
 use two_bot_core::Snowflake;
@@ -31,8 +34,15 @@ use crate::{
     gateway::GatewayState,
     jobs::{self, ErrorClass, Job},
     voice_snapshot,
-    website_jobs::Context,
 };
+
+/// No REST dependency: registration needs only gateway prerequisites, and the
+/// DML-only pool is opened lazily when a completed bucket is ready to flush.
+struct Context {
+    url: String,
+    pool: OnceCell<sqlx::PgPool>,
+    guild: Snowflake,
+}
 
 /// Supervised job name, also the `/readyz` status entry.
 pub const NAME: &str = "voice_heat";
@@ -128,10 +138,16 @@ impl Accumulator {
 /// read from, and the accumulator across ticks.
 #[must_use]
 pub fn job(
-    context: Arc<Context>,
+    database_url: &str,
+    guild: Snowflake,
     cache: Arc<DefaultInMemoryCache>,
     gateway: Arc<RwLock<GatewayState>>,
 ) -> Job {
+    let context = Arc::new(Context {
+        url: database_url.to_owned(),
+        pool: OnceCell::new(),
+        guild,
+    });
     let accumulator = Arc::new(Mutex::new(Accumulator::default()));
     Job {
         name: NAME,
@@ -161,11 +177,7 @@ async fn tick(
     if !matches!(*gateway.read().await, GatewayState::Connected) {
         return Ok(());
     }
-    let guild: Snowflake = context
-        .guild
-        .parse()
-        .map_err(|_| ErrorClass::Configuration)?;
-    let total = match voice_snapshot::read_voice_snapshot(cache, guild) {
+    let total = match voice_snapshot::read_voice_snapshot(cache, context.guild) {
         Ok(value) => value
             .get("total_in_voice")
             .and_then(serde_json::Value::as_u64)
@@ -185,8 +197,20 @@ async fn tick(
     if buckets.is_empty() {
         return Ok(());
     }
-    let pool = context.pool().await?.clone();
-    if let Err(err) = voice_heat_store::flush_hour_buckets(&pool, &buckets).await {
+    let pool = context
+        .pool
+        .get_or_try_init(|| async {
+            let db = two_bot_cutover::connect(
+                &context.url,
+                two_bot_cutover::DB_POOL_MAX_DEFAULT,
+                true, // Runtime is DML-only; migrations/views are provisioned first.
+            )
+            .await
+            .map_err(|_| ErrorClass::Database)?;
+            Ok::<_, ErrorClass>(db.pool().clone())
+        })
+        .await?;
+    if let Err(err) = voice_heat_store::flush_hour_buckets(pool, &buckets).await {
         let reason = match &err {
             voice_heat_store::VoiceHeatStoreError::Db(inner) => crate::db_log::db_class(inner),
         };
@@ -335,6 +359,44 @@ mod tests {
             (late.samples, late.occupancy_sum)
         );
         assert_ne!(early.last_observed_at, late.last_observed_at);
+    }
+
+    #[test]
+    fn restart_leaves_unflushed_observations_as_gaps() {
+        let mut before_restart = Accumulator::default();
+        for minute in (0..60).step_by(5) {
+            before_restart.record(hour(9) + time::Duration::minutes(minute), 4);
+        }
+        assert_eq!(before_restart.completed(hour(10))[0].samples, 12);
+        drop(before_restart);
+        let mut after_restart = Accumulator::default();
+        assert!(after_restart.completed(hour(10)).is_empty());
+        after_restart.record(hour(10), 0);
+        let pending = after_restart.completed(hour(11));
+        assert_eq!(pending.len(), 1, "no synthetic row for the lost hour");
+        assert_eq!(pending[0].hour_start, hour(10));
+        assert_eq!((pending[0].samples, pending[0].occupancy_sum), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn cache_only_ticks_preserve_gaps_without_opening_a_pool() {
+        let context = Arc::new(Context {
+            url: "not a database URL".to_owned(),
+            pool: OnceCell::new(),
+            guild: 2222,
+        });
+        let cache = voice_snapshot::new_shared_cache();
+        let gateway = Arc::new(RwLock::new(GatewayState::Armed));
+        let accumulator = Arc::new(Mutex::new(Accumulator::default()));
+        tick(&context, &cache, &gateway, &accumulator)
+            .await
+            .unwrap();
+        *gateway.write().await = GatewayState::Connected;
+        tick(&context, &cache, &gateway, &accumulator)
+            .await
+            .unwrap();
+        assert!(context.pool.get().is_none(), "skips never open the DB");
+        assert_eq!(accumulator.lock().unwrap().len(), 0);
     }
 
     #[test]
