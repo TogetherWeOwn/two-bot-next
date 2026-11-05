@@ -72,9 +72,9 @@ AUTHORITY_RECORDS = {
                          "principal_refs": Array(REF, 7, 7),
                          "controller_ref": REF, "verifier_ref": REF,
                          "installation_mapping_ref": REF, "history_ref": REF,
-                         "stage_bindings": Array({"purpose": enum("runtime", "installation"),
+                         "stage_bindings": Array({"purpose": enum("runtime", "installation", "recovery"),
                              "role": enum("security", "qa"), "principal_ref": REF,
-                             "stage_id": UUID, "participant_id": UUID}, 4, 4)},
+                             "stage_id": UUID, "participant_id": UUID}, 6, 6)},
     "authority_scope": {"scope": SCOPE, "control": CONTROL, "policy": DOCUMENT,
                         "source_sha256": SHA256, "consumers_sha256": SHA256,
                         "implementation": MANIFEST, "resource_plan": DOCUMENT,
@@ -403,9 +403,28 @@ DELIVERY_RECORDS = {
             "replay": {"kind": enum("replay"), **DELIVERY_EVENT, "row": DELIVERY_ROW},
         }), 1, 16)},
 }
-# This finite plan is NOT a recovery grant. In particular it cannot be resolved
-# as execution_authority or as lifecycle.restoration_authority_ref.
+# Recovery scope/grant/consumption claims are distinct from runtime grants.
+# Neither these records nor a plan authenticates authority or supplies a fence.
 RECOVERY_RECORDS = {
+    "recovery_scope": {
+        "purpose": enum("owned_recovery_only"), "runtime_scope_sha256": SHA256,
+        "source_sha256": SHA256, "consumers_sha256": SHA256,
+        "plan_ref": REF, "plan_sha256": SHA256, "resource_plan": DOCUMENT,
+        "owner": PRINCIPAL, "run": RUN, "epoch": SERVICE_ID, "resource_epoch": SERVICE_ID,
+    },
+    "recovery_authority": {
+        "ref": REF, "purpose": enum("owned_recovery_only"), "source_ref": REF,
+        "scope_ref": REF, "scope_sha256": SHA256, "epoch": SERVICE_ID,
+        "resource_epoch": SERVICE_ID, "generation": SERVICE_ID, "run": RUN,
+        "owner": PRINCIPAL, "nonce_ref": REF, "consumption_ref": REF,
+        "not_before": UTC, "expires_at": UTC, "decisions": Array(DECISION, 2, 2),
+    },
+    "recovery_nonce_consumption": {
+        "source_ref": REF, "recovery_ref": REF, "scope_sha256": SHA256,
+        "nonce_ref": REF, "run": RUN, "owner_ref": REF, "consumed_at": UTC,
+        "authority_epoch": SERVICE_ID, "resource_epoch": SERVICE_ID,
+        "outcome": enum("consumed", "replayed", "unknown"),
+    },
     "recovery_plan_content": {
         "purpose": enum("owned_recovery_only"), "run": RUN,
         "contract": DOCUMENT, "policy": DOCUMENT, "implementation": MANIFEST,

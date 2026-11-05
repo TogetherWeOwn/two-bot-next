@@ -1,13 +1,14 @@
 """Offline finite recovery-plan comparisons, NOT recovery authority or execution.
 
-The resource-plan digest binds this closed plan, not a caller allowlist. No
-recovery grant, authority read/history, nonce consumption or mutation fence is
-implemented here. The mandatory lifecycle-phase checker still refuses cleanup;
-a copied execution grant or this plan cannot replace separate recovery authority.
+The resource-plan digest binds a closed plan, not a caller allowlist. Separate
+scope/grant/decision/nonce claims are compared, never authenticated or consumed.
+Recovery reads/history and mutation fences remain unimplemented. The mandatory
+lifecycle-phase checker still refuses cleanup, regardless of these comparisons.
 """
 
 from datetime import timedelta
 
+from announcement_runtime_authority import _authority_source_claims, _decisions
 from announcement_runtime_evidence import canonical_digest
 from announcement_runtime_lifecycle import check_lifecycle_ledger_claims
 from announcement_runtime_provenance import _index, _unique_refs
@@ -95,3 +96,67 @@ def check_recovery_plan_claims(receipt, evidence, now):
                                     else "db_cas"), "recovery_method")
         final = evidence.resolve(resource["after_state_ref"], "resource_state")
         require(utc(final["observed_at"]) < expiry, "recovery_final_time")
+
+
+def check_recovery_grant_claims(receipt, evidence, now):
+    """Compare a separate grant and nonce claim; NOT a recovery authority graph.
+
+    This composes plan consistency with declared source/consumer/principal and
+    ordered decision bindings. Runtime authority/provenance checks remain
+    mandatory upstream. No current recovery reads, complete history, installation
+    revalidation or boundary fence is proved, so lifecycle cleanup still refuses.
+    In particular successful comparison cannot make an expired grant usable.
+    """
+    check_recovery_plan_claims(receipt, evidence, now)
+    authority, lifecycle, attempt = receipt["authority"], receipt["lifecycle"], receipt["attempt"]
+    source, principals, consumers, stages = _authority_source_claims(receipt, evidence)
+    plan = evidence.resolve(RECOVERY_PLAN_REF, "recovery_plan_content")
+    grant_ref = lifecycle["restoration_authority_ref"]
+    grant = evidence.resolve(grant_ref, "recovery_authority")
+    require(grant["ref"] == grant_ref and grant["source_ref"] == authority["source_ref"] and
+            grant["run"] == attempt["run"] and
+            grant["resource_epoch"] == attempt["enforcement_epoch"] and
+            grant["owner"] == plan["owner"] == principals["controller"], "recovery_grant")
+    # The separate recovery epoch may differ from runtime's epoch. Exact recovery
+    # decisions and the claimed nonce use must all agree on it; no epoch is minted.
+    scope = evidence.resolve(grant["scope_ref"], "recovery_scope")
+    require(scope == {
+        "purpose": "owned_recovery_only", "runtime_scope_sha256": authority["scope_sha256"],
+        "source_sha256": canonical_digest(source), "consumers_sha256": canonical_digest(consumers),
+        "plan_ref": RECOVERY_PLAN_REF, "plan_sha256": canonical_digest(plan),
+        "resource_plan": receipt["resources"]["plan"], "owner": plan["owner"],
+        "run": attempt["run"], "epoch": grant["epoch"],
+        "resource_epoch": attempt["enforcement_epoch"],
+    } and canonical_digest(scope) == grant["scope_sha256"], "recovery_grant_scope")
+    require(grant["not_before"] == plan["not_before"] and
+            grant["expires_at"] == plan["expires_at"], "recovery_grant_lease")
+    execution = authority["execution"]
+    refs = [grant_ref, grant["scope_ref"], grant["nonce_ref"], grant["consumption_ref"]]
+    require(len(refs) == len(set(refs)) and not set(refs).intersection(
+        (execution["ref"], execution["nonce_ref"], execution["consumption_ref"],
+         RECOVERY_PLAN_REF, authority["source_ref"])), "recovery_grant_separation")
+    decisions = grant["decisions"]
+    _decisions(decisions, grant["scope_sha256"], grant["epoch"], principals,
+               utc(grant["not_before"]), stages, "recovery")
+    prior = list(authority["decisions"])
+    for ref in authority["installation_approval_refs"]:
+        prior.extend(evidence.resolve(ref, "installation_approval")["decisions"])
+    for field in ("ref", "decision_id", "stage_id", "participant_id"):
+        require(not {d[field] for d in decisions}.intersection(d[field] for d in prior),
+                "recovery_decision_separation")
+    for decision in decisions:
+        record = evidence.resolve(decision["ref"], "authority_decision")
+        require(record == {"claim": decision, "source_ref": authority["source_ref"],
+            "security_round": decisions[0]["round"], "generation": grant["generation"]},
+            "recovery_decision_binding")
+    consumed = evidence.resolve(grant["consumption_ref"], "recovery_nonce_consumption")
+    require(consumed == {
+        "source_ref": authority["source_ref"], "recovery_ref": grant_ref,
+        "scope_sha256": grant["scope_sha256"], "nonce_ref": grant["nonce_ref"],
+        "run": attempt["run"], "owner_ref": plan["owner"]["ref"],
+        "consumed_at": consumed["consumed_at"], "authority_epoch": grant["epoch"],
+        "resource_epoch": attempt["enforcement_epoch"], "outcome": "consumed",
+    }, "recovery_nonce_binding")
+    first_cleanup = min(utc(claim["observed_at"]) for claim in lifecycle["cleanup"])
+    require(utc(grant["not_before"]) <= utc(consumed["consumed_at"]) <= first_cleanup <
+            utc(grant["expires_at"]), "recovery_nonce_time")

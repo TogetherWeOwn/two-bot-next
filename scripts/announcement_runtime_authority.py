@@ -91,28 +91,9 @@ def _decisions(decisions, scope, epoch, principals, checked, stage_bindings, pur
                 binding["participant_id"] == decision["participant_id"], "decision_stage")
 
 
-def check_authority_graph_claims(receipt, evidence, now):
-    """Resolve authority claims and reject inconsistent scope/history/fence data.
-
-    This is not the independent verifier and never returns a runtime capability.
-    A future approved adapter must authenticate every claimed principal, source,
-    complete history and boundary atomically outside candidate/caller control.
-    No endpoint or provisioning reference from this graph selects that adapter.
-    Other receipt predicates and final all-used accounting remain mandatory.
-    """
-    validate_receipt_shape(receipt)
-    require(type(evidence) is EvidenceIndex, "evidence_index")
-    require(type(now) is datetime and now.tzinfo is timezone.utc, "clock")
-    authority, attempt, control = receipt["authority"], receipt["attempt"], receipt["control"]
-    run = attempt["run"]
-    evidence.require_run(run)
-    start, expiry = check_lease(authority["execution"]["not_before"],
-                               authority["execution"]["expires_at"], now)
-    attempt_start, attempt_end = utc(attempt["started_at"]), utc(attempt["ended_at"])
-    require(start <= attempt_start < attempt_end <= now < expiry, "authority_window")
-    require(authority["execution"]["run"] == run and
-            run["control_sha"] == control["version"]["commit"] and
-            attempt["actor"] == authority["caller"], "authority_attempt")
+def _authority_source_claims(receipt, evidence):
+    """Compare declared source/principal/consumer bindings, not a trust root."""
+    authority, control = receipt["authority"], receipt["control"]
     source_ref = authority["source_ref"]
     source = evidence.resolve(source_ref, "authority_source")
     require(source["repository"] == receipt["scope"]["repository"] and
@@ -120,7 +101,7 @@ def check_authority_graph_claims(receipt, evidence, now):
             source["installation_mapping_ref"] == control["installation"]["mapping_ref"],
             "authority_source")
     stage_bindings = {(x["purpose"], x["role"]): x for x in source["stage_bindings"]}
-    require(set(stage_bindings) == {(purpose, role) for purpose in ("runtime", "installation")
+    require(set(stage_bindings) == {(purpose, role) for purpose in ("runtime", "installation", "recovery")
                                     for role in ("security", "qa")}, "stage_mapping")
     for key in ("stage_id", "participant_id"):
         _unique([x[key] for x in stage_bindings.values()], "stage_mapping")
@@ -147,6 +128,34 @@ def check_authority_graph_claims(receipt, evidence, now):
         consumers[role] = consumer
     require(consumers["controller"]["provisioning_ref"] !=
             consumers["verifier"]["provisioning_ref"], "consumer_independence")
+
+    return source, principals, consumers, stage_bindings
+
+
+def check_authority_graph_claims(receipt, evidence, now):
+    """Resolve authority claims and reject inconsistent scope/history/fence data.
+
+    This is not the independent verifier and never returns a runtime capability.
+    A future approved adapter must authenticate every claimed principal, source,
+    complete history and boundary atomically outside candidate/caller control.
+    No endpoint or provisioning reference from this graph selects that adapter.
+    Other receipt predicates and final all-used accounting remain mandatory.
+    """
+    validate_receipt_shape(receipt)
+    require(type(evidence) is EvidenceIndex, "evidence_index")
+    require(type(now) is datetime and now.tzinfo is timezone.utc, "clock")
+    authority, attempt, control = receipt["authority"], receipt["attempt"], receipt["control"]
+    run = attempt["run"]
+    evidence.require_run(run)
+    start, expiry = check_lease(authority["execution"]["not_before"],
+                               authority["execution"]["expires_at"], now)
+    attempt_start, attempt_end = utc(attempt["started_at"]), utc(attempt["ended_at"])
+    require(start <= attempt_start < attempt_end <= now < expiry, "authority_window")
+    require(authority["execution"]["run"] == run and
+            run["control_sha"] == control["version"]["commit"] and
+            attempt["actor"] == authority["caller"], "authority_attempt")
+    source_ref = authority["source_ref"]
+    source, principals, consumers, stage_bindings = _authority_source_claims(receipt, evidence)
 
     for claim in (authority["policy"], authority["resource_plan"], receipt["scope"]["contract"],
                   receipt["resources"]["plan"], receipt["resources"]["identity_map"]):

@@ -65,8 +65,10 @@ not canonical staging qualification or production promotion.
   resolution. The content-bound scope compares exact source/control/code/policy,
   resource/identity/operation-plan pins, image/components, epochs and the full
   principal/source/consumer mapping. Seven distinct subjects have fixed role
-  claims; runtime and installation decisions bind separate native stage and
-  participant mappings, ordered Security→QA, exact scope and Security round.
+  claims; runtime, installation and recovery purposes have six distinct native
+  stage/participant bindings. Runtime and installation decisions bind ordered
+  Security→QA, exact scope and Security round; the separate partial recovery-grant
+  comparison below applies the same decision predicates to its own scope.
   Both consumers must claim separate provisioning and matching complete
   effective decision histories at each mandatory checkpoint. Every effective
   decision must already exist at its read/history timestamp. History snapshots
@@ -468,13 +470,29 @@ not canonical staging qualification or production promotion.
   comparison still checks the prior-value projection and actual ledger equality.
   **This is a finite plan comparison, not separate recovery authority.** The
   plan is not an execution grant and cannot substitute for either an ordinary
-  execution grant or `restoration_authority_ref`. The latter remains deliberately
-  unresolved: independent recovery decisions/history/reads, one-use recovery
-  nonce, mutation-boundary fences, actual ownership/CAS tokens, full-row state,
-  process/Worker restoration and final verification are unfinished. The mandatory
-  lifecycle-phase checker still refuses cleanup, and the CLI/runtime stay HOLD.
-  Existing partial resource fixtures carry only a placeholder recovery-plan
-  hash and do not claim a complete plan or successful lifecycle.
+  execution grant or `restoration_authority_ref`. Existing partial resource
+  fixtures carry only a placeholder recovery-plan hash and do not claim a
+  complete plan or successful lifecycle.
+  `check_recovery_grant_claims` separately resolves the restoration reference as
+  a closed `recovery_authority`, with distinct `recovery_scope` and
+  `recovery_nonce_consumption` records. Scope binds the runtime scope digest,
+  exact source/consumer definitions, complete finite plan/resource-plan digests,
+  owner, same run and recovery/resource epochs. The grant must match the plan's
+  exact lease and resource-owning controller, use its own recovery Security→QA
+  decisions/stages/participants and bind complete decision sidecars, generation
+  and Security round. Neither runtime nor installation decision identities may
+  be reused. Its grant/scope/nonce/consumption references must be distinct from
+  one another and from runtime authority references. Nonce use claims bind exact
+  scope/run/owner/epochs, declare `consumed` and precede first cleanup within the
+  lease; nothing actually consumes trusted state. Runtime nonce records cannot
+  substitute by relabeling their reference. This is **partial grant consistency,
+  not a separate authenticated recovery authority graph**. Runtime scope checks
+  remain mandatory upstream; recovery current reads/history, installation
+  revalidation and mutation-boundary fences are still missing. Actual ownership/
+  CAS tokens, full-row state, process/Worker restoration and final verification
+  remain unfinished. The mandatory lifecycle-phase checker still refuses cleanup,
+  and the CLI/runtime stay unconditional HOLD. Retrospective grant consistency
+  never makes a grant usable after expiry or supplies missing boundary freshness.
 - `scripts/announcement_runtime_drain.py` resolves four closed work-inventory,
   snapshot, fence and drain claim kinds alongside the lifecycle-ledger comparison.
   The declared finite surface inventory is content-bound to the scoped inventory
@@ -582,7 +600,7 @@ must not be called as a substitute for any canonical admission control.
 ## Offline claim-checking entry point
 
 `scripts/announcement_runtime_check.py` composes bounded archive intake,
-closed same-run typed sidecars, all nineteen existing public claim comparisons
+closed same-run typed sidecars, all twenty existing public claim comparisons
 and final all-used sidecar accounting. It is **not an independently provisioned
 verifier, receipt producer or runtime admission path**. The local Git topology
 collector is not invoked; authenticated source/service inventories, complete

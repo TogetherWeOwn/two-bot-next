@@ -111,7 +111,8 @@ def drain_fixture(prior="absent"):
                             "participant_id": str(n) * 8 + "-3333-4333-8333-333333333333"}
                            for n, (purpose, role) in enumerate((
                                ("runtime", "security"), ("runtime", "qa"),
-                               ("installation", "security"), ("installation", "qa")), 1)]})
+                               ("installation", "security"), ("installation", "qa"),
+                               ("recovery", "security"), ("recovery", "qa")), 1)]})
     add("controller-consumer", "authority_consumer", {
         "principal": principal("principal-controller", CONTROLLER[0]), "role": "controller",
         "provisioning_ref": "controller-provisioning"})

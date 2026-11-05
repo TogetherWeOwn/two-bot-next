@@ -23,17 +23,18 @@ def principal(role):
             "identity_root_ref": "native-mapping-ref"}
 
 
-def decision(role, scope_digest, *, installation=False):
-    digit = ("a" if role == "security" else "b") if installation else (
-             "c" if role == "security" else "d")
-    prefix = "install-" if installation else "runtime-"
-    sec = ("a" if installation else "c") * 8 + "-1111-4111-8111-111111111111"
+def decision(role, scope_digest, *, installation=False, recovery=False):
+    digit = (("e" if role == "security" else "f") if recovery else
+             ("a" if role == "security" else "b") if installation else
+             ("c" if role == "security" else "d"))
+    prefix = "recovery-" if recovery else "install-" if installation else "runtime-"
+    sec = ("e" if recovery else "a" if installation else "c") * 8 + "-1111-4111-8111-111111111111"
     return {"ref": prefix + role, "role": role,
             "decision_id": digit * 8 + "-1111-4111-8111-111111111111",
             "stage_id": digit * 8 + "-2222-4222-8222-222222222222",
             "participant_id": digit * 8 + "-3333-4333-8333-333333333333", "round": 2,
             "principal": principal(role), "scope_sha256": scope_digest,
-            "epoch": "3" if installation else "7", "security_decision_id": sec,
+            "epoch": "11" if recovery else "3" if installation else "7", "security_decision_id": sec,
             "outcome": "approved",
             "decided_at": "2025-12-31T23:" + ("41:00" if role == "security" else "42:00") + "Z"}
 
@@ -69,9 +70,10 @@ def authority_fixture():
                            "provisioning_ref": role + "-provisioning"}
         add(role + "-consumer", "authority_consumer", consumers[role])
     stages = []
-    for purpose in ("runtime", "installation"):
+    for purpose in ("runtime", "installation", "recovery"):
         for role in ("security", "qa"):
-            d = decision(role, "0" * 64, installation=purpose == "installation")
+            d = decision(role, "0" * 64, installation=purpose == "installation",
+                         recovery=purpose == "recovery")
             stages.append({"purpose": purpose, "role": role, "principal_ref": "principal-" + role,
                            "stage_id": d["stage_id"], "participant_id": d["participant_id"]})
     source = {"repository": receipt["scope"]["repository"], "policy": a["policy"],
