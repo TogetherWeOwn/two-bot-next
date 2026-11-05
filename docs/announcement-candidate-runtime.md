@@ -359,6 +359,46 @@ unsupported profile. A successful consistency predicate is not authenticated
 independent authority, external containment or an observation. These modules
 must not be called as a substitute for any canonical admission control.
 
+## Offline claim-checking entry point
+
+`scripts/announcement_runtime_check.py` composes bounded archive intake,
+closed same-run typed sidecars, all thirteen existing public claim comparisons
+and final all-used sidecar accounting. It is **not an independently provisioned
+verifier, receipt producer or runtime admission path**. The local Git topology
+collector is not invoked; authenticated source/service inventories, complete
+business/lifecycle semantics and final authority/identity rereads remain missing.
+Even complete sidecar consumption would not prove that every opaque receipt
+reference resolves or that any claimed observation actually happened.
+
+From the reviewed tooling checkout, credential-free offline inspection is:
+
+```sh
+python3 scripts/announcement_runtime_check.py --archive candidate.zip --inventory inventory.json
+```
+
+The separate inventory is a closed JSON object with exactly `run` and `members`.
+`run` has exactly `run_id`, `attempt` and `control_sha` in the receipt's canonical
+formats; `members` has 1–257 entries with exactly `path`, `size` and `sha256`,
+matching the existing archive inventory. It binds all archived bytes and must
+match the receipt's run. It is **caller-supplied unauthenticated data**, not
+post-upload service inventory, approval or a verifier root. No endpoint, root,
+credential, alternate clock, allowlist or enable flag is accepted.
+
+Both inputs must be nonempty regular files: the archive is at most 32 MiB and
+the inventory at most 1 MiB. Descriptor-based intake refuses symlinks, FIFOs,
+devices and directories before reading; JSON/archive bounds still apply. No
+member is extracted, imported or executed, and no artifact is written. Always
+run the tool from reviewed tooling, never from an untrusted extraction directory.
+
+Every normal inspection invocation emits only a fixed sanitized JSON HOLD report
+and exits **1**, whether intake/claims refuse or all current comparisons agree.
+The latter still calls the unchanged unconditional `runtime_preflight()` refusal;
+even an accidental future preflight return cannot enable this offline CLI.
+Unexpected checker failures also remain adverse without echoing paths, input
+values or tracebacks. `--help` describes the offline interface, not admission.
+No command here performs a live probe, build, setup, credential use, rollout,
+effect, cleanup, restoration or promotion.
+
 ## Capability gaps and accountable roles
 
 The code's fixed `CAPABILITY_GAPS` ledger records these absent capabilities:
