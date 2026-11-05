@@ -972,6 +972,8 @@ def preflight_metadata_restore(metadata):
 def recreate_output_directory(path, metadata):
     """Restore ownership before mode (chown can clear setgid), under the slot lock."""
     path.mkdir(mode=0o700)
+    # mkdir applies umask; restore private owner access before the directory open.
+    path.chmod(0o700, follow_symlinks=False)
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         uid, gid, mode = metadata

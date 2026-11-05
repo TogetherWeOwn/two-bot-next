@@ -1344,6 +1344,48 @@ class SharedPoolRetainTests(unittest.TestCase):
         for path in expected:
             self.assertEqual(cache.directory_metadata(path), expected[path])
 
+    def test_restrictive_umask_restores_metadata_under_original_lock(self):
+        self.inventory['slots'] = [self.row('slot-1')]
+        slot = self.pool / 'slot-1'
+        lock_identity = cache._lock_path_identity(slot / 'lock')
+        original_lease = (slot / 'lease.json').read_bytes()
+        expected = {}
+        for name, mode in (('target', 0o2770), ('scratch', 0o1770)):
+            path = slot / name
+            path.chmod(mode)
+            expected[path] = cache.directory_metadata(path)
+        real_restore = cache.recreate_output_directory
+        restored = []
+
+        def restore(path, metadata):
+            self.assertEqual(cache._lock_path_identity(slot / 'lock'), lock_identity)
+            probe = os.open(slot / 'lock', os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+            self.assertEqual((slot / 'lease.json').read_bytes(), original_lease)
+            real_restore(path, metadata)
+            self.assertEqual(cache.directory_metadata(path), expected[path])
+            restored.append(path.name)
+
+        old_umask = os.umask(0o400)
+        try:
+            with patch.object(cache, 'recreate_output_directory', side_effect=restore):
+                result = self.by_slot(self.retain())['slot-1']
+        finally:
+            os.umask(old_umask)
+        self.assertTrue(result['eligible'], result)
+        self.assertTrue(result['directory_metadata_preserved'])
+        self.assertTrue(result['lock_held_through_mutation'])
+        self.assertEqual(restored, ['target', 'scratch'])
+        self.assertFalse((slot / 'lease.json').exists())
+        self.assertEqual(cache._lock_path_identity(slot / 'lock'), lock_identity)
+        for path, metadata in expected.items():
+            self.assertEqual(cache.directory_metadata(path), metadata)
+            self.assertEqual(list(path.iterdir()), [])
+
     def test_blocked_idle_stale_still_vetoes_live_references_and_foreign_output(self):
         slot = self.pool / 'slot-1'
         (slot / 'scratch' / 'retained').write_bytes(b'x' * self.policy['slot_budget_bytes'])
