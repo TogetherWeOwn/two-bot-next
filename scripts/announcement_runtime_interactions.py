@@ -14,7 +14,9 @@ from announcement_runtime_evidence import canonical_digest
 from announcement_runtime_inputs import INPUT_PLAN_REF
 from announcement_runtime_provenance import _index, _unique_refs
 from announcement_runtime_resources import PLAN_REF
-from announcement_runtime_schema import Integer, Text, _validate, enum, parse_bounded_json, require, utc
+from announcement_runtime_schema import (
+    Integer, SERVICE_ID, Text, _validate, enum, parse_bounded_json, require, utc,
+)
 from announcement_runtime_source import CANDIDATE, CANDIDATE_TREE
 
 
@@ -52,6 +54,51 @@ def _body(raw, method, positive, status):
             field: enum(actual) for field, actual in mentions.items()}})
         require(normalized == {"content": "RSVP saved: " + status + ".",
                                "allowed_mentions": MENTIONS}, "interaction_edit_body")
+
+
+def _eligibility_reads(exchange, case, effects, coverage, application, actor, event):
+    # C: discord/rsvp.rs guild_membership/check_live_event/revalidate_rsvp.
+    # Only minimal closed JSON responses are supported; no member profile,
+    # arbitrary event fields or private content is carried into this projection.
+    # These bytes are pinned CLAIMS, not authenticated raw platform responses.
+    reads = _index(exchange["eligibility_reads"], "operation_id", "eligibility_inventory")
+    selected = sorted((effects[ref] for ref in case["actual_effect_refs"]
+                       if effects[ref]["method"] in ("member_get", "event_get")),
+                      key=lambda effect: effect["sequence"])
+    require(reads.keys() == {effect["operation_id"] for effect in selected},
+            "eligibility_inventory")
+    if case["phase"] != "on":
+        require(not reads, "eligibility_inventory")
+        return
+    require([effect["method"] for effect in selected] ==
+            ["member_get", "event_get", "member_get", "event_get"], "eligibility_order")
+    writes = [effects[ref] for ref in case["actual_effect_refs"]
+              if effects[ref]["method"] == "db_insert"]
+    edit = next(effects[ref] for ref in case["actual_effect_refs"]
+                if effects[ref]["method"] == "interaction_edit")
+    # Complete each pre-read before the next read/write; complete the post-read
+    # pair before the success edit. Equality only reflects coarse UTC seconds.
+    deadlines = [selected[1], min(writes, key=lambda effect: effect["sequence"]),
+                 selected[3], edit]
+    guild = application["guild_id"]
+    for effect, deadline in zip(selected, deadlines):
+        record = reads[effect["operation_id"]]
+        member = effect["method"] == "member_get"
+        path = f"/guilds/{guild}/members/{actor}" if member else f"/guilds/{guild}/scheduled-events/{event}"
+        require(record["origin"] == "https://discord.com" and record["http_method"] == "GET" and
+                record["path"] == path and effect["payload_sha256"] == hashlib.sha256(b"").hexdigest(),
+                "eligibility_request")
+        require(record["observer_ref"] == coverage["observer_ref"] and
+                utc(effect["observed_at"]) <= utc(record["received_at"]) <= utc(deadline["observed_at"])
+                and utc(record["received_at"]) < utc(case["ended_at"]), "eligibility_observation")
+        require(record["http_status"] == 200, "eligibility_status")
+        body = parse_bounded_json(record["body_utf8"].encode("utf-8"))
+        if member:
+            _validate(body, {"user": {"id": SERVICE_ID}})
+            require(body["user"]["id"] == actor, "eligibility_member")
+        else:
+            _validate(body, {"id": SERVICE_ID, "guild_id": SERVICE_ID, "status": Integer(1, 3)})
+            require(body["id"] == event and body["guild_id"] == guild, "eligibility_event")
 
 
 def check_interaction_exchange_claims(receipt, evidence, now):
@@ -145,4 +192,5 @@ def check_interaction_exchange_claims(receipt, evidence, now):
             message_ids.append(readback["message_id"])
             used.append(operation)
         require(len(set(message_ids)) == 1, "interaction_original_message")
+        _eligibility_reads(exchange, case, effects, coverage, application, actor, event)
     _unique_refs(used)

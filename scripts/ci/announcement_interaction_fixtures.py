@@ -143,9 +143,23 @@ def interaction_fixture():
                              "application_id": request["application_id"],
                              "channel_id": channel, "flags": 192 if positive and is_ack else 64,
                              "content": "" if positive and is_ack else SAVED if positive else DISABLED}})
+        eligibility = []
+        for ref in case["actual_effect_refs"]:
+            effect = effects[ref]
+            if effect["method"] not in ("member_get", "event_get"):
+                continue
+            member = effect["method"] == "member_get"
+            eligibility.append({"operation_id": ref, "observer_ref": observer,
+                "origin": "https://discord.com", "http_method": "GET",
+                "path": f"/guilds/{application['guild_id']}/members/{actor}" if member else
+                    f"/guilds/{application['guild_id']}/scheduled-events/{event}",
+                "received_at": effect["observed_at"], "http_status": 200,
+                "body_utf8": raw({"user": {"id": actor}} if member else
+                    {"id": event, "guild_id": application["guild_id"], "status": 2})})
+            set_payload(receipt, records, ref, hashlib.sha256(b"").hexdigest())
         exchanges.append({"case_id": interaction["case_id"], "observer_ref": observer,
                           "received_at": ack["observed_at"], "request": request,
-                          "responses": responses})
+                          "responses": responses, "eligibility_reads": eligibility})
         if positive:
             set_platform_id(receipt, records, ack["operation_id"], message_id)
     records[EXCHANGES] = {"schema": records[PLAN]["schema"], "ref": EXCHANGES,

@@ -313,12 +313,27 @@ not canonical staging qualification or production promotion.
   Claimed initial ACK attempts three or more whole seconds after receipt refuse;
   original-response edits do not inherit that deadline. This coarse necessary
   comparison is not proof of actual Discord deadline compliance.
+  Each exchange also carries a closed finite eligibility-read list: empty for
+  off refusals; exactly member/event pre-read then member/event post-read for the
+  first RSVP. Exact GET origin/path/fixture IDs and empty request-body digests
+  must match the operation ledger. Minimal response JSON permits only
+  `user.id` for membership and `id`, `guild_id`, integer `status` for events;
+  wrong echoes, cancelled/unknown events, non-200 responses, malformed/duplicate
+  or extra fields refuse. Statuses 1 through 3 match C's predicate (including
+  completed events); no invented future-event-only rule is imposed. Each read's
+  independent-observer claim and response time must precede the next dependent
+  read/write/success edit. All four reads bind distinct same-case operations;
+  off cases cannot borrow them. These restricted minimal bytes are content-bound
+  claims, not proof of actual HTTP response bytes or faithful projection of a
+  normal richer Discord response. Arbitrary member profiles/event metadata and
+  alternate positive/negative profiles remain unsupported.
   **These remain unauthenticated projections, not proof of real requests,
   transport routing, ephemeral visibility or persistence.** Other request kinds,
   complete raw-envelope-to-projection validation, actual observers, callback
   secret enforcement, stored business values and source-parser equivalence of
-  every serialization are still missing. No token or raw Discord response may be
-  serialized into these records or public artifacts. Unsupported serializers
+  every serialization are still missing. No token or arbitrary raw Discord
+  response may be serialized into these records. No restricted record may be
+  serialized into public artifacts. Unsupported serializers
   refuse rather than gain an extension object. Runtime remains HOLD.
 - `scripts/announcement_runtime_lifecycle.py` compares the existing setup/cleanup
   DB ledgers to exact typed transition claims and operation sequence. Setup must
