@@ -27,6 +27,27 @@ not canonical staging qualification or production promotion.
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
   sequence and treats abort as terminal for qualification.
+- `scripts/announcement_runtime_source.py` observes complete local Git-object
+  inventories without checkout, fetch, import, filter or build execution. It
+  verifies raw commit/tree/blob hashes and validates raw canonical tree modes
+  before Git can normalize them, records every regular source path as
+  reversible hex bytes with mode, object ID, size and SHA-256, and computes
+  unfiltered additions/deletions/content/mode deltas. Local collection refuses
+  shallow/promisor/replaced/grafted history, symlinks, submodules, unsafe paths,
+  missing objects and exhausted bounds. It separately labels M→C, historical
+  B0→C, B0→T and served-S→C comparisons; unbound T/S are not inferred. Offline
+  topology predicates require the frozen C/B0, singleton merge-base M, all
+  required M ancestries, same-repository open PR and base/main equality to T.
+  Source inventories are limited to 16,384 regular entries, 32 MiB per object,
+  256 MiB per tree and unique object bytes per collector, 4,096 bytes per raw
+  path, 30 seconds per child and 120 seconds per collector. Object sizes are
+  checked before body reads. The Linux collector uses existing `/usr/bin/git`
+  and `/usr/bin/prlimit`; each Git child has a 512 MiB address-space ceiling
+  and 30 CPU-second limit. Missing tools or limits fail closed; no packages
+  are installed. These are local intake limits, not a change to
+  receipt/archive limits or runtime budgets. A complete
+  local inventory is not authenticated remote identity, reviewed packaging,
+  build isolation, installed T or evidence of actual served S.
 - `runtime_preflight()` always raises `Refusal("unsupported")`, before any
   credentials or effects. It has no caller adapter, enable flag, root URL,
   allowlist or credential parameter. No mutation, deployment, recovery or
@@ -64,8 +85,10 @@ external enforcement.
 
 This checkpoint is not the complete runtime-candidate lane. It still needs:
 
-1. Complete raw source/tooling/component manifests and the candidate-specific
-   M/B0/T/served-before topology and build-isolation checks.
+1. Independently authenticated source/tooling/component manifest bindings,
+   approved T/actual served-S provenance, build isolation and packaging checks.
+   The local full-tree/delta collector and offline topology predicates do not
+   establish independent review or any of those external facts.
 2. Closed typed resolution of every evidence reference, full cross-object and
    same-attempt identity comparisons, exact resource/profile budgets, stored
    off/on/replay/final-off semantics, atomic RSVP/audit evidence, owned CAS
@@ -75,8 +98,10 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
    post-upload immutable artifact binding and final authority/identity rereads.
    Neither a caller inventory nor a copied receipt may select the verifier root.
 4. Existing-lane integration without widening the separate docs/CI-only
-   installer, canonical-promotion adversarial regressions and all finite refusal
-   rows. Readiness and full-window exclusion semantics must stay unchanged.
+   installer and complete finite refusal-matrix coverage, including independent
+   candidate-verifier identity/provenance adversaries. The canonical-admission
+   rejection tests below do not implement candidate verification. Readiness and
+   full-window exclusion semantics must stay unchanged.
 5. Complete exact-head implementation manifests, source-to-control traceability,
    independent Security then QA review, CI and applicable release/installation
    approvals. None is supplied by this checkpoint.
@@ -96,7 +121,13 @@ The new tests run in the existing `scripts/ci/test_*.py` discovery lane. Fixture
 are synthetic syntax/accounting claims, explicitly not live observations or
 approval evidence. The canonical staging/production workflows, promotion tool,
 main-ref/main-ancestor requirements and main-only environment policies remain
-unchanged. Candidate packets remain non-promotable, including after source merge.
+unchanged. `test_announcement_runtime_nonpromotable.py` passes candidate bytes
+through the real canonical admission command using the existing offline service
+fixture. Canonical naming/producer metadata, mixed packets, changed envelope
+literals, wrong candidate claims and a hypothetical postmerge main identity all
+refuse before image copy or admitted-file output. These tests prove rejection
+by canonical admission, not positive acceptance by a candidate verifier.
+Candidate packets remain non-promotable, including after source merge.
 
 REA angle: reuse the existing candidate tooling boundary, immutable-promotion
 intake conventions and source-backed feed/RSVP semantics. Do not create another
