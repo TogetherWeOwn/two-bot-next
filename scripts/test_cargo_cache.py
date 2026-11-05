@@ -1410,6 +1410,77 @@ class SharedPoolRetainTests(unittest.TestCase):
                 self.assertTrue((slot / 'lease.json').exists())
                 self.assertFalse(row['lease_removed'])
 
+    def test_unrestorable_owner_or_group_refuses_before_either_removal(self):
+        real_metadata = cache.directory_metadata
+        originals = {name: (self.pool / name / 'lease.json').read_bytes()
+                     for name in ('slot-0', 'slot-1')}
+        for root in ('target', 'scratch'):
+            for failure in ('owner', 'group'):
+                with self.subTest(root=root, failure=failure):
+                    def metadata(path):
+                        _uid, _gid, mode = real_metadata(path)
+                        uid = 1002 if path.name == root and failure == 'owner' else 1001
+                        gid = 1004 if path.name == root and failure == 'group' else 1003
+                        return uid, gid, mode
+
+                    with patch.object(cache.os, 'geteuid', return_value=1001), \
+                            patch.object(cache.os, 'getegid', return_value=1003), \
+                            patch.object(cache.os, 'getgroups', return_value=[]), \
+                            patch.object(cache, 'directory_metadata', side_effect=metadata), \
+                            patch.object(cache.shutil, 'rmtree') as remove:
+                        receipt = self.retain()
+                    remove.assert_not_called()
+                    row = self.by_slot(receipt)['slot-0']
+                    self.assertFalse(row['eligible'])
+                    self.assertTrue(row['mutation_failed'])
+                    self.assertFalse(row['mutation_started'])
+                    self.assertEqual(row['completed_steps'], [])
+                    self.assertFalse(row['lease_removed'])
+                    self.assertIn(f'cannot restore {failure}', row['reason'])
+                    self.assertIn('no mutation; lease kept', row['reason'])
+                    for name, original in originals.items():
+                        slot = self.pool / name
+                        self.assertEqual((slot / 'lease.json').read_bytes(), original)
+                        self.assertTrue((slot / 'target' / 'debug' / 'fixture').exists())
+                        self.assertTrue((slot / 'scratch').is_dir())
+
+    def test_nonroot_group_membership_and_parent_inheritance_preflight(self):
+        self.inventory['slots'] = [self.row('slot-1')]
+        slot = self.pool / 'slot-1'
+        inherited_gid = slot.stat().st_gid
+        for membership in ('effective', 'supplementary', 'inherited'):
+            with self.subTest(membership=membership):
+                slot.chmod(0o2770 if membership == 'inherited' else 0o770)
+                metadata = (1001, inherited_gid, 0o770)
+                with patch.object(cache.os, 'geteuid', return_value=1001), \
+                        patch.object(cache.os, 'getegid', return_value=(
+                            inherited_gid if membership == 'effective' else inherited_gid + 1)), \
+                        patch.object(cache.os, 'getgroups', return_value=(
+                            [inherited_gid] if membership == 'supplementary' else [])), \
+                        patch.object(cache, 'directory_metadata', return_value=metadata), \
+                        patch.object(cache, 'recreate_output_directory') as restore, \
+                        patch.object(cache.shutil, 'rmtree') as remove:
+                    row = self.by_slot(self.retain())['slot-1']
+                self.assertTrue(row['eligible'], row)
+                self.assertEqual(remove.call_count, 2)
+                self.assertEqual(restore.call_args_list,
+                                 [unittest.mock.call(slot / root, metadata)
+                                  for root in ('target', 'scratch')])
+
+    def test_inherited_nonmember_group_cannot_restore_setgid_mode(self):
+        slot = self.pool / 'slot-0'
+        slot.chmod(0o2770)
+        gid = slot.stat().st_gid
+        with patch.object(cache.os, 'geteuid', return_value=1001), \
+                patch.object(cache.os, 'getegid', return_value=gid + 1), \
+                patch.object(cache.os, 'getgroups', return_value=[]), \
+                patch.object(cache, 'directory_metadata', return_value=(1001, gid, 0o2770)), \
+                patch.object(cache.shutil, 'rmtree') as remove:
+            row = self.by_slot(self.retain())['slot-0']
+        remove.assert_not_called()
+        self.assertFalse(row['mutation_started'])
+        self.assertIn('cannot restore setgid', row['reason'])
+
     def test_restore_failure_reports_partial_mutation_and_keeps_lease(self):
         slot = self.pool / 'slot-0'
         original = (slot / 'lease.json').read_bytes()
@@ -1511,10 +1582,98 @@ class SharedPoolRetainTests(unittest.TestCase):
             if calls == 3:
                 raise OSError('synthetic final evidence failure')
 
-        with patch.object(cache.os, 'fsync', side_effect=fsync):
-            with self.assertRaisesRegex(cache.Refusal, 'may have mutated'):
+        stderr = io.StringIO()
+        with patch.object(cache.os, 'fsync', side_effect=fsync), \
+                contextlib.redirect_stderr(stderr):
+            with self.assertRaisesRegex(cache.Refusal, 'may have mutated') as raised:
                 cache.retain_with_evidence(self.pool, self.inventory, self.proc, evidence)
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertEqual(str(raised.exception.__cause__), 'synthetic final evidence failure')
+        receipt = json.loads(stderr.getvalue())
+        self.assertEqual(receipt, json.loads(evidence.read_text()))
+        self.assertTrue(self.by_slot(receipt)['slot-0']['eligible'])
+        self.assertTrue(self.by_slot(receipt)['slot-0']['directory_metadata_preserved'])
         self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_final_evidence_io_failure_survives_secondary_close_failure(self):
+        receipt = {'version': 1, 'slots': [{'slot': 'slot-0', 'mutation_failed': True,
+                   'completed_steps': ['target_removed'], 'lease_removed': False}]}
+        real_fdopen = os.fdopen
+        for operation in ('write', 'flush'):
+            with self.subTest(operation=operation):
+                original = OSError(errno.ENOSPC, f'synthetic final {operation} failure')
+                cleanup = OSError(errno.EIO, 'synthetic secondary close failure')
+
+                class FailingStream:
+                    def __init__(self, fd, mode):
+                        self.stream = real_fdopen(fd, mode)
+                        self.writes = self.flushes = 0
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        self.stream.close()
+                        raise cleanup
+
+                    def __getattr__(self, name):
+                        return getattr(self.stream, name)
+
+                    def write(self, data):
+                        self.writes += 1
+                        if operation == 'write' and self.writes == 2:
+                            raise original
+                        return self.stream.write(data)
+
+                    def flush(self):
+                        self.flushes += 1
+                        if operation == 'flush' and self.flushes == 2:
+                            raise original
+                        return self.stream.flush()
+
+                stderr = io.StringIO()
+                with patch.object(cache.os, 'fdopen', side_effect=FailingStream), \
+                        patch.object(cache, 'shared_pool_retain', return_value=receipt), \
+                        contextlib.redirect_stderr(stderr):
+                    with self.assertRaisesRegex(cache.Refusal, 'may have mutated') as raised:
+                        cache.retain_with_evidence(self.pool, self.inventory, self.proc,
+                                                   self.root / f'{operation}-receipt.json')
+                self.assertIs(raised.exception.__cause__, original)
+                self.assertIn(str(original), str(raised.exception))
+                self.assertEqual(json.loads(stderr.getvalue()), receipt)
+
+    def test_cli_final_evidence_failure_exposes_actual_partial_result(self):
+        inventory = self.root / 'inventory.json'
+        inventory.write_text(json.dumps(self.inventory))
+        evidence = self.root / 'receipt.json'
+        argv = [str(SCRIPT), 'retain', '--pool', str(self.pool), '--inventory', str(inventory),
+                '--proc-root', str(self.proc), '--evidence', str(evidence)]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        calls = 0
+
+        def fsync(_fd):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError('synthetic final evidence failure')
+
+        with patch.object(sys, 'argv', argv), contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr), \
+                patch.object(cache.os, 'fsync', side_effect=fsync), \
+                patch.object(cache.os, 'fchmod', side_effect=PermissionError('denied')):
+            self.assertEqual(cache.main(), 75)
+        self.assertEqual(stdout.getvalue(), '')
+        receipt, refusal = map(json.loads, stderr.getvalue().splitlines())
+        row = self.by_slot(receipt)['slot-0']
+        self.assertTrue(row['mutation_started'])
+        self.assertTrue(row['mutation_failed'])
+        self.assertEqual(row['completed_steps'], ['target_removed', 'scratch_removed'])
+        self.assertFalse(row['lease_removed'])
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+        self.assertFalse(self.by_slot(receipt)['slot-1']['eligible'])
+        self.assertEqual(refusal['finding'], 'refused')
+        self.assertIn('may have mutated', refusal['reason'])
+        self.assertIn('synthetic final evidence failure', refusal['reason'])
 
     def test_lock_held_through_mutation(self):
         seen = {}

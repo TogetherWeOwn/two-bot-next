@@ -479,17 +479,24 @@ cache candidates. Any doubt before execution means STOP, no mutation handoff.
    existing project quota (project id 9380) is inherited by the recreated
    directories; and that the hard quota is in force. Do not rely on a late,
    unlocked `chmod`/`chown` or on policy or quota edits to repair a slot.
-   `retain` restores a valid uid/gid and the full permission modes under the
-   same original lock. If restoration fails it keeps the lease and reports the
-   partial mutation. Treat that as a partial mutation to investigate, not as a
-   clean run.
+   `retain` checks both roots for known owner/group restoration impossibilities
+   before deleting either, under the same original lock. Ordinary non-root
+   callers must own both roots and either belong to each recorded group or
+   inherit it from a setgid parent; non-member inheritance cannot restore a
+   setgid mode. This preflight is not a guarantee against later syscall failures.
+   The command restores valid uid/gid and full permission modes under that lock.
+   If restoration fails it keeps the lease and reports the partial mutation.
+   The kept lease alone does not fence admission: maintain the independent hold
+   through post-verification and STOP for separately authorized recovery.
 5. **Evidence receipt.** Use `--evidence` with a **new**, external file; the CLI
    refuses an existing path rather than overwriting evidence. It creates and
    fsyncs a prepared record and its parent before invoking `retain`; this is
    not the lease archive or transcript. The final receipt write can
-   still fail after mutation. A missing or incomplete receipt therefore never
-   proves that nothing was mutated: compare the recorded identities and
-   allocated bytes.
+   still fail after mutation. On final write/flush/fsync failure the CLI emits
+   the actual structured per-slot result to stderr before refusing with exit 75;
+   capture it in the persistent transcript. A missing or incomplete receipt
+   therefore never proves that nothing was mutated: compare the recorded
+   identities and allocated bytes.
 
 #### Bounded TWO-only build/dispatch admission hold
 

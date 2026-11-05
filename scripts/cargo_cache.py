@@ -950,6 +950,25 @@ def directory_metadata(path):
     return info.st_uid, info.st_gid, mode
 
 
+def preflight_metadata_restore(metadata):
+    """Reject known ordinary-credential failures, not promise syscall success."""
+    uid = os.geteuid()
+    if uid == 0:
+        return  # Privileged restoration still has to succeed and verify below.
+    groups = {os.getegid(), *os.getgroups()}
+    for path, (owner, group, mode) in metadata.items():
+        if owner != uid:
+            raise Refusal(f'cannot restore owner of {path}')
+        if group not in groups:
+            parent = path.parent.stat()
+            if parent.st_gid != group or not parent.st_mode & stat.S_ISGID:
+                raise Refusal(f'cannot restore group of {path}')
+            # mkdir can inherit a non-member group, but fchmod clears setgid
+            # for ordinary callers outside that group, even after inheritance.
+            if mode & stat.S_ISGID:
+                raise Refusal(f'cannot restore setgid mode of {path}')
+
+
 def recreate_output_directory(path, metadata):
     """Restore ownership before mode (chown can clear setgid), under the slot lock."""
     path.mkdir(mode=0o700)
@@ -1210,6 +1229,7 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
                 # Capture BOTH roots before touching either. Invalid/unreadable
                 # metadata is not permission to recreate with the caller's defaults.
                 metadata = {path: directory_metadata(path) for path in (target, scratch)}
+                preflight_metadata_restore(metadata)
                 if now - captured + time.monotonic() - started > max_age:
                     raise Refusal('retain took too long; capture a new inventory')
                 mutation_started = True  # even a failing rmtree may remove some output
@@ -1552,26 +1572,37 @@ def retain_with_evidence(pool, inventory, proc_root, evidence):
     if evidence.resolve().is_relative_to(pool):
         raise Refusal('retain evidence must be outside the pool')
     fd = os.open(evidence, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, 'w') as stream:
-        stream.write(json.dumps({'version': 1, 'state': 'prepared', 'pool': str(pool),
-                                 'outcome': 'unknown until final receipt',
-                                 'captured_at_unix': inventory.get('captured_at_unix')}))
-        stream.flush()
-        os.fsync(stream.fileno())
-        parent_fd = os.open(evidence.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
-        result = shared_pool_retain(pool, inventory, proc_root=proc_root)
-        try:
-            stream.seek(0)
-            stream.write(json.dumps(result, sort_keys=True))
-            stream.truncate()
+    result = None
+    final_error = None
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(json.dumps({'version': 1, 'state': 'prepared', 'pool': str(pool),
+                                     'outcome': 'unknown until final receipt',
+                                     'captured_at_unix': inventory.get('captured_at_unix')}))
             stream.flush()
             os.fsync(stream.fileno())
-        except OSError as error:
-            raise Refusal(f'final evidence write failed; retention may have mutated output: {error}')
+            parent_fd = os.open(evidence.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+            result = shared_pool_retain(pool, inventory, proc_root=proc_root)
+            try:
+                stream.seek(0)
+                stream.write(json.dumps(result, sort_keys=True))
+                stream.truncate()
+                stream.flush()
+                os.fsync(stream.fileno())
+            except OSError as error:
+                final_error = error  # A secondary close/flush failure must not replace this.
+                raise
+    except OSError as error:
+        if result is None:
+            raise  # Preparation failed before retention returned any result.
+        cause = final_error if final_error is not None else error
+        print(json.dumps(result, sort_keys=True), file=sys.stderr)
+        raise Refusal('final evidence write failed; retention may have mutated '
+                      f'output: {cause}') from cause
     return result
 
 
