@@ -17,7 +17,8 @@ def report(sqlx=11417, events=900, server=None, per_event=None):
     per_event = per_event or {"MESSAGE_CREATE": [600, calls - 1500], "VOICE_STATE_UPDATE": [300, 1500]}
     return {
         "schema_version": 1,
-        "workload": {"members": 107, "channels": 10, "profile": "debug"},
+        "workload": {"members": 107, "channels": 10, "profile": "debug",
+                     "duration_secs": 30, "messages_per_sec": 20, "voice_per_sec": 10},
         "metrics": {
             "peak_rss_mib": 24.6,
             "handler_latency_us": {"p50": 3606.274, "p99": 91700.671},
@@ -185,6 +186,35 @@ class ProfileDiffTest(unittest.TestCase):
         other["evidence"]["event_statement_profile"] = {"MESSAGE_CREATE": [450, 5450]}
         other["evidence"]["server_statement_profile"] = {"77": 5450}
         self.invalid(report(), other)
+
+    def test_event_mix_matches_declared_rates(self):
+        before = report()
+        for mix in ({"MESSAGE_CREATE": [900, 9617]},
+                    {"MESSAGE_CREATE": [601, 6617], "VOICE_STATE_UPDATE": [299, 3000]},
+                    {"MESSAGE_CREATE": [600, 6617], "OTHER": [300, 3000]}):
+            after = improved()
+            after["evidence"]["event_statement_profile"] = mix
+            with self.subTest(mix=mix):
+                self.invalid(before, after, "event counts do not match declared workload")
+                # Two equally wrong observations must not qualify each other.
+                self.invalid(after, copy.deepcopy(after), "event counts do not match declared workload")
+        for field, value in (("duration_secs", 0), ("duration_secs", True),
+                             ("messages_per_sec", -1), ("messages_per_sec", 20.0),
+                             ("voice_per_sec", "10"), ("voice_per_sec", None)):
+            bad = report()
+            bad["workload"][field] = value
+            with self.subTest(field=field, value=value):
+                self.invalid(bad, copy.deepcopy(bad), "workload.")
+        bad = report()
+        del bad["workload"]["duration_secs"]
+        self.invalid(bad, copy.deepcopy(bad), "workload.")
+        for family, rate in (("MESSAGE_CREATE", "voice_per_sec"),
+                             ("VOICE_STATE_UPDATE", "messages_per_sec")):
+            single = report(events=600)
+            single["workload"][rate] = 0
+            single["workload"]["messages_per_sec" if rate == "voice_per_sec" else "voice_per_sec"] = 20
+            single["evidence"]["event_statement_profile"] = {family: [600, 12017]}
+            self.assertEqual(profile.diff(single, copy.deepcopy(single))["total_exchange_delta"], 0)
 
     def test_unqualified_historical_baseline_is_invalid(self):
         historical = json.loads(Path(__file__).resolve().parent.parent

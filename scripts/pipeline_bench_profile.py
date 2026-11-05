@@ -96,6 +96,19 @@ def _event_profile(evidence, events, calls):
     return profile
 
 
+def _workload_event_counts(workload):
+    for name, minimum, maximum in (("duration_secs", 1, 120),
+                                   ("messages_per_sec", 0, 1000),
+                                   ("voice_per_sec", 0, 1000)):
+        value = workload.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise ValueError(f"workload.{name} must be an integer in {minimum}..{maximum}")
+    return {family: workload["duration_secs"] * workload[rate]
+            for family, rate in (("MESSAGE_CREATE", "messages_per_sec"),
+                                 ("VOICE_STATE_UPDATE", "voice_per_sec"))
+            if workload[rate] > 0}
+
+
 def qualify(report):
     """Validate one report; return its comparable mechanism facts."""
     if not isinstance(report, dict):
@@ -123,6 +136,8 @@ def qualify(report):
             raise ValueError(f"evidence.{name} must be true")
     server = _server_profile(evidence, calls)
     per_event = _event_profile(evidence, events, calls)
+    if {name: count for name, (count, _) in per_event.items()} != _workload_event_counts(report["workload"]):
+        raise ValueError("event_statement_profile event counts do not match declared workload")
     if not math.isclose(metrics[METRIC], calls / events, rel_tol=REL_TOL, abs_tol=ABS_TOL):
         raise ValueError("db_round_trips_per_event does not match statement counters")
     return {"events": events, "calls": calls, "metric": metrics[METRIC],

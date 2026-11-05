@@ -180,7 +180,7 @@ async fn commit(
     sequence: u64,
     at_ms: i64,
     expected: &mut BTreeSet<String>,
-) -> Result<()> {
+) -> Result<Duration> {
     pipeline.handle_at(&event, &two_bot_core::format_iso_millis(at_ms));
     let checkpoint = GatewaySession {
         session_id: "pipeline-bench".into(),
@@ -189,12 +189,15 @@ async fn commit(
         updated_at_ms: at_ms,
     };
     let batch = pipeline.handlers().store().take_batch();
+    // Exclude only the new oracle bookkeeping, not handling, drain or persistence.
+    let oracle_started = Instant::now();
     expected.extend(batch.events.iter().map(two_bot_core::idempotency_key));
+    let oracle_elapsed = oracle_started.elapsed();
     ensure!(
         store.commit_dispatch(&checkpoint, batch).await? == DispatchAction::Apply,
         "unexpected duplicate dispatch"
     );
-    Ok(())
+    Ok(oracle_elapsed)
 }
 
 fn percentiles(mut samples: Vec<f64>) -> Value {
@@ -321,8 +324,15 @@ async fn measure(
             let event = dispatch(sequence, kind, data)?;
             let before = queries.statements.load(Ordering::Relaxed);
             let started = Instant::now();
-            commit(&pipeline, &store, event, sequence, at_ms, &mut expected).await?;
-            latency.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+            let oracle_elapsed =
+                commit(&pipeline, &store, event, sequence, at_ms, &mut expected).await?;
+            latency.push(
+                started
+                    .elapsed()
+                    .saturating_sub(oracle_elapsed)
+                    .as_secs_f64()
+                    * 1_000_000.0,
+            );
             let profile = event_profile.entry(kind).or_default();
             profile.0 += 1;
             profile.1 += queries.statements.load(Ordering::Relaxed) - before + 1;
@@ -377,15 +387,6 @@ async fn measure(
     let statistics = ServerSnapshot::read(observer.pool(), db.name())
         .await?
         .delta(&server_before)?;
-    let server = ServerDelta {
-        commits: statistics
-            .commits
-            .checked_sub(2)
-            .context("missing boundary transactions")?,
-        rollbacks: statistics.rollbacks,
-        statements: completed_statement_profile(observer.pool(), db.name()).await?,
-    };
-    server.verify(config.events(), statements, commits)?;
     let verification = db.independent_pool().await?;
     verify_durable_events(&verification, &expected).await?;
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM events")
@@ -420,6 +421,17 @@ async fn measure(
         "checkpoint did not reach final dispatch"
     );
     let peak = peak_rss_mib()?;
+    // Preserve the historical workload/row-verification RSS boundary. Completion
+    // log buffering/JSON decoding is new oracle work, not workload memory.
+    let server = ServerDelta {
+        commits: statistics
+            .commits
+            .checked_sub(2)
+            .context("missing boundary transactions")?,
+        rollbacks: statistics.rollbacks,
+        statements: completed_statement_profile(observer.pool(), db.name()).await?,
+    };
+    server.verify(config.events(), statements, commits)?;
     mock.shutdown().await;
     Ok(json!({
         "schema_version":1,

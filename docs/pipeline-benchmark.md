@@ -88,12 +88,17 @@ A larger profile needs its own baseline; unlike workloads are never compared.
 ## Measurement definitions
 
 - **Peak RSS (MiB):** Linux process-lifetime `VmHWM` from `/proc/self/status`,
-  after replay and row verification. Includes driver, mock server, SQLx,
-  migrations, cache and latency samples. No cgroup cap is claimed.
+  after replay and row/journal/checkpoint verification, before completion-log
+  buffering/JSON decoding. Includes driver, mock server, SQLx, migrations, cache
+  and latency samples. All evidence checks still run before a report is emitted;
+  the new log reader must not inflate the historical workload RSS sample.
+  No cgroup cap is claimed.
 - **Handler p50/p99 (microseconds):** exact nearest-rank quantiles of
   `handle_at` + buffer drain + awaited dispatch transaction. Includes cache,
   lock/read/write/projection/checkpoint/commit, excludes synthetic JSON parsing,
-  schedule sleep and REST fixture calls. All 900 load events contribute.
+  schedule sleep and REST fixture calls. Only the newly added expected-key
+  generation/set insertion interval is subtracted from the handler timer; all
+  original handler and persistence operations remain timed. All 900 load events contribute.
 - **DB round-trips/event:** logical completed SQL exchanges, not packet-level
   transport RTTs. Count SQLx 0.9 `sqlx::query` completion diagnostics during replay
   plus one `BEGIN` per successful dispatch. SQLx logs `COMMIT` but queues `BEGIN`
@@ -216,8 +221,11 @@ python3 scripts/pipeline_bench_profile.py before.json after.json
 
 The second command validates counter identities, complete durability evidence,
 profile totals and metric arithmetic before reporting changed statement
-fingerprints, per-family deltas and total exchange delta. It refuses the
-historical baseline as a mechanism reference because that report predates the
+fingerprints, per-family deltas and total exchange delta. Observed message/voice
+family counts must equal duration times the declared rates in each report;
+changing the observed mix cannot masquerade as an efficiency improvement under
+an unchanged workload declaration. Zero-rate families are absent from the profile.
+It refuses the historical baseline as a mechanism reference because that report predates the
 independent counters. It creates no new target, tolerance or baseline ratchet.
 The historic raw observation remains `(11417 + 900) / 900 = 13.685555555555556`,
 not the old comparator failure limit of 10.562.

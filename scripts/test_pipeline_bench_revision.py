@@ -92,6 +92,39 @@ class RevisionTests(unittest.TestCase):
         self.assertLess(benchmark.index(build), benchmark.index(run))
         self.assertIn("cargo test -p two-bot-testsupport --test pipeline_integrity --locked", benchmark)
 
+    def test_completion_log_processing_follows_historical_rss_sample(self):
+        driver = (ROOT / "crates/discord/examples/pipeline_bench.rs").read_text()
+        measure = driver.split("async fn measure(", 1)[1].split("#[tokio::main", 1)[0]
+        peak = measure.index("let peak = peak_rss_mib()?;")
+        # Keep all historical row/journal/checkpoint verification inside VmHWM.
+        for operation in ("SELECT count(*) FROM events", "SELECT count(*) FROM members",
+                          "SELECT count(*), count(DISTINCT e.id)",
+                          'checkpoint.sequence == sequence'):
+            self.assertLess(measure.index(operation), peak)
+        # JSON buffering/decoding can be as large as the 64 MiB log budget.
+        self.assertGreater(measure.index("completed_statement_profile("), peak)
+        self.assertGreater(measure.index("server.verify(config.events(), statements, commits)?;"), peak)
+        self.assertLess(peak, measure.index('"peak_rss_mib":peak'))
+
+    def test_only_new_key_oracle_is_excluded_from_handler_latency(self):
+        driver = (ROOT / "crates/discord/examples/pipeline_bench.rs").read_text()
+        commit = driver.split("async fn commit(", 1)[1].split("fn percentiles(", 1)[0]
+        oracle = commit.split("let oracle_started = Instant::now();", 1)[1]
+        oracle, persistence = oracle.split("let oracle_elapsed = oracle_started.elapsed();", 1)
+        self.assertEqual(oracle.strip(),
+                         "expected.extend(batch.events.iter().map(two_bot_core::idempotency_key));")
+        self.assertIn("pipeline.handle_at(", commit.split("let oracle_started", 1)[0])
+        self.assertIn("let checkpoint = GatewaySession", commit.split("let oracle_started", 1)[0])
+        self.assertIn("let batch = pipeline.handlers().store().take_batch();",
+                      commit.split("let oracle_started", 1)[0])
+        self.assertIn("store.commit_dispatch(&checkpoint, batch).await?", persistence)
+        self.assertIn("Ok(oracle_elapsed)", persistence)
+        timing = driver.split("let started = Instant::now();\n            let oracle_elapsed", 1)[1]
+        timing = timing.split("let profile = event_profile.entry", 1)[0]
+        self.assertIn("commit(&pipeline, &store, event, sequence, at_ms, &mut expected).await?;", timing)
+        self.assertIn("started.elapsed().saturating_sub(oracle_elapsed).as_secs_f64()",
+                      "".join(timing.split()))
+
     def test_workflow_runs_regressions_and_uploads_both_receipts(self):
         workflow = (ROOT / ".github/workflows/pipeline-benchmark.yml").read_text()
         self.assertIn("-p 'test*pipeline_bench*.py'", workflow)
