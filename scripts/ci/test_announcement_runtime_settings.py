@@ -9,8 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from announcement_provenance_fixtures import at, evidence_index
 from announcement_resource_fixtures import repin_authority, repin_resources
 from announcement_scheduler_fixtures import repin_scheduler
-from announcement_setting_fixtures import SETTING_OPS, repin_settings, setting_fixture
+from announcement_setting_fixtures import (
+    SETTING_OPS, add_checkpoint, compact_claims, repin_settings, setting_fixture,
+)
 from announcement_runtime_evidence import canonical_digest
+from announcement_runtime_lifecycle import check_lifecycle_phase_claims
 from announcement_runtime_policy import runtime_preflight
 from announcement_runtime_schema import Refusal
 from announcement_runtime_settings import check_setting_claims
@@ -66,6 +69,20 @@ def prior_string(receipt, records, prior):
     repin_settings(receipt, records)
 
 
+def business_baseline(receipt, records, *, omit_setup=False):
+    """Bind a fresh wrong-phase fence and witness without a stale-hash shortcut."""
+    ref = add_checkpoint(receipt, records, "00:03:00")
+    claim = records["transition-" + SETTING_OPS[0]]["data"]["claim"]
+    claim["authority_ref"] = ref
+    records[claim["ownership_match_ref"]]["data"]["checkpoint_ref"] = ref
+    if omit_setup:
+        receipt["lifecycle"]["setup"][0]["operation_id"] = "unrelated-setup"
+    else:
+        receipt["lifecycle"]["setup"][0] = copy.deepcopy(claim)
+    compact_claims(receipt, records)
+    repin_settings(receipt, records)
+
+
 class Settings(unittest.TestCase):
     def reject(self, mutate, code, *, repin=True):
         receipt, records, now = setting_fixture()
@@ -101,10 +118,60 @@ class Settings(unittest.TestCase):
             for role in ("controller", "verifier"):
                 read = records[checkpoint[role + "_read_ref"]]["data"]["claim"]
                 self.assertEqual(transition["observed_at"], read["read_at"])
-        self.assertEqual(["effect_batch", "transition", "transition", "effect_batch"], phases)
+        self.assertEqual(["setup", "transition", "transition", "effect_batch"], phases)
         index = evidence_index(records)
         self.assertIsNone(check_setting_claims(receipt, index, now))
         index.require_all_used()
+
+    def test_baseline_insert_and_cas_bind_exact_setup_claims_within_record_bound(self):
+        for prior in (None, "0", "1"):
+            with self.subTest(prior=prior):
+                receipt, records, now = setting_fixture()
+                if prior is not None:
+                    prior_string(receipt, records, prior)
+                self.assertLessEqual(len(records), 256)
+                claim = records["transition-" + SETTING_OPS[0]]["data"]["claim"]
+                self.assertEqual([claim], receipt["lifecycle"]["setup"])
+                self.assertEqual("checkpoint-1", claim["authority_ref"])
+                self.assertEqual(at("00:03:00"), claim["observed_at"])
+                self.assertEqual("setup", next(x["phase"] for x in receipt["attempt"]["checkpoints"]
+                                 if x["ref"] == claim["authority_ref"]))
+                index = evidence_index(records)
+                self.assertIsNone(check_setting_claims(receipt, index, now))
+                index.require_all_used()
+
+    def test_baseline_cannot_be_omitted_even_with_fresh_business_authority(self):
+        receipt, records, now = setting_fixture()
+        self.assertIsNone(check_setting_claims(receipt, evidence_index(records), now))
+        business_baseline(receipt, records, omit_setup=True)
+        self.assertLessEqual(len(records), 256)
+        self.assertIsNone(check_transition_claims(receipt, evidence_index(records), now))
+        with self.assertRaisesRegex(Refusal, "setting_setup$"):
+            check_setting_claims(receipt, evidence_index(records), now)
+
+    def test_baseline_setup_cannot_name_fresh_business_authority(self):
+        receipt, records, now = setting_fixture()
+        self.assertIsNone(check_setting_claims(receipt, evidence_index(records), now))
+        business_baseline(receipt, records)
+        self.assertLessEqual(len(records), 256)
+        with self.assertRaisesRegex(Refusal, "transition_authority$"):
+            check_setting_claims(receipt, evidence_index(records), now)
+
+    def test_baseline_setup_ledger_must_equal_the_complete_transition_claim(self):
+        for field, wrong in (("resource_ref", "feed"), ("owner", "different-owner"),
+                             ("observed_at", at("00:02:59")),
+                             ("authority_ref", "unrelated-checkpoint")):
+            with self.subTest(field=field):
+                self.reject(lambda r, e: r["lifecycle"]["setup"][0].update({field: wrong}),
+                            "lifecycle_transition", repin=False)
+
+    def test_baseline_setup_does_not_admit_unassigned_restoration(self):
+        receipt, records, now = setting_fixture()
+        self.assertIsNone(check_setting_claims(receipt, evidence_index(records), now))
+        with self.assertRaisesRegex(Refusal, "unassigned_lifecycle_effect$"):
+            check_lifecycle_phase_claims(receipt, evidence_index(records), now)
+        with self.assertRaisesRegex(Refusal, "unsupported"):
+            runtime_preflight()
 
     def test_compacted_setting_enable_cannot_borrow_same_time_business_authority(self):
         receipt, records, now = setting_fixture()

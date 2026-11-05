@@ -2,10 +2,10 @@
 
 Only the setting operations are distributed across the fabricated timeline.
 All other telemetry remains at 08:00, including cleanup-shaped writes; this is
-NOT a coherent full-lifecycle/business-case fixture. In-window setting writes
-use transition authority. Baseline/restoration retain the old generic batch
-claims without exact setup/cleanup membership; full lifecycle must still refuse.
-The baseline and rollout share a timestamp; triggers/audit and real CAS token
+NOT a coherent full-lifecycle/business-case fixture. The baseline names exact
+setup authority and in-window setting writes use transition authority. Restoration
+retains old generic batch claims without cleanup membership; full lifecycle must
+still refuse. The baseline and rollout share a timestamp; triggers/audit and real CAS token
 semantics remain absent.
 """
 
@@ -185,7 +185,8 @@ def setting_fixture():
     records[schedule["activation_fence"]["ref"]]["data"]["observed_at"] = at("00:03:00")
     checkpoints = {clock: add_checkpoint(receipt, records, clock,
                    phase="transition" if clock == "00:12:00" else "effect_batch")
-                   for clock in ("00:03:00", "00:12:00", "00:18:00")}
+                   for clock in ("00:12:00", "00:18:00")}
+    checkpoints["00:03:00"] = "checkpoint-1"
     checkpoints["00:08:00"] = "checkpoint-3"
     effects = {effect["operation_id"]: effect for effect in receipt["observations"]["actual_effects"]}
     for operation, clock, value in zip(SETTING_OPS,
@@ -204,6 +205,9 @@ def setting_fixture():
             checkpoint_ref=checkpoints[clock], observed_at=at(clock))
         transaction = records[records[effect["db_transition_refs"][0]]["data"]["transaction_ref"]]["data"]
         transaction["committed_at"] = at(clock)
+    baseline = effects[SETTING_OPS[0]]
+    receipt["lifecycle"]["setup"] = [copy.deepcopy(
+        records[baseline["db_transition_refs"][0]]["data"]["claim"])]
     actual = receipt["observations"]["actual_effects"]
     actual.sort(key=lambda effect: effect["observed_at"])
     for sequence, effect in enumerate(actual, 1):

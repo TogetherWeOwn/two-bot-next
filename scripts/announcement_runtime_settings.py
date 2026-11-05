@@ -45,6 +45,11 @@ def check_setting_claims(receipt, evidence, now):
     _unique_refs(list(plan["operations"].values()))
     transitions = [evidence.resolve(effect["db_transition_refs"][0], "db_transition")["claim"]
                    for effect in writes]
+    # A baseline is trusted setup, not a candidate business batch. The composed
+    # chain checks its exact setup claim, method, time and named setup authority.
+    require([claim for claim in receipt["lifecycle"]["setup"]
+             if claim["operation_id"] == writes[0]["operation_id"]] == [transitions[0]],
+            "setting_setup")
     state_refs = [resource["before_state_ref"],
                   *(claim["actual_after_state_ref"] for claim in transitions),
                   resource["after_state_ref"]]

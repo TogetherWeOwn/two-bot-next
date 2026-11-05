@@ -277,8 +277,12 @@ not canonical staging qualification or production promotion.
   restored and separately observed final value/presence must equal the original
   projection without resetting a present row's advancing version. All four
   mutation IDs/methods/order and the latest committed state/version at each
-  off/on/replay/final-off reader must agree. A value change before the claimed
-  poll finishes cannot borrow an earlier snapshot as suppression evidence.
+  off/on/replay/final-off reader must agree. The baseline must be an exact setup
+  ledger member, even if fresh business authority could cover an omitted entry.
+  Its complete transition claim, insert/CAS method, snapshot-to-rollout time and
+  named setup fence/ownership/read bindings are checked by the composed chain.
+  A value change before the claimed poll finishes cannot borrow an earlier
+  snapshot as suppression evidence.
   **This is not persistence, full-row restoration, actual SQL CAS or stored-case
   proof.** Positive row versions here describe legacy row-version claims, not C's
   distinct negative database-owned `cas_version` tokens. Settings audit/revision
@@ -438,9 +442,11 @@ not canonical staging qualification or production promotion.
   transition checkpoint, even when a fresh business fence has the same time.
   Compacted setting fixtures preserve the 08-minute transition/business reads
   separately from the 03-minute initial checkpoints and the 12-minute disable
-  checkpoint without raising the 256-record bound. Their baseline/restoration
-  still carry historical generic claims without exact setup/cleanup membership;
-  full lifecycle must refuse them. Credential usability, recovery and full
+  checkpoint without raising the 256-record bound. The baseline now reuses the
+  initial named setup checkpoint with an identical setup ledger claim; it cannot
+  substitute a same-time business fence. Restoration still carries historical
+  generic claims without exact cleanup membership; full lifecycle must refuse
+  it. Credential usability, recovery and full
   lifecycle integration remain unfinished. Separate partial phase tests still
   assert the terminal recovery refusal; no successful composed lifecycle is claimed.
 - `scripts/announcement_runtime_drain.py` resolves four closed work-inventory,
