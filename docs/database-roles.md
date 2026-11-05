@@ -275,8 +275,11 @@ their login status or silently removing memberships. It contains no passwords.
    start: creator-specific default ACLs belong to the group, not automatically
    to a member login; (c) the provisioning identity reapplies the reviewed full
    plan after migrations and view updates, then `verify` reads 0 findings.
-   `sql/web_v1.sql` is applied with `public` as the bot-table search
-   path before the bootstrap phase; functions stay strict in both phases.
+   Before bootstrap, retain the existing contract views and helpers with
+   `public` as the bot-table search path; functions stay strict in both phases.
+   Apply the latest `sql/web_v1.sql` as the migrator after pending migrations
+   create its dependencies and before the full role plan. Do not apply a new
+   view against an older ledger that lacks its table.
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
    tables are not transferred or granted to the runtime.
