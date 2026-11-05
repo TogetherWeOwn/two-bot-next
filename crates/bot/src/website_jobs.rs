@@ -306,7 +306,7 @@ pub async fn serve(
     receiver: Option<crate::internal_action_http::BoundReceiver>,
     eventsub_receiver: Option<crate::eventsub_http::BoundEventsubReceiver>,
     member: Option<Arc<MemberRuntime>>,
-    voice_cache: Arc<twilight_cache_inmemory::DefaultInMemoryCache>,
+    voice_cache: Arc<two_bot_discord::SharedCache>,
 ) -> std::io::Result<()> {
     let mut registered = Vec::new();
     let mut parked = Vec::new();

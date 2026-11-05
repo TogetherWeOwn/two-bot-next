@@ -1061,6 +1061,9 @@ pub struct OrderedLevelingPipeline<S, I = NoInvites, P = PipelineSnapshots> {
     facts: DeferredCommunityFacts,
     dispatch: tokio::sync::Mutex<()>,
     runtime: Option<LevelingRuntime>,
+    /// Caller-owned caches serve readers outside the ordered funnel. A cold
+    /// RESUME must rebuild their full snapshot before claiming live readiness.
+    snapshot_cache: Option<Arc<crate::pipeline::SharedCache>>,
 }
 
 impl<S: FunnelStore> OrderedLevelingPipeline<S> {
@@ -1085,6 +1088,7 @@ impl<S: FunnelStore> OrderedLevelingPipeline<S> {
             facts,
             dispatch: tokio::sync::Mutex::new(()),
             runtime,
+            snapshot_cache: None,
         }
     }
 }
@@ -1117,6 +1121,7 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
             facts,
             dispatch: tokio::sync::Mutex::new(()),
             runtime,
+            snapshot_cache: None,
         }
     }
 
@@ -1133,7 +1138,7 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         runtime: Option<LevelingRuntime>,
         invite_source: I,
         snapshots: P,
-        cache: Arc<twilight_cache_inmemory::InMemoryCache>,
+        cache: Arc<crate::pipeline::SharedCache>,
     ) -> Self {
         let pending = DeferredLeveling::default();
         let facts = DeferredCommunityFacts::default();
@@ -1145,7 +1150,7 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
             invite_source,
             classifier.clone(),
             snapshots,
-            cache,
+            Arc::clone(&cache),
         );
         // Fail closed like `new`: the gateway runtime declares the real
         // `MESSAGE_CONTENT` subscription before its shard runs.
@@ -1157,6 +1162,7 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
             facts,
             dispatch: tokio::sync::Mutex::new(()),
             runtime,
+            snapshot_cache: Some(cache),
         }
     }
 
@@ -1203,7 +1209,17 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.facts.drain().await
     }
 
-    /// Access the cache (shard runner updates, tests seed).
+    /// Whether a cold caller-owned cache needs READY + GuildCreate after
+    /// RESUME. Private replay/funnel caches have no external snapshot readers;
+    /// the live shared sampler/receiver cache always requires bootstrap.
+    #[must_use]
+    pub fn needs_cache_bootstrap(&self) -> bool {
+        self.snapshot_cache
+            .as_ref()
+            .is_some_and(|cache| cache.needs_bootstrap())
+    }
+
+    /// Access individual cached objects; coherent guild reads use SharedCache.
     #[must_use]
     pub fn cache(&self) -> &twilight_cache_inmemory::InMemoryCache {
         self.pipeline.cache()

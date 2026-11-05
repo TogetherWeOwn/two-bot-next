@@ -708,3 +708,81 @@ async fn voice_heat_expiry_failure_keeps_report_and_retries() {
     assert_eq!(kept, 0, "repaired run must expire the deferred row");
     db.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn game_aggregate_expiry_failure_still_expires_voice_heat_and_returns_err() {
+    let _serial = RUNTIME_LOCK.lock().await;
+    let Some(db) = database().await else { return };
+    let pool = db.pool();
+    const DENIED_GUILD: &str = "555555555555555556";
+    sqlx::query("INSERT INTO game_activity_guild_aggregates (guild_id, game, total_play_ms, in_voice_ms, session_count) VALUES ($1, 'Apex', 600000, 0, 2)")
+        .bind(DENIED_GUILD).execute(pool).await.unwrap();
+    sqlx::query("UPDATE game_activity_guild_aggregates SET updated_at = now() - make_interval(days => 100) WHERE guild_id = $1")
+        .bind(DENIED_GUILD).execute(pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
+         VALUES (now() - make_interval(days => 40), 12, 30, now() - make_interval(days => 40))",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql("CREATE FUNCTION aggregate_expiry_refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic aggregate expiry refusal'; END $$; CREATE TRIGGER aggregate_expiry_refuse BEFORE DELETE ON game_activity_guild_aggregates FOR EACH ROW EXECUTE FUNCTION aggregate_expiry_refuse();").execute(pool).await.unwrap();
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    assert_eq!(
+        result,
+        Err(ErrorClass::Database),
+        "the isolated aggregate failure is still returned: {logs}"
+    );
+    assert_classified_db_error(expiry_failure_line(&logs));
+    assert_no_completed_line(&logs);
+    assert!(
+        report_line(&logs).contains("aggregate expiry failed"),
+        "committed report names the failed aggregate sweep: {logs}"
+    );
+    field(voice_heat_expiry_line(&logs), "stale_rows", 1);
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        kept, 0,
+        "healthy heat expiry runs despite the aggregate error"
+    );
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM game_activity_guild_aggregates WHERE guild_id = $1",
+    )
+    .bind(DENIED_GUILD)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(kept, 1, "the denied aggregate row remains for retry");
+    // If both independent deletes fail, the committed counters still belong
+    // to exactly one retention_run report; each sweep keeps its diagnostic.
+    sqlx::query(
+        "INSERT INTO voice_heat_hours (hour_start_utc, samples, occupancy_sum, last_observed_at)
+         VALUES (now() - make_interval(days => 40), 12, 30, now() - make_interval(days => 40))",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql("CREATE FUNCTION heat_expiry_refuse() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic heat expiry refusal'; END $$; CREATE TRIGGER heat_expiry_refuse BEFORE DELETE ON voice_heat_hours FOR EACH ROW EXECUTE FUNCTION heat_expiry_refuse();").execute(pool).await.unwrap();
+    let (result, logs) = tick(pool, RetentionMode::Execute).await;
+    assert_eq!(result, Err(ErrorClass::Database));
+    assert_no_completed_line(&logs);
+    assert_classified_db_error(expiry_failure_line(&logs));
+    assert_classified_db_error(voice_heat_expiry_failure_line(&logs));
+    assert!(report_line(&logs).contains("aggregate expiry and voice-heat expiry failed"));
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, 1, "failed heat expiry remains retryable");
+    sqlx::raw_sql(
+        "DROP TRIGGER heat_expiry_refuse ON voice_heat_hours; DROP FUNCTION heat_expiry_refuse();",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql("DROP TRIGGER aggregate_expiry_refuse ON game_activity_guild_aggregates; DROP FUNCTION aggregate_expiry_refuse();").execute(pool).await.unwrap();
+    db.close().await.unwrap();
+}

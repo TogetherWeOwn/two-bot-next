@@ -106,7 +106,10 @@ test (`acceptance_every_unmeasurable_spec_has_a_pinned_disposition`): pin
 
 `rollback-delta` marks a table `unmeasurable` when it has no usable
 timestamp column (`crates/cutover/src/rollback_delta.rs`, `TABLE_SPECS`).
-Thirteen of those specs are voice-prefixed. The rollback trigger document
+Thirteen of those specs are voice-prefixed configuration or settings
+tables covered by the dispositions below; `voice_heat_hours` is a separate
+unmeasurable spec whose disposition is re-sampling (see the map above), so it
+is not one of the thirteen. The rollback trigger document
 fires its watermark-gap trigger on any `unmeasurable` table without a
 reviewed disposition; this section is that disposition for the voice
 window, recorded 2026-10-04 from an offline tabletop replay of the trigger
@@ -124,7 +127,8 @@ alternate evidence for the voice window.
 ### Replay rule for the voice window
 
 When a `rollback-delta --since T_f` report's only `unmeasurable` entries
-are the thirteen tables above, the watermark-gap trigger does not fire for
+are the thirteen tables above (`voice_heat_hours` is separately dispositioned
+by re-sampling and does not need the evidence below), the watermark-gap trigger does not fire for
 lack of disposition: each table is covered either by an accepted reason or
 by the named alternate evidence, which the rollback operator attaches to
 the window record. The trigger still fires on an export-cap refusal (any

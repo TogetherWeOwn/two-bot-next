@@ -7,7 +7,6 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tower::ServiceExt;
-use twilight_cache_inmemory::DefaultInMemoryCache;
 use twilight_gateway::Event;
 use twilight_model::gateway::payload::incoming::{GuildCreate, VoiceStateUpdate};
 use twilight_model::guild::Guild;
@@ -1969,7 +1968,7 @@ fn voice_state(user_id: &str, channel_id: Option<&str>) -> VoiceStateUpdate {
 /// Gateway cache holding a small guild: five voice rooms (one AFK, one
 /// empty), one stage channel and one text channel, with a bot, an unknown
 /// user and a stage speaker among the occupants.
-fn seeded_voice_cache() -> Arc<DefaultInMemoryCache> {
+fn seeded_voice_cache() -> Arc<two_bot_discord::SharedCache> {
     let cache = voice_snapshot::new_shared_cache();
     cache.update(&seeded_guild_event());
     cache
@@ -2028,7 +2027,7 @@ fn connected_gateway() -> Arc<tokio::sync::RwLock<crate::gateway::GatewayState>>
     ))
 }
 
-fn voice_app(pool: sqlx::PgPool, cache: Arc<DefaultInMemoryCache>) -> Router {
+fn voice_app(pool: sqlx::PgPool, cache: Arc<two_bot_discord::SharedCache>) -> Router {
     let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
     router(Arc::new(
         ReceiverState::new(
@@ -2048,7 +2047,7 @@ fn voice_app(pool: sqlx::PgPool, cache: Arc<DefaultInMemoryCache>) -> Router {
 
 /// Same shared cache but the gateway mid-reconnect: `Armed`, never
 /// `Connected`. Stale occupancy must refuse, never serve.
-fn voice_app_not_ready(pool: sqlx::PgPool, cache: Arc<DefaultInMemoryCache>) -> Router {
+fn voice_app_not_ready(pool: sqlx::PgPool, cache: Arc<two_bot_discord::SharedCache>) -> Router {
     let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
     router(Arc::new(
         ReceiverState::new(

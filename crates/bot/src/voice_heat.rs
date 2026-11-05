@@ -27,7 +27,6 @@ use std::{
 };
 
 use tokio::sync::{OnceCell, RwLock};
-use twilight_cache_inmemory::DefaultInMemoryCache;
 use two_bot_core::voice_heat_store::{self, HourBucket};
 use two_bot_core::Snowflake;
 
@@ -141,7 +140,7 @@ impl Accumulator {
 pub fn job(
     database_url: &str,
     guild: Snowflake,
-    cache: Arc<DefaultInMemoryCache>,
+    cache: Arc<two_bot_discord::SharedCache>,
     gateway: Arc<RwLock<GatewayState>>,
 ) -> Job {
     let context = Arc::new(Context {
@@ -171,7 +170,7 @@ pub fn job(
 /// database failures keep buffered buckets and read as [`ErrorClass::Database`].
 async fn tick(
     context: &Arc<Context>,
-    cache: &Arc<DefaultInMemoryCache>,
+    cache: &Arc<two_bot_discord::SharedCache>,
     gateway: &Arc<RwLock<GatewayState>>,
     accumulator: &Arc<Mutex<Accumulator>>,
 ) -> Result<(), ErrorClass> {
@@ -393,6 +392,62 @@ mod tests {
             .unwrap();
         assert!(context.pool.get().is_none(), "skips never open the DB");
         assert_eq!(accumulator.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn rebuilding_and_unavailable_guilds_are_gaps_but_complete_empty_is_zero() {
+        use serde_json::json;
+        use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
+        let context = Arc::new(Context {
+            url: "not a database URL".to_owned(),
+            pool: OnceCell::new(),
+            guild: 100,
+        });
+        let cache = voice_snapshot::new_shared_cache();
+        let full = || {
+            Event::GuildCreate(Box::new(GuildCreate::Available(
+                serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json")).unwrap(),
+            )))
+        };
+        cache.update(&full());
+        cache.update(&Event::Ready(Box::new(serde_json::from_value(json!({
+            "v": 10, "session_id": "fixture", "resume_gateway_url": "ws://fixture.invalid",
+            "application": {"id": "999", "flags": 0},
+            "user": {"id": "999", "username": "fixture", "discriminator": "0", "mfa_enabled": false},
+            "guilds": [{"id": "100", "unavailable": true}]
+        })).unwrap())));
+        let gateway = Arc::new(RwLock::new(GatewayState::Connected));
+        let accumulator = Arc::new(Mutex::new(Accumulator::default()));
+        tick(&context, &cache, &gateway, &accumulator)
+            .await
+            .unwrap();
+        assert_eq!(
+            accumulator.lock().unwrap().len(),
+            0,
+            "READY is not a full guild snapshot"
+        );
+        cache.update(&Event::GuildCreate(Box::new(GuildCreate::Unavailable(
+            serde_json::from_value(json!({"id": "100", "unavailable": true})).unwrap(),
+        ))));
+        tick(&context, &cache, &gateway, &accumulator)
+            .await
+            .unwrap();
+        assert_eq!(
+            accumulator.lock().unwrap().len(),
+            0,
+            "unavailable is not zero"
+        );
+        cache.update(&full());
+        tick(&context, &cache, &gateway, &accumulator)
+            .await
+            .unwrap();
+        let buckets = accumulator
+            .lock()
+            .unwrap()
+            .completed(time::OffsetDateTime::now_utc() + time::Duration::hours(1));
+        assert_eq!(buckets.len(), 1);
+        assert_eq!((buckets[0].samples, buckets[0].occupancy_sum), (1, 0));
+        assert!(context.pool.get().is_none());
     }
 
     #[tokio::test]

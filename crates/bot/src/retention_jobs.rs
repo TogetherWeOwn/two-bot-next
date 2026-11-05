@@ -213,34 +213,23 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                 // has already committed, the committed counters still get one
                 // structured `retention_run` WARN with distinct text before
                 // returning, so the report is never dropped.
-                if let Err(expiry) = expire_stale_game_aggregates(&pool, mode).await {
-                    tracing::warn!(
-                        message = "retention_run",
-                        mode = ?mode,
-                        presence_raw_deleted = report.presence_raw_deleted,
-                        voice_raw_deleted = report.voice_raw_deleted,
-                        audit_cache_deleted = report.audit_cache_deleted,
-                        stream_live_delivered_expired = report.stream_live_delivered_expired,
-                        guild_rows_purged = report.guild_rows_purged,
-                        guild_purges_failed = report.guild_purges_failed,
-                        guild_purges_deferred = report.guild_purges_deferred,
-                        guild_purges_deferred_oldest_secs =
-                            report.guild_purges_deferred_oldest_secs,
-                        deletions_completed = report.deletions_completed,
-                        deletions_deferred = report.deletions_deferred,
-                        schema_gap_deferrals = report.schema_gap_deferrals,
-                        deletions_overdue = report.deletions_overdue,
-                        pending_truncated = report.pending_truncated,
-                        duration_ms = report.duration_ms,
-                        "retention run committed; aggregate expiry failed",
-                    );
-                    return Err(expiry);
-                }
+                let game_expiry = expire_stale_game_aggregates(&pool, mode).await;
                 // Voice-heat hourly rows expire on this same cadence: a single
                 // whole-table predicate delete (rows carry no guild scope), so
-                // no page or cursor. Runs after the game-aggregate sweep so a
-                // failed tick keeps the same committed-counters report shape.
-                if let Err(expiry) = expire_stale_voice_heat(&pool, mode).await {
+                // no page or cursor. Runs after the game-aggregate sweep even
+                // when that sweep failed, so a failed tick keeps the same
+                // committed-counters report shape.
+                let heat_expiry = expire_stale_voice_heat(&pool, mode).await;
+                if game_expiry.is_err() || heat_expiry.is_err() {
+                    let failure = if game_expiry.is_err() {
+                        if heat_expiry.is_err() {
+                            "retention run committed; aggregate expiry and voice-heat expiry failed"
+                        } else {
+                            "retention run committed; aggregate expiry failed"
+                        }
+                    } else {
+                        "retention run committed; voice-heat expiry failed"
+                    };
                     tracing::warn!(
                         message = "retention_run",
                         mode = ?mode,
@@ -259,10 +248,14 @@ pub fn job(pool: PgPool, mode: RetentionMode) -> Job {
                         deletions_overdue = report.deletions_overdue,
                         pending_truncated = report.pending_truncated,
                         duration_ms = report.duration_ms,
-                        "retention run committed; voice-heat expiry failed",
+                        game_aggregate_expiry_failed = game_expiry.is_err(),
+                        voice_heat_expiry_failed = heat_expiry.is_err(),
+                        "{failure}",
                     );
-                    return Err(expiry);
                 }
+                // Independent sweeps: a game-aggregate failure never skips the
+                // heat expiry; the first failure is returned once both ran.
+                game_expiry.and(heat_expiry)?;
                 let partial = report.guild_purges_failed > 0
                     || report.guild_purges_deferred > 0
                     || report.deletions_deferred > 0
