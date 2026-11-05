@@ -424,11 +424,18 @@ not canonical staging qualification or production promotion.
   refuses `unsupported_recovery_authority`: the current schema has no separately
   scoped recovery checkpoint, and an ordinary fresh effect-batch/final fence
   cannot substitute for it. This layer does not authenticate authority or prove
-  phase completion. The older authority/transition layers still require generic
-  effect-batch coverage; reconciling those with this stricter phase assignment,
-  credential usability, recovery and full lifecycle integration remains unfinished.
-  The new tests deliberately splice partial fabricated graphs, assert the
-  terminal recovery refusal, and claim no successful composed lifecycle.
+  phase completion. Authority and state-chain comparisons now share the exact
+  setup-write classifier with this layer: one matching setup entry, no duplicate
+  or cleanup overlap, identical complete transition claim, insert/CAS method and
+  a snapshot-to-rollout timestamp are required. Such a write uses its named
+  `setup` fence and all current runtime/installation reads, not a business batch.
+  The setup tests compose real offline scope/history/resource/telemetry/ownership
+  comparisons without mocks; the remaining single-instant accounting operations
+  and placeholder cleanup are explicitly not full lifecycle proof. Setting
+  transitions still encounter generic effect-batch expectations in the older
+  consumers. Reconciling those, credential usability, recovery and full lifecycle
+  integration remains unfinished. Separate partial phase tests still assert the
+  terminal recovery refusal; no successful composed lifecycle is claimed.
 - `scripts/announcement_runtime_drain.py` resolves four closed work-inventory,
   snapshot, fence and drain claim kinds alongside the lifecycle-ledger comparison.
   The declared finite surface inventory is content-bound to the scoped inventory

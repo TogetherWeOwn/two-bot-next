@@ -16,6 +16,8 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from announcement_provenance_fixtures import at, evidence_index
 from announcement_resource_fixtures import repin_authority, repin_resources
+from announcement_setting_fixtures import add_checkpoint
+from announcement_telemetry_fixtures import repin_telemetry
 from announcement_transition_fixtures import (
     add_late_effect_checkpoint, repin_ownership, transition_fixture,
 )
@@ -155,6 +157,134 @@ class Coherence(Transitions):
             set_state_claim(records, SETTING_CAS0, value_sha256="e" * 64)
         self.accept(mutate)
         self.reject(mutate, "ownership_match", repin=False)
+
+
+def setup_fixture(clock="00:02:00"):
+    """Move only the feed insert into setup; remaining lifecycle is incomplete.
+
+    Keep every upstream scope/history/resource/telemetry/ownership comparison.
+    This remains fabricated, and the placeholder cleanup is not recovery proof.
+    """
+    receipt, records, now = transition_fixture()
+    effect = next(x for x in receipt["observations"]["actual_effects"]
+                  if x["operation_id"] == FEED_INS)
+    effect.update(observed_at=at(clock), served_ref=receipt["lifecycle"]["served_before"]["ref"])
+    setup = claim(records, FEED_INS)
+    setup.update(observed_at=at(clock), authority_ref="checkpoint-1")
+    state(records, FEED_INS)["observed_at"] = at(clock)
+    match(records, FEED_INS).update(observed_at=at(clock), checkpoint_ref="checkpoint-1")
+    records[records["transition-" + FEED_INS]["data"]["transaction_ref"]]["data"][
+        "committed_at"] = at(clock)
+    receipt["lifecycle"]["setup"] = [copy.deepcopy(setup)]
+    effects = receipt["observations"]["actual_effects"]
+    effects.sort(key=lambda x: x["observed_at"])
+    for sequence, operation in enumerate(effects, 1):
+        operation["sequence"] = sequence
+    receipt["observations"]["expected_effects"] = copy.deepcopy(effects)
+    repin_ownership(receipt, records)
+    repin_telemetry(receipt, records)
+    return receipt, records, now
+
+
+class SetupCheckpoints(unittest.TestCase):
+    def check(self, receipt, records, now):
+        self.assertIsNone(check_authority_graph_claims(receipt, evidence_index(records), now))
+        self.assertIsNone(check_transition_claims(receipt, evidence_index(records), now))
+
+    def reject(self, receipt, records, now, code):
+        for checker in (check_authority_graph_claims, check_transition_claims):
+            with self.subTest(checker=checker.__name__):
+                with self.assertRaisesRegex(Refusal, "announcement evidence refused: " + code + "$"):
+                    checker(receipt, evidence_index(records), now)
+
+    def test_exact_setup_ledger_write_uses_named_setup_authority_in_both_graphs(self):
+        receipt, records, now = setup_fixture()
+        self.check(receipt, records, now)
+        self.assertEqual(claim(records, FEED_INS), receipt["lifecycle"]["setup"][0])
+        self.assertEqual("checkpoint-1", claim(records, FEED_INS)["authority_ref"])
+        self.assertEqual("checkpoint-1", match(records, FEED_INS)["checkpoint_ref"])
+        with self.assertRaisesRegex(Refusal, "unsupported"):
+            runtime_preflight()
+
+    def test_setup_cannot_name_effect_authority_even_with_covering_fresh_reads(self):
+        receipt, records, now = setup_fixture()
+        ref = add_checkpoint(receipt, records, "00:02:00")
+        claim(records, FEED_INS)["authority_ref"] = ref
+        receipt["lifecycle"]["setup"][0]["authority_ref"] = ref
+        match(records, FEED_INS)["checkpoint_ref"] = ref
+        self.reject(receipt, records, now, "transition_authority")
+
+    def test_setup_ledger_must_equal_the_complete_transition_claim(self):
+        receipt, records, now = setup_fixture()
+        for field, replacement in (("authority_ref", "checkpoint-4"),
+                                   ("owner", "other-owner"), ("before_state_ref", "other-state"),
+                                   ("key_sha256", "e" * 64), ("actual_count", 0)):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(receipt)
+                changed["lifecycle"]["setup"][0][field] = replacement
+                self.reject(changed, records, now, "lifecycle_transition")
+
+    def test_setup_cannot_be_both_setup_and_cleanup(self):
+        receipt, records, now = setup_fixture()
+        receipt["lifecycle"]["cleanup"].append(copy.deepcopy(receipt["lifecycle"]["setup"][0]))
+        self.reject(receipt, records, now, "lifecycle_operation")
+
+    def test_setup_cannot_repeat_one_operation_in_its_ledger(self):
+        receipt, records, now = setup_fixture()
+        receipt["lifecycle"]["setup"].append(copy.deepcopy(receipt["lifecycle"]["setup"][0]))
+        self.reject(receipt, records, now, "lifecycle_operation")
+
+    def test_setup_cannot_relabel_owned_deletion_as_setup_authority(self):
+        receipt, records, now = setup_fixture()
+        receipt["lifecycle"]["setup"].append(copy.deepcopy(claim(records, FEED_DEL)))
+        self.reject(receipt, records, now, "lifecycle_transition")
+
+    def test_setup_cannot_precede_snapshot_or_follow_rollout(self):
+        for clock in ("00:01:59", "00:03:01"):
+            with self.subTest(clock=clock):
+                receipt, records, now = setup_fixture(clock)
+                with self.assertRaisesRegex(Refusal, "lifecycle_operation_time$"):
+                    check_authority_graph_claims(receipt, evidence_index(records), now)
+
+    def test_setup_named_fence_expiry_remains_exclusive(self):
+        receipt, records, now = setup_fixture("00:02:30")
+        self.reject(receipt, records, now, "transition_authority_time")
+
+    def set_reads(self, receipt, records, prefix, clock):
+        # Each family's controller/verifier reads must still agree on complete
+        # history, not fail an incidental stale digest before the boundary check.
+        for role in ("controller", "verifier"):
+            ref = prefix + "-read-" + role + "-1"
+            read = records[ref]["data"]
+            read["claim"]["read_at"] = at(clock)
+            history = records[read["history_ref"]]["data"]
+            history["ended_at"] = at(clock)
+            read["claim"]["history_sha256"] = canonical_digest(history)
+            if prefix == "runtime":
+                next(x for x in receipt["authority"]["reads"] if x["ref"] == ref).update(
+                    copy.deepcopy(read["claim"]))
+
+    def test_setup_cannot_borrow_a_fresh_effect_fence_for_stale_named_reads(self):
+        for prefix in ("runtime", "install"):
+            with self.subTest(prefix=prefix):
+                receipt, records, now = setup_fixture("00:02:20")
+                add_checkpoint(receipt, records, "00:02:20")
+                self.set_reads(receipt, records, prefix, "00:01:00")
+                self.reject(receipt, records, now, "stale_mutation_read")
+
+    def test_setup_runtime_and_installation_reads_accept_exactly_sixty_seconds(self):
+        for prefix in ("runtime", "install"):
+            with self.subTest(prefix=prefix):
+                receipt, records, now = setup_fixture("00:02:20")
+                self.set_reads(receipt, records, prefix, "00:01:20")
+                self.check(receipt, records, now)
+
+    def test_setup_still_requires_the_exact_independent_ownership_witness(self):
+        receipt, records, now = setup_fixture()
+        self.assertIsNone(check_authority_graph_claims(receipt, evidence_index(records), now))
+        match(records, FEED_INS)["checkpoint_ref"] = "checkpoint-4"
+        with self.assertRaisesRegex(Refusal, "ownership_match$"):
+            check_transition_claims(receipt, evidence_index(records), now)
 
 
 class Schema(Transitions):

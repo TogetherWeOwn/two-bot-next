@@ -6,7 +6,9 @@ root. Literal values, stored cases, phase completion and actual restoration
 remain mandatory separate checks. runtime_preflight() always refuses.
 """
 
-from announcement_runtime_authority import _mutation_reads_current, check_authority_graph_claims
+from announcement_runtime_authority import (
+    _db_checkpoint_phase, _mutation_reads_current, check_authority_graph_claims,
+)
 from announcement_runtime_evidence import canonical_digest
 from announcement_runtime_provenance import _index, _unique_refs
 from announcement_runtime_schema import require, utc
@@ -18,7 +20,7 @@ def check_transition_claims(receipt, evidence, now):
 
     Read-only effects cannot hide a transition. Every write must consume a
     distinct external compare-and-match witness tied to its exact snapshots,
-    operation, execution/nonce/epochs and current effect-batch checkpoint. These
+    operation, execution/nonce/epochs and current named setup/effect checkpoint. These
     are necessary consistency predicates, not independently acquired evidence.
     """
     check_telemetry_claims(receipt, evidence, now)
@@ -79,7 +81,8 @@ def check_transition_claims(receipt, evidence, now):
                     new["presence"] == "absent", "transition_delete")
 
         checkpoint = checkpoints.get(claim["authority_ref"])
-        require(checkpoint is not None and checkpoint["phase"] == "effect_batch",
+        require(checkpoint is not None and
+                checkpoint["phase"] == _db_checkpoint_phase(receipt, effect, claim),
                 "transition_authority")
         fence = evidence.resolve(checkpoint["mutation_fence_ref"], "mutation_fence")
         require(utc(fence["observed_at"]) <= observed < utc(fence["valid_until"]),

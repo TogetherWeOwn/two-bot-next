@@ -28,6 +28,27 @@ def _mutation_reads_current(checkpoint, installation, evidence, observed):
         for record in (checkpoint, installation) for role in ("controller", "verifier"))
 
 
+def _db_checkpoint_phase(receipt, effect, claim):
+    """Resolve an exact setup write; other lifecycle phases remain separate.
+
+    This partial classifier does not admit recovery or prove ledger completeness.
+    The mandatory lifecycle phase checker still rejects unsupported cleanup and
+    requires setting transitions, rather than generic effect-batch authority.
+    """
+    setup = [entry for entry in receipt["lifecycle"]["setup"]
+             if entry["operation_id"] == effect["operation_id"]]
+    if not setup:
+        return "effect_batch"
+    require(len(setup) == 1 and not any(entry["operation_id"] == effect["operation_id"]
+            for entry in receipt["lifecycle"]["cleanup"]), "lifecycle_operation")
+    require(effect["method"] in ("db_insert", "db_cas") and claim == setup[0],
+            "lifecycle_transition")
+    require(utc(receipt["lifecycle"]["served_before"]["observed_at"]) <=
+            utc(effect["observed_at"]) <= utc(receipt["rollout"]["started_at"]),
+            "lifecycle_operation_time")
+    return "setup"
+
+
 def budget_claims(receipt):
     """The exact finite plan being compared, not permission for its effects."""
     fixtures = receipt["fixtures"]
@@ -313,6 +334,7 @@ def check_authority_graph_claims(receipt, evidence, now):
     mutation_checkpoint("rollout", receipt["rollout"]["started_at"])
     for effect in receipt["observations"]["actual_effects"]:
         named_ref = None
+        phase = "effect_batch"
         # Missing transition evidence still refuses in the telemetry/state-chain
         # layers. When supplied here it cannot be ignored or borrow another fence.
         if (effect["method"].startswith("db_") and effect["method"] != "db_read" and
@@ -325,7 +347,8 @@ def check_authority_graph_claims(receipt, evidence, now):
                     claim["resource_ref"] == effect["resource_ref"] and
                     claim["observed_at"] == effect["observed_at"], "mutation_transition_binding")
             named_ref = claim["authority_ref"]
-        mutation_checkpoint("effect_batch", effect["observed_at"], named_ref)
+            phase = _db_checkpoint_phase(receipt, effect, claim)
+        mutation_checkpoint(phase, effect["observed_at"], named_ref)
     _unique(fence_refs, "mutation_fence_replay")
     require(used_reads == reads.keys(), "unreferenced_authority_read")
     require(final_histories == [source["history_ref"], source["history_ref"]], "current_history")

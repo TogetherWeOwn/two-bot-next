@@ -8,7 +8,7 @@ message cleanup refuses; runtime_preflight() still always refuses.
 
 from datetime import datetime, timezone
 
-from announcement_runtime_authority import _mutation_reads_current
+from announcement_runtime_authority import _db_checkpoint_phase, _mutation_reads_current
 from announcement_runtime_evidence import EvidenceIndex, canonical_digest
 from announcement_runtime_provenance import _index, _unique_refs
 from announcement_runtime_schema import require, utc, validate_receipt_shape
@@ -65,8 +65,7 @@ def check_lifecycle_phase_claims(receipt, evidence, now):
                     claim["observed_at"] == effect["observed_at"], "lifecycle_transition")
         if operation in setup:
             require(write and claim == setup[operation], "lifecycle_transition")
-            require(snapshot <= observed <= rollout_start, "lifecycle_operation_time")
-            phase = "setup"
+            phase = _db_checkpoint_phase(receipt, effect, claim)
         elif operation in cleanup:
             require(write and claim == cleanup[operation], "lifecycle_transition")
             require(observation_end <= observed <= restored, "lifecycle_operation_time")
