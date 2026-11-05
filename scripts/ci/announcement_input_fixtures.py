@@ -68,7 +68,10 @@ def input_fixture():
         cases.append(case)
     receipt["observations"]["cases"] = cases
     receipt["fixtures"]["case_ids"] = [x["case_id"] for x in cases]
-    add("interaction-plan-ref", "interaction_plan", {"interactions": interactions})
+    # Other partial fixtures deliberately leave exchange resolution to its own
+    # checker; this pin is not silently consumed as complete response evidence.
+    add("interaction-plan-ref", "interaction_plan", {"interactions": interactions,
+        "exchanges": {"ref": "interaction-exchanges", "sha256": "a" * 64}})
     add("consent-ref", "test_consent", {"actor_ref": "actor", "actor_id": "300",
         "application_id": "100", "guild_id": "200", "execution_ref": "execution-ref",
         "nonce_ref": "one-shot-nonce", "case_ids": [x["case_id"] for x in interactions],

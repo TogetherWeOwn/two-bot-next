@@ -18,6 +18,7 @@ from announcement_runtime_cases import check_case_effect_claims
 from announcement_runtime_drain import check_drain_claims
 from announcement_runtime_evidence import EvidenceIndex
 from announcement_runtime_inputs import check_input_graph_claims
+from announcement_runtime_interactions import check_interaction_exchange_claims
 from announcement_runtime_lifecycle import check_lifecycle_ledger_claims
 from announcement_runtime_policy import CAPABILITY_GAPS, runtime_preflight
 from announcement_runtime_provenance import check_provenance_claims
@@ -49,7 +50,7 @@ CLAIM_CHECKS = (
     check_scheduler_graph_claims, check_source_input_claims,
     check_telemetry_claims, check_serialization_claims,
     check_transition_claims, check_setting_claims, check_case_effect_claims,
-    check_lifecycle_ledger_claims, check_drain_claims,
+    check_lifecycle_ledger_claims, check_drain_claims, check_interaction_exchange_claims,
 )
 
 

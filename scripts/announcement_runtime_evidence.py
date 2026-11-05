@@ -174,7 +174,7 @@ INPUT_RECORDS = {
         "execution_ref": REF, "nonce_ref": REF, "case_ids": Array(REF),
         "granted_at": UTC, "not_before": UTC, "expires_at": UTC,
         "outcome": enum("granted", "revoked", "unknown")},
-    "interaction_plan": {"interactions": Array(INTERACTION)},
+    "interaction_plan": {"interactions": Array(INTERACTION), "exchanges": CONTENT_PIN},
     "input_plan_content": {"keys": Array({"resource_ref": REF, "key": CONTENT_PIN}),
         "consent": CONTENT_PIN, "interactions": CONTENT_PIN, "scheduler_plan_sha256": SHA256,
         "source_plan_sha256": SHA256, "setting_plan_sha256": SHA256,
@@ -257,6 +257,27 @@ TELEMETRY_RECORDS = {
     "db_transition": {"claim": TRANSITION, "transaction_ref": REF,
                       "method": enum("db_insert", "db_cas", "db_delete_owned")},
 }
+# Token-free request/route and original-message projections stay RESTRICTED.
+# They are claims, not raw authenticated Discord envelopes or transport proof.
+INTERACTION_EXCHANGES = {
+    "interaction_exchanges": {"exchanges": Array({
+        "case_id": REF, "observer_ref": REF, "received_at": UTC,
+        "request": {"interaction_id": SERVICE_ID, "application_id": SERVICE_ID,
+            "guild_id": SERVICE_ID, "channel_id": SERVICE_ID, "actor_id": SERVICE_ID,
+            "command": enum(*sorted(COMMAND_GATES)), "options": Array(Union("name", {
+                "event-id": {"name": enum("event-id"), "value": SERVICE_ID},
+                "status": {"name": enum("status"),
+                           "value": enum("going", "interested", "declined")},
+            }), 0, 2)},
+        "responses": Array({"operation_id": REF, "origin": enum("https://discord.com"),
+            "route": enum("interaction_callback", "original_response"),
+            "http_method": enum("POST", "PATCH"),
+            "interaction_id": SERVICE_ID, "application_id": SERVICE_ID,
+            "body_utf8": Text(r"[\s\S]+"), "readback": {
+                "message_id": SERVICE_ID, "application_id": SERVICE_ID,
+                "channel_id": SERVICE_ID, "flags": Integer(),
+                "content": Text(r"[\s\S]*")}}, 1, 2)})},
+}
 # Lock graph observations are claims, NOT an acquired distributed fence. A plan
 # digest in the resource scope binds every participant and its acquisition path.
 LOCK_NAME = enum("deploy-staging", "staging-lifecycle")
@@ -326,7 +347,7 @@ WORK_RECORDS = {
 EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS,
                     **INPUT_RECORDS, **SCHEDULER_RECORDS, **SOURCE_RECORDS,
                     **TELEMETRY_RECORDS, **SERIALIZATION_RECORDS, **TRANSITION_RECORDS,
-                    **SETTING_RECORDS, **WORK_RECORDS}
+                    **SETTING_RECORDS, **WORK_RECORDS, **INTERACTION_EXCHANGES}
 
 
 def canonical_digest(value):

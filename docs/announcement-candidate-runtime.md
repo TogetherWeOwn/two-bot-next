@@ -289,6 +289,37 @@ not canonical staging qualification or production promotion.
   placeholder transition state/authority refs; it is not full-lifecycle proof.
   Synthetic/setup/cleanup operations still need their own exact semantic checks.
   No schema limit, live adapter, canonical gate or runtime refusal is changed.
+- `scripts/announcement_runtime_interactions.py` adds one closed restricted
+  aggregate exchange record, content-bound through the interaction/input/resource
+  and authority plans. The token-free request projection binds interaction,
+  application, guild, channel, consenting actor, command and closed options; its
+  canonical JSON digest must match the interaction's `request_sha256`. This
+  digest is explicitly **not a hash of a raw token-bearing Discord envelope**.
+  Every declared interaction has exactly one exchange; its ACK/edit operation
+  IDs must match the case. Claimed route classes bind callback POST versus
+  original-response PATCH at the fixed Discord origin without storing a URL
+  containing an interaction token. Exact body-byte digests must match the effect
+  ledger. Duplicate/unknown JSON fields, followups, non-ephemeral flags, mentions,
+  extra payloads and borrowed operations refuse. The narrow profile supports the
+  eight off-command refusals, final-off refusals, and one first RSVP with a raw
+  numeric event ID/status: deferred ephemeral ACK then the source-backed saved
+  response text in an original-response edit. Negative/replay/pasted-link or
+  changed-response profiles remain unsupported. Readback projections bind the
+  exact application/channel/content/ephemeral flag/platform ID; ACK and edit must
+  concern the same original message. The initial deferred readback requires
+  `EPHEMERAL | LOADING` (192), while the outbound callback, completed edit and
+  immediate refusals require only `EPHEMERAL` (64). Request-received time and
+  observer must fit the case/full-window observer claims and precede the ACK.
+  Claimed initial ACK attempts three or more whole seconds after receipt refuse;
+  original-response edits do not inherit that deadline. This coarse necessary
+  comparison is not proof of actual Discord deadline compliance.
+  **These remain unauthenticated projections, not proof of real requests,
+  transport routing, ephemeral visibility or persistence.** Other request kinds,
+  complete raw-envelope-to-projection validation, actual observers, callback
+  secret enforcement, stored business values and source-parser equivalence of
+  every serialization are still missing. No token or raw Discord response may be
+  serialized into these records or public artifacts. Unsupported serializers
+  refuse rather than gain an extension object. Runtime remains HOLD.
 - `scripts/announcement_runtime_lifecycle.py` compares the existing setup/cleanup
   DB ledgers to exact typed transition claims and operation sequence. Setup must
   follow the served-before snapshot and precede rollout; cleanup follows the
@@ -362,7 +393,7 @@ must not be called as a substitute for any canonical admission control.
 ## Offline claim-checking entry point
 
 `scripts/announcement_runtime_check.py` composes bounded archive intake,
-closed same-run typed sidecars, all thirteen existing public claim comparisons
+closed same-run typed sidecars, all fourteen existing public claim comparisons
 and final all-used sidecar accounting. It is **not an independently provisioned
 verifier, receipt producer or runtime admission path**. The local Git topology
 collector is not invoked; authenticated source/service inventories, complete
