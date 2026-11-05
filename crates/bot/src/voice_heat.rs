@@ -398,9 +398,8 @@ mod tests {
     #[tokio::test]
     async fn skipped_observations_still_persist_completed_hours() {
         let url = match std::env::var("TWO_TEST_DATABASE_URL") {
-            Ok(url) => url,
             Err(std::env::VarError::NotPresent) => return,
-            Err(error) => panic!("invalid test bootstrap configuration: {error}"),
+            result => result.expect("valid UTF-8 test bootstrap configuration"),
         };
         let fixture = two_bot_testsupport::TestDatabase::create(
             &url,
