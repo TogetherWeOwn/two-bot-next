@@ -176,6 +176,7 @@ INPUT_RECORDS = {
     "interaction_plan": {"interactions": Array(INTERACTION)},
     "input_plan_content": {"keys": Array({"resource_ref": REF, "key": CONTENT_PIN}),
         "consent": CONTENT_PIN, "interactions": CONTENT_PIN, "scheduler_plan_sha256": SHA256,
+        "source_plan_sha256": SHA256,
         "feed": {"resource_ref": REF, "guild_id": SERVICE_ID, "channel_id": SERVICE_ID,
                  "source_ref": REF, "item_key": ROW_ID, "nonce_ref": REF},
         "rsvp": {"resource_ref": REF, "status": enum("going", "interested", "declined"),
@@ -210,8 +211,32 @@ SCHEDULER_RECORDS = {
         "effective_poll_seconds": Integer(60, 86400),
         "decision": enum("suppressed", "admitted", "reconciled", "unknown")},
 }
+# Source bytes, URLs, row values and literal nonce stay RESTRICTED. This narrow
+# ASCII RSS profile avoids pretending Python URL/trim/markdown behavior is C's
+# general Rust parser. Unsupported source forms refuse; no URL is ever fetched.
+SOURCE_TARGET = {"origin": Text(r"https://[a-z0-9.-]+"),
+                 "path": Text(r"/[A-Za-z0-9/._~-]*")}
+SOURCE_RECORDS = {
+    "source_plan_content": {"candidate": VERSION, "source_ref": REF, "feed_ref": REF,
+        "item_ref": REF, "target": SOURCE_TARGET, "stored_feed": CONTENT_PIN,
+        "body": CONTENT_PIN, "selection": CONTENT_PIN,
+        "maximum_response_bytes": Integer(1, 4096),
+        "maximum_wire_attempts": Integer(1, LEDGER_LIMIT),
+        "redirects": enum("deny"), "content_encoding": enum("identity")},
+    "stored_feed_source": {"feed_ref": REF, "key_ref": REF, "guild_id": SERVICE_ID,
+        "channel_id": SERVICE_ID, "source_url": Text(r"https://[A-Za-z0-9/._~-]+"),
+        "kind": enum("rss", "youtube", "twitch"), "enabled": enum(True),
+        "observed_at": UTC, "observer_ref": REF, "served_ref": REF},
+    "source_body": {"source_ref": REF, "target": SOURCE_TARGET,
+        "body_utf8": Text(r"[\s\S]+"), "byte_count": Integer(1, 4096), "sha256": SHA256},
+    "source_selection": {"source_ref": REF, "body_sha256": SHA256, "item_ref": REF,
+        "item": {"key": Text(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,255}"),
+                 "title": Text(r"[A-Za-z0-9][A-Za-z0-9 -]{0,127}"),
+                 "url": Text(r"https://[a-z0-9./_~-]+"), "published_at": UTC},
+        "nonce_ref": REF, "nonce": Text(r"[0-9a-f]{24}"), "post_content_sha256": SHA256},
+}
 EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS,
-                    **INPUT_RECORDS, **SCHEDULER_RECORDS}
+                    **INPUT_RECORDS, **SCHEDULER_RECORDS, **SOURCE_RECORDS}
 
 
 def canonical_digest(value):

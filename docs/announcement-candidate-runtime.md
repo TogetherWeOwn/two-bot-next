@@ -147,6 +147,30 @@ not canonical staging qualification or production promotion.
   cadence, eligible poll, send/suppression or any observation. Full source,
   transitive/synthetic inventory, operation telemetry and lifecycle resolution
   remain mandatory. Runtime admission is still unconditionally unsupported.
+- `scripts/announcement_runtime_source_inputs.py` resolves four closed restricted
+  source-plan/stored-relay/body/selected-item claim kinds. The source plan hashes
+  through the input/resource/authority scope. A deliberately narrower ASCII RSS
+  profile requires a canonical HTTPS DNS origin and exact query-free path, no
+  IDNA labels/credentials/ports/redirects/alternate encoding, and at most 4,096 UTF-8 response
+  bytes. The origin and path identities hash their exact UTF-8 spelling; the body
+  digest and byte count compare actual inert text, not equal arbitrary hashes.
+  This bound fits the existing scalar limit; it does not raise C's fetch limits
+  or silently authorize general feeds. Stored-relay claims bind exact row-key,
+  guild/channel/source, enabled state, pre-rollout time and served-before pair;
+  their observer/job/producer claims use the separate verifier identity. The
+  selected-item claim has an exact content digest and C-derived item-key and
+  delivery-nonce comparisons: SHA-256 of the nonempty ASCII raw key, then the
+  first 24 hex characters of SHA-256 over relay ID, NUL and that **derived hash**.
+  Narrow title/URL checks compare the resulting RSS post-content digest, including
+  escaped title hyphens; unsupported trim/Unicode/markdown/URL forms refuse.
+  Source wire-attempt ceilings must equal the exact finite method budget.
+  **This is not a feed parser or a transport/selection observation.** A coherent
+  claim that selects an item absent from the body does not prove parser output;
+  exact C parser/source immutability, externally enforced request/response caps,
+  actual source requests and full stored-case semantics remain mandatory. No URL
+  is fetched, no XML is executed/parsed, no source is authenticated and no public
+  serializer exposes these restricted bytes or literal nonce. Runtime admission
+  stays unconditionally unsupported even for coherent fabricated records.
 - `scripts/announcement_runtime_policy.py` checks offline lease/freshness,
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
@@ -216,8 +240,10 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
 2. Complete typed input, effect, telemetry and lifecycle resolution beyond the
    provenance/authority, resource and scoped restricted-input claim comparisons.
    Authenticate restricted literal keys, consent and identity maps; bind complete
-   transitive inventory, source URL/content and synthetic-cleanup plans. The
-   scheduler comparison is scoped offline consistency, not a stored-data proof.
+   transitive inventory and synthetic-cleanup plans. The source-input comparison
+   binds restricted URL/body/item claims but still needs exact C parser selection,
+   actual source requests, immutable hosting and independent transport evidence.
+   The scheduler comparison is scoped offline consistency, not a stored-data proof.
    Resolve exact interaction request contents and actual ACK/edit wire records;
    live interaction replay remains explicitly unsupported. Implement full stored
    off/on/replay/final-off semantics and negatives, atomic RSVP/audit evidence,
