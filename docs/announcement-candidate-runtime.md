@@ -521,10 +521,26 @@ not canonical staging qualification or production promotion.
   upstream; this standalone checker does not validate their entire inventory or
   enforce an installation epoch fence. The offline CLI explicitly registers
   both comparisons before the mandatory lifecycle-phase refusal and final
-  all-used accounting. Coordinated authority/state-chain/lifecycle consumption remains
-  unfinished. Actual ownership/
-  CAS tokens, full-row state, process/Worker restoration and final verification
-  remain unfinished. The mandatory lifecycle-phase checker still refuses cleanup,
+  all-used accounting. Library-only `check_recovery_ownership_claims` composes
+  these plan/grant/read/fence/installation checks before comparing every cleanup
+  DB mutation's independent full-state `ownership_match` witness. Here that
+  generic record's `execution_ref` must name the **separate recovery grant**, with
+  its nonce and authority/resource epochs, never the ceased runtime execution
+  grant. Exact operation/resource/key/owner, named cleanup checkpoint, method,
+  before/after digests, observer, timestamp and matched compare-and-match boundary
+  must agree. The cleanup before-state must be the most recent declared DB write's
+  after-state at that write's actual timestamp, or the pre-snapshot baseline if
+  no write preceded it. That baseline may use the separate endpoint observer
+  validated by the mandatory resource graph; intermediate states, cleanup outputs
+  and witnesses still bind the full-window telemetry observer. Cleanup requires
+  present→absent owned deletion or
+  present→present CAS with an increasing version; endpoint-state reuse and
+  ordinary-write witness reuse refuse. These are still unauthenticated claims,
+  **not actual owned CAS or full-row restoration proof**. This narrower library
+  comparison is not yet a CLI registration or coordinated generic
+  authority/state-chain/lifecycle consumption. Actual ownership/CAS tokens,
+  full-row state, process/Worker restoration and final verification remain
+  unfinished. The mandatory lifecycle-phase checker still refuses cleanup,
   and the CLI/runtime stay unconditional HOLD. Retrospective grant consistency
   never makes a grant usable after expiry or supplies missing boundary freshness.
 - `scripts/announcement_runtime_drain.py` resolves four closed work-inventory,

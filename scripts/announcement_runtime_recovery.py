@@ -3,8 +3,9 @@
 The resource-plan digest binds a closed plan, not a caller allowlist. Separate
 scope/grant/decision/nonce claims are compared, never authenticated or consumed.
 Recovery reads/history/checkpoints/fences and installation revalidation are
-separate offline claims; mutation-phase integration remains unimplemented. The mandatory
-lifecycle-phase checker still refuses cleanup, regardless of these comparisons.
+separate offline claims. Owned cleanup witnesses can be compared against that
+separate grant, but coordinated mutation-phase integration remains unimplemented.
+The mandatory lifecycle-phase checker still refuses cleanup.
 """
 
 from datetime import timedelta
@@ -436,3 +437,90 @@ def check_recovery_installation_claims(receipt, evidence, now):
         require(all(utc(e["observed_at"]) > utc(previous["ended_at"])
                     for e in current["events"][len(previous["events"]):]),
                 "recovery_installation_history_backfill")
+
+
+def check_recovery_ownership_claims(receipt, evidence, now):
+    """Compare owned cleanup state/witness claims under the separate recovery grant.
+
+    This is not an actual CAS or complete state-chain/authority check. Ordinary
+    mutations still require the runtime authority and transition checkers. The
+    generic ownership record's execution_ref names the recovery grant here, never
+    the ceased runtime grant. No phase consumer or CLI refusal is bypassed.
+    """
+    check_recovery_installation_claims(receipt, evidence, now)
+    attempt, lifecycle = receipt["attempt"], receipt["lifecycle"]
+    grant = evidence.resolve(lifecycle["restoration_authority_ref"], "recovery_authority")
+    checkpoints = _index(evidence.resolve(RECOVERY_CHECKPOINTS_REF,
+        "recovery_checkpoints")["checkpoints"], "ref", "recovery_checkpoint_inventory")
+    resources = _index(receipt["resources"]["entries"], "ref", "resource_inventory")
+    cleanup = _index(lifecycle["cleanup"], "operation_id", "lifecycle_operation")
+    coverage = receipt["observations"]["coverage"]
+    require(len(coverage) == 1, "recovery_ownership_observer")
+    observer_ref = coverage[0]["observer_ref"]
+    prior = {ref: (resource["before_state_ref"], None) for ref, resource in resources.items()}
+    witnesses, created_states = [], []
+    ordinary_witnesses = []
+
+    def state(ref, resource, *, baseline=False):
+        record = evidence.resolve(ref, "resource_state")
+        require(record["claim"]["ref"] == ref and
+                record["resource_ref"] == resource["ref"] and
+                record["identity_sha256"] == canonical_digest(resource["identity"]) and
+                record["owner_ref"] == resource["owner"], "recovery_ownership_state")
+        # Endpoint observers are validated by the mandatory resource graph. Only
+        # a genuine no-prior-write baseline may use that separate observer here.
+        require(baseline or record["observer_ref"] == observer_ref, "recovery_ownership_observer")
+        return record
+
+    for effect in receipt["observations"]["actual_effects"]:
+        if not effect["method"].startswith("db_") or effect["method"] == "db_read":
+            continue
+        claim = evidence.resolve(effect["db_transition_refs"][0], "db_transition")["claim"]
+        resource = resources[effect["resource_ref"]]
+        if effect["operation_id"] not in cleanup:
+            ordinary_witnesses.append(claim["ownership_match_ref"])
+        else:
+            prior_ref, prior_time = prior[resource["ref"]]
+            require(claim["before_state_ref"] == prior_ref, "recovery_ownership_chain")
+            before = state(claim["before_state_ref"], resource, baseline=prior_time is None)
+            after = state(claim["actual_after_state_ref"], resource)
+            observed = utc(effect["observed_at"])
+            require(utc(attempt["started_at"]) <= utc(before["observed_at"]) <= observed and
+                    after["observed_at"] == effect["observed_at"] and
+                    (before["observed_at"] == prior_time if prior_time is not None else
+                     utc(before["observed_at"]) <= utc(lifecycle["served_before"]["observed_at"])),
+                    "recovery_ownership_time")
+            old, new = before["claim"], after["claim"]
+            require(new["ref"] != old["ref"] and new["ref"] not in (
+                resource["before_state_ref"], resource["after_state_ref"]),
+                "recovery_ownership_state_reuse")
+            created_states.append(new["ref"])
+            if effect["method"] == "db_cas":
+                require(old["presence"] == new["presence"] == "present" and
+                        int(new["version"]) > int(old["version"]), "recovery_ownership_cas")
+            else:
+                require(effect["method"] == "db_delete_owned" and
+                        old["presence"] == "present" and new["presence"] == "absent",
+                        "recovery_ownership_delete")
+            checkpoint = checkpoints.get(claim["authority_ref"])
+            require(checkpoint is not None and checkpoint["phase"] == "cleanup" and
+                    effect["operation_id"] in checkpoint["operation_id_refs"],
+                    "recovery_ownership_checkpoint")
+            witness_ref = claim["ownership_match_ref"]
+            witness = evidence.resolve(witness_ref, "ownership_match")
+            require(witness == {
+                "operation_id": effect["operation_id"], "resource_ref": resource["ref"],
+                "identity_sha256": canonical_digest(resource["identity"]),
+                "key_sha256": resource["identity"]["key_sha256"], "owner_ref": resource["owner"],
+                "execution_ref": grant["ref"], "nonce_ref": grant["nonce_ref"],
+                "authority_epoch": grant["epoch"], "resource_epoch": grant["resource_epoch"],
+                "checkpoint_ref": checkpoint["ref"], "method": effect["method"],
+                "before_state_sha256": canonical_digest(before),
+                "after_state_sha256": canonical_digest(after), "observer_ref": observer_ref,
+                "observed_at": effect["observed_at"], "boundary": "external_compare_and_match",
+                "outcome": "matched"}, "recovery_ownership_match")
+            witnesses.append(witness_ref)
+        prior[resource["ref"]] = (claim["actual_after_state_ref"], effect["observed_at"])
+    _unique_refs(witnesses)
+    _unique_refs(created_states)
+    require(not set(witnesses).intersection(ordinary_witnesses), "recovery_ownership_replay")
