@@ -171,6 +171,31 @@ not canonical staging qualification or production promotion.
   is fetched, no XML is executed/parsed, no source is authenticated and no public
   serializer exposes these restricted bytes or literal nonce. Runtime admission
   stays unconditionally unsupported even for coherent fabricated records.
+- `scripts/announcement_runtime_telemetry.py` composes provenance and resource
+  checks with five closed restricted telemetry-window/wire/platform/transaction/
+  transition sidecar kinds. One exact full-attempt coverage claim must match the
+  run, enforcement epoch, inventory digest and ordered operation IDs. Subwindow
+  or multiple coverage records refuse rather than imply complete coverage. The
+  observer's matching successful external-observer job must span the entire
+  attempt and its principal cannot be any declared writer/author/executor/caller
+  or resource-owning controller, even if that owner has no producing job.
+  Every non-DB operation has exactly one content-bound wire-attempt claim; every
+  applicable message/ACK/edit/command-replace operation has matching platform
+  identity/content/resource/nonce readback. DB operations each belong to one
+  committed transaction; writes bind one exact owned key/count/method transition.
+  The positive RSVP and audit inserts must share exactly one transaction; its
+  additional budgeted reads are reconciled, while unrelated writes refuse. Missing,
+  extra, aliased, stale, blocked, unknown or inconsistent records refuse; matching
+  aggregate counts or a nonempty unrelated receipt list cannot substitute.
+  Reference lists retain the 256-entry bound, so this narrower window profile
+  refuses larger operation-ID lists rather than raising the contract's limits.
+  **These are comparisons of claims, not authenticated telemetry, atomicity or
+  all-path enforcement.** Exact request bodies/routes/ephemeral flags, literal
+  platform identity semantics, transition state/ownership/authority evidence,
+  source parser/transport, stored cases, triggers, lock/drain/cleanup/restoration
+  and final all-used accounting remain mandatory separate checks. No observer,
+  credential, DB transaction, external fence or public serializer is created.
+  Consistent fabricated telemetry still cannot pass runtime admission.
 - `scripts/announcement_runtime_policy.py` checks offline lease/freshness,
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
@@ -246,8 +271,11 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
    The scheduler comparison is scoped offline consistency, not a stored-data proof.
    Resolve exact interaction request contents and actual ACK/edit wire records;
    live interaction replay remains explicitly unsupported. Implement full stored
-   off/on/replay/final-off semantics and negatives, atomic RSVP/audit evidence,
-   owned CAS cleanup and independently verified restoration. Bind every actual
+   off/on/replay/final-off semantics and negatives. The scoped telemetry checker
+   compares wire/platform/transaction correspondence and RSVP/audit grouping,
+   but does not authenticate observation, prove SQL atomicity or resolve the
+   transition state/ownership/authority references. Implement owned CAS cleanup
+   and independently verified restoration. Bind every actual
    mutation to its correct authority checkpoint. The scoped resource graph and
    method-count checks alone are not a complete receipt-verification result.
 3. Strict receipt production and independently provisioned verification,

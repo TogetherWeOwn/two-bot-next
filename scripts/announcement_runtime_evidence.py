@@ -12,10 +12,10 @@ import json
 
 from announcement_runtime_schema import (
     ARCHIVE_LIMIT, Array, AUTHORITY, AUTHORITY_READ, CONTROL, DECISION, DOCUMENT,
-    COUNT, GATE_NAMES, IDENTITY, IMAGE, Integer, LEDGER_LIMIT, MANIFEST, OPERATIONS,
+    COUNT, COVERAGE, GATE_NAMES, IDENTITY, IMAGE, Integer, LEDGER_LIMIT, MANIFEST, OPERATIONS,
     PRINCIPAL, REF, REFERENCE_LIMIT, RESOURCE, RUN, SCOPE, SERVICE_ID, SERVED_PAIR,
     SHA, SHA256, STATE, TOKEN_FREE_PATH, UTC, UUID, COMMAND_GATES,
-    Text, Union, VERSION, WORKER, _validate, enum,
+    Text, TRANSITION, Union, VERSION, WORKER, _validate, enum,
     parse_bounded_json, require,
 )
 
@@ -235,8 +235,30 @@ SOURCE_RECORDS = {
                  "url": Text(r"https://[a-z0-9./_~-]+"), "published_at": UTC},
         "nonce_ref": REF, "nonce": Text(r"[0-9a-f]{24}"), "post_content_sha256": SHA256},
 }
+# These are restricted observation CLAIMS. Complete correspondence is necessary,
+# but cannot establish independent all-path observation or actual transactions.
+EFFECT_BINDING = {"operation_id": REF, "effect_sha256": SHA256,
+                  "resource_identity_sha256": SHA256}
+TELEMETRY_RECORDS = {
+    "telemetry_window": {"claim": COVERAGE, "operation_ids": Array(REF, 0)},
+    "wire_attempt": {**EFFECT_BINDING, "observer_ref": REF, "observed_at": UTC,
+                     "outcome": enum("accepted", "blocked", "failed", "unknown")},
+    "platform_effect": {"operation_id": REF, "resource_identity_sha256": SHA256,
+        "method": enum("feed_post", "interaction_ack", "interaction_edit",
+                       "guild_commands_replace"),
+        "payload_sha256": SHA256, "nonce_refs": Array(REF, 0),
+        "platform_ids": Array(SERVICE_ID), "observer_ref": REF, "observed_at": UTC,
+        "outcome": enum("accepted", "unknown")},
+    "db_transaction": {"transaction_id": UUID, "observer_ref": REF,
+        "effects": Array(EFFECT_BINDING, 1, LEDGER_LIMIT),
+        "transition_refs": Array(REF, 0), "committed_at": UTC,
+        "outcome": enum("committed", "rolled_back", "unknown")},
+    "db_transition": {"claim": TRANSITION, "transaction_ref": REF,
+                      "method": enum("db_insert", "db_cas", "db_delete_owned")},
+}
 EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS,
-                    **INPUT_RECORDS, **SCHEDULER_RECORDS, **SOURCE_RECORDS}
+                    **INPUT_RECORDS, **SCHEDULER_RECORDS, **SOURCE_RECORDS,
+                    **TELEMETRY_RECORDS}
 
 
 def canonical_digest(value):
