@@ -34,7 +34,7 @@ from test_announcement_runtime_recovery import repin
 from test_announcement_runtime_recovery_grant import CONSUMPTION, GRANT, NONCE, SCOPE, repin_grant
 from test_announcement_runtime_recovery_reads import (
     CKPT, CLEAN_CP, CLEAN_TIME, FINAL_CP, FINAL_TIME, HISTORY, read_fixture,
-    read_ref, repin_reads, retime_cleanup, set_read_time)
+    read_ref, retime_cleanup, set_read_time)
 
 FENCES = "runtime-recovery-fences"
 FENCE = {"cleanup": "recovery-fence-cleanup", "final": "recovery-fence-final"}
@@ -79,6 +79,100 @@ def entries(records):
 
 def set_until(records, phase, clock):
     fence_data(records, phase)["valid_until"] = at(clock)
+
+
+def repin_recovery_scope(receipt, records):
+    repin(receipt, records)
+    scope = records[SCOPE]["data"]
+    scope["plan_sha256"] = canonical_digest(records[RECOVERY_PLAN_REF]["data"])
+    scope["resource_plan"] = copy.deepcopy(receipt["resources"]["plan"])
+    repin_grant(records)
+    digest = records[GRANT]["data"]["scope_sha256"]
+    for record in records.values():
+        if record["kind"] == "recovery_history":
+            record["data"]["scope_sha256"] = digest
+    for record in records.values():
+        if record["kind"] == "recovery_read":
+            data = record["data"]
+            data["claim"]["scope_sha256"] = digest
+            data["claim"]["history_sha256"] = canonical_digest(records[data["history_ref"]]["data"])
+
+
+def add_second_cleanup(receipt, records, *, split_checkpoint=False):
+    """Two distinct literal DB keys; still only a partial offline graph."""
+    resource = copy.deepcopy(receipt["resources"]["entries"][0])
+    resource["ref"] = "db-resource-second"
+    resource["identity"]["key_sha256"] = "f" * 64
+    for field in ("before_state_ref", "after_state_ref"):
+        resource[field] += "-second"
+    receipt["resources"]["entries"].append(resource)
+    for old in ("state-before", "state-after", "state-final"):
+        ref = old + "-second"
+        record = copy.deepcopy(records[old]["data"])
+        record.update(resource_ref=resource["ref"], identity_sha256=canonical_digest(resource["identity"]))
+        record["claim"]["ref"] = ref
+        if old == "state-final":
+            record["observed_at"] = at("00:20:40")
+        records[ref] = envelope(ref, "resource_state", record)
+        if old != "state-final":
+            receipt["resources"]["states"].append(copy.deepcopy(record["claim"]))
+    operation = "op-cleanup-second"
+    claim = copy.deepcopy(receipt["lifecycle"]["cleanup"][0])
+    claim.update(operation_id=operation, resource_ref=resource["ref"],
+        key_sha256=resource["identity"]["key_sha256"], before_state_ref="state-setup-second",
+        intended_after_state_ref="state-final-second", actual_after_state_ref="state-final-second",
+        ownership_match_ref="match-cleanup-second", observed_at=at("00:20:40"))
+    receipt["lifecycle"]["cleanup"].append(claim)
+    transition = copy.deepcopy(records["transition-" + CLEANUP]["data"])
+    transition.update(claim=copy.deepcopy(claim), transaction_ref="transaction-cleanup-second")
+    records["transition-" + operation] = envelope("transition-" + operation, "db_transition", transition)
+    for field in ("actual_effects", "expected_effects"):
+        effects = receipt["observations"][field]
+        effect = copy.deepcopy(next(e for e in effects if e["operation_id"] == CLEANUP))
+        effect.update(operation_id=operation, sequence=len(effects) + 1,
+            resource_ref=resource["ref"], observed_at=claim["observed_at"],
+            db_transition_refs=["transition-" + operation])
+        effects.append(effect)
+    plan = records[RECOVERY_PLAN_REF]["data"]
+    entry = copy.deepcopy(plan["operations"][0])
+    entry.update(operation_id=operation, resource_ref=resource["ref"],
+        identity_sha256=canonical_digest(resource["identity"]), key_sha256=claim["key_sha256"],
+        restore_state_ref=resource["before_state_ref"])
+    plan["operations"].append(entry)
+    resource_plan = records["runtime-resource-plan"]["data"]
+    resource_plan["entries"] = copy.deepcopy(receipt["resources"]["entries"])
+    resource_plan["states"] = copy.deepcopy(receipt["resources"]["states"])
+    budget = copy.deepcopy(resource_plan["operation_budgets"][0])
+    budget.update(ref="cleanup-budget-second", resource_ref=resource["ref"])
+    resource_plan["operation_budgets"].append(budget)
+    checkpoints = records[CKPT]["data"]["checkpoints"]
+    if not split_checkpoint:
+        checkpoints[0]["operation_id_refs"].append(operation)
+    else:
+        checkpoint = copy.deepcopy(checkpoints[0])
+        checkpoint.update(ref="recovery-checkpoint-second", checked_at=at("00:20:35"),
+                          operation_id_refs=[operation])
+        history = copy.deepcopy(records[HISTORY["cleanup"]]["data"])
+        history["ended_at"] = checkpoint["checked_at"]
+        history_ref = "recovery-history-second"
+        records[history_ref] = envelope(history_ref, "recovery_history", history)
+        for role in ("controller", "verifier"):
+            ref = "recovery-read-second-" + role
+            data = copy.deepcopy(records[read_ref("cleanup", role)]["data"])
+            data.update(history_ref=history_ref)
+            data["claim"].update(ref=ref, read_at=checkpoint["checked_at"])
+            records[ref] = envelope(ref, "recovery_read", data)
+            checkpoint[role + "_read_ref"] = ref
+        checkpoints.insert(1, checkpoint)
+        claim["authority_ref"] = checkpoint["ref"]
+        records["transition-" + operation]["data"]["claim"] = copy.deepcopy(claim)
+        ref = "recovery-fence-second"
+        fence = copy.deepcopy(fence_data(records, "cleanup"))
+        fence.update(checkpoint_ref=checkpoint["ref"], observed_at=checkpoint["checked_at"],
+                     valid_until=at("00:21:05"))
+        records[ref] = envelope(ref, "recovery_mutation_fence", fence)
+        entries(records).insert(1, {"checkpoint_ref": checkpoint["ref"], "fence_ref": ref})
+    repin_recovery_scope(receipt, records)
 
 
 class RecoveryFences(unittest.TestCase):
@@ -335,18 +429,8 @@ class RecoveryFences(unittest.TestCase):
             # label, so the final fence's grant bound is independently exercised.
             plan = e[RECOVERY_PLAN_REF]["data"]
             plan["expires_at"] = at("00:22:20")
-            repin(r, e)
-            scope = e[SCOPE]["data"]
-            scope["plan_sha256"] = canonical_digest(plan)
-            scope["resource_plan"] = copy.deepcopy(r["resources"]["plan"])
             e[GRANT]["data"]["expires_at"] = plan["expires_at"]
-            repin_grant(e)
-            digest = e[GRANT]["data"]["scope_sha256"]
-            for phase in PHASES:
-                e[HISTORY[phase]]["data"]["scope_sha256"] = digest
-                for role in ("controller", "verifier"):
-                    e[read_ref(phase, role)]["data"]["claim"]["scope_sha256"] = digest
-                repin_reads(e, phase)
+            repin_recovery_scope(r, e)
             set_until(e, "final", clock)
         self.reject(lambda r, e: shorter_grant(r, e, "00:22:21"), "recovery_fence_time")
         self.accept(lambda r, e: shorter_grant(r, e, "00:22:20"))
@@ -368,6 +452,21 @@ class RecoveryFences(unittest.TestCase):
         self.accept(move("00:21:00", "00:21:10"))
         self.reject(move("00:21:00", "00:21:00"), "recovery_mutation_fence_time")
         self.reject(move("00:21:00", "00:20:59"), "recovery_mutation_fence_time")
+
+    def test_every_operation_in_one_checkpoint_must_precede_expiry(self):
+        self.reject(lambda r, e: add_second_cleanup(r, e), "recovery_mutation_fence_time")
+        def unexpired(r, e):
+            add_second_cleanup(r, e)
+            set_until(e, "cleanup", "00:20:41")
+        self.accept(unexpired)
+
+    def test_multiple_cleanup_checkpoints_are_each_checked(self):
+        self.accept(lambda r, e: add_second_cleanup(r, e, split_checkpoint=True))
+        def second_expired(r, e):
+            add_second_cleanup(r, e, split_checkpoint=True)
+            set_until(e, "cleanup", "00:20:31")
+            e["recovery-fence-second"]["data"]["valid_until"] = at("00:20:40")
+        self.reject(second_expired, "recovery_mutation_fence_time")
 
     def test_final_now_must_be_before_fence_expiry(self):
         self.reject(lambda r, e: None, "recovery_mutation_fence_time", now=at_second(30))
