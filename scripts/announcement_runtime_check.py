@@ -25,6 +25,7 @@ from announcement_runtime_lifecycle import check_lifecycle_ledger_claims
 from announcement_runtime_policy import CAPABILITY_GAPS, runtime_preflight
 from announcement_runtime_provenance import check_provenance_claims
 from announcement_runtime_resources import check_resource_graph_claims
+from announcement_runtime_rsvp_storage import check_rsvp_storage_claims
 from announcement_runtime_scheduler import check_scheduler_graph_claims
 from announcement_runtime_schema import (
     ARCHIVE_LIMIT, RECEIPT_LIMIT, REFERENCE_LIMIT, RUN, SHA256, Array, Integer,
@@ -53,7 +54,7 @@ CLAIM_CHECKS = (
     check_telemetry_claims, check_serialization_claims,
     check_transition_claims, check_setting_claims, check_case_effect_claims,
     check_lifecycle_ledger_claims, check_drain_claims, check_interaction_exchange_claims,
-    check_feed_exchange_claims, check_delivery_trace_claims,
+    check_feed_exchange_claims, check_delivery_trace_claims, check_rsvp_storage_claims,
 )
 
 

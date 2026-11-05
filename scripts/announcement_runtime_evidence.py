@@ -273,7 +273,15 @@ FEED_EXCHANGE_RECORDS = {
 # Token-free request/route and original-message projections stay RESTRICTED.
 # They are claims, not raw authenticated Discord envelopes or transport proof.
 INTERACTION_EXCHANGES = {
-    "interaction_exchanges": {"exchanges": Array({
+    "interaction_exchanges": {"storage": {
+        "case_id": REF, "transaction_ref": REF,
+        "rsvp": {"guild_id": SERVICE_ID, "event_id": SERVICE_ID, "user_id": SERVICE_ID,
+                 "status": enum("going", "interested", "declined"), "responded_at": UTC},
+        "audit": {"id": ROW_ID, "guild_id": SERVICE_ID, "actor_id": SERVICE_ID,
+                  "action": enum("event.rsvp"), "target_key": SERVICE_ID,
+                  "outcome": enum("going", "interested", "declined"),
+                  "reason": enum({"kind": "sql_null"}), "created_at": UTC}},
+        "exchanges": Array({
         "case_id": REF, "observer_ref": REF, "received_at": UTC,
         "request": {"interaction_id": SERVICE_ID, "application_id": SERVICE_ID,
             "guild_id": SERVICE_ID, "channel_id": SERVICE_ID, "actor_id": SERVICE_ID,

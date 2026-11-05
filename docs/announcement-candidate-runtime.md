@@ -335,6 +335,23 @@ not canonical staging qualification or production promotion.
   response may be serialized into these records. No restricted record may be
   serialized into public artifacts. Unsupported serializers
   refuse rather than gain an extension object. Runtime remains HOLD.
+- `scripts/announcement_runtime_rsvp_storage.py` composes the interaction checks
+  with mandatory restricted first-RSVP/audit column projections in the same
+  content-pinned exchange aggregate. The RSVP must use the exact `(guild,event,user)`
+  key and planned status; audit ID is `rsvp:<interaction ID>`, with the same guild,
+  actor, event target, status and timestamp, action `event.rsvp` and typed SQL-null
+  reason. The timestamp follows completed pre-reads and fits the baseline/case/
+  commit interval. The declared inserts must occur in RSVP-then-audit sequence
+  and name the same covered committed transaction. Each transition starts at its
+  absent baseline and ends at a distinct present state with exact resource,
+  identity, owner, observer, commit time and canonical row-projection digest.
+  This narrow profile does not admit re-responses, audit dedupe or compensation.
+  **These are column and transaction claims, not actual SQL results, advisory
+  locks, atomicity, trigger enforcement or independently obtained stored values.**
+  Later cleanup/restoration, real transaction admission/readback and authenticated
+  evidence remain mandatory. Restricted literal columns must never be emitted
+  into public artifacts. No SQL/transport/credential adapter is added; runtime
+  admission and the composed offline CLI remain unconditionally HOLD.
 - `scripts/announcement_runtime_feed_exchange.py` adds one closed restricted
   `feed_post_exchange` sidecar, content-pinned by the source plan's mandatory
   `post_exchange` pin, for the single RSS feed post. It composes the source and
@@ -484,7 +501,7 @@ must not be called as a substitute for any canonical admission control.
 ## Offline claim-checking entry point
 
 `scripts/announcement_runtime_check.py` composes bounded archive intake,
-closed same-run typed sidecars, all sixteen existing public claim comparisons
+closed same-run typed sidecars, all seventeen existing public claim comparisons
 and final all-used sidecar accounting. It is **not an independently provisioned
 verifier, receipt producer or runtime admission path**. The local Git topology
 collector is not invoked; authenticated source/service inventories, complete
