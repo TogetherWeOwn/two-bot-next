@@ -8,9 +8,88 @@ message cleanup refuses; runtime_preflight() still always refuses.
 
 from datetime import datetime, timezone
 
+from announcement_runtime_authority import _mutation_reads_current
 from announcement_runtime_evidence import EvidenceIndex, canonical_digest
 from announcement_runtime_provenance import _index, _unique_refs
 from announcement_runtime_schema import require, utc, validate_receipt_shape
+
+
+def check_lifecycle_phase_claims(receipt, evidence, now):
+    """Compare setup/setting/business checkpoint phases, never authorize recovery.
+
+    Compose with the authority, state-chain and ledger checkers: this narrower
+    comparison neither authenticates reads nor replaces their scope/history and
+    ownership checks. The schema has no separately scoped recovery checkpoint.
+    Cleanup therefore explicitly refuses, even with a fresh effect-batch fence;
+    no complete lifecycle can pass this layer until recovery is implemented.
+    """
+    validate_receipt_shape(receipt)
+    require(type(evidence) is EvidenceIndex, "evidence_index")
+    require(type(now) is datetime and now.tzinfo is timezone.utc, "clock")
+    attempt, lifecycle = receipt["attempt"], receipt["lifecycle"]
+    evidence.require_run(attempt["run"])
+    start, end = utc(attempt["started_at"]), utc(attempt["ended_at"])
+    snapshot = utc(lifecycle["served_before"]["observed_at"])
+    restored = utc(lifecycle["served_after"]["observed_at"])
+    rollout_start, rollout_end = utc(receipt["rollout"]["started_at"]), utc(receipt["rollout"]["ended_at"])
+    observation_start = utc(attempt["observation_started_at"])
+    observation_end = utc(attempt["observation_ended_at"])
+    require(start <= snapshot <= rollout_start <= rollout_end <= observation_start <
+            observation_end <= restored <= end <= now, "lifecycle_window")
+    checkpoints = _index(attempt["checkpoints"], "ref", "checkpoint_inventory")
+    resources = _index(receipt["resources"]["entries"], "ref", "resource_inventory")
+    effects = receipt["observations"]["actual_effects"]
+    by_operation = _index(effects, "operation_id", "operation_replay")
+    setup = _index(lifecycle["setup"], "operation_id", "lifecycle_ledger_order")
+    cleanup = _index(lifecycle["cleanup"], "operation_id", "lifecycle_ledger_order")
+    require(not setup.keys() & cleanup.keys() and
+            setup.keys() | cleanup.keys() <= by_operation.keys(), "lifecycle_operation")
+    install_refs = receipt["authority"]["installation_approval_refs"]
+    require(len(install_refs) == len(checkpoints), "installation_approval")
+    installations = dict(zip(checkpoints, install_refs))
+    for effect in effects:
+        operation = effect["operation_id"]
+        observed = utc(effect["observed_at"])
+        resource = resources.get(effect["resource_ref"])
+        require(resource is not None, "lifecycle_resource")
+        write = effect["method"].startswith("db_") and effect["method"] != "db_read"
+        claim = None
+        if write:
+            require(resource["identity"]["kind"] == "database" and
+                    len(effect["db_transition_refs"]) == 1, "lifecycle_operation")
+            transition = evidence.resolve(effect["db_transition_refs"][0], "db_transition")
+            claim = transition["claim"]
+            require(transition["method"] == effect["method"] and
+                    claim["operation_id"] == operation and
+                    claim["resource_ref"] == effect["resource_ref"] and
+                    claim["observed_at"] == effect["observed_at"], "lifecycle_transition")
+        if operation in setup:
+            require(write and claim == setup[operation], "lifecycle_transition")
+            require(snapshot <= observed <= rollout_start, "lifecycle_operation_time")
+            phase = "setup"
+        elif operation in cleanup:
+            require(write and claim == cleanup[operation], "lifecycle_transition")
+            require(observation_end <= observed <= restored, "lifecycle_operation_time")
+            require(False, "unsupported_recovery_authority")
+        else:
+            # No default phase for startup, drain or restoration operations.
+            require(observation_start <= observed < observation_end, "unassigned_lifecycle_effect")
+            phase = "transition" if write and resource["kind"] == "setting" else "effect_batch"
+        matching = [checkpoint for checkpoint in checkpoints.values()
+                    if checkpoint["phase"] == phase and
+                    (claim is None or checkpoint["ref"] == claim["authority_ref"])]
+        current = []
+        for checkpoint in matching:
+            fence = evidence.resolve(checkpoint["mutation_fence_ref"], "mutation_fence")
+            require(fence["checkpoint_ref"] == checkpoint["ref"] and fence["phase"] == phase and
+                    fence["run"] == attempt["run"] and
+                    fence["observed_at"] == checkpoint["checked_at"], "lifecycle_fence")
+            if utc(checkpoint["checked_at"]) <= observed < utc(fence["valid_until"]):
+                current.append(checkpoint)
+        require(current, "lifecycle_phase_checkpoint")
+        require(any(_mutation_reads_current(checkpoint, evidence.resolve(
+            installations[checkpoint["ref"]], "installation_approval"), evidence, observed)
+            for checkpoint in current), "stale_mutation_read")
 
 
 def check_lifecycle_ledger_claims(receipt, evidence, now):

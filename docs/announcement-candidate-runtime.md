@@ -409,6 +409,21 @@ not canonical staging qualification or production promotion.
   references, prove queue quiescence, validate actual SQL/CAS tokens or acquire
   separately scoped recovery authority. A fabricated coherent ledger returns no
   capability; unresolved full-packet evidence remains adverse.
+  Its separate `check_lifecycle_phase_claims` layer maps setup-ledger writes to
+  the named `setup` checkpoint, in-window setting writes to `transition`, and
+  other in-window operations to `effect_batch`. Named DB checkpoints cannot
+  borrow another fresh checkpoint's phase or read freshness. Exact fence phase,
+  checkpoint/run/time correspondence, exclusive expiry and all four runtime/
+  installation read ages are compared at the operation time. Unassigned startup,
+  drain or restoration operations have no default phase. Cleanup explicitly
+  refuses `unsupported_recovery_authority`: the current schema has no separately
+  scoped recovery checkpoint, and an ordinary fresh effect-batch/final fence
+  cannot substitute for it. This layer does not authenticate authority or prove
+  phase completion. The older authority/transition layers still require generic
+  effect-batch coverage; reconciling those with this stricter phase assignment,
+  credential usability, recovery and full lifecycle integration remains unfinished.
+  The new tests deliberately splice partial fabricated graphs, assert the
+  terminal recovery refusal, and claim no successful composed lifecycle.
 - `scripts/announcement_runtime_drain.py` resolves four closed work-inventory,
   snapshot, fence and drain claim kinds alongside the lifecycle-ledger comparison.
   The declared finite surface inventory is content-bound to the scoped inventory
@@ -516,7 +531,7 @@ must not be called as a substitute for any canonical admission control.
 ## Offline claim-checking entry point
 
 `scripts/announcement_runtime_check.py` composes bounded archive intake,
-closed same-run typed sidecars, all seventeen existing public claim comparisons
+closed same-run typed sidecars, all eighteen existing public claim comparisons
 and final all-used sidecar accounting. It is **not an independently provisioned
 verifier, receipt producer or runtime admission path**. The local Git topology
 collector is not invoked; authenticated source/service inventories, complete

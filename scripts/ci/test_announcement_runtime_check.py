@@ -63,7 +63,8 @@ class ArchiveComposition(unittest.TestCase):
             "check_telemetry_claims", "check_serialization_claims",
             "check_transition_claims", "check_setting_claims", "check_case_effect_claims",
             "check_lifecycle_ledger_claims", "check_drain_claims", "check_interaction_exchange_claims",
-            "check_feed_exchange_claims", "check_delivery_trace_claims", "check_rsvp_storage_claims"])
+            "check_feed_exchange_claims", "check_delivery_trace_claims", "check_rsvp_storage_claims",
+            "check_lifecycle_phase_claims"])
 
     def test_same_index_and_clock_flow_through_every_comparison(self):
         raw, inventory = packet()
@@ -73,9 +74,9 @@ class ArchiveComposition(unittest.TestCase):
             calls.append((receipt, evidence, now))
             evidence.resolve("check-doc", "document")
 
-        with mock.patch.object(checker, "CLAIM_CHECKS", (compare,) * 17):
+        with mock.patch.object(checker, "CLAIM_CHECKS", (compare,) * 18):
             self.assertIsNone(checker.check_archive_claims(raw, inventory, now=NOW))
-        self.assertEqual(len(calls), 17)
+        self.assertEqual(len(calls), 18)
         self.assertTrue(all(r is calls[0][0] and e is calls[0][1] and n is NOW
                             for r, e, n in calls))
         self.assertIs(calls[0][0]["promotable"], False)
