@@ -153,6 +153,7 @@ def resource_fixture(*, synthetic=False):
             "source_ref": "source"},
         "entries": entries, "states": states, "identity_map": receipt["resources"]["identity_map"],
         "inventory_manifest": receipt["resources"]["inventory_manifest"], "operation_budgets": budgets,
+        "input_plan_sha256": "a" * 64,
         "not_before": at("00:00:00"), "expires_at": at("00:40:00")})
     repin_resources(receipt, records)
     repin_authority(receipt, records)

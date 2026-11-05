@@ -106,6 +106,29 @@ not canonical staging qualification or production promotion.
   transitive inventories, operation contents, wire/DB receipts, stored-case or
   full restoration semantics. Coherent fabricated graphs still return no
   capability. The fixtures explicitly omit those qualifications.
+- `scripts/announcement_runtime_inputs.py` adds scoped **restricted** literal-key,
+  consent and finite interaction-plan claim comparisons. Four closed sidecar
+  kinds define table-specific primary keys, test consent, interaction plans and
+  input-plan contents. The resource plan hashes the fixed `runtime-input-plan`;
+  each referenced key/consent/interaction record is content-bound in that plan.
+  Every modeled database resource must have one unique complete typed key whose
+  table and digest match its identity. Delivery keys bind the relay/item; K binds
+  the guild and exact `TWO_ANNOUNCEMENTS` key; RSVP binds the guild/event/actor,
+  and its audit ID is the source-backed `rsvp:<interaction ID>`, not a check-in ID.
+  Consent claims bind the exact actor/application/guild, execution/nonce, full
+  attempt window and finite case set. Interaction claims bind the case/phase,
+  consenting actor, application, control channel and event; live-off covers all
+  eight command names. The scoped positive interaction is exactly one RSVP with
+  one ephemeral ACK and one original-response edit. Live-off/negative/final-off
+  interactions get one ephemeral ACK and no business edit; followups, excess wire
+  retries, duplicate interaction IDs and positive feed CRUD are refused. Live
+  interaction replay is explicitly unsupported, never assigned a fresh budget.
+  These totals must match the resource plan's exact ACK/edit budgets. No literal
+  key or consent record is authenticated, and no request payload or actual effect
+  is proved. This code must **not** serialize restricted records into public
+  artifacts; no public producer exists yet. Scheduler/transitive inventory,
+  source URL/content, stored cases, actual wire/DB records and lifecycle remain
+  mandatory separate checks. Consistent fabricated records return no capability.
 - `scripts/announcement_runtime_policy.py` checks offline lease/freshness,
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
@@ -173,10 +196,12 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
    The local full-tree/delta collector and offline topology predicates do not
    establish independent review or any of those external facts.
 2. Complete typed input, effect, telemetry and lifecycle resolution beyond the
-   provenance/authority and resource/state/budget claim comparisons. Authenticate
-   restricted literal keys and identity-map comparisons; bind complete transitive
-   inventory contents and consent/scheduler/interaction/synthetic-cleanup plans.
-   Implement stored off/on/replay/final-off semantics, atomic RSVP/audit evidence,
+   provenance/authority, resource and scoped restricted-input claim comparisons.
+   Authenticate restricted literal keys, consent and identity maps; bind complete
+   transitive inventory, source URL/content and scheduler/synthetic-cleanup plans.
+   Resolve exact interaction request contents and actual ACK/edit wire records;
+   live interaction replay remains explicitly unsupported. Implement full stored
+   off/on/replay/final-off semantics and negatives, atomic RSVP/audit evidence,
    owned CAS cleanup and independently verified restoration. Bind every actual
    mutation to its correct authority checkpoint. The scoped resource graph and
    method-count checks alone are not a complete receipt-verification result.

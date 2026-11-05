@@ -14,8 +14,8 @@ from announcement_runtime_schema import (
     ARCHIVE_LIMIT, Array, AUTHORITY, AUTHORITY_READ, CONTROL, DECISION, DOCUMENT,
     COUNT, GATE_NAMES, IDENTITY, IMAGE, Integer, LEDGER_LIMIT, MANIFEST, OPERATIONS,
     PRINCIPAL, REF, REFERENCE_LIMIT, RESOURCE, RUN, SCOPE, SERVICE_ID, SERVED_PAIR,
-    SHA, SHA256, STATE, TOKEN_FREE_PATH, UTC, UUID,
-    VERSION, WORKER, _validate, enum,
+    SHA, SHA256, STATE, TOKEN_FREE_PATH, UTC, UUID, COMMAND_GATES,
+    Text, Union, VERSION, WORKER, _validate, enum,
     parse_bounded_json, require,
 )
 
@@ -139,11 +139,49 @@ RESOURCE_RECORDS = {
     "resource_plan_content": {"slots": RESOURCE_SLOTS, "entries": Array(RESOURCE),
         "states": Array(STATE), "identity_map": DOCUMENT, "inventory_manifest": MANIFEST,
         "operation_budgets": Array(OPERATION_BUDGET, 1, LEDGER_LIMIT),
-        "not_before": UTC, "expires_at": UTC},
+        "input_plan_sha256": SHA256, "not_before": UTC, "expires_at": UTC},
     "feed_item": {"source_ref": REF, "feed_ref": REF, "item_ref": REF,
         "source_content_sha256": SHA256, "item_content_sha256": SHA256, "nonce_ref": REF},
 }
-EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS}
+# Literal row keys are RESTRICTED evidence, never public artifact payloads. These
+# closed claims do not authenticate the map or prove consent/resource existence.
+ROW_ID = Text(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,127}")
+DB_KEY = Union("table", {
+    "feed_relays": {"table": enum("feed_relays"), "id": ROW_ID},
+    "feed_deliveries": {"table": enum("feed_deliveries"), "feed_id": ROW_ID,
+                        "item_key": ROW_ID},
+    "guild_settings": {"table": enum("guild_settings"), "guild_id": SERVICE_ID,
+                       "key": enum("TWO_ANNOUNCEMENTS")},
+    "event_rsvps": {"table": enum("event_rsvps"), "guild_id": SERVICE_ID,
+                    "event_id": SERVICE_ID, "user_id": SERVICE_ID},
+    "announcements_audit_log": {"table": enum("announcements_audit_log"), "id": ROW_ID},
+})
+CONTENT_PIN = {"ref": REF, "sha256": SHA256}
+INTERACTION = {
+    "case_id": REF, "command": enum(*sorted(COMMAND_GATES)),
+    "phase": enum("off", "on", "replay", "negative", "final_off"),
+    "interaction_id": SERVICE_ID, "application_id": SERVICE_ID,
+    "actor_ref": REF, "channel_ref": REF, "event_ref": REF,
+    "request_sha256": SHA256, "ack_count": Integer(1, 1),
+    "edit_count": Integer(0, 1), "followup_count": enum(0), "ephemeral": enum(True),
+    "maximum_wire_attempts": Integer(1, 2),
+}
+INPUT_RECORDS = {
+    "literal_db_key": DB_KEY,
+    "test_consent": {"actor_ref": REF, "actor_id": SERVICE_ID,
+        "application_id": SERVICE_ID, "guild_id": SERVICE_ID,
+        "execution_ref": REF, "nonce_ref": REF, "case_ids": Array(REF),
+        "granted_at": UTC, "not_before": UTC, "expires_at": UTC,
+        "outcome": enum("granted", "revoked", "unknown")},
+    "interaction_plan": {"interactions": Array(INTERACTION)},
+    "input_plan_content": {"keys": Array({"resource_ref": REF, "key": CONTENT_PIN}),
+        "consent": CONTENT_PIN, "interactions": CONTENT_PIN,
+        "feed": {"resource_ref": REF, "guild_id": SERVICE_ID, "channel_id": SERVICE_ID,
+                 "source_ref": REF, "item_key": ROW_ID, "nonce_ref": REF},
+        "rsvp": {"resource_ref": REF, "status": enum("going", "interested", "declined"),
+                 "interaction_id": SERVICE_ID, "audit_ref": REF}},
+}
+EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS, **INPUT_RECORDS}
 
 
 def canonical_digest(value):
