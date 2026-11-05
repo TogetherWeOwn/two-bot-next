@@ -182,10 +182,16 @@ class RecoveryReads(unittest.TestCase):
         receipt, records, now = read_fixture()
         self.assertIsNone(check_recovery_read_claims(receipt, evidence_index(records), now))
         # Isolate the existing mandatory cleanup refusal, not a complete packet.
+        # Keep the required setup ledger and its matching effect; bind them to
+        # the existing fresh setup checkpoint rather than bypassing the schema.
         receipt["attempt"]["checkpoints"] = authority_fixture()[0]["attempt"]["checkpoints"]
-        receipt["lifecycle"]["setup"] = []
+        receipt["lifecycle"]["setup"][0]["authority_ref"] = "checkpoint-1"
+        records["transition-" + SETUP]["data"]["claim"]["authority_ref"] = "checkpoint-1"
         receipt["observations"]["actual_effects"] = [effect for effect in
-            receipt["observations"]["actual_effects"] if effect["operation_id"] == CLEANUP]
+            receipt["observations"]["actual_effects"] if effect["operation_id"] in (SETUP, CLEANUP)]
+        self.assertEqual([claim["operation_id"] for claim in receipt["lifecycle"]["setup"]], [SETUP])
+        self.assertEqual([effect["operation_id"] for effect in
+                          receipt["observations"]["actual_effects"]], [SETUP, CLEANUP])
         with self.assertRaisesRegex(Refusal, "unsupported_recovery_authority$"):
             check_lifecycle_phase_claims(receipt, evidence_index(records), now)
 
