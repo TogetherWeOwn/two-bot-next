@@ -428,11 +428,27 @@ not canonical staging qualification or production promotion.
   release/reclaim before replay. Up to sixteen closed events are parsed; only the
   exact five-event successful model sequence can complete. Extra/missing/reordered
   events refuse, as do unknown outcomes in the upstream ledger.
-  These pending/delivered projections contain only state, literal nonce and (when
-  delivered) message ID. They are **not complete stored rows or authenticated SQL
-  results**; claim-token fencing, before/after value correspondence, actual replay
-  reads/history/response-loss reconciliation and later cleanup/restoration remain
-  mandatory independent work. No new read or mutation is performed or authorized.
+  The mandatory restricted `storage` object additionally projects the fresh pending,
+  completed and replayed delivery columns from C's `0180_feeds.sql`: exact relay/item
+  keys, nonce, state, message, first-seen/delivery/claim timestamps and a claim-token
+  fingerprint. SQL NULL columns use a closed `{"kind":"sql_null"}` marker, never
+  nullable success evidence, missing fields or a raw claim token. Pending must have
+  no message/delivery timestamp and equal first-seen/claim timestamps; completion
+  retains the exact keys/nonce/first-seen, binds the accepted message and clears
+  claim token/time. Replay must equal the entire completed projection. Column
+  times fit the on-case, absent baseline, claim operation, accepted response and
+  completion operation. The two writes must chain from the absent baseline to
+  distinct present state records with increasing versions, exact resource/owner/
+  observer/time and digests of those closed projections. Those versions are
+  observation claims, not database-owned CAS tokens. The digest does not hash raw
+  SQL row/token bytes or authenticate the supplied fingerprint.
+  These are **not authenticated SQL results or actual replay readback**. Claim-token
+  ownership/fencing, actual query/parameter/result equivalence, full transition and
+  cleanup authority, history/response-loss reconciliation and later restoration
+  remain mandatory independent work. A later cleanup-chain mismatch is outside this
+  narrow slice; full transition/lifecycle composition must refuse it, and partial
+  packets still fail all-used accounting. No new read or mutation is performed
+  or authorized.
 - `scripts/announcement_runtime_source.py` observes complete local Git-object
   inventories without checkout, fetch, import, filter or build execution. It
   verifies raw commit/tree/blob hashes and validates raw canonical tree modes

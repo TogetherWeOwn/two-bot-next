@@ -371,8 +371,21 @@ DELIVERY_ROW = Union("state", {
                   "message_id": SERVICE_ID},
 })
 DELIVERY_EVENT = {"operation_id": REF, "observed_at": UTC, "observer_ref": REF}
+# Full column projections use a digest instead of the raw claim token. SQL NULL
+# is an explicit typed marker, not absent evidence or a nullable success record.
+SQL_NULL = enum({"kind": "sql_null"})
+DELIVERY_COLUMNS = {"feed_id": ROW_ID, "item_key": ROW_ID,
+                    "nonce": DELIVERY_NONCE, "first_seen_at": UTC}
+STORED_DELIVERY_ROW = Union("state", {
+    "pending": {**DELIVERY_COLUMNS, "state": enum("pending"), "message_id": SQL_NULL,
+        "delivered_at": SQL_NULL, "claim_token_sha256": SHA256, "claimed_at": UTC},
+    "delivered": {**DELIVERY_COLUMNS, "state": enum("delivered"), "message_id": SERVICE_ID,
+        "delivered_at": UTC, "claim_token_sha256": SQL_NULL, "claimed_at": SQL_NULL},
+})
 DELIVERY_RECORDS = {
     "feed_delivery_trace": {"key_ref": REF, "nonce_ref": REF, "claim_ref": REF,
+        "storage": {"claim_token_sha256": SHA256, "claimed": STORED_DELIVERY_ROW,
+                    "completed": STORED_DELIVERY_ROW, "replay": STORED_DELIVERY_ROW},
         "events": Array(Union("kind", {
             "claim": {"kind": enum("claim"), **DELIVERY_EVENT, "row": DELIVERY_ROW},
             "wire_attempt": {"kind": enum("wire_attempt"), **DELIVERY_EVENT},

@@ -12,11 +12,16 @@ chains and ownership witnesses stay unconsumed.
 Two ledger changes make the replay representable. A BUDGETED delivery db_read
 (own transaction, no transition refs) follows the commit inside the replay case,
 and the delivery cleanup (db_delete_owned, its transition observed_at and its
-transaction committed_at) moves after that read. The record adds two sidecars
-(trace, read transaction) to the unchanged 256-record packet bound.
+transaction committed_at) moves after that read. The record adds four sidecars
+(trace, read transaction, pending and delivered row states) to the unchanged
+256-record packet bound. The trace's mandatory storage object carries full
+column projections (claim token as a digest only) whose digests the two row
+states pin; the delivery transitions chain baseline, pending, delivered, cleanup.
+Ownership and authority chains stay unbuilt.
 """
 
 import copy
+import hashlib
 
 from announcement_case_fixtures import resequence
 from announcement_feed_exchange_fixtures import (
@@ -33,6 +38,8 @@ READ_OPERATION = "budget-delivery-db_read-0"
 READ_TRANSACTION = "transaction-" + READ_OPERATION
 REPLAY_AT = "00:10:30"
 CLEANUP_AT = "00:14:30"
+CLAIM_TOKEN_SHA256 = hashlib.sha256(b"synthetic-delivery-claim-token").hexdigest()
+SQL_NULL = {"kind": "sql_null"}
 KINDS = ("claim", "wire_attempt", "accepted", "committed", "replay")
 
 
@@ -103,6 +110,75 @@ def add_delivery_read(receipt, records):
     return READ_OPERATION
 
 
+def delivery_entry(receipt):
+    return next(x for x in receipt["resources"]["entries"] if x["ref"] == "delivery")
+
+
+def claim_state_ref(receipt):
+    """Sidecar ref of the pending (claimed) row state; distinct from baseline/final."""
+    return "state-" + delivery_effect(receipt, "db_insert")["operation_id"]
+
+
+def completion_state_ref(receipt):
+    """Sidecar ref of the delivered (completed) row state."""
+    return "state-" + delivery_effect(receipt, "db_cas")["operation_id"]
+
+
+def build_storage(receipt, records):
+    """Full column projections, from the literal delivery key and the ledgers.
+
+    Rows carry the claim token only as a digest; nothing here is a SQL result.
+    """
+    slots = records["runtime-resource-plan"]["data"]["slots"]
+    keys = {x["resource_ref"]: x["key"]["ref"]
+            for x in records["runtime-input-plan"]["data"]["keys"]}
+    key = records[keys[slots["delivery_ref"]]]["data"]
+    nonce = records["selected-item"]["data"]["nonce"]
+    message_id = records[EXCHANGE]["data"]["response"]["message"]["id"]
+    seen = delivery_effect(receipt, "db_insert")["observed_at"]
+    done = delivery_effect(receipt, "db_cas")["observed_at"]
+    base = {"feed_id": key["feed_id"], "item_key": key["item_key"], "nonce": nonce,
+            "first_seen_at": seen}
+    claimed = {**base, "state": "pending", "message_id": copy.deepcopy(SQL_NULL),
+               "delivered_at": copy.deepcopy(SQL_NULL), "claim_token_sha256": CLAIM_TOKEN_SHA256,
+               "claimed_at": seen}
+    completed = {**base, "state": "delivered", "message_id": message_id, "delivered_at": done,
+                 "claim_token_sha256": copy.deepcopy(SQL_NULL), "claimed_at": copy.deepcopy(SQL_NULL)}
+    return {"claim_token_sha256": CLAIM_TOKEN_SHA256, "claimed": claimed,
+            "completed": completed, "replay": copy.deepcopy(completed)}
+
+
+def bind_delivery_states(receipt, records):
+    """Add the two row-state sidecars and chain the three delivery transitions.
+
+    Baseline -> pending (version 1) -> delivered (version 2) -> cleanup. Only
+    the delivery transitions change; no ownership or authority chain is built,
+    so the graph stays partial.
+    """
+    entry = delivery_entry(receipt)
+    observer = receipt["observations"]["coverage"][0]["observer_ref"]
+    storage = records[TRACE]["data"]["storage"]
+    insert, cas = delivery_effect(receipt, "db_insert"), delivery_effect(receipt, "db_cas")
+    delete = delivery_effect(receipt, "db_delete_owned")
+    pending_ref, delivered_ref = claim_state_ref(receipt), completion_state_ref(receipt)
+    for ref, version, row, effect in ((pending_ref, "1", storage["claimed"], insert),
+                                      (delivered_ref, "2", storage["completed"], cas)):
+        records[ref] = envelope(ref, "resource_state", {
+            "claim": {"ref": ref, "presence": "present", "version": version,
+                      "value_sha256": canonical_digest(row)},
+            "resource_ref": entry["ref"], "identity_sha256": canonical_digest(entry["identity"]),
+            "owner_ref": entry["owner"], "observer_ref": observer,
+            "observed_at": effect["observed_at"]})
+    for effect, before, after in ((insert, entry["before_state_ref"], pending_ref),
+                                  (cas, pending_ref, delivered_ref),
+                                  (delete, delivered_ref, None)):
+        claim = records[effect["db_transition_refs"][0]]["data"]["claim"]
+        claim["before_state_ref"] = before
+        if after is not None:
+            claim["intended_after_state_ref"] = after
+            claim["actual_after_state_ref"] = after
+
+
 def build_trace(receipt, records):
     """Write the five-event claim from the current fabricated ledgers."""
     slots = records["runtime-resource-plan"]["data"]["slots"]
@@ -122,7 +198,8 @@ def build_trace(receipt, records):
                 "observed_at": observed_at, "observer_ref": observer, **fields}
 
     return {"key_ref": keys[slots["delivery_ref"]], "nonce_ref": selection["nonce_ref"],
-            "claim_ref": claim["operation_id"], "events": [
+            "claim_ref": claim["operation_id"], "storage": build_storage(receipt, records),
+            "events": [
                 event("claim", claim, claim["observed_at"], row=pending),
                 event("wire_attempt", post, post["observed_at"]),
                 event("accepted", post, exchange["response"]["received_at"],
@@ -131,13 +208,28 @@ def build_trace(receipt, records):
                 event("replay", read, read["observed_at"], row=copy.deepcopy(delivered))]}
 
 
-def repin_delivery_trace(receipt, records, *, trace=True, **repin):
+def repin_delivery_states(receipt, records):
+    """Refresh only the two derived full-row state value digests."""
+    storage = records[TRACE]["data"].get("storage") if TRACE in records else None
+    if type(storage) is not dict:
+        return
+    for ref, name in ((claim_state_ref(receipt), "claimed"),
+                      (completion_state_ref(receipt), "completed")):
+        state = records.get(ref)
+        if state is not None and name in storage and state["data"]["claim"]["presence"] == "present":
+            state["data"]["claim"]["value_sha256"] = canonical_digest(storage[name])
+
+
+def repin_delivery_trace(receipt, records, *, trace=True, storage=True, **repin):
     """Refresh the source plan's delivery_trace pin, then the feed-exchange chain.
 
-    trace=False deliberately leaves the pin stale. Semantic fields are never
-    touched, so a mutation reaches the trace checker instead of a stale digest.
-    repin accepts repin_feed_exchange's payload/pin switches.
+    trace=False deliberately leaves the pin stale. storage=False leaves the two
+    full-row state digests stale. Semantic fields (refs, times, owners, versions)
+    are never touched, so a mutation reaches the trace checker instead of a stale
+    digest. repin accepts repin_feed_exchange's payload/pin switches.
     """
+    if storage:
+        repin_delivery_states(receipt, records)
     if trace and TRACE in records:
         records[SOURCE_PLAN_REF]["data"]["delivery_trace"]["sha256"] = canonical_digest(
             records[TRACE]["data"])
@@ -150,5 +242,6 @@ def delivery_trace_fixture():
     add_delivery_read(receipt, records)
     move_delivery_write(receipt, records, "db_delete_owned", CLEANUP_AT)
     records[TRACE] = envelope(TRACE, "feed_delivery_trace", build_trace(receipt, records))
+    bind_delivery_states(receipt, records)
     repin_delivery_trace(receipt, records)
     return receipt, records, now

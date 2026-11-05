@@ -1,9 +1,9 @@
-"""Pinned offline delivery trace, NOT stored-row or no-repost enforcement proof.
+"""Pinned offline delivery trace, NOT SQL or no-repost enforcement proof.
 
-Connects the terminal accounting model to declared case/transport/DB operations.
-Partial pending/delivered row projections do not prove complete stored values,
-claim-token fencing, SQL results, history, atomicity or actual readback. Missing
-or uncertain evidence refuses; runtime admission remains unconditionally HOLD.
+Connects terminal accounting and restricted column projections to declared
+case/transport/DB operations and state digests. A token fingerprint is not its
+raw stored value or a CAS fence; projections do not authenticate SQL results,
+history, atomicity or actual readback. Runtime admission remains HOLD.
 """
 
 from announcement_runtime_delivery import FeedDeliveryAccounting
@@ -22,8 +22,8 @@ def check_delivery_trace_claims(receipt, evidence, now):
     Replay requires a separately budgeted delivery DB read, not merely an idle
     poll, history miss or a copied successful response. No delivery write may
     intervene through that read except the one fresh claim and completion. This
-    scoped comparison does not qualify later cleanup/restoration or prove that a
-    claimed row projection is an actual result of the named database operation.
+    scoped comparison binds column projections to declared state digests, but
+    does not qualify later cleanup/restoration or authenticate any SQL result.
     """
     check_feed_exchange_claims(receipt, evidence, now)
     source = evidence.resolve(SOURCE_PLAN_REF, "source_plan_content")
@@ -105,3 +105,65 @@ def check_delivery_trace_claims(receipt, evidence, now):
               effect["method"] != "db_read" and
               first_sequence <= effect["sequence"] <= last_sequence}
     require(writes == write_ids, "delivery_trace_interference")
+    _check_storage(receipt, evidence, trace, effects, feed_cases["on"], selection, exchange, slots)
+
+
+def _check_storage(receipt, evidence, trace, effects, case, selection, exchange, slots):
+    """Compare the fresh-only column profile with its two declared write states.
+
+    C's 0180_feeds.sql columns are represented, except the claim token is only a
+    fingerprint. Digests below identify this closed projection, NOT raw SQL bytes
+    or a database-owned version token. Replay is a claimed result of the already
+    budgeted read, never a new read or permission to release/reclaim a row.
+    """
+    storage = trace["storage"]
+    claimed, completed, replay = (storage[name] for name in ("claimed", "completed", "replay"))
+    require(claimed["state"] == "pending" and
+            completed["state"] == replay["state"] == "delivered", "delivery_storage_state")
+    key = evidence.resolve(trace["key_ref"], "literal_db_key")
+    require(key["table"] == "feed_deliveries", "delivery_storage_key")
+    columns = {"feed_id": key["feed_id"], "item_key": key["item_key"],
+               "nonce": selection["nonce"], "first_seen_at": claimed["claimed_at"]}
+    sql_null = {"kind": "sql_null"}
+    require(claimed == {**columns, "state": "pending", "message_id": sql_null,
+        "delivered_at": sql_null, "claim_token_sha256": storage["claim_token_sha256"],
+        "claimed_at": claimed["claimed_at"]}, "delivery_storage_claim")
+    require(completed == {**columns, "state": "delivered",
+        "message_id": exchange["response"]["message"]["id"],
+        "delivered_at": completed["delivered_at"], "claim_token_sha256": sql_null,
+        "claimed_at": sql_null} and replay == completed, "delivery_storage_completion")
+    events = {event["kind"]: event for event in trace["events"]}
+    claim_effect, completion_effect = (effects[events[name]["operation_id"]]
+                                       for name in ("claim", "committed"))
+    claim_at, completed_at = utc(claimed["claimed_at"]), utc(completed["delivered_at"])
+    require(utc(case["started_at"]) <= claim_at <= utc(claim_effect["observed_at"]) and
+            utc(exchange["response"]["received_at"]) <= completed_at <=
+            utc(completion_effect["observed_at"]), "delivery_storage_time")
+    resource = next(entry for entry in receipt["resources"]["entries"]
+                    if entry["ref"] == slots["delivery_ref"])
+    observer = receipt["observations"]["coverage"][0]["observer_ref"]
+    prior_ref = resource["before_state_ref"]
+    baseline = evidence.resolve(prior_ref, "resource_state")
+    require(baseline["claim"]["presence"] == "absent" and
+            utc(baseline["observed_at"]) <= claim_at, "delivery_storage_baseline")
+    prior_version = 0
+    created = {resource["before_state_ref"], resource["after_state_ref"]}
+    for effect, projection in ((claim_effect, claimed), (completion_effect, completed)):
+        transition = evidence.resolve(effect["db_transition_refs"][0], "db_transition")["claim"]
+        ref = transition["actual_after_state_ref"]
+        require(transition["before_state_ref"] == prior_ref and
+                transition["intended_after_state_ref"] == ref and ref not in created,
+                "delivery_storage_chain")
+        state = evidence.resolve(ref, "resource_state")
+        require(state["claim"]["ref"] == ref and
+                state["resource_ref"] == resource["ref"] and
+                state["identity_sha256"] == canonical_digest(resource["identity"]) and
+                state["owner_ref"] == resource["owner"] and
+                state["observer_ref"] == observer and
+                state["observed_at"] == effect["observed_at"], "delivery_storage_binding")
+        value = state["claim"]
+        require(value["presence"] == "present", "delivery_storage_presence")
+        require(int(value["version"]) > prior_version, "delivery_storage_version")
+        require(value["value_sha256"] == canonical_digest(projection), "delivery_storage_digest")
+        prior_ref, prior_version = ref, int(value["version"])
+        created.add(ref)
