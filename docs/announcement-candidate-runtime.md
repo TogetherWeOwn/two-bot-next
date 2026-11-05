@@ -504,9 +504,23 @@ not canonical staging qualification or production promotion.
   checkpoint clock. Its exclusive validity ends no later than 60 seconds after
   checking or grant expiry; the named cleanup timestamp or final verifier clock
   must be inside it. This library comparison neither acquires nor enforces an
-  atomic fence and is not yet registered in the CLI. Installation revalidation
-  and coordinated authority/state-chain/lifecycle consumption of these recovery
-  fences remain unimplemented. Actual ownership/
+  atomic fence and is not yet registered in the CLI.
+  Standalone `check_recovery_installation_claims` composes those checks with a
+  closed fixed `runtime-recovery-installations` inventory. Every named recovery
+  checkpoint requires a distinct `installation_approval` and fresh controller/
+  verifier `authority_read` records, never reused runtime/recovery reads. The
+  installed-code mapping, policy, implementation, control, epoch and ordered
+  decisions must remain identical to the first declared runtime installation
+  approval. Its history anchors complete, gap-free, non-invalidating,
+  generation-pinned histories without rewrites or backfilled events. Both read
+  ages are checked at each cleanup mutation and the final verifier clock (at most
+  60 seconds); the checkpoint time alone cannot make stale reads current. This
+  compares reusable installation claims, **not legitimate installation or current
+  authenticated authority**. Full runtime authority checks remain mandatory
+  upstream; this standalone checker does not validate their entire inventory or
+  enforce an installation epoch fence. Neither new library comparison is in the
+  CLI yet. Coordinated authority/state-chain/lifecycle consumption remains
+  unfinished. Actual ownership/
   CAS tokens, full-row state, process/Worker restoration and final verification
   remain unfinished. The mandatory lifecycle-phase checker still refuses cleanup,
   and the CLI/runtime stay unconditional HOLD. Retrospective grant consistency

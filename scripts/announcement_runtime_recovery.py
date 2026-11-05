@@ -2,14 +2,14 @@
 
 The resource-plan digest binds a closed plan, not a caller allowlist. Separate
 scope/grant/decision/nonce claims are compared, never authenticated or consumed.
-Recovery reads/history/checkpoints/fences are separate offline claims; installation
-revalidation and mutation-phase integration remain unimplemented. The mandatory
+Recovery reads/history/checkpoints/fences and installation revalidation are
+separate offline claims; mutation-phase integration remains unimplemented. The mandatory
 lifecycle-phase checker still refuses cleanup, regardless of these comparisons.
 """
 
 from datetime import timedelta
 
-from announcement_runtime_authority import _authority_source_claims, _decisions
+from announcement_runtime_authority import _authority_source_claims, _decisions, installation_scope
 from announcement_runtime_evidence import canonical_digest
 from announcement_runtime_lifecycle import check_lifecycle_ledger_claims
 from announcement_runtime_provenance import _index, _unique_refs
@@ -214,8 +214,8 @@ def check_recovery_read_claims(receipt, evidence, now):
     """Compare named cleanup/final reads and histories, NOT a boundary fence.
 
     Fixed-reference inventory is inert same-attempt data, never a trust root or
-    acquisition adapter. Installation revalidation and all three mutation-phase
-    consumers remain mandatory and unfinished; cleanup still refuses there.
+    acquisition adapter. Separate installation comparisons and all three
+    mutation-phase consumers remain mandatory; cleanup still refuses there.
     """
     check_recovery_grant_claims(receipt, evidence, now)
     authority, lifecycle, attempt = receipt["authority"], receipt["lifecycle"], receipt["attempt"]
@@ -274,8 +274,8 @@ def check_recovery_read_claims(receipt, evidence, now):
 def check_recovery_fence_claims(receipt, evidence, now):
     """Compare separate named boundary fences, NOT enforce or acquire one.
 
-    Installation revalidation and authority/state-chain/lifecycle integration
-    remain mandatory and unfinished. This standalone comparison does not replace
+    Separate installation comparisons and authority/state-chain/lifecycle
+    integration remain mandatory. This standalone comparison does not replace
     the CLI's terminal cleanup refusal or runtime_preflight's unconditional HOLD.
     """
     check_recovery_read_claims(receipt, evidence, now)
@@ -311,3 +311,128 @@ def check_recovery_fence_claims(receipt, evidence, now):
             boundaries.append(now)
         require(all(checked <= observed < expiry for observed in boundaries),
                 "recovery_mutation_fence_time")
+
+
+def _installation_history(approval, role, source, resource_epoch, evidence, lower, freshness_at):
+    ref = approval[role + "_read_ref"]
+    record = evidence.resolve(ref, "authority_read")
+    read = record["claim"]
+    require(read["ref"] == ref and read["consumer"] == role and
+            record["consumer_ref"] == source[role + "_ref"] and
+            record["history_ref"] == approval["history_ref"], "recovery_installation_read")
+    require(read["source_ref"] == approval["source_ref"] and
+            read["scope_sha256"] == approval["scope_sha256"] and
+            read["epoch"] == approval["epoch"] and read["resource_epoch"] == resource_epoch and
+            read["effective_decision_refs"] == [d["ref"] for d in approval["decisions"]],
+            "recovery_installation_read_scope")
+    require(lower <= utc(read["read_at"]) <= utc(approval["checked_at"]) <= freshness_at and
+            freshness_at - utc(read["read_at"]) <= timedelta(seconds=60),
+            "stale_recovery_installation_read")
+    history = evidence.resolve(record["history_ref"], "authority_history")
+    require(canonical_digest(history) == read["history_sha256"] and
+            all(history[key] == read[key] for key in ("source_ref", "scope_sha256", "epoch",
+                "resource_epoch", "effective_decision_refs")) and
+            history["ended_at"] == read["read_at"] and history["coverage"] == "complete",
+            "recovery_installation_history")
+    events, decisions = history["events"], approval["decisions"]
+    require(history["first_sequence"] == 1 and history["last_sequence"] == len(events) and
+            [e["sequence"] for e in events] == list(range(1, len(events) + 1)),
+            "recovery_installation_history_gap")
+    require(utc(history["started_at"]) < utc(decisions[0]["decided_at"]) and
+            all(utc(d["decided_at"]) <= utc(history["ended_at"]) for d in decisions) and
+            [e["observed_at"] for e in events] == sorted(e["observed_at"] for e in events),
+            "recovery_installation_history_time")
+    for event in events:
+        _unique_refs(event["invalidated_decision_refs"])
+        require(utc(history["started_at"]) <= utc(event["observed_at"]) <
+                utc(decisions[0]["decided_at"]) and
+                not set(event["invalidated_decision_refs"]).intersection(d["ref"] for d in decisions),
+                "invalidated_recovery_installation")
+    return history
+
+
+def check_recovery_installation_claims(receipt, evidence, now):
+    """Compare reusable installation authority at recovery boundaries, NOT install.
+
+    Anchor unchanged installed-code scope/decisions/history to the first declared
+    runtime installation approval. Full runtime authority checks remain mandatory
+    upstream; this is not an authenticated acquisition or installation epoch fence.
+    Neither this comparison nor the separate recovery fences enable cleanup/CLI.
+    """
+    check_recovery_fence_claims(receipt, evidence, now)
+    authority, control, attempt = receipt["authority"], receipt["control"], receipt["attempt"]
+    source, principals, _, stages = _authority_source_claims(receipt, evidence)
+    grant = evidence.resolve(receipt["lifecycle"]["restoration_authority_ref"], "recovery_authority")
+    checkpoints = evidence.resolve(RECOVERY_CHECKPOINTS_REF, "recovery_checkpoints")["checkpoints"]
+    inventory = evidence.resolve("runtime-recovery-installations", "recovery_installations")
+    require(inventory["recovery_ref"] == grant["ref"] and inventory["run"] == attempt["run"],
+            "recovery_installation_scope")
+    entries = inventory["entries"]
+    require([e["checkpoint_ref"] for e in entries] == [c["ref"] for c in checkpoints],
+            "recovery_installation_inventory")
+    refs = [e["installation_ref"] for e in entries]
+    _unique_refs(refs)
+    prior_refs = authority["installation_approval_refs"]
+    require(prior_refs == control["installation"]["authority_receipt_refs"],
+            "recovery_installation_anchor")
+    _unique_refs(prior_refs)
+    require(not set(refs).intersection(prior_refs), "recovery_installation_replay")
+    prior = [evidence.resolve(ref, "installation_approval") for ref in prior_refs]
+    anchor = prior[0]
+    require(utc(attempt["started_at"]) <= utc(anchor["checked_at"]) <= utc(grant["not_before"]),
+            "recovery_installation_anchor")
+    mapping = evidence.resolve(control["installation"]["mapping_ref"], "installation_mapping")
+    require(mapping == {"pr": control["installation"]["pr"], "head": control["installation"]["head"],
+            "squash": control["installation"]["squash"], "control": control["version"]} and
+            mapping["squash"] == control["version"], "installation_mapping")
+    claims = _index(receipt["lifecycle"]["cleanup"], "operation_id", "lifecycle_operation")
+    used_reads = {p[role + "_read_ref"] for p in prior for role in ("controller", "verifier")}
+    used_reads.update(c[role + "_read_ref"] for c in checkpoints for role in ("controller", "verifier"))
+    used_reads.update(read["ref"] for read in authority["reads"])
+    histories = []
+    for checkpoint, ref in [(None, prior_refs[0]), *zip(checkpoints, refs)]:
+        approval = evidence.resolve(ref, "installation_approval")
+        checked = utc(approval["checked_at"])
+        require(approval["source_ref"] == authority["source_ref"] and
+                approval["mapping_ref"] == control["installation"]["mapping_ref"] and
+                approval["policy"] == authority["policy"] and
+                approval["implementation"] == authority["implementation"] and
+                approval["control"] == control["version"] and
+                approval["scope_sha256"] == canonical_digest(installation_scope(approval)) and
+                installation_scope(approval) == installation_scope(anchor) and
+                approval["decisions"] == anchor["decisions"], "recovery_installation_approval")
+        _decisions(approval["decisions"], approval["scope_sha256"], approval["epoch"], principals,
+                   checked, stages, "installation")
+        require(approval["security_round"] == approval["decisions"][0]["round"],
+                "security_round_binding")
+        # Historical reads may precede attempt start inside the execution lease,
+        # exactly as in runtime authority validation. New reads use recovery's lease.
+        freshness_at, lower = checked, utc(authority["execution"]["not_before"])
+        if checkpoint is not None:
+            require(approval["checked_at"] == checkpoint["checked_at"],
+                    "recovery_installation_checkpoint")
+            lower = utc(grant["not_before"])
+            freshness_at = max([checked, *(utc(claims[op]["observed_at"])
+                for op in checkpoint["operation_id_refs"])])
+            if checkpoint["phase"] == "final":
+                freshness_at = now
+        pair = []
+        for role in ("controller", "verifier"):
+            read_ref = approval[role + "_read_ref"]
+            if checkpoint is not None:
+                require(read_ref not in used_reads, "recovery_installation_replay")
+                used_reads.add(read_ref)
+            pair.append(_installation_history(approval, role, source, grant["resource_epoch"],
+                                             evidence, lower, freshness_at))
+        require(pair[0] == pair[1], "recovery_installation_disagreement")
+        histories.append(pair[0])
+    histories.sort(key=lambda h: h["ended_at"])
+    for previous, current in zip(histories, histories[1:]):
+        require(previous["generation"] == current["generation"] and
+                previous["started_at"] == current["started_at"] and
+                previous["events"] == current["events"][:len(previous["events"])] and
+                len(previous["events"]) <= len(current["events"]),
+                "recovery_installation_history_rewrite")
+        require(all(utc(e["observed_at"]) > utc(previous["ended_at"])
+                    for e in current["events"][len(previous["events"]):]),
+                "recovery_installation_history_backfill")

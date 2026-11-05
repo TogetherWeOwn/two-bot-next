@@ -406,6 +406,10 @@ DELIVERY_RECORDS = {
 # Recovery scope/grant/consumption claims are distinct from runtime grants.
 # Neither these records nor a plan authenticates authority or supplies a fence.
 RECOVERY_RECORDS = {
+    "recovery_installations": {
+        "recovery_ref": REF, "run": RUN,
+        "entries": Array({"checkpoint_ref": REF, "installation_ref": REF}, 2),
+    },
     "recovery_fences": {
         "recovery_ref": REF, "run": RUN,
         "entries": Array({"checkpoint_ref": REF, "fence_ref": REF}, 2),
