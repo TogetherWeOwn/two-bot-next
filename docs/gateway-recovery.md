@@ -128,23 +128,18 @@ review as gates; this seam does not enable broader automation or retry authority
 
 ## Verification (test containers only)
 
-On the persistent controller, compiling commands use the bounded cache wrapper
-from the isolated worktree; a refused lease is not permission to bypass it.
-Ephemeral CI retains its existing direct Cargo commands.
+The full suite and CI gates are GitHub Actions-owned. Push the PR branch and
+record exact-head run/job links; keep the PR a draft while incomplete. The
+commands below describe hosted-CI coverage, not a local checklist or controller
+fallback. Local execution is only for one failing test or crate under the
+[focused reproduction policy](../CONTRIBUTING.md#focused-failure-reproduction-only),
+including guarded Boat for heavy focused work and no heavy raw-host fallback.
+A refused cache lease is never permission to bypass admission.
 
 ```sh
-cargo fmt --all -- --check
-python3 scripts/cargo_cache.py run -- clippy --workspace --all-targets --locked -- -D warnings
-python3 scripts/cargo_cache.py run -- test --workspace --locked
-TWO_GATEWAY_TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/agent_test \
-  python3 scripts/cargo_cache.py run -- test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
-# Ephemeral CI only — on the persistent controller use the wrapper form above.
+# Ephemeral hosted CI only, not a shared-host CI mirror.
 TWO_GATEWAY_TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/agent_test \
   cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
-# Persistent controller: bounded wrapper.
-TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
-  python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --locked --test gateway_force_identify_cli
-# Ephemeral CI only — on the persistent controller use the wrapper form above.
 TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
   cargo test -p two-bot-cutover --locked --test gateway_force_identify_cli
 ```
