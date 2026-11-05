@@ -294,7 +294,7 @@ mod tests {
             "guilds": [{"id": "100", "unavailable": true}]
         }))
         .expect("ready fixture");
-        cache.update(&Event::Ready(Box::new(ready)));
+        cache.update(&Event::Ready(ready));
         assert!(!cache.needs_bootstrap());
         assert_eq!(
             read_voice_total(&cache, 100),

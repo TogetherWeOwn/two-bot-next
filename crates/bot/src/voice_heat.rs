@@ -410,12 +410,12 @@ mod tests {
             )))
         };
         cache.update(&full());
-        cache.update(&Event::Ready(Box::new(serde_json::from_value(json!({
+        cache.update(&Event::Ready(serde_json::from_value(json!({
             "v": 10, "session_id": "fixture", "resume_gateway_url": "ws://fixture.invalid",
             "application": {"id": "999", "flags": 0},
             "user": {"id": "999", "username": "fixture", "discriminator": "0", "mfa_enabled": false},
             "guilds": [{"id": "100", "unavailable": true}]
-        })).unwrap())));
+        })).unwrap()));
         let gateway = Arc::new(RwLock::new(GatewayState::Connected));
         let accumulator = Arc::new(Mutex::new(Accumulator::default()));
         tick(&context, &cache, &gateway, &accumulator)

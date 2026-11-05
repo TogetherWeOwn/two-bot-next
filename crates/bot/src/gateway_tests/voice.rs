@@ -590,7 +590,7 @@ async fn resume_without_voice_rooms(cold: bool) {
     ));
     if !cold {
         let ready = serde_json::from_value(ready(&mock.url, "saved-session")["d"].clone()).unwrap();
-        cache.update(&twilight_gateway::Event::Ready(Box::new(ready)));
+        cache.update(&twilight_gateway::Event::Ready(ready));
         let fixture = include_str!("../../tests/fixtures/voice_guild.json")
             .replace("\"100\"", &format!("\"{VOICE_GUILD}\""));
         let mut guild: Value = serde_json::from_str(&fixture).unwrap();
