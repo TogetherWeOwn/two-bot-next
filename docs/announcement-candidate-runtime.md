@@ -279,6 +279,21 @@ not canonical staging qualification or production promotion.
   placeholder transition state/authority refs; it is not full-lifecycle proof.
   Synthetic/setup/cleanup operations still need their own exact semantic checks.
   No schema limit, live adapter, canonical gate or runtime refusal is changed.
+- `scripts/announcement_runtime_lifecycle.py` compares the existing setup/cleanup
+  DB ledgers to exact typed transition claims and operation sequence. Setup must
+  follow the served-before snapshot and precede rollout; cleanup follows the
+  observation window and precedes the restored sample. Every DB write outside
+  the test window must belong to one ledger, including writes at the exclusive
+  observation end. Final database presence/value projections must restore the
+  prior projections and agree with the last observed transition's full state
+  and commit timestamp. A new version may restore a present value; an unobserved version change cannot
+  be accepted as an unchanged resource. Message cleanup is explicitly unsupported.
+  **This is a scoped ledger comparison, not a complete lifecycle verifier.** It
+  must be composed with the authority, transition, resource, telemetry and
+  provenance checks. It does not consume opaque drain/recovery/postcondition
+  references, prove queue quiescence, validate actual SQL/CAS tokens or acquire
+  separately scoped recovery authority. A fabricated coherent ledger returns no
+  capability; unresolved full-packet evidence remains adverse.
 - `scripts/announcement_runtime_policy.py` checks offline lease/freshness,
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
@@ -364,9 +379,10 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
    exact ownership witness claims and each write's effect-batch authority reference.
    The setting checker compares a narrow value projection, mutation order and
    reader/poll state correspondence; neither establishes real CAS, full SQL row
-   restoration or actual stored-data acceptance. Implement setup/cleanup
-   phase assignment, independently verified restoration and separately scoped
-   recovery authority. Bind every actual mutation to its correct lifecycle-phase
+   restoration or actual stored-data acceptance. The lifecycle-ledger comparison
+   adds setup/cleanup operation assignment and prior-value projection checks,
+   not independently verified restoration or separately scoped recovery authority.
+   Complete the remaining lifecycle phases and bind every actual mutation to its correct lifecycle-phase
    authority checkpoint. The scoped resource graph and
    method-count checks alone are not a complete receipt-verification result.
 3. Strict receipt production and independently provisioned verification,
