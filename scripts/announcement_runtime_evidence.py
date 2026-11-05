@@ -299,10 +299,34 @@ SETTING_RECORDS = {
         "values": Array(CONTENT_PIN, 6, 6),
         "operations": {phase: REF for phase in ("baseline", "enable", "disable", "restore")}},
 }
+# Finite work-surface/drain claims. These do NOT establish that an inventory is
+# complete, that an external fence exists, or that an observer is authenticated.
+WORK_RECORDS = {
+    "work_inventory_content": {"candidate": VERSION, "control": VERSION,
+        "source_manifest": MANIFEST,
+        "surfaces": Array({"ref": REF,
+            "kind": enum("startup", "job", "queue", "retry", "trigger", "gateway",
+                         "internal_action", "transport", "synthetic"),
+            "source": enum("candidate", "control"), "path": TOKEN_FREE_PATH,
+            "blob": SHA, "sha256": SHA256, "disposition": enum("selected", "denied")})},
+    "work_snapshot": {"inventory_sha256": SHA256, "observer_ref": REF,
+        "enforcement_epoch": SERVICE_ID, "observed_at": UTC,
+        "surfaces": Array({"surface_ref": REF, "queued": COUNT, "in_flight": COUNT,
+                           "claimed": COUNT, "delayed": COUNT}),
+        "outcome": enum("observed", "unknown")},
+    "work_fence": {"source_ref": REF, "execution_ref": REF, "owner_ref": REF,
+        "nonce_ref": REF, "authority_epoch": SERVICE_ID, "resource_epoch": SERVICE_ID,
+        "inventory_sha256": SHA256, "closed_at": UTC, "held_until": UTC,
+        "boundary": enum("external_all_paths", "application_only", "unknown"),
+        "outcome": enum("closed", "lost", "unknown")},
+    "work_drain": {"inventory_ref": REF, "coverage_ref": REF, "fence_ref": REF,
+        "drained_snapshot_ref": REF, "started_at": UTC, "ended_at": UTC,
+        "unknown_operation_refs": Array(REF, 0), "outcome": enum("resolved", "unknown")},
+}
 EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS,
                     **INPUT_RECORDS, **SCHEDULER_RECORDS, **SOURCE_RECORDS,
                     **TELEMETRY_RECORDS, **SERIALIZATION_RECORDS, **TRANSITION_RECORDS,
-                    **SETTING_RECORDS}
+                    **SETTING_RECORDS, **WORK_RECORDS}
 
 
 def canonical_digest(value):

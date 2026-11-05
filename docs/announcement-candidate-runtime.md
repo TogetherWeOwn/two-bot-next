@@ -294,6 +294,25 @@ not canonical staging qualification or production promotion.
   references, prove queue quiescence, validate actual SQL/CAS tokens or acquire
   separately scoped recovery authority. A fabricated coherent ledger returns no
   capability; unresolved full-packet evidence remains adverse.
+- `scripts/announcement_runtime_drain.py` resolves four closed work-inventory,
+  snapshot, fence and drain claim kinds alongside the lifecycle-ledger comparison.
+  The declared finite surface inventory is content-bound to the scoped inventory
+  manifest, C/T and source manifest; every baseline, drained and final snapshot
+  must enumerate exactly those surfaces with zero queued, in-flight, claimed and
+  delayed work. Drain must finish before cleanup. A full-window external-observer
+  job/producer, exact gap-free coverage claim and a closed-through-end external
+  fence claim must agree on attempt, inventory and epochs. Observer subjects
+  cannot overlap authors, callers, controller, resource owners or candidate/control
+  writers. Missing/extra surfaces, nonzero work, late operations or unresolved
+  outcomes refuse. This narrow post-cutoff projection supports only the DB writes
+  already in the cleanup ledger: additional trusted recovery reads/wire operations
+  remain unsupported until separately typed and scoped, not implicitly exempt.
+  **These are declared quiescence comparisons, not proof of actual drain.** No
+  complete source-to-surface inventory, authenticated observer/fence, actual
+  queue/request resolution, cancellation or recovery authority is established.
+  Recovery, postconditions and full-packet accounting still need independent
+  semantics; coherent fabricated claims grant no capability. Nothing starts,
+  stops, deletes or restores a process/resource, and runtime admission is unchanged.
 - `scripts/announcement_runtime_policy.py` checks offline lease/freshness,
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
@@ -382,6 +401,8 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
    restoration or actual stored-data acceptance. The lifecycle-ledger comparison
    adds setup/cleanup operation assignment and prior-value projection checks,
    not independently verified restoration or separately scoped recovery authority.
+   The drain comparison adds declared finite-surface/empty-snapshot and closed-fence
+   correspondence, not a complete source-to-surface inventory or actual quiescence.
    Complete the remaining lifecycle phases and bind every actual mutation to its correct lifecycle-phase
    authority checkpoint. The scoped resource graph and
    method-count checks alone are not a complete receipt-verification result.
