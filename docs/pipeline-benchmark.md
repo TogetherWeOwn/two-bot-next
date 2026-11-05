@@ -136,11 +136,12 @@ requires the previous committed event/journal/checkpoint to survive with no
 partial batch, restarts through a fresh pool, and replays the unacknowledged
 batch. It verifies complete durability after drain and duplicate replay. Real
 fixture corruption (missing row/journal or duplicate journal) must fail the same
-oracle. The required database lane and benchmark workflow run this test; it
-never kills a production database process.
+oracle. The normal workspace integration lane and benchmark workflow run this
+non-ignored test; it never kills a production database process. The benchmark
+job builds it before applying the 120-second execution timeout.
 
 ```sh
-cargo test -p two-bot-cutover --test pipeline_durability --locked -- --ignored
+cargo test -p two-bot-cutover --test pipeline_durability --locked
 ```
 
 Use the bounded wrapper for controller compilation, as above. The existing full
@@ -188,14 +189,19 @@ The existing negative accounting tests still reject every extra transaction.
   SQLx-plus-BEGIN exchanges by event family. Fingerprints identify mechanisms;
   they are not an isolation/security boundary.
 
-Log reading is streamed in 128 KiB chunks, with 64 MiB total, 64 KiB line and
-1024 distinct-statement caps. Because the logging collector is asynchronous,
-the reader follows appended bytes for at most 10 seconds until the complete stop
-marker arrives, rather than treating the first EOF as final. Regression tests
-cover a delayed stop marker and awaited first-fixture cleanup when observer
-setup fails. Broad nightly/coverage ignored sweeps provide a JSON collector too,
-but retain maintenance defaults and enable completion logging only on the
-log-reader test's single synthetic connection, not across unrelated suites.
+Log reading is streamed in 128 KiB chunks, with a 64 MiB total budget, a 64 KiB
+line cap inside the measured database/window and a 1024 distinct-statement cap.
+Unrelated or earlier setup records are not subject to the measured line cap;
+a partial JSON record remains bounded by the total budget until it can be scoped.
+Because the logging collector is asynchronous, the reader follows appended bytes
+for at most 10 seconds until the complete stop marker arrives, rather than treating
+the first EOF as final. Regression tests cover oversized setup records spanning
+chunks, rejection of oversized measured records, a delayed stop marker and awaited
+first-fixture cleanup when observer setup fails. These database regressions live
+in the non-ignored `testsupport/tests/pipeline_integrity.rs` integration target.
+Normal integration, nightly and coverage sweeps provide a JSON collector, retain
+maintenance defaults and enable completion logging only on the log-reader test's
+single synthetic connection, not across unrelated suites.
 Only fingerprints/counts are published. Full raw
 logs may contain parameter values and remain inside the disposable server;
 never upload them. Missing instrumentation is INVALID/NOT RUN, not a score.
@@ -254,7 +260,8 @@ Driver fixture/percentile/bounds tests and database guard tests run in CI job co
 
 ```sh
 cargo test -p two-bot-discord --example pipeline_bench --locked
-cargo test -p two-bot-testsupport --lib --locked -- --include-ignored --test-threads=1
+cargo test -p two-bot-testsupport --lib --locked -- --test-threads=1
+cargo test -p two-bot-testsupport --test pipeline_integrity --locked -- --test-threads=1
 ```
 
 The journaled baseline uses [run 39637827461](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39637827461)

@@ -60,7 +60,6 @@ impl Drop for Writer {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable test database; pipeline benchmark workflow runs this guard"]
 async fn kill_mid_batch_then_replay_and_drain() {
     // Invoke the same test binary as a writer, rather than add a production hook
     // or pretend cancelling a Rust future is a process crash.
@@ -119,7 +118,6 @@ async fn kill_mid_batch_then_replay_and_drain() {
             .args([
                 "--exact",
                 "kill_mid_batch_then_replay_and_drain",
-                "--ignored",
                 "--nocapture",
             ])
             .env(CHILD_DATABASE, fixture_url)

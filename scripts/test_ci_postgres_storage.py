@@ -20,11 +20,11 @@ NEXTEST_WORKFLOW = (
 )
 NEXTEST_WORKFLOW_TEXT = NEXTEST_WORKFLOW.read_text()
 # The four Rust test lanes (rust-tests, coverage-shard, ignored-db-stores,
-# ignored-db-runtime) each run their own copy of this service; the first one
-# in the file is the storage reference. Coverage also needs a JSON collector
-# for the ignored log-reader regression; pin that exact instrumentation below.
+# ignored-db-runtime) each run their own copy of this service; the stores
+# service is the storage reference. Normal integration and coverage also need
+# a JSON collector for the log-reader regression; pin that instrumentation below.
 SERVICES = [part.split("    steps:\n", 1)[0] for part in WORKFLOW_TEXT.split("      agent-testdb:\n")[1:]]
-SERVICE = SERVICES[0]
+SERVICE = SERVICES[2]
 TOKENS = shlex.split(SERVICE.split("        options: >-\n", 1)[1])
 OPTIONS = dict(zip(TOKENS[::2], TOKENS[1::2]))
 VERIFY_TAILS = WORKFLOW_TEXT.split("      - name: Verify disposable Postgres defaults\n")[1:]
@@ -85,14 +85,14 @@ class PostgresStorageTests(unittest.TestCase):
         self.assertEqual(OPTIONS["--memory"], "2147483648")
         self.assertEqual(OPTIONS["--memory-swap"], OPTIONS["--memory"])
         # One bounded service per lane. All bytes must match the reference,
-        # with only coverage's exact collector configuration added. Compare
+        # with only the exact integration/coverage collector added. Compare
         # complete services so a storage/durability change still fails.
         self.assertEqual(WORKFLOW_TEXT.count("--tmpfs /var/lib/postgresql:"), 4)
         self.assertEqual(WORKFLOW_TEXT.count("image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722"), 4)
         bounded = [service for service in SERVICES if "--tmpfs" in service]
         self.assertEqual(len(bounded), 4)
         collector = (
-            "          # The ignored log-reader regression enables completion logging only\n"
+            "          # The log-reader regression enables completion logging only\n"
             "          # on its own synthetic connection; unrelated suites remain unlogged.\n"
             "          POSTGRES_INITDB_ARGS: >-\n"
             "            -c logging_collector=on -c log_destination=jsonlog\n"
@@ -108,7 +108,7 @@ class PostgresStorageTests(unittest.TestCase):
         self.assertNotEqual(coverage_service, SERVICE)
         self.assertEqual(
             bounded,
-            [coverage_service if lane == "coverage-shard" else SERVICE for lane in POSTGRES_LANES],
+            [coverage_service if lane in ("rust-tests", "coverage-shard") else SERVICE for lane in POSTGRES_LANES],
             "the lanes' Postgres services drifted from their pinned configurations",
         )
         self.assertNotIn("/var/lib/postgresql/data", SERVICE)
@@ -120,6 +120,8 @@ class PostgresStorageTests(unittest.TestCase):
 
     def test_service_contract_rejects_storage_or_collector_drift(self):
         mutations = [
+            (0, "log_destination=jsonlog", "log_destination=stderr"),
+            (0, "log_rotation_size=0", "log_rotation_size=10MB"),
             (1, "size=1073741824", "size=2147483648"),
             (1, "--memory 2147483648", "--memory 4294967296"),
             (1, "log_destination=jsonlog", "log_destination=stderr"),

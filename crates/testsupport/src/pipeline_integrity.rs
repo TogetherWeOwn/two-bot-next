@@ -111,20 +111,15 @@ pub async fn completed_statement_profile(
                 pending.extend_from_slice(&bytes);
                 if let Some(last) = pending.iter().rposition(|byte| *byte == b'\n') {
                     for line in pending[..last].split(|byte| *byte == b'\n') {
-                        ensure!(
-                            line.len() <= 64 * 1024,
-                            "server log line exceeds 64 KiB budget"
-                        );
                         if !line.is_empty() {
                             window.record(line, measured_database)?;
                         }
                     }
                     pending.drain(..=last);
                 }
-                ensure!(
-                    pending.len() <= 64 * 1024,
-                    "server log line exceeds 64 KiB budget"
-                );
+                // A partial record cannot be scoped until its JSON is complete.
+                // The total 64 MiB file budget still bounds this buffer; record()
+                // enforces 64 KiB only inside the measured database/window.
             }
             let current: Option<String> =
                 sqlx::query_scalar("SELECT pg_current_logfile('jsonlog')")
@@ -184,6 +179,10 @@ impl CompletionWindow {
             return Ok(());
         }
         if self.started && !self.stopped {
+            ensure!(
+                line.len() <= 64 * 1024,
+                "server log line exceeds 64 KiB budget"
+            );
             ensure!(
                 !matches!(
                     record["error_severity"].as_str(),
@@ -382,102 +381,6 @@ impl ServerDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TestDatabase;
-    use std::time::Duration;
-
-    #[tokio::test]
-    #[ignore = "requires disposable test database with JSON completion logging"]
-    async fn completion_reader_accepts_a_stop_marker_appended_after_initial_eof() {
-        let raw = std::env::var("TWO_TEST_DATABASE_URL").unwrap();
-        let db = TestDatabase::create(&raw, &sqlx::migrate::Migrator::DEFAULT)
-            .await
-            .unwrap();
-        let observer = TestDatabase::create(&raw, &sqlx::migrate::Migrator::DEFAULT)
-            .await
-            .unwrap();
-        // Broad ignored/coverage sweeps log only this synthetic connection,
-        // not every statement in their unrelated database suites.
-        let mut writer = db.pool().acquire().await.unwrap();
-        sqlx::raw_sql("SET log_min_duration_statement = 0")
-            .execute(&mut *writer)
-            .await
-            .unwrap();
-        sqlx::raw_sql("SELECT 'pipeline-accounting-start'")
-            .execute(&mut *writer)
-            .await
-            .unwrap();
-        sqlx::raw_sql("SELECT 42")
-            .execute(&mut *writer)
-            .await
-            .unwrap();
-        // Model the collector delivering the final record after the reader's
-        // first EOF, without stopping a server process.
-        let stop = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            sqlx::raw_sql("SELECT 'pipeline-accounting-stop'")
-                .execute(&mut *writer)
-                .await
-        });
-        let profile = completed_statement_profile(observer.pool(), db.name()).await;
-        let stopped = stop.await.unwrap();
-        db.close().await.unwrap();
-        observer.close().await.unwrap();
-        stopped.unwrap();
-        assert_eq!(profile.unwrap().values().sum::<i64>(), 1);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable test database with pg_stat_statements"]
-    async fn server_snapshots_require_disabled_autovacuum() {
-        let raw = std::env::var("TWO_TEST_DATABASE_URL").unwrap();
-        let db = TestDatabase::create(&raw, &sqlx::migrate::Migrator::DEFAULT)
-            .await
-            .unwrap();
-        let (db, observer) = add_observer(&raw, db).await.unwrap();
-        sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
-            .execute(observer.pool())
-            .await
-            .unwrap();
-        let autovacuum: bool = sqlx::query_scalar("SELECT current_setting('autovacuum')::boolean")
-            .fetch_one(observer.pool())
-            .await
-            .unwrap();
-        let snapshot = ServerSnapshot::read(observer.pool(), db.name()).await;
-        db.close().await.unwrap();
-        observer.close().await.unwrap();
-        if autovacuum {
-            assert!(
-                snapshot.unwrap_err().to_string().contains("autovacuum"),
-                "background maintenance transactions must invalidate server accounting"
-            );
-        } else {
-            snapshot.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable test database for verified fixture teardown"]
-    async fn observer_setup_failure_awaits_first_fixture_cleanup() {
-        let raw = std::env::var("TWO_TEST_DATABASE_URL").unwrap();
-        let db = TestDatabase::create(&raw, &sqlx::migrate::Migrator::DEFAULT)
-            .await
-            .unwrap();
-        let held = db.pool().acquire().await.unwrap();
-        // A checked-out connection blocks verified close. A Drop-only cleanup
-        // returns early here and can be lost when the main runtime shuts down.
-        let mut cleanup = tokio::spawn(add_observer("invalid fixture URL", db));
-        let premature = tokio::time::timeout(Duration::from_millis(20), &mut cleanup).await;
-        drop(held);
-        let (returned_early, outcome) = match premature {
-            Ok(result) => (true, result.unwrap()),
-            Err(_) => (false, cleanup.await.unwrap()),
-        };
-        assert!(
-            !returned_early,
-            "observer error returned before verified first-fixture cleanup"
-        );
-        assert!(outcome.is_err(), "invalid observer URL must still fail");
-    }
 
     #[test]
     fn durable_oracle_rejects_loss_duplicates_and_corrupt_journal() {
@@ -542,6 +445,36 @@ mod tests {
                 ("SAVEPOINT gateway_journal".into(), 2),
                 ("COMMIT".into(), 1),
             ])
+        );
+    }
+
+    #[test]
+    fn log_line_budget_applies_only_to_the_measured_database_window() {
+        let start = "duration: 0.1 ms  statement: SELECT 'pipeline-accounting-start'";
+        let stop = "duration: 0.1 ms  statement: SELECT 'pipeline-accounting-stop'";
+        let oversized = log_record("measured", &"x".repeat(128 * 1024));
+        let mut window = CompletionWindow::default();
+        window.record(&oversized, "measured").unwrap();
+        window
+            .record(&log_record("measured", start), "measured")
+            .unwrap();
+        window
+            .record(&log_record("observer", &"x".repeat(128 * 1024)), "measured")
+            .unwrap();
+        assert!(window.record(&oversized, "measured").is_err());
+        window
+            .record(
+                &log_record("measured", "duration: 0.1 ms  statement: SELECT 42"),
+                "measured",
+            )
+            .unwrap();
+        window
+            .record(&log_record("measured", stop), "measured")
+            .unwrap();
+        window.record(&oversized, "measured").unwrap();
+        assert_eq!(
+            window.finish().unwrap(),
+            BTreeMap::from([("SELECT 42".into(), 1)])
         );
     }
 

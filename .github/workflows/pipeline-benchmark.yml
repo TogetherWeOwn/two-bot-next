@@ -9,6 +9,7 @@ on:
       - '.github/workflows/pipeline-benchmark.yml'
       - 'crates/discord/examples/pipeline_bench.rs'
       - 'crates/testsupport/src/pipeline_integrity.rs'
+      - 'crates/testsupport/tests/pipeline_integrity.rs'
       - 'crates/cutover/tests/pipeline_durability.rs'
       - 'scripts/*pipeline_bench*'
       - 'docs/pipeline-benchmark-baseline.json'
@@ -74,8 +75,10 @@ jobs:
       - name: Benchmark fixture and guard regressions (CI job container only)
         run: |
           cargo test -p two-bot-discord --example pipeline_bench --locked
-          cargo test -p two-bot-testsupport --lib --locked -- --include-ignored --test-threads=1
-          timeout 120s cargo test -p two-bot-cutover --test pipeline_durability --locked -- --ignored --test-threads=1
+          cargo test -p two-bot-testsupport --lib --locked -- --test-threads=1
+          cargo test -p two-bot-testsupport --test pipeline_integrity --locked -- --test-threads=1
+          cargo test -p two-bot-cutover --test pipeline_durability --locked --no-run
+          timeout 120s cargo test -p two-bot-cutover --test pipeline_durability --locked -- --test-threads=1
       - name: Build benchmark (CI job container only)
         run: cargo build -p two-bot-discord --example pipeline_bench --locked
       - name: Measure bounded synthetic pipeline

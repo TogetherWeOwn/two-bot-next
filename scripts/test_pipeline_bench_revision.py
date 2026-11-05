@@ -55,9 +55,10 @@ class RevisionTests(unittest.TestCase):
         self.assertEqual((self.root / "pipeline-benchmark-revision.txt").read_text(), "")
         self.assertFalse((self.root / "pipeline-benchmark-pr-head.txt").exists())
 
-    def test_benchmark_and_ignored_sweeps_provide_disposable_log_collectors(self):
+    def test_benchmark_and_normal_sweeps_provide_disposable_log_collectors(self):
         for filename, job in [("pipeline-benchmark.yml", "benchmark"),
-                              ("check.yml", "coverage-shard"), ("nightly.yml", "sweep")]:
+                              ("check.yml", "rust-tests"), ("check.yml", "coverage-shard"),
+                              ("nightly.yml", "sweep")]:
             workflow = (ROOT / ".github/workflows" / filename).read_text()
             service = workflow.split(f"  {job}:\n", 1)[1].split("    services:\n", 1)[1]
             service = service.split("    steps:\n", 1)[0]
@@ -71,6 +72,25 @@ class RevisionTests(unittest.TestCase):
                 else:
                     self.assertNotIn("-c autovacuum=off", service)
                     self.assertNotIn("-c log_min_duration_statement=0", service)
+
+    def test_pipeline_database_guards_run_without_ignored_test_opt_ins(self):
+        durability = (ROOT / "crates/cutover/tests/pipeline_durability.rs").read_text()
+        self.assertNotIn("#[ignore", durability)
+        self.assertNotIn('"--ignored"', durability)
+        integrity = (ROOT / "crates/testsupport/tests/pipeline_integrity.rs").read_text()
+        self.assertNotIn("#[ignore", integrity)
+        self.assertEqual(integrity.count("#[tokio::test]"), 3)
+        workflow = (ROOT / ".github/workflows/check.yml").read_text()
+        normal = workflow.split("  rust-tests:\n", 1)[1].split("  coverage-plan:\n", 1)[0]
+        self.assertIn("TWO_TEST_DATABASE_URL:", normal)
+        self.assertIn("cargo test --workspace --test '*'", normal)
+        benchmark = (ROOT / ".github/workflows/pipeline-benchmark.yml").read_text()
+        build = "cargo test -p two-bot-cutover --test pipeline_durability --locked --no-run"
+        run = "timeout 120s cargo test -p two-bot-cutover --test pipeline_durability --locked -- --test-threads=1"
+        self.assertIn(build, benchmark)
+        self.assertIn(run, benchmark)
+        self.assertLess(benchmark.index(build), benchmark.index(run))
+        self.assertIn("cargo test -p two-bot-testsupport --test pipeline_integrity --locked", benchmark)
 
     def test_workflow_runs_regressions_and_uploads_both_receipts(self):
         workflow = (ROOT / ".github/workflows/pipeline-benchmark.yml").read_text()
