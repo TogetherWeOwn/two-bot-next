@@ -26,7 +26,7 @@ from announcement_runtime_policy import CAPABILITY_GAPS, runtime_preflight
 from announcement_runtime_provenance import check_provenance_claims
 from announcement_runtime_recovery import (
     check_recovery_fence_claims, check_recovery_grant_claims, check_recovery_installation_claims,
-    check_recovery_plan_claims, check_recovery_read_claims,
+    check_recovery_ownership_claims, check_recovery_plan_claims, check_recovery_read_claims,
 )
 from announcement_runtime_resources import check_resource_graph_claims
 from announcement_runtime_rsvp_storage import check_rsvp_storage_claims
@@ -60,7 +60,8 @@ CLAIM_CHECKS = (
     check_lifecycle_ledger_claims, check_drain_claims, check_interaction_exchange_claims,
     check_feed_exchange_claims, check_delivery_trace_claims, check_rsvp_storage_claims,
     check_recovery_plan_claims, check_recovery_grant_claims, check_recovery_read_claims,
-    check_recovery_fence_claims, check_recovery_installation_claims, check_lifecycle_phase_claims,
+    check_recovery_fence_claims, check_recovery_installation_claims,
+    check_recovery_ownership_claims, check_lifecycle_phase_claims,
 )
 
 

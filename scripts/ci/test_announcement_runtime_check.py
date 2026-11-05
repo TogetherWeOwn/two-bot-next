@@ -66,7 +66,7 @@ class ArchiveComposition(unittest.TestCase):
             "check_feed_exchange_claims", "check_delivery_trace_claims", "check_rsvp_storage_claims",
             "check_recovery_plan_claims", "check_recovery_grant_claims", "check_recovery_read_claims",
             "check_recovery_fence_claims", "check_recovery_installation_claims",
-            "check_lifecycle_phase_claims"])
+            "check_recovery_ownership_claims", "check_lifecycle_phase_claims"])
         self.assertEqual(len(checker.CLAIM_CHECKS), len(set(checker.CLAIM_CHECKS)))
 
     def test_same_index_and_clock_flow_through_every_comparison(self):
@@ -77,9 +77,9 @@ class ArchiveComposition(unittest.TestCase):
             calls.append((receipt, evidence, now))
             evidence.resolve("check-doc", "document")
 
-        with mock.patch.object(checker, "CLAIM_CHECKS", (compare,) * 23):
+        with mock.patch.object(checker, "CLAIM_CHECKS", (compare,) * 24):
             self.assertIsNone(checker.check_archive_claims(raw, inventory, now=NOW))
-        self.assertEqual(len(calls), 23)
+        self.assertEqual(len(calls), 24)
         self.assertTrue(all(r is calls[0][0] and e is calls[0][1] and n is NOW
                             for r, e, n in calls))
         self.assertIs(calls[0][0]["promotable"], False)
@@ -178,28 +178,28 @@ class RecoveryArchiveComposition(unittest.TestCase):
             checker.check_archive_claims(raw, inventory, now=now)
 
     def test_coherent_recovery_block_still_requires_complete_packet_accounting(self):
-        from test_announcement_runtime_recovery_installations import install_fixture
+        from test_announcement_runtime_recovery_ownership import ownership_fixture
 
         for prior in ("absent", "present"):
-            receipt, records, now = install_fixture(prior)
+            receipt, records, now = ownership_fixture(prior)
             with self.subTest(prior=prior), self.assertRaisesRegex(Refusal, "unreferenced_evidence$"):
                 self.inspect_recovery(receipt, records, now)
 
     def test_each_registered_recovery_fence_refuses_drift(self):
-        from test_announcement_runtime_recovery_installations import install_fixture
+        from test_announcement_runtime_recovery_ownership import ownership_fixture
 
         for phase in (0, 1):
-            receipt, records, now = install_fixture()
+            receipt, records, now = ownership_fixture()
             entry = records["runtime-recovery-fences"]["data"]["entries"][phase]
             records[entry["fence_ref"]]["data"]["resource_epoch"] = "999"
             with self.subTest(phase=phase), self.assertRaisesRegex(Refusal, "recovery_fence_binding$"):
                 self.inspect_recovery(receipt, records, now)
 
     def test_each_registered_recovery_installation_refuses_read_role_drift(self):
-        from test_announcement_runtime_recovery_installations import install_fixture
+        from test_announcement_runtime_recovery_ownership import ownership_fixture
 
         for phase in (0, 1):
-            receipt, records, now = install_fixture()
+            receipt, records, now = ownership_fixture()
             entry = records["runtime-recovery-installations"]["data"]["entries"][phase]
             approval = records[entry["installation_ref"]]["data"]
             records[approval["controller_read_ref"]]["data"]["claim"]["consumer"] = "verifier"
@@ -207,18 +207,78 @@ class RecoveryArchiveComposition(unittest.TestCase):
                 self.inspect_recovery(receipt, records, now)
 
     def test_missing_recovery_inventories_refuse_at_archive_entry_point(self):
-        from test_announcement_runtime_recovery_installations import install_fixture
+        from test_announcement_runtime_recovery_ownership import ownership_fixture
 
         for ref in ("runtime-recovery-fences", "runtime-recovery-installations"):
-            receipt, records, now = install_fixture()
+            receipt, records, now = ownership_fixture()
             del records[ref]
             with self.subTest(ref=ref), self.assertRaisesRegex(Refusal, "unresolved_reference$"):
                 self.inspect_recovery(receipt, records, now)
 
-    def test_recovery_comparisons_cannot_replace_real_lifecycle_refusal(self):
-        from test_announcement_runtime_recovery_installations import install_fixture
+    def test_registered_ownership_requires_the_cleanup_witness(self):
+        from test_announcement_runtime_recovery_ownership import WITNESS, ownership_fixture
 
-        receipt, records, now = install_fixture()
+        for prior in ("absent", "present"):
+            receipt, records, now = ownership_fixture(prior)
+            del records[WITNESS]
+            with self.subTest(prior=prior), self.assertRaisesRegex(Refusal, "unresolved_reference$"):
+                self.inspect_recovery(receipt, records, now)
+
+    def test_registered_ownership_cannot_borrow_runtime_grant_nonce_or_epoch(self):
+        from test_announcement_runtime_recovery_ownership import WITNESS, ownership_fixture
+
+        for prior in ("absent", "present"):
+            for fields in (("execution_ref",), ("nonce_ref",), ("authority_epoch",),
+                           ("execution_ref", "nonce_ref", "authority_epoch")):
+                receipt, records, now = ownership_fixture(prior)
+                runtime = receipt["authority"]["execution"]
+                borrowed = {"execution_ref": runtime["ref"], "nonce_ref": runtime["nonce_ref"],
+                            "authority_epoch": receipt["authority"]["epoch"]}
+                records[WITNESS]["data"].update({field: borrowed[field] for field in fields})
+                with self.subTest(prior=prior, fields=fields), self.assertRaisesRegex(
+                        Refusal, "recovery_ownership_match$"):
+                    self.inspect_recovery(receipt, records, now)
+
+    def test_registered_ownership_rejects_rewitnessed_stale_prior_state(self):
+        from test_announcement_runtime_recovery_ownership import (
+            ownership_fixture, rewitness, set_claim)
+
+        for prior in ("absent", "present"):
+            receipt, records, now = ownership_fixture(prior)
+            set_claim(receipt, records, before_state_ref="state-setup")
+            rewitness(receipt, records)
+            with self.subTest(prior=prior), self.assertRaisesRegex(Refusal, "recovery_ownership_chain$"):
+                self.inspect_recovery(receipt, records, now)
+
+    def test_registered_ownership_rejects_telemetry_observer_substitution(self):
+        from test_announcement_runtime_recovery_ownership import (
+            WITNESS, ownership_fixture, rewitness)
+
+        for prior in ("absent", "present"):
+            for target in ("state-interior", "state-final", WITNESS):
+                receipt, records, now = ownership_fixture(prior)
+                records[target]["data"]["observer_ref"] = "other-observer"
+                if target != WITNESS:
+                    rewitness(receipt, records)
+                code = "recovery_ownership_match" if target == WITNESS else "recovery_ownership_observer"
+                with self.subTest(prior=prior, target=target), self.assertRaisesRegex(
+                        Refusal, code + "$"):
+                    self.inspect_recovery(receipt, records, now)
+
+    def test_registered_ownership_must_precede_the_terminal_phase_checker(self):
+        from test_announcement_runtime_recovery_ownership import WITNESS, ownership_fixture
+
+        receipt, records, now = ownership_fixture()
+        records[WITNESS]["data"]["before_state_sha256"] = "0" * 64
+        phase = mock.Mock(wraps=checker.check_lifecycle_phase_claims)
+        with self.assertRaisesRegex(Refusal, "recovery_ownership_match$"):
+            self.inspect_recovery(receipt, records, now, lifecycle=phase)
+        phase.assert_not_called()
+
+    def test_recovery_comparisons_cannot_replace_real_lifecycle_refusal(self):
+        from test_announcement_runtime_recovery_ownership import ownership_fixture
+
+        receipt, records, now = ownership_fixture()
         phase = mock.Mock(wraps=checker.check_lifecycle_phase_claims)
         with self.assertRaises(Refusal):
             self.inspect_recovery(receipt, records, now, lifecycle=phase)

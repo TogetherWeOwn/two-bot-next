@@ -521,7 +521,7 @@ not canonical staging qualification or production promotion.
   upstream; this standalone checker does not validate their entire inventory or
   enforce an installation epoch fence. The offline CLI explicitly registers
   both comparisons before the mandatory lifecycle-phase refusal and final
-  all-used accounting. Library-only `check_recovery_ownership_claims` composes
+  all-used accounting. `check_recovery_ownership_claims` composes
   these plan/grant/read/fence/installation checks before comparing every cleanup
   DB mutation's independent full-state `ownership_match` witness. Here that
   generic record's `execution_ref` must name the **separate recovery grant**, with
@@ -536,9 +536,13 @@ not canonical staging qualification or production promotion.
   present→absent owned deletion or
   present→present CAS with an increasing version; endpoint-state reuse and
   ordinary-write witness reuse refuse. These are still unauthenticated claims,
-  **not actual owned CAS or full-row restoration proof**. This narrower library
-  comparison is not yet a CLI registration or coordinated generic
-  authority/state-chain/lifecycle consumption. Actual ownership/CAS tokens,
+  **not actual owned CAS or full-row restoration proof**. The offline archive
+  entry point explicitly registers this among twenty-four comparisons, after
+  installation checks and before the terminal lifecycle-phase refusal. Archive
+  tests reject missing witnesses, runtime grant/nonce/epoch substitution, a
+  rewitnessed stale prior state and observer drift; coherent partial fixtures
+  still fail final all-used accounting. This registration does not complete
+  coordinated generic authority/state-chain/lifecycle consumption. Actual ownership/CAS tokens,
   full-row state, process/Worker restoration and final verification remain
   unfinished. The mandatory lifecycle-phase checker still refuses cleanup,
   and the CLI/runtime stay unconditional HOLD. Retrospective grant consistency
