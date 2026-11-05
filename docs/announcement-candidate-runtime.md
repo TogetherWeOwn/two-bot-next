@@ -400,6 +400,24 @@ not canonical staging qualification or production promotion.
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
   sequence and treats abort as terminal for qualification.
+- `scripts/announcement_runtime_delivery.py` adds a separate offline one-item
+  accounting model for closed claim → wire-attempt → known-accepted-message →
+  known-DB-completion → unchanged-replay declarations. Every event binds the same
+  run/attempt/control, literal-key reference, nonce reference and claim; wire and
+  acceptance events also pin the same operation. Message IDs must be canonical
+  nonzero u64s. The model counts the declared first wire attempt before its
+  outcome and a repeated in-scope attempt before refusing it. A timeout, unknown
+  history/completion, pre-wire failure, abort, wrong scope/order/message or malformed
+  event permanently makes this object adverse; catching a refusal never reopens
+  it. Neither a history miss nor cleanup/reset/recovery input can authorize repost.
+  Immutable snapshots retain known counts, including a known acceptance when DB
+  completion is unknown. They stop at the first refusal and are **not full-window
+  telemetry or final real-effect totals**. This is a narrower qualification model
+  than C's recovery logic, not an implementation of that recovery. It has no
+  receipt/CLI integration, authority, persistence, external fence or transport.
+  Reconstructing a new object grants no new attempt or nonce use. Stored row values,
+  actual history/response-loss reconciliation and full-window effects remain
+  mandatory independent work; successful model completion never grants admission.
 - `scripts/announcement_runtime_source.py` observes complete local Git-object
   inventories without checkout, fetch, import, filter or build execution. It
   verifies raw commit/tree/blob hashes and validates raw canonical tree modes
