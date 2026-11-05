@@ -7,7 +7,9 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from announcement_provenance_fixtures import at, evidence_index
-from announcement_source_input_fixtures import source_input_fixture, repin_source_inputs, sha
+from announcement_source_input_fixtures import (
+    source_input_fixture, repin_source_inputs, replace_source_body, sha,
+)
 from announcement_runtime_authority import check_authority_graph_claims
 from announcement_runtime_evidence import SOURCE_RECORDS, canonical_digest
 from announcement_runtime_policy import runtime_preflight
@@ -213,7 +215,8 @@ class SourceInputs(unittest.TestCase):
         data(records, "item-ref")["item_content_sha256"] = digest
         selected["post_content_sha256"] = sha("New feed item: **Fixture\\-item**\n" +
                                              selected["item"]["url"])
-        repin_source_inputs(receipt, records)
+        replace_source_body(receipt, records, data(records, "source-body")["body_utf8"].replace(
+            "<title>Fixture item</title>", "<title>Fixture-item</title>"))
         self.assertIsNone(self.check(receipt, records, now))
         selected["post_content_sha256"] = sha("New feed item: **Fixture-item**\n" +
                                              selected["item"]["url"])

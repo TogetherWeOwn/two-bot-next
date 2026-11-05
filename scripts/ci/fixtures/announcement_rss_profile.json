@@ -1,0 +1,28 @@
+{
+  "cases": [
+    {
+      "name": "plain",
+      "body": "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>Fixture</title><link>https://fixture.example.test/</link><description>Inert fixture</description><item><guid>fixture-item-one</guid><title>Fixture item</title><link>https://fixture.example.test/item</link><pubDate>2026-01-01T00:00:00Z</pubDate></item></channel></rss>",
+      "item": {"key": "fixture-item-one", "title": "Fixture item", "url": "https://fixture.example.test/item", "published_at": "2026-01-01T00:00:00Z"},
+      "item_key": "393f044161a5c84af9769981a439424eb5d82589e04ddcd1cd7f15ed35e31601",
+      "nonce": "c5ac38d2c92b4d32ca3f52c1",
+      "post_content": "New feed item: **Fixture item**\nhttps://fixture.example.test/item"
+    },
+    {
+      "name": "punctuated-key-and-escaped-title",
+      "body": "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>Second fixture</title><link>https://another.example.test/news/</link><description>Another inert fixture</description><item><guid>fixture:two_2.0</guid><title>Fixture-item 2</title><link>https://another.example.test/a_b~c/d-2.html</link><pubDate>2026-02-28T12:34:56Z</pubDate></item></channel></rss>",
+      "item": {"key": "fixture:two_2.0", "title": "Fixture-item 2", "url": "https://another.example.test/a_b~c/d-2.html", "published_at": "2026-02-28T12:34:56Z"},
+      "item_key": "7d6ff5c81b7c920bd337d1930ae9d92a01f09d736d34e63c8aa34fa6162a652b",
+      "nonce": "29a1276e06c459aa6b55e4e1",
+      "post_content": "New feed item: **Fixture\\-item 2**\nhttps://another.example.test/a_b~c/d-2.html"
+    },
+    {
+      "name": "numeric-key-and-leap-day",
+      "body": "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>7</title><link>https://fixture.example.test/7</link><description>7</description><item><guid>7</guid><title>7</title><link>https://fixture.example.test/7</link><pubDate>2024-02-29T23:59:59Z</pubDate></item></channel></rss>",
+      "item": {"key": "7", "title": "7", "url": "https://fixture.example.test/7", "published_at": "2024-02-29T23:59:59Z"},
+      "item_key": "7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451",
+      "nonce": "ca673a5bbf011f06fef6d514",
+      "post_content": "New feed item: **7**\nhttps://fixture.example.test/7"
+    }
+  ]
+}

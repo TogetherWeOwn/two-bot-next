@@ -1,10 +1,10 @@
 """Restricted offline source-content comparisons, never fetching or admission.
 
-A body hash cannot prove immutable hosting, a real stored row or C's parser
-selection. This layer checks a deliberately narrow ASCII RSS plan; general URL,
-Unicode/markdown rendering and feed-parser equivalence remain unsupported. All
-transport/selection observations and external containment still need independent
-proof. No public serializer, root, credential or network adapter exists here.
+A body hash cannot prove immutable hosting or a real stored row. This layer
+checks a deliberately narrow single-item ASCII RSS grammar against C's selection
+rules; general XML/URL/Unicode behavior remains unsupported. Actual transport,
+served-parser observations and external containment still need independent proof.
+No public serializer, root, credential or network adapter exists here.
 """
 
 import hashlib
@@ -18,6 +18,22 @@ from announcement_runtime_schema import require, utc
 
 
 SOURCE_PLAN_REF = "runtime-source-plan"
+
+# A closed fixture grammar, not a general XML parser. C feeds.rs:1109-1239
+# selects this one unprefixed item, with no attribute shadowing, repeated fields,
+# fallback key/title/date, entity decoding, namespace or URL normalization.
+# Bounded disjoint character classes cannot contain markup or escape sequences.
+RSS_FIXTURE = re.compile(
+    r'<\?xml version="1\.0"\?><rss version="2\.0"><channel>'
+    r'<title>[A-Za-z0-9][A-Za-z0-9 -]{0,127}</title>'
+    r'<link>(?P<channel_url>https://[a-z0-9./_~-]{1,2048})</link>'
+    r'<description>[A-Za-z0-9][A-Za-z0-9 -]{0,127}</description>'
+    r'<item><guid>(?P<key>[A-Za-z0-9][A-Za-z0-9:._-]{0,255})</guid>'
+    r'<title>(?P<title>[A-Za-z0-9][A-Za-z0-9 -]{0,127})</title>'
+    r'<link>(?P<url>https://[a-z0-9./_~-]{1,2048})</link>'
+    r'<pubDate>(?P<published_at>[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+    r'[0-9]{2}:[0-9]{2}:[0-9]{2}Z)</pubDate></item></channel></rss>'
+)
 
 
 def _sha(text):
@@ -46,10 +62,10 @@ def _target(target):
 def check_source_input_claims(receipt, evidence, now):
     """Compare content-bound source/row/item/nonce claims; return no capability.
 
-    This is not a complete source verifier: selected item contents remain a
-    parser-output CLAIM, not a Python reimplementation of C's feed parser. A
-    coherent fabricated graph, or a body containing another item, is not proof
-    of selection and can never pass runtime_preflight().
+    This is not a complete source verifier. The single-item fixture grammar
+    rejects divergent selection claims, but never establishes immutable hosting
+    or that served C actually fetched/parsed these bytes. A coherent fabricated
+    graph can never pass runtime_preflight().
     """
     check_scheduler_graph_claims(receipt, evidence, now)
     inputs = evidence.resolve(INPUT_PLAN_REF, "input_plan_content")
@@ -129,6 +145,16 @@ def check_source_input_claims(receipt, evidence, now):
     title = item["title"].replace("-", "\\-")
     post = "New feed item: **" + title + "**\n" + item["url"]
     require(len(post) <= 2000 and selected["post_content_sha256"] == _sha(post), "source_post")
+    # Full document matching rejects hidden extra items/fields, DTD/entities,
+    # CDATA, comments, processing instructions, namespaces and malformed XML
+    # without invoking an XML engine or resolving any external input.
+    parsed = RSS_FIXTURE.fullmatch(body["body_utf8"])
+    require(parsed is not None, "unsupported_rss_fixture")
+    fields = parsed.groupdict()
+    channel_parts = fields.pop("channel_url").removeprefix("https://").split("/", 1)
+    require(len(channel_parts) == 2, "source_target")
+    _target({"origin": "https://" + channel_parts[0], "path": "/" + channel_parts[1]})
+    require(fields == item, "source_parser_selection")
     budgets = [x for x in resources["operation_budgets"]
                if x["resource_ref"] == slots["source_ref"] and x["method"] == "source_get"]
     require(len(budgets) == 1 and budgets[0]["expected_count"] ==

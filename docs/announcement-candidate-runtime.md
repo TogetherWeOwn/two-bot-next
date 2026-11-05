@@ -165,11 +165,21 @@ not canonical staging qualification or production promotion.
   Narrow title/URL checks compare the resulting RSS post-content digest, including
   escaped title hyphens; unsupported trim/Unicode/markdown/URL forms refuse.
   Source wire-attempt ceilings must equal the exact finite method budget.
-  **This is not a feed parser or a transport/selection observation.** A coherent
-  claim that selects an item absent from the body does not prove parser output;
-  exact C parser/source immutability, externally enforced request/response caps,
-  actual source requests and full stored-case semantics remain mandatory. No URL
-  is fetched, no XML is executed/parsed, no source is authenticated and no public
+  A closed single-item ASCII RSS fixture grammar now compares all four selected
+  item fields directly with the body, including an explicit UTC `pubDate`.
+  The entire document must match the fixed declaration/root/channel/item field
+  order; duplicate/missing/extra fields or items, attribute shadowing, namespace
+  variants, DTD/entities, CDATA, comments, processing instructions, fallback
+  identifiers and noncanonical XML refuse without invoking an XML engine. This
+  is deliberately narrower than C, not permission to run arbitrary XML. The
+  frozen C and implementation-base `crates/core/src/feeds.rs` share blob
+  `f5148aaa0faf7767474ca8da344006f262122e92`. A shared three-case golden corpus
+  is consumed by Python claim tests and a Rust parser/planner test in Actions;
+  that is a hermetic comparison of the shipped parser, not a served observation.
+  **This is not authenticated source or transport/selection evidence.** Actual
+  served-C fetch/parse, immutable hosting, externally enforced request/response
+  caps and full stored-case semantics remain mandatory. No URL is fetched, no
+  general XML is parsed/executed, no source is authenticated and no public
   serializer exposes these restricted bytes or literal nonce. Runtime admission
   stays unconditionally unsupported even for coherent fabricated records.
 - `scripts/announcement_runtime_telemetry.py` composes provenance and resource
@@ -383,8 +393,9 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
    provenance/authority, resource and scoped restricted-input claim comparisons.
    Authenticate restricted literal keys, consent and identity maps; bind complete
    transitive inventory and synthetic-cleanup plans. The source-input comparison
-   binds restricted URL/body/item claims but still needs exact C parser selection,
-   actual source requests, immutable hosting and independent transport evidence.
+   binds restricted URL/body/item claims and a closed single-item RSS grammar,
+   but still needs actual served-C parser/fetch observations, immutable hosting
+   and independent transport evidence.
    The scheduler comparison is scoped offline consistency, not a stored-data proof.
    Resolve exact interaction request contents and actual ACK/edit wire records;
    live interaction replay remains explicitly unsupported. Implement full stored

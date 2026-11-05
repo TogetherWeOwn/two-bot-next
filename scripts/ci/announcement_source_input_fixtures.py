@@ -21,6 +21,24 @@ def repin_source_inputs(receipt, records):
     repin_scheduler(receipt, records)
 
 
+def replace_source_body(receipt, records, body):
+    """Repin inert body bytes everywhere, so selection adversaries reach semantics."""
+    digest = sha(body)
+    records["source-body"]["data"].update(body_utf8=body, byte_count=len(body.encode("utf-8")),
+                                         sha256=digest)
+    receipt["fixtures"]["source_content_sha256"] = digest
+    records["item-ref"]["data"]["source_content_sha256"] = digest
+    records["selected-item"]["data"]["body_sha256"] = digest
+    entry = next(x for x in receipt["resources"]["entries"] if x["ref"] == "source")
+    entry["identity"]["content_sha256"] = digest
+    binding = next(x for x in records["runtime-identity-map"]["data"]["bindings"]
+                   if x["resource_ref"] == "source")
+    binding["identity"] = copy.deepcopy(entry["identity"])
+    for ref in ("before-source", "after-source", "isolation-source"):
+        records[ref]["data"]["identity_sha256"] = canonical_digest(entry["identity"])
+    repin_source_inputs(receipt, records)
+
+
 def source_input_fixture():
     receipt, records, now = scheduler_fixture()
 
@@ -34,7 +52,8 @@ def source_input_fixture():
     body = ('<?xml version="1.0"?><rss version="2.0"><channel><title>Fixture</title>'
             '<link>https://fixture.example.test/</link><description>Inert fixture</description>'
             '<item><guid>fixture-item-one</guid><title>Fixture item</title>'
-            '<link>https://fixture.example.test/item</link></item></channel></rss>')
+            '<link>https://fixture.example.test/item</link>'
+            '<pubDate>2026-01-01T00:00:00Z</pubDate></item></channel></rss>')
     inputs = records["runtime-input-plan"]["data"]
     inputs["feed"]["item_key"] = sha(item["key"])
     records["key-delivery"]["data"]["item_key"] = sha(item["key"])

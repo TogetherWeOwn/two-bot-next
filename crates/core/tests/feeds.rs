@@ -1594,3 +1594,48 @@ fn feed_list_page_frame_inflated_rows_converge_with_ids_reachable() {
         "converged total is one page: {refusal}"
     );
 }
+
+#[test]
+fn announcement_rss_profile_golden_corpus_matches_shipped_parser_and_planner() {
+    let corpus: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../scripts/ci/fixtures/announcement_rss_profile.json"
+    ))
+    .unwrap();
+    let cases = corpus["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 3);
+    let text = |value: &serde_json::Value| value.as_str().unwrap().to_owned();
+    for case in cases {
+        let name = text(&case["name"]);
+        let parsed = parse_xml_feed_report(case["body"].as_str().unwrap(), FeedKind::Rss).unwrap();
+        assert_eq!(parsed.unsafe_urls_filtered, 0, "{name}");
+        let expected = FeedItem {
+            key: text(&case["item"]["key"]),
+            title: text(&case["item"]["title"]),
+            url: text(&case["item"]["url"]),
+            published_at: Some(text(&case["item"]["published_at"])),
+        };
+        assert_eq!(parsed.items, vec![expected], "{name}");
+        let derived_key = item_key(&parsed.items[0]).unwrap();
+        assert_eq!(derived_key, text(&case["item_key"]), "{name}");
+        assert_eq!(
+            delivery_nonce("fixture-relay", &derived_key),
+            text(&case["nonce"]),
+            "{name}"
+        );
+        let mut feed = relay(FeedKind::Rss);
+        feed.id = "fixture-relay".into();
+        assert_eq!(
+            plan_post(&feed, &parsed.items[0]).unwrap(),
+            FeedPost {
+                feed_id: "fixture-relay".into(),
+                channel_id: feed.channel_id.clone(),
+                item_key: text(&case["item_key"]),
+                nonce: text(&case["nonce"]),
+                content: text(&case["post_content"]),
+                suppress_mentions: true,
+                enforce_nonce: true,
+            },
+            "{name}"
+        );
+    }
+}
