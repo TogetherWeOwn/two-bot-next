@@ -2,9 +2,9 @@
 
 The resource-plan digest binds a closed plan, not a caller allowlist. Separate
 scope/grant/decision/nonce claims are compared, never authenticated or consumed.
-Recovery reads/history/checkpoints are separate offline claims; installation
-revalidation and mutation fences remain unimplemented. The mandatory lifecycle-
-phase checker still refuses cleanup, regardless of these comparisons.
+Recovery reads/history/checkpoints/fences are separate offline claims; installation
+revalidation and mutation-phase integration remain unimplemented. The mandatory
+lifecycle-phase checker still refuses cleanup, regardless of these comparisons.
 """
 
 from datetime import timedelta
@@ -18,6 +18,7 @@ from announcement_runtime_schema import LEDGER_LIMIT, require, utc
 
 RECOVERY_PLAN_REF = "runtime-recovery-plan"
 RECOVERY_CHECKPOINTS_REF = "runtime-recovery-checkpoints"
+RECOVERY_FENCES_REF = "runtime-recovery-fences"
 
 
 def check_recovery_plan_claims(receipt, evidence, now):
@@ -268,3 +269,45 @@ def check_recovery_read_claims(receipt, evidence, now):
                 len(previous["events"]) <= len(current["events"]), "recovery_history_rewrite")
         require(all(utc(e["observed_at"]) > utc(previous["ended_at"])
                     for e in current["events"][len(previous["events"]):]), "recovery_history_backfill")
+
+
+def check_recovery_fence_claims(receipt, evidence, now):
+    """Compare separate named boundary fences, NOT enforce or acquire one.
+
+    Installation revalidation and authority/state-chain/lifecycle integration
+    remain mandatory and unfinished. This standalone comparison does not replace
+    the CLI's terminal cleanup refusal or runtime_preflight's unconditional HOLD.
+    """
+    check_recovery_read_claims(receipt, evidence, now)
+    lifecycle, attempt = receipt["lifecycle"], receipt["attempt"]
+    grant = evidence.resolve(lifecycle["restoration_authority_ref"], "recovery_authority")
+    checkpoints = evidence.resolve(RECOVERY_CHECKPOINTS_REF, "recovery_checkpoints")["checkpoints"]
+    inventory = evidence.resolve(RECOVERY_FENCES_REF, "recovery_fences")
+    require(inventory["recovery_ref"] == grant["ref"] and inventory["run"] == attempt["run"],
+            "recovery_fence_scope")
+    entries = inventory["entries"]
+    require([entry["checkpoint_ref"] for entry in entries] ==
+            [checkpoint["ref"] for checkpoint in checkpoints], "recovery_fence_inventory")
+    refs = [entry["fence_ref"] for entry in entries]
+    _unique_refs(refs)
+    require(not set(refs).intersection(checkpoint["mutation_fence_ref"]
+            for checkpoint in attempt["checkpoints"]), "recovery_fence_separation")
+    claims = _index(lifecycle["cleanup"], "operation_id", "lifecycle_operation")
+    for checkpoint, entry in zip(checkpoints, entries):
+        fence = evidence.resolve(entry["fence_ref"], "recovery_mutation_fence")
+        require(fence == {
+            "source_ref": grant["source_ref"], "recovery_ref": grant["ref"],
+            "checkpoint_ref": checkpoint["ref"], "run": attempt["run"],
+            "phase": checkpoint["phase"], "authority_epoch": grant["epoch"],
+            "resource_epoch": grant["resource_epoch"], "nonce_ref": grant["nonce_ref"],
+            "consumption_ref": grant["consumption_ref"], "observed_at": checkpoint["checked_at"],
+            "valid_until": fence["valid_until"], "boundary": "external_atomic",
+        }, "recovery_fence_binding")
+        checked, expiry = utc(checkpoint["checked_at"]), utc(fence["valid_until"])
+        require(checked < expiry <= min(utc(grant["expires_at"]), checked + timedelta(seconds=60)),
+                "recovery_fence_time")
+        boundaries = [utc(claims[op]["observed_at"]) for op in checkpoint["operation_id_refs"]]
+        if checkpoint["phase"] == "final":
+            boundaries.append(now)
+        require(all(checked <= observed < expiry for observed in boundaries),
+                "recovery_mutation_fence_time")

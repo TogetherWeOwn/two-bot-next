@@ -497,8 +497,16 @@ not canonical staging qualification or production promotion.
   remain at most 60 seconds old at the actual cleanup timestamp and final
   verifier clock, not merely checkpoint creation; expiry remains exclusive.
   These are inert claim comparisons, not authenticated reads or enforceable
-  checkpoints. Installation revalidation, boundary fences and the coordinated
-  authority/state-chain/lifecycle consumers remain unimplemented. Actual ownership/
+  checkpoints. Standalone `check_recovery_fence_claims` additionally resolves a
+  fixed `runtime-recovery-fences` inventory and closed `recovery_mutation_fence`
+  records. Each cleanup/final checkpoint requires one unique fence, separate from
+  runtime fences, bound to its exact source/grant/run/phase/epochs/nonce-use and
+  checkpoint clock. Its exclusive validity ends no later than 60 seconds after
+  checking or grant expiry; the named cleanup timestamp or final verifier clock
+  must be inside it. This library comparison neither acquires nor enforces an
+  atomic fence and is not yet registered in the CLI. Installation revalidation
+  and coordinated authority/state-chain/lifecycle consumption of these recovery
+  fences remain unimplemented. Actual ownership/
   CAS tokens, full-row state, process/Worker restoration and final verification
   remain unfinished. The mandatory lifecycle-phase checker still refuses cleanup,
   and the CLI/runtime stay unconditional HOLD. Retrospective grant consistency
