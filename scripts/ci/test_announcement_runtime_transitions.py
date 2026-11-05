@@ -125,7 +125,9 @@ class Coherence(Transitions):
             self.assertEqual(effect["method"], witness["method"])
             self.assertEqual("external_compare_and_match", witness["boundary"])
             self.assertEqual("matched", witness["outcome"])
-            self.assertEqual(EFFECT_BATCH, claim(records, effect["operation_id"])["authority_ref"])
+            expected = "checkpoint-3" if effect["resource_ref"] == "setting" else EFFECT_BATCH
+            self.assertEqual(expected, claim(records, effect["operation_id"])["authority_ref"])
+            self.assertEqual(expected, witness["checkpoint_ref"])
         versions = [state(records, x)["claim"]["version"]
                     for x in (SETTING_INS, SETTING_CAS0, SETTING_CAS1)]
         self.assertEqual(["1", "2", "3"], versions)
@@ -462,8 +464,11 @@ class Authority(Transitions):
                 # Reuse the complete clone as an EARLIER checkpoint. Its fence
                 # covers 08:00, but one family of paired reads is 61 seconds old.
                 checkpoint["checked_at"] = at("00:07:59")
-                attempt["checkpoints"].insert(index - 1, checkpoint)
-                authority["installation_approval_refs"].insert(index - 1, install_ref)
+                pairs = list(zip(attempt["checkpoints"], authority["installation_approval_refs"]))
+                pairs.append((checkpoint, install_ref))
+                pairs.sort(key=lambda pair: pair[0]["checked_at"])
+                attempt["checkpoints"] = [pair[0] for pair in pairs]
+                authority["installation_approval_refs"] = [pair[1] for pair in pairs]
                 install = records[install_ref]["data"]
                 install["checked_at"] = at("00:07:59")
                 records[checkpoint["mutation_fence_ref"]]["data"]["observed_at"] = at("00:07:59")
@@ -527,11 +532,81 @@ class Authority(Transitions):
                 with self.assertRaisesRegex(Refusal, "transition_authority$"):
                     check_authority_graph_claims(receipt, evidence_index(records), now)
 
-    def test_every_write_needs_the_effect_batch_authority(self):
+    def test_every_write_needs_its_exact_setting_or_business_authority(self):
         for operation in WRITES:
+            wrong_ref = EFFECT_BATCH if operation.startswith("budget-setting-") else "checkpoint-3"
             with self.subTest(operation=operation):
-                self.reject(lambda r, s, o=operation: claim(s, o).update(
-                    authority_ref="checkpoint-3"), "transition_authority")
+                self.reject(lambda r, s, o=operation, ref=wrong_ref: claim(s, o).update(
+                    authority_ref=ref), "transition_authority")
+
+
+class SettingCheckpoints(Transitions):
+    def both(self, receipt, records, now, code=None):
+        for checker in (check_authority_graph_claims, check_transition_claims):
+            with self.subTest(checker=checker.__name__):
+                if code is None:
+                    self.assertIsNone(checker(receipt, evidence_index(records), now))
+                else:
+                    with self.assertRaisesRegex(Refusal, code + "$"):
+                        checker(receipt, evidence_index(records), now)
+
+    def test_in_window_setting_writes_compose_with_distinct_same_time_phases(self):
+        receipt, records, now = transition_fixture()
+        self.both(receipt, records, now)
+        checkpoints = {x["ref"]: x for x in receipt["attempt"]["checkpoints"]}
+        setting, business = checkpoints["checkpoint-3"], checkpoints[EFFECT_BATCH]
+        self.assertEqual("transition", setting["phase"])
+        self.assertEqual("effect_batch", business["phase"])
+        self.assertEqual(setting["checked_at"], business["checked_at"])
+        self.assertNotEqual(setting["mutation_fence_ref"], business["mutation_fence_ref"])
+        index = evidence_index(records)
+        self.assertIsNone(check_transition_claims(receipt, index, now))
+        index.require_all_used()
+        with self.assertRaisesRegex(Refusal, "unsupported"):
+            runtime_preflight()
+
+    def test_setting_cannot_name_business_fence_even_with_matching_ownership(self):
+        for operation in (SETTING_INS, SETTING_CAS0, SETTING_CAS1, SETTING_DEL):
+            with self.subTest(operation=operation):
+                receipt, records, now = transition_fixture()
+                self.both(receipt, records, now)
+                claim(records, operation)["authority_ref"] = EFFECT_BATCH
+                match(records, operation)["checkpoint_ref"] = EFFECT_BATCH
+                self.both(receipt, records, now, "transition_authority")
+
+    def test_setting_cannot_borrow_the_original_fence_for_a_later_named_transition(self):
+        receipt, records, now = transition_fixture()
+        later = add_checkpoint(receipt, records, "00:08:01", phase="transition")
+        self.both(receipt, records, now)
+        claim(records, SETTING_CAS0)["authority_ref"] = later
+        match(records, SETTING_CAS0)["checkpoint_ref"] = later
+        self.both(receipt, records, now, "transition_authority_time")
+
+    def test_setting_named_reads_accept_sixty_seconds_but_not_sixty_one(self):
+        for group in ("runtime", "install"):
+            with self.subTest(group=group):
+                receipt, records, now = transition_fixture()
+                ref = add_checkpoint(receipt, records, "00:07:59", phase="transition")
+                attempt = receipt["attempt"]
+                index = next(i for i, c in enumerate(attempt["checkpoints"]) if c["ref"] == ref)
+                checkpoint = attempt["checkpoints"][index]
+                install = records[receipt["authority"]["installation_approval_refs"][index]]["data"]
+                record = checkpoint if group == "runtime" else install
+                claim(records, SETTING_CAS0)["authority_ref"] = ref
+                match(records, SETTING_CAS0)["checkpoint_ref"] = ref
+                for clock, code in (("00:07:00", None), ("00:06:59", "stale_mutation_read")):
+                    for role in ("controller", "verifier"):
+                        read = records[record[role + "_read_ref"]]["data"]
+                        history = records[read["history_ref"]]["data"]
+                        read["claim"]["read_at"] = history["ended_at"] = at(clock)
+                        read["claim"]["history_sha256"] = canonical_digest(history)
+                    repin_authority(receipt, records)
+                    self.both(receipt, records, now, code)
+
+    def test_setting_setup_membership_still_requires_setup_time(self):
+        receipt, records, now = transition_fixture()
+        receipt["lifecycle"]["setup"] = [copy.deepcopy(claim(records, SETTING_INS))]
+        self.both(receipt, records, now, "lifecycle_operation_time")
 
 
 class Witnesses(Transitions):

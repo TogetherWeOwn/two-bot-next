@@ -431,11 +431,18 @@ not canonical staging qualification or production promotion.
   `setup` fence and all current runtime/installation reads, not a business batch.
   The setup tests compose real offline scope/history/resource/telemetry/ownership
   comparisons without mocks; the remaining single-instant accounting operations
-  and placeholder cleanup are explicitly not full lifecycle proof. Setting
-  transitions still encounter generic effect-batch expectations in the older
-  consumers. Reconciling those, credential usability, recovery and full lifecycle
-  integration remains unfinished. Separate partial phase tests still assert the
-  terminal recovery refusal; no successful composed lifecycle is claimed.
+  and placeholder cleanup are explicitly not full lifecycle proof. The shared
+  classifier also assigns setting DB writes inside the observation window to
+  named `transition` authority in all three consumers. Shared telemetry/state
+  fixtures now bind those writes and their ownership witnesses to a distinct
+  transition checkpoint, even when a fresh business fence has the same time.
+  Compacted setting fixtures preserve the 08-minute transition/business reads
+  separately from the 03-minute initial checkpoints and the 12-minute disable
+  checkpoint without raising the 256-record bound. Their baseline/restoration
+  still carry historical generic claims without exact setup/cleanup membership;
+  full lifecycle must refuse them. Credential usability, recovery and full
+  lifecycle integration remain unfinished. Separate partial phase tests still
+  assert the terminal recovery refusal; no successful composed lifecycle is claimed.
 - `scripts/announcement_runtime_drain.py` resolves four closed work-inventory,
   snapshot, fence and drain claim kinds alongside the lifecycle-ledger comparison.
   The declared finite surface inventory is content-bound to the scoped inventory

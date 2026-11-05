@@ -85,6 +85,36 @@ class Settings(unittest.TestCase):
         with self.assertRaisesRegex(Refusal, "unsupported"):
             runtime_preflight()
 
+    def test_compaction_keeps_setting_and_business_reads_at_their_operation_time(self):
+        receipt, records, now = setting_fixture()
+        self.assertLessEqual(len(records), 256)
+        checkpoints = {x["ref"]: x for x in receipt["attempt"]["checkpoints"]}
+        self.assertEqual(at("00:03:00"), checkpoints["checkpoint-0"]["checked_at"])
+        self.assertEqual(at("00:08:00"), checkpoints["checkpoint-3"]["checked_at"])
+        self.assertEqual(at("00:08:00"), checkpoints["checkpoint-4"]["checked_at"])
+        phases = []
+        for operation in SETTING_OPS:
+            transition = records["transition-" + operation]["data"]["claim"]
+            checkpoint = checkpoints[transition["authority_ref"]]
+            phases.append(checkpoint["phase"])
+            self.assertEqual(transition["observed_at"], checkpoint["checked_at"])
+            for role in ("controller", "verifier"):
+                read = records[checkpoint[role + "_read_ref"]]["data"]["claim"]
+                self.assertEqual(transition["observed_at"], read["read_at"])
+        self.assertEqual(["effect_batch", "transition", "transition", "effect_batch"], phases)
+        index = evidence_index(records)
+        self.assertIsNone(check_setting_claims(receipt, index, now))
+        index.require_all_used()
+
+    def test_compacted_setting_enable_cannot_borrow_same_time_business_authority(self):
+        receipt, records, now = setting_fixture()
+        self.assertIsNone(check_setting_claims(receipt, evidence_index(records), now))
+        transition = records["transition-" + SETTING_OPS[1]]["data"]["claim"]
+        transition["authority_ref"] = "checkpoint-4"
+        records[transition["ownership_match_ref"]]["data"]["checkpoint_ref"] = "checkpoint-4"
+        with self.assertRaisesRegex(Refusal, "transition_authority$"):
+            check_setting_claims(receipt, evidence_index(records), now)
+
     def test_present_zero_and_one_baselines_restore_value_without_resetting_version(self):
         for prior in ("0", "1"):
             with self.subTest(prior=prior):

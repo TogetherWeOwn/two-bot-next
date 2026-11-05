@@ -20,8 +20,9 @@ def check_transition_claims(receipt, evidence, now):
 
     Read-only effects cannot hide a transition. Every write must consume a
     distinct external compare-and-match witness tied to its exact snapshots,
-    operation, execution/nonce/epochs and current named setup/effect checkpoint. These
-    are necessary consistency predicates, not independently acquired evidence.
+    operation, execution/nonce/epochs and current named setup/setting/effect
+    checkpoint. These are necessary consistency predicates, not independently
+    acquired evidence.
     """
     check_telemetry_claims(receipt, evidence, now)
     check_authority_graph_claims(receipt, evidence, now)

@@ -29,15 +29,22 @@ def _mutation_reads_current(checkpoint, installation, evidence, observed):
 
 
 def _db_checkpoint_phase(receipt, effect, claim):
-    """Resolve an exact setup write; other lifecycle phases remain separate.
+    """Resolve setup and in-observation setting writes, never admit recovery.
 
-    This partial classifier does not admit recovery or prove ledger completeness.
-    The mandatory lifecycle phase checker still rejects unsupported cleanup and
-    requires setting transitions, rather than generic effect-batch authority.
+    This partial classifier does not prove ledger completeness. The mandatory
+    lifecycle phase checker still rejects unsupported cleanup and unassigned
+    startup/drain/restoration effects.
     """
     setup = [entry for entry in receipt["lifecycle"]["setup"]
              if entry["operation_id"] == effect["operation_id"]]
     if not setup:
+        resources = [entry for entry in receipt["resources"]["entries"]
+                     if entry["ref"] == effect["resource_ref"]]
+        require(len(resources) == 1, "lifecycle_resource")
+        if (resources[0]["kind"] == "setting" and
+                utc(receipt["attempt"]["observation_started_at"]) <= utc(effect["observed_at"]) <
+                utc(receipt["attempt"]["observation_ended_at"])):
+            return "transition"
         return "effect_batch"
     require(len(setup) == 1 and not any(entry["operation_id"] == effect["operation_id"]
             for entry in receipt["lifecycle"]["cleanup"]), "lifecycle_operation")

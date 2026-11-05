@@ -12,7 +12,7 @@ from announcement_runtime_evidence import canonical_digest
 
 
 ROLES = ("author", "executor", "caller", "security", "qa", "controller", "verifier")
-CLOCKS = ("00:00:10", "00:02:00", "00:03:00", "00:05:30", "00:08:00", "00:24:00")
+CLOCKS = ("00:00:10", "00:02:00", "00:03:00", "00:08:00", "00:08:00", "00:24:00")
 PHASES = ("credentials", "setup", "rollout", "transition", "effect_batch", "final")
 
 
@@ -146,8 +146,6 @@ def authority_fixture():
         attempt["checkpoints"].append(checkpoint)
         # Thirty-second validity; this records a claim, never creates a fence.
         until = at(clock[:-2] + "30") if clock.endswith("00") else at("00:00:40")
-        if clock == "00:05:30":
-            until = at("00:06:00")
         add("fence-" + str(i), "mutation_fence", {"source_ref": "authority-source",
             "execution_ref": "execution-ref", "checkpoint_ref": checkpoint["ref"], "run": run(),
             "phase": phase, "authority_epoch": "7", "resource_epoch": "9",

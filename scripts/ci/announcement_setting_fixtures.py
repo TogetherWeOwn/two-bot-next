@@ -2,9 +2,11 @@
 
 Only the setting operations are distributed across the fabricated timeline.
 All other telemetry remains at 08:00, including cleanup-shaped writes; this is
-NOT a coherent full-lifecycle/business-case fixture. The baseline and rollout
-share a timestamp to fit the prior generic effect-batch graph; correct phase
-assignment, settings triggers/audit and real CAS token semantics remain absent.
+NOT a coherent full-lifecycle/business-case fixture. In-window setting writes
+use transition authority. Baseline/restoration retain the old generic batch
+claims without exact setup/cleanup membership; full lifecycle must still refuse.
+The baseline and rollout share a timestamp; triggers/audit and real CAS token
+semantics remain absent.
 """
 
 import copy
@@ -22,8 +24,8 @@ SETTING_OPS = ("budget-setting-db_insert-0", "budget-setting-db_cas-0",
                "budget-setting-db_cas-1", "budget-setting-db_delete_owned-0")
 
 
-def add_checkpoint(receipt, records, clock):
-    """Clone a complete fabricated effect checkpoint without acquiring authority."""
+def add_checkpoint(receipt, records, clock, phase="effect_batch"):
+    """Clone complete fabricated reads/fence for a phase, never acquire authority."""
     from announcement_runtime_schema import utc
 
     authority, attempt = receipt["authority"], receipt["attempt"]
@@ -57,8 +59,11 @@ def add_checkpoint(receipt, records, clock):
         data["claim"]["history_sha256"] = canonical_digest(records[data["history_ref"]]["data"])
         if data["claim"]["ref"].startswith("runtime-"):
             authority["reads"].append(copy.deepcopy(data["claim"]))
+    cloned = remap(checkpoint)
+    cloned["phase"] = phase
+    records[cloned["mutation_fence_ref"]]["data"]["phase"] = phase
     pairs = list(zip(attempt["checkpoints"], authority["installation_approval_refs"]))
-    pairs.append((remap(checkpoint), mapping[install_ref]))
+    pairs.append((cloned, mapping[install_ref]))
     pairs.sort(key=lambda pair: pair[0]["checked_at"])
     attempt["checkpoints"] = [pair[0] for pair in pairs]
     authority["installation_approval_refs"] = [pair[1] for pair in pairs]
@@ -74,15 +79,16 @@ def add_checkpoint(receipt, records, clock):
 def compact_claims(receipt, records):
     """Keep this synthetic graph within 256 records WITHOUT relaxing any bound.
 
-    The four initial checkpoints share a single instant (not real phase proof).
-    Identical history snapshots and installation reads at that same instant may
+    The three initial checkpoints share one instant (not real phase proof).
+    Transition and effect checkpoints share 08:00 but retain distinct fences.
+    Identical history snapshots and installation reads at the same instant may
     reference one record. Runtime reads and mutation fences stay distinct. All
     non-setting, non-RSVP writes at 08:00 share one fabricated transaction, never
     the isolated RSVP/audit transaction. No operation or evidence is dropped.
     """
     for checkpoint, install_ref in zip(receipt["attempt"]["checkpoints"],
                                        receipt["authority"]["installation_approval_refs"]):
-        if checkpoint["ref"] not in ("checkpoint-0", "checkpoint-1", "checkpoint-2", "checkpoint-3"):
+        if checkpoint["ref"] not in ("checkpoint-0", "checkpoint-1", "checkpoint-2"):
             continue
         checkpoint["checked_at"] = at("00:03:00")
         records[checkpoint["mutation_fence_ref"]]["data"].update(
@@ -177,9 +183,10 @@ def setting_fixture():
             if case["phase"] == window["phase"]:
                 case.update(started_at=at(start), ended_at=at(end))
     records[schedule["activation_fence"]["ref"]]["data"]["observed_at"] = at("00:03:00")
-    checkpoints = {clock: add_checkpoint(receipt, records, clock)
+    checkpoints = {clock: add_checkpoint(receipt, records, clock,
+                   phase="transition" if clock == "00:12:00" else "effect_batch")
                    for clock in ("00:03:00", "00:12:00", "00:18:00")}
-    checkpoints["00:08:00"] = "checkpoint-4"
+    checkpoints["00:08:00"] = "checkpoint-3"
     effects = {effect["operation_id"]: effect for effect in receipt["observations"]["actual_effects"]}
     for operation, clock, value in zip(SETTING_OPS,
             ("00:03:00", "00:08:00", "00:12:00", "00:18:00"), ("0", "1", "0", None)):

@@ -76,7 +76,7 @@ def transition_fixture(base=None):
     prior = {ref: entry["before_state_ref"] for ref, entry in entries.items()
              if entry["identity"]["kind"] == "database"}
     versions = {ref: 0 for ref in prior}
-    checkpoint = next(x for x in receipt["attempt"]["checkpoints"] if x["phase"] == "effect_batch")
+    checkpoints = {x["phase"]: x for x in receipt["attempt"]["checkpoints"]}
     authority = receipt["authority"]
     observer = receipt["observations"]["coverage"][0]["observer_ref"]
 
@@ -88,6 +88,7 @@ def transition_fixture(base=None):
             continue
         ref, method, operation = effect["resource_ref"], effect["method"], effect["operation_id"]
         resource = entries[ref]
+        checkpoint = checkpoints["transition" if resource["kind"] == "setting" else "effect_batch"]
         transition = records[effect["db_transition_refs"][0]]["data"]["claim"]
         after_ref = "state-" + operation
         witness_ref = "match-" + operation

@@ -73,7 +73,7 @@ def check_lifecycle_phase_claims(receipt, evidence, now):
         else:
             # No default phase for startup, drain or restoration operations.
             require(observation_start <= observed < observation_end, "unassigned_lifecycle_effect")
-            phase = "transition" if write and resource["kind"] == "setting" else "effect_batch"
+            phase = _db_checkpoint_phase(receipt, effect, claim) if write else "effect_batch"
         matching = [checkpoint for checkpoint in checkpoints.values()
                     if checkpoint["phase"] == phase and
                     (claim is None or checkpoint["ref"] == claim["authority_ref"])]
