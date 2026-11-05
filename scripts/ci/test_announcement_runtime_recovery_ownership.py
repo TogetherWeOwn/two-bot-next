@@ -404,12 +404,14 @@ class RecoveryOwnership(unittest.TestCase):
                          "recovery_ownership_match")
 
     def test_missing_or_multiple_coverage_observers_refuse(self):
-        for total in (0, 2):
+        # Empty coverage refuses in mandatory schema intake before ownership;
+        # nonempty duplicate coverage reaches the ownership cardinality check.
+        for total, code in ((0, "array_size"), (2, "recovery_ownership_observer")):
             def mutate(r, e):
                 original = r["observations"]["coverage"][0]
                 r["observations"]["coverage"] = [copy.deepcopy(original) for _ in range(total)]
             with self.subTest(total=total):
-                self.reject_both(mutate, "recovery_ownership_observer")
+                self.reject_both(mutate, code)
 
     # Prior-state chain.
     def test_cleanup_before_state_must_be_the_latest_prior_write(self):
