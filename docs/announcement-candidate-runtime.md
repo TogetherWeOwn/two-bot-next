@@ -260,6 +260,25 @@ not canonical staging qualification or production promotion.
   fabricated timeline; other effects still occupy one instant and the baseline
   shares rollout's timestamp. No successful lifecycle is claimed. No value
   projection is a trust root or runtime permission; admission stays unsupported.
+- `scripts/announcement_runtime_cases.py` composes scheduler/input and telemetry
+  comparisons for the exact four feed cases plus the finite declared interactions.
+  Expected/actual operation IDs must resolve, agree and be disjoint across cases;
+  each wire/DB attempt and applicable platform readback must fit its case window,
+  candidate served reference and exact resource set. The window end is exclusive.
+  Off/replay/final-off feed cases allow scoped reads only, not a business post or
+  delivery write. The on case needs source reads followed by claim → post →
+  completion in full-window sequence order. Off/negative interactions require
+  exactly one ACK and no business effect; on-RSVP requires ACK → membership/event
+  pre-reads → atomic RSVP/audit → post-reads → original-response edit. Required
+  business and announcement transport operations cannot disappear outside cases
+  even if global totals match. **These are case-membership/order comparisons,
+  not stored-data acceptance or request/response authentication.** Payload bodies,
+  ephemeral visibility, exact interaction/platform IDs, stored business values,
+  source parser selection and live suppression/delivery remain unproved. The
+  fabricated fixture deliberately retains setup/cleanup at one instant and
+  placeholder transition state/authority refs; it is not full-lifecycle proof.
+  Synthetic/setup/cleanup operations still need their own exact semantic checks.
+  No schema limit, live adapter, canonical gate or runtime refusal is changed.
 - `scripts/announcement_runtime_policy.py` checks offline lease/freshness,
   ordered same-scope reviewer claims, operation multisets and coverage claims.
   The lifecycle accounting model requires the complete snapshot-through-verified
@@ -336,9 +355,12 @@ This checkpoint is not the complete runtime-candidate lane. It still needs:
    Resolve exact interaction request contents and actual ACK/edit wire records;
    live interaction replay remains explicitly unsupported. Implement full stored
    off/on/replay/final-off semantics and negatives. The scoped telemetry checker
-   compares wire/platform/transaction correspondence and RSVP/audit grouping,
-   but does not authenticate observation, prove SQL atomicity or resolve the
-   full lifecycle semantics. The transition checker now resolves DB state chains,
+   compares wire/platform/transaction correspondence and RSVP/audit grouping.
+   The case checker adds exact operation membership, phase/resource/time/served
+   comparisons and positive feed/RSVP operation order. Neither authenticates
+   observation, exact interaction IDs, ephemeral wire bodies, real stored business
+   values or SQL atomicity, nor resolves the full lifecycle. The transition checker
+   now resolves DB state chains,
    exact ownership witness claims and each write's effect-batch authority reference.
    The setting checker compares a narrow value projection, mutation order and
    reader/poll state correspondence; neither establishes real CAS, full SQL row
