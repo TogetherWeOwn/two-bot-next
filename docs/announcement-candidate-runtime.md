@@ -449,6 +449,32 @@ not canonical staging qualification or production promotion.
   it. Credential usability, recovery and full
   lifecycle integration remain unfinished. Separate partial phase tests still
   assert the terminal recovery refusal; no successful composed lifecycle is claimed.
+- `scripts/announcement_runtime_recovery.py` adds a closed, restricted
+  `recovery_plan_content` comparison before the terminal lifecycle-phase check.
+  Its fixed `runtime-recovery-plan` content hash is mandatory in the resource
+  plan, so it propagates into the existing resource/authority scope rather than
+  becoming a free caller allowlist. The plan names the same run/control/C,
+  contract/policy/implementation, execution/nonce and authority/resource epochs,
+  exact served-before/Worker snapshot digests, a separate positive lease of at
+  most 60 minutes and an explicit resource-owning controller principal. That
+  subject cannot alias the declared author, executor, caller or reviewers.
+  Every cleanup DB operation must appear once, in order, with exact resource
+  identity/key/owner, prior-state reference, CAS/owned-delete method and one-row
+  expected/maximum counts. This narrow plan permits one cleanup mutation per
+  DB resource, not inserts, business sends, recovery reads or message deletion.
+  Cleanup, restored sample and separately observed final states must fit its
+  exclusive expiry. Prior absence requires owned deletion; prior presence
+  requires CAS without resetting the version. The existing lifecycle-ledger
+  comparison still checks the prior-value projection and actual ledger equality.
+  **This is a finite plan comparison, not separate recovery authority.** The
+  plan is not an execution grant and cannot substitute for either an ordinary
+  execution grant or `restoration_authority_ref`. The latter remains deliberately
+  unresolved: independent recovery decisions/history/reads, one-use recovery
+  nonce, mutation-boundary fences, actual ownership/CAS tokens, full-row state,
+  process/Worker restoration and final verification are unfinished. The mandatory
+  lifecycle-phase checker still refuses cleanup, and the CLI/runtime stay HOLD.
+  Existing partial resource fixtures carry only a placeholder recovery-plan
+  hash and do not claim a complete plan or successful lifecycle.
 - `scripts/announcement_runtime_drain.py` resolves four closed work-inventory,
   snapshot, fence and drain claim kinds alongside the lifecycle-ledger comparison.
   The declared finite surface inventory is content-bound to the scoped inventory
@@ -556,7 +582,7 @@ must not be called as a substitute for any canonical admission control.
 ## Offline claim-checking entry point
 
 `scripts/announcement_runtime_check.py` composes bounded archive intake,
-closed same-run typed sidecars, all eighteen existing public claim comparisons
+closed same-run typed sidecars, all nineteen existing public claim comparisons
 and final all-used sidecar accounting. It is **not an independently provisioned
 verifier, receipt producer or runtime admission path**. The local Git topology
 collector is not invoked; authenticated source/service inventories, complete

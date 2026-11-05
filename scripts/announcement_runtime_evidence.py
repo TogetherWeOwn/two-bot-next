@@ -140,6 +140,7 @@ RESOURCE_RECORDS = {
         "states": Array(STATE), "identity_map": DOCUMENT, "inventory_manifest": MANIFEST,
         "operation_budgets": Array(OPERATION_BUDGET, 1, LEDGER_LIMIT),
         "input_plan_sha256": SHA256, "serialization_plan_sha256": SHA256,
+        "recovery_plan_sha256": SHA256,
         "not_before": UTC, "expires_at": UTC},
     "feed_item": {"source_ref": REF, "feed_ref": REF, "item_ref": REF,
         "source_content_sha256": SHA256, "item_content_sha256": SHA256, "nonce_ref": REF},
@@ -402,11 +403,27 @@ DELIVERY_RECORDS = {
             "replay": {"kind": enum("replay"), **DELIVERY_EVENT, "row": DELIVERY_ROW},
         }), 1, 16)},
 }
+# This finite plan is NOT a recovery grant. In particular it cannot be resolved
+# as execution_authority or as lifecycle.restoration_authority_ref.
+RECOVERY_RECORDS = {
+    "recovery_plan_content": {
+        "purpose": enum("owned_recovery_only"), "run": RUN,
+        "contract": DOCUMENT, "policy": DOCUMENT, "implementation": MANIFEST,
+        "candidate": VERSION, "control": VERSION, "execution_ref": REF,
+        "execution_nonce_ref": REF, "authority_epoch": SERVICE_ID, "resource_epoch": SERVICE_ID,
+        "owner": PRINCIPAL, "served_before_sha256": SHA256, "worker_before_sha256": SHA256,
+        "not_before": UTC, "expires_at": UTC,
+        "operations": Array({"operation_id": REF, "resource_ref": REF,
+            "method": enum("db_cas", "db_delete_owned"), "identity_sha256": SHA256,
+            "key_sha256": SHA256, "owner_ref": REF, "restore_state_ref": REF,
+            "expected_count": Integer(1, 1), "maximum_count": Integer(1, 1)}, 1, LEDGER_LIMIT),
+    },
+}
 EVIDENCE_RECORDS = {**PROVENANCE_RECORDS, **AUTHORITY_RECORDS, **RESOURCE_RECORDS,
                     **INPUT_RECORDS, **SCHEDULER_RECORDS, **SOURCE_RECORDS,
                     **TELEMETRY_RECORDS, **SERIALIZATION_RECORDS, **TRANSITION_RECORDS,
                     **SETTING_RECORDS, **WORK_RECORDS, **INTERACTION_EXCHANGES,
-                    **FEED_EXCHANGE_RECORDS, **DELIVERY_RECORDS}
+                    **FEED_EXCHANGE_RECORDS, **DELIVERY_RECORDS, **RECOVERY_RECORDS}
 
 
 def canonical_digest(value):
