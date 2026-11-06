@@ -148,7 +148,7 @@ class RecoveryBoundary(unittest.TestCase):
                 with self.assertRaisesRegex(Refusal, "expiry$"):
                     check_authority_graph_claims(ordinary_prefix(receipt), evidence_index(records), now)
 
-    def test_exactly_sixty_second_final_reads_do_not_extend_their_lifetime(self):
+    def test_exactly_sixty_second_final_checkpoint_does_not_extend_its_lifetime(self):
         for prior in PRIORS:
             with self.subTest(prior=prior):
                 receipt, records, now = paired_fixture(prior)
@@ -158,13 +158,44 @@ class RecoveryBoundary(unittest.TestCase):
                     check_authority_graph_claims(ordinary_prefix(receipt), evidence_index(records),
                                                 now + timedelta(seconds=61))
 
+    def test_current_checkpoint_cannot_extend_older_final_runtime_or_installation_reads(self):
+        for prior in PRIORS:
+            for group in ("runtime", "installation"):
+                with self.subTest(prior=prior, group=group):
+                    receipt, records, now = paired_fixture(prior)
+                    authority = receipt["authority"]
+                    checkpoint = receipt["attempt"]["checkpoints"][-1]
+                    record = checkpoint if group == "runtime" else records[
+                        authority["installation_approval_refs"][-1]]["data"]
+                    for role in ("controller", "verifier"):
+                        data = records[record[role + "_read_ref"]]["data"]
+                        history = records[data["history_ref"]]["data"]
+                        history["ended_at"] = at("00:21:00")
+                        data["claim"].update(read_at=at("00:21:00"),
+                            history_sha256=canonical_digest(history))
+                    authority["reads"] = [copy.deepcopy(records[read["ref"]]["data"]["claim"])
+                                           for read in authority["reads"]]
+                    # Checkpoint is current, while the chosen independent pair
+                    # has exactly 60-second reads. Separate recovery stays valid.
+                    self.assertEqual(checkpoint["checked_at"], at("00:22:00"))
+                    self.assertIsNone(check_authority_graph_claims(
+                        ordinary_prefix(receipt), evidence_index(records), now))
+                    self.assertIsNone(check_recovery_ownership_claims(
+                        receipt, evidence_index(records), now + timedelta(seconds=1)))
+                    with self.assertRaisesRegex(Refusal, "stale_read$"):
+                        check_authority_graph_claims(ordinary_prefix(receipt), evidence_index(records),
+                                                    now + timedelta(seconds=1))
+
     def test_missing_ordinary_installation_still_refuses_with_valid_recovery(self):
         for prior in PRIORS:
             with self.subTest(prior=prior):
                 receipt, records, now = paired_fixture(prior)
                 ref = next(ref for checkpoint, ref in zip(receipt["attempt"]["checkpoints"],
                     receipt["authority"]["installation_approval_refs"]) if checkpoint["phase"] == "final")
-                del records[ref]
+                # Recovery needs all ordinary decisions but not the non-anchor
+                # ordinary final read: retain the approval and its decisions.
+                del records[records[ref]["data"]["controller_read_ref"]]
+                self.assertIsNone(check_recovery_ownership_claims(receipt, evidence_index(records), now))
                 with self.assertRaisesRegex(Refusal, "unresolved_reference$"):
                     check_authority_graph_claims(ordinary_prefix(receipt), evidence_index(records), now)
 
