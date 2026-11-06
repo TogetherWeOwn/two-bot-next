@@ -268,8 +268,17 @@ not canonical staging qualification or production promotion.
   authentication, phase completion or verified restoration.** The private
   authority/state helper permits narrow unit comparisons, not receipt acceptance:
   the public entry still requires full telemetry/resource/provenance checks.
-  Its paired recovery fixture lacks that complete graph and must refuse at the
-  public entry; the older single-instant fixture is not lifecycle evidence either.
+  The earlier paired recovery fixture lacks that complete graph and must refuse
+  at the public entry. A separate synthetic public-transition fixture retains all
+  original resource/telemetry operations, adds an explicitly budgeted audit
+  deletion, and places five owned DB deletions under separate recovery authority.
+  It compares the real public entry plus lifecycle ledger/phase checks without
+  mocks or removing provenance/isolation/telemetry requirements. The exact
+  RSVP/audit insertion transaction stays separate from cleanup. Its regression
+  tests require the unchanged 256-record bound and exercise missing evidence and
+  cross-purpose substitutions. These fabricated comparisons are not complete
+  stored-case, drain, process-restoration or actual lifecycle evidence; neither
+  is the older single-instant fixture.
   Business value semantics, actual setting persistence, complete lifecycle-phase
   integration, actual restoration postconditions and queue/drain evidence remain
   mandatory. Runtime admission remains unsupported; no SQL or live adapter exists.
