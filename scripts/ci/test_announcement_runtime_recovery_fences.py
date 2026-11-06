@@ -201,21 +201,24 @@ class RecoveryFences(unittest.TestCase):
                 self.assertFalse(receipt["promotable"])
                 with self.assertRaisesRegex(Refusal, "unsupported$"):
                     runtime_preflight()
-                # Existing runtime checkpoint placeholders may refuse before the
-                # unsupported_recovery_authority line; either way it must refuse.
+                # Ordinary checkpoint placeholders still cannot satisfy the full
+                # phase comparison, even when this partial recovery layer agrees.
                 with self.assertRaises(Refusal):
                     check_lifecycle_phase_claims(receipt, evidence_index(records), now)
 
-    def test_fences_still_cannot_replace_unsupported_recovery_refusal(self):
+    def test_fences_still_cannot_replace_missing_installation_and_ownership(self):
         receipt, records, now = fence_fixture()
         self.assertIsNone(check_recovery_fence_claims(receipt, evidence_index(records), now))
-        # Isolate the existing mandatory cleanup refusal, not a complete packet.
+        # Isolate the incomplete recovery graph, not a complete packet.
+        # Compact the projected sequence so a gap does not hide the missing layer.
         receipt["attempt"]["checkpoints"] = authority_fixture()[0]["attempt"]["checkpoints"]
         receipt["lifecycle"]["setup"][0]["authority_ref"] = "checkpoint-1"
         records["transition-" + SETUP]["data"]["claim"]["authority_ref"] = "checkpoint-1"
         receipt["observations"]["actual_effects"] = [effect for effect in
             receipt["observations"]["actual_effects"] if effect["operation_id"] in (SETUP, CLEANUP)]
-        with self.assertRaisesRegex(Refusal, "unsupported_recovery_authority$"):
+        for sequence, effect in enumerate(receipt["observations"]["actual_effects"], 1):
+            effect["sequence"] = sequence
+        with self.assertRaisesRegex(Refusal, "unresolved_reference$"):
             check_lifecycle_phase_claims(receipt, evidence_index(records), now)
 
     def test_read_only_fixture_cannot_satisfy_fence_check(self):

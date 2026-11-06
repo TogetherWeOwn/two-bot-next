@@ -175,7 +175,7 @@ class Settings(unittest.TestCase):
             records["transition-" + SETTING_OPS[3]]["data"]["claim"])]
         with self.assertRaisesRegex(Refusal, "lifecycle_prior_state$"):
             check_setting_claims(receipt, evidence_index(records), now)
-        with self.assertRaisesRegex(Refusal, "unsupported_recovery_authority$"):
+        with self.assertRaisesRegex(Refusal, "lifecycle_prior_state$"):
             check_lifecycle_phase_claims(receipt, evidence_index(records), now)
         with self.assertRaisesRegex(Refusal, "unsupported"):
             runtime_preflight()

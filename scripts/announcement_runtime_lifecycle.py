@@ -15,13 +15,13 @@ from announcement_runtime_schema import require, utc, validate_receipt_shape
 
 
 def check_lifecycle_phase_claims(receipt, evidence, now):
-    """Compare setup/setting/business checkpoint phases, never authorize recovery.
+    """Compare ordinary phases and exact separately scoped DB cleanup claims.
 
-    Compose with the authority, state-chain and ledger checkers: this narrower
-    comparison neither authenticates reads nor replaces their scope/history and
-    ownership checks. Recovery checkpoint claims do not yet bind separate
-    installation revalidation or a recovery fence. Cleanup explicitly refuses,
-    no complete lifecycle can pass this layer until recovery is implemented.
+    Compose with the authority, telemetry, resource and state-chain checkers:
+    this narrower comparison authenticates nothing and grants no capability.
+    Cleanup requires the complete separate recovery graph, including its named
+    checkpoints, installation revalidation, fences and ownership witnesses; it
+    never borrows an ordinary phase or extends the ordinary execution lease.
     """
     validate_receipt_shape(receipt)
     require(type(evidence) is EvidenceIndex, "evidence_index")
@@ -47,6 +47,7 @@ def check_lifecycle_phase_claims(receipt, evidence, now):
     install_refs = receipt["authority"]["installation_approval_refs"]
     require(len(install_refs) == len(checkpoints), "installation_approval")
     installations = dict(zip(checkpoints, install_refs))
+    recovery_required = False
     for effect in effects:
         operation = effect["operation_id"]
         observed = utc(effect["observed_at"])
@@ -69,7 +70,8 @@ def check_lifecycle_phase_claims(receipt, evidence, now):
         elif operation in cleanup:
             require(write and claim == cleanup[operation], "lifecycle_transition")
             require(observation_end <= observed <= restored, "lifecycle_operation_time")
-            require(False, "unsupported_recovery_authority")
+            recovery_required = True
+            continue
         else:
             # No default phase for startup, drain or restoration operations.
             require(observation_start <= observed < observation_end, "unassigned_lifecycle_effect")
@@ -89,6 +91,11 @@ def check_lifecycle_phase_claims(receipt, evidence, now):
         require(any(_mutation_reads_current(checkpoint, evidence.resolve(
             installations[checkpoint["ref"]], "installation_approval"), evidence, observed)
             for checkpoint in current), "stale_mutation_read")
+    if recovery_required:
+        # Recovery composes the narrower ledger check below, not this phase
+        # checker. Import after initialization to keep that dependency acyclic.
+        from announcement_runtime_recovery import check_recovery_ownership_claims
+        check_recovery_ownership_claims(receipt, evidence, now)
 
 
 def check_lifecycle_ledger_claims(receipt, evidence, now):

@@ -32,8 +32,8 @@ def _db_checkpoint_phase(receipt, effect, claim):
     """Resolve setup and in-observation setting writes, never admit recovery.
 
     This partial classifier does not prove ledger completeness. The mandatory
-    lifecycle phase checker still rejects unsupported cleanup and unassigned
-    startup/drain/restoration effects.
+    lifecycle phase checker requires separate recovery for cleanup and rejects
+    unassigned startup/drain/restoration effects.
     """
     setup = [entry for entry in receipt["lifecycle"]["setup"]
              if entry["operation_id"] == effect["operation_id"]]

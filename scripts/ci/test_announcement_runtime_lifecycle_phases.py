@@ -3,7 +3,7 @@
 The authority and lifecycle fixtures are deliberately spliced, not reconciled
 into an authenticated or fully consistent packet. Only the new narrow phase
 comparison runs; upstream comparisons are not mocked or claimed to pass.
-Every baseline ends in the explicit unsupported recovery refusal. No scopes,
+Every baseline refuses the missing recovery graph. No scopes,
 SQL, ownership, stored values, effect totals or real phase completion are proved.
 """
 
@@ -65,14 +65,14 @@ def rephase(receipt, records, operation, phase):
 
 
 class LifecyclePhases(unittest.TestCase):
-    def reject(self, mutate=None, code="unsupported_recovery_authority"):
+    def reject(self, mutate=None, code="unresolved_reference"):
         receipt, records, now = fixture()
         if mutate:
             mutate(receipt, records)
         with self.assertRaisesRegex(Refusal, "announcement evidence refused: " + code + "$"):
             check_lifecycle_phase_claims(receipt, evidence_index(records), now)
 
-    def test_coherent_early_phases_still_refuse_unimplemented_recovery(self):
+    def test_coherent_early_phases_still_require_the_complete_recovery_graph(self):
         self.reject()
         with self.assertRaisesRegex(Refusal, "unsupported"):
             runtime_preflight()

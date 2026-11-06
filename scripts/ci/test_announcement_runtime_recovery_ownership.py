@@ -185,8 +185,8 @@ class RecoveryOwnership(unittest.TestCase):
                 self.assertFalse(receipt["promotable"])
                 with self.assertRaisesRegex(Refusal, "unsupported$"):
                     runtime_preflight()
-                # Existing runtime checkpoint placeholders may refuse before the
-                # unsupported_recovery_authority line; either way it must refuse.
+                # Ordinary checkpoint placeholders still cannot satisfy the full
+                # phase comparison, even when this partial recovery layer agrees.
                 with self.assertRaises(Refusal):
                     check_lifecycle_phase_claims(receipt, evidence_index(records), now)
 
@@ -226,16 +226,19 @@ class RecoveryOwnership(unittest.TestCase):
         self.assertGreater(int(final["version"]), int(interior["version"]))
         self.assertGreater(int(final["version"]), int(before["version"]))
 
-    def test_ownership_still_cannot_replace_unsupported_recovery_refusal(self):
+    def test_ownership_cannot_hide_an_omitted_intermediate_write(self):
         receipt, records, now = ownership_fixture()
         self.assertIsNone(check_recovery_ownership_claims(receipt, evidence_index(records), now))
-        # Isolate the existing mandatory cleanup refusal, not a complete packet.
+        # Deliberately omit the interior write while keeping its before-state
+        # claim. Compact the projection so ownership, not a sequence gap, refuses.
         receipt["attempt"]["checkpoints"] = authority_fixture()[0]["attempt"]["checkpoints"]
         receipt["lifecycle"]["setup"][0]["authority_ref"] = "checkpoint-1"
         records["transition-" + SETUP]["data"]["claim"]["authority_ref"] = "checkpoint-1"
         receipt["observations"]["actual_effects"] = [effect for effect in
             receipt["observations"]["actual_effects"] if effect["operation_id"] in (SETUP, CLEANUP)]
-        with self.assertRaisesRegex(Refusal, "unsupported_recovery_authority$"):
+        for sequence, effect in enumerate(receipt["observations"]["actual_effects"], 1):
+            effect["sequence"] = sequence
+        with self.assertRaisesRegex(Refusal, "recovery_ownership_chain$"):
             check_lifecycle_phase_claims(receipt, evidence_index(records), now)
 
     def test_no_new_record_kind_exists_and_witness_schema_is_literal(self):

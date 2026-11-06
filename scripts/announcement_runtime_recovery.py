@@ -4,8 +4,8 @@ The resource-plan digest binds a closed plan, not a caller allowlist. Separate
 scope/grant/decision/nonce claims are compared, never authenticated or consumed.
 Recovery reads/history/checkpoints/fences and installation revalidation are
 separate offline claims. Owned cleanup witnesses can be compared against that
-separate grant, but coordinated mutation-phase integration remains unimplemented.
-The mandatory lifecycle-phase checker still refuses cleanup.
+separate grant by the authority, state-chain and lifecycle-phase checkers.
+Complete resource/telemetry/restoration integration remains unfinished.
 """
 
 from datetime import timedelta
@@ -108,7 +108,7 @@ def check_recovery_grant_claims(receipt, evidence, now):
     This composes plan consistency with declared source/consumer/principal and
     ordered decision bindings. Runtime authority/provenance checks remain
     mandatory upstream. No current recovery reads, complete history, installation
-    revalidation or boundary fence is proved, so lifecycle cleanup still refuses.
+    revalidation or boundary fence is proved by this grant-only comparison.
     In particular successful comparison cannot make an expired grant usable.
     """
     check_recovery_plan_claims(receipt, evidence, now)
@@ -216,7 +216,7 @@ def check_recovery_read_claims(receipt, evidence, now):
 
     Fixed-reference inventory is inert same-attempt data, never a trust root or
     acquisition adapter. Separate installation comparisons and all three
-    mutation-phase consumers remain mandatory; cleanup still refuses there.
+    mutation-phase consumers remain mandatory for complete receipt comparison.
     """
     check_recovery_grant_claims(receipt, evidence, now)
     authority, lifecycle, attempt = receipt["authority"], receipt["lifecycle"], receipt["attempt"]
@@ -277,7 +277,7 @@ def check_recovery_fence_claims(receipt, evidence, now):
 
     Separate installation comparisons and authority/state-chain/lifecycle
     integration remain mandatory. This standalone comparison does not replace
-    the CLI's terminal cleanup refusal or runtime_preflight's unconditional HOLD.
+    the CLI's unconditional HOLD or runtime_preflight's unsupported refusal.
     """
     check_recovery_read_claims(receipt, evidence, now)
     lifecycle, attempt = receipt["lifecycle"], receipt["attempt"]
@@ -358,7 +358,7 @@ def check_recovery_installation_claims(receipt, evidence, now):
     Anchor unchanged installed-code scope/decisions/history to the first declared
     runtime installation approval. Full runtime authority checks remain mandatory
     upstream; this is not an authenticated acquisition or installation epoch fence.
-    Neither this comparison nor the separate recovery fences enable cleanup/CLI.
+    Neither this comparison nor the separate recovery fences enable live cleanup.
     """
     check_recovery_fence_claims(receipt, evidence, now)
     authority, control, attempt = receipt["authority"], receipt["control"], receipt["attempt"]
@@ -445,7 +445,7 @@ def check_recovery_ownership_claims(receipt, evidence, now):
     This is not an actual CAS or complete state-chain/authority check. Ordinary
     mutations still require the runtime authority and transition checkers. The
     generic ownership record's execution_ref names the recovery grant here, never
-    the ceased runtime grant. No phase consumer or CLI refusal is bypassed.
+    the ceased runtime grant. CLI/runtime HOLD is not bypassed.
     """
     check_recovery_installation_claims(receipt, evidence, now)
     attempt, lifecycle = receipt["attempt"], receipt["lifecycle"]

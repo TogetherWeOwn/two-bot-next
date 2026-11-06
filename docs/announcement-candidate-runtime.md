@@ -432,11 +432,12 @@ not canonical staging qualification or production promotion.
   borrow another fresh checkpoint's phase or read freshness. Exact fence phase,
   checkpoint/run/time correspondence, exclusive expiry and all four runtime/
   installation read ages are compared at the operation time. Unassigned startup,
-  drain or restoration operations have no default phase. Cleanup explicitly
-  refuses `unsupported_recovery_authority`: the separate recovery graph is not
-  yet integrated with this phase consumer and the complete state-chain checker;
-  an ordinary fresh effect-batch/final fence cannot substitute for recovery.
-  This layer does not authenticate authority or prove phase completion. Authority and state-chain comparisons now share the exact
+  drain or restoration operations have no default phase. Exact cleanup-ledger
+  writes compose the complete separate recovery ownership graph after ordinary
+  phase checks; an ordinary effect-batch/final fence cannot substitute. Missing
+  plan/grant/read/history/fence/installation/witness claims refuse. This layer
+  does not authenticate authority or prove full lifecycle completion. Authority
+  and state-chain comparisons share the exact
   setup-write classifier with this layer: one matching setup entry, no duplicate
   or cleanup overlap, identical complete transition claim, insert/CAS method and
   a snapshot-to-rollout timestamp are required. Such a write uses its named
@@ -454,11 +455,11 @@ not canonical staging qualification or production promotion.
   initial named setup checkpoint with an identical setup ledger claim; it cannot
   substitute a same-time business fence. Restoration still carries historical
   generic claims without exact cleanup membership; full lifecycle must refuse
-  it. Credential usability, recovery and full
-  lifecycle integration remain unfinished. Separate partial phase tests still
-  assert the terminal recovery refusal; no successful composed lifecycle is claimed.
+  it. Credential usability and full lifecycle integration remain unfinished.
+  Partial phase tests refuse the missing recovery graph; complete paired phase
+  claims can compare, but no successful full lifecycle or runtime is claimed.
 - `scripts/announcement_runtime_recovery.py` adds a closed, restricted
-  `recovery_plan_content` comparison before the terminal lifecycle-phase check.
+  `recovery_plan_content` comparison composed by the lifecycle-phase check.
   Its fixed `runtime-recovery-plan` content hash is mandatory in the resource
   plan, so it propagates into the existing resource/authority scope rather than
   becoming a free caller allowlist. The plan names the same run/control/C,
@@ -526,7 +527,7 @@ not canonical staging qualification or production promotion.
   authenticated authority**. Full runtime authority checks remain mandatory
   upstream; this standalone checker does not validate their entire inventory or
   enforce an installation epoch fence. The offline CLI explicitly registers
-  both comparisons before the mandatory lifecycle-phase refusal and final
+  both comparisons before the mandatory lifecycle-phase check and final
   all-used accounting. `check_recovery_ownership_claims` composes
   these plan/grant/read/fence/installation checks before comparing every cleanup
   DB mutation's independent full-state `ownership_match` witness. Here that
@@ -544,14 +545,14 @@ not canonical staging qualification or production promotion.
   ordinary-write witness reuse refuse. These are still unauthenticated claims,
   **not actual owned CAS or full-row restoration proof**. The offline archive
   entry point explicitly registers this among twenty-four comparisons, after
-  installation checks and before the terminal lifecycle-phase refusal. Archive
+  installation checks and before the mandatory lifecycle-phase check. Archive
   tests reject missing witnesses, runtime grant/nonce/epoch substitution, a
   rewitnessed stale prior state and observer drift; coherent partial fixtures
-  still fail final all-used accounting. This registration does not complete
-  coordinated generic authority/state-chain/lifecycle consumption. Actual ownership/CAS tokens,
-  full-row state, process/Worker restoration and final verification remain
-  unfinished. The mandatory lifecycle-phase checker still refuses cleanup,
-  and the CLI/runtime stay unconditional HOLD. Retrospective grant consistency
+  still fail final all-used accounting. Authority, state-chain and phase
+  comparisons now compose this graph for exact cleanup membership. Actual
+  ownership/CAS tokens, full-row state, complete resource/telemetry composition,
+  process/Worker restoration and final verification remain unfinished. The
+  CLI/runtime stay unconditional HOLD. Retrospective grant consistency
   never makes a grant usable after expiry or supplies missing boundary freshness.
   `scripts/ci/test_announcement_runtime_recovery_boundary.py` pairs the ordinary
   authority graph and separate recovery graph on one synthetic scope and clock.
@@ -563,9 +564,12 @@ not canonical staging qualification or production promotion.
   non-cleanup operation cannot borrow recovery authority. Missing recovery
   layers, differing transition claims, duplicate cleanup membership and read/wire
   effects disguised as cleanup refuse. No missing cleanup effect is excused:
-  full ledger/telemetry/phase accounting remains mandatory. The full paired
-  authority comparison can agree while the lifecycle checker must still refuse;
-  state-chain and phase-consumer integration remain unfinished. Current recovery
+  full ledger/telemetry/phase accounting remains mandatory. The paired authority,
+  private state and phase comparisons can agree without a full receipt passing;
+  the public transition entry still requires telemetry/resources/provenance.
+  `test_announcement_runtime_recovery_phases.py` covers both prior-presence cases,
+  missing recovery layers, named checkpoints, ordinary freshness/expiry,
+  ledger/method/time boundaries and cross-purpose witness substitution. Current recovery
   claims cannot replace an expired ordinary lease, missing ordinary installation
   evidence or stale final checks. The ordinary 60-second checkpoint-age control
   deliberately excludes cleanup to isolate it from recovery's stricter final

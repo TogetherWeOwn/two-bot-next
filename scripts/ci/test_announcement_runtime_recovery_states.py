@@ -4,7 +4,7 @@ Add the two ordinary witnesses missing from paired_fixture(). The private state
 comparison is exercised without mocking any checker. It still runs the complete
 ordinary and separate recovery authority graphs. The PUBLIC transition entry
 point retains its mandatory telemetry/resource checks and refuses this partial
-fixture; lifecycle and runtime remain unsupported. Full-window telemetry,
+fixture; the narrower phase comparison grants no runtime capability. Full-window telemetry,
 literal resource ownership and process restoration are NOT demonstrated here.
 """
 
@@ -60,7 +60,7 @@ class RecoveryStates(unittest.TestCase):
                 with self.assertRaisesRegex(Refusal, "announcement evidence refused: " + code + "$"):
                     _check_transition_states(receipt, evidence_index(records), now)
 
-    def test_paired_states_compare_but_full_entry_lifecycle_and_runtime_still_refuse(self):
+    def test_paired_states_and_phases_compare_but_full_entry_and_runtime_still_refuse(self):
         for prior in PRIORS:
             with self.subTest(prior=prior):
                 receipt, records, now = state_fixture(prior)
@@ -71,8 +71,7 @@ class RecoveryStates(unittest.TestCase):
                                     records["match-" + SETUP]["data"]["execution_ref"])
                 with self.assertRaises(Refusal):
                     check_transition_claims(receipt, evidence_index(records), now)
-                with self.assertRaisesRegex(Refusal, "unsupported_recovery_authority$"):
-                    check_lifecycle_phase_claims(receipt, evidence_index(records), now)
+                self.assertIsNone(check_lifecycle_phase_claims(receipt, evidence_index(records), now))
                 with self.assertRaisesRegex(Refusal, "unsupported$"):
                     runtime_preflight()
 

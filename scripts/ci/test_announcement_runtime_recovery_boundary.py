@@ -3,10 +3,10 @@
 Unlike the earlier recovery-only fixtures, ordinary runtime scope, decisions,
 reads, installation anchors and checkpoints agree with this receipt. Ordinary
 setup/read/setting writes and separately scoped cleanup pass the real authority
-checker together. State-chain/lifecycle consumers remain incomplete, not hidden
-behind an unrelated scope or timestamp error. No checker is mocked or omitted
+checker together. Lifecycle phases also compare the complete recovery graph;
+ordinary state witnesses remain absent here. No checker is mocked or omitted
 from the production entry point. Telemetry, literal resources and process
-restoration are still incomplete; runtime admission and lifecycle MUST refuse.
+restoration are still incomplete; complete receipt and runtime MUST refuse.
 
 Timeline: ordinary lease 00:00-00:40, attempt 00:00-00:22, setup 00:02,
 rollout 00:05, read 00:12, setting write 00:15, separately authorized cleanup
@@ -130,13 +130,12 @@ class RecoveryBoundary(unittest.TestCase):
                 with self.assertRaisesRegex(Refusal, "unsupported$"):
                     runtime_preflight()
 
-    def test_full_authority_graph_compares_separate_cleanup_without_admitting_lifecycle(self):
+    def test_authority_and_phase_graphs_compare_separate_cleanup_without_runtime_admission(self):
         for prior in PRIORS:
             with self.subTest(prior=prior):
                 receipt, records, now = paired_fixture(prior)
                 self.assertIsNone(check_authority_graph_claims(receipt, evidence_index(records), now))
-                with self.assertRaisesRegex(Refusal, "unsupported_recovery_authority$"):
-                    check_lifecycle_phase_claims(receipt, evidence_index(records), now)
+                self.assertIsNone(check_lifecycle_phase_claims(receipt, evidence_index(records), now))
                 with self.assertRaisesRegex(Refusal, "unsupported$"):
                     runtime_preflight()
 

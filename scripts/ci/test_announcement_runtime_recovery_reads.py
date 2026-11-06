@@ -173,15 +173,16 @@ class RecoveryReads(unittest.TestCase):
                 self.assertFalse(receipt["promotable"])
                 with self.assertRaisesRegex(Refusal, "unsupported$"):
                     runtime_preflight()
-                # Existing runtime checkpoint placeholders may refuse before the
-                # unsupported_recovery_authority line; either way it must refuse.
+                # Ordinary checkpoint placeholders still cannot satisfy the full
+                # phase comparison, even when this partial recovery layer agrees.
                 with self.assertRaises(Refusal):
                     check_lifecycle_phase_claims(receipt, evidence_index(records), now)
 
     def test_current_read_claims_still_cannot_replace_recovery_fence(self):
         receipt, records, now = read_fixture()
         self.assertIsNone(check_recovery_read_claims(receipt, evidence_index(records), now))
-        # Isolate the existing mandatory cleanup refusal, not a complete packet.
+        # Isolate the incomplete recovery graph, not a complete packet.
+        # Compact the projected sequence so a gap does not hide the missing layer.
         # Keep the required setup ledger and its matching effect; bind them to
         # the existing fresh setup checkpoint rather than bypassing the schema.
         receipt["attempt"]["checkpoints"] = authority_fixture()[0]["attempt"]["checkpoints"]
@@ -192,7 +193,9 @@ class RecoveryReads(unittest.TestCase):
         self.assertEqual([claim["operation_id"] for claim in receipt["lifecycle"]["setup"]], [SETUP])
         self.assertEqual([effect["operation_id"] for effect in
                           receipt["observations"]["actual_effects"]], [SETUP, CLEANUP])
-        with self.assertRaisesRegex(Refusal, "unsupported_recovery_authority$"):
+        for sequence, effect in enumerate(receipt["observations"]["actual_effects"], 1):
+            effect["sequence"] = sequence
+        with self.assertRaisesRegex(Refusal, "unresolved_reference$"):
             check_lifecycle_phase_claims(receipt, evidence_index(records), now)
 
     def test_grant_only_fixture_cannot_satisfy_read_check(self):
