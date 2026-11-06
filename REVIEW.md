@@ -28,8 +28,9 @@ Severity is impact times confidence, after the disproof pass below:
 - **Non-severe:** a real defect with limited blast radius or a narrow trigger.
 - **Investigate/flag, not a bug:** the mechanism depends on an assumption you
   could not verify against this code or the pinned Twilight/Discord contract.
-- **Security exception:** never drop or downgrade a plausible security issue
-  for lack of full verification; reserve Critical for a traced, verified path.
+- **Security exception:** for candidates meeting the concrete-path requirement
+  below, never drop or downgrade a plausible security issue for lack of full
+  verification; reserve Critical for a traced, verified path.
   Do not describe a suspected vulnerability, exposed secret, or sensitive
   data publicly: post only a non-sensitive notice that a private report under
   `SECURITY.md` is required.
@@ -66,6 +67,36 @@ These labels only grade a finding that already qualifies under "What
 merits a finding", "Test rigor" and "Skip"; they never make an item
 reportable. Most of the Not Severe items are skipped outright, and any
 that is still reported is Non-severe.
+
+## Before you flag a security issue
+
+- Require a concrete exploit path at the exact reviewed commit: name the
+  attacker, the input they control, what they gain, and the file/lines where
+  protection is missing. Follow `SECURITY.md` for private reporting; never post
+  a runnable exploit or sensitive values.
+- First check the documented design (ADRs, README, module docs and PR body).
+  Behavior explicitly intended by that design is not itself a security finding;
+  raise design disagreement as a non-blocking question instead.
+- Trace protection earlier in the call path: middleware, size caps, signature
+  checks, server-only creation and allowlists can disprove the candidate.
+- Hypothetical hardening without an exploit path ("could log", "might leak",
+  defence in depth) is **Non-severe at most**, categorized as **analysis**, not
+  security; the existing Skip rules still apply.
+
+Examples grounded in this repository:
+
+- **Would qualify (hypothetical regression, not a present defect):** removing
+  the MAC rejection in `AuthenticatedRequest::verify`
+  (`crates/core/src/internal_actions.rs`) would let a caller who can reach the
+  internal receiver, but has no signing secret, supply an action body and gain
+  an enabled moderation effect if the remaining gates pass. Trace those gates
+  in `crates/bot/src/internal_action_http.rs` before reporting; the current
+  receiver verifies the MAC before nonce burn, authorization or effects.
+- **False alarm:** "unknown key IDs use a fallback signing key" is not an auth
+  bypass. `KeyRing::verify` in `crates/core/src/internal_actions.rs` deliberately
+  performs the comparison with a random decoy, then requires a known key as
+  well as a matching signature. The module docs describe this equal-work
+  protection; even a matching decoy signature cannot authenticate a caller.
 
 ## Disproof pass (before posting any finding)
 
