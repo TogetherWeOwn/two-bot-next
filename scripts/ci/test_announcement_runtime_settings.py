@@ -167,11 +167,14 @@ class Settings(unittest.TestCase):
 
     def test_baseline_setup_does_not_admit_unsupported_recovery(self):
         receipt, records, now = setting_fixture()
-        # Replace the inherited orphan placeholder with the exact restoration
-        # claim, so refusal must reach recovery authority rather than inventory.
+        self.assertIsNone(check_setting_claims(receipt, evidence_index(records), now))
+        # Exact cleanup membership now invokes the complete recovery graph through
+        # authority. This partial setting fixture does not restore other DB rows,
+        # so its lifecycle prior-state comparison must refuse before authority.
         receipt["lifecycle"]["cleanup"] = [copy.deepcopy(
             records["transition-" + SETTING_OPS[3]]["data"]["claim"])]
-        self.assertIsNone(check_setting_claims(receipt, evidence_index(records), now))
+        with self.assertRaisesRegex(Refusal, "lifecycle_prior_state$"):
+            check_setting_claims(receipt, evidence_index(records), now)
         with self.assertRaisesRegex(Refusal, "unsupported_recovery_authority$"):
             check_lifecycle_phase_claims(receipt, evidence_index(records), now)
         with self.assertRaisesRegex(Refusal, "unsupported"):
