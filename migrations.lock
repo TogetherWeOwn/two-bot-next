@@ -2,8 +2,8 @@
   "version": 1,
   "migrations": {
     "crates/cutover/migrations/0471_internal_audit_identity.sql": {
-      "sha256": "27539e38f247239f83cbe64801b376970157e8571998a1b4c7af25d831a93e06",
-      "justification": "Held unshipped expansion: document whole-file nullable-key and private-helper rollback compatibility without altering SQL, REVOKE or deployed history; actual serving-image proof remains a release gate."
+      "sha256": "02da7032b2b8c884ee051933fb4298c1cefd77a22e992358ba372d66c7ddf31b",
+      "justification": "Held unshipped expansion: guard current-schema table bindings and helper ownership, render the unchanged private invoker identity definition per schema and attach qualified triggers; public rendering still equals explicit bootstrap preparation, with nullable-key rollback compatibility and actual serving-image release proof retained."
     },
     "crates/store/migrations/0458_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
@@ -538,8 +538,8 @@
       "justification": "Expand step: copy the imported voice creation switch and guild-wide command role from voice_guild_settings into voice_access_controls, the columns the runtime gates enforce, tightening only (creation off wins, an enforced role wins) and syncing the legacy columns as a mirror for the previous binary until a contract migration drops them; data copy only, no DDL."
     },
     "crates/cutover/migrations/0472_internal_audit_order.sql": {
-      "sha256": "0aebc4d8746c3f37b2603650202fa83693877d50e31bce011a3474664f0ed53b",
-      "justification": "Held unshipped expansion: document whole-file old-image trigger DML compatibility with retained schema, grants and allocator; preserve all SQL and private ACLs, with actual serving-image proof still required before release."
+      "sha256": "49a91802a5030901be4e9c038dc58479eb2840ed42489e169fe0f069c0d57040",
+      "justification": "Held unshipped expansion: bind the draining lock, seed, allocator state and triggers to one guarded current schema; render unchanged private invoker helpers whose public definitions equal preparation, retain commit-held fencing and all revokes, and keep actual serving-image rollback qualification as a release gate."
     }
   }
 }

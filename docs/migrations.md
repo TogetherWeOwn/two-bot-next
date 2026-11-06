@@ -145,6 +145,21 @@ rollback-preflight result or a release approval. Every REVOKE remains in place;
 the checker and both strict role phases are unchanged. Renew the whole-file
 review for any later edit, and never rewrite these migrations after rollout.
 
+Both migrations resolve `current_schema()` once before DDL. They refuse unsafe
+names, missing or shadowed audit/intent tables, helper overloads or foreign
+owners; 0472 also refuses pre-existing allocator state. All helpers, triggers,
+state and seeding bind to that schema, never a fallback `public`. Installation
+pins catalog-first resolution after capturing and checking the caller's table
+bindings, then restores the caller's search path. Each helper has one fixed
+schema-token template: its `public` rendering is byte-identical to
+`sql/internal_audit_bootstrap_helpers.sql`. That public-only preparation artifact
+and both strict role phases are unchanged. Non-public same-database regression
+schemas run the real migration chain alongside populated public audit state.
+The lock, seed and activation remain in one migration transaction; rendering
+changes neither the allocator's fence nor the private SECURITY INVOKER contract.
+Dollar-quoted DDL keeps actual revokes visible to the rollback parser; unmarked
+files still refuse as `revoke`, without changing or waiving the gate.
+
 - **0471:** nullable, bounded event/rank keys preserve legacy explicit-column
   INSERTs and unknown history. Ordinary prior-image claim, finish and reconcile
   writes leave pinned identity unchanged. The log trigger permits identical

@@ -245,7 +245,7 @@ class MigrationFindingTests(unittest.TestCase):
                 self.assertEqual(preflight.incompatible_code(sql), "revoke")
                 without_revokes = sql
                 for function in functions:
-                    revoke = f"REVOKE ALL ON FUNCTION public.{function}() FROM PUBLIC;"
+                    revoke = f"REVOKE ALL ON FUNCTION %I.{function}() FROM PUBLIC"
                     self.assertEqual(sql.count(revoke), 1)
                     without_revokes = without_revokes.replace(revoke, "")
                 self.assertIsNone(preflight.incompatible_code(without_revokes))

@@ -288,6 +288,16 @@ their login status or silently removing memberships. It contains no passwords.
    plan after migrations and view updates, then `verify` reads 0 findings.
    `sql/web_v1.sql` is applied with `public` as the bot-table search
    path before the bootstrap phase; functions stay strict in both phases.
+   The self-contained audit migrations resolve and validate their current data
+   schema, refuse shadowed tables, overloads, foreign helper owners and existing
+   allocator state, and install helpers/state/triggers only there. Their single
+   schema-token templates render byte-identically to the public preparation
+   artifact for `public`, preserving prepared helper OIDs during replacement.
+   Non-public disposable regression schemas get independent catalog-first,
+   schema-qualified helpers and allocator state, not access to public's state.
+   This does not broaden the production role matrix: its three exact `public`
+   signatures, missing-function refusals, private ACLs and read-only verification
+   remain unchanged. See [audit migration boundaries](migrations.md#private-audit-helpers-migrations-0471-and-0472).
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
    tables are not transferred or granted to the runtime.
