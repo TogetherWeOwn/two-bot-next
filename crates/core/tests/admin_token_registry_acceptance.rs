@@ -257,6 +257,22 @@ fn voice_snapshot_requires_read() {
 }
 
 #[test]
+fn event_attendance_read_requires_read() {
+    // Slice row: the keyless event-window session read maps to the read
+    // scope like the other keyless reads. The v0 map above stays pinned at
+    // nineteen rows; new verbs gain tests of their own.
+    assert_eq!(
+        InternalFlags::required_admin_scope("event.attendance.read"),
+        Some(SCOPE_READ),
+        "event.attendance.read is a read verb"
+    );
+    assert!(InternalFlags::admin_scope_allows(
+        &[SCOPE_READ],
+        "event.attendance.read"
+    ));
+}
+
+#[test]
 fn moderate_verbs_require_moderate() {
     for verb in [
         "moderation.warn",

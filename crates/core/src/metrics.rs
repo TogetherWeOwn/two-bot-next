@@ -475,7 +475,8 @@ pub const INTERNAL_ACTION_FAMILIES: &[&str] = &[
 /// replays served without a second effect), otherwise the bounded refusal
 /// class matching `RejectionClass::as_str` (`auth_failure`, `unknown_key`,
 /// `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`,
-/// `action_disabled`, `malformed_body`, `conflict`, `upstream`, `internal`).
+/// `action_disabled`, `malformed_body`, `conflict`, `upstream`, `not_found`,
+/// `internal`). `internal` stays last: unknown outcomes collapse to it.
 /// Each request counts exactly once. No secret, token, key id or raw request
 /// bytes ever become an outcome label.
 pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
@@ -490,6 +491,7 @@ pub const INTERNAL_ACTION_OUTCOMES: &[&str] = &[
     "malformed_body",
     "conflict",
     "upstream",
+    "not_found",
     "internal",
 ];
 /// Reasons for `two_bot_community_facts_drain_failures_total{reason}`:
@@ -2916,10 +2918,13 @@ mod tests {
         );
         // Leave room for other counters to grow without relaxing any consumer's
         // 64 KiB cap. This fixture saturates EventSub, pool and guard samples,
-        // not every process metric simultaneously.
+        // not every process metric simultaneously. The 13th internal-action
+        // outcome (`not_found`, one series per family) deliberately spent
+        // about half the old 1 KiB headroom; the outcome vocabulary stays
+        // fixed, so the next outcome addition revisits this pin again.
         assert!(
-            full.len() < 65_536 - 1_024,
-            "{} bytes leaves less than 1 KiB of scrape headroom",
+            full.len() < 65_536 - 512,
+            "{} bytes leaves less than 512 B of scrape headroom",
             full.len()
         );
         let series = |text: &str| -> Vec<String> {

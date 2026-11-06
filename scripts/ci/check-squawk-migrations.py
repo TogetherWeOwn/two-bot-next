@@ -52,8 +52,10 @@ STRICT_RULES = frozenset(RULES) - {"dropping-object"}
 # cannot run inside sqlx's migration transaction at all. The 0456/0457
 # entries index a table created earlier in the same file: empty at first
 # apply, and the IF NOT EXISTS re-apply is a no-op for both statements.
-# Keep every other creating-index finding strict, including any other
-# statement in these files.
+# The 0471 entries share that shape: both indexes target
+# event_voice_sessions, created earlier in the same file and empty at
+# first apply. Keep every other creating-index finding strict, including
+# any other statement in these files.
 TRANSACTIONAL_INDEX_WAIVERS = {
     (
         "crates/cutover/migrations/0444_event_store_expiry_index.sql",
@@ -74,6 +76,16 @@ TRANSACTIONAL_INDEX_WAIVERS = {
         "crates/store/migrations/0457_admin_api_tokens.sql",
         "create index if not exists idx_admin_api_tokens_live "
         "on admin_api_tokens (revoked_at, expires_at)",
+    ),
+    (
+        "crates/cutover/migrations/0471_event_attendance.sql",
+        "create index if not exists event_voice_sessions_open_idx "
+        "on event_voice_sessions (guild_id, member_id) where left_at is null",
+    ),
+    (
+        "crates/cutover/migrations/0471_event_attendance.sql",
+        "create index if not exists event_voice_sessions_keys_idx "
+        "on event_voice_sessions using gin (event_keys)",
     ),
 }
 

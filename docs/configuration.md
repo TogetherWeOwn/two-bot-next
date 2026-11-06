@@ -212,7 +212,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 137.
+Catalog entries: 138.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -294,6 +294,7 @@ Catalog entries: 137.
 | `TWO_INACTIVITY_DAYS` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Inactivity horizon used for community nudges. |
 | `TWO_INTERNAL_ACTIONS` | env_only | Not specified in Next | environment only | Master gate for website-origin internal actions; never dashboard-writable. |
 | `TWO_INTERNAL_ALLOW_ADD_MEMBER` | env_only | Not specified in Next | environment only | Capability gate for internal member-add actions. |
+| `TWO_INTERNAL_ALLOW_ATTENDANCE_READ` | env_only | Not specified in Next | environment only | Capability gate for event attendance reads. |
 | `TWO_INTERNAL_ALLOW_AUTOMATIONS` | env_only | Not specified in Next | environment only | Capability gate for internal automation actions. |
 | `TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE` | env_only | Not specified in Next | environment only | Separate capability gate for overwriting automations. |
 | `TWO_INTERNAL_ALLOW_EVENT_CANCEL` | env_only | Not specified in Next | environment only | Capability gate for event cancellation. |

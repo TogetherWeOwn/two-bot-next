@@ -28,7 +28,7 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
   two_bot_dispatch_drops_total: { lane: ["messages", "interactions", "registry", "privileged", "busy", "reactions"] },
   two_bot_internal_actions_total: {
     family: ["announcement", "event", "settings", "moderation", "membership", "voice", "other"],
-    outcome: ["executed", "auth_failure", "unknown_key", "clock_skew", "nonce_replay", "rate_limit", "unknown_action", "action_disabled", "malformed_body", "conflict", "upstream", "internal"],
+    outcome: ["executed", "auth_failure", "unknown_key", "clock_skew", "nonce_replay", "rate_limit", "unknown_action", "action_disabled", "malformed_body", "conflict", "upstream", "not_found", "internal"],
   },
   // Gateway transport and job-run family. Always emitted on the same render
   // path as the gateway/job inputs above (metrics.rs, since #82/#123), so a

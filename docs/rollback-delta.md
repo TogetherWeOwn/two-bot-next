@@ -137,6 +137,8 @@ the owner-grant journal (`voice_owner_grants`) via `touched_at`,
 `created_at`, the append-only `voice_vote_kick_audit` via `occurred_at`, and
 the event voice pair (`event_voice_channels` via
 `created_at`/`updated_at`, `event_voice_presence` via
+`joined_at`/`left_at`), and the attendance pair
+(`event_attendance_windows` via `updated_at`, `event_voice_sessions` via
 `joined_at`/`left_at`)) need no
 disposition: their counts are the evidence. The journal is not append-only
 deletion history: completion deletes non-current recipients and marks the
