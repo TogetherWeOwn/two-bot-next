@@ -91,8 +91,11 @@ the receipt identically to the live path and exits 0.
 3. Read the **fresh** `WRANGLER_OUTPUT_FILE_PATH` NDJSON only after Wrangler exits
    successfully. Every Wrangler invocation appends its own `wrangler-session`
    record, and `wrangler-action` runs `wrangler --version` before deploying, so
-   the file holds several sessions. Require at least one session, all pinned to
-   4.152.0 with record version 1, exactly one `deploy` invocation and every other
+   the file holds several sessions. The action selects its exact CLI version
+   from the deployed checkout's lockfile after `npm ci`, so an older pinned drill
+   uses that commit's CLI and receipt guard, not the workflow head's newer pin.
+   Require at least one session, all pinned to that checkout's version (currently
+   4.156.0) with record version 1, exactly one `deploy` invocation and every other
    session exactly `--version` or `-v`, and exactly one staging deploy record
    with the expected Worker name, fresh timestamp and concrete Worker version.
    The `receipt` step runs this check **before** `deployment-takeover`, so
