@@ -25,6 +25,155 @@ const MEMBER_TABLES: [&str; 5] = [
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
 const TEST_URL: &str = "postgres://agent_test:@agent-testdb:5432/agent_test";
+const AUDIT_PREPARATION: &str = include_str!("../../../sql/internal_audit_bootstrap_helpers.sql");
+const AUDIT_HELPERS: [&str; 3] = [
+    "internal_audit_identity_immutable",
+    "internal_audit_allocate_order",
+    "internal_audit_order_guard",
+];
+
+const AUDIT_IDENTITY: &str =
+    include_str!("../../cutover/migrations/0471_internal_audit_identity.sql");
+const AUDIT_ORDER: &str = include_str!("../../cutover/migrations/0472_internal_audit_order.sql");
+
+fn audit_definition(name: &str) -> &str {
+    AUDIT_PREPARATION
+        .split("$definition$")
+        .skip(1)
+        .step_by(2)
+        .find(|definition| {
+            definition.starts_with(&format!("CREATE OR REPLACE FUNCTION public.{name}()"))
+        })
+        .expect("complete preparation definition")
+}
+
+#[test]
+fn audit_preparation_uses_complete_migration_definitions() {
+    let mut names = Vec::new();
+    for migration in [AUDIT_IDENTITY, AUDIT_ORDER] {
+        for template in migration.split("$definition$").skip(1).step_by(2) {
+            let name = template
+                .strip_prefix("CREATE OR REPLACE FUNCTION @audit_schema@.")
+                .unwrap()
+                .split_once("()")
+                .unwrap()
+                .0;
+            assert!(!template.contains("public"));
+            assert_eq!(
+                template.matches("@audit_schema@").count(),
+                if name == "internal_audit_allocate_order" {
+                    4
+                } else {
+                    2
+                }
+            );
+            assert_eq!(
+                template.replace("@audit_schema@", "public"),
+                audit_definition(name)
+            );
+            assert_eq!(
+                template.replace("@audit_schema@", "audit_isolated"),
+                audit_definition(name).replace("public", "audit_isolated")
+            );
+            names.push(name);
+        }
+        let guard = migration
+            .find("RAISE EXCEPTION 'internal audit schema binding mismatch'")
+            .unwrap();
+        let first_ddl = migration
+            .find(if migration == AUDIT_IDENTITY {
+                "ALTER TABLE"
+            } else {
+                "LOCK TABLE"
+            })
+            .unwrap();
+        assert!(guard < first_ddl);
+        assert!(migration.contains("pg_catalog.current_schema()"));
+        assert!(migration.contains("^[a-z_][a-z0-9_]{0,58}$"));
+        assert!(migration.contains("visible_log IS DISTINCT FROM"));
+        assert!(migration.contains("visible_intent IS DISTINCT FROM"));
+        for catalog in ["pg_proc", "pg_namespace", "pg_roles"] {
+            assert!(
+                migration.contains(&format!("FROM pg_catalog.{catalog}"))
+                    || migration.contains(&format!("JOIN pg_catalog.{catalog}"))
+            );
+            assert!(!migration.contains(&format!("FROM {catalog}")));
+            assert!(!migration.contains(&format!("JOIN {catalog}")));
+        }
+        for forbidden in [
+            "SECURITY DEFINER",
+            "GRANT ",
+            "ALTER DEFAULT PRIVILEGES",
+            "session_replication_role",
+            "DISABLE TRIGGER",
+        ] {
+            assert!(
+                !migration.contains(forbidden),
+                "forbidden migration statement: {forbidden}"
+            );
+        }
+    }
+    assert_eq!(names, AUDIT_HELPERS);
+    assert!(!AUDIT_ORDER.contains("public."));
+    assert!(!AUDIT_ORDER.contains("IF NOT EXISTS"));
+    let mut previous = 0;
+    for statement in [
+        "LOCK TABLE",
+        "CREATE TABLE",
+        "INSERT INTO",
+        "CREATE OR REPLACE FUNCTION",
+        "CREATE TRIGGER",
+    ] {
+        let position = AUDIT_ORDER.find(statement).unwrap();
+        assert!(position > previous, "activation order: {statement}");
+        previous = position;
+    }
+    for name in AUDIT_HELPERS {
+        assert_eq!(
+            AUDIT_PREPARATION
+                .matches(&format!("FUNCTION public.{name}()"))
+                .count(),
+            1
+        );
+    }
+}
+
+async fn assert_public_audit_definitions(pool: &PgPool) {
+    for name in AUDIT_HELPERS {
+        let correct: bool = sqlx::query_scalar(
+            "SELECT p.prorettype = 'pg_catalog.trigger'::regtype
+                AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
+                AND p.prokind = 'f' AND NOT p.prosecdef AND NOT p.proisstrict
+                AND NOT p.proleakproof AND NOT p.proretset
+                AND p.provolatile = 'v' AND p.proparallel = 'u'
+                AND p.proconfig = ARRAY['search_path=pg_catalog, public']
+                AND p.prosrc = $2
+                AND NOT EXISTS (SELECT FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) acl
+                                WHERE acl.grantee <> p.proowner)
+             FROM pg_proc p WHERE p.oid = to_regprocedure($1)",
+        )
+        .bind(format!("public.{name}()"))
+        .bind(audit_definition(name).split("$body$").nth(1).unwrap())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(correct, "public render differs from preparation: {name}");
+    }
+}
+
+async fn audit_helper_oids(pool: &PgPool) -> Vec<i64> {
+    let mut result = Vec::new();
+    for name in AUDIT_HELPERS {
+        result.push(
+            sqlx::query_scalar("SELECT to_regprocedure($1)::oid::bigint")
+                .bind(format!("public.{name}()"))
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+        );
+    }
+    result
+}
 const SCHEDULED_INSERT: &str = "INSERT INTO public.scheduled_messages
     (id, guild_id, channel_id, body, next_run_at, created_by, created_at, updated_by, updated_at)
     VALUES ('scheduled-role-probe', 'g', 'c', 'hello', '2026-01-01T00:00:00.000Z',
@@ -260,6 +409,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         // Never grant a shared cluster role: isolate names even in migrations.
         execute(pool, isolated(&sql, roles)).await?;
     }
+    assert_public_audit_definitions(pool).await;
     sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
         .execute(pool)
         .await?;
@@ -1502,6 +1652,63 @@ async fn scratch_membership_run(creation_self_grant: Option<&str>) {
     setup.unwrap();
 }
 
+async fn audit_preparation_guards(pool: &PgPool) {
+    for _ in 0..2 {
+        sqlx::raw_sql(AUDIT_PREPARATION)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    for (change, undo) in [
+        ("ALTER FUNCTION public.internal_audit_allocate_order() SECURITY DEFINER", "ALTER FUNCTION public.internal_audit_allocate_order() SECURITY INVOKER"),
+        ("ALTER FUNCTION public.internal_audit_allocate_order() SET search_path = public", "ALTER FUNCTION public.internal_audit_allocate_order() SET search_path = pg_catalog, public"),
+        ("GRANT EXECUTE ON FUNCTION public.internal_audit_allocate_order() TO PUBLIC", "REVOKE ALL ON FUNCTION public.internal_audit_allocate_order() FROM PUBLIC"),
+        ("CREATE FUNCTION public.internal_audit_allocate_order(integer) RETURNS integer LANGUAGE SQL AS 'SELECT 1'", "DROP FUNCTION public.internal_audit_allocate_order(integer)"),
+        ("INSERT INTO public._two_bot_migrations VALUES (472)", "DELETE FROM public._two_bot_migrations WHERE version = 472"),
+        ("INSERT INTO public._sqlx_migrations VALUES (471)", "DELETE FROM public._sqlx_migrations WHERE version = 471"),
+        ("CREATE TABLE public.preparation_probe (id integer); CREATE TRIGGER preparation_probe BEFORE UPDATE ON public.preparation_probe FOR EACH ROW EXECUTE FUNCTION public.internal_audit_identity_immutable()", "DROP TABLE public.preparation_probe"),
+    ] {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(change)).execute(pool).await.unwrap();
+        sqlx::raw_sql(AUDIT_PREPARATION).execute(pool).await.expect_err("preparation must refuse drift/activation");
+        sqlx::raw_sql("ROLLBACK").execute(pool).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(undo)).execute(pool).await.unwrap();
+    }
+    // A bad body is never replaced by preparation. It cannot silently repair.
+    sqlx::raw_sql("CREATE OR REPLACE FUNCTION public.internal_audit_allocate_order() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, public AS 'BEGIN RETURN NEW; END;'")
+        .execute(pool).await.unwrap();
+    sqlx::raw_sql(AUDIT_PREPARATION)
+        .execute(pool)
+        .await
+        .expect_err("changed body must fail");
+    sqlx::raw_sql("ROLLBACK").execute(pool).await.unwrap();
+    sqlx::raw_sql("DROP FUNCTION public.internal_audit_allocate_order()")
+        .execute(pool)
+        .await
+        .unwrap();
+    // Unexpected creator-default grants roll back even the earlier helper.
+    sqlx::raw_sql("DROP FUNCTION public.internal_audit_identity_immutable(); ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO pg_monitor")
+        .execute(pool).await.unwrap();
+    sqlx::raw_sql(AUDIT_PREPARATION)
+        .execute(pool)
+        .await
+        .expect_err("unexpected creator grant must fail");
+    sqlx::raw_sql("ROLLBACK").execute(pool).await.unwrap();
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT to_regprocedure('public.internal_audit_identity_immutable()') IS NULL"
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap());
+    sqlx::raw_sql("ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM pg_monitor")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(AUDIT_PREPARATION)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn scratch_bootstrap_flow_from_staging_ledger() {
     let url = match std::env::var("TWO_ROLES_TEST_DATABASE_URL") {
@@ -1604,6 +1811,41 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         .execute(&provision_pool)
         .await
         .unwrap();
+    // Functions stay strict in Bootstrap too: preparation is explicit, not a
+    // plan/verify side effect. No ledger fixture or missing-object rule changes.
+    let error = execute(
+        &provision_pool,
+        isolated(
+            &database_roles::plan_for_phase(database_roles::Phase::Bootstrap),
+            &roles,
+        ),
+    )
+    .await
+    .expect_err("bootstrap without real helper preparation must fail");
+    assert!(error.to_string().contains("missing function"));
+    sqlx::raw_sql("ROLLBACK")
+        .execute(&provision_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pg_proc WHERE proname LIKE 'internal_audit_%'"
+        )
+        .fetch_one(&provision_pool)
+        .await
+        .unwrap(),
+        0
+    );
+    audit_preparation_guards(&provision_pool).await;
+    assert_public_audit_definitions(&provision_pool).await;
+    let prepared_oids = audit_helper_oids(&provision_pool).await;
+    let untouched: (bool, bool, bool, i64) = sqlx::query_as(
+        "SELECT to_regclass('public.internal_audit_order') IS NULL,
+         NOT EXISTS (SELECT FROM pg_trigger WHERE tgname LIKE 'internal_audit_%' OR tgname LIKE 'internal_%_identity_immutable'),
+         NOT EXISTS (SELECT FROM information_schema.columns WHERE column_name = 'audit_event_key'),
+         (SELECT count(*) FROM public._sqlx_migrations)",
+    ).fetch_one(&provision_pool).await.unwrap();
+    assert_eq!(untouched, (true, true, true, STAGING_LEDGER29.len() as i64));
     // The bootstrap phase transfers the existing objects as the non-superuser
     // identity, using the ephemeral SET membership for this transaction only.
     execute(
@@ -1649,6 +1891,8 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         }
     }
     require(!pending.is_empty(), "no pending migrations applied").unwrap();
+    assert_public_audit_definitions(&migrator_pool).await;
+    assert_eq!(audit_helper_oids(&migrator_pool).await, prepared_oids);
     let pending_rows = pending
         .iter()
         .map(|version| format!("({version})"))
@@ -1686,6 +1930,112 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         "bootstrap flow drifted",
     )
     .unwrap();
+    // Every new private helper remains strictly required in BOTH phases.
+    // Renaming keeps its installed trigger dependency and proves neither the
+    // preparation artifact nor a role plan can repair post-migration absence.
+    for name in AUDIT_HELPERS
+        .into_iter()
+        .chain(["guild_settings_assign_version"])
+    {
+        execute(
+            &scratch_admin,
+            format!("ALTER FUNCTION public.{name}() RENAME TO hidden_helper"),
+        )
+        .await
+        .unwrap();
+        assert!(!findings(&scratch_admin, &roles).await.unwrap().is_empty());
+        for phase in [
+            database_roles::Phase::Bootstrap,
+            database_roles::Phase::Full,
+        ] {
+            let error = execute(
+                &scratch_admin,
+                isolated(&database_roles::plan_for_phase(phase), &roles),
+            )
+            .await
+            .expect_err("both role phases require every function");
+            assert!(error.to_string().contains("missing function"));
+            sqlx::raw_sql("ROLLBACK")
+                .execute(&scratch_admin)
+                .await
+                .unwrap();
+        }
+        sqlx::raw_sql(AUDIT_PREPARATION)
+            .execute(&scratch_admin)
+            .await
+            .expect_err("post-migration preparation must refuse");
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&scratch_admin)
+            .await
+            .unwrap();
+        execute(
+            &scratch_admin,
+            format!("ALTER FUNCTION public.hidden_helper() RENAME TO {name}"),
+        )
+        .await
+        .unwrap();
+    }
+    for name in AUDIT_HELPERS {
+        for role in &roles[1..] {
+            denied(&scratch_admin, role, &format!("SELECT public.{name}()"))
+                .await
+                .unwrap();
+        }
+        for (change, undo) in [
+            (
+                format!("ALTER FUNCTION public.{name}() SECURITY DEFINER"),
+                format!("ALTER FUNCTION public.{name}() SECURITY INVOKER"),
+            ),
+            (
+                format!("ALTER FUNCTION public.{name}() OWNER TO {}", roles[1]),
+                format!("ALTER FUNCTION public.{name}() OWNER TO {}", roles[0]),
+            ),
+            (
+                format!("GRANT EXECUTE ON FUNCTION public.{name}() TO PUBLIC"),
+                format!("REVOKE ALL ON FUNCTION public.{name}() FROM PUBLIC"),
+            ),
+            (
+                format!(
+                    "GRANT EXECUTE ON FUNCTION public.{name}() TO {} WITH GRANT OPTION",
+                    roles[1]
+                ),
+                format!("REVOKE ALL ON FUNCTION public.{name}() FROM {}", roles[1]),
+            ),
+            (
+                format!(
+                    "REVOKE EXECUTE ON FUNCTION public.{name}() FROM {}",
+                    roles[0]
+                ),
+                format!("GRANT EXECUTE ON FUNCTION public.{name}() TO {}", roles[0]),
+            ),
+        ] {
+            execute(&scratch_admin, change).await.unwrap();
+            assert!(
+                !findings(&scratch_admin, &roles).await.unwrap().is_empty(),
+                "drift must be reported for {name}"
+            );
+            execute(&scratch_admin, undo).await.unwrap();
+        }
+    }
+    // Trigger execution is allowed by runtime DML without direct function
+    // EXECUTE. The transaction also exercises immutable no-change UPDATE and
+    // authorized audit erasure while keeping the state singleton installed.
+    as_role(
+        &scratch_admin,
+        &roles[1],
+        "
+        INSERT INTO public.internal_idempotency (caller_hash,key_hash,action,payload_hash,state)
+            VALUES (repeat('a',64),repeat('b',64),'guild.add_member',repeat('c',64),'in_flight');
+        INSERT INTO public.internal_action_log (intent_id,phase,caller_hash,action)
+            SELECT intent_id,'intent',caller_hash,action FROM public.internal_idempotency;
+        UPDATE public.internal_action_log SET audit_id = audit_id;
+        UPDATE public.internal_idempotency SET updated_at = clock_timestamp();
+        DELETE FROM public.internal_action_log;
+    ",
+    )
+    .await
+    .unwrap();
+    assert!(findings(&scratch_admin, &roles).await.unwrap().is_empty());
     provision_pool.close().await;
     migrator_pool.close().await;
     scratch_admin.close().await;
@@ -1697,6 +2047,113 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         execute(&admin, format!("DROP ROLE IF EXISTS {role}"))
             .await
             .unwrap();
+    }
+    admin.close().await;
+}
+
+#[tokio::test]
+async fn scratch_current_migrator_installs_private_audit_helpers() {
+    let url = match std::env::var("TWO_ROLES_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") => TEST_URL.to_owned(),
+        Err(_) => return, // Offline suite: explicitly requested and CI tests never skip.
+    };
+    let options = test_database::test_options(&url).expect("refusing non-test-container target");
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let (name, roles) = names();
+    execute(&admin, format!("CREATE DATABASE {name}"))
+        .await
+        .unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.database(&name))
+        .await
+        .unwrap();
+    for (version, migration) in migration_files() {
+        if version < 471 {
+            execute(&pool, isolated(&migration, &roles)).await.unwrap();
+        }
+    }
+    execute(
+        &pool,
+        "CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);
+        CREATE TABLE public._two_bot_migrations (version bigint PRIMARY KEY);"
+            .to_owned(),
+    )
+    .await
+    .unwrap();
+    execute(&pool, include_str!("../../../sql/web_v1.sql").to_owned())
+        .await
+        .unwrap();
+    execute(&pool, AUDIT_PREPARATION.to_owned()).await.unwrap();
+    execute(
+        &pool,
+        isolated(
+            &database_roles::plan_for_phase(database_roles::Phase::Bootstrap),
+            &roles,
+        ),
+    )
+    .await
+    .unwrap();
+    // Bootstrap is strict even on this pre-471 fixture. Remove only its
+    // unactivated preparation functions as their owner to exercise a later
+    // migrator creating the new definitions, not replacing prepared objects.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET LOCAL ROLE {}", roles[0])))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    for helper in AUDIT_HELPERS {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP FUNCTION public.{helper}()"
+        )))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    let absent: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT FROM pg_proc WHERE proname LIKE 'internal_audit_%')",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert!(absent);
+    sqlx::raw_sql("INSERT INTO public.internal_idempotency (caller_hash,key_hash,action,payload_hash,state)
+        VALUES (repeat('a',64),repeat('b',64),'guild.add_member',repeat('c',64),'in_flight');
+        INSERT INTO public.internal_action_log (audit_id,created_at,intent_id,phase,caller_hash,action)
+        SELECT 900,'2030-01-01'::timestamptz,intent_id,'intent',caller_hash,action FROM public.internal_idempotency;")
+        .execute(&mut *tx).await.unwrap();
+    for migration in [AUDIT_IDENTITY, AUDIT_ORDER] {
+        sqlx::raw_sql(migration).execute(&mut *tx).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+    assert_public_audit_definitions(&pool).await;
+    let seeded: (i64, bool) = sqlx::query_as("SELECT last_audit_id, last_created_at = '2030-01-01'::timestamptz FROM public.internal_audit_order")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(seeded, (900, true));
+    let linked: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public' AND p.proname = ANY($1)
+          AND p.proowner = (SELECT oid FROM pg_roles WHERE rolname = $2)
+          AND t.tgrelid IN ('public.internal_action_log'::regclass, 'public.internal_idempotency'::regclass, 'public.internal_audit_order'::regclass)")
+        .bind(AUDIT_HELPERS.to_vec()).bind(&roles[0]).fetch_one(&pool).await.unwrap();
+    assert_eq!(linked, 5);
+    for _ in 0..2 {
+        execute(&pool, isolated(&database_roles::plan(), &roles))
+            .await
+            .unwrap();
+    }
+    assert!(findings(&pool, &roles).await.unwrap().is_empty());
+    pool.close().await;
+    execute(&admin, format!("DROP DATABASE {name}"))
+        .await
+        .unwrap();
+    for role in roles {
+        execute(&admin, format!("DROP ROLE {role}")).await.unwrap();
     }
     admin.close().await;
 }

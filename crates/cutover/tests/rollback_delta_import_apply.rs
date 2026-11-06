@@ -31,7 +31,7 @@ use two_bot_cutover::legacy_copy::options::guarded_target;
 use two_bot_cutover::rollback_delta::export_delta;
 use two_bot_cutover::rollback_import::{
     apply_import, divergence_check_sql, import_table_order, is_exportable_table, parse_import,
-    primary_key_columns,
+    primary_key_columns, ImportApplyError,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -916,6 +916,111 @@ async fn apply_import_guild_settings_ignores_destination_owned_cas() -> TestResu
             serde_json::json!({"text": "hi"}),
             "target values kept"
         );
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    let cleaned = db.cleanup().await;
+    result.and(cleaned)
+}
+
+/// Minimal identity-bearing audit table for the pre-activation import case.
+const AUDIT_TABLE_SQL: &str = "CREATE TABLE internal_action_log (
+    audit_id BIGINT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL)";
+const AUDIT_TRIGGER_SQL: &str = include_str!("../migrations/0472_internal_audit_order.sql");
+
+fn audit_line() -> String {
+    line(
+        "internal_action_log",
+        &serde_json::json!({"audit_id": 7, "created_at": "2026-10-01T12:00:00+00:00"}),
+    )
+}
+
+/// With the ordering trigger installed, audit rows refuse before any write, in
+/// every trigger state, and leave even an unrelated row of the file unapplied.
+#[tokio::test]
+async fn apply_import_refuses_audit_rows_when_ordering_trigger_installed() -> TestResult {
+    if !db_opted_in() {
+        return Ok(());
+    }
+    let db = TestDb::new(
+        "auditguard",
+        &[
+            include_str!("../migrations/0210_tickets.sql"),
+            // Activation binds both audit tables; use their real base migration.
+            include_str!("../migrations/0350_internal_actions.sql"),
+            AUDIT_TRIGGER_SQL,
+        ],
+    )
+    .await?;
+    let result = async {
+        let contents = format!(
+            "{}\n{}\n",
+            line("tickets", &ticket_row("t-a1")),
+            audit_line()
+        );
+        let rows = parse_import(&contents).expect("valid audit fixture");
+        for state in ["ENABLE", "DISABLE"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE internal_action_log {state} TRIGGER internal_audit_allocate_order"
+            )))
+            .execute(&db.pool)
+            .await?;
+            let error = apply_import(&db.pool, &rows)
+                .await
+                .expect_err("must refuse");
+            assert!(
+                matches!(error, ImportApplyError::AuditOrderingInstalled { rows: 1 }),
+                "{state}: {error}"
+            );
+        }
+        // Catalog damage must not turn an activated installation into an
+        // unfenced identity import. The retained state still proves activation.
+        sqlx::raw_sql("DROP TRIGGER internal_audit_allocate_order ON internal_action_log; ALTER FUNCTION public.internal_audit_allocate_order() RENAME TO hidden_allocator")
+            .execute(&db.pool).await?;
+        assert!(matches!(apply_import(&db.pool, &rows).await,
+            Err(ImportApplyError::AuditOrderingInstalled { rows: 1 })));
+        let tickets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tickets")
+            .fetch_one(&db.pool)
+            .await?;
+        let audits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM internal_action_log")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!((tickets, audits), (0, 0), "nothing was written");
+        let allocator_unchanged: bool = sqlx::query_scalar(
+            "SELECT last_audit_id = 0 AND last_created_at = TIMESTAMPTZ '1970-01-01 00:00:00+00'
+             FROM internal_audit_order WHERE singleton",
+        )
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(allocator_unchanged, "refused imports never advance allocation");
+        // An audit-free file is not blocked by the installed trigger.
+        let free = parse_import(&line("tickets", &ticket_row("t-a2"))).expect("valid");
+        let outcome = apply_import(&db.pool, &free)
+            .await
+            .expect("audit-free import");
+        assert_eq!(outcome.inserted, 1);
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    let cleaned = db.cleanup().await;
+    result.and(cleaned)
+}
+
+/// Without the trigger the audit import keeps its identity-preserving behavior.
+#[tokio::test]
+async fn apply_import_keeps_audit_identity_without_ordering_trigger() -> TestResult {
+    if !db_opted_in() {
+        return Ok(());
+    }
+    let db = TestDb::new("auditfree", &[AUDIT_TABLE_SQL]).await?;
+    let result = async {
+        let rows = parse_import(&audit_line()).expect("valid audit fixture");
+        let outcome = apply_import(&db.pool, &rows).await.expect("audit import");
+        assert_eq!(outcome.inserted, 1);
+        let id: i64 = sqlx::query_scalar("SELECT audit_id FROM internal_action_log")
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(id, 7, "audit_id preserved");
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     }
     .await;

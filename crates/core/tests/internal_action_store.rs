@@ -13,6 +13,9 @@ use two_bot_core::secret::Secret;
 use two_bot_core::{body_hash, CLAIM_STALE_SECONDS, NONCE_TTL_SECONDS, SKEW_SECONDS};
 use two_bot_testsupport::TestDatabase;
 
+#[path = "support/internal_audit_order.rs"]
+mod audit_order;
+
 struct TestDb {
     fixture: TestDatabase,
     pool: PgPool,
@@ -464,6 +467,7 @@ fn subject() -> AuditSubject {
         actor_id: Some(DiscordId::new("234567890123456789").unwrap()),
         target_id: None,
         resolved_role_id: None,
+        ..AuditSubject::default()
     }
 }
 
@@ -1185,14 +1189,20 @@ async fn purge_stop_reason_columns_reject_unknown_words() {
     store.finish(&claim, &receipt).await.unwrap();
     for table in ["internal_idempotency", "internal_action_log"] {
         for invalid in ["bogus", "", "Refused", "rate-limited", "refused "] {
-            let error = sqlx::query(sqlx::AssertSqlSafe(format!(
-                "UPDATE {table} SET stop_reason = $1 WHERE intent_id = $2",
-            )))
-            .bind(invalid)
-            .bind(claim.intent_id())
-            .execute(&db.pool)
-            .await
-            .expect_err("closed vocabulary must reject invalid stored reasons");
+            let query = if table == "internal_action_log" {
+                // Audit UPDATEs are independently refused as immutable. Exercise
+                // the vocabulary constraint at INSERT, not that earlier guard.
+                "INSERT INTO internal_action_log (intent_id, phase, caller_hash, action, stop_reason) \
+                 SELECT intent_id, 'unknown', caller_hash, action, $1 FROM internal_idempotency WHERE intent_id = $2".to_owned()
+            } else {
+                format!("UPDATE {table} SET stop_reason = $1 WHERE intent_id = $2")
+            };
+            let error = sqlx::query(sqlx::AssertSqlSafe(query))
+                .bind(invalid)
+                .bind(claim.intent_id())
+                .execute(&db.pool)
+                .await
+                .expect_err("closed vocabulary must reject invalid stored reasons");
             assert_eq!(
                 error
                     .as_database_error()
@@ -1590,6 +1600,7 @@ fn event_subject(guild: &str) -> AuditSubject {
         actor_id: None,
         target_id: None,
         resolved_role_id: None,
+        ..AuditSubject::default()
     }
 }
 
@@ -1940,5 +1951,305 @@ async fn resolve_event_intent_refuses_invalid_evidence_and_mappings() {
             .await,
         Err(InternalStoreError::InvalidInput)
     );
+    db.cleanup().await;
+}
+
+/// Contract §6 (card B6): `botlog.read` is this closed projection, enforced
+/// where the audit is written. Terminal successes of the named (action,
+/// outcome) pairs project to their kinds; failures, in-flight rows, moves,
+/// DMs, every other verb, unmapped keys and idempotent no-ops publish
+/// nothing. The opt-out backstop omits the subject while the entry still
+/// counts. Resume is exact: the tail replays empty and echoes the cursor.
+#[tokio::test]
+async fn botlog_page_projects_only_the_closed_publishable_kinds() {
+    use two_bot_core::botlog::{assemble_botlog_page, validate_botlog_read, BotlogCursor};
+
+    const GUILD: &str = "123456789012345678";
+    const MEMBER: &str = "100000000000000001";
+    const JOINER: &str = "100000000000000002";
+    const CHANNEL: &str = "333333333333333333";
+    const RANK_ROLE: &str = "555555555555555555";
+    const OTHER_ROLE: &str = "666666666666666666";
+    const EVENT_ID: &str = "777777777777777777";
+    const MESSAGE_ID: &str = "888888888888888888";
+    const EVENT_KEY: &str = "raid-night-2026-11-07";
+
+    fn log_subject(target: Option<&str>, role: Option<&str>) -> AuditSubject {
+        AuditSubject {
+            guild_id: Some(DiscordId::new(GUILD).unwrap()),
+            actor_id: Some(DiscordId::new("234567890123456789").unwrap()),
+            target_id: target.map(|id| DiscordId::new(id).unwrap()),
+            resolved_role_id: role.map(|id| DiscordId::new(id).unwrap()),
+            ..AuditSubject::default()
+        }
+    }
+
+    fn receipt(
+        resource: Option<&str>,
+        affected: u32,
+        outcome: Option<EventOutcome>,
+    ) -> TerminalResponse {
+        TerminalResponse::Success {
+            resource_id: resource.map(|id| DiscordId::new(id).unwrap()),
+            affected,
+            outcome,
+            stop_reason: None,
+        }
+    }
+
+    async fn terminal(
+        store: &InternalActionStore,
+        key: &str,
+        action: &str,
+        subject: &AuditSubject,
+        response: &TerminalResponse,
+    ) {
+        let id = identity(key, action, b"botlog-fixture");
+        let mut subject = subject.clone();
+        if matches!(action, "event.upsert" | "event.cancel") {
+            subject.audit_event_key = Some(EVENT_KEY.to_owned());
+        }
+        let claim = claimed(store.claim(&id, &subject).await.unwrap());
+        store.finish(&claim, response).await.unwrap();
+    }
+
+    let db = TestDb::new().await;
+    let store = db.store();
+    store
+        .put_event_key(GUILD, EVENT_KEY, EVENT_ID)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE rank_ladder SET role_id = $1 WHERE rank_key = 'soldier'")
+        .bind(RANK_ROLE)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // The opt-out backstop: this member's entries publish without them.
+    sqlx::query("INSERT INTO privacy_opt_outs (guild_id, member_id) VALUES ($1, $2)")
+        .bind(GUILD)
+        .bind(MEMBER)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    terminal(
+        &store,
+        "botlog:upsert-created",
+        "event.upsert",
+        &log_subject(None, None),
+        &receipt(Some(EVENT_ID), 1, Some(EventOutcome::Created)),
+    )
+    .await;
+    terminal(
+        &store,
+        "botlog:upsert-updated",
+        "event.upsert",
+        &log_subject(None, None),
+        &receipt(Some(EVENT_ID), 1, Some(EventOutcome::Updated)),
+    )
+    .await;
+    terminal(
+        &store,
+        "botlog:cancel",
+        "event.cancel",
+        &log_subject(None, None),
+        &receipt(Some(EVENT_ID), 1, Some(EventOutcome::Cancelled)),
+    )
+    .await;
+    terminal(
+        &store,
+        "botlog:announce",
+        "announcement.post",
+        &log_subject(Some(CHANNEL), None),
+        &receipt(Some(MESSAGE_ID), 1, None),
+    )
+    .await;
+    // A grant outside the ladder is not a rank arrival.
+    terminal(
+        &store,
+        "botlog:plain-grant",
+        "role.assign",
+        &log_subject(Some(MEMBER), Some(OTHER_ROLE)),
+        &receipt(None, 1, None),
+    )
+    .await;
+    let rank_claim = claimed(
+        store
+            .claim(
+                &identity("botlog:rank-grant", "role.assign", b"botlog-fixture"),
+                &log_subject(Some(MEMBER), Some(RANK_ROLE)),
+            )
+            .await
+            .unwrap(),
+    );
+    store
+        .finish_role_assignment(
+            &rank_claim,
+            &receipt(None, 1, None),
+            &two_bot_core::internal_actions::RoleAssignmentReport {
+                outcome: two_bot_core::internal_actions::MemberOutcome::Assigned,
+                resolved_role_id: RANK_ROLE.to_owned(),
+                rank_key: Some(two_bot_core::RankKey::Soldier),
+            },
+        )
+        .await
+        .unwrap();
+    // Idempotent no-ops publish nothing: no arrival happened.
+    terminal(
+        &store,
+        "botlog:rank-noop",
+        "role.assign",
+        &log_subject(Some(MEMBER), Some(RANK_ROLE)),
+        &receipt(None, 0, None),
+    )
+    .await;
+    terminal(
+        &store,
+        "botlog:join",
+        "guild.add_member",
+        &log_subject(Some(JOINER), None),
+        &receipt(None, 1, None),
+    )
+    .await;
+    terminal(
+        &store,
+        "botlog:rejoin",
+        "guild.add_member",
+        &log_subject(Some(JOINER), None),
+        &receipt(None, 0, None),
+    )
+    .await;
+    // Moderation and failed sends stay in the internal audits only.
+    terminal(
+        &store,
+        "botlog:ban",
+        "moderation.ban",
+        &log_subject(Some(MEMBER), None),
+        &receipt(None, 1, None),
+    )
+    .await;
+    terminal(
+        &store,
+        "botlog:announce-fail",
+        "announcement.post",
+        &log_subject(Some(CHANNEL), None),
+        &TerminalResponse::Failure(TerminalFailure::NoEffect),
+    )
+    .await;
+    // Moves and DMs never publish even as terminal successes. These verbs
+    // cannot be claimed (the intent table names only the allowlist), so the
+    // scratch intents carry `event.upsert` while their terminal audit rows
+    // carry the foreign action — exactly the shape a leaked writer would
+    // leave, and the projection still names nothing.
+    for (key, action, target) in [
+        ("botlog:scratch-move", "voice.move_member", MEMBER),
+        ("botlog:scratch-remind", "reminder.send", JOINER),
+        ("botlog:scratch-offer", "place_offer.send", JOINER),
+    ] {
+        let id = identity(key, "event.upsert", b"scratch");
+        let claim = claimed(store.claim(&id, &subject()).await.unwrap());
+        sqlx::query(
+            "INSERT INTO internal_action_log \
+             (intent_id, phase, caller_hash, action, guild_id, target_id, \
+              response_code, http_status, evidence_code, affected) \
+             SELECT $1, 'terminal', caller_hash, $2, guild_id, $3, \
+              'success', 200, 'executor', 1 \
+             FROM internal_idempotency WHERE intent_id = $1",
+        )
+        .bind(claim.intent_id())
+        .bind(action)
+        .bind(target)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    let channels =
+        std::collections::HashMap::from([(CHANNEL.to_owned(), "announcements".to_owned())]);
+    let rows = store.list_botlog_page(GUILD, 0, 0, 200).await.unwrap();
+    let page = assemble_botlog_page(
+        rows,
+        &channels,
+        &validate_botlog_read(&serde_json::Map::new()).unwrap(),
+    );
+    assert_eq!(page.v, 1);
+    let kinds: Vec<&str> = page
+        .entries
+        .iter()
+        .map(|entry| entry.kind.as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "event.opened",
+            "event.updated",
+            "event.cancelled",
+            "announcement.posted",
+            "rank.assigned",
+            "member.joined",
+        ]
+    );
+    // Events name the key only: never the actor, never a subject.
+    for entry in &page.entries[..3] {
+        assert_eq!(entry.event_key.as_deref(), Some(EVENT_KEY));
+        assert_eq!(entry.subject_id, None);
+        assert_eq!(entry.detail, None);
+    }
+    // Announcements name the channel key: never the body, never a raw id.
+    assert_eq!(page.entries[3].detail.as_deref(), Some("announcements"));
+    assert_eq!(page.entries[3].subject_id, None);
+    // The opted-out member's arrival still counts, without them.
+    assert_eq!(page.entries[4].subject_id, None);
+    assert_eq!(page.entries[4].detail.as_deref(), Some("soldier"));
+    assert_eq!(page.entries[5].subject_id.as_deref(), Some(JOINER));
+    for entry in &page.entries {
+        assert!(
+            entry.at.len() == 20 && entry.at.ends_with('Z'),
+            "whole-second Zulu, got {}",
+            entry.at
+        );
+    }
+    // The cursor consumed everything: resume replays empty and echoes.
+    assert_eq!(page.next, page.entries[5].seq);
+    let resume_body: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_value(serde_json::json!({"after": page.next, "limit": 200})).unwrap();
+    let resume = validate_botlog_read(&resume_body).unwrap();
+    let tail = store
+        .list_botlog_page(
+            GUILD,
+            resume.after.after_micros,
+            resume.after.after_audit_id,
+            resume.limit,
+        )
+        .await
+        .unwrap();
+    assert!(tail.is_empty());
+    let tail = assemble_botlog_page(tail, &channels, &resume);
+    assert!(tail.entries.is_empty());
+    assert_eq!(tail.next, page.next);
+    // A limit of one consumes exactly the first row.
+    let one_body: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_value(serde_json::json!({"limit": 1})).unwrap();
+    let one = validate_botlog_read(&one_body).unwrap();
+    let rows = store
+        .list_botlog_page(
+            GUILD,
+            one.after.after_micros,
+            one.after.after_audit_id,
+            one.limit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let first = assemble_botlog_page(rows, &channels, &one);
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(first.entries[0].kind, "event.opened");
+    assert_eq!(first.next, first.entries[0].seq);
+    assert_ne!(first.next, BotlogCursor::zero().encode());
+    // A non-snowflake guild refuses before any read.
+    assert!(matches!(
+        store.list_botlog_page("not-a-guild", 0, 0, 200).await,
+        Err(InternalStoreError::InvalidInput)
+    ));
     db.cleanup().await;
 }

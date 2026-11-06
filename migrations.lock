@@ -1,6 +1,10 @@
 {
   "version": 1,
   "migrations": {
+    "crates/cutover/migrations/0471_internal_audit_identity.sql": {
+      "sha256": "ecaeb8dd6626347b1f0a8eb5b2185b70851b5897050a18dbad2b5fdc7518f1d6",
+      "justification": "Held unshipped expansion: qualify collision-guard catalogs against temporary shadows, validate current-schema table bindings and helper ownership, and render the unchanged private invoker identity definition with qualified triggers; exact public bootstrap preparation and nullable-key rollback compatibility remain, with actual serving-image release proof required."
+    },
     "crates/store/migrations/0458_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
       "justification": "Add inert starboard configuration, distinct starrers and unique post records to the store chain."
@@ -532,6 +536,10 @@
     "crates/cutover/migrations/0470_voice_creation_gates_authority.sql": {
       "sha256": "eb1feb5257b747b8d114923f32a40a032929dd4437c61329b1c62d1c1dd1ad8b",
       "justification": "Expand step: copy the imported voice creation switch and guild-wide command role from voice_guild_settings into voice_access_controls, the columns the runtime gates enforce, tightening only (creation off wins, an enforced role wins) and syncing the legacy columns as a mirror for the previous binary until a contract migration drops them; data copy only, no DDL."
+    },
+    "crates/cutover/migrations/0472_internal_audit_order.sql": {
+      "sha256": "228b1b928534d08608948ff963f32e2100ae1231467391edc31cf52fccff1b33",
+      "justification": "Held unshipped expansion: qualify collision-guard catalogs against temporary shadows while binding the draining lock, seed, state and triggers to one validated schema; unchanged private invoker templates render exactly as public preparation, with commit-held fencing, all revokes and actual serving-image rollback qualification retained."
     }
   }
 }

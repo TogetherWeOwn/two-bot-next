@@ -5,11 +5,13 @@
 **Direct-container support is not the shipped Worker capability set.** The
 container source integrates an opt-in private `POST /internal/actions`
 listener with the durable store, announcement executor, event-read,
-voice-snapshot, event-mutation, settings, automations, moderation, membership and
+voice-snapshot, botlog-read, event-mutation, settings, automations, moderation,
+membership and
 channel-moderation executors, nonce-commit authentication capability and strict
 receiver configuration. It supports `announcement.post`, the keyless `event.read`
 (behind `TWO_INTERNAL_ALLOW_EVENT_READ`), the keyless `voice.snapshot`
-(behind `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT`), `event.upsert` and `event.cancel`
+(behind `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT`), the keyless `botlog.read`
+(behind `TWO_INTERNAL_ALLOW_BOTLOG_READ`), `event.upsert` and `event.cancel`
 (cancel behind `TWO_INTERNAL_ALLOW_EVENT_CANCEL`), `settings.get`/`settings.set`
 (behind `TWO_INTERNAL_ALLOW_SETTINGS`), the automations pair
 `automations.export` (keyless redacted read) / `automations.import` (claimed
@@ -140,6 +142,7 @@ capabilities; this table is not an instruction to create or stage them.
 | `TWO_INTERNAL_ALLOW_MODERATION` | Member/channel moderation stay gated off, even with `TWO_MODERATION=1` |
 | `TWO_INTERNAL_ALLOW_SETTINGS` | Settings get/set stay gated off |
 | `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | `voice.snapshot` stays gated off |
+| `TWO_INTERNAL_ALLOW_BOTLOG_READ` | `botlog.read` stays gated off |
 
 Fixed receiver port: **8091** (health stays on `BOT_PORT` 8080, and the two may
 not be equal while the receiver is enabled). While enabled, 8091 joins the
@@ -418,10 +421,85 @@ Success (`200` only, `result` always an object, no `error` key):
 | event.upsert/cancel | `{outcome, event_id}` | `outcome` replayed from the stored receipt |
 | event.read | full observed event | behind its allowlist flag |
 | voice.snapshot | live voice-room listing | behind its allowlist flag; refuses `discord_unavailable` unless the gateway is connected, so a warm cache never serves stale occupancy mid-reconnect |
+| botlog.read | publishable log page `{v, entries, next}` | behind its allowlist flag; closed projection over terminal successes only (see below) |
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
 | moderation.\* | `{outcome[, affected]}` | |
+
+### botlog.read result shape
+
+`botlog.read` is keyless (no `Idempotency-Key`) and request-bounded only:
+`{"action":"botlog.read","after":"<cursor>","limit":200}` returns
+`{v:1,entries:[{seq,at,kind,subject_id?,event_key?,detail?}],next}` with
+`Cache-Control: no-store`. `after` is an opaque base64url cursor over
+`(created_at, audit_id)`, using the canonical encoding of two non-negative
+64-bit integers (at most 52 bytes). A missing `after` starts at the head;
+a malformed, noncanonical or oversized `after` is refused `malformed` before
+the feed query, with the size checked before decoding. `limit` defaults to 200
+when omitted; a supplied
+value must be an integer in 1–200 or is refused `malformed`, not clamped.
+Ordering is strictly ascending; the site stores `next` and resumes
+from it, deduping replays on `seq`. An empty tail echoes the request cursor.
+
+The page is a closed projection, filtered in SQL over terminal successes
+only (`phase = 'terminal'`, success `response_code`): created/updated event
+upserts name `event.opened`/`event.updated` (with `event_key` only),
+`event.cancel` names `event.cancelled` (with `event_key` only),
+`announcement.post` names `announcement.posted` (with the configured channel
+key only, never body text), a rank-rung `role.assign` with real effect names
+`rank.assigned` (subject plus rank key; idempotent `already_held` no-ops
+publish nothing), and an effective `guild.add_member` names `member.joined`
+(subject only; `already_member` replays publish nothing). Moves and DMs
+(`voice.move_member`, `reminder.send`, `place_offer.send`), every
+`moderation.*`/`settings.*`/`automations.*` verb, failures, refusals and
+in-flight rows never publish. Rows that no longer resolve to a configured
+channel key are dropped in Rust while still advancing `next`, so config drift
+cannot leak raw snowflakes or stall resumption.
+
+Event and rank names no longer come from the mutable `rank_ladder` or
+`internal_event_keys` tables. Migration `0471` adds nullable
+`audit_event_key` and `audit_rank_key` to `internal_idempotency` and
+`internal_action_log`, and the feed reads those pinned columns:
+
+- The validated event request key is pinned when the claim is taken and copied
+  into the terminal audit. Reconciliation must match a non-null pinned key
+  when repairing its mapping. A legacy NULL intent may still have its operational
+  mapping repaired, but its audit stays unnamed; there is no reverse-map fallback.
+- The rank key comes from the Discord hierarchy role snapshot the executor
+  already reads, matched against the whole ladder with `match_rank_roles`. The
+  typed `RoleAssignmentReport` is retained across the role PUT and persisted
+  atomically with the terminal row by `finish_role_assignment`. This adds no
+  REST call and changes neither the wire result nor replay.
+- A missing or ambiguous ladder, or a grant of a non-rank role, is authorized
+  as before but pins no rank key and publishes no rank line. `already_held`
+  performs no extra reads and publishes nothing. A crash or lost local proof,
+  and a legacy or reconciled row, keeps a NULL rank key and stays suppressed.
+- On `internal_action_log`, an UPDATE cannot change the identity or publication
+  facts once written. The authorized erasure DELETE remains.
+
+Migration `0472` establishes commit-visible ordering for every audit INSERT,
+including old images and direct SQL. Under a draining write-conflicting table
+lock it seeds one global `internal_audit_order` row above the committed maxima,
+leaves historical tuples unchanged and attaches the insert trigger atomically.
+The trigger locks that row through outer commit/rollback, then samples the
+clock, clamps time to the prior high water and increments the ID. A later
+writer cannot allocate ahead of an uncommitted earlier row. Timestamp ties,
+clock retreat and aborted writers do not lose entries. Missing/exhausted state
+refuses; the singleton cannot be deleted, truncated or moved backwards.
+
+The lock order is intent/map locks, then audit INSERT/fence, then commit. No
+REST, timer waits, pool acquisition or unrelated intent locks follow the fence.
+Ordinary image rollback leaves the expanded schema, triggers and state in
+place; old-shaped writes remain valid, with unproven event/rank names suppressed.
+Audit-bearing backup restore and rollback-delta import refuse before mutation:
+identity-preserving offline recovery is not yet qualified ([backup boundary](backup.md#audit-identity-recovery-boundary)).
+Keep the flag OFF until separately approved staging/production rollout. A
+prototype consumer that advanced on the unfenced implementation needs an
+explicit earlier-cursor replay; existing omissions are not repaired by renumbering.
+A membership subject present in `privacy_opt_outs` keeps its entry but omits
+`subject_id`; the relay ceiling stays scalar (no message text, tokens or
+request bytes leave the Worker).
 
 Refusals keep their code, status and retry policy with the fixed message
 `request refused`:

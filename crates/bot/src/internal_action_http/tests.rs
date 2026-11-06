@@ -165,12 +165,16 @@ impl MemberEffect for MockEffect {
         &'a self,
         _: &'a str,
         _: &'a str,
-        _: &'a RoleAssignRequest<'a>,
-    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>> {
+        request: &'a RoleAssignRequest<'a>,
+    ) -> BoxFuture<'a, Result<RoleAssignmentReport, ActionError>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self.outcome {
-                MockOutcome::Success | MockOutcome::Wait => Ok(MemberOutcome::Assigned),
+                MockOutcome::Success | MockOutcome::Wait => Ok(RoleAssignmentReport {
+                    outcome: MemberOutcome::Assigned,
+                    resolved_role_id: request.role_id().to_owned(),
+                    rank_key: None,
+                }),
                 MockOutcome::NoEffect => Err(ActionError::new(
                     ErrorCode::DiscordRejected,
                     "Discord refused the request",
@@ -2246,6 +2250,247 @@ async fn voice_snapshot_empty_guild_lists_rooms_with_zero_total() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["result"]["total_in_voice"], 0);
     assert_eq!(body["result"]["rooms"].as_array().expect("rooms").len(), 5);
+    db.close().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Keyless `botlog.read` (public-log projection over the internal audit)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn botlog_rank_identity_crosses_the_real_signed_member_receiver() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_botlog_read_flag(true);
+    let role = "222222222222222222";
+    let bot_role = "100000000000000010";
+    let api = MockEventApi::start_scripted(vec![
+        ScriptedEvent {
+            status: StatusCode::OK,
+            body: json!({"id":"999999999999999999","bot":true}),
+        },
+        ScriptedEvent {
+            status: StatusCode::OK,
+            body: json!({"roles":[]}),
+        },
+        ScriptedEvent {
+            status: StatusCode::OK,
+            body: json!({"roles":[bot_role]}),
+        },
+        ScriptedEvent {
+            status: StatusCode::OK,
+            body: json!([
+                {"id":staging_guild(),"name":"everyone","position":0,"managed":false},
+                {"id":role,"name":"Prospect","position":1,"managed":false},
+                {"id":"100000000000000006","name":"Member","position":2,"managed":false},
+                {"id":"100000000000000007","name":"Soldier","position":3,"managed":false},
+                {"id":"100000000000000008","name":"Veteran","position":4,"managed":false},
+                {"id":"100000000000000009","name":"Legend","position":5,"managed":false},
+                {"id":bot_role,"name":"bot","position":10,"managed":true}
+            ]),
+        },
+        ScriptedEvent {
+            status: StatusCode::NO_CONTENT,
+            body: Value::Null,
+        },
+    ])
+    .await;
+    let member = Arc::new(
+        ActionExecutor::with_proxy("fixture-token".into(), Some(api.origin.clone())).unwrap(),
+    );
+    let app = router(Arc::new(ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+        member,
+        Arc::new(MockEventRead::default()),
+        Arc::new(MockEventMutate),
+        Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
+    )));
+    let raw = r#"{"action":"role.assign","discord_id":"111111111111111111","role_key":"member"}"#;
+    let (status, _, first) = answer(app.clone(), signed(raw, "old", "rank-before-snapshot")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["result"], json!({"outcome":"assigned"}));
+    let (status, _, feed) = answer(app.clone(), signed_read(&botlog_payload(), "old")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(feed["result"]["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        feed["result"]["entries"][0]["detail"], "prospect",
+        "the caller's member key is not rank identity"
+    );
+    let (status, _, replay) = answer(app, signed(raw, "old", "rank-before-snapshot")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["result"], replay["result"]);
+    assert_eq!(
+        api.count(),
+        5,
+        "the real receiver adds only its existing bot identity read"
+    );
+    set_botlog_read_flag(false);
+    db.close().await.unwrap();
+}
+
+fn botlog_payload() -> String {
+    serde_json::json!({"action": "botlog.read"}).to_string()
+}
+
+fn set_botlog_read_flag(on: bool) {
+    if on {
+        std::env::set_var("TWO_INTERNAL_ALLOW_BOTLOG_READ", "1");
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_BOTLOG_READ");
+    }
+}
+
+/// Seed one terminal success the projection can name: an event create (named
+/// by its immutable request key), an announcement (named by its channel key)
+/// or a membership arrival.
+async fn seed_botlog_row(pool: &sqlx::PgPool, key: &str, action: &str, target: Option<&str>) {
+    let store = InternalActionStore::new(pool.clone());
+    let identity = RequestIdentity::new("website", key, action, b"botlog-fixture").unwrap();
+    let subject = AuditSubject {
+        guild_id: Some(DiscordId::new(staging_guild()).unwrap()),
+        actor_id: Some(DiscordId::new("234567890123456789").unwrap()),
+        target_id: target.map(|id| DiscordId::new(id).unwrap()),
+        resolved_role_id: None,
+        audit_event_key: (action == "event.upsert").then(|| "launch".to_owned()),
+    };
+    let claim = match store.claim(&identity, &subject).await.unwrap() {
+        InternalClaim::Claimed(claim) => claim,
+        other => panic!("expected committed claim, got {other:?}"),
+    };
+    let created = action == "event.upsert";
+    store
+        .finish(
+            &claim,
+            &TerminalResponse::Success {
+                resource_id: created.then(|| DiscordId::new("777777777777777777").unwrap()),
+                affected: 1,
+                outcome: created.then_some(EventOutcome::Created),
+                stop_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn botlog_read_flag_off_is_refused_before_any_effect() {
+    // The nonce burns durably before authorize, so even the flag-off refusal
+    // needs the migrated test database, like the `event.read` tests.
+    let Some(db) = database().await else { return };
+    let state = state(
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+    );
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_botlog_read_flag(false);
+    // Keyless like `event.read`: no Idempotency-Key header is sent.
+    let (status, _, body) = answer(router(state), signed_read(&botlog_payload(), "old")).await;
+    set_botlog_read_flag(false);
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(body["error"]["retryable"], false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn botlog_read_malformed_cursor_and_limit_refuse() {
+    let Some(db) = database().await else { return };
+    let state = state(
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+    );
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_botlog_read_flag(true);
+    for raw in [
+        serde_json::json!({"action": "botlog.read", "limit": 0}),
+        serde_json::json!({"action": "botlog.read", "limit": 201}),
+        serde_json::json!({"action": "botlog.read", "limit": "200"}),
+        serde_json::json!({"action": "botlog.read", "after": ""}),
+        serde_json::json!({"action": "botlog.read", "after": "cursor-0000"}),
+        serde_json::json!({"action": "botlog.read", "after": "A".repeat(53)}),
+    ] {
+        let (status, _, body) =
+            answer(router(state.clone()), signed_read(&raw.to_string(), "old")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{raw}");
+        assert_eq!(body["error"]["code"], "malformed", "{raw}");
+    }
+    set_botlog_read_flag(false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn botlog_read_projects_seeded_terminal_rows_keyless() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_botlog_read_flag(true);
+    InternalActionStore::new(db.pool().clone())
+        .put_event_key(staging_guild(), "launch", "777777777777777777")
+        .await
+        .unwrap();
+    seed_botlog_row(db.pool(), "botlog:created", "event.upsert", None).await;
+    seed_botlog_row(
+        db.pool(),
+        "botlog:posted",
+        "announcement.post",
+        Some("333333333333333333"),
+    )
+    .await;
+    seed_botlog_row(
+        db.pool(),
+        "botlog:joined",
+        "guild.add_member",
+        Some("100000000000000001"),
+    )
+    .await;
+    let app_state = state(
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+    );
+    // No Idempotency-Key header: the projection is keyless by construction.
+    let (status, headers, body) = answer(
+        router(app_state.clone()),
+        signed_read(&botlog_payload(), "old"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    assert!(body["request_id"].is_string());
+    assert!(!headers.contains_key("idempotent-replay"));
+    assert_eq!(
+        headers
+            .get(header::CACHE_CONTROL)
+            .map(HeaderValue::as_bytes),
+        Some(b"no-store".as_slice())
+    );
+    let result = &body["result"];
+    assert_eq!(result["v"], 1);
+    let entries = result["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["kind"], "event.opened");
+    assert_eq!(entries[0]["event_key"], "launch");
+    assert!(entries[0].get("subject_id").is_none());
+    assert_eq!(entries[1]["kind"], "announcement.posted");
+    assert_eq!(entries[1]["detail"], "ann");
+    assert_eq!(entries[2]["kind"], "member.joined");
+    assert_eq!(entries[2]["subject_id"], "100000000000000001");
+    // The cursor consumed everything: resume replays empty and echoes.
+    let next = result["next"].as_str().expect("opaque cursor");
+    assert_eq!(next, entries[2]["seq"].as_str().unwrap());
+    let (status, _, tail) = answer(
+        router(app_state),
+        signed_read(
+            &serde_json::json!({"action": "botlog.read", "after": next}).to_string(),
+            "old",
+        ),
+    )
+    .await;
+    set_botlog_read_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tail["result"]["entries"].as_array().unwrap().len(), 0);
+    assert_eq!(tail["result"]["next"], next);
     db.close().await.unwrap();
 }
 

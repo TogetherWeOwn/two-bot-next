@@ -201,6 +201,7 @@ mod tests {
                     );
                 } else if let Some(rest) = line.strip_prefix("CREATE OR REPLACE FUNCTION ") {
                     let name = rest.split_whitespace().next().unwrap();
+                    let name = name.strip_prefix("public.").unwrap_or(name);
                     assert!(
                         MATRIX.contains(&format!("'public', '{name}', 'function'")),
                         "missing matrix function {name} from {}",

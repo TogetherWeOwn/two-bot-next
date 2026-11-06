@@ -151,6 +151,7 @@ impl ActionExecutor {
                 .map(|request| DiscordId::new(request.role_id()))
                 .transpose()
                 .map_err(storage_error)?,
+            ..AuditSubject::default()
         };
         let claim = match store
             .claim(&identity, &subject)
@@ -171,6 +172,7 @@ impl ActionExecutor {
         let result = if let Some(request) = role_request {
             self.assign_internal_role_once(config.guild_id, config.bot_user_id, &request)
                 .await
+                .map(|report| (report.outcome, Some(report)))
         } else {
             // Already validated; never format the parsed body or this local.
             let token = require_field_str(body, "access_token")?;
@@ -180,25 +182,28 @@ impl ActionExecutor {
                 token,
             )
             .await
+            .map(|outcome| (outcome, None))
         };
         match result {
-            Ok(outcome) => {
+            Ok((outcome, role_report)) => {
                 let affected = u32::from(matches!(
                     outcome,
                     MemberOutcome::Added | MemberOutcome::Assigned
                 ));
-                store
-                    .finish(
-                        &claim,
-                        &TerminalResponse::Success {
-                            resource_id: None,
-                            affected,
-                            outcome: None,
-                            stop_reason: None,
-                        },
-                    )
-                    .await
-                    .map_err(storage_error)?;
+                let response = TerminalResponse::Success {
+                    resource_id: None,
+                    affected,
+                    outcome: None,
+                    stop_reason: None,
+                };
+                if let Some(report) = role_report {
+                    store
+                        .finish_role_assignment(&claim, &response, &report)
+                        .await
+                } else {
+                    store.finish(&claim, &response).await
+                }
+                .map_err(storage_error)?;
                 Ok(MemberExecution {
                     outcome,
                     replayed: false,

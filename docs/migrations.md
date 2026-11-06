@@ -138,6 +138,69 @@ DROP TABLE IF EXISTS guild_legacy_flags;
 The reason must be at least ten characters. The marker covers the whole
 file, so keep a reviewed contract migration in its own file.
 
+### Private audit helpers: migrations 0471 and 0472
+
+These whole-file markers classify the new private trigger helpers, not a live
+rollback-preflight result or a release approval. Every REVOKE remains in place;
+the checker and both strict role phases are unchanged. Renew the whole-file
+review for any later edit, and never rewrite these migrations after rollout.
+
+Both migrations resolve `current_schema()` once before DDL. They refuse unsafe
+names, missing or shadowed audit/intent tables, helper overloads or foreign
+owners; 0472 also refuses pre-existing allocator state. All helpers, triggers,
+state and seeding bind to that schema, never a fallback `public`. Installation
+pins catalog-first resolution after capturing and checking the caller's table
+bindings, then restores the caller's search path. Guard catalog relations are
+explicitly qualified: implicit temporary-schema lookup cannot bypass collision
+or ownership refusals. Each helper has one fixed
+schema-token template: its `public` rendering is byte-identical to
+`sql/internal_audit_bootstrap_helpers.sql`. That public-only preparation artifact
+and both strict role phases are unchanged. Non-public same-database regression
+schemas run the real migration chain alongside populated public audit state.
+The lock, seed and activation remain in one migration transaction; rendering
+changes neither the allocator's fence nor the private SECURITY INVOKER contract.
+Dollar-quoted DDL keeps actual revokes visible to the rollback parser; unmarked
+files still refuse as `revoke`, without changing or waiving the gate.
+
+- **0471:** nullable, bounded event/rank keys preserve legacy explicit-column
+  INSERTs and unknown history. Ordinary prior-image claim, finish and reconcile
+  writes leave pinned identity unchanged. The log trigger permits identical
+  UPDATEs and authorized erasure DELETE, but refuses relabeling existing facts.
+- **0472:** the activation lock drains old inserts before seeding and attaching
+  the allocator atomically, without rewriting historical tuples. Every later
+  INSERT, including old-image SQL, uses the transaction-held global fence.
+  Image rollback retains the expanded schema, triggers, allocator state and
+  candidate role grants; it does not import rows or reapply an old role plan.
+- The three zero-argument helpers return `trigger`, use SECURITY INVOKER and a
+  fixed search path, and introduce no public direct-call API. PostgreSQL checks
+  trigger-function EXECUTE at trigger creation, not at each firing. The migrator
+  retains installation rights; runtime needs the allocator's underlying
+  SELECT/UPDATE grants, not direct helper EXECUTE. The explicit pre-bootstrap
+  artifact must match the real definitions and pass collision/ACL/dependency
+  guards; startup and role verification never repair helpers implicitly.
+
+Disposable regression evidence lives in `crates/core/tests/database_roles.rs`
+(strict historical preparation, Bootstrap, dedicated migrator, Full twice,
+helper drift/absence, direct-call SQLSTATE 42501 and real runtime DML),
+`crates/core/tests/botlog_identity.rs` (immutable naming/erasure) and
+`crates/core/tests/support/internal_audit_order.rs` (activation, commit/abort,
+clock retreat, old-shaped inserts and cursor continuation). The offline
+`test_private_audit_migrations_use_reviewed_whole_file_markers` fixture checks
+the actual migration bytes, unmarked REVOKE refusals and rewritten-file refusal.
+These tests do not establish compatibility with the actual serving image.
+
+**Before release:** bind source-call absence to the exact serving receipt SHA;
+refuse unexpected existing helpers/dependencies. Exercise that actual image's
+startup and ordinary claim/finish/reconcile/erasure against the complete
+candidate schema/grants, including candidate-created pending/completed intents.
+Run the unchanged rollback preflight with live provenance, registry and ancestry
+checks. A common ancestor or a synthetic scan is not a substitute serving target.
+Keep schema management on candidate tooling: older role inventories may reject
+new allocator grants. Archive recovery is separately unqualified: the
+[audit-bearing restore refusal](backup.md#audit-identity-recovery-boundary)
+and failing full-backup drill are not waived by these markers or by successful
+audit-free fixtures. Publication stays default off.
+
 ## Existing migration changes
 
 Prefer an **additive new migration**, especially after a migration has shipped.

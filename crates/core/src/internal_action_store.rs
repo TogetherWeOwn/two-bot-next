@@ -6,12 +6,13 @@
 use sqlx::{PgPool, Row};
 use std::str::FromStr as _;
 
+use crate::botlog::{BotlogAuditRow, BOTLOG_PAGE_LIMIT_MAX};
 use crate::channel_moderation::PurgeStopReason;
 use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
 use crate::internal_actions::{
     body_hash, is_implemented, is_snowflake, valid_event_key, valid_idempotency_key,
-    valid_nonce_format, within_skew, CLAIM_STALE_SECONDS, MAX_BODY_BYTES, NONCE_TTL_SECONDS,
-    SKEW_SECONDS,
+    valid_nonce_format, within_skew, MemberOutcome, RoleAssignmentReport, CLAIM_STALE_SECONDS,
+    MAX_BODY_BYTES, NONCE_TTL_SECONDS, SKEW_SECONDS,
 };
 
 /// Clock domain for the durable nonce high-water mark. One guard per clock
@@ -104,6 +105,8 @@ pub struct AuditSubject {
     pub target_id: Option<DiscordId>,
     /// Pin the allowlist-resolved role before REST; configuration may later change.
     pub resolved_role_id: Option<DiscordId>,
+    /// Pin an event request's validated key before REST; maps are not history.
+    pub audit_event_key: Option<String>,
 }
 
 /// A definitive failure, not a timeout with an unknown Discord outcome.
@@ -492,11 +495,17 @@ impl InternalActionStore {
         identity: &RequestIdentity,
         subject: &AuditSubject,
     ) -> Result<InternalClaim, InternalStoreError> {
+        if subject.audit_event_key.as_deref().is_some_and(|key| {
+            !matches!(identity.action.as_str(), "event.upsert" | "event.cancel")
+                || !valid_event_key(key)
+        }) {
+            return Err(InternalStoreError::InvalidInput);
+        }
         let mut tx = self.pool.begin().await?;
         let inserted: Option<i64> = sqlx::query_scalar(
             "INSERT INTO internal_idempotency \
-             (caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id, target_id, resolved_role_id) \
-             VALUES ($1, $2, $3, $4, 'in_flight', $5, $6, $7, $8) \
+             (caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id, target_id, resolved_role_id, audit_event_key) \
+             VALUES ($1, $2, $3, $4, 'in_flight', $5, $6, $7, $8, $9) \
              ON CONFLICT (caller_hash, key_hash) DO NOTHING RETURNING intent_id",
         )
         .bind(&identity.caller_hash)
@@ -507,6 +516,7 @@ impl InternalActionStore {
         .bind(subject.actor_id.as_ref().map(DiscordId::as_str))
         .bind(subject.target_id.as_ref().map(DiscordId::as_str))
         .bind(subject.resolved_role_id.as_ref().map(DiscordId::as_str))
+        .bind(subject.audit_event_key.as_deref())
         .fetch_optional(&mut *tx)
         .await?;
         let result = if let Some(intent_id) = inserted {
@@ -609,8 +619,39 @@ impl InternalActionStore {
         claim: &ExecutionClaim,
         response: &TerminalResponse,
     ) -> Result<(), InternalStoreError> {
-        self.terminalize(&claim.identity, Some(claim.intent_id), response, None)
+        self.terminalize(&claim.identity, Some(claim.intent_id), response, None, None)
             .await
+    }
+
+    /// Atomically freeze the executor's rank proof with its terminal receipt.
+    /// Generic finish/reconciliation never infer identity from current role maps.
+    pub async fn finish_role_assignment(
+        &self,
+        claim: &ExecutionClaim,
+        response: &TerminalResponse,
+        report: &RoleAssignmentReport,
+    ) -> Result<(), InternalStoreError> {
+        let affected = match report.outcome {
+            MemberOutcome::Assigned => 1,
+            MemberOutcome::AlreadyHeld if report.rank_key.is_none() => 0,
+            _ => return Err(InternalStoreError::InvalidInput),
+        };
+        if claim.identity.action != "role.assign"
+            || !is_snowflake(&report.resolved_role_id)
+            || !matches!(response, TerminalResponse::Success {
+                resource_id: None, affected: n, outcome: None, stop_reason: None,
+            } if *n == affected)
+        {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        self.terminalize(
+            &claim.identity,
+            Some(claim.intent_id),
+            response,
+            None,
+            Some(report),
+        )
+        .await
     }
 
     /// A timeout/crash path retains the intent; it never releases execution rights.
@@ -646,7 +687,7 @@ impl InternalActionStore {
         if !evidence.supports(response) {
             return Err(InternalStoreError::InvalidInput);
         }
-        self.terminalize(identity, None, response, Some(evidence))
+        self.terminalize(identity, None, response, Some(evidence), None)
             .await
     }
 
@@ -656,6 +697,7 @@ impl InternalActionStore {
         owner_id: Option<i64>,
         response: &TerminalResponse,
         evidence: Option<ReconciliationEvidence>,
+        role_report: Option<&RoleAssignmentReport>,
     ) -> Result<(), InternalStoreError> {
         let mut tx = self.pool.begin().await?;
         let row = Self::lock_identity(&mut tx, identity).await?;
@@ -668,20 +710,22 @@ impl InternalActionStore {
         {
             return Err(InternalStoreError::TransitionRefused);
         }
-        sqlx::query(
-            "UPDATE internal_idempotency SET state = 'completed', response_code = $2, \
-             http_status = $3, resource_id = $4, affected = $5, outcome = $6, \
-             stop_reason = $7, updated_at = clock_timestamp() WHERE intent_id = $1",
-        )
-        .bind(intent_id)
-        .bind(response.code())
-        .bind(i32::from(response.status()))
-        .bind(response.resource_id())
-        .bind(response.affected())
-        .bind(response.outcome())
-        .bind(response.stop_reason())
-        .execute(&mut *tx)
-        .await?;
+        if let Some(report) = role_report {
+            if row.try_get::<Option<&str>, _>("resolved_role_id")?
+                != Some(report.resolved_role_id.as_str())
+            {
+                return Err(InternalStoreError::TransitionRefused);
+            }
+            sqlx::query("UPDATE internal_idempotency SET audit_rank_key = $2 WHERE intent_id = $1")
+                .bind(intent_id)
+                .bind(
+                    report
+                        .rank_key
+                        .map(crate::community_snapshots::RankKey::key),
+                )
+                .execute(&mut *tx)
+                .await?;
+        }
         Self::complete_locked(&mut tx, intent_id, response, evidence).await?;
         tx.commit().await?;
         Ok(())
@@ -852,7 +896,7 @@ impl InternalActionStore {
         }
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT state, action, guild_id FROM internal_idempotency \
+            "SELECT state, action, guild_id, audit_event_key FROM internal_idempotency \
              WHERE intent_id = $1 FOR UPDATE",
         )
         .bind(intent_id)
@@ -866,6 +910,12 @@ impl InternalActionStore {
             return Err(InternalStoreError::TransitionRefused);
         }
         if let Some((event_key, event_id)) = key_mapping {
+            if row
+                .try_get::<Option<&str>, _>("audit_event_key")?
+                .is_some_and(|pinned| pinned != event_key)
+            {
+                return Err(InternalStoreError::TransitionRefused);
+            }
             sqlx::query(
                 "INSERT INTO internal_event_keys (guild_id, event_key, event_id) \
                  VALUES ($1, $2, $3) \
@@ -917,7 +967,9 @@ impl InternalActionStore {
             && row.try_get::<Option<&str>, _>("target_id")?
                 == subject.target_id.as_ref().map(DiscordId::as_str)
             && row.try_get::<Option<&str>, _>("resolved_role_id")?
-                == subject.resolved_role_id.as_ref().map(DiscordId::as_str))
+                == subject.resolved_role_id.as_ref().map(DiscordId::as_str)
+            && row.try_get::<Option<&str>, _>("audit_event_key")?
+                == subject.audit_event_key.as_deref())
     }
 
     async fn audit(
@@ -929,9 +981,9 @@ impl InternalActionStore {
         sqlx::query(
             "INSERT INTO internal_action_log \
              (intent_id, phase, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-              response_code, http_status, evidence_code, resource_id, affected, outcome, stop_reason) \
+              response_code, http_status, evidence_code, resource_id, affected, outcome, stop_reason, audit_event_key, audit_rank_key) \
              SELECT intent_id, $2, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-                    response_code, http_status, $3, resource_id, affected, outcome, stop_reason \
+                    response_code, http_status, $3, resource_id, affected, outcome, stop_reason, audit_event_key, audit_rank_key \
              FROM internal_idempotency WHERE intent_id = $1 \
              ON CONFLICT (intent_id, phase) DO NOTHING",
         )
@@ -1018,6 +1070,81 @@ impl InternalActionStore {
         .bind(event_key)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    /// Publishable-kind window over `internal_action_log` for `botlog.read`
+    /// (contract §6, card B6): the public log is this query, not a table. The
+    /// WHERE clause is the closed allowlist — terminal successes only, with
+    /// the per-kind outcome words (`created`/`updated`/`cancelled`) and a
+    /// real effect (`affected >= 1`) for the two membership kinds, so an
+    /// idempotent no-op (`already_held`, `already_member`) never publishes.
+    /// Failures, refusals, in-flight intents, moves, DMs and every other verb
+    /// stay in the internal audits only because the filter never names them.
+    ///
+    /// Event/rank names come only from immutable audit scalars, never mutable
+    /// event maps or rank snapshots. NULL historical identity stays unnamed.
+    /// `privacy_opt_outs` marks subjects the projection must omit. The
+    /// page is strictly ascending over `(created_at, audit_id)` after the
+    /// cursor, so resumption never skips or repeats; `limit` clamps to the
+    /// contract ceiling. The row order is the consumption order: `next`
+    /// advances past every consumed row, including ones the projection
+    /// cannot name.
+    pub async fn list_botlog_page(
+        &self,
+        guild_id: &str,
+        after_micros: i64,
+        after_audit_id: i64,
+        limit: i64,
+    ) -> Result<Vec<BotlogAuditRow>, InternalStoreError> {
+        if !is_snowflake(guild_id) {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        Ok(sqlx::query(
+            "SELECT log.audit_id, \
+             floor(extract(epoch FROM log.created_at) * 1000000)::bigint AS created_micros, \
+             to_char(log.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' \
+               || to_char(log.created_at AT TIME ZONE 'UTC', 'HH24:MI:SS') || 'Z' AS at_utc, \
+             log.action, log.target_id, log.resolved_role_id, log.resource_id, \
+             log.outcome, log.affected, log.audit_event_key AS event_key, log.audit_rank_key AS rank_key, \
+             (opt.member_id IS NOT NULL) AS suppressed \
+             FROM internal_action_log AS log \
+             LEFT JOIN privacy_opt_outs AS opt \
+               ON opt.guild_id = log.guild_id AND opt.member_id = log.target_id \
+             WHERE log.guild_id = $1 AND log.phase = 'terminal' \
+               AND log.response_code = 'success' \
+               AND ((log.action = 'event.upsert' AND log.outcome IN ('created', 'updated')) \
+                 OR (log.action = 'event.cancel' AND log.outcome = 'cancelled') \
+                 OR log.action = 'announcement.post' \
+                 OR (log.action = 'role.assign' AND log.affected >= 1) \
+                 OR (log.action = 'guild.add_member' AND log.affected >= 1)) \
+               AND (floor(extract(epoch FROM log.created_at) * 1000000)::bigint, \
+                 log.audit_id) > ($2, $3) \
+             ORDER BY created_micros, log.audit_id LIMIT $4",
+        )
+        .bind(guild_id)
+        .bind(after_micros)
+        .bind(after_audit_id)
+        .bind(limit.clamp(1, BOTLOG_PAGE_LIMIT_MAX))
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(BotlogAuditRow {
+                audit_id: row.try_get("audit_id")?,
+                created_micros: row.try_get("created_micros")?,
+                at_utc: row.try_get("at_utc")?,
+                action: row.try_get("action")?,
+                target_id: row.try_get("target_id")?,
+                resolved_role_id: row.try_get("resolved_role_id")?,
+                resource_id: row.try_get("resource_id")?,
+                outcome: row.try_get("outcome")?,
+                affected: row.try_get("affected")?,
+                event_key: row.try_get("event_key")?,
+                rank_key: row.try_get("rank_key")?,
+                suppressed: row.try_get("suppressed")?,
+            })
+        })
+        .collect::<Result<Vec<BotlogAuditRow>, sqlx::Error>>()?)
     }
 }
 

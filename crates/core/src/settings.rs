@@ -131,6 +131,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
         "TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE",
         SettingClass::EnvOnly,
     ),
+    ("TWO_INTERNAL_ALLOW_BOTLOG_READ", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_EVENT_CANCEL", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_EVENT_READ", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_MODERATION", SettingClass::EnvOnly),
@@ -1296,6 +1297,7 @@ mod tests {
         "TWO_INTERNAL_ALLOW_ADD_MEMBER",
         "TWO_INTERNAL_ALLOW_AUTOMATIONS",
         "TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE",
+        "TWO_INTERNAL_ALLOW_BOTLOG_READ",
         "TWO_INTERNAL_ALLOW_EVENT_CANCEL",
         "TWO_INTERNAL_ALLOW_EVENT_READ",
         "TWO_INTERNAL_ALLOW_MODERATION",
@@ -1344,7 +1346,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 137, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 138, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,
