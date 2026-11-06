@@ -1,19 +1,19 @@
 # Custom commands: one bounded `{args}` substitution
 
-Status: **Accepted for M2, conditional on its kill rule** (owner decision
-2026-11-01). If containment cannot be proved with a bounded test plan, it
-becomes Declined and M2 does not slip. Building it reverses the `{args}` refusal
-in `custom_commands.rs` and in [custom
-responses](dashboard-custom-responses-spec.md); change both in the same slice.
-Build slice 1 (core render, `MAX_ARGS_UNITS` bound and this-slice contract
-cases; run paths substitute empty until the capture slice) is under review;
-run-path capture, corrections and audit follow in slice 2.
-Each build re-checks this spec's `file:line` seams on current `main` first. This
-acceptance is the owner intent review the original proposal waits for; its own
-technical gates, test matrix and kill rule still apply before any build PR
-merges. Original proposal: written 2026-10-24. No runtime, command, test,
-migration, permission or configuration change is included. Merging this document
-does not enable `{args}` or authorize build work. This file is the repository
+Status: **Built in this stack, merges pending** — containment was proved with the bounded §8 test plan,
+so the kill rule did not trigger. Both build slices are built here, stacked as
+slice 1 (core render, `MAX_ARGS_UNITS` bound and this-slice contract cases) under
+slice 2 (slash/prefix capture with the §5 corrections, the preview sample as preview
+input, the published `arguments` option, and the run-path contract cases).
+Neither build PR has merged; this status becomes Shipped when both do.
+Shipping reverses the `{args}` refusal in `custom_commands.rs` and in [custom
+responses](dashboard-custom-responses-spec.md), changed together in slice 1.
+Each build re-checked this spec's `file:line` seams on current `main` first. This
+acceptance was the owner intent review the original proposal waited for; its
+technical gates, test matrix and kill rule applied before either build PR
+merged. Original proposal: written 2026-10-24, when no runtime, command, test,
+migration, permission or configuration change was included — merging the
+proposal enabled no `{args}` and authorized no build work. This file is the repository
 source of truth; card documents bind its commit and SHA-256 rather than
 maintaining a second editable contract.
 
