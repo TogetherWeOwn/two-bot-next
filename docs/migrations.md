@@ -150,7 +150,9 @@ names, missing or shadowed audit/intent tables, helper overloads or foreign
 owners; 0472 also refuses pre-existing allocator state. All helpers, triggers,
 state and seeding bind to that schema, never a fallback `public`. Installation
 pins catalog-first resolution after capturing and checking the caller's table
-bindings, then restores the caller's search path. Each helper has one fixed
+bindings, then restores the caller's search path. Guard catalog relations are
+explicitly qualified: implicit temporary-schema lookup cannot bypass collision
+or ownership refusals. Each helper has one fixed
 schema-token template: its `public` rendering is byte-identical to
 `sql/internal_audit_bootstrap_helpers.sql`. That public-only preparation artifact
 and both strict role phases are unchanged. Non-public same-database regression

@@ -92,6 +92,14 @@ fn audit_preparation_uses_complete_migration_definitions() {
         assert!(migration.contains("^[a-z_][a-z0-9_]{0,58}$"));
         assert!(migration.contains("visible_log IS DISTINCT FROM"));
         assert!(migration.contains("visible_intent IS DISTINCT FROM"));
+        for catalog in ["pg_proc", "pg_namespace", "pg_roles"] {
+            assert!(
+                migration.contains(&format!("FROM pg_catalog.{catalog}"))
+                    || migration.contains(&format!("JOIN pg_catalog.{catalog}"))
+            );
+            assert!(!migration.contains(&format!("FROM {catalog}")));
+            assert!(!migration.contains(&format!("JOIN {catalog}")));
+        }
         for forbidden in [
             "SECURITY DEFINER",
             "GRANT ",

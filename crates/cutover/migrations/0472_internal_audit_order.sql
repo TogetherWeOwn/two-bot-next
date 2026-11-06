@@ -21,11 +21,11 @@ BEGIN
        OR visible_intent IS DISTINCT FROM to_regclass(format('%I.internal_idempotency', schema_name))::oid THEN
         RAISE EXCEPTION 'internal audit schema binding mismatch';
     END IF;
-    IF EXISTS (SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    IF EXISTS (SELECT FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
                WHERE n.nspname = schema_name
                  AND p.proname IN ('internal_audit_allocate_order', 'internal_audit_order_guard')
                  AND (p.pronargs <> 0 OR p.prokind <> 'f'
-                      OR p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user))) THEN
+                      OR p.proowner <> (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user))) THEN
         RAISE EXCEPTION 'internal audit helper signature or owner mismatch';
     END IF;
     IF to_regclass(format('%I.internal_audit_order', schema_name)) IS NOT NULL THEN

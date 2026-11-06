@@ -425,6 +425,33 @@ fn cases(role: &str) -> Vec<Case> {
         true,
         only_472,
     ));
+    for (catalog, columns) in [
+        (
+            "pg_proc",
+            "pronamespace oid, proname name, pronargs smallint, prokind text, proowner oid",
+        ),
+        ("pg_namespace", "oid oid, nspname name"),
+        ("pg_roles", "oid oid, rolname name"),
+    ] {
+        for (version, helper, through_471, migration) in [
+            (471, HELPERS[0], false, M471),
+            (472, HELPERS[1], true, M472),
+        ] {
+            let base = format!("tog10090_shadow_{catalog}_{version}");
+            let collision = if catalog == "pg_roles" {
+                foreign(&base, helper)
+            } else {
+                overload(&base, helper)
+            };
+            out.push(plain(
+                "temporary catalog shadow must not bypass collision guard",
+                &base,
+                format!("{collision} CREATE TEMP TABLE {catalog} ({columns});"),
+                through_471,
+                vec![(if through_471 { "0472" } else { "0471" }, migration)],
+            ));
+        }
+    }
     out
 }
 
@@ -509,6 +536,13 @@ pub async fn refuses_hostile_installs_without_catalog_change(fixture: &TestDatab
                 "{}: {label} must refuse in the database, got {error}",
                 case.name
             );
+            if case.name == "temporary catalog shadow must not bypass collision guard" {
+                assert!(error
+                    .as_database_error()
+                    .unwrap()
+                    .message()
+                    .contains("internal audit helper signature or owner mismatch"));
+            }
             for (schema, prior) in schemas.iter().zip(&before) {
                 assert_eq!(
                     &snapshot(admin, schema).await,

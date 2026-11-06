@@ -2,8 +2,8 @@
   "version": 1,
   "migrations": {
     "crates/cutover/migrations/0471_internal_audit_identity.sql": {
-      "sha256": "02da7032b2b8c884ee051933fb4298c1cefd77a22e992358ba372d66c7ddf31b",
-      "justification": "Held unshipped expansion: guard current-schema table bindings and helper ownership, render the unchanged private invoker identity definition per schema and attach qualified triggers; public rendering still equals explicit bootstrap preparation, with nullable-key rollback compatibility and actual serving-image release proof retained."
+      "sha256": "ecaeb8dd6626347b1f0a8eb5b2185b70851b5897050a18dbad2b5fdc7518f1d6",
+      "justification": "Held unshipped expansion: qualify collision-guard catalogs against temporary shadows, validate current-schema table bindings and helper ownership, and render the unchanged private invoker identity definition with qualified triggers; exact public bootstrap preparation and nullable-key rollback compatibility remain, with actual serving-image release proof required."
     },
     "crates/store/migrations/0458_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
@@ -538,8 +538,8 @@
       "justification": "Expand step: copy the imported voice creation switch and guild-wide command role from voice_guild_settings into voice_access_controls, the columns the runtime gates enforce, tightening only (creation off wins, an enforced role wins) and syncing the legacy columns as a mirror for the previous binary until a contract migration drops them; data copy only, no DDL."
     },
     "crates/cutover/migrations/0472_internal_audit_order.sql": {
-      "sha256": "49a91802a5030901be4e9c038dc58479eb2840ed42489e169fe0f069c0d57040",
-      "justification": "Held unshipped expansion: bind the draining lock, seed, allocator state and triggers to one guarded current schema; render unchanged private invoker helpers whose public definitions equal preparation, retain commit-held fencing and all revokes, and keep actual serving-image rollback qualification as a release gate."
+      "sha256": "228b1b928534d08608948ff963f32e2100ae1231467391edc31cf52fccff1b33",
+      "justification": "Held unshipped expansion: qualify collision-guard catalogs against temporary shadows while binding the draining lock, seed, state and triggers to one validated schema; unchanged private invoker templates render exactly as public preparation, with commit-held fencing, all revokes and actual serving-image rollback qualification retained."
     }
   }
 }
