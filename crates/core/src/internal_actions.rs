@@ -32,7 +32,7 @@
 //!   module validates literal addresses.
 //! - `server.ts` — the load-bearing check order, ported as [`authorize`]:
 //!   headers → signature → skew → replay → key bucket → body → allowlist →
-//!   action bucket. The idempotency claim and the Discord run stay with the
+//!   action buckets. The idempotency claim and the Discord run stay with the
 //!   store/bot slices.
 //!
 //! Security invariants carried over verbatim: buckets are keyed only after the
@@ -43,7 +43,7 @@
 //! field — [`AuthDecision`] carries the parsed body to the caller and the
 //! `Seen`-style log scalars stay with the route.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use hmac::{Hmac, KeyInit, Mac as _};
 use serde_json::{Map, Value};
@@ -81,6 +81,14 @@ pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_MESSAGE_CHARS: usize = 2000;
 /// Discord's own event-name ceiling.
 pub const MAX_EVENT_NAME_CHARS: usize = 100;
+/// Member-notify event-key ceiling: the website's stable event identity is at
+/// most 64 characters, and the bound matters because the key lands in the
+/// audit trail beside the member and the outcome.
+pub const MAX_NOTIFY_EVENT_KEY_CHARS: usize = 64;
+/// The only `reminder.send` kind in v1: an event starting soon. Any other
+/// value is a different intent the bot has no template for, so it refuses
+/// rather than guessing.
+pub const REMINDER_KIND_STARTING_SOON: &str = "starting_soon";
 /// Discord's own event-description ceiling.
 pub const MAX_EVENT_DESCRIPTION_CHARS: usize = 1000;
 pub const MAX_EVENT_LOCATION_CHARS: usize = 100;
@@ -457,6 +465,18 @@ pub const ADD_MEMBER_BUCKET: BucketSpec = BucketSpec {
     refill_per_second: 0.5,
 };
 
+/// Member-notify burst and sustained rate. [`TokenBuckets::take_notify`]
+/// additionally counts the burst against a strict rolling-day ceiling.
+pub const NOTIFY_MEMBER_BUCKET: BucketSpec = BucketSpec {
+    capacity: 3.0,
+    refill_per_second: 10.0 / 86_400.0,
+};
+
+const NOTIFY_MEMBER_DAY_MS: u64 = 86_400_000;
+const NOTIFY_MEMBER_DAY_LIMIT: usize = 10;
+const NOTIFY_MEMBER_TOKEN_MS: u64 = NOTIFY_MEMBER_DAY_MS / NOTIFY_MEMBER_DAY_LIMIT as u64;
+const NOTIFY_MEMBER_BURST_MS: u64 = 3 * NOTIFY_MEMBER_TOKEN_MS;
+
 /// Bucket verdict. `retry_after_secs` is only meaningful when denied — and is
 /// never 0, because a `Retry-After: 0` invites a hot loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,6 +491,14 @@ pub struct BucketDecision {
 #[derive(Debug, Clone, Default)]
 pub struct TokenBuckets {
     buckets: HashMap<String, BucketState>,
+    notify_buckets: HashMap<String, NotifyBucketState>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NotifyBucketState {
+    pub(crate) credit_ms: u64,
+    pub(crate) updated_ms: u64,
+    pub(crate) admissions: VecDeque<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -513,6 +541,70 @@ impl TokenBuckets {
         BucketDecision {
             allowed: false,
             retry_after_secs: wait.max(1),
+        }
+    }
+
+    /// Share one burst-3, at-most-10-per-rolling-day budget across both notify
+    /// verbs and all callers. `key` is `notify:<canonical discord_id>`. Denied
+    /// attempts consume neither a burst token nor a daily admission.
+    pub fn take_notify(&mut self, key: &str, now_ms: u64) -> BucketDecision {
+        let bucket = self
+            .notify_buckets
+            .entry(key.to_owned())
+            .or_insert_with(|| NotifyBucketState::new(now_ms));
+        bucket.take(now_ms)
+    }
+}
+
+impl NotifyBucketState {
+    pub(crate) fn new(now_ms: u64) -> Self {
+        Self {
+            credit_ms: NOTIFY_MEMBER_BURST_MS,
+            updated_ms: now_ms,
+            admissions: VecDeque::new(),
+        }
+    }
+
+    pub(crate) fn take(&mut self, now_ms: u64) -> BucketDecision {
+        let bucket = self;
+        // Integer credits preserve exact refill boundaries even when denied
+        // attempts split one interval into many small updates.
+        bucket.credit_ms = bucket
+            .credit_ms
+            .saturating_add(now_ms.saturating_sub(bucket.updated_ms))
+            .min(NOTIFY_MEMBER_BURST_MS);
+        bucket.updated_ms = bucket.updated_ms.max(now_ms);
+        while bucket.admissions.front().is_some_and(|&admitted_ms| {
+            bucket.updated_ms.saturating_sub(admitted_ms) >= NOTIFY_MEMBER_DAY_MS
+        }) {
+            bucket.admissions.pop_front();
+        }
+        let burst_wait_ms = if bucket.credit_ms < NOTIFY_MEMBER_TOKEN_MS {
+            bucket
+                .updated_ms
+                .saturating_sub(now_ms)
+                .saturating_add(NOTIFY_MEMBER_TOKEN_MS - bucket.credit_ms)
+        } else {
+            0
+        };
+        let daily_wait_ms = if bucket.admissions.len() >= NOTIFY_MEMBER_DAY_LIMIT {
+            bucket.admissions[0]
+                .saturating_add(NOTIFY_MEMBER_DAY_MS)
+                .saturating_sub(now_ms)
+        } else {
+            0
+        };
+        if burst_wait_ms > 0 || bucket.admissions.len() >= NOTIFY_MEMBER_DAY_LIMIT {
+            return BucketDecision {
+                allowed: false,
+                retry_after_secs: burst_wait_ms.max(daily_wait_ms).div_ceil(1000).max(1),
+            };
+        }
+        bucket.credit_ms -= NOTIFY_MEMBER_TOKEN_MS;
+        bucket.admissions.push_back(bucket.updated_ms);
+        BucketDecision {
+            allowed: true,
+            retry_after_secs: 0,
         }
     }
 }
@@ -669,10 +761,12 @@ pub fn auth_failure(log_reason: impl Into<String>) -> ActionError {
 
 /// Every verb the endpoint will run, in legacy publish order: the card's 18
 /// plus `event.read`, the narrow mapped-event verifier that landed later
-/// (TOG-5510), plus `voice.snapshot`, the keyless gateway-cache read. Adding
-/// a verb here without deciding which side of [`NEEDS_IDEMPOTENCY_KEY`] it
-/// falls on is the mistake that set exists to prevent.
-pub const IMPLEMENTED_ACTIONS: [&str; 20] = [
+/// (TOG-5510), plus `voice.snapshot`, the keyless gateway-cache read, and
+/// the two member-notify DM verbs (`reminder.send`, `place_offer.send`),
+/// which stay dark behind their own flag. Adding a verb here without
+/// deciding which side of [`NEEDS_IDEMPOTENCY_KEY`] it falls on is the
+/// mistake that set exists to prevent.
+pub const IMPLEMENTED_ACTIONS: [&str; 22] = [
     "role.assign",
     "guild.add_member",
     "announcement.post",
@@ -693,14 +787,18 @@ pub const IMPLEMENTED_ACTIONS: [&str; 20] = [
     "moderation.lockdown",
     "moderation.unlock",
     "voice.snapshot",
+    "reminder.send",
+    "place_offer.send",
 ];
 
 /// Actions where a repeat is not harmless, so the caller must send an
 /// `Idempotency-Key` and the bot must remember the result. A settings write
 /// sits here because two deliveries of the same save are two audit rows and
 /// two version bumps — and a concurrent save landing in between would be
-/// silently reverted by the second delivery.
-pub const NEEDS_IDEMPOTENCY_KEY: [&str; 14] = [
+/// silently reverted by the second delivery. The two member-notify verbs sit
+/// here because a repeat DM is not harmless: a second delivery is a second
+/// message to the member.
+pub const NEEDS_IDEMPOTENCY_KEY: [&str; 16] = [
     "announcement.post",
     "event.upsert",
     "event.cancel",
@@ -715,6 +813,8 @@ pub const NEEDS_IDEMPOTENCY_KEY: [&str; 14] = [
     "moderation.slowmode",
     "moderation.lockdown",
     "moderation.unlock",
+    "reminder.send",
+    "place_offer.send",
 ];
 
 /// Actions that cannot run without the config store wired in. Configured-on
@@ -856,6 +956,14 @@ impl InternalFlags {
         }
         if flag("TWO_INTERNAL_ALLOW_MODERATION") && flag("TWO_MODERATION") {
             enabled.extend(MODERATION_ACTIONS.iter().map(|s| (*s).to_owned()));
+        }
+        // Member-notify DM delivery stays dark until the operator enables it
+        // for a staging-proven rollout; one flag gates both verbs because
+        // they share the DM transport and the same no-free-text template rule.
+        // Merely shipping the implementation must not widen the allowlist.
+        if flag("TWO_INTERNAL_ALLOW_MEMBER_NOTIFY") {
+            enabled.insert("reminder.send".to_owned());
+            enabled.insert("place_offer.send".to_owned());
         }
         Self {
             enabled,
@@ -1402,6 +1510,186 @@ impl<'a> GuildAddMemberRequest<'a> {
     }
 }
 
+/// Member-notify event-key shape: the website's stable event identity, carried
+/// only for the DM deep link (`/e/{event_key}`) and never interpreted.
+/// Deliberately tighter than [`valid_event_key`] (1-200): the site's key
+/// ceiling is 64, and the bound matters because the key lands in the audit
+/// trail beside the member and the outcome. Same charset as
+/// [`valid_idempotency_key`].
+#[must_use]
+pub fn valid_notify_event_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    (1..=MAX_NOTIFY_EVENT_KEY_CHARS).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
+/// `reminder.send` / `place_offer.send` shared fields: the member snowflake,
+/// the site event key for the deep link, and the site event name for the
+/// template. There is deliberately no `body` field: the bot renders its own
+/// template from these facts, and free-form caller text never reaches a DM.
+fn validate_notify_event_key(body: &Map<String, Value>) -> Result<&str, ActionError> {
+    let key = require_field_str(body, "event_key")?;
+    if !valid_notify_event_key(key) {
+        return Err(ActionError::new(
+            ErrorCode::Malformed,
+            format!(
+                "\"event_key\" must be 1-{MAX_NOTIFY_EVENT_KEY_CHARS} characters of [A-Za-z0-9._:-]"
+            ),
+            "bad_event_key",
+        ));
+    }
+    Ok(key)
+}
+
+/// Site event name for a notify template: non-empty, at most
+/// [`MAX_EVENT_NAME_CHARS`] UTF-16 units, like the event input validator.
+fn validate_notify_event_name(body: &Map<String, Value>) -> Result<&str, ActionError> {
+    let name = require_field_str(body, "event_name")?;
+    if utf16_len(name) > MAX_EVENT_NAME_CHARS {
+        return Err(ActionError::new(
+            ErrorCode::Malformed,
+            format!(r#""event_name" is longer than {MAX_EVENT_NAME_CHARS} characters"#),
+            "event_name_too_long",
+        ));
+    }
+    Ok(name)
+}
+
+/// Reject caller-supplied DM text on the notify verbs: the template is the
+/// bot's, rendered from validated facts. Present-but-ignored would let a
+/// caller believe its words were delivered.
+fn reject_notify_body(body: &Map<String, Value>) -> Result<(), ActionError> {
+    if body.contains_key("body") {
+        return Err(ActionError::new(
+            ErrorCode::Malformed,
+            "\"body\" must not be present; the bot renders its own template",
+            "body_not_allowed",
+        ));
+    }
+    Ok(())
+}
+
+/// Consent, budgets, audit and Discord must all use the same member identity.
+/// Keep notification IDs canonical rather than accepting numeric aliases.
+fn validate_notify_member(body: &Map<String, Value>) -> Result<&str, ActionError> {
+    let member = require_snowflake(body, "discord_id")?;
+    if member.starts_with('0') || member.parse::<u64>().is_err() {
+        return Err(ActionError::new(
+            ErrorCode::Malformed,
+            "\"discord_id\" must be a canonical nonzero Discord id",
+            "bad_discord_id",
+        ));
+    }
+    Ok(member)
+}
+
+/// Validated `reminder.send` facts: the member, the event key for the deep
+/// link, the v1-only kind, the normalized Zulu start, and the event name.
+/// The site owns scheduling; the bot owns only this delivery.
+#[derive(Debug, Clone)]
+pub struct ReminderSendRequest<'a> {
+    discord_id: &'a str,
+    event_key: &'a str,
+    starts_at: String,
+    event_name: &'a str,
+}
+
+impl<'a> ReminderSendRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        reject_notify_body(body)?;
+        let discord_id = validate_notify_member(body)?;
+        let event_key = validate_notify_event_key(body)?;
+        let kind = require_field_str(body, "kind")?;
+        if kind != REMINDER_KIND_STARTING_SOON {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                format!("\"kind\" must be \"{REMINDER_KIND_STARTING_SOON}\""),
+                "bad_kind",
+            ));
+        }
+        let starts_at = require_timestamp(body, "starts_at")?;
+        let event_name = validate_notify_event_name(body)?;
+        Ok(Self {
+            discord_id,
+            event_key,
+            starts_at,
+            event_name,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
+
+    #[must_use]
+    pub fn event_key(&self) -> &'a str {
+        self.event_key
+    }
+
+    /// Bot-side DM template: facts only, plus the site deep link. The path is
+    /// bare (`/e/{event_key}`) on purpose — the bot never invents the site's
+    /// domain. Mention suppression happens at send time, not here.
+    #[must_use]
+    pub fn dm_text(&self) -> String {
+        format!(
+            "Reminder: {} starts at {}. Details: /e/{}",
+            self.event_name, self.starts_at, self.event_key
+        )
+    }
+}
+
+/// Validated `place_offer.send` facts: the member, the event key for the deep
+/// link, the event name, and the normalized Zulu offer expiry. A delivered DM
+/// never consumes a place on its own; the site's state machine decides on the
+/// linked page.
+#[derive(Debug, Clone)]
+pub struct PlaceOfferSendRequest<'a> {
+    discord_id: &'a str,
+    event_key: &'a str,
+    event_name: &'a str,
+    expires_at: String,
+}
+
+impl<'a> PlaceOfferSendRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        reject_notify_body(body)?;
+        let discord_id = validate_notify_member(body)?;
+        let event_key = validate_notify_event_key(body)?;
+        let event_name = validate_notify_event_name(body)?;
+        let expires_at = require_timestamp(body, "expires_at")?;
+        Ok(Self {
+            discord_id,
+            event_key,
+            event_name,
+            expires_at,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
+
+    #[must_use]
+    pub fn event_key(&self) -> &'a str {
+        self.event_key
+    }
+
+    /// Bot-side DM template: facts only, plus the site deep link. The path is
+    /// bare (`/e/{event_key}`) on purpose — the bot never invents the site's
+    /// domain. Mention suppression happens at send time, not here.
+    #[must_use]
+    pub fn dm_text(&self) -> String {
+        format!(
+            "A place opened for {}. Claim it before {}: /e/{}",
+            self.event_name, self.expires_at, self.event_key
+        )
+    }
+}
+
 /// `announcement.post` field validation: channel through the key map, body
 /// within Discord's ceiling. The message id comes back from Discord, so the
 /// stored idempotency result can still tell the website *which* message it has.
@@ -1828,7 +2116,9 @@ fn replayed_nonce() -> ActionError {
 ///    read, so a replay can never reach Discord) → 5. per-key bucket → 6. body
 ///    parses as one JSON object with no repeated key at any depth → 7. action
 ///    allowlisted and enabled, store and
-///    settings present where required → 8. `guild.add_member`'s tighter bucket.
+///    settings present where required → 8. action-specific tighter buckets:
+///    `guild.add_member`'s per-caller bucket, the member-notify verbs'
+///    per-member bucket.
 ///
 /// Buckets 5 and 8 run after verification on purpose: rate-limiting an
 /// unverified key id would let anyone lock out a legitimate caller by spamming
@@ -1924,6 +2214,16 @@ fn authorize_burned(
                 "rate_limited_add_member",
             )
             .with_retry_after(per_action.retry_after_secs));
+        }
+    }
+
+    if action == "reminder.send" || action == "place_offer.send" {
+        // Validate before any durable claim. The store charges the shared
+        // member budget atomically with a new claim, never on receipt replay.
+        if action == "reminder.send" {
+            ReminderSendRequest::validate(&body)?;
+        } else {
+            PlaceOfferSendRequest::validate(&body)?;
         }
     }
 
@@ -2049,9 +2349,11 @@ pub const ADMIN_SCOPE_ADMIN: &str = "admin";
 impl InternalFlags {
     /// Scope the admin API requires for `action` (scope map v0).
     ///
-    /// Covers the 20 verbs the endpoint runs today: 4 read, 8 moderate and
-    /// 8 admin. `role.assign` is deliberately admin (a privilege grant, not
-    /// membership tooling). Later slices extend the map with new verbs;
+    /// Covers the 22 verbs the endpoint runs today: 4 read, 8 moderate and
+    /// 10 admin. `role.assign` is deliberately admin (a privilege grant, not
+    /// membership tooling); the two member-notify verbs are deliberately
+    /// admin too (an outbound DM is irreversible once read, like a broadcast).
+    /// Later slices extend the map with new verbs;
     /// anything unmapped — including strings that can never be verbs —
     /// resolves to no scope, which every allowance check refuses.
     #[must_use]
@@ -2075,7 +2377,9 @@ impl InternalFlags {
             | "role.assign"
             | "announcement.post"
             | "settings.set"
-            | "automations.import" => Some(ADMIN_SCOPE_ADMIN),
+            | "automations.import"
+            | "reminder.send"
+            | "place_offer.send" => Some(ADMIN_SCOPE_ADMIN),
             _ => None,
         }
     }
@@ -2734,6 +3038,95 @@ mod tests {
     }
 
     #[test]
+    fn notify_member_bucket_bursts_three_then_refills_daily() {
+        let mut buckets = TokenBuckets::new();
+        for _ in 0..3 {
+            assert!(buckets.take_notify("notify:123", 0).allowed);
+        }
+        let denied = buckets.take_notify("notify:123", 0);
+        assert!(!denied.allowed);
+        assert!(denied.retry_after_secs >= 1);
+        // Other members keep their own budget.
+        assert!(buckets.take_notify("notify:456", 0).allowed);
+        // One token refills per 8640 seconds (10/day).
+        assert!(buckets.take_notify("notify:123", 8_640_000).allowed);
+        assert!(!buckets.take_notify("notify:123", 8_640_000).allowed);
+    }
+
+    #[test]
+    fn notify_member_bucket_never_allows_more_than_ten_in_a_rolling_day() {
+        let mut buckets = TokenBuckets::new();
+        let mut allowed = 0;
+        for now_ms in std::iter::repeat_n(0, 3).chain((1..=9).map(|step| step * 8_640_000)) {
+            if buckets.take_notify("notify:123", now_ms).allowed {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 10, "the burst must count toward the daily cap");
+    }
+
+    #[test]
+    fn notify_daily_ceiling_expires_without_charging_denied_attempts() {
+        let mut buckets = TokenBuckets::new();
+        for now_ms in std::iter::repeat_n(0, 3).chain((1..=7).map(|step| step * 8_640_000)) {
+            assert!(buckets.take_notify("notify:123", now_ms).allowed);
+        }
+        let denied = buckets.take_notify("notify:123", 69_120_000);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 17_280);
+        assert!(buckets.take_notify("notify:456", 69_120_000).allowed);
+        for now_ms in [86_399_000, 86_399_001, 86_399_999] {
+            let denied = buckets.take_notify("notify:123", now_ms);
+            assert!(!denied.allowed);
+            assert_eq!(denied.retry_after_secs, 1);
+        }
+        // The initial three admissions expire exactly at the boundary. Daily
+        // refusals must not have spent any of the refilled burst tokens.
+        for _ in 0..3 {
+            assert!(
+                buckets
+                    .take_notify("notify:123", NOTIFY_MEMBER_DAY_MS)
+                    .allowed
+            );
+        }
+        let denied = buckets.take_notify("notify:123", NOTIFY_MEMBER_DAY_MS);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 8640);
+        assert_eq!(buckets.notify_buckets["notify:123"].admissions.len(), 10);
+    }
+
+    #[test]
+    fn notify_daily_ceiling_and_burst_survive_clock_rollback() {
+        let mut buckets = TokenBuckets::new();
+        for now_ms in std::iter::repeat_n(0, 3).chain((1..=7).map(|step| step * 8_640_000)) {
+            assert!(buckets.take_notify("notify:123", now_ms).allowed);
+        }
+        let denied = buckets.take_notify("notify:123", 59_480_000);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 26_920);
+        for _ in 0..3 {
+            assert!(
+                buckets
+                    .take_notify("notify:123", NOTIFY_MEMBER_DAY_MS)
+                    .allowed
+            );
+        }
+        let denied = buckets.take_notify("notify:123", NOTIFY_MEMBER_DAY_MS - 1000);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 8641);
+        assert!(
+            !buckets
+                .take_notify("notify:123", NOTIFY_MEMBER_DAY_MS)
+                .allowed
+        );
+        assert!(
+            buckets
+                .take_notify("notify:123", NOTIFY_MEMBER_DAY_MS + 8_640_000)
+                .allowed
+        );
+    }
+
+    #[test]
     fn buckets_refill_over_time() {
         let mut buckets = TokenBuckets::new();
         for _ in 0..20 {
@@ -2747,7 +3140,7 @@ mod tests {
 
     #[test]
     fn buckets_clock_rollback_does_not_refill_spent_tokens_twice() {
-        for spec in [DEFAULT_BUCKET, ADD_MEMBER_BUCKET] {
+        for spec in [DEFAULT_BUCKET, ADD_MEMBER_BUCKET, NOTIFY_MEMBER_BUCKET] {
             let mut buckets = TokenBuckets::new();
             for _ in 0..spec.capacity as usize {
                 assert!(buckets.take("k", spec, 10_000).allowed);
@@ -2826,6 +3219,12 @@ mod tests {
         // Gated verbs stay dark by default.
         let err = assert_allowed("guild.add_member", &flags, true, true).expect_err("dark");
         assert_eq!(err.code, ErrorCode::ActionNotAllowed);
+        // Member-notify DM verbs stay dark by default too: a repeat DM is not
+        // harmless, so delivery needs its own reviewed flag.
+        for action in ["reminder.send", "place_offer.send"] {
+            let err = assert_allowed(action, &flags, true, true).expect_err("dark");
+            assert_eq!(err.code, ErrorCode::ActionNotAllowed, "{action}");
+        }
         // Key-requiring verbs refuse without a store instead of 500ing later.
         let mut vars = HashMap::new();
         vars.insert("TWO_INTERNAL_ALLOW_EVENT_CANCEL".to_owned(), "1".to_owned());
@@ -2849,6 +3248,11 @@ mod tests {
             InternalFlags::from_map(&vars)
         };
         assert!(on("TWO_INTERNAL_ALLOW_ADD_MEMBER").is_enabled("guild.add_member"));
+        // One flag gates both DM-delivery verbs; anything else leaves them dark.
+        let notify = on("TWO_INTERNAL_ALLOW_MEMBER_NOTIFY");
+        assert!(notify.is_enabled("reminder.send"));
+        assert!(notify.is_enabled("place_offer.send"));
+        assert!(!on("TWO_INTERNAL_ALLOW_EVENT_READ").is_enabled("reminder.send"));
         assert!(on("TWO_INTERNAL_ALLOW_EVENT_CANCEL").is_enabled("event.cancel"));
         assert!(on("TWO_INTERNAL_ALLOW_EVENT_READ").is_enabled("event.read"));
         assert!(on("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT").is_enabled("voice.snapshot"));
@@ -2981,12 +3385,12 @@ mod tests {
         // assistant credential binding and required event-voice category
         // slices add two env-only keys
         // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID). The
-        // voice.snapshot read adds one env-only key
-        // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT).
+        // voice.snapshot read and member notifications add two env-only gates
+        // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT, TWO_INTERNAL_ALLOW_MEMBER_NOTIFY).
         for (class, expected) in [
             (SettingClass::Hot, 52),
             (SettingClass::Cold, 18),
-            (SettingClass::EnvOnly, 67),
+            (SettingClass::EnvOnly, 68),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
@@ -3301,6 +3705,269 @@ mod tests {
                 .code,
             ErrorCode::Malformed
         );
+    }
+
+    #[test]
+    fn member_notify_requires_canonical_nonzero_u64_ids() {
+        for member in [
+            "0123456789012345678",
+            "00000000000000000",
+            "18446744073709551616",
+            "99999999999999999999",
+        ] {
+            let body = map(json!({
+                "discord_id": member,
+                "event_key": "launch:2026",
+                "kind": "starting_soon",
+                "starts_at": "2026-11-04T18:00:00Z",
+                "expires_at": "2026-11-04T18:00:00Z",
+                "event_name": "Launch Night",
+            }));
+            for result in [
+                ReminderSendRequest::validate(&body).map(|_| ()),
+                PlaceOfferSendRequest::validate(&body).map(|_| ()),
+            ] {
+                let err = result.expect_err("noncanonical or out-of-range member");
+                assert_eq!(err.code, ErrorCode::Malformed);
+                assert_eq!(err.log_reason, "bad_discord_id");
+            }
+        }
+        for member in ["123456789012345678", "18446744073709551615"] {
+            let body = map(json!({"discord_id": member}));
+            assert_eq!(validate_notify_member(&body).unwrap(), member);
+        }
+    }
+
+    #[test]
+    fn member_notify_validation() {
+        // A repeat DM is not harmless, so both verbs require an idempotency key.
+        assert!(needs_idempotency_key("reminder.send"));
+        assert!(needs_idempotency_key("place_offer.send"));
+        assert!(IMPLEMENTED_ACTIONS.contains(&"reminder.send"));
+        assert!(IMPLEMENTED_ACTIONS.contains(&"place_offer.send"));
+
+        let reminder = map(json!({
+            "discord_id": "123456789012345678",
+            "event_key": "launch:2026",
+            "kind": "starting_soon",
+            "starts_at": "2026-11-04T18:00:00Z",
+            "event_name": "Launch Night",
+        }));
+        let request = ReminderSendRequest::validate(&reminder).expect("valid");
+        assert_eq!(request.discord_id(), "123456789012345678");
+        // Timestamps normalize to millis Zulu; the deep link is a bare path —
+        // the bot never invents the site's domain.
+        assert_eq!(
+            request.dm_text(),
+            "Reminder: Launch Night starts at 2026-11-04T18:00:00.000Z. Details: /e/launch:2026"
+        );
+
+        let offer = map(json!({
+            "discord_id": "123456789012345678",
+            "event_key": "launch-2026",
+            "event_name": "Launch Night",
+            "expires_at": "2026-11-04T18:00:00+01:00",
+        }));
+        let request = PlaceOfferSendRequest::validate(&offer).expect("valid");
+        assert_eq!(
+            request.dm_text(),
+            "A place opened for Launch Night. Claim it before 2026-11-04T17:00:00.000Z: /e/launch-2026"
+        );
+
+        // v1 knows exactly one reminder kind.
+        let body = map(json!({
+            "discord_id": "123456789012345678",
+            "event_key": "launch:2026",
+            "kind": "sesame_street",
+            "starts_at": "2026-11-04T18:00:00Z",
+            "event_name": "Launch Night",
+        }));
+        let err = ReminderSendRequest::validate(&body).expect_err("bad kind");
+        assert_eq!(err.code, ErrorCode::Malformed);
+        assert_eq!(err.log_reason, "bad_kind");
+
+        // Free-form caller text never reaches a DM, so a present `body` is a
+        // refusal, not a silent ignore.
+        for raw in [
+            json!({
+                "discord_id": "123456789012345678",
+                "event_key": "launch:2026",
+                "kind": "starting_soon",
+                "starts_at": "2026-11-04T18:00:00Z",
+                "event_name": "Launch Night",
+                "body": "hello",
+            }),
+            json!({
+                "discord_id": "123456789012345678",
+                "event_key": "launch:2026",
+                "event_name": "Launch Night",
+                "expires_at": "2026-11-04T18:00:00Z",
+                "body": "hello",
+            }),
+        ] {
+            let body = map(raw);
+            for result in [
+                ReminderSendRequest::validate(&body).map(|_| ()),
+                PlaceOfferSendRequest::validate(&body).map(|_| ()),
+            ] {
+                let err = result.expect_err("body not allowed");
+                assert_eq!(err.code, ErrorCode::Malformed);
+                assert_eq!(err.log_reason, "body_not_allowed");
+            }
+        }
+
+        // Event key: 1-64 chars of [A-Za-z0-9._:-].
+        assert!(valid_notify_event_key("a"));
+        assert!(valid_notify_event_key(&"k".repeat(64)));
+        assert!(!valid_notify_event_key(""));
+        assert!(!valid_notify_event_key(&"k".repeat(65)));
+        assert!(!valid_notify_event_key("has space"));
+        for raw in [
+            json!({"event_key": ""}),
+            json!({"event_key": "has space"}),
+            json!({"event_key": "k".repeat(65)}),
+            json!({}),
+        ] {
+            let mut merged = map(json!({
+                "discord_id": "123456789012345678",
+                "kind": "starting_soon",
+                "starts_at": "2026-11-04T18:00:00Z",
+                "event_name": "Launch Night",
+            }));
+            for (k, v) in map(raw) {
+                merged.insert(k, v);
+            }
+            assert_eq!(
+                ReminderSendRequest::validate(&merged)
+                    .expect_err("bad key")
+                    .code,
+                ErrorCode::Malformed
+            );
+        }
+
+        // Event name: non-empty, at most 100 UTF-16 units, like event input.
+        let mut long = map(json!({
+            "discord_id": "123456789012345678",
+            "event_key": "launch:2026",
+            "kind": "starting_soon",
+            "starts_at": "2026-11-04T18:00:00Z",
+            "event_name": "n".repeat(101),
+        }));
+        let err = ReminderSendRequest::validate(&long).expect_err("too long");
+        assert_eq!(err.code, ErrorCode::Malformed);
+        assert_eq!(err.log_reason, "event_name_too_long");
+        long.insert("event_name".to_owned(), json!(""));
+        assert_eq!(
+            ReminderSendRequest::validate(&long)
+                .expect_err("empty")
+                .code,
+            ErrorCode::Malformed
+        );
+
+        // Bad member id and bad timestamps are malformed, never a Discord call.
+        for raw in [
+            json!({
+                "discord_id": "not-an-id",
+                "event_key": "launch:2026",
+                "kind": "starting_soon",
+                "starts_at": "2026-11-04T18:00:00Z",
+                "event_name": "Launch Night",
+            }),
+            json!({
+                "discord_id": "123456789012345678",
+                "event_key": "launch:2026",
+                "kind": "starting_soon",
+                "starts_at": "next Tuesday",
+                "event_name": "Launch Night",
+            }),
+            json!({
+                "discord_id": "123456789012345678",
+                "event_key": "launch:2026",
+                "event_name": "Launch Night",
+                "expires_at": "next Tuesday",
+            }),
+        ] {
+            let body = map(raw);
+            for result in [
+                ReminderSendRequest::validate(&body).map(|_| ()),
+                PlaceOfferSendRequest::validate(&body).map(|_| ()),
+            ] {
+                assert_eq!(result.expect_err("malformed").code, ErrorCode::Malformed);
+            }
+        }
+    }
+
+    #[test]
+    fn notify_authorization_validates_but_leaves_member_accounting_to_durable_claims() {
+        let mut vars = HashMap::new();
+        vars.insert(
+            "TWO_INTERNAL_ALLOW_MEMBER_NOTIFY".to_owned(),
+            "1".to_owned(),
+        );
+        let flags = InternalFlags::from_map(&vars);
+        let keys = ring();
+        let now_ms = 1_750_000_000_000u64;
+        let timestamp = (now_ms / 1000).to_string();
+        let body_for = |member: &str| {
+            serde_json::json!({
+                "action": "reminder.send",
+                "discord_id": member,
+                "event_key": "launch:2026",
+                "kind": "starting_soon",
+                "starts_at": "2026-11-04T18:00:00Z",
+                "event_name": "Launch Night",
+            })
+            .to_string()
+        };
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
+        let attempt = |raw: &str,
+                       nonces: &mut NonceCache,
+                       buckets: &mut TokenBuckets,
+                       clock: &mut ClockGuard| {
+            let nonce = test_nonce();
+            let sig = sign(vec1().secret.as_bytes(), &timestamp, &nonce, raw.as_bytes());
+            let headers = signed_headers("web", &timestamp, &nonce, &sig);
+            authorize(
+                &headers,
+                raw.as_bytes(),
+                &keys,
+                &flags,
+                true,
+                true,
+                SKEW_SECONDS,
+                now_ms,
+                nonces,
+                buckets,
+                clock,
+            )
+        };
+        // Replays are not distinguished until the durable claim. Authorization
+        // must not spend member allowance, but still applies the caller limit.
+        let capped = body_for("123456789012345678");
+        let mut malformed: Value = serde_json::from_str(&capped).unwrap();
+        malformed["kind"] = json!("unsupported");
+        for _ in 0..4 {
+            let err = attempt(
+                &malformed.to_string(),
+                &mut nonces,
+                &mut buckets,
+                &mut clock,
+            )
+            .expect_err("malformed facts do not consume the member budget");
+            assert_eq!(err.code, ErrorCode::Malformed);
+        }
+        for _ in 0..16 {
+            attempt(&capped, &mut nonces, &mut buckets, &mut clock)
+                .expect("durable claim decides member accounting");
+        }
+        assert!(buckets.notify_buckets.is_empty());
+        let err = attempt(&capped, &mut nonces, &mut buckets, &mut clock)
+            .expect_err("all attempts still charge the caller bucket");
+        assert_eq!(err.code, ErrorCode::RateLimited);
+        assert_eq!(err.log_reason, "rate_limited_key");
+        assert!(err.retry_after_secs.is_some());
     }
 
     #[test]

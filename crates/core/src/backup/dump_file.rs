@@ -1,4 +1,4 @@
-//! The v15 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14): manifest / rows / end marker, gzipped NDJSON.
+//! The v16 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -212,6 +212,9 @@ pub const DUMP_TABLES: &[&str] = &[
     "giveaways",
     "giveaway_entries",
     "giveaway_draws",
+    // V16 notification limiter (0471): hashed per-member buckets holding only
+    // exhausted history, token credit and high-water; no foreign keys.
+    "internal_notify_budgets",
 ];
 
 /// Tables first covered by v5. A v4 archive predates them and need not declare
@@ -309,6 +312,14 @@ pub const V14_ADDED_TABLES: &[&str] =
 /// giveaway definitions, entries and draw rounds.
 pub const V15_ADDED_TABLES: &[&str] = &["giveaways", "giveaway_entries", "giveaway_draws"];
 
+/// Tables first covered by v16 (member-notification limiter, migration 0471).
+/// Released v15 archives retain every earlier requirement but may omit the
+/// limiter. Restoring them clears destination-only limiter rows, so a
+/// pre-v16 recovery point cannot carry an exhausted bucket forward. New
+/// archives must contain it so a restore cannot reset exhausted history,
+/// credit or the high-water mark and re-open the notification budget.
+pub const V16_ADDED_TABLES: &[&str] = &["internal_notify_budgets"];
+
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
 /// legacy subsystems. A table created by migrations must leave this list
@@ -390,8 +401,8 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v15 coverage; the reader also accepts frozen v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14 coverage.
-pub const DUMP_VERSION: u32 = 15;
+/// Write complete v16 coverage; the reader also accepts frozen v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15 coverage.
+pub const DUMP_VERSION: u32 = 16;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -971,10 +982,11 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     && version != 12
                     && version != 13
                     && version != 14
+                    && version != 15
                     && version != u64::from(DUMP_VERSION)
                 {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -1270,16 +1282,18 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
         let _ = count;
     }
     // Historical inventories are pinned by fixtures. Each old version waives
-    // only tables first covered by a later version. New v15 archives require
+    // only tables first covered by a later version. New v16 archives require
     // the full inventory, including both guild counters (0441/0442/0446/0447),
     // the epoch-claim guard (0450/0451), the delete tombstones (0452/0453),
     // the token registry (0456/0457), the event voice pair (0455) and
-    // the starboard tables (0458/0459) and giveaways (0460/0461).
+    // the starboard tables (0458/0459), giveaways (0460/0461) and the
+    // notification limiter (0471).
     let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
         .copied()
         .enumerate()
+        .filter(|(_, name)| !matches!(version, Some(3..=15)) || !V16_ADDED_TABLES.contains(name))
         .filter(|(_, name)| !matches!(version, Some(3..=14)) || !V15_ADDED_TABLES.contains(name))
         .filter(|(_, name)| !matches!(version, Some(3..=13)) || !V14_ADDED_TABLES.contains(name))
         .filter(|(_, name)| !matches!(version, Some(3..=12)) || !V13_ADDED_TABLES.contains(name))
@@ -2366,6 +2380,7 @@ mod tests {
                         "giveaways",
                         "giveaway_entries",
                         "giveaway_draws",
+                        "internal_notify_budgets",
                     ]
                     .contains(name)
             })
@@ -2396,7 +2411,8 @@ mod tests {
                 "starboard_posts",
                 "giveaways",
                 "giveaway_entries",
-                "giveaway_draws"
+                "giveaway_draws",
+                "internal_notify_budgets"
             ]
         );
         assert_eq!(contents.buffers["voice_rooms"][0]["channel_id"], "500");
@@ -2462,7 +2478,7 @@ mod tests {
         );
         // The same inventory at the current version refuses: new archives must
         // cover the event store.
-        assert_eq!(DUMP_VERSION, 15);
+        assert_eq!(DUMP_VERSION, 16);
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
         assert!(validate_manifest(&current)
@@ -2570,7 +2586,7 @@ mod tests {
             .contains("event_store"));
         let mut current = v5;
         current["version"] = serde_json::json!(DUMP_VERSION);
-        assert_eq!(DUMP_VERSION, 15, "frozen v5 test pins the v15 bump");
+        assert_eq!(DUMP_VERSION, 16, "frozen v5 test pins the v16 bump");
         assert!(validate_manifest(&current)
             .unwrap_err()
             .to_string()
@@ -2644,7 +2660,7 @@ mod tests {
             "member_season_xp",
         ));
         assert_eq!(v7_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 15, "frozen v6 test pins the v15 bump");
+        assert_eq!(DUMP_VERSION, 16, "frozen v6 test pins the v16 bump");
         assert!(validate_manifest(&v7_gap)
             .unwrap_err()
             .to_string()
@@ -2726,8 +2742,8 @@ mod tests {
         let mut v7_gap = v6.clone();
         v7_gap["version"] = serde_json::json!(DUMP_VERSION);
         assert_eq!(
-            DUMP_VERSION, 15,
-            "frozen pre-retention test pins the v15 bump"
+            DUMP_VERSION, 16,
+            "frozen pre-retention test pins the v16 bump"
         );
         let err = validate_manifest(&v7_gap).unwrap_err().to_string();
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
@@ -2802,7 +2818,7 @@ mod tests {
             "stream_live_claims",
         ));
         assert_eq!(v8_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 15, "frozen v7 test pins the v15 bump");
+        assert_eq!(DUMP_VERSION, 16, "frozen v7 test pins the v16 bump");
         assert!(validate_manifest(&v8_gap)
             .unwrap_err()
             .to_string()
@@ -2824,6 +2840,7 @@ mod tests {
                     && table["name"] != "giveaways"
                     && table["name"] != "giveaway_entries"
                     && table["name"] != "giveaway_draws"
+                    && table["name"] != "internal_notify_budgets"
             })
             .collect();
         let mut old = manifest(tables);
@@ -2845,7 +2862,8 @@ mod tests {
                     "starboard_posts",
                     "giveaways",
                     "giveaway_entries",
-                    "giveaway_draws"
+                    "giveaway_draws",
+                    "internal_notify_budgets"
                 ]
             );
             let mut gap = old.clone();
@@ -2858,13 +2876,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 15, "new dumps require both guild counters");
+        assert_eq!(DUMP_VERSION, 16, "new dumps require both guild counters");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v15 archive inspects");
+        .expect("complete v16 archive inspects");
         for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -2896,6 +2914,7 @@ mod tests {
                         "giveaways",
                         "giveaway_entries",
                         "giveaway_draws",
+                        "internal_notify_budgets",
                     ]
                     .iter()
                     .any(|n| table["name"] == *n)
@@ -2919,7 +2938,8 @@ mod tests {
                     "starboard_posts",
                     "giveaways",
                     "giveaway_entries",
-                    "giveaway_draws"
+                    "giveaway_draws",
+                    "internal_notify_budgets"
                 ]
             );
             let mut gap = old.clone();
@@ -2932,13 +2952,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 15, "new dumps require the epoch-claim guard");
+        assert_eq!(DUMP_VERSION, 16, "new dumps require the epoch-claim guard");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v15 archive inspects");
+        .expect("complete v16 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -2972,6 +2992,7 @@ mod tests {
                     && table["name"] != "giveaways"
                     && table["name"] != "giveaway_entries"
                     && table["name"] != "giveaway_draws"
+                    && table["name"] != "internal_notify_budgets"
                     && table["name"] != "admin_api_tokens"
             })
             .collect();
@@ -2996,7 +3017,8 @@ mod tests {
                     "starboard_posts",
                     "giveaways",
                     "giveaway_entries",
-                    "giveaway_draws"
+                    "giveaway_draws",
+                    "internal_notify_budgets"
                 ]
             );
             let mut gap = old.clone();
@@ -3009,11 +3031,11 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 15, "new dumps require the delete tombstones");
+        assert_eq!(DUMP_VERSION, 16, "new dumps require the delete tombstones");
         // v11 kept the tombstones mandatory but predates registry and starboard:
         // the frozen old-v11 shape carries the tombstone and omits the
         // registry, event voice pair and starboard three.
-        assert_eq!(DUMP_VERSION, 15, "new dumps require the v11 tombstones");
+        assert_eq!(DUMP_VERSION, 16, "new dumps require the v11 tombstones");
         let old_v11: Vec<Value> = complete_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| {
@@ -3026,6 +3048,7 @@ mod tests {
                     && table["name"] != "giveaways"
                     && table["name"] != "giveaway_entries"
                     && table["name"] != "giveaway_draws"
+                    && table["name"] != "internal_notify_budgets"
             })
             .collect();
         let mut at_v11 = manifest(old_v11);
@@ -3047,7 +3070,8 @@ mod tests {
                 "starboard_posts",
                 "giveaways",
                 "giveaway_entries",
-                "giveaway_draws"
+                "giveaway_draws",
+                "internal_notify_budgets"
             ]
         );
         let mut tombstone_gap = at_v11.clone();
@@ -3064,7 +3088,7 @@ mod tests {
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v15 archive inspects");
+        .expect("complete v16 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -3098,6 +3122,7 @@ mod tests {
                     && table["name"] != "giveaways"
                     && table["name"] != "giveaway_entries"
                     && table["name"] != "giveaway_draws"
+                    && table["name"] != "internal_notify_budgets"
             })
             .collect();
         let mut old = manifest(tables);
@@ -3120,7 +3145,8 @@ mod tests {
                     "starboard_posts",
                     "giveaways",
                     "giveaway_entries",
-                    "giveaway_draws"
+                    "giveaway_draws",
+                    "internal_notify_budgets"
                 ]
             );
             let mut gap = old.clone();
@@ -3139,13 +3165,13 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("admin_api_tokens"));
-        assert_eq!(DUMP_VERSION, 15, "new dumps require the token registry");
+        assert_eq!(DUMP_VERSION, 16, "new dumps require the token registry");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v15 archive inspects");
+        .expect("complete v16 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -3175,6 +3201,7 @@ mod tests {
                     && table["name"] != "giveaways"
                     && table["name"] != "giveaway_entries"
                     && table["name"] != "giveaway_draws"
+                    && table["name"] != "internal_notify_budgets"
             })
             .collect();
         let mut old = manifest(tables);
@@ -3196,7 +3223,8 @@ mod tests {
                     "starboard_posts",
                     "giveaways",
                     "giveaway_entries",
-                    "giveaway_draws"
+                    "giveaway_draws",
+                    "internal_notify_budgets"
                 ]
             );
             let mut gap = old.clone();
@@ -3209,13 +3237,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 15, "new dumps require the event voice pair");
+        assert_eq!(DUMP_VERSION, 16, "new dumps require the event voice pair");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v15 archive inspects");
+        .expect("complete v16 archive inspects");
         for name in ["event_voice_channels", "event_voice_presence"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -3257,7 +3285,8 @@ mod tests {
                     "starboard_posts",
                     "giveaways",
                     "giveaway_entries",
-                    "giveaway_draws"
+                    "giveaway_draws",
+                    "internal_notify_budgets"
                 ]
             );
             let mut gap = old.clone();
@@ -3290,13 +3319,13 @@ mod tests {
             .collect();
         assert_eq!(released_without_voice, FROZEN_V12_TABLES);
         assert_eq!(
-            DUMP_VERSION, 15,
+            DUMP_VERSION, 16,
             "new dumps require the v14 starboard tables"
         );
         assert_eq!(
             DUMP_TABLES.len(),
-            107,
-            "released 101 plus three starboard and three giveaway tables"
+            108,
+            "released 101 plus starboard, giveaway and limiter tables"
         );
         assert_eq!(&DUMP_TABLES[..101], FROZEN_V13_TABLES.as_slice());
         assert_eq!(
@@ -3307,7 +3336,8 @@ mod tests {
                 "starboard_posts",
                 "giveaways",
                 "giveaway_entries",
-                "giveaway_draws"
+                "giveaway_draws",
+                "internal_notify_budgets"
             ]
         );
         let current = manifest(complete_tables(&BTreeMap::new()));
@@ -3315,7 +3345,7 @@ mod tests {
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v15 archive inspects");
+        .expect("complete v16 archive inspects");
         for name in [
             "starboard_config",
             "starboard_starrers",
@@ -3366,7 +3396,8 @@ mod tests {
                 "starboard_posts",
                 "giveaways",
                 "giveaway_entries",
-                "giveaway_draws"
+                "giveaway_draws",
+                "internal_notify_budgets"
             ]
         );
         assert_eq!(
@@ -3411,7 +3442,7 @@ mod tests {
     #[test]
     fn v14_archives_read_without_giveaways_but_v15_requires_them() {
         assert_eq!(
-            DUMP_VERSION, 15,
+            DUMP_VERSION, 16,
             "giveaways follow the released v14 starboard format"
         );
         // Literal names, not V15_ADDED_TABLES: this reproduces the pre-change
@@ -3475,13 +3506,13 @@ mod tests {
             let error = validate_manifest(&v14_gap).unwrap_err().to_string();
             assert!(error.contains(name), "{error}");
         }
-        assert_eq!(DUMP_VERSION, 15, "new dumps require the giveaway tables");
+        assert_eq!(DUMP_VERSION, 16, "new dumps require the giveaway tables");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v15 archive inspects");
+        .expect("complete v16 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -3494,6 +3525,54 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("giveaways"), "{error}");
+    }
+
+    #[test]
+    fn v15_archives_read_without_notify_budgets_but_v16_requires_them() {
+        assert_eq!(
+            DUMP_VERSION, 16,
+            "the notification limiter follows the released v15 giveaway format"
+        );
+        // Literal name, not V16_ADDED_TABLES: this reproduces the released
+        // v15 inventory even if the version waiver is accidentally removed.
+        let tables: Vec<Value> = complete_tables(&BTreeMap::new())
+            .into_iter()
+            .filter(|table| table["name"] != "internal_notify_budgets")
+            .collect();
+        let mut old = manifest(tables);
+        for version in 3..=15 {
+            old["version"] = serde_json::json!(version);
+            let contents = inspect_bytes(&gzip_lines(&[
+                old.clone(),
+                serde_json::json!({"kind":"end","rows":0}),
+            ]))
+            .expect("archives without the v16 limiter table stay readable");
+            assert_eq!(contents.manifest.version, version);
+            assert_eq!(
+                contents.manifest.missing_tables(),
+                ["internal_notify_budgets"]
+            );
+        }
+        let mut mislabeled = old.clone();
+        mislabeled["version"] = serde_json::json!(16);
+        let error = inspect_bytes(&gzip_lines(&[
+            mislabeled,
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("internal_notify_budgets"), "{error}");
+        // The waiver never hides an older requirement.
+        let mut v15_gap = old;
+        v15_gap["version"] = serde_json::json!(15);
+        v15_gap["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|table| table["name"] != "giveaways");
+        assert!(validate_manifest(&v15_gap)
+            .unwrap_err()
+            .to_string()
+            .contains("giveaways"));
     }
 
     #[test]
@@ -3602,7 +3681,7 @@ mod tests {
         let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
         assert!(
             message.contains(&format!(
-                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 and {DUMP_VERSION}"
+                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 and {DUMP_VERSION}"
             )),
             "unknown versions are refused with the readable list: {message}"
         );

@@ -77,6 +77,7 @@ fn drain_rig(pool: sqlx::PgPool, capacity: usize, released: bool) -> DrainRig {
         pool,
         effect,
         Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
         reads,
         mutates,
         Arc::new(MockModeration::default()),

@@ -969,6 +969,8 @@ pub struct KickAttemptState {
 
 #[path = "internal_exec/member.rs"]
 pub mod member;
+#[path = "internal_exec/notify.rs"]
+pub mod notify;
 #[path = "self_roles_rest.rs"]
 pub mod self_roles;
 

@@ -158,6 +158,69 @@ async fn admission_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Err
     result
 }
 
+async fn notify_as_runtime(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
+    use two_bot_core::internal_action_store::{
+        AuditSubject, DiscordId, InternalActionStore, InternalClaim, InternalStoreError,
+        RequestIdentity,
+    };
+
+    let role = role.to_owned();
+    let runtime = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |connection, _| {
+            let role = role.clone();
+            Box::pin(async move {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET ROLE {role}")))
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with((*pool.connect_options()).clone())
+        .await?;
+    let result = async {
+        let error = |_: InternalStoreError| {
+            sqlx::Error::InvalidArgument("runtime notification store operation failed".into())
+        };
+        let store = InternalActionStore::new(runtime.clone());
+        let subject = AuditSubject {
+            target_id: Some(DiscordId::new("123456789012345678").map_err(error)?),
+            ..AuditSubject::default()
+        };
+        for n in 0..4 {
+            let id = RequestIdentity::new(
+                "role-probe",
+                &format!("role-notify-{n}"),
+                "reminder.send",
+                b"facts",
+            )
+            .map_err(error)?;
+            match store.claim_notify(&id, &subject, "role-probe").await {
+                Ok(InternalClaim::Claimed(claim)) if n < 3 => {
+                    store.finish_suppressed(&claim).await.map_err(error)?;
+                    require(
+                        matches!(
+                            store
+                                .claim_notify(&id, &subject, "role-probe")
+                                .await
+                                .map_err(error)?,
+                            InternalClaim::Replay(_)
+                        ),
+                        "runtime notification receipt did not replay",
+                    )?;
+                }
+                Err(InternalStoreError::NotifyRateLimited { retry_after_secs })
+                    if n == 3 && retry_after_secs > 0 => {}
+                _ => return Err(error(InternalStoreError::Unavailable)),
+            }
+        }
+        Ok(())
+    }
+    .await;
+    runtime.close().await;
+    result
+}
+
 async fn scheduled_runtime_probe(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET LOCAL ROLE {role}")))
@@ -408,6 +471,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         as_role(pool, &roles[2], &format!("SELECT * FROM web_v1.{view}")).await?;
     }
     admission_as_runtime(pool, &roles[1]).await?;
+    notify_as_runtime(pool, &roles[1]).await?;
     as_role(
         pool,
         &roles[1],
@@ -423,6 +487,8 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "TRUNCATE public.discord_send_admission",
         "DELETE FROM public.voice_create_reservations",
         "TRUNCATE public.voice_create_reservations",
+        "DELETE FROM public.internal_notify_budgets",
+        "TRUNCATE public.internal_notify_budgets",
         "CREATE TABLE public.runtime_probe (id int)",
         "CREATE SCHEMA runtime_probe",
         "CREATE TEMP TABLE runtime_probe (id int)",
@@ -440,6 +506,10 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
     }
     for sql in [
         "SELECT * FROM public.discord_send_admission",
+        "SELECT * FROM public.internal_notify_budgets",
+        "INSERT INTO public.internal_notify_budgets (bucket_key) VALUES (repeat('a', 64))",
+        "UPDATE public.internal_notify_budgets SET credit_ms = 25920000",
+        "DELETE FROM public.internal_notify_budgets",
         "INSERT INTO public.discord_send_admission (token_key) VALUES ('offline')",
         "UPDATE public.discord_send_admission SET in_flight = FALSE",
         "DELETE FROM public.discord_send_admission",

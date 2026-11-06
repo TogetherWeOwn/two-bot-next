@@ -733,3 +733,14 @@ VALUES (100000000000000001, 100000000000000003, 100000000000000006,
         100000000000000010, 100000000000000020, 2, 'posted'),
        (100000000000000001, 100000000000000003, 100000000000000007,
         100000000000000010, NULL, 1, 'below_threshold');
+-- Member-notification limiter (0471): hashed bucket keys only. One bucket is
+-- exhausted (ten admissions in the rolling window, zero credit, advanced
+-- high-water); the other holds partial credit and a short history. The
+-- roundtrip proves a restore cannot reset either back to a full budget.
+INSERT INTO internal_notify_budgets (bucket_key, credit_ms, updated_ms, admissions)
+VALUES (repeat('a', 64), 0, 1785578400000,
+        ARRAY[1785578100000, 1785578130000, 1785578160000, 1785578190000,
+              1785578220000, 1785578250000, 1785578280000, 1785578310000,
+              1785578340000, 1785578400000]::bigint[]),
+       (repeat('b', 64), 12960000, 1785578000000,
+        ARRAY[1785577000000, 1785578000000]::bigint[]);

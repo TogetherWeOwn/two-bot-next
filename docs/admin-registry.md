@@ -99,7 +99,7 @@ not the repair's operational backout. Keep migration history intact.
 
 ## Backup, rollback and privacy
 
-Backup discovers live columns dynamically. The current v15 inventory includes the
+Backup discovers live columns dynamically. The current v16 inventory includes the
 event voice pair, starboard and giveaway tables; this holder repair adds no table or archive
 version. New archives
 include both holder columns. Populated pre-holder archives cannot restore valid

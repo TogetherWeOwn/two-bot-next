@@ -70,7 +70,8 @@ use two_bot_core::{
         require_field_str, require_snowflake, unmapped_event_key, validate_announcement,
         validate_event_input, validate_event_key, validate_idempotency_key, ActionError,
         AuthDecision, AuthHeaders, AuthenticatedRequest, ErrorCode, GuildAddMemberRequest,
-        InternalFlags, RoleAssignRequest, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
+        InternalFlags, PlaceOfferSendRequest, ReminderSendRequest, RoleAssignRequest, TokenBuckets,
+        ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
     },
     internal_settings::SettingsCommand,
     member_moderation_store::PgMemberModerationStore,
@@ -82,6 +83,7 @@ use two_bot_core::{
 };
 use two_bot_cutover::{internal_settings::execute_settings, settings::SettingsStore};
 use two_bot_discord::executor::member::MemberOutcome;
+use two_bot_discord::executor::notify::NotifyOutcome;
 use two_bot_discord::internal_actions::{
     supports_event_mutation, AnnouncementExecutor, ExecutionOutcome, Refusal,
 };
@@ -113,18 +115,20 @@ const EVENT_GATE_WAIT: Duration = Duration::from_secs(8);
 /// (TOG-20119). Maps the already-bounded [`ActionLabel`] to one of
 /// `metrics::INTERNAL_ACTION_FAMILIES`: `announcement.post` to
 /// `announcement`, `event.*` to `event`, `settings.*` to `settings`,
-/// `moderation.*` to `moderation`, `role.assign`/`guild.add_member` to
-/// `membership`, `voice.snapshot` to `voice`; anything else (including
-/// unwired catalog verbs and unknown verbs) to `other`. Takes only the
-/// bounded label, never raw request bytes, so no secret, token, key id or
-/// body can become a metric label.
+/// `moderation.*` to `moderation`, `role.assign`/`guild.add_member` and the
+/// member-notify DM verbs to `membership`, `voice.snapshot` to `voice`;
+/// anything else (including unwired catalog verbs and unknown verbs) to
+/// `other`. Takes only the bounded label, never raw request bytes, so no
+/// secret, token, key id or body can become a metric label.
 fn internal_family(action: ActionLabel) -> &'static str {
     match action {
         ActionLabel::Known(name) => match name {
             "announcement.post" => "announcement",
             "event.read" | "event.upsert" | "event.cancel" => "event",
             "settings.get" | "settings.set" => "settings",
-            "role.assign" | "guild.add_member" => "membership",
+            "role.assign" | "guild.add_member" | "reminder.send" | "place_offer.send" => {
+                "membership"
+            }
             "voice.snapshot" => "voice",
             _ if name.starts_with("moderation.") => "moderation",
             _ => "other",
@@ -256,6 +260,38 @@ impl MemberEffect for ActionExecutor {
                     )
                 })
         })
+    }
+}
+
+/// Member-notify DM delivery: `reminder.send` and `place_offer.send` post a
+/// bot-side template (rendered from validated facts, never caller text) to the
+/// member's DMs. The receiver owns the durable claim; this trait owns only the
+/// Discord calls after the claim. The site owns scheduling and waitlist state;
+/// the bot owns only this delivery.
+trait NotifyEffect: Send + Sync {
+    fn execute_reminder<'a>(
+        &'a self,
+        request: &'a ReminderSendRequest<'a>,
+    ) -> BoxFuture<'a, Result<NotifyOutcome, ActionError>>;
+    fn execute_place_offer<'a>(
+        &'a self,
+        request: &'a PlaceOfferSendRequest<'a>,
+    ) -> BoxFuture<'a, Result<NotifyOutcome, ActionError>>;
+}
+
+impl NotifyEffect for ActionExecutor {
+    fn execute_reminder<'a>(
+        &'a self,
+        request: &'a ReminderSendRequest<'a>,
+    ) -> BoxFuture<'a, Result<NotifyOutcome, ActionError>> {
+        Box::pin(async move { self.send_reminder_dm(request).await })
+    }
+
+    fn execute_place_offer<'a>(
+        &'a self,
+        request: &'a PlaceOfferSendRequest<'a>,
+    ) -> BoxFuture<'a, Result<NotifyOutcome, ActionError>> {
+        Box::pin(async move { self.send_place_offer_dm(request).await })
     }
 }
 
@@ -909,6 +945,7 @@ struct ReceiverState {
     store: InternalActionStore,
     effect: Arc<dyn ActionEffect>,
     member: Arc<dyn MemberEffect>,
+    notify: Arc<dyn NotifyEffect>,
     event_read: Arc<dyn EventReadEffect>,
     event_mutate: Arc<dyn EventMutateEffect>,
     moderation: Arc<dyn ModerationEffect>,
@@ -950,6 +987,7 @@ impl ReceiverState {
         pool: sqlx::PgPool,
         effect: Arc<dyn ActionEffect>,
         member: Arc<dyn MemberEffect>,
+        notify: Arc<dyn NotifyEffect>,
         event_read: Arc<dyn EventReadEffect>,
         event_mutate: Arc<dyn EventMutateEffect>,
         moderation: Arc<dyn ModerationEffect>,
@@ -960,6 +998,7 @@ impl ReceiverState {
             store: InternalActionStore::new(pool),
             effect,
             member,
+            notify,
             event_read,
             event_mutate,
             moderation,
@@ -1246,8 +1285,10 @@ pub async fn bind(
         })?;
     // Membership shares the same admitted transport as event reads: one
     // token-wide lane for every Discord send. Cloned before the read wrapper
-    // takes ownership; role hierarchy and add-member PUTs hold the same lane.
+    // takes ownership; role hierarchy, add-member PUTs and member-notify DMs
+    // hold the same lane.
     let member = events.clone();
+    let notify = events.clone();
     let moderation_discord =
         ActionExecutor::with_admission(token.to_owned(), None, Arc::clone(&admission)).map_err(
             |_| std::io::Error::other("internal-action moderation executor configuration invalid"),
@@ -1272,6 +1313,7 @@ pub async fn bind(
                 pool.clone(),
                 Arc::new(executor),
                 Arc::new(member),
+                Arc::new(notify),
                 Arc::new(EventReadExecutor::new(events.clone(), pool.clone())),
                 Arc::new(EventMutationExecutor::new(events, pool)),
                 Arc::new(moderation),
@@ -1672,6 +1714,12 @@ async fn receive(
     if decision.action == "role.assign" || decision.action == "guild.add_member" {
         return execute_member(state, &decision, headers.idempotency, &raw, id, key, action).await;
     }
+    // Member-notify family: bot-rendered DM delivery for site-owned
+    // scheduling. Same nonce/bucket fences and durable-claim shape as the
+    // membership path; the site never sends free-form DM text.
+    if decision.action == "reminder.send" || decision.action == "place_offer.send" {
+        return execute_notify(state, &decision, headers.idempotency, &raw, id, key, action).await;
+    }
     // This second fence is explicit: core phase-1 defaults are not capabilities.
     if !AnnouncementExecutor::supports(&decision.action) {
         return reject(Failure::code(ErrorCode::ActionNotAllowed), action);
@@ -2036,6 +2084,208 @@ async fn execute_member(
                 return reject(Failure::reconciliation());
             }
             state.terminal(response, false, id, key.clone(), action)
+        }
+        Err(_) => {
+            mark_unknown_best_effort(&state.store, &claim, action).await;
+            reject(Failure::reconciliation())
+        }
+    }
+}
+
+/// Member-notify DM delivery (`reminder.send`, `place_offer.send`): validate
+/// the site's facts, take the durable claim, then post the bot-side template
+/// once. Field validation runs before the claim, so malformed facts refuse
+/// with no Discord call and no idempotency row. The claim, terminal receipts
+/// and replay mapping match the membership path, with two delivery-specific
+/// encodings: a posted DM finishes as `Success{Some(message_id), 1}` (wired
+/// to the `sent` envelope, never the announcement `message_id` envelope), and
+/// a definitive refusal from either DM call — closed DMs, a blocked bot, or
+/// no shared guild — finishes as `Success{None, 0}` (the `dm_unavailable`
+/// envelope), consuming no place. A suppressed member (contract v2 §7 consent
+/// backstop) finishes the same receipt before any Discord call, with the
+/// `suppressed` audit scalar. A 429 proves no effect, so the claim is
+/// released and the same key may retry; every other post-claim failure
+/// (timeout, transport, unreadable receipt, suppression-lookup error)
+/// retains the claim as `unknown`. The store charges the durable per-member
+/// budget atomically with a new claim, so replays never spend allowance.
+async fn execute_notify(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    idempotency_header: Option<&str>,
+    raw: &[u8],
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let idempotency = match validate_idempotency_key(idempotency_header, &decision.action) {
+        Ok(key) => key,
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    // Validate before the claim: no Discord call, no idempotency row on bad
+    // input. Retain the validated facts borrowed from the immutable signed
+    // body; only the member and bounded event-key scalars enter the audit.
+    enum Validated<'a> {
+        Reminder(ReminderSendRequest<'a>),
+        PlaceOffer(PlaceOfferSendRequest<'a>),
+    }
+    let validated = match decision.action.as_str() {
+        "reminder.send" => match ReminderSendRequest::validate(&decision.body) {
+            Ok(request) => Validated::Reminder(request),
+            Err(error) => return reject(Failure::from_action(error)),
+        },
+        "place_offer.send" => match PlaceOfferSendRequest::validate(&decision.body) {
+            Ok(request) => Validated::PlaceOffer(request),
+            Err(error) => return reject(Failure::from_action(error)),
+        },
+        _ => return reject(Failure::code(ErrorCode::ActionNotAllowed)),
+    };
+    let (target_id, event_key) = match &validated {
+        Validated::Reminder(request) => (request.discord_id(), request.event_key()),
+        Validated::PlaceOffer(request) => (request.discord_id(), request.event_key()),
+    };
+    let subject = {
+        let guild = match DiscordId::new(guild_id) {
+            Ok(id) => id,
+            Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+        };
+        let target = match DiscordId::new(target_id) {
+            Ok(id) => id,
+            Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+        };
+        AuditSubject {
+            guild_id: Some(guild),
+            target_id: Some(target),
+            actor_id: None,
+            resolved_role_id: None,
+        }
+    };
+    let Some(caller) = state.config.caller_for(&decision.key_id) else {
+        return reject(Failure::code(ErrorCode::Internal));
+    };
+    let identity = match RequestIdentity::new(caller, idempotency, &decision.action, raw) {
+        Ok(identity) => identity,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let claim = match state
+        .store
+        .claim_notify(&identity, &subject, event_key)
+        .await
+    {
+        Err(InternalStoreError::NotifyRateLimited { retry_after_secs }) => {
+            return reject(Failure::from_action(
+                ActionError::new(
+                    ErrorCode::RateLimited,
+                    "Rate limit exceeded for member notifications",
+                    "rate_limited_notify",
+                )
+                .with_retry_after(retry_after_secs),
+            ));
+        }
+        Ok(InternalClaim::Claimed(claim)) => claim,
+        Ok(InternalClaim::Replay(response)) => {
+            return state.terminal(response, true, id, key.clone(), action);
+        }
+        Ok(InternalClaim::Mismatch) => {
+            return reject(Failure::code(ErrorCode::VersionConflict));
+        }
+        Ok(InternalClaim::InFlight) => return reject(Failure::code(ErrorCode::InProgress)),
+        Ok(InternalClaim::NeedsReconciliation) => return reject(Failure::reconciliation()),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    // Contract v2 §7 consent backstop: the site owns member-facing notify
+    // preferences; the bot refuses a suppressed member before any Discord
+    // call. The receipt is the same `dm_unavailable` shape as a closed-DM
+    // refusal (200, consumes no place), but the terminal audit carries the
+    // `suppressed` scalar instead of `executor`. A database error fails
+    // closed: the claim is retained unknown and the member is not messaged,
+    // because an uncertain suppression must never send.
+    let suppression = {
+        let mut conn = match state.store.pool().acquire().await {
+            Ok(conn) => conn,
+            Err(_) => {
+                mark_unknown_best_effort(&state.store, &claim, action).await;
+                return reject(Failure::reconciliation());
+            }
+        };
+        two_bot_core::privacy::suppressed_in(&mut conn, guild_id, target_id).await
+    };
+    // Return the lookup connection before delivery or any store transition;
+    // even a one-connection pool must be able to persist the receipt.
+    let suppressed = match suppression {
+        Ok(suppressed) => suppressed,
+        Err(_) => {
+            mark_unknown_best_effort(&state.store, &claim, action).await;
+            return reject(Failure::reconciliation());
+        }
+    };
+    if suppressed {
+        if let Err(finish_error) = state.store.finish_suppressed(&claim).await {
+            log_terminal_persist_failed(action, "finish", finish_error);
+            mark_unknown_best_effort(&state.store, &claim, action).await;
+            return reject(Failure::reconciliation());
+        }
+        let response = TerminalResponse::Success {
+            resource_id: None,
+            affected: 0,
+            outcome: None,
+            stop_reason: None,
+        };
+        return state.terminal(response, false, id, key.clone(), action);
+    }
+    // The claim is committed: send only the facts validated before it.
+    let outcome = match &validated {
+        Validated::Reminder(request) => state.notify.execute_reminder(request).await,
+        Validated::PlaceOffer(request) => state.notify.execute_place_offer(request).await,
+    };
+    match outcome {
+        Ok(NotifyOutcome::Sent { message_id }) => {
+            let message_id = match DiscordId::new(&message_id) {
+                // The transport only returns snowflakes, so an unreadable id
+                // is an unknown outcome, never a receipt.
+                Ok(id) => id,
+                Err(_) => {
+                    mark_unknown_best_effort(&state.store, &claim, action).await;
+                    return reject(Failure::reconciliation());
+                }
+            };
+            let response = TerminalResponse::Success {
+                resource_id: Some(message_id),
+                affected: 1,
+                outcome: None,
+                stop_reason: None,
+            };
+            if let Err(finish_error) = state.store.finish(&claim, &response).await {
+                log_terminal_persist_failed(action, "finish", finish_error);
+                mark_unknown_best_effort(&state.store, &claim, action).await;
+                return reject(Failure::reconciliation());
+            }
+            state.terminal(response, false, id, key.clone(), action)
+        }
+        Ok(NotifyOutcome::DmUnavailable) => {
+            let response = TerminalResponse::Success {
+                resource_id: None,
+                affected: 0,
+                outcome: None,
+                stop_reason: None,
+            };
+            if let Err(finish_error) = state.store.finish(&claim, &response).await {
+                log_terminal_persist_failed(action, "finish", finish_error);
+                mark_unknown_best_effort(&state.store, &claim, action).await;
+                return reject(Failure::reconciliation());
+            }
+            state.terminal(response, false, id, key.clone(), action)
+        }
+        Err(error) if error.code == ErrorCode::RateLimited => {
+            // A 429 proves no effect, so the claim is released and the same
+            // key may retry. `Failure::from_action` carries the transport's
+            // `Retry-After` to the wire.
+            if let Err(release_error) = state.store.release_proven_not_sent(claim).await {
+                log_terminal_persist_failed(action, "release", release_error);
+                return reject(Failure::code(ErrorCode::Internal));
+            }
+            reject(Failure::from_action(error))
         }
         Err(_) => {
             mark_unknown_best_effort(&state.store, &claim, action).await;
@@ -3423,6 +3673,17 @@ fn terminal_response(
     id: &str,
 ) -> Response {
     let mut wire = match response {
+        // Member-notify `sent`: the message id lives in the audit row, while
+        // the wire carries the outcome word the card promises. Guarded before
+        // the announcement arm below, which shares the receipt shape.
+        TerminalResponse::Success {
+            resource_id: Some(_),
+            affected: 1,
+            outcome: None,
+            stop_reason: None,
+        } if matches!(action.as_str(), "reminder.send" | "place_offer.send") => {
+            member_success("sent", id)
+        }
         TerminalResponse::Success {
             resource_id: Some(message_id),
             affected: 1,
@@ -3457,6 +3718,9 @@ fn terminal_response(
             ("role.assign", 0) => member_success("already_held", id),
             ("guild.add_member", 1) => member_success("added", id),
             ("guild.add_member", 0) => member_success("already_member", id),
+            // Member-notify `dm_unavailable`: closed DMs, a blocked bot, or
+            // no shared guild. A 200 outcome that consumes no place.
+            ("reminder.send", 0) | ("place_offer.send", 0) => member_success("dm_unavailable", id),
             _ => Failure::reconciliation().response(id),
         },
         TerminalResponse::Success { .. } => Failure::reconciliation().response(id),
@@ -3530,6 +3794,7 @@ fn unknown_persist_class(error: InternalStoreError) -> &'static str {
         InternalStoreError::InvalidInput => "invalid_input",
         InternalStoreError::Unavailable => "storage_unavailable",
         InternalStoreError::TransitionRefused => "transition_refused",
+        InternalStoreError::NotifyRateLimited { .. } => "rate_limited_notify",
     }
 }
 
