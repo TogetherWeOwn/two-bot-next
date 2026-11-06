@@ -152,6 +152,13 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Unmeasurable("monotonic revision counter with no timestamp column; changes are visible via guild_settings.updated_at", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec { table: "internal_action_log", measure: TableMeasure::Columns(&["created_at"]) },
+    // This high-water timestamp never retreats, so it is not a wall-clock
+    // write time. Preserve the singleton through image rollback; audit-bearing
+    // recovery needs separately qualified state/tuple reconciliation.
+    TableSpec {
+        table: "internal_audit_order",
+        measure: TableMeasure::Unmeasurable("transactional audit high-water state has no wall-clock write timestamp; retain it on image rollback and reconcile it with audit tuples only through qualified offline recovery", DISPOSITION_MANUAL_RECONCILE_REQUIRED),
+    },
     // One row per clock domain, rewritten on every burn; observed_at is the
     // DB instant that advanced the mark, so its maximum is the row's last write.
     TableSpec { table: "internal_clock_high_water", measure: TableMeasure::Columns(&["observed_at"]) },
