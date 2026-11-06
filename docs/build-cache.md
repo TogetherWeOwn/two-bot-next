@@ -299,14 +299,17 @@ The legacy `audit` above covers worktree targets only and **must never prune
 the shared pool**. Over-budget shared slots with dead recorded holders need a
 separate, reviewed retention path that holds exclusivity through the mutation
 itself: `scripts/cargo_cache.py retain`. It mutates **exact slot paths only**
-(`slot-N/target`, `slot-N/scratch`, `slot-N/lease.json`, then recreates empty
-`target`+`scratch`) while holding the SAME slot `lock` flock fd/inode from
+(deletes `slot-N/target` and `slot-N/scratch`, recreates both with their original
+metadata, then unlinks `slot-N/lease.json`) while holding the SAME slot `lock` flock fd/inode from
 re-verify through deletion and recreation. It never releases-then-deletes,
 never replaces the lock file, and never touches `policy.json`, budgets,
 quotas, registries, services, or `/tmp`.
 
 Supply a fresh, complete, **host-scope** slot inventory (distinct `slots` key,
-not `workspaces`):
+not `workspaces`). The sample lists only `slot-1`. A policy slot with no row
+(here `slot-0`) is unattributed: it is reported ineligible and skipped with its
+lease kept. The generic CLI still read-only inspects every policy slot, so a
+receipt can show `slot-0` as skipped even though it was never a candidate.
 
 ```json
 {
@@ -316,9 +319,10 @@ not `workspaces`):
   "captured_at_unix": 1790737200,
   "slots": [
     {
-      "path": "/paperclip/.cache/two-bot-next-bounded/slot-0",
+      "path": "/paperclip/.cache/two-bot-next-bounded/slot-1",
       "issue_id": "actual-issue-uuid",
-      "status": "done",
+      "status": "blocked",
+      "idle_stale": true,
       "live_run": false,
       "referenced": false,
       "target_provenance": "build_output_only"
@@ -327,13 +331,33 @@ not `workspaces`):
 }
 ```
 
-`live_run` covers **running, queued and retry** runs; `referenced` covers
-**all execution/project/shared workspace refs** to that exact slot.
-`target_provenance: build_output_only` is an independently recorded,
-exact-slot Operator classification (unclassified/mixed/unknown or missing
-stays ineligible). `complete: true` only after accounting for the whole
-relevant control-plane set. The inventory must be at most 60 seconds old
-both before AND after the scan; missing/ambiguous rows fail closed.
+This example is not a usable inventory; every value comes from a fresh
+control-plane export.
+
+Row semantics (all independently assessed, none inferred by the tool):
+
+- **Status gate.** A terminal status passes. A nonterminal row (including
+  `blocked`, `in_progress` or `in_review`) passes this gate only with
+  `idle_stale` set to the JSON boolean `true`. Absent or `false` does not open
+  the gate; a present string, number or null refuses the whole run.
+  `idle_stale` records an independent Operator assessment, not a tool inference
+  or elapsed-time heuristic. Keep the true issue status; never make an active
+  checkout terminal. It opens **only** the status gate, not any other veto.
+- **`live_run`** covers running, queued and retry runs on **all related**
+  issues.
+- **`referenced`** covers every execution, project and shared-workspace
+  reference to that **exact slot**, including namespace/mount aliases. A mere
+  reference to the active **source checkout** is not a reference to the cache
+  slot. Any actual exact-slot reference still vetoes, even on a terminal card.
+- **`target_provenance: build_output_only`** is one existing field that attests
+  **both** the exact slot's `target` **and** `scratch` independently; each is
+  also checked by the tool's own veto heuristics. Unclassified, mixed,
+  unknown or missing stays ineligible. There is no separate schema field for
+  scratch.
+
+`complete: true` only after accounting for the whole relevant control-plane
+set. The inventory must be at most 60 seconds old both before AND after the
+scan; missing/ambiguous rows fail closed.
 
 Run on the **host in its PID namespace** with read access to *all* process
 cwd, exe, fd, mmap **and cmdline** entries, including container processes.
@@ -351,7 +375,7 @@ python3 scripts/cargo_cache.py retain \
   --pool /paperclip/.cache/two-bot-next-bounded \
   --inventory /RUN-SCRATCH/two-pool-inventory.json \
   --proc-root /proc \
-  --evidence /RUN-SCRATCH/two-pool-retain-receipt.json
+  --evidence /EXTERNAL-EVIDENCE/new-two-pool-retain-receipt.json
 ```
 
 Output is JSON with `retain: true`, an `excluded_deleted_references` count,
@@ -415,40 +439,126 @@ are held throughout). The read-only legacy `audit` keeps the strict global
 rule except for the same non-file identity exclusion; only `retain`
 partitions by device.
 
-### Bounded TWO-only build/dispatch admission hold (and undo)
+### Idle-stale over-budget exact-slot retention lifecycle
+
+This lifecycle applies only to independently assessed **idle-stale,
+over-budget build output**, retaining its true issue status. It does not
+extend retention to active or under-budget caches. The generic command does
+not enforce the over-budget scope: the Operator must measure whole-slot
+allocated bytes against the unchanged policy and omit every other candidate.
+An old incident receipt or a free lock is context, never eligibility.
+
+The assessment records the current lease holder identities and dead/ended
+wrapper, Cargo process-group and control-plane run evidence; complete absence
+of running/queued/retry work and exact-slot references; host/container namespace
+and device/inode reconciliation; and independent target **and** scratch output
+classification. Age alone establishes none of these. Preserve source, active
+and shared workspaces, evidence, backups and incident archives: they are never
+cache candidates. Any doubt before execution means STOP, no mutation handoff.
+
+1. **What `retain` does.** For an eligible slot it deletes `target` and
+   `scratch`, recreates them empty, and unlinks `lease.json` only after that
+   succeeds. There is no target-only mode, no dry-run and no lease-preserving
+   mode. If the situation needs the lease left in place, STOP: this command is
+   not the right tool.
+2. **Preserve evidence before any mutation.** The CLI does not copy lease
+   bytes. The Operator independently archives, outside the pool, the original
+   `lease.json` raw bytes and their hash, plus the relevant transcript and
+   diagnostics in a persistent external evidence location (not disposable run
+   scratch). Verify the copy byte-for-byte and record its hash before proceeding.
+   The transcript captures the invocation, stdout/stderr and exit status. If any
+   evidence write fails, STOP. A preservation veto from the
+   tool remains a veto. If output data must be kept, preserve it under a
+   separately reviewed, bounded procedure and then restart the whole
+   assessment from a fresh inventory.
+3. **Record identities.** Record the exact slot identities (path,
+   `(st_dev, st_ino)` of the slot, `lock`, `target`, `scratch`, owner uid/gid
+   and permission modes) and the allocated bytes before and after.
+4. **Verify the release conditions** before handing the slot back: that the
+   recreated metadata is valid and writable by the build user; that the
+   existing project quota (project id 9380) is inherited by the recreated
+   directories; and that the hard quota is in force. Do not rely on a late,
+   unlocked `chmod`/`chown` or on policy or quota edits to repair a slot.
+   `retain` checks both roots for known owner/group restoration impossibilities
+   before deleting either, under the same original lock. Ordinary non-root
+   callers must own both roots and either belong to each recorded group or
+   inherit it from a setgid parent; non-member inheritance cannot restore a
+   setgid mode. This preflight is not a guarantee against later syscall failures.
+   The command restores valid uid/gid and full permission modes under that lock.
+   If restoration fails it keeps the lease and reports the partial mutation.
+   The kept lease alone does not fence admission: maintain the independent hold
+   through post-verification and STOP for separately authorized recovery.
+5. **Evidence receipt.** Use `--evidence` with a **new**, external file; the CLI
+   refuses an existing path rather than overwriting evidence. It creates and
+   fsyncs a prepared record and its parent before invoking `retain`; this is
+   not the lease archive or transcript. The final receipt write can
+   still fail after mutation. On final write/flush/fsync failure the CLI emits
+   the actual structured per-slot result to stderr before refusing with exit 75;
+   capture it in the persistent transcript. A missing or incomplete receipt
+   therefore never proves that nothing was mutated: compare the recorded
+   identities and allocated bytes.
+
+#### Bounded TWO-only build/dispatch admission hold
 
 Existing supported controls only: slot `lock` flocks, `timeout(1)`,
 read-only `policy.json`, and a fresh inventory. No service stop, no mass
-cancellation, no environment/roster change. Running workers keep their slots:
-the holder below uses non-blocking locks and never steals or kills.
+cancellation, no environment/roster change, no policy or quota edit. Running
+workers keep their slots: any holder uses non-blocking locks and never steals
+or kills.
 
-1. Record pre-hold state: `sha256sum policy.json`, lock inodes (`stat`), and
-   lease hashes. If `run` admission already refuses (wedged pool, no idle
-   below-budget slot), record that refusal as the hold evidence and skip to
-   step 4 — no holder process is needed.
-2. Otherwise start a bounded holder (e.g. `timeout 300`) that non-blocking
-   flocks each *free* slot lock and sleeps; locks held by running workers
-   fail `LOCK_NB` and are reported as preserved, never touched.
-3. Validate scope and quiescence: the holder reports held vs worker-held
-   slots; a re-probe shows no idle slot for new `run` admission. Export a
-   fresh complete host-scope inventory (≤60s): every row terminal with
-   `live_run: false` and `referenced: false`.
-4. Release the holder (kill its PID; expiry is the `timeout`) and run `retain`
-   immediately in the same shell with the fresh inventory and an evidence
-   path. The residual release-to-acquire race stays fail-closed: a new writer
-   holds its slot lock (slot skips, lease kept) and inventory revalidation
-   refuses a stale run with no mutation.
-5. Release/expiry: the holder always ends via kill or timeout; `retain` ends
-   by exiting. Verify the post-run inventory and the evidence receipt.
+1. Start with a bounded **TWO-only** admission/dispatch hold, with its exact
+   mechanism, scope, expiry and undo recorded. It must prevent new TWO starts
+   through assessment, mutation **and post-verification** without changing
+   services, environments or other projects. If an existing supported fence
+   covering that whole interval cannot be demonstrated, STOP and request a
+   separately reviewed hold procedure; do not improvise one. Record pre-hold
+   `sha256sum policy.json`, lock inodes (`stat`), lease hashes and external
+   evidence copies. The source checkout and omitted `slot-0` stay preserved.
+2. A refusal of `run` admission may serve as hold evidence only if it was
+   freshly proven and every new-run and race assumption still holds for the
+   whole window (for example, no idle below-budget slot can appear). Observing
+   that a lock is free is **not** sufficient evidence of a hold.
+3. Otherwise start a bounded holder (for example `timeout 300`) that
+   non-blocking flocks each *free* slot lock and sleeps. Locks held by running
+   workers fail `LOCK_NB` and are reported as preserved, never touched.
+4. Validate scope and quiescence, then complete the inventory. Export it and
+   require the target row to satisfy the status gate above, with
+   `live_run: false` and `referenced: false`. Do not stretch a preparation hold
+   across asynchronous review: record its release/expiry, then establish a fresh
+   bounded execution hold. **Re-export** after review and after any hold expiry. A
+   complete inventory (at most 60 seconds old) must exist both before and after
+   the process scan. The scan runs on the host namespace and covers processes
+   plus alias device/inode identity.
+5. If anything is doubtful (stale or expired hold, incomplete scan, unexplained
+   reference, changed identity), do not hand off for mutation.
+6. **Handoff** to run `retain` is Operator-only and needs a separate
+   authorization, given only after the reviewed source is merged. Do not run
+   it from an unmerged or unreviewed copy.
+7. Under that independent admission fence, release only the temporary flock
+   holder and run `retain` immediately in the same shell with the fresh
+   inventory and an evidence path. The CLI needs the **original** lock inode;
+   never unlink, replace or manually clear the lock/lease. A concurrent holder
+   skips the slot, and stale inventory refuses, but neither makes the
+   release-to-acquire gap atomic. If any dispatcher can start work in that gap
+   or before post-verification, STOP: slot flocks alone cannot provide this
+   continuous fence. Reassess from fresh evidence after any expiry.
+8. Before releasing admission, retain the post-run control-plane/process scan
+   and receipt, verify the release conditions above (build-user writability,
+   inherited project 9380 and hard quota), and compare policy hash, original
+   lock identity, exact paths and allocated bytes. Source and `slot-0` must be
+   unchanged. Failed restoration or verification means STOP and a separately
+   authorized recovery, never a late unlocked metadata repair.
 
-Undo (retain never ran or aborted before mutation): release the holder,
-verify `policy.json` hash, lock inodes and lease files match the pre-hold
-record, and re-probe admission behavior. A missing receipt does not prove no
-mutation occurred; verify actual paths/outcome. Running workers were never
-touched. If `retain` mutated some slots
-and then must be rolled back, regenerable output rebuilds through the
-repaired bounded pool; source, secrets, services and archives have no
-rollback change here.
+If `retain` never ran, or refused before mutation, release the holder and
+verify that the `policy.json` hash, lock inodes and lease files match the
+pre-hold record, then re-probe admission. Do not read the absence of a receipt
+as proof of that (see step 5 above): check the recorded identities. A completed
+or partial mutation cannot be undone by this procedure. Deleted output is
+regenerable and rebuilds only after the bounded pool is verified usable. The
+archived lease is historical evidence, not an instruction to restore or unlink
+a live sentinel manually. Source, secrets, services and archives are not changed
+here. Code merge authorizes no host mutation; a fresh reviewed evidence pack
+and separate normal Operator execution authorization are still required.
 
 ## /home available-byte alarm
 
@@ -489,9 +599,13 @@ and readiness packets in the restricted remediation card, not the public PR.
 - Bounded-pool `retain` is a **separate lock-through-mutation path**. Reuse its
   exact-slot eligibility, evidence and same-lock controls above, including its
   bounded holder-to-`retain` transition; do not replace them with this checklist.
-  Its optional `--evidence` receipt is written after mutation, not a pre-mutation
-  audit export; a missing receipt does not prove no mutation occurred. This
-  legacy-removal contract adds no `retain` dry-run or new tool capability.
+  With `--evidence`, the CLI exclusively creates and fsyncs a new external
+  prepared record and its parent before invoking `retain`; the final result
+  receipt is written afterwards and can still fail after mutation. Neither is
+  a legacy pre-mutation audit export, and a missing or incomplete receipt does
+  not prove no mutation occurred. Follow the pool lifecycle's external lease
+  archive and transcript requirements as well. This legacy-removal contract
+  adds no `retain` dry-run or new tool capability.
   A slot holder is not a general hold for legacy or external writers.
 - Primary shared-workspace targets, old shared caches and arbitrary external
   targets are **unsupported by the legacy audit**. An empty audit, terminal
@@ -571,9 +685,10 @@ cannot override any STOP below. Before **ANY mutation, including rename**:
 4. Retain and verify the **final evidence BEFORE mutation**: exact-target binding,
    hold record, fresh inventory, complete scan/audit output and exit status,
    provenance/references and allocated bytes before. This ordering is required
-   for the separately authorized legacy procedure; it is not supplied by
-   `retain`'s post-mutation receipt. Pool retention follows its separate controls
-   above; never run legacy `audit` as a substitute or release its mutation lock.
+   for the separately authorized legacy procedure; neither `retain`'s prepared
+   record nor its final result receipt supplies that legacy preflight evidence.
+   Pool retention follows its separate controls above; never run legacy `audit`
+   as a substitute or release its mutation lock.
 5. Only if every gate still passes, use the separately authorized exact-path
    procedure. Missing/expired hold, stale inventory, denied/incomplete scan,
    positive reference, unsupported path or **failed final evidence write** means
