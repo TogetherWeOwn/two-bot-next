@@ -923,7 +923,7 @@ async fn apply_import_guild_settings_ignores_destination_owned_cas() -> TestResu
     result.and(cleaned)
 }
 
-/// Minimal identity-bearing audit table plus the real activation migration.
+/// Minimal identity-bearing audit table for the pre-activation import case.
 const AUDIT_TABLE_SQL: &str = "CREATE TABLE internal_action_log (
     audit_id BIGINT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL)";
 const AUDIT_TRIGGER_SQL: &str = include_str!("../migrations/0472_internal_audit_order.sql");
@@ -946,7 +946,8 @@ async fn apply_import_refuses_audit_rows_when_ordering_trigger_installed() -> Te
         "auditguard",
         &[
             include_str!("../migrations/0210_tickets.sql"),
-            AUDIT_TABLE_SQL,
+            // Activation binds both audit tables; use their real base migration.
+            include_str!("../migrations/0350_internal_actions.sql"),
             AUDIT_TRIGGER_SQL,
         ],
     )
@@ -985,6 +986,13 @@ async fn apply_import_refuses_audit_rows_when_ordering_trigger_installed() -> Te
             .fetch_one(&db.pool)
             .await?;
         assert_eq!((tickets, audits), (0, 0), "nothing was written");
+        let allocator_unchanged: bool = sqlx::query_scalar(
+            "SELECT last_audit_id = 0 AND last_created_at = TIMESTAMPTZ '1970-01-01 00:00:00+00'
+             FROM internal_audit_order WHERE singleton",
+        )
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(allocator_unchanged, "refused imports never advance allocation");
         // An audit-free file is not blocked by the installed trigger.
         let free = parse_import(&line("tickets", &ticket_row("t-a2"))).expect("valid");
         let outcome = apply_import(&db.pool, &free)
