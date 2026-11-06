@@ -427,10 +427,10 @@ not canonical staging qualification or production promotion.
   checkpoint/run/time correspondence, exclusive expiry and all four runtime/
   installation read ages are compared at the operation time. Unassigned startup,
   drain or restoration operations have no default phase. Cleanup explicitly
-  refuses `unsupported_recovery_authority`: recovery read/checkpoint claims do
-  not yet bind separate installation revalidation or a recovery boundary fence;
-  an ordinary fresh effect-batch/final fence cannot substitute for them. This
-  layer does not authenticate authority or prove phase completion. Authority and state-chain comparisons now share the exact
+  refuses `unsupported_recovery_authority`: the separate recovery graph is not
+  yet integrated with this phase consumer and the complete state-chain checker;
+  an ordinary fresh effect-batch/final fence cannot substitute for recovery.
+  This layer does not authenticate authority or prove phase completion. Authority and state-chain comparisons now share the exact
   setup-write classifier with this layer: one matching setup entry, no duplicate
   or cleanup overlap, identical complete transition claim, insert/CAS method and
   a snapshot-to-rollout timestamp are required. Such a write uses its named
@@ -550,10 +550,20 @@ not canonical staging qualification or production promotion.
   `scripts/ci/test_announcement_runtime_recovery_boundary.py` pairs the ordinary
   authority graph and separate recovery graph on one synthetic scope and clock.
   Its ordinary-operation prefix is only a partial positive control, not a full
-  receipt: adding cleanup must reach the named authority mismatch and explicit
-  lifecycle refusal. It also checks that current recovery claims cannot replace
-  an expired ordinary lease, missing ordinary installation evidence or stale
-  final checks. This fixture does not qualify telemetry, literal resources,
+  receipt. The ordinary authority checker now delegates exact cleanup-ledger
+  operations to the complete existing recovery ownership comparison, including
+  its plan/grant/read/history/fence/installation prerequisites. Cleanup cannot
+  use runtime grant/nonce/epochs or borrow an ordinary named checkpoint, and a
+  non-cleanup operation cannot borrow recovery authority. Missing recovery
+  layers, differing transition claims, duplicate cleanup membership and read/wire
+  effects disguised as cleanup refuse. No missing cleanup effect is excused:
+  full ledger/telemetry/phase accounting remains mandatory. The full paired
+  authority comparison can agree while the lifecycle checker must still refuse;
+  state-chain and phase-consumer integration remain unfinished. Current recovery
+  claims cannot replace an expired ordinary lease, missing ordinary installation
+  evidence or stale final checks. The ordinary 60-second checkpoint-age control
+  deliberately excludes cleanup to isolate it from recovery's stricter final
+  fence expiry. This fixture does not qualify telemetry, literal resources,
   restoration or recovery beyond the original execution lease.
 - `scripts/announcement_runtime_drain.py` resolves four closed work-inventory,
   snapshot, fence and drain claim kinds alongside the lifecycle-ledger comparison.
@@ -662,7 +672,7 @@ must not be called as a substitute for any canonical admission control.
 ## Offline claim-checking entry point
 
 `scripts/announcement_runtime_check.py` composes bounded archive intake,
-closed same-run typed sidecars, all twenty-three existing public claim comparisons
+closed same-run typed sidecars, all twenty-four existing public claim comparisons
 and final all-used sidecar accounting. It is **not an independently provisioned
 verifier, receipt producer or runtime admission path**. The local Git topology
 collector is not invoked; authenticated source/service inventories, complete

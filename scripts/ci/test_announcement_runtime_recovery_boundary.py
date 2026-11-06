@@ -2,11 +2,11 @@
 
 Unlike the earlier recovery-only fixtures, ordinary runtime scope, decisions,
 reads, installation anchors and checkpoints agree with this receipt. Ordinary
-setup/read/setting writes pass the real authority checker when compared alone;
-adding cleanup reaches the exact unsupported cross-consumer boundary, not an
-unrelated scope or timestamp error. No checker is mocked or omitted from the
-production entry point. Telemetry, literal resources and process restoration are
-still incomplete, and both runtime admission and lifecycle cleanup MUST refuse.
+setup/read/setting writes and separately scoped cleanup pass the real authority
+checker together. State-chain/lifecycle consumers remain incomplete, not hidden
+behind an unrelated scope or timestamp error. No checker is mocked or omitted
+from the production entry point. Telemetry, literal resources and process
+restoration are still incomplete; runtime admission and lifecycle MUST refuse.
 
 Timeline: ordinary lease 00:00-00:40, attempt 00:00-00:22, setup 00:02,
 rollout 00:05, read 00:12, setting write 00:15, separately authorized cleanup
@@ -33,7 +33,7 @@ from announcement_runtime_recovery import RECOVERY_PLAN_REF, check_recovery_owne
 from announcement_runtime_schema import Refusal, utc
 from test_announcement_runtime_recovery_fences import repin_recovery_scope
 from test_announcement_runtime_recovery_grant import GRANT, SCOPE
-from test_announcement_runtime_recovery_ownership import ownership_fixture
+from test_announcement_runtime_recovery_ownership import ownership_fixture, set_claim
 
 
 CLOCKS = ("00:00:10", "00:02:00", "00:05:00", "00:15:00", "00:12:00", "00:22:00")
@@ -103,7 +103,8 @@ def ordinary_prefix(receipt):
 
     Keep the original exact authority/resource scope and all final checkpoints.
     This deliberately partial projection is only a positive control that the
-    ordinary graph itself works. The full paired receipt below MUST refuse.
+    ordinary graph itself works without recovery delegation. This is never a
+    complete receipt-verification result.
     """
     result = copy.deepcopy(receipt)
     for field in ("actual_effects", "expected_effects"):
@@ -129,14 +130,15 @@ class RecoveryBoundary(unittest.TestCase):
                 with self.assertRaisesRegex(Refusal, "unsupported$"):
                     runtime_preflight()
 
-    def test_full_authority_graph_reaches_named_cleanup_boundary(self):
+    def test_full_authority_graph_compares_separate_cleanup_without_admitting_lifecycle(self):
         for prior in PRIORS:
             with self.subTest(prior=prior):
                 receipt, records, now = paired_fixture(prior)
-                with self.assertRaisesRegex(Refusal, "transition_authority$"):
-                    check_authority_graph_claims(receipt, evidence_index(records), now)
+                self.assertIsNone(check_authority_graph_claims(receipt, evidence_index(records), now))
                 with self.assertRaisesRegex(Refusal, "unsupported_recovery_authority$"):
                     check_lifecycle_phase_claims(receipt, evidence_index(records), now)
+                with self.assertRaisesRegex(Refusal, "unsupported$"):
+                    runtime_preflight()
 
     def test_recovery_grant_cannot_replace_expired_ordinary_lease(self):
         for prior in PRIORS:
@@ -146,12 +148,14 @@ class RecoveryBoundary(unittest.TestCase):
                 # A coherent, current recovery graph is deliberately insufficient.
                 self.assertIsNone(check_recovery_ownership_claims(receipt, evidence_index(records), now))
                 with self.assertRaisesRegex(Refusal, "expiry$"):
-                    check_authority_graph_claims(ordinary_prefix(receipt), evidence_index(records), now)
+                    check_authority_graph_claims(receipt, evidence_index(records), now)
 
     def test_exactly_sixty_second_final_checkpoint_does_not_extend_its_lifetime(self):
         for prior in PRIORS:
             with self.subTest(prior=prior):
                 receipt, records, now = paired_fixture(prior)
+                # Isolate ordinary checkpoint age: the separate recovery final
+                # fence has its own strict expiry before this 60-second boundary.
                 self.assertIsNone(check_authority_graph_claims(ordinary_prefix(receipt),
                     evidence_index(records), now + timedelta(seconds=60)))
                 with self.assertRaisesRegex(Refusal, "stale_checkpoint$"):
@@ -178,12 +182,11 @@ class RecoveryBoundary(unittest.TestCase):
                     # Checkpoint is current, while the chosen independent pair
                     # has exactly 60-second reads. Separate recovery stays valid.
                     self.assertEqual(checkpoint["checked_at"], at("00:22:00"))
-                    self.assertIsNone(check_authority_graph_claims(
-                        ordinary_prefix(receipt), evidence_index(records), now))
+                    self.assertIsNone(check_authority_graph_claims(receipt, evidence_index(records), now))
                     self.assertIsNone(check_recovery_ownership_claims(
                         receipt, evidence_index(records), now + timedelta(seconds=1)))
                     with self.assertRaisesRegex(Refusal, "stale_read$"):
-                        check_authority_graph_claims(ordinary_prefix(receipt), evidence_index(records),
+                        check_authority_graph_claims(receipt, evidence_index(records),
                                                     now + timedelta(seconds=1))
 
     def test_missing_ordinary_installation_still_refuses_with_valid_recovery(self):
@@ -197,7 +200,79 @@ class RecoveryBoundary(unittest.TestCase):
                 del records[records[ref]["data"]["controller_read_ref"]]
                 self.assertIsNone(check_recovery_ownership_claims(receipt, evidence_index(records), now))
                 with self.assertRaisesRegex(Refusal, "unresolved_reference$"):
-                    check_authority_graph_claims(ordinary_prefix(receipt), evidence_index(records), now)
+                    check_authority_graph_claims(receipt, evidence_index(records), now)
+
+    def test_cleanup_requires_every_separate_recovery_layer(self):
+        for prior in PRIORS:
+            for ref in (GRANT, "runtime-recovery-checkpoints", "runtime-recovery-fences",
+                        "runtime-recovery-installations", "recovery-install-read-cleanup-controller",
+                        "match-" + CLEANUP):
+                with self.subTest(prior=prior, ref=ref):
+                    receipt, records, now = paired_fixture(prior)
+                    self.assertIsNone(check_authority_graph_claims(receipt, evidence_index(records), now))
+                    self.assertIn(ref, records)
+                    del records[ref]
+                    # Ordinary checks alone cannot mask the missing recovery layer.
+                    self.assertIsNone(check_authority_graph_claims(
+                        ordinary_prefix(receipt), evidence_index(records), now))
+                    with self.assertRaisesRegex(Refusal, "unresolved_reference$"):
+                        check_authority_graph_claims(receipt, evidence_index(records), now)
+
+    def test_cleanup_witness_cannot_reuse_ordinary_grant_nonce_or_epoch(self):
+        for prior in PRIORS:
+            for field in ("execution_ref", "nonce_ref", "authority_epoch"):
+                with self.subTest(prior=prior, field=field):
+                    receipt, records, now = paired_fixture(prior)
+                    authority = receipt["authority"]
+                    value = authority["epoch"] if field == "authority_epoch" else authority[
+                        "execution"]["ref" if field == "execution_ref" else "nonce_ref"]
+                    records["match-" + CLEANUP]["data"][field] = value
+                    with self.assertRaisesRegex(Refusal, "recovery_ownership_match$"):
+                        check_authority_graph_claims(receipt, evidence_index(records), now)
+
+    def test_cleanup_must_use_its_named_recovery_checkpoint(self):
+        for prior in PRIORS:
+            with self.subTest(prior=prior):
+                receipt, records, now = paired_fixture(prior)
+                set_claim(receipt, records, authority_ref="checkpoint-3")
+                with self.assertRaisesRegex(Refusal, "recovery_named_checkpoint$"):
+                    check_authority_graph_claims(receipt, evidence_index(records), now)
+
+    def test_ordinary_write_cannot_borrow_recovery_checkpoint(self):
+        for prior in PRIORS:
+            with self.subTest(prior=prior):
+                receipt, records, now = paired_fixture(prior)
+                records["transition-" + INTERIOR]["data"]["claim"]["authority_ref"] = (
+                    receipt["lifecycle"]["cleanup"][0]["authority_ref"])
+                self.assertIsNone(check_recovery_ownership_claims(receipt, evidence_index(records), now))
+                with self.assertRaisesRegex(Refusal, "transition_authority$"):
+                    check_authority_graph_claims(receipt, evidence_index(records), now)
+
+    def test_cleanup_membership_cannot_hide_read_or_wire_effects(self):
+        for prior in PRIORS:
+            for method in ("db_read", "member_get"):
+                with self.subTest(prior=prior, method=method):
+                    receipt, records, now = paired_fixture(prior)
+                    for field in ("actual_effects", "expected_effects"):
+                        next(effect for effect in receipt["observations"][field]
+                             if effect["operation_id"] == CLEANUP)["method"] = method
+                    with self.assertRaisesRegex(Refusal, "lifecycle_operation$"):
+                        check_authority_graph_claims(receipt, evidence_index(records), now)
+
+    def test_cleanup_ledger_requires_unique_complete_transition_claims(self):
+        for prior in PRIORS:
+            for mutation in ("duplicate", "different_claim"):
+                with self.subTest(prior=prior, mutation=mutation):
+                    receipt, records, now = paired_fixture(prior)
+                    if mutation == "duplicate":
+                        receipt["lifecycle"]["cleanup"].append(copy.deepcopy(
+                            receipt["lifecycle"]["cleanup"][0]))
+                        code = "reference_duplicate"
+                    else:
+                        receipt["lifecycle"]["cleanup"][0]["authority_ref"] = "other-checkpoint"
+                        code = "lifecycle_transition"
+                    with self.assertRaisesRegex(Refusal, code + "$"):
+                        check_authority_graph_claims(receipt, evidence_index(records), now)
 
 
 if __name__ == "__main__":

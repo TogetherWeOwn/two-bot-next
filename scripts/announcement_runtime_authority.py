@@ -348,7 +348,12 @@ def check_authority_graph_claims(receipt, evidence, now):
                     for checkpoint, install in matching), "stale_mutation_read")
 
     mutation_checkpoint("rollout", receipt["rollout"]["started_at"])
+    cleanup_operations = {entry["operation_id"] for entry in receipt["lifecycle"]["cleanup"]}
+    recovery_required = False
     for effect in receipt["observations"]["actual_effects"]:
+        if effect["operation_id"] in cleanup_operations:
+            recovery_required = True
+            continue
         named_ref = None
         phase = "effect_batch"
         # Missing transition evidence still refuses in the telemetry/state-chain
@@ -365,6 +370,13 @@ def check_authority_graph_claims(receipt, evidence, now):
             named_ref = claim["authority_ref"]
             phase = _db_checkpoint_phase(receipt, effect, claim)
         mutation_checkpoint(phase, effect["observed_at"], named_ref)
+    if recovery_required:
+        # Recovery uses authority helpers and the narrower lifecycle ledger, not
+        # this graph. Defer the import to avoid a module initialization cycle.
+        # Exact ledger membership selects the separate grant/read/fence/witness
+        # comparison; it never extends ordinary effects or their execution lease.
+        from announcement_runtime_recovery import check_recovery_ownership_claims
+        check_recovery_ownership_claims(receipt, evidence, now)
     _unique(fence_refs, "mutation_fence_replay")
     require(used_reads == reads.keys(), "unreferenced_authority_read")
     require(final_histories == [source["history_ref"], source["history_ref"]], "current_history")

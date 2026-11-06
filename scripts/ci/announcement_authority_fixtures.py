@@ -41,6 +41,10 @@ def decision(role, scope_digest, *, installation=False, recovery=False):
 
 def authority_fixture():
     receipt, records, _ = provenance_fixture()
+    # Nonempty schema placeholders are not actual ordinary effects or cleanup.
+    # Keep them disjoint so this partial graph does not select recovery checks.
+    for phase in ("setup", "cleanup"):
+        receipt["lifecycle"][phase][0]["operation_id"] = "unresolved-" + phase + "-operation"
     a, control, attempt = receipt["authority"], receipt["control"], receipt["attempt"]
 
     def add(ref, kind, data):

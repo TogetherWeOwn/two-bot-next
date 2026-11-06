@@ -40,6 +40,11 @@ class AuthorityGraph(unittest.TestCase):
 
     def test_coherent_claims_return_no_authority_and_preflight_still_refuses(self):
         r, s, now = authority_fixture()
+        operations = {effect["operation_id"] for effect in r["observations"]["actual_effects"]}
+        placeholders = [claim["operation_id"] for phase in ("setup", "cleanup")
+                        for claim in r["lifecycle"][phase]]
+        self.assertFalse(operations.intersection(placeholders))
+        self.assertEqual(len(placeholders), len(set(placeholders)))
         index = evidence_index(s)
         self.assertIsNone(check_authority_graph_claims(r, index, now))
         self.assertIsNone(check_provenance_claims(r, index, now))
