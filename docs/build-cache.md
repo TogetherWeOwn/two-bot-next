@@ -752,11 +752,19 @@ Keep the existing rollout receipts on the same remediation/handoff card.
 1. Record `findmnt -T /home`, `findmnt -T <host TWO worktrees>`, `df -B1` and
    `statvfs` user-available bytes and the explicit container-to-host mapping.
    Do not trust the container's `/home` reading.
-2. Resolve and retain the container-scratch coverage evidence above. If mapping,
+2. Before scratch checks or pool creation, establish and record the supported
+   **bounded TWO-only build-admission restriction**: method, scope, start, expiry
+   and release/undo. Keep it effective through pool provisioning, policy write
+   and post-verification in steps 2–4; release it only in step 5. If it expires or
+   loses coverage, **stop rollout**; re-establish and verify the supported bounded
+   restriction before resuming. Do not extend it indefinitely for review.
+   Resolve and retain the container-scratch coverage evidence above. If mapping,
    attribution, process visibility or external growth is unresolved, **stop rollout
    and preserve fail-closed admission refusal**; successful worktree audit alone
-   is insufficient. Release temporary readiness holders at their recorded bound;
-   do not stretch a mutation hold across asynchronous evidence review.
+   is insufficient. This rollout restriction is distinct from the legacy-removal
+   mutation hold. Release temporary **legacy-removal readiness holders** at their
+   recorded bound before asynchronous evidence review; that release must not
+   release the rollout restriction or stretch a legacy mutation hold across review.
    Create the **new, initially empty** pool and its two `slot-N/target` and
    `slot-N/scratch` directories plus `slot-N/lock` regular files. Do not repoint or
    migrate the old shared cache or any legacy `/tmp` output.
