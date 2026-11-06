@@ -547,6 +547,14 @@ not canonical staging qualification or production promotion.
   unfinished. The mandatory lifecycle-phase checker still refuses cleanup,
   and the CLI/runtime stay unconditional HOLD. Retrospective grant consistency
   never makes a grant usable after expiry or supplies missing boundary freshness.
+  `scripts/ci/test_announcement_runtime_recovery_boundary.py` pairs the ordinary
+  authority graph and separate recovery graph on one synthetic scope and clock.
+  Its ordinary-operation prefix is only a partial positive control, not a full
+  receipt: adding cleanup must reach the named authority mismatch and explicit
+  lifecycle refusal. It also checks that current recovery claims cannot replace
+  an expired ordinary lease, missing ordinary installation evidence or stale
+  final checks. This fixture does not qualify telemetry, literal resources,
+  restoration or recovery beyond the original execution lease.
 - `scripts/announcement_runtime_drain.py` resolves four closed work-inventory,
   snapshot, fence and drain claim kinds alongside the lifecycle-ledger comparison.
   The declared finite surface inventory is content-bound to the scoped inventory
