@@ -256,17 +256,23 @@ not canonical staging qualification or production promotion.
   owned deletion requires presence. Intermediate state refs and compare-and-match
   witnesses cannot be reused. Each witness compares the exact operation, key,
   identity, owner, execution/nonce/epochs, method, snapshot hashes, independent
-  full-window observer and timestamp. The transition must reference its own
-  declared effect-batch checkpoint and fall inside that checkpoint's validated
-  external-atomic fence; an unrelated fresh checkpoint is insufficient. Final
-  separately observed DB states must match the chain's full terminal state,
-  including version, not just its value digest. **These are claim comparisons,
-  not actual CAS, authentication, phase completion or verified restoration.**
-  Business value semantics, actual setting persistence, setup/cleanup phase
-  assignment, separately scoped recovery authority, actual desired restoration postconditions and
-  queue/drain evidence remain mandatory. The synthetic fixture intentionally
-  leaves every effect at one instant, not a successful lifecycle. Runtime
-  admission remains unsupported and no SQL or live adapter is introduced.
+  full-window observer and timestamp. Ordinary transitions must reference their
+  own named setup/setting/effect-batch checkpoint and validated external-atomic
+  fence; an unrelated fresh checkpoint is insufficient. Exact cleanup-ledger
+  writes instead require the complete separate recovery grant/read/installation/
+  fence/ownership graph already composed by the authority checker. They still
+  participate in every state-chain, timestamp, witness/state-reuse and terminal
+  comparison; cleanup never extends ordinary authority. Final separately observed
+  DB states must match the chain's full terminal state, including version, not
+  just its value digest. **These are claim comparisons, not actual CAS,
+  authentication, phase completion or verified restoration.** The private
+  authority/state helper permits narrow unit comparisons, not receipt acceptance:
+  the public entry still requires full telemetry/resource/provenance checks.
+  Its paired recovery fixture lacks that complete graph and must refuse at the
+  public entry; the older single-instant fixture is not lifecycle evidence either.
+  Business value semantics, actual setting persistence, complete lifecycle-phase
+  integration, actual restoration postconditions and queue/drain evidence remain
+  mandatory. Runtime admission remains unsupported; no SQL or live adapter exists.
 - `scripts/announcement_runtime_settings.py` composes the transition and scheduler
   comparisons with two closed restricted setting-plan/value-projection sidecars.
   The input-plan digest binds four exact setting operation IDs and six distinct

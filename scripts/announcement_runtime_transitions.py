@@ -21,11 +21,22 @@ def check_transition_claims(receipt, evidence, now):
     Read-only effects cannot hide a transition. Every write must consume a
     distinct external compare-and-match witness tied to its exact snapshots,
     operation, execution/nonce/epochs and current named setup/setting/effect
-    checkpoint. These are necessary consistency predicates, not independently
-    acquired evidence.
+    checkpoint, or its separately authorized cleanup checkpoint. These are
+    necessary consistency predicates, not independently acquired evidence.
     """
     check_telemetry_claims(receipt, evidence, now)
+    _check_transition_states(receipt, evidence, now)
+
+
+def _check_transition_states(receipt, evidence, now):
+    """Compare authority and state chains only; telemetry remains mandatory above.
+
+    This partial library comparison cannot establish resource/telemetry coverage
+    or lifecycle completion. Exact cleanup membership is validated by the full
+    recovery graph inside the authority checker, never by an ordinary grant.
+    """
     check_authority_graph_claims(receipt, evidence, now)
+    cleanup = {entry["operation_id"] for entry in receipt["lifecycle"]["cleanup"]}
     resources = _index(receipt["resources"]["entries"], "ref", "resource_inventory")
     authority, attempt = receipt["authority"], receipt["attempt"]
     coverage = receipt["observations"]["coverage"][0]
@@ -81,31 +92,34 @@ def check_transition_claims(receipt, evidence, now):
             require(method == "db_delete_owned" and old["presence"] == "present" and
                     new["presence"] == "absent", "transition_delete")
 
-        checkpoint = checkpoints.get(claim["authority_ref"])
-        require(checkpoint is not None and
-                checkpoint["phase"] == _db_checkpoint_phase(receipt, effect, claim),
-                "transition_authority")
-        fence = evidence.resolve(checkpoint["mutation_fence_ref"], "mutation_fence")
-        require(utc(fence["observed_at"]) <= observed < utc(fence["valid_until"]),
-                "transition_authority_time")
-        checkpoint_index = attempt["checkpoints"].index(checkpoint)
-        installation = evidence.resolve(authority["installation_approval_refs"][checkpoint_index],
-                                        "installation_approval")
-        require(_mutation_reads_current(checkpoint, installation, evidence, observed),
-                "stale_mutation_read")
         witness_ref = claim["ownership_match_ref"]
-        witness = evidence.resolve(witness_ref, "ownership_match")
-        require(witness == {"operation_id": effect["operation_id"],
-            "resource_ref": resource["ref"], "identity_sha256": canonical_digest(resource["identity"]),
-            "key_sha256": resource["identity"]["key_sha256"], "owner_ref": resource["owner"],
-            "execution_ref": authority["execution"]["ref"],
-            "nonce_ref": authority["execution"]["nonce_ref"],
-            "authority_epoch": authority["epoch"], "resource_epoch": attempt["enforcement_epoch"],
-            "checkpoint_ref": checkpoint["ref"], "method": method,
-            "before_state_sha256": canonical_digest(before),
-            "after_state_sha256": canonical_digest(after), "observer_ref": observer_ref,
-            "observed_at": effect["observed_at"], "boundary": "external_compare_and_match",
-            "outcome": "matched"}, "ownership_match")
+        if effect["operation_id"] not in cleanup:
+            checkpoint = checkpoints.get(claim["authority_ref"])
+            require(checkpoint is not None and
+                    checkpoint["phase"] == _db_checkpoint_phase(receipt, effect, claim),
+                    "transition_authority")
+            fence = evidence.resolve(checkpoint["mutation_fence_ref"], "mutation_fence")
+            require(utc(fence["observed_at"]) <= observed < utc(fence["valid_until"]),
+                    "transition_authority_time")
+            checkpoint_index = attempt["checkpoints"].index(checkpoint)
+            installation = evidence.resolve(authority["installation_approval_refs"][checkpoint_index],
+                                            "installation_approval")
+            require(_mutation_reads_current(checkpoint, installation, evidence, observed),
+                    "stale_mutation_read")
+            witness = evidence.resolve(witness_ref, "ownership_match")
+            require(witness == {"operation_id": effect["operation_id"],
+                "resource_ref": resource["ref"], "identity_sha256": canonical_digest(resource["identity"]),
+                "key_sha256": resource["identity"]["key_sha256"], "owner_ref": resource["owner"],
+                "execution_ref": authority["execution"]["ref"],
+                "nonce_ref": authority["execution"]["nonce_ref"],
+                "authority_epoch": authority["epoch"], "resource_epoch": attempt["enforcement_epoch"],
+                "checkpoint_ref": checkpoint["ref"], "method": method,
+                "before_state_sha256": canonical_digest(before),
+                "after_state_sha256": canonical_digest(after), "observer_ref": observer_ref,
+                "observed_at": effect["observed_at"], "boundary": "external_compare_and_match",
+                "outcome": "matched"}, "ownership_match")
+        # Cleanup's complete separate witness was already checked by the mandatory
+        # authority graph. Keep ALL writes in state/reuse/final-state accounting.
         witnesses.append(witness_ref)
         prior[resource["ref"]] = after
 
