@@ -174,13 +174,17 @@ as a local CI mirror. Push the PR branch and keep the PR a draft while incomplet
 Record the full head SHA and matching Actions run/job links, not local transcripts,
 for reviewers and the Release Manager. The single `ci-ok` aggregate in
 `.github/workflows/check.yml` gates both selectors, lint (`check`: fmt, clippy
--D warnings, cargo-deny), every selected Rust/database lane and `worker check`.
+-D warnings, cargo-deny), every selected Rust/database lane and `worker check`
+(including the runbook command-drift test).
 
 The final-stage reviewer squash-merges the pinned settled head before final
 approval; the author merges only without a review stage. Every `main` merge,
 including docs-only, needs the Release Manager's exact-head authorization because
-it can reach production through the promotion path. CI evidence does not replace
-existing staging/e2e, migration, rollback, security or review gates. See
+it can reach production through the promotion path. Exact-head staging remains
+the default; only the complete artifact-identical proof described in
+[Production merge evidence](CONTRIBUTING.md#production-merge-evidence) can remove
+that prerequisite. CI evidence alone does not replace staging/e2e, migration,
+rollback, security or review gates. See
 [Contributing](CONTRIBUTING.md#verification-on-github-actions) and
 [AGENTS.md](AGENTS.md). The toolchain stays pinned in `rust-toolchain.toml`.
 
