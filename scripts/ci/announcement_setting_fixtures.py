@@ -76,6 +76,42 @@ def add_checkpoint(receipt, records, clock, phase="effect_batch"):
     return mapping[checkpoint["ref"]]
 
 
+def deduplicate_authority_snapshots(receipt, records):
+    """Share identical histories/ordinary installation reads, never retime claims.
+
+    Runtime and recovery reads stay distinct, as do all fences, checkpoints and
+    transactions. This can be used with separate setup/recovery clocks, unlike
+    the legacy single-instant compaction below. It does NOT guarantee that a
+    later composed fixture fits the unchanged 256-record bound.
+    """
+    def remap(value, mapping):
+        if type(value) is dict:
+            return {key: remap(child, mapping) for key, child in value.items()}
+        if type(value) is list:
+            return [remap(child, mapping) for child in value]
+        return mapping.get(value, value) if type(value) is str else value
+
+    for kind in ("authority_history", "authority_read"):
+        seen, mapping = {}, {}
+        for ref, record in records.items():
+            if record["kind"] != kind or (kind == "authority_read" and not ref.startswith("install-")):
+                continue
+            data = copy.deepcopy(record["data"])
+            if kind == "authority_read":
+                data["claim"].pop("ref")
+            digest = canonical_digest(data)
+            if digest in seen:
+                mapping[ref] = seen[digest]
+            else:
+                seen[digest] = ref
+        for ref in mapping:
+            del records[ref]
+        receipt.update(remap(receipt, mapping))
+        for ref in list(records):
+            records[ref] = remap(records[ref], mapping)
+    repin_authority(receipt, records)
+
+
 def compact_claims(receipt, records):
     """Keep this synthetic graph within 256 records WITHOUT relaxing any bound.
 
@@ -103,32 +139,7 @@ def compact_claims(receipt, records):
                 read["claim"]["history_sha256"] = canonical_digest(
                     records[read["history_ref"]]["data"])
     repin_authority(receipt, records)
-
-    def remap(value, mapping):
-        if type(value) is dict:
-            return {key: remap(child, mapping) for key, child in value.items()}
-        if type(value) is list:
-            return [remap(child, mapping) for child in value]
-        return mapping.get(value, value) if type(value) is str else value
-
-    for kind in ("authority_history", "authority_read"):
-        seen, mapping = {}, {}
-        for ref, record in records.items():
-            if record["kind"] != kind or (kind == "authority_read" and not ref.startswith("install-")):
-                continue
-            data = copy.deepcopy(record["data"])
-            if kind == "authority_read":
-                data["claim"].pop("ref")
-            digest = canonical_digest(data)
-            if digest in seen:
-                mapping[ref] = seen[digest]
-            else:
-                seen[digest] = ref
-        for ref in mapping:
-            del records[ref]
-        receipt.update(remap(receipt, mapping))
-        for ref in list(records):
-            records[ref] = remap(records[ref], mapping)
+    deduplicate_authority_snapshots(receipt, records)
 
     setting_ops = set(SETTING_OPS)
     groups = [ref for ref, record in records.items() if record["kind"] == "db_transaction" and
