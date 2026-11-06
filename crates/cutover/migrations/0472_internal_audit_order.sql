@@ -1,3 +1,5 @@
+-- rollback-compatible: prior-image audit INSERTs use the retained invoker ordering trigger with runtime table rights; no prior direct helper caller loses EXECUTE, and image rollback retains schema, triggers and allocator state.
+-- Whole-file argument and target-specific release proof: docs/migrations.md.
 -- Drain old inserts before seeding; keep this lock through trigger activation.
 -- SQLx applies this migration in one transaction. Existing tuples never change.
 LOCK TABLE public.internal_action_log IN SHARE ROW EXCLUSIVE MODE;

@@ -232,6 +232,42 @@ class MigrationFindingTests(unittest.TestCase):
                         "ALTER TABLE t DROP COLUMN c;\n")
         self.assertEqual(self.findings(self.repo.commit("reviewed"))[1], [])
 
+    def test_private_audit_migrations_use_reviewed_whole_file_markers(self):
+        migrations = Path(__file__).resolve().parents[1] / "crates/cutover/migrations"
+        helpers = {
+            "0471_internal_audit_identity.sql": ("internal_audit_identity_immutable",),
+            "0472_internal_audit_order.sql": (
+                "internal_audit_allocate_order", "internal_audit_order_guard"),
+        }
+        for name, functions in helpers.items():
+            with self.subTest(migration=name):
+                sql = (migrations / name).read_text()
+                self.assertEqual(preflight.incompatible_code(sql), "revoke")
+                without_revokes = sql
+                for function in functions:
+                    revoke = f"REVOKE ALL ON FUNCTION public.{function}() FROM PUBLIC;"
+                    self.assertEqual(sql.count(revoke), 1)
+                    without_revokes = without_revokes.replace(revoke, "")
+                self.assertIsNone(preflight.incompatible_code(without_revokes))
+                path = f"crates/cutover/migrations/{name}"
+                unmarked = "\n".join(line for line in sql.splitlines()
+                                     if not line.startswith("-- rollback-compatible:")) + "\n"
+                self.repo.write(path, unmarked)
+                self.assertIn({"migration": name, "code": "revoke"},
+                              self.findings(self.repo.commit("unmarked audit helper"))[1])
+                self.repo.write(path, sql)
+                # Use the original serving fixture: these files are new, not
+                # permission to rewrite a migration already applied by serving.
+                checked, refusals = self.findings(self.repo.commit("reviewed audit helper"))
+                self.assertIn(name, checked)
+                self.assertEqual(refusals, [])
+                serving = self.repo.git("rev-parse", "HEAD")
+                self.repo.write(path, sql + "-- changed after serving\n")
+                self.assertEqual(self.findings(self.repo.commit("rewritten audit helper"), serving)[1],
+                                 [{"migration": name, "code": "migration_rewritten"}])
+                self.repo.write(path, sql)
+                self.repo.commit("restore reviewed fixture")
+
     def test_an_empty_override_does_not_count(self):
         self.repo.write("crates/store/migrations/0002_drop.sql",
                         "-- rollback-compatible: ok\nTRUNCATE t;\n")

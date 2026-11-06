@@ -1,3 +1,5 @@
+-- rollback-compatible: prior-image writes omit nullable audit keys and preserve pinned identity; only the new private invoker helper loses PUBLIC EXECUTE, while normal intent transitions and audit erasure remain valid.
+-- Whole-file argument and target-specific release proof: docs/migrations.md.
 -- Freeze publication identity at the action boundary, not through mutable maps.
 -- NULL supports old images and unprovable history; never backfill guessed names.
 ALTER TABLE internal_idempotency

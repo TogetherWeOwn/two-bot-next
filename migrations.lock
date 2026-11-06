@@ -2,8 +2,8 @@
   "version": 1,
   "migrations": {
     "crates/cutover/migrations/0471_internal_audit_identity.sql": {
-      "sha256": "0f8230630516a2a2d5b634f02113cedef903da6447e2b82dc3c05ed7212ac95e",
-      "justification": "Unshipped expansion: freeze validated audit names; use the real private invoker definition in explicit pre-bootstrap preparation and the migration without changing deployed history."
+      "sha256": "27539e38f247239f83cbe64801b376970157e8571998a1b4c7af25d831a93e06",
+      "justification": "Held unshipped expansion: document whole-file nullable-key and private-helper rollback compatibility without altering SQL, REVOKE or deployed history; actual serving-image proof remains a release gate."
     },
     "crates/store/migrations/0458_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
@@ -538,8 +538,8 @@
       "justification": "Expand step: copy the imported voice creation switch and guild-wide command role from voice_guild_settings into voice_access_controls, the columns the runtime gates enforce, tightening only (creation off wins, an enforced role wins) and syncing the legacy columns as a mirror for the previous binary until a contract migration drops them; data copy only, no DDL."
     },
     "crates/cutover/migrations/0472_internal_audit_order.sql": {
-      "sha256": "6639e960899774ee9f5debcbbbb084e561b68566fff347129266c252f5ee7f4d",
-      "justification": "Expand step: drain audit writers, seed a protected singleton above committed maxima and allocate every inserted tuple under its transaction-held row fence; preserve old tuples and nullable old-image writes."
+      "sha256": "0aebc4d8746c3f37b2603650202fa83693877d50e31bce011a3474664f0ed53b",
+      "justification": "Held unshipped expansion: document whole-file old-image trigger DML compatibility with retained schema, grants and allocator; preserve all SQL and private ACLs, with actual serving-image proof still required before release."
     }
   }
 }
