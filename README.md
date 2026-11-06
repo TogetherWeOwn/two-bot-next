@@ -173,12 +173,11 @@ require `ci-ok`, `gitleaks`, `pr-lint`, `CodeRabbit` and `Devin Review` on the e
 head commit, with no approving review. The single
 `ci-ok` aggregate gates both selectors, lint (`check`: fmt, clippy -D warnings,
 cargo-deny), all selected `rust tests` and `ignored db` lanes, and `worker check`
-(including the runbook command-drift test). The agent that did the work
-squash-merges once every required check is green and each review finding is fixed
-or answered with evidence. A merge to `main` that touches a path outside the
-`paths-ignore` list in `deploy-staging.yml` (CI scripts and workflows included)
-deploys production, so it also needs the owner's approval. See [Contributing](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). The
-workspace toolchain is pinned in `rust-toolchain.toml`.
+(including the runbook command-drift test). See
+[Production merge evidence](CONTRIBUTING.md#production-merge-evidence) for merge
+ownership, exact-head Release Manager confirmation and staging requirements, and
+[AGENTS.md](AGENTS.md) for contributor guidance. The workspace toolchain is pinned
+in `rust-toolchain.toml`.
 
 Persistent-controller Rust builds use the [bounded Cargo cache wrapper](docs/build-cache.md),
 not a new `target/` in each worktree. The runbook includes offline cache tests,
