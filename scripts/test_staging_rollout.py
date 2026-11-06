@@ -959,10 +959,9 @@ class DeploymentWiringTests(unittest.TestCase):
             self.assertIn('--receipt "$ROLLOUT_DIR/baseline.json"', step)
             self.assertIn('--output "$WRANGLER_OUTPUT_FILE_PATH"', step)
             self.assertNotIn("|| true", step)
-        # Pinned dynamically: a Dependabot bump to wrangler/package.json must
-        # move staging_rollout.WRANGLER with it (see
-        # test_wrangler_pin_matches_lockfile_package below), never this literal.
-        self.assertIn(f'wranglerVersion: "{rollout.WRANGLER}"', deploy[0])
+        # The workflow can deploy an older SHA, so its action version follows
+        # that checkout's lockfile rather than the workflow head's literal pin.
+        self.assertIn('wranglerVersion: ${{ steps.wrangler.outputs.version }}', deploy[0])
         self.assertIn("--env staging", deploy[0])
         self.assertIn('${{ env.ROLLOUT_DIR }}/staging-deploy.json', deploy[0])
         self.assertIn('--evidence "$ROLLOUT_DIR/evidence.json"', verify[0])
@@ -986,16 +985,52 @@ class DeploymentWiringTests(unittest.TestCase):
         self.assertNotIn("curl", executable_lines)
 
     def test_wrangler_pin_matches_lockfile_package(self):
-        # One pin, three places: wrangler/package.json, the staging
-        # workflow's wranglerVersion, and staging_rollout.WRANGLER must agree.
-        # A lockfile-only bump would deploy production on a Wrangler version
-        # the staging gate never ran, so it fails here instead of in review.
+        # The package, installed lockfile version and that checkout's receipt
+        # guard must agree. A lockfile-only bump still fails before deployment.
         root = Path(__file__).resolve().parent.parent
         package = json.loads((root / "wrangler" / "package.json").read_text())
+        lock = json.loads((root / "wrangler" / "package-lock.json").read_text())
         pinned = package["devDependencies"]["wrangler"]
         self.assertEqual(pinned, rollout.WRANGLER)
+        self.assertEqual(lock["packages"]["node_modules/wrangler"]["version"], pinned)
         source = (root / ".github" / "workflows" / "deploy-staging.yml").read_text()
-        self.assertIn(f'wranglerVersion: "{pinned}"', source)
+        self.assertIn('wranglerVersion: ${{ steps.wrangler.outputs.version }}', source)
+
+    def test_wrangler_action_uses_deploy_checkout_lockfile(self):
+        root = Path(__file__).resolve().parent.parent
+        source = (root / ".github" / "workflows" / "deploy-staging.yml").read_text()
+        steps = re.split(r"(?m)^      - ", source)[1:]
+        selectors = [step for step in steps if "id: wrangler\n" in step]
+        self.assertEqual(len(selectors), 1)
+        selector = selectors[0]
+        deploy = next(step for step in steps if "command: deploy --config" in step)
+        install = next(step for step in steps if step.startswith("run: npm ci\n"))
+        self.assertLess(steps.index(install), steps.index(selector))
+        self.assertLess(steps.index(selector), steps.index(deploy))
+        self.assertIn("working-directory: wrangler", source)
+        self.assertIn("wranglerVersion: ${{ steps.wrangler.outputs.version }}", deploy)
+        self.assertNotRegex(selector, r"(?m)^\s*(?:if|continue-on-error):")
+        script = "\n".join(line.removeprefix("          ")
+                           for line in selector.split("        run: |\n", 1)[1].splitlines())
+        # Run the workflow's selector against current and pre-upgrade deploy
+        # checkouts; the workflow head must not override either lockfile.
+        for version in (rollout.WRANGLER, "4.152.0", "4.x", "4.156.0\nother=value", None):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                checkout = Path(directory)
+                package = {} if version is None else {"version": version}
+                (checkout / "package-lock.json").write_text(json.dumps({
+                    "packages": {"node_modules/wrangler": package},
+                }))
+                output = checkout / "outputs"
+                env = dict(os.environ, GITHUB_OUTPUT=str(output))
+                result = subprocess.run(["bash", "-c", script], cwd=checkout,
+                                        env=env, capture_output=True, text=True, timeout=10)
+                if version in (rollout.WRANGLER, "4.152.0"):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(output.read_text(), f"version={version}\n")
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(output.exists())
 
     @unittest.skipUnless(shutil.which("node"), "Node runtime not installed")
     def test_takeover_pin_env_reaches_control_client_cli(self):
