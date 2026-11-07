@@ -60,7 +60,15 @@ idle/zero-cost proof, and must be repaired through the existing incident path.
 
 `wrangler/scripts/staging-use.mjs` is the pipeline client for the protocol.
 `status` reads only the authenticated control path and neither acquires nor
-starts staging. `acquire`, `assert`, `ready` and `release` pin the intended
+starts staging. `observe` is also control-only: periodic readers sample only
+an active window bound to the current deployment/SHA/epoch. A confirmed stopped,
+unauthorized/released/expired runtime emits `intentional_idle`, never a healthy
+sample; an unconfirmed stop or invalid authority fails. It never acquires,
+renews, starts, probes or releases staging. The slow-burn workflow uses this
+observer in a separate credential-isolated step and skips both issue writes and
+cache saves during idle. Its five-minute cadence and active-use burn checks are
+unchanged; scheduled user-flow and other readers still need integration.
+`acquire`, `assert`, `ready` and `release` pin the intended
 `STAGING_USE_SHA`, `STAGING_USE_DEPLOYMENT`, `GITHUB_RUN_ID`,
 `GITHUB_RUN_ATTEMPT` and absolute millisecond `STAGING_USE_EXPIRES_AT`. The
 origin must be the approved staging workers.dev origin, with no path, query or

@@ -92,6 +92,51 @@ test("staging client: status is control-only and grants no readiness or authoriz
   assert.equal(h.calls[0].init.method, "GET");
 });
 
+test("staging client: periodic observation never starts or grants and distinguishes idle from health", async () => {
+  const observer = { action: "observe", url: args.url, token: TOKEN };
+  for (const value of [null, { ...use, phase: "released" }, { ...use, acquiredAt: NOW - 60000, expiresAt: NOW }]) {
+    const h = responses([Response.json({ ...state, use: value })]);
+    const result = await stagingUse(observer, h.send, async () => assert.fail("no retry"), clock);
+    assert.equal(result.sample, false);
+    assert.equal(result.code, "intentional_idle");
+    assert.equal(result.health, "unknown");
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.calls[0].init.method, "GET");
+    assert.equal(h.calls[0].url.pathname, "/internal/staging-use");
+    assert.equal(h.calls[0].init.body, undefined);
+  }
+  for (const running of [false, true]) {
+    const h = responses([Response.json({ ...state, running })]);
+    const result = await stagingUse(observer, h.send, async () => assert.fail("no retry"), clock);
+    assert.equal(result.sample, true, "active startup/failure must still be monitored");
+    assert.equal(result.code, "active_window");
+    assert.equal(result.health, "unknown");
+    assert.equal(result.use?.expiresAt, use.expiresAt);
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.calls[0].init.method, "GET");
+  }
+});
+
+test("staging client: periodic observation fails closed on unconfirmed stop or invalid authority", async () => {
+  const observer = { action: "observe", url: args.url, token: TOKEN };
+  for (const value of [null, { ...use, phase: "released" }, { ...use, acquiredAt: NOW - 60000, expiresAt: NOW }]) {
+    const h = responses([Response.json({ ...state, running: true, use: value })]);
+    await assert.rejects(stagingUse(observer, h.send, async () => {}, clock), /staging_stop_unconfirmed/);
+    assert.equal(h.calls.length, 1);
+  }
+  for (const patch of [{ phase: "preparing" }, { acquiredAt: NOW + 1 }, { epoch: 8 },
+    { sha: "b".repeat(40) }, { deploymentId: "deployment-B" }]) {
+    const h = responses([Response.json({ ...state, use: { ...use, ...patch } })]);
+    await assert.rejects(stagingUse(observer, h.send, async () => {}, clock), /staging_window_mismatch/);
+    assert.equal(h.calls.length, 1);
+  }
+  for (const response of [new Response(null, { status: 404 }), Response.json({ running: false })]) {
+    const h = responses([response]);
+    await assert.rejects(stagingUse(observer, h.send, async () => {}, clock), /staging_(control_refused|response_invalid)/);
+    assert.equal(h.calls.length, 1);
+  }
+});
+
 test("staging client: stale deployment/build refuses before POST; changed POST response refuses", async () => {
   for (const patch of [{ deploymentId: "deployment-B" }, { sha: "b".repeat(40) }]) {
     const wrong = { ...state, ...patch, owner: { ...state.owner, deploymentId: patch.deploymentId ?? args.deploymentId } };

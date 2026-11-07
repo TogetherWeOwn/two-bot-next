@@ -126,9 +126,9 @@ function window(state, args, now, phase = "active") {
 export async function stagingUse(args, send = fetch, pause = wait, now = Date.now) {
   const base = origin(args.url);
   require(typeof args.token === "string" && args.token.length >= 32, "staging_token_missing");
-  require(["status", "acquire", "assert", "ready", "release"].includes(args.action), "staging_action_invalid");
+  require(["status", "observe", "acquire", "assert", "ready", "release"].includes(args.action), "staging_action_invalid");
   // A release may be retried after expiry, but never extends that expiry.
-  if (args.action !== "status") binding(args, args.action === "release" ? Math.min(now(), args.expiresAt - 1) : now());
+  if (!["status", "observe"].includes(args.action)) binding(args, args.action === "release" ? Math.min(now(), args.expiresAt - 1) : now());
   const headers = { authorization: `Bearer ${args.token}`, "cache-control": "no-cache" };
   const control = async (init) => {
     const response = await request(send, new URL(PATH, base), { ...init, headers }, performance.now() + MAX_REQUEST_MS);
@@ -139,6 +139,19 @@ export async function stagingUse(args, send = fetch, pause = wait, now = Date.no
   };
   let state = await control({ method: "GET" });
   if (args.action === "status") return receipt(args.action, state, now());
+  if (args.action === "observe") {
+    const at = now();
+    const use = state.use;
+    // A periodic reader observes authority only: it never starts, grants,
+    // releases or extends a window. Idle is not readiness or burn recovery.
+    const idle = !use || use.phase === "released" || at >= use.expiresAt;
+    if (idle) require(!state.running, "staging_stop_unconfirmed");
+    else require(use.phase === "active" && at >= use.acquiredAt
+      && use.deploymentId === state.deploymentId && use.sha === state.sha && use.epoch === state.epoch,
+    "staging_window_mismatch");
+    return { ...receipt(args.action, state, at), sample: !idle,
+      code: idle ? "intentional_idle" : "active_window", health: "unknown" };
+  }
   identity(state, args);
   const epoch = state.epoch;
   if (args.action === "acquire" || args.action === "release") {
@@ -203,10 +216,16 @@ if (isDirectInvocation(process.argv[1], import.meta.url)) {
     // Receipt persistence precedes the first possible mutation. Runner loss
     // afterwards is covered by the runtime's native persisted expiry, not a trap.
     emit({ schema: "two-bot-staging-use.v1", action: "attempt", environment: "staging", observedAt: new Date().toISOString() });
-    emit(await stagingUse({ action, url: process.env.STAGING_WORKER_URL, token: process.env.OWNERSHIP_CONTROL_TOKEN,
+    const result = await stagingUse({ action, url: process.env.STAGING_WORKER_URL, token: process.env.OWNERSHIP_CONTROL_TOKEN,
       sha: process.env.STAGING_USE_SHA, deploymentId: process.env.STAGING_USE_DEPLOYMENT,
       runId: process.env.GITHUB_RUN_ID, runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
-      expiresAt: Number(process.env.STAGING_USE_EXPIRES_AT) }));
+      expiresAt: Number(process.env.STAGING_USE_EXPIRES_AT) });
+    emit(result);
+    // Publish only after the validated receipt is durably retained. Missing
+    // output on any error must never open a periodic reader's sample gate.
+    if (action === "observe" && process.env.GITHUB_OUTPUT) {
+      appendFileSync(process.env.GITHUB_OUTPUT, `sample=${result.sample}\n`, { mode: 0o600 });
+    }
   } catch (error) {
     // Provider errors (including arbitrary messages/URLs) are never printable.
     const code = error instanceof StagingUseError ? error.code : "staging_client_failed";

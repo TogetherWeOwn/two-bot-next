@@ -776,7 +776,9 @@ close it as "fast burn resolved": the fast window can clear while the slow
 grind continues.
 
 The first firing also files one tracking issue by itself. Every five minutes
-the `slow-burn-tracker` workflow scrapes staging `/ops/metrics`, replays the
+the `slow-burn-tracker` workflow observes the authenticated staging control state
+without starting staging or acquiring/extending a window. During a validated
+active window it scrapes staging `/ops/metrics`, replays the
 checked-in slow-burn verdict over its cached ring and reconciles the
 `slow-burn` label: no open card means file one, an open card stays untouched
 (a refresh comment lands at most every six hours, so a refire never
@@ -809,6 +811,18 @@ binding. Prove the path by dispatching the workflow with the fire and
 clear fixtures: a separate `fixture` job, which binds no environment and
 holds no scrape bearer, runs the real verdict and the real issue calls under
 the `slow-burn-test` label without touching the live ring.
+
+Intentional idle retains a `staging-use-observer.jsonl` receipt with
+`sample: false`, `code: intentional_idle` and `health: unknown`. It skips the
+scrape, evaluator, issue writes and cache save: no zero/healthy sample is
+invented, no incident is closed and no coverage timestamp is refreshed. On the
+next active window the unchanged evaluator still detects real gaps and requires
+full history before clearing a burn. A running container after expiry/release,
+malformed authority or a failed control read fails closed, not idle/healthy.
+The existing `STAGING_OWNERSHIP_CONTROL_TOKEN` is isolated in the observer step;
+it never reaches the scrape/evaluator. This integration remains unactivated
+until the [lifecycle activation gates](staging-rollout-gate.md#no-always-on-staging-rule-and-activation-hold)
+pass; an idle receipt proves neither database suspension nor zero billed usage.
 
 #### Alert: voice creator-map stale
 

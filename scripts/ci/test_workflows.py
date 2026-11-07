@@ -4011,6 +4011,20 @@ SLOW_BURN_LIVE_ENV = {
     "COVERAGE_PATH": "slow-burn-coverage.json",
     "TRACKER_DRY_RUN": "${{ github.event.inputs.dry_run }}",
 }
+SLOW_BURN_SAMPLE_IF = "steps.window.outputs.sample == 'true'"
+SLOW_BURN_OBSERVER_STEP = {
+    "name": "Observe the staging window without starting it", "id": "window",
+    "env": {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+            "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+            "METRICS_CONFIGURED": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN != '' }}",
+            "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-use-observer.jsonl"},
+    "run": ('set -euo pipefail\n'
+            'if [ "$METRICS_CONFIGURED" != "true" ]; then\n'
+            '  echo "::error::STAGING_METRICS_SCRAPE_TOKEN is unset; refusing a sample-free green run"\n'
+            '  exit 1\n'
+            'fi\n'
+            'node wrangler/scripts/staging-use.mjs observe\n'),
+}
 SLOW_BURN_FIXTURE_ENV = {
     "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
     "TRACKER_FIXTURE": "${{ github.event.inputs.fixture }}",
@@ -4031,6 +4045,25 @@ SLOW_BURN_FIXTURE_RUN = ('set -euo pipefail\n'
                          'args=(--fixture "$TRACKER_FIXTURE" --label slow-burn-test '
                          "--title-prefix '[slow-burn-test]' --evidence-out slow-burn-tracker-evidence.json "
                          '--exposition-out slow-burn-exposition.prom)\n' + SLOW_BURN_RUN_TAIL)
+
+
+def slow_burn_observer_errors(job):
+    """A periodic scrape may observe authority but must never acquire it."""
+    steps = job.get("steps") or []
+    if len(steps) != 7 or steps[3] != SLOW_BURN_OBSERVER_STEP:
+        return ["slow-burn-tracker.yml:tracker: must unconditionally observe with the exact isolated control step"]
+    errors = []
+    if steps[4].get("if") != SLOW_BURN_SAMPLE_IF:
+        errors.append("slow-burn-tracker.yml:tracker: scrape must require a validated active window")
+    if steps[5].get("if") != "${{ !cancelled() && steps.window.outputs.sample == 'true' }}":
+        errors.append("slow-burn-tracker.yml:tracker: idle must not save a fresh burn cache")
+    upload = steps[6]
+    if upload.get("with") != {
+            "name": "slow-burn-tracker-${{ github.run_id }}",
+            "path": "slow-burn-tracker-evidence.json\nslow-burn-exposition.prom\n${{ runner.temp }}/staging-use-observer.jsonl\n",
+            "if-no-files-found": "error", "retention-days": "14"}:
+        errors.append("slow-burn-tracker.yml:tracker: must retain idle/active/refusal receipts without treating idle as health")
+    return errors
 
 
 def slow_burn_tracker_errors(workflow):
@@ -4085,7 +4118,7 @@ def slow_burn_tracker_errors(workflow):
     if set(jobs) != {"tracker", "fixture"}:
         errors.append(f"{name}: jobs must be exactly tracker and fixture")
         return errors
-    shapes = (("tracker", "slow-burn tracker", SLOW_BURN_LIVE_IF, SLOW_BURN_LIVE_RUN, 6, 3),
+    shapes = (("tracker", "slow-burn tracker", SLOW_BURN_LIVE_IF, SLOW_BURN_LIVE_RUN, 7, 4),
               ("fixture", "slow-burn fixture proof", SLOW_BURN_FIXTURE_IF, SLOW_BURN_FIXTURE_RUN, 4, 2))
     for job_id, title, condition, command, step_count, run_index in shapes:
         job = jobs[job_id]
@@ -4102,7 +4135,11 @@ def slow_burn_tracker_errors(workflow):
         for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy", "defaults"):
             if key in job:
                 errors.append(f"{name}:{job_id}: must not set {key}")
-        text = str(job).lower().replace(" ", "")
+        # Only the exact control-only observer may name the ownership client.
+        # Its full shape is pinned below; all other steps retain the prohibition.
+        restricted = {**job, "steps": [step for step in job.get("steps") or []
+                                      if step != SLOW_BURN_OBSERVER_STEP]}
+        text = str(restricted).lower().replace(" ", "")
         for marker in ("wrangler", "production", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
                        "cloudflare_api_token", "ownership_control"):
             if marker in text:
@@ -4122,7 +4159,9 @@ def slow_burn_tracker_errors(workflow):
         if run_step.get("run") != command or "uses" in run_step:
             errors.append(f"{name}:{job_id}: run step must run exactly the reviewed tracker command, "
                           "with inputs passed via env only")
-        if "if" in run_step:
+        if job_id == "tracker":
+            errors.extend(slow_burn_observer_errors(job))
+        elif "if" in run_step:
             errors.append(f"{name}:{job_id}: run step must not set if (fail closed)")
         if "shell" in run_step:
             errors.append(f"{name}:{job_id}: run step must not override shell (fail closed)")
@@ -4133,8 +4172,8 @@ def slow_burn_tracker_errors(workflow):
         if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
             errors.append(f"{name}:{job_id}: must upload the run evidence artifact")
         for step in steps:
-            if step is not run_step and "secrets." in str(step):
-                errors.append(f"{name}:{job_id}: only the run step may hold a secret")
+            if step is not run_step and not (job_id == "tracker" and step == SLOW_BURN_OBSERVER_STEP) and "secrets." in str(step):
+                errors.append(f"{name}:{job_id}: only the run and exact control observer steps may hold a secret")
 
     live = jobs["tracker"]
     # The existing staging Environment holds STAGING_METRICS_SCRAPE_TOKEN.
@@ -4143,11 +4182,11 @@ def slow_burn_tracker_errors(workflow):
     if live.get("environment") != {"name": "staging", "deployment": "false"}:
         errors.append(f"{name}:tracker: must read the existing staging Environment with deployment: false")
     live_secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", str(live).lower()))
-    if live_secrets != {"staging_metrics_scrape_token", "github_token"}:
-        errors.append(f"{name}:tracker: must read only the staging scrape bearer and the GitHub token")
+    if live_secrets != {"staging_metrics_scrape_token", "staging_ownership_control_token", "github_token"}:
+        errors.append(f"{name}:tracker: must read only the staging scrape/control bearers and the GitHub token")
     live_steps = live.get("steps") or []
-    if len(live_steps) == 6:
-        restore, track, save = live_steps[2], live_steps[3], live_steps[4]
+    if len(live_steps) == 7:
+        restore, track, save = live_steps[2], live_steps[4], live_steps[5]
         # Split restore/save: a full actions/cache step restores in its main
         # phase, so the save step would overwrite the tracker's fresh ring with
         # the stale cached copy before saving it back.
@@ -4163,8 +4202,8 @@ def slow_burn_tracker_errors(workflow):
                 or "restore-keys" in save_with):
             errors.append(f"{name}:tracker: ring save must use actions/cache/save "
                           "with the rotating key and no restore")
-        if save.get("if") != "${{ !cancelled() }}":
-            errors.append(f"{name}:tracker: ring save must run unless the run was cancelled")
+        if save.get("if") != "${{ !cancelled() && steps.window.outputs.sample == 'true' }}":
+            errors.append(f"{name}:tracker: ring save requires an active window and must not run when cancelled")
         if track.get("env") != SLOW_BURN_LIVE_ENV:
             errors.append(f"{name}:tracker: track step must pass exactly the staging url, the staging "
                           "scrape bearer, the GitHub token, the cache paths and the dry-run flag via env")
@@ -4200,8 +4239,9 @@ def scheduled_binding_audit_errors(workflows):
     hands both bindings to scripts/slow_burn_tracker.py, which exits 1
     with an ::error:: naming the unset binding (proved below against the
     reviewed script, and pinned per binding in
-    scripts/test_slow_burn_tracker.py), and the handoff step itself
-    carries no if or continue-on-error; synthetic's missing-binding
+    scripts/test_slow_burn_tracker.py). The unconditional control observer
+    also checks scrape-token presence; only its validated active output opens
+    the scrape gate, never a tolerated failure. Synthetic's missing-binding
     notice keeps its probe-skipped gate and fails the job with an
     ::error:: naming the unset target var, with no continue-on-error.
     """
@@ -4235,9 +4275,9 @@ def scheduled_binding_audit_errors(workflows):
         if "STAGING_WORKER_URL" not in handoff or "METRICS_SCRAPE_TOKEN" not in handoff:
             errors.append(f"{name}: slow-burn-tracker.yml: tracker step must hand both "
                           "bindings to the tracker script via env")
-        if "if" in runs[0]:
-            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must not set "
-                          "if (fail closed)")
+        if runs[0].get("if") != SLOW_BURN_SAMPLE_IF:
+            errors.append(f"{name}: slow-burn-tracker.yml: tracker step must require the validated active window")
+        errors.extend(slow_burn_observer_errors(tracker))
         if "shell" in runs[0]:
             errors.append(f"{name}: slow-burn-tracker.yml: tracker step must not "
                           "override shell")
@@ -9033,7 +9073,7 @@ class WorkflowTests(unittest.TestCase):
         # deployment: false form keeps the five-minute scrape out of the
         # staging deployment history.
         self.assertEqual(live.get("environment"), {"name": "staging", "deployment": "false"})
-        self.assertEqual(live["steps"][3]["env"]["METRICS_SCRAPE_TOKEN"],
+        self.assertEqual(live["steps"][4]["env"]["METRICS_SCRAPE_TOKEN"],
                          "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}")
         # Fixture proofs run in their own job: no Environment, only the job token.
         self.assertIn("fixture", tracker["jobs"])
@@ -9054,7 +9094,7 @@ class WorkflowTests(unittest.TestCase):
             return copy["jobs"]["fixture"]
 
         def live_run(copy, text):
-            live_job(copy)["steps"][3]["run"] = text(live_job(copy)["steps"][3]["run"])
+            live_job(copy)["steps"][4]["run"] = text(live_job(copy)["steps"][4]["run"])
 
         def fixture_run(copy, text):
             fixture_job(copy)["steps"][2]["run"] = text(fixture_job(copy)["steps"][2]["run"])
@@ -9072,7 +9112,7 @@ class WorkflowTests(unittest.TestCase):
                 {"defaults": {"run": {"shell": "echo {0}"}}}),
             "fixture job shell default": lambda w: fixture_job(w).update(
                 {"defaults": {"run": {"shell": "echo {0}"}}}),
-            "live run step shell override": lambda w: live_job(w)["steps"][3].update(
+            "live run step shell override": lambda w: live_job(w)["steps"][4].update(
                 {"shell": "echo {0}"}),
             "fixture run step shell override": lambda w: fixture_job(w)["steps"][2].update(
                 {"shell": "echo {0}"}),
@@ -9086,21 +9126,21 @@ class WorkflowTests(unittest.TestCase):
             "production environment": lambda w: live_job(w).update(
                 {"environment": {"name": "production", "deployment": "false"}}),
             "no live environment": lambda w: live_job(w).pop("environment"),
-            "unbound secret name": lambda w: live_job(w)["steps"][3]["env"].update(
+            "unbound secret name": lambda w: live_job(w)["steps"][4]["env"].update(
                 {"METRICS_SCRAPE_TOKEN": "${{ secrets.METRICS_SCRAPE_TOKEN }}"}),
-            "production bearer": lambda w: live_job(w)["steps"][3]["env"].update(
+            "production bearer": lambda w: live_job(w)["steps"][4]["env"].update(
                 {"METRICS_SCRAPE_TOKEN": "${{ secrets.PRODUCTION_METRICS_SCRAPE_TOKEN }}"}),
-            "dropped bearer": lambda w: live_job(w)["steps"][3]["env"].pop("METRICS_SCRAPE_TOKEN"),
+            "dropped bearer": lambda w: live_job(w)["steps"][4]["env"].pop("METRICS_SCRAPE_TOKEN"),
             # The script reads METRICS_SCRAPE_TOKEN: the bearer must keep that name.
-            "bearer under another name": lambda w: live_job(w)["steps"][3]["env"].update(
-                {"SCRAPE_TOKEN": live_job(w)["steps"][3]["env"].pop("METRICS_SCRAPE_TOKEN")}),
-            "dropped worker url": lambda w: live_job(w)["steps"][3]["env"].pop("STAGING_WORKER_URL"),
+            "bearer under another name": lambda w: live_job(w)["steps"][4]["env"].update(
+                {"SCRAPE_TOKEN": live_job(w)["steps"][4]["env"].pop("METRICS_SCRAPE_TOKEN")}),
+            "dropped worker url": lambda w: live_job(w)["steps"][4]["env"].pop("STAGING_WORKER_URL"),
             "bearer on the job": lambda w: live_job(w).update({"env": {"METRICS_SCRAPE_TOKEN": bearer}}),
             "bearer on the restore": lambda w: live_job(w)["steps"][2].update(
                 {"env": {"METRICS_SCRAPE_TOKEN": bearer}}),
-            "extra staging secret": lambda w: live_job(w)["steps"][3]["env"].update(
+            "extra staging secret": lambda w: live_job(w)["steps"][4]["env"].update(
                 {"X": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
-            "blanket secrets": lambda w: live_job(w)["steps"][3]["env"].update(
+            "blanket secrets": lambda w: live_job(w)["steps"][4]["env"].update(
                 {"ALL": "${{ toJSON(secrets) }}"}),
             "live any branch": lambda w: live_job(w).update(
                 {"if": "(github.event.inputs.fixture || 'live') == 'live'"}),
@@ -9120,7 +9160,18 @@ class WorkflowTests(unittest.TestCase):
                 {"ref": "evil-branch"}),
             "live checkout repository swap": lambda w: live_job(w)["steps"][0]["with"].update(
                 {"repository": "evil/repo"}),
-            "live save only on success": lambda w: live_job(w)["steps"][4].update({"if": "success()"}),
+            "live save only on success": lambda w: live_job(w)["steps"][5].update({"if": "success()"}),
+            "idle scrape allowed": lambda w: live_job(w)["steps"][4].pop("if"),
+            "idle cache refreshed": lambda w: live_job(w)["steps"][5].update({"if": "${{ !cancelled() }}"}),
+            "observer acquires": lambda w: live_job(w)["steps"][3].update(
+                {"run": SLOW_BURN_OBSERVER_STEP["run"].replace(" observe", " acquire")}),
+            "observer tolerates refusal": lambda w: live_job(w)["steps"][3].update({"continue-on-error": "true"}),
+            "observer gated off": lambda w: live_job(w)["steps"][3].update({"if": "false"}),
+            "observer missing scrape preflight": lambda w: live_job(w)["steps"][3]["env"].pop("METRICS_CONFIGURED"),
+            "observer secret leaked to scrape": lambda w: live_job(w)["steps"][4]["env"].update(
+                {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
+            "idle receipt dropped": lambda w: live_job(w)["steps"][6]["with"].update(
+                {"path": "slow-burn-tracker-evidence.json\nslow-burn-exposition.prom\n"}),
             # Fixture job: proof runs never reach the staging Environment.
             "fixture binds staging": lambda w: fixture_job(w).update({"environment": deepcopy(staging)}),
             "fixture binds deployment staging": lambda w: fixture_job(w).update({"environment": "staging"}),
@@ -9152,7 +9203,7 @@ class WorkflowTests(unittest.TestCase):
             "fixture restores the ring": lambda w: fixture_job(w)["steps"].insert(
                 2, deepcopy(live_job(w)["steps"][2])),
             "fixture saves the ring": lambda w: fixture_job(w)["steps"].insert(
-                3, deepcopy(live_job(w)["steps"][4])),
+                3, deepcopy(live_job(w)["steps"][5])),
             "fixture write grant": lambda w: fixture_job(w).update(
                 {"permissions": {"contents": "write", "issues": "write"}}),
             "fixture persisted credentials": lambda w: fixture_job(w)["steps"][0]["with"].update(
@@ -9615,8 +9666,8 @@ class WorkflowTests(unittest.TestCase):
                 self.assertFalse(runner_allowed("worker", runs_on))
 
     def test_certify_promotion_runner_must_use_its_own_routed_expression(self):
-        # Reconciliation pin: certification is artifact-only, but that buys
-        # service/container isolation, not a runner waiver. The real job must
+        # Certification checks the existing live grant before packaging artifacts;
+        # that buys service/container isolation, not a runner waiver. The job must
         # use the exact canonical routed expression naming certify-promotion,
         # matching scripts/test-runner-routing.py::routed('certify-promotion').
         canonical = ROUTED_RUNNER.format(job="certify-promotion")
@@ -9639,7 +9690,9 @@ class WorkflowTests(unittest.TestCase):
                 self.assertFalse(runner_allowed("certify-promotion", runs_on))
         self.assertNotIn("services", job)
         self.assertNotIn("container", job)
-        self.assertNotIn("environment", job)
+        self.assertEqual(job["environment"], "staging")
+        self.assertFalse(staging_qualification_assert_errors(job, "certify-promotion",
+            "scripts/bot_promotion.py certify", "staging-use-certify.jsonl", "staging-use-certify"))
         self.assertNotIn("secrets", job)
         self.assertEqual(job["permissions"], {"contents": "read", "actions": "read"})
         self.assertEqual(job["runs-on"], canonical)
@@ -10138,10 +10191,12 @@ class WorkflowTests(unittest.TestCase):
                         # Deployments, then records this one.
                         expected = {"contents": "read", "deployments": "write"}
                     elif (name, job_id) == ("deploy-staging.yml", "certify-promotion"):
-                        # Reads the producing run and its immutable diagnostics artifact;
-                        # certification itself has no environment or deploy credentials.
+                        # Reads the immutable artifact and asserts the live grant;
+                        # only the exact readiness step holds the control credential.
                         expected = {"contents": "read", "actions": "read"}
-                        self.assertNotIn("environment", job)
+                        self.assertEqual(job["environment"], "staging")
+                        self.assertFalse(staging_qualification_assert_errors(job, job_id,
+                            "scripts/bot_promotion.py certify", "staging-use-certify.jsonl", "staging-use-certify"))
                         self.assertNotIn("secrets", job)
                     elif (name, job_id) == ("deploy-production.yml", "production"):
                         # Reads immutable staging artifacts, then records this
@@ -10284,6 +10339,9 @@ class WorkflowTests(unittest.TestCase):
             # promotion can never queue an operator rollback behind it (see
             # the header comment in the workflow).
             "deploy-production.yml",
+            # Staging holds the canonical lifecycle group at job level only;
+            # production samples have their own independent queue.
+            "synthetic-user-flow.yml",
         }
         for name, workflow in self.workflows.items():
             on = workflow.get("on") or {}
@@ -10295,6 +10353,12 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(
                     workflow["jobs"]["production"].get("concurrency", {}).get("group"),
                     "deploy-production", f"{name}:production")
+            if name == "synthetic-user-flow.yml":
+                self.assertNotIn("concurrency", workflow)
+                for job_id, group in (("staging", "staging-lifecycle"),
+                                      ("prod-passive", "synthetic-user-flow-production")):
+                    self.assertEqual(workflow["jobs"][job_id].get("concurrency"),
+                                     {"group": group, "cancel-in-progress": "false"})
             if name in exempt:
                 continue
             with self.subTest(workflow=name):
