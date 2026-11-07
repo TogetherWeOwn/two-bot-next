@@ -180,11 +180,17 @@ for reviewers and the Release Manager. The single `ci-ok` aggregate in
 The final-stage reviewer squash-merges the pinned settled head before final
 approval; the author merges only without a review stage. Every `main` merge,
 including docs-only, needs the Release Manager's exact-head authorization because
-it can reach production through the promotion path. Exact-head staging remains
-the default; only the complete artifact-identical proof described in
-[Production merge evidence](CONTRIBUTING.md#production-merge-evidence) can remove
-that prerequisite. CI evidence alone does not replace staging/e2e, migration,
-rollback, security or review gates. See
+it can reach production through the promotion path. For web/bot, staging
+qualification is the automatic **post-merge, pre-production exact-main
+staging/e2e/soak gate**, enforced by the promotion guard. Staging accepts only
+main-ancestor SHAs; unmerged-head staging and artifact-equality proofs are not
+substitute merge prerequisites. See
+[Production merge evidence](CONTRIBUTING.md#production-merge-evidence) for the
+superseding contract. Exact-PR-head Actions/Devin, specialist/native review,
+existing production holds, migration/no-migration and rollback evidence, fresh
+per-PR exact-head Release Manager acceptance and release-log recording remain
+required. Neither this policy nor CI evidence claims a staging pass or hold lift,
+or replaces post-merge qualification and exact-SHA artifact/promotion evidence. See
 [Contributing](CONTRIBUTING.md#verification-on-github-actions) and
 [AGENTS.md](AGENTS.md). The toolchain stays pinned in `rust-toolchain.toml`.
 

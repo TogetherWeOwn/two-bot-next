@@ -71,45 +71,33 @@ exact head before merge. Put the confirmation on a child task assigned and
 addressed to the Release Manager (`resolverPolicy: not_creator`). A manual
 production dispatch or rollback needs its own Release Manager confirmation too.
 
-Exact-head staging qualification remains the default. The artifact-identical
-rule (owner decision 2026-11-05) removes only that staging prerequisite, and only
-when **all** of the following hold:
+For two-web-next and two-bot-next, staging qualification is the automatic
+**post-merge, pre-production exact-main staging/e2e/soak gate** (owner decision
+2026-11-06). Staging accepts only main-ancestor SHAs; an unmerged PR-head staging
+run is not a merge prerequisite. Production promotes only the exact main SHA
+that passes staging deploy, e2e and soak, enforced by the promotion guard. See the
+[production deploy gate](docs/production-deploy.md) and
+[staging rollout gate](docs/staging-rollout-gate.md) for the pipeline evidence.
+This describes the required gate, not a claim that any SHA has qualified.
 
-1. **Qualifying actual diff.** Every change is only tests (`test/`, `e2e/`,
-   `*.test.*`, fixtures), documentation (`docs/`, `*.md`), or CI unrelated to
-   build, deploy, release or promotion. Inspect content, not just paths or PR
-   labels. Deploy/release workflows, Wrangler/Worker configuration, Dockerfiles,
-   migrations, package manifests and lockfiles are excluded, even under an
-   otherwise qualifying path. Any runtime, dependency or deployment change is
-   outside this rule.
-2. **Byte-identical production artifacts.** Compare the complete production build
-   artifacts for the exact PR head and current `main`, using the existing
-   production build and artifact definitions. Record both full head SHAs, both
-   bundle/image hashes, and evidence identifying the compared artifacts on the
-   confirmation card. For multiple deployed components, record the paired hashes
-   for each: this bot's container image and Worker bundle must both be covered,
-   including all deployed assets and image metadata. An identical source tree,
-   file label, PR title, isolated Rust binary, or partial build output is not
-   artifact proof. Do not strip provenance stamps to manufacture equality.
-3. **Exact-head gates pass.** Required CI and Devin Review pass on that same PR
-   head, and all review findings are fixed or answered with evidence.
+This contract supersedes the earlier artifact-identical staging exception.
+Unmerged-head staging and paired artifact-equality proofs are not substitute
+merge prerequisites. Do not demand either to satisfy the staging item before
+merge, or treat artifact equality as permission to skip post-merge qualification.
+The pipeline's exact-SHA artifact and promotion evidence remains required.
 
-The Release Manager verifies the classification and records it with both SHAs
-and both hashes (per deployed component) in each decision. Missing/incomplete
-proof, any hash mismatch, or a non-qualifying diff retains the full exact-head
-staging requirement. Supply the normal staging/e2e evidence in that case; in
-either case retain the migration ledger entry (or `no migration`) and rollback
-target with the decision.
-
-This rule waives no required check, review gate or red deterministic gate. Keep
-incident, freeze and hold safeguards, identity/capability holds, exact-head
-per-PR confirmation, SHA-pinned squash merge and release-log recording. Any new
-PR head needs fresh review/check evidence and a new Release Manager confirmation;
-if the `main` comparison SHA changes, revalidate the artifact comparison before
-merge. Previously rejected requests remain historical rejections, not approvals:
-qualifying candidates must supply hashes and be freshly submitted. This policy
-authorizes no pipeline skip/no-op implementation, deployment or other production
-action. On owner revocation, revert this documented rule through normal gates.
+Before merge, retain required GitHub Actions checks and Devin Review on the
+exact PR head, all applicable specialist and native review, and evidence-backed
+finding dispositions. Include the migration ledger entry (or `no migration`)
+and rollback target in the fresh per-PR exact-head Release Manager decision.
+Keep incident, freeze and hold safeguards, identity/capability holds and red
+staging-drill or other deterministic gates; this staging contract lifts none of
+them. A previous rejection remains a rejection, not retroactive approval. Submit
+a fresh confirmation only after its remaining conditions are met. Any new PR
+head requires fresh review/check evidence and Release Manager acceptance before
+the SHA-pinned squash merge and release-log recording. This documentation
+authorizes no pipeline skip/no-op implementation, hold lift, deployment or other
+production action.
 
 ### CI lanes
 
