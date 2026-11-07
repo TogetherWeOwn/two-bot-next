@@ -599,8 +599,8 @@ jobs:
           set -euo pipefail
           # No --expected-sha flag: the snapshot's recorded serving SHA is
           # the receipt member the stable gate pins (the restored build
-          # reports the previous revision, not the failed SHA). A pre-stamp
-          # snapshot carries none and identity rests on the version header.
+          # reports the previous revision, not the failed SHA). Staging refuses
+          # pre-stamp targets: both the SHA and bounded-policy proof are required.
           # Recovery tooling belongs to the workflow head, never the historical
           # deployed checkout: a pinned old helper must not bypass finite use.
           python3 ../tooling/scripts/worker_container_rollback.py rollback \
