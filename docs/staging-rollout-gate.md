@@ -26,6 +26,60 @@ ordered restore plan for a receipt without any mutation via
 `scripts/worker_container_rollback.py rollback ... --dry-run`, which validates
 the receipt identically to the live path and exits 0.
 
+## No-always-on staging rule and activation hold
+
+Idle staging/preview must carry **no recurring always-on runtime cost**. Start
+staging only through a trusted pipeline-owned, finite-use window, verify the
+exact tested SHA/environment before qualification, and stop through native
+Container/DO lifecycle controls on completion or expiry. A runner's `always()`
+cleanup is useful but cannot be the cancellation/runner-loss backstop. Production
+behavior, probes and release gates are unchanged. Never add a host timer, idle
+keepalive or scheduled probe that resurrects staging outside an authorized window.
+
+**Rollout status: incomplete, not activated.** The staging-use protocol in
+`wrangler/src/staging-lifecycle.ts` is gated by the staging-only
+`STAGING_RUNTIME_POLICY=bounded` configuration. That setting is not installed by
+this protocol checkpoint. The existing deployment and synthetic workflows below
+are not yet evidence of the complete bounded lifecycle; pipeline integration and
+live acceptance are still required. Do not enable the policy or claim savings
+from source code or a sleeping container alone.
+
+The protocol binds a finite window to staging, an exact Worker deployment and
+container SHA, the current ownership epoch, and a workflow run/attempt. It
+persists denial before teardown and before publishing a new grant. Rebinding
+through a deployment or rollback keeps the original expiry; a retry cannot
+extend it or steal a different consumer's window. Released attempts cannot be
+reacquired. Native persisted expiry re-reads the current grant after DO
+reconstruction; expired probes, ingress and SDK startup paths cannot revive the
+container. Routine callers must request only their needed window; the runtime
+ceiling accommodates a separately authorized four-ACTIVE-hour soak, not a
+permanent staging session. A provider stop failure is unconfirmed cleanup, never
+idle/zero-cost proof, and must be repaired through the existing incident path.
+
+Before activation, retain authorized live inventory for the staging and
+production Worker versions, namespaces, Container applications/instances,
+alarms/schedules, and active pipeline consumers. Inventory Neon suspend policy
+and every shared database consumer too. A sleeping bot cannot establish that a
+shared database or another consumer stopped billing. Unsupported controls are
+real prerequisites, not permission to weaken active-use security, health or
+qualification checks.
+
+Retain a rollback receipt with the exact staging Worker version, immutable
+image, SHA, ownership epoch, configuration and migration ledger. A rollback
+target must preserve finite-use expiry; reverting to indefinite always-on staging
+requires an explicit dated owner cost exception naming scope, recurring cost and
+expiry/review date. No such exception is supplied here. Bootstrap/rollback
+compatibility must be resolved before activation, not after a failed rollout.
+
+At verified activation record UTC `t0`, actual resource/version/SHA identities,
+finite expiry, exact-head startup/qualification evidence, stop/idle convergence
+and rollback receipt. Immediately retain the separated staging pre-window
+`[t0-7d,t0)` DO GB-s and Container hours; schedule the measurement follow-up at
+`t0+7d` for `[t0,t0+7d)`. Keep production as a separate control. Report gross
+usage, modeled monthly savings and invoice-confirmed savings separately, with
+query schema/filters/units and incomplete or delayed data disclosed. Assignment,
+merge or an unverified deployment is not `t0`.
+
 ## Step order and why
 
 1. `preflight` -> `prepare` -> `wrangler deploy` -> `receipt` ->

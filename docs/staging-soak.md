@@ -115,6 +115,24 @@ is the serving version (same id as `wrangler deployments status --env staging`),
 and if they differ redeploy the intended SHA through the workflow first (full rule
 in `docs/production-deploy.md`).
 
+## Bounded staging use
+
+The [no-always-on staging rule](staging-rollout-gate.md#no-always-on-staging-rule-and-activation-hold)
+applies to the soak too. Reserve a finite pipeline-owned use window covering
+startup, every required ACTIVE hour and cleanup. Independently verify the exact
+SHA/environment and readiness before starting qualification. Keep native runtime
+expiry as the runner-loss backstop; release on success, failure and cancellation.
+Inventory DO alarms, Containers, database compute/suspend and shared consumers;
+a stopped bot alone is not zero idle cost. This does not authorize activation or
+satisfy any unverified precondition above.
+
+Expiry or stop during required ACTIVE evidence is an interruption, not a passing
+sample or an implicit pause/reset. Preserve the original acceptance criteria and
+record the gap. Do not extend a window indefinitely, infer new soak semantics,
+remove health/security checks or disable production probes to achieve sleeping.
+Rollback to indefinite always-on staging needs a dated owner cost exception; it
+is not the default recovery route.
+
 ## Starting the soak
 
 1. Keep the normal release and staging deployment gates. This document does

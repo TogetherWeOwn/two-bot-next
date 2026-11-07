@@ -6,6 +6,21 @@ minutes: `GET /health` plus `GET /readyz` with build identity, on staging and
 follow no redirects, and refuse any origin outside their own allowlist before
 a request is sent. No Gatus or third-party monitor is used.
 
+## Bounded staging prerequisite
+
+Staging must follow the [finite-use lifecycle](staging-rollout-gate.md#no-always-on-staging-rule-and-activation-hold):
+trusted pipeline acquisition/start and exact-SHA readiness precede the probe;
+serialization covers its entire use window, followed by release and native
+expiry on cancellation or runner loss. A scheduled probe is not permission for
+idle keepalive or for an unauthorized cold start. Preserve the existing required
+active-use checks and incident evidence. Production's passive probes are unchanged.
+
+The protocol checkpoint is not activated and the scheduled consumer integration
+is still outstanding. The five-minute cadence below describes the existing
+workflow, not proof that staging has reached zero idle runtime cost. Do not claim
+activation until the live resource/consumer inventory and startup/stop evidence
+in the rollout gate have been recorded.
+
 ## What runs
 
 | Job | Probe | Target |

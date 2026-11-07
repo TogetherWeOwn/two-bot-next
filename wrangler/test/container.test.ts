@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
+import { STAGING_USE_PATH, STAGING_USE_KEY, type StagingWindow } from "../src/staging-lifecycle.ts";
 import { EMPTY_STATE, LOG_QUERY_URL, type MetricsAlertState } from "../src/alert-rules.ts";
 import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
 
@@ -97,7 +98,7 @@ type StartConfig = {
 };
 
 async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: {
-  owner?: unknown; readError?: boolean; stopError?: boolean; running?: boolean;
+  owner?: unknown; readError?: boolean; stopError?: boolean; running?: boolean; values?: Map<string, unknown>;
 } | Map<string, unknown> = {}, sqlStore?: DatabaseSync) {
   const database = sqlStore ?? new DatabaseSync(":memory:");
   if (!sqlStore) t.after(() => database.close());
@@ -111,7 +112,7 @@ async function harness(t: TestContext, env: Partial<Env> = WORKER_ENV, options: 
   const starts: StartConfig[] = [];
   const requests: { pathname: string; port: number }[] = [];
   const values = options instanceof Map ? options
-    : new Map<string, unknown>([[OWNER_KEY, "owner" in flags ? flags.owner : ACTIVE_OWNER]]);
+    : flags.values ?? new Map<string, unknown>([[OWNER_KEY, "owner" in flags ? flags.owner : ACTIVE_OWNER]]);
   const gates: Promise<unknown>[] = [];
   let listenerPort = 8080;
   let probeStatus = 503;
@@ -204,6 +205,217 @@ async function tickKeepalive(bot: TwoBotContainer) {
   const [pending] = await bot.listSchedules<{ startedAt: number }>("keepalive");
   assert.ok(pending);
   await bot.keepalive(pending.payload!, pending);
+}
+
+const BOUNDED_STAGING_ENV = {
+  ...WORKER_ENV, TWO_DEPLOY_ENV: "staging", STAGING_RUNTIME_POLICY: "bounded", CONTAINER_RELEASE: "a".repeat(40),
+};
+
+function stagingUseRequest(action: "acquire" | "release", window: StagingWindow): Request {
+  return probeRequest(`https://worker.invalid${STAGING_USE_PATH}`, {
+    method: "POST", headers: { authorization: `Bearer ${CONTROL_TOKEN}` },
+    body: JSON.stringify({ ...window, action, expectedEpoch: 1, deploymentId: ID, sha: BOUNDED_STAGING_ENV.CONTAINER_RELEASE }),
+  });
+}
+
+function stagingWindow(): StagingWindow {
+  return { environment: "staging", runId: "123456", runAttempt: 1, expiresAt: Date.now() + 120_000 };
+}
+
+for (const path of ["/health", "/readyz", "/version"]) {
+  test(`bounded staging: idle ${path} cannot start or arm keepalive`, async (t) => {
+    const h = await harness(t, BOUNDED_STAGING_ENV);
+    const response = await h.bot.fetch(probeRequest(`https://worker.invalid${path}`));
+    assert.equal(response.status, 503);
+    assert.equal(h.starts.length, 0);
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.pending().length, 0);
+    assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 0);
+    await assert.rejects(h.bot.start(), /staging_use_required/);
+    await assert.rejects(h.bot.startAndWaitForPorts(8080), /staging_use_required/);
+    await assert.rejects(h.bot.containerFetch("http://c/health"), /staging_use_required/);
+    assert.equal(h.starts.length, 0, "all native SDK start paths are fenced");
+  });
+}
+
+test("bounded staging: authenticated acquire authorizes exact identity without starting; release is idempotent", async (t) => {
+  const h = await harness(t, BOUNDED_STAGING_ENV);
+  const window = stagingWindow();
+  const acquired = await h.bot.fetch(stagingUseRequest("acquire", window));
+  assert.equal(acquired.status, 200);
+  const grant = await acquired.json() as { running: boolean; use: { phase: string; expiresAt: number } };
+  assert.equal(grant.running, false);
+  assert.equal(grant.use.phase, "active");
+  assert.equal(grant.use.expiresAt, window.expiresAt);
+  assert.equal(h.starts.length, 0);
+  const [expiry] = await h.bot.listSchedules("stagingExpiry");
+  assert.equal(expiry?.time, Math.ceil(window.expiresAt / 1000));
+  assert.equal(expiry?.payload, null, "SDK SQL bindings must be serializable, not undefined");
+  const ready = await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  assert.equal(ready.status, 200);
+  await ready.arrayBuffer();
+  assert.equal(h.runtime.running, true);
+  assert.equal(h.pending().length, 1);
+  const first = await h.bot.fetch(stagingUseRequest("release", window));
+  assert.equal(first.status, 200);
+  assert.equal(h.runtime.running, false);
+  assert.equal(h.pending().length, 0);
+  assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 0);
+  assert.equal((await h.bot.fetch(stagingUseRequest("release", window))).status, 200);
+  assert.equal((await h.bot.fetch(stagingUseRequest("acquire", window))).status, 503);
+  assert.equal((await h.bot.fetch(probeRequest("https://worker.invalid/readyz"))).status, 503);
+  assert.equal(h.starts.length, 1);
+});
+
+test("bounded staging: control authentication, version stamping and bounded body parsing precede acquisition", async (t) => {
+  const h = await harness(t, BOUNDED_STAGING_ENV);
+  const window = stagingWindow();
+  const unauthorized = stagingUseRequest("acquire", window);
+  unauthorized.headers.set("authorization", "Bearer incorrect-synthetic-token");
+  assert.equal((await h.bot.fetch(unauthorized)).status, 401);
+  assert.equal(h.values.has(STAGING_USE_KEY), false);
+  const noVersion = stagingUseRequest("acquire", window);
+  noVersion.headers.delete(DEPLOYMENT_HEADER);
+  assert.equal((await h.bot.fetch(noVersion)).status, 503);
+  assert.equal(h.values.has(STAGING_USE_KEY), false);
+  for (const body of ["{", "x".repeat(1025), JSON.stringify({ environment: "production" })]) {
+    const malformed = probeRequest(`https://worker.invalid${STAGING_USE_PATH}`, {
+      method: "POST", headers: { authorization: `Bearer ${CONTROL_TOKEN}` }, body,
+    });
+    assert.equal((await h.bot.fetch(malformed)).status, 400);
+    assert.equal(h.values.has(STAGING_USE_KEY), false);
+  }
+  let stamped = "";
+  const forged = stagingUseRequest("acquire", window);
+  forged.headers.set(DEPLOYMENT_HEADER, "deployment-forged");
+  const result = await worker.fetch(forged, {
+    ...BOUNDED_STAGING_ENV,
+    TWO_BOT: { getByName: () => ({ fetch: async (request: Request) => {
+      stamped = request.headers.get(DEPLOYMENT_HEADER) ?? "";
+      return h.bot.fetch(request);
+    } }) },
+  } as unknown as Env, {} as ExecutionContext);
+  assert.equal(stamped, ID);
+  assert.equal(result.status, 200);
+  assert.equal(h.starts.length, 0);
+});
+
+test("bounded staging: native expiry stops a lost runner's container, consumes schedules, and never resurrects", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  const h = await harness(t, BOUNDED_STAGING_ENV);
+  const window = stagingWindow();
+  assert.equal((await h.bot.fetch(stagingUseRequest("acquire", window))).status, 200);
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  await response.arrayBuffer();
+  const [oldTick] = await h.bot.listSchedules("keepalive");
+  assert.ok(oldTick);
+  t.mock.timers.tick(120_000);
+  await h.bot.alarm();
+  assert.equal(h.runtime.running, false);
+  assert.equal(h.pending().length, 0);
+  assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 0);
+  const before = h.requests.length;
+  await h.bot.keepalive(oldTick.payload as typeof KEEPALIVE, oldTick);
+  await h.bot.stagingExpiry();
+  assert.equal(h.requests.length, before);
+  assert.equal(h.starts.length, 1);
+  assert.equal((await h.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 503);
+  assert.equal(h.starts.length, 1);
+});
+
+test("bounded staging: DO reconstruction after expiry stops a reattached process before ingress", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  const h = await harness(t, BOUNDED_STAGING_ENV);
+  assert.equal((await h.bot.fetch(stagingUseRequest("acquire", stagingWindow()))).status, 200);
+  t.mock.timers.tick(120_001);
+  const reconstructed = await harness(t, BOUNDED_STAGING_ENV, { values: h.values, running: true }, h.database);
+  assert.equal(reconstructed.runtime.running, false);
+  assert.equal(reconstructed.runtime.destroys, 1);
+  assert.equal((await reconstructed.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 503);
+  assert.equal(reconstructed.starts.length, 0);
+  await reconstructed.bot.stagingExpiry();
+  assert.equal((await reconstructed.bot.listSchedules("stagingExpiry")).length, 0);
+});
+
+test("bounded staging: cleanup from an older run cannot stop the new consumer", async (t) => {
+  const h = await harness(t, BOUNDED_STAGING_ENV);
+  const first = stagingWindow();
+  assert.equal((await h.bot.fetch(stagingUseRequest("acquire", first))).status, 200);
+  assert.equal((await h.bot.fetch(stagingUseRequest("release", first))).status, 200);
+  const next = { ...first, runId: "999999" };
+  assert.equal((await h.bot.fetch(stagingUseRequest("acquire", next))).status, 200);
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  await response.arrayBuffer();
+  assert.equal((await h.bot.fetch(stagingUseRequest("release", first))).status, 503);
+  assert.equal(h.runtime.running, true);
+  await h.bot.stagingExpiry();
+  assert.equal(h.runtime.running, true, "an early/stale callback is not stop authority");
+});
+
+test("bounded staging: startup that crosses expiry cannot leave an unauthorized process running", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  const h = await harness(t, BOUNDED_STAGING_ENV);
+  assert.equal((await h.bot.fetch(stagingUseRequest("acquire", stagingWindow()))).status, 200);
+  const start = h.runtime.start.bind(h.runtime);
+  t.mock.method(h.runtime, "start", (config: StartConfig) => {
+    start(config);
+    t.mock.timers.tick(120_000);
+  });
+  await assert.rejects(h.bot.start(), /staging_use_required/);
+  assert.equal(h.runtime.running, false);
+  assert.equal(h.pending().length, 0);
+});
+
+test("bounded staging: unreadable authority in expiry stops rather than sustaining an idle alarm loop", async (t) => {
+  const h = await harness(t, BOUNDED_STAGING_ENV);
+  assert.equal((await h.bot.fetch(stagingUseRequest("acquire", stagingWindow()))).status, 200);
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  await response.arrayBuffer();
+  const get = h.ctx.storage.get;
+  t.mock.method(h.ctx.storage, "get", async (key: string) => {
+    if (key === STAGING_USE_KEY) throw new Error("synthetic storage failure");
+    return get(key);
+  });
+  await h.bot.stagingExpiry();
+  assert.equal(h.runtime.running, false);
+  assert.equal(h.pending().length, 0);
+  assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 0);
+});
+
+test("bounded staging: unconfirmed expiry teardown persists a stop-only successor until confirmed", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  const h = await harness(t, BOUNDED_STAGING_ENV);
+  assert.equal((await h.bot.fetch(stagingUseRequest("acquire", stagingWindow()))).status, 200);
+  const response = await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+  await response.arrayBuffer();
+  const destroy = h.runtime.destroy.bind(h.runtime);
+  let failing = true;
+  t.mock.method(h.runtime, "destroy", async () => {
+    if (failing) throw new Error("synthetic provider stop failure");
+    await destroy();
+  });
+  t.mock.timers.tick(120_000);
+  await fireSdkAlarm(t, h.bot, 15_000);
+  assert.equal(h.pending().length, 0);
+  assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 1, "SDK consuming the failed row must not lose stop retry");
+  await assert.rejects(h.bot.start(), /shutdown_unconfirmed/);
+  failing = false;
+  t.mock.timers.tick(15_000);
+  await h.bot.alarm();
+  assert.equal(h.runtime.running, false);
+  assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 0);
+  assert.equal(h.starts.length, 1);
+});
+
+for (const env of [WORKER_ENV, { ...WORKER_ENV, TWO_DEPLOY_ENV: "production", STAGING_RUNTIME_POLICY: "bounded" }]) {
+  test(`staging-use route is dark outside bounded staging (${env.TWO_DEPLOY_ENV ?? "unmarked"})`, async (t) => {
+    const h = await harness(t, env);
+    assert.equal((await h.bot.fetch(stagingUseRequest("acquire", stagingWindow()))).status, 404);
+    const response = await h.bot.fetch(probeRequest("https://worker.invalid/health"));
+    assert.equal(response.status, 200, "production auto-start behavior is unchanged");
+    await response.arrayBuffer();
+    assert.equal(h.starts.length, 1);
+  });
 }
 
 for (const path of ["/health", "/readyz"]) {

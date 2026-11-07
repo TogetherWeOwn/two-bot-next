@@ -86,6 +86,22 @@ The offline suites (`scripts/test_staging_voice_synthetic.py`,
 caps, the exact-cap passes, the cap-plus-one refusals on every path and the
 fixed messages.
 
+## Bounded staging prerequisite
+
+Voice and [help-embed checks](staging-help-embed-smoke.md) must use the same
+[bounded staging contract](staging-rollout-gate.md#no-always-on-staging-rule-and-activation-hold)
+as deployment and rollback consumers: acquire/start through the trusted pipeline,
+verify the exact SHA/environment before live checks, serialize the complete use
+window, then release with native expiry surviving cancellation or runner loss.
+A workflow's retry loop must fit inside the original window, not renew it.
+Keep every existing active-use check and cleanup obligation; a stopped gateway
+is not a passing room-lifecycle test.
+
+The runtime protocol checkpoint is not activation. The existing scheduled and
+reusable consumers still need lifecycle wiring and full-window serialization
+before rollout acceptance. Production is unchanged; no permanent staging
+keepalive, host timer or new always-on cost is authorized.
+
 ## When it runs
 
 - After every `deploy-staging` run (job `voice-synthetic`). A failure fails the
