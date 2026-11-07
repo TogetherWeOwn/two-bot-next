@@ -110,6 +110,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'backfill_history_messages', 'table'),
     ('public', 'backfill_history_counts', 'table'),
     ('public', 'game_activity_guild_aggregates', 'table'),
+    ('public', 'voice_heat_hours', 'table'),
     ('public', 'assistant_monthly_builds', 'table'),
     ('public', 'scheduled_events_claim', 'table'),
     ('public', 'scheduled_events_tombstone', 'table'),
@@ -149,6 +150,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('web_v1', 'next_event', 'view'),
     ('web_v1', 'funnel_daily', 'view'),
     ('web_v1', 'funnel_by_source', 'view'),
+    ('web_v1', 'voice_heat', 'view'),
     ('web_v1', '_ts(text)', 'function'),
     ('web_v1', '_iso(timestamp with time zone)', 'function'),
     ('web_v1', '_json(text)', 'function')

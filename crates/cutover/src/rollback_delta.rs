@@ -279,6 +279,12 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         table: "voice_creators",
         measure: TableMeasure::Unmeasurable("no timestamp column; creator configuration is upserted in place (see PgRoomStore::add_creator)", DISPOSITION_ACCEPT_WITH_REASON),
     },
+    // Buffered hourly flushes may arrive after their observation time; neither
+    // timestamp measures insertion. Derived calibration is excluded from backups.
+    TableSpec {
+        table: "voice_heat_hours",
+        measure: TableMeasure::Unmeasurable("timestamps record observation time, not buffered insertion; short-lived derived calibration is excluded from backups and re-sampled after recovery, with gaps kept insufficient", DISPOSITION_ACCEPT_WITH_REASON),
+    },
     // V3 block list (0416): one row per blocked member, stamped on insert; an
     // unblock deletes the row, so only additions are measurable.
     TableSpec { table: "voice_room_blocks", measure: TableMeasure::Columns(&["created_at"]) },

@@ -105,6 +105,7 @@ async fn isolated_boot_probe() {
             None,
             None,
             None,
+            crate::voice_snapshot::new_shared_cache(),
         )
         .await
     });

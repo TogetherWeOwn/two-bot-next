@@ -284,3 +284,88 @@ LEFT JOIN members m ON m.guild_id = e.guild_id AND m.member_id = e.member_id
 WHERE e.event_type = 'member_join'
   AND NOT COALESCE(m.is_bot, FALSE)
 GROUP BY to_char(e.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD'), e.source;
+
+-- ---------------------------------------------------------------------------
+-- voice_heat - guild voice occupancy by hour-of-week, trailing 28 days
+-- ---------------------------------------------------------------------------
+--
+-- Contract v2 B5 (1.1 addition): the sampler persists guild-wide
+-- `total_in_voice` per UTC hour in `voice_heat_hours`; this view folds the
+-- trailing 28 complete UTC days into the 7x24 grid the site's Now Line
+-- shades. One row per (dow, hour) cell, always all 168 rows.
+--
+--   dow              0-6, Monday = 0 (ISODOW - 1)
+--   hour             0-23 UTC
+--   avg_in_voice     mean occupancy for the cell, NULL when the cell holds
+--                    no samples (a gap is a gap, never a zero)
+--   sample_days      distinct UTC days contributing samples to the window
+--   coverage         per-cell valid samples / 48 expected five-minute slots
+--   measured_through ISO-8601 UTC text of the latest included observation,
+--                    NULL iff the window has no valid observations
+--   source           measured when sample_days >= 14 AND every cell has
+--                    coverage >= 0.8 (at least 39/48 slots), else insufficient
+--
+-- sample_days, measured_through and source are window-global provenance.
+-- Coverage is per cell, with a fixed denominator over all 28 complete days.
+-- Valid zero occupancy counts; zero-sample rows and missing hours are gaps.
+-- The consumer falls back to estimates when the observation watermark is
+-- stale (>48 h); fetching an unchanged grid does not refresh that watermark.
+CREATE OR REPLACE VIEW web_v1.voice_heat AS
+WITH bounds AS (
+  SELECT
+    (date_trunc('day', now() AT TIME ZONE 'UTC') - interval '28 days') AT TIME ZONE 'UTC' AS window_start,
+    date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS window_end
+),
+scoped AS (
+  SELECT h.hour_start_utc, h.samples, h.occupancy_sum, h.last_observed_at
+  FROM voice_heat_hours h, bounds b
+  WHERE h.hour_start_utc >= b.window_start
+    AND h.hour_start_utc < b.window_end
+    AND h.samples > 0
+),
+provenance AS (
+  SELECT
+    (SELECT count(DISTINCT (hour_start_utc AT TIME ZONE 'UTC')::date) FROM scoped) AS sample_days,
+    (SELECT max(last_observed_at) FROM scoped) AS measured_through_ts
+),
+cells AS (
+  SELECT
+    ((EXTRACT(ISODOW FROM hour_start_utc AT TIME ZONE 'UTC'))::int - 1) AS dow,
+    (EXTRACT(HOUR FROM hour_start_utc AT TIME ZONE 'UTC'))::int AS hour,
+    sum(occupancy_sum)::double precision / NULLIF(sum(samples), 0) AS avg_in_voice,
+    sum(samples)::double precision / 48.0 AS coverage
+  FROM scoped
+  GROUP BY 1, 2
+),
+grid AS (
+  SELECT days.dow, hours.hour
+  FROM generate_series(0, 6) AS days(dow)
+  CROSS JOIN generate_series(0, 23) AS hours(hour)
+)
+SELECT
+  grid.dow,
+  grid.hour,
+  cells.avg_in_voice,
+  provenance.sample_days,
+  COALESCE(cells.coverage, 0.0) AS coverage,
+  web_v1._iso(provenance.measured_through_ts) AS measured_through,
+  CASE WHEN provenance.sample_days >= 14
+         AND (SELECT count(*) FROM cells WHERE coverage >= 0.8) = 168
+       THEN 'measured' ELSE 'insufficient' END AS source
+FROM grid
+LEFT JOIN cells ON cells.dow = grid.dow AND cells.hour = grid.hour
+CROSS JOIN provenance
+ORDER BY grid.dow, grid.hour;
+
+-- ---------------------------------------------------------------------------
+-- contract version publication - must stay the LAST statement
+-- ---------------------------------------------------------------------------
+--
+-- 1.0 -> 1.1 is published only here, after every view above (including
+-- `voice_heat`) exists. The applier runs this whole file as one atomic unit,
+-- so a failed view install rolls the bump back and the recorded version never
+-- claims views that are not installed. Guarded and idempotent: only the exact
+-- `1.0` seed moves; a newer recorded version is never touched or lowered.
+UPDATE web_contract_meta
+   SET contract_version = '1.1'
+ WHERE singleton AND contract_version = '1.0';

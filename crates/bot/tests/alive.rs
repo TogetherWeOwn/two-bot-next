@@ -30,6 +30,7 @@ const STEP: Duration = Duration::from_secs(5);
 const TOTAL: Duration = Duration::from_secs(45);
 const GUILD: &str = "2222";
 const SESSION: &str = "alive-mock-session";
+const BOOTSTRAP_SESSION: &str = "alive-mock-bootstrap-session";
 type Logs = Arc<Mutex<String>>;
 
 struct TestDb {
@@ -202,6 +203,7 @@ async fn capture(stream: impl AsyncRead + Unpin, logs: Logs) {
 
 struct MockDiscord {
     url: String,
+    bootstrap_url: String,
     api: String,
     auth: mpsc::Receiver<Value>,
     release: mpsc::Sender<()>,
@@ -215,6 +217,8 @@ impl MockDiscord {
         let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ws_addr = ws_listener.local_addr().unwrap();
         let url = format!("ws://{ws_addr}");
+        let bootstrap_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bootstrap_url = format!("ws://{}", bootstrap_listener.local_addr().unwrap());
         // Registry publication is HTTP before gateway connect on BOTH boots.
         // Onboarding identity and website jobs share DISCORD_API_BASE, so use
         // a route-aware REST socket separate from the gateway: job reads must
@@ -227,8 +231,15 @@ impl MockDiscord {
         let (release, mut gates) = mpsc::channel(4);
         let resume_url = url.clone();
         let task = tokio::spawn(async move {
-            for boot in 0..2 {
-                let (stream, _) = ws_listener.accept().await.unwrap();
+            for connection in 0..3 {
+                // The second boot must RESUME on the saved endpoint before
+                // using its distinct configured endpoint for cold IDENTIFY.
+                let listener = if connection == 2 {
+                    &bootstrap_listener
+                } else {
+                    &ws_listener
+                };
+                let (stream, _) = listener.accept().await.unwrap();
                 let (_, mut ws) = ServerBuilder::new()
                     .accept(stream)
                     .await
@@ -258,17 +269,24 @@ impl MockDiscord {
                         Some(2 | 6) => {
                             auth_tx.send(packet).await.unwrap();
                             gates.recv().await.expect("release READY/RESUMED");
-                            if boot == 0 {
+                            if connection != 1 {
+                                let session = if connection == 0 {
+                                    SESSION
+                                } else {
+                                    BOOTSTRAP_SESSION
+                                };
                                 ws.send(Message::text(json!({"op":0,"s":1,"t":"READY","d":{
                                     "v":10,"user":{"id":"999","username":"mock-bot","discriminator":"0","mfa_enabled":false},
-                                    "session_id":SESSION,"resume_gateway_url":resume_url,"guilds":[],"application":{"id":"1111","flags":0}
+                                    "session_id":session,"resume_gateway_url":resume_url,"guilds":[],"application":{"id":"1111","flags":0}
                                 }}).to_string())).await.unwrap();
                             }
-                            // On restart this is the exact already-committed dispatch replay.
-                            ws.send(Message::text(json!({"op":0,"s":2,"t":"GUILD_MEMBER_REMOVE","d":{
-                                "guild_id":GUILD,"user":{"id":"77","username":"mock-member","discriminator":"0"}
-                            }}).to_string())).await.unwrap();
-                            if boot == 1 {
+                            if connection != 2 {
+                                // On restart this is the exact already-committed dispatch replay.
+                                ws.send(Message::text(json!({"op":0,"s":2,"t":"GUILD_MEMBER_REMOVE","d":{
+                                    "guild_id":GUILD,"user":{"id":"77","username":"mock-member","discriminator":"0"}
+                                }}).to_string())).await.unwrap();
+                            }
+                            if connection == 1 {
                                 ws.send(Message::text(
                                     json!({"op":0,"s":3,"t":"RESUMED","d":{}}).to_string(),
                                 ))
@@ -287,6 +305,7 @@ impl MockDiscord {
         let rest_task = tokio::spawn(serve_rest(rest_listener, rest_requests.clone()));
         Self {
             url,
+            bootstrap_url,
             api,
             auth,
             release,
@@ -464,8 +483,9 @@ async fn checkpoint(db: &TestDb, seq: u64) {
 /// Count lines carrying a stable `msg` catalog name (`docs/logging.md`). The
 /// readiness line keeps its human "gateway ready; checkpoint committed"
 /// message for the dashboards that match it, but tests key on `msg`. Each boot
-/// emits exactly one durable READY/RESUMED commit (`ready` on fresh IDENTIFY,
-/// `gateway_resumed` on RESUME replay) and one `shutdown_started` on SIGTERM.
+/// emits exactly one durable readiness commit: `ready` on fresh IDENTIFY,
+/// including cold-resume bootstrap, or `gateway_resumed` on warm RESUME.
+/// Each SIGTERM emits one `shutdown_started`.
 fn msg_count(logs: &str, names: &[&str]) -> usize {
     logs.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -525,12 +545,12 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
     // Registry-sync requests consumed by the per-boot assertion below.
     let mut consumed = 0usize;
     for boot in 0..2 {
-        // Restart with an unreachable bootstrap URL: RESUME must select the
-        // unchanged persisted endpoint rather than quietly IDENTIFY again.
+        // Restart with a distinct bootstrap URL: RESUME must first select
+        // the saved endpoint, then IDENTIFY to rebuild the fresh shared cache.
         let gateway = if boot == 0 {
             &discord.url
         } else {
-            "ws://127.0.0.1:1"
+            &discord.bootstrap_url
         };
         bots.push(Bot::spawn(db, addr, gateway, &discord.api, logs));
         let bot = bots.last_mut().unwrap();
@@ -642,6 +662,29 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         );
         discord.release.send(()).await.unwrap();
         checkpoint(db, if boot == 0 { 2 } else { 3 }).await;
+        if boot == 1 {
+            // A committed cold replay is not readiness: the cache still needs
+            // a fresh snapshot. Hold READY until IDENTIFY and its durable
+            // predecessor have both been observed.
+            discord.release.send(()).await.unwrap(); // Bootstrap HELLO.
+            let identify = discord.authentication().await;
+            assert_eq!(
+                identify["op"], 2,
+                "cold RESUME must bootstrap with IDENTIFY"
+            );
+            let saved = db.store().load().await.unwrap().unwrap();
+            assert_eq!(saved.session_id, SESSION);
+            assert_eq!(saved.sequence, 3, "RESUMED must commit before IDENTIFY");
+            wait_http(bot, addr, "/readyz", 503).await;
+            assert_eq!(ready_commits(&logs.lock().await), 1);
+            discord.release.send(()).await.unwrap(); // Bootstrap READY.
+            checkpoint(db, 1).await;
+            assert_eq!(
+                db.store().load().await.unwrap().unwrap().session_id,
+                BOOTSTRAP_SESSION,
+                "fresh READY replaces the resumed session"
+            );
+        }
         let ready = wait_http(bot, addr, "/readyz", 200).await;
         assert!(ready.contains("\"gateway\",\"ready\""));
         if boot == 0 {
