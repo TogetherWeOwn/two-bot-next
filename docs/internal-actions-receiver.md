@@ -5,11 +5,14 @@
 **Direct-container support is not the shipped Worker capability set.** The
 container source integrates an opt-in private `POST /internal/actions`
 listener with the durable store, announcement executor, event-read,
-voice-snapshot, event-mutation, settings, automations, moderation, membership and
-channel-moderation executors, nonce-commit authentication capability and strict
-receiver configuration. It supports `announcement.post`, the keyless `event.read`
+voice-snapshot, voice-move, event-mutation, settings, automations, moderation,
+membership and channel-moderation executors, nonce-commit authentication
+capability and strict receiver configuration. It supports `announcement.post`,
+the keyless `event.read`
 (behind `TWO_INTERNAL_ALLOW_EVENT_READ`), the keyless `voice.snapshot`
-(behind `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT`), `event.upsert` and `event.cancel`
+(behind `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT`), the self-only `voice.move_member`
+(behind `TWO_INTERNAL_ALLOW_VOICE_MOVE`, keyless like the reads),
+`event.upsert` and `event.cancel`
 (cancel behind `TWO_INTERNAL_ALLOW_EVENT_CANCEL`), `settings.get`/`settings.set`
 (behind `TWO_INTERNAL_ALLOW_SETTINGS`), the automations pair
 `automations.export` (keyless redacted read) / `automations.import` (claimed
@@ -24,13 +27,16 @@ catalogue's broader defaults. Every other verb stays refused by the per-effect
 fences.
 The public health/readiness/metrics router has no action route. The shipped
 Worker exposes only the staging ingress below, dark until separately enabled.
-Its explicit container wiring carries neither role keys nor the optional
-`TWO_INTERNAL_ALLOW_*` gates: `role.assign` has no configured role target, and
-the gated verbs above stay refused. The ungated `announcement.post` and
+Its explicit container wiring carries neither role keys nor any optional
+`TWO_INTERNAL_ALLOW_*` gate except `TWO_INTERNAL_ALLOW_VOICE_MOVE`: `role.assign`
+has no configured role target, and the other gated verbs above stay refused.
+`voice.move_member` is default off and stays refused unless the Operator sets
+that one gate (see [Container wiring](#container-wiring)). The ungated `announcement.post` and
 `event.upsert` paths remain subject to receiver authentication, target validation
 and durable execution fences; this is not evidence that either has run.
 Adding secrets cannot enable unforwarded role/capability gates. Do not stage
-those inputs to try to enable them. Widening forwarding requires a separate
+those inputs to try to enable them. The voice-move gate being forwardable is
+not rollout authority. Widening forwarding requires a separate
 reviewed change; direct-container configuration support is not rollout authority.
 
 No signing key, secret custodian or export authority is supplied by this code.
@@ -73,6 +79,11 @@ no container. Honor `Retry-After` when present. For any uncertain outcome, keep
 the same intent's `Idempotency-Key`, with a fresh timestamp/nonce/signature for
 each attempt; never mint a new intent key to escape `in_progress` or
 `needs_reconciliation`. The latter requires reconciliation before resubmission.
+The keyless `voice.move_member` is the exception: it sends no `Idempotency-Key`
+and has no claim, so after a timeout retry with a fresh nonce/signature and no
+key. A repeated move converges: if the member already reached the target room
+the answer is `already_in_room`. Claimed event mutations do not behave this
+way; they must retry the same key.
 A response-read abort can instead become Worker `503 unavailable`; it is not
 proof of no effect either (see [next actions](#relayed-answer-contract)).
 
@@ -124,9 +135,10 @@ only while `TWO_INTERNAL_ACTIONS` is exactly `1`:
 | `TWO_INTERNAL_CONTAINER` | Worker constant `1`: the Worker sets it to mark the process as running inside the container network, where the wildcard bind is reachable only via `containerFetch` and the startup port check. That network is presumed private but unverified. The marker is a deployment claim, not a proof: the bot trusts it only because the Worker (not the Operator) sets it. A wildcard bind without exactly this marker is refused. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Worker secret, e.g. `smoke-throwaway:<channel snowflake in the TWO Staging guild>` |
 | `TWO_INTERNAL_KEYS` | Worker secret `web-staging:<64 hex>`; never a var, never logged |
+| `TWO_INTERNAL_ALLOW_VOICE_MOVE` | Explicit line, not `FORWARDED_FLAGS`. Forwarded as exactly `1` only while `TWO_INTERNAL_ACTIONS` is exactly `1`; absent or any other value forwards nothing. Default off; not rollout authority |
 
 `NOT_FORWARDED` in `wrangler/src/container-env.ts` deliberately excludes the
-following. Setting them as Worker secrets cannot change the container's
+following (every optional gate except the explicit voice-move line above). Setting them as Worker secrets cannot change the container's
 capabilities; this table is not an instruction to create or stage them.
 
 | Not forwarded | Effect |
@@ -418,10 +430,24 @@ Success (`200` only, `result` always an object, no `error` key):
 | event.upsert/cancel | `{outcome, event_id}` | `outcome` replayed from the stored receipt |
 | event.read | full observed event | behind its allowlist flag |
 | voice.snapshot | live voice-room listing | behind its allowlist flag; refuses `discord_unavailable` unless the gateway is connected, so a warm cache never serves stale occupancy mid-reconnect |
+| voice.move_member | `{outcome[, from_channel_id]}` (`moved` carries `from_channel_id`) | session-derived subject behind its allowlist flag; refuses `discord_unavailable` unless the gateway is connected and the guild/channel/voice cache proves occupancy |
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
 | moderation.\* | `{outcome[, affected]}` | |
+
+For `voice.move_member`, the trusted website signer must derive `discord_id`
+from its authenticated end-user session, never browser input. HMAC binds that
+subject to the body; the one-subject schema does not independently prove consent
+or constrain a compromised signer. The per-member token bucket has burst capacity
+six and continuously refills one token every 50 seconds, not a strict six-move
+rolling window.
+
+The voice response remains synchronous, but receiver-tracked work holds admission
+capacity through terminal audit persistence even if the HTTP handler is cancelled.
+Shutdown drains this work within its bounded budget. Voice moves have no durable
+pre-effect claim: a process crash or forced drain abort can still leave completion
+or audit persistence unproven.
 
 Refusals keep their code, status and retry policy with the fixed message
 `request refused`:
@@ -452,7 +478,7 @@ the human gloss):
 
 | Situation | Next action |
 | --- | --- |
-| `retryable: true` (408, 409 `in_progress`, 429, 500, 502 `discord_unavailable`, 503 `busy`, 504) | Retry the same `Idempotency-Key`; never mint a new key for an unknown outcome. Honor `Retry-After` when present. |
+| `retryable: true` (408, 409 `in_progress`, 429, 500, 502 `discord_unavailable`, 503 `busy`, 504) | Retry the same `Idempotency-Key`; never mint a new key for an unknown outcome. Keyless `voice.move_member` has none: retry with a fresh nonce and expect `already_in_room` convergence. Honor `Retry-After` when present. |
 | `needs_reconciliation` (409) | Reconcile by hand first (see the event rules above); never re-submit under a new key. |
 | `replayed` / `version_conflict` (409) | Same key already decided or superseded: read the stored outcome, use a new key only for a new intent. |
 | 401 / 403 | Fix the caller: signing key, timestamp/nonce freshness, action allowlist. Do not retry the bytes. |

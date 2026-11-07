@@ -260,6 +260,11 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_INTERNAL_CHANNEL_KEYS?: string;
   /** Signing keys: a secret, forwarded by its own explicit line and never logged. */
   TWO_INTERNAL_KEYS?: string;
+  /** Operator-set capability gate for self-only voice.move_member. Forwarded as
+   * exactly "1" on its own explicit containerEnvVars line while the private
+   * receiver is forwarded; absent or any other value forwards nothing. Never
+   * flag-forwarded. */
+  TWO_INTERNAL_ALLOW_VOICE_MOVE?: string;
 }
 
 /** Both alert senders share this exact Discord-only destination boundary. */
@@ -772,6 +777,9 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
     if (env.TWO_INTERNAL_CALLERS) vars["TWO_INTERNAL_CALLERS"] = env.TWO_INTERNAL_CALLERS;
     if (env.TWO_INTERNAL_CHANNEL_KEYS) vars["TWO_INTERNAL_CHANNEL_KEYS"] = env.TWO_INTERNAL_CHANNEL_KEYS;
     if (env.TWO_INTERNAL_KEYS) vars["TWO_INTERNAL_KEYS"] = env.TWO_INTERNAL_KEYS;
+    // Capability gate: only exactly "1" travels, and only with the receiver.
+    // Absent or disabled stays absent, so the Rust flag fence keeps the action off.
+    if (env.TWO_INTERNAL_ALLOW_VOICE_MOVE === "1") vars["TWO_INTERNAL_ALLOW_VOICE_MOVE"] = "1";
   }
   // Private EventSub receiver. Dark unless the Operator sets TWO_EVENTSUB to
   // exactly "1" with the signing secret present; any other state forwards

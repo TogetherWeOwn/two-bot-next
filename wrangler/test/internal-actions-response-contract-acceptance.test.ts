@@ -172,6 +172,14 @@ const SUCCESSES: { name: string; value: Record<string, unknown> }[] = [
       request_id: REQUEST_ID,
     },
   },
+  {
+    name: "voice.move_member moved",
+    value: { ok: true, result: { outcome: "moved", from_channel_id: "222333444555666777" }, request_id: REQUEST_ID },
+  },
+  {
+    name: "voice.move_member already_in_room",
+    value: { ok: true, result: { outcome: "already_in_room" }, request_id: REQUEST_ID },
+  },
 ];
 
 function captureLogs(t: TestContext): string[] {

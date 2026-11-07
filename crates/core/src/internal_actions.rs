@@ -16,13 +16,14 @@
 //!   smallest TTL covering the whole ±120 s skew acceptance interval given
 //!   whole-second freshness rounding) plus the skew check itself.
 //! - `rateLimit.ts` — per-key token buckets applied AFTER verify: default 20
-//!   burst / 1 per s, `guild.add_member` 10 burst / 0.5 per s, `Retry-After`
-//!   never 0.
+//!   burst / 1 per s, `guild.add_member` 10 burst / 0.5 per s, `voice.move_member`
+//!   6 moves per 5 min per member, `Retry-After` never 0.
 //! - `errors.ts` — the typed `{code, status, retryable}` envelope and the one
 //!   message every auth failure returns.
-//! - `actions.ts` — the 20-verb allowlist (the card's 18 plus `event.read`,
+//! - `actions.ts` — the 21-verb allowlist (the card's 18 plus `event.read`,
 //!   which landed later under TOG-5510, plus the keyless `voice.snapshot`
-//!   gateway-cache read), the idempotency-key set, the
+//!   gateway-cache read, plus the self-only `voice.move_member` voice move),
+//!   the idempotency-key set, the
 //!   settings-store set, the role/channel key maps, and the per-field
 //!   validators (snowflakes, reason, event input, moderation bounds, settings
 //!   guard).
@@ -457,6 +458,15 @@ pub const ADD_MEMBER_BUCKET: BucketSpec = BucketSpec {
     refill_per_second: 0.5,
 };
 
+/// Per-member `voice.move_member` token bucket: burst capacity six, refilled
+/// continuously at six tokens per five minutes (one every 50 seconds). This
+/// is not a strict six-per-rolling-window counter; an exhausted bucket must
+/// wait for a token instead of hammering Discord's move endpoint.
+pub const MOVE_MEMBER_BUCKET: BucketSpec = BucketSpec {
+    capacity: 6.0,
+    refill_per_second: 0.02,
+};
+
 /// Bucket verdict. `retry_after_secs` is only meaningful when denied — and is
 /// never 0, because a `Retry-After: 0` invites a hot loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -669,10 +679,13 @@ pub fn auth_failure(log_reason: impl Into<String>) -> ActionError {
 
 /// Every verb the endpoint will run, in legacy publish order: the card's 18
 /// plus `event.read`, the narrow mapped-event verifier that landed later
-/// (TOG-5510), plus `voice.snapshot`, the keyless gateway-cache read. Adding
-/// a verb here without deciding which side of [`NEEDS_IDEMPOTENCY_KEY`] it
-/// falls on is the mistake that set exists to prevent.
-pub const IMPLEMENTED_ACTIONS: [&str; 20] = [
+/// (TOG-5510), plus `voice.snapshot`, the keyless gateway-cache read, plus
+/// `voice.move_member`, the self-only voice move. Adding a verb here without
+/// deciding which side of [`NEEDS_IDEMPOTENCY_KEY`] it falls on is the
+/// mistake that set exists to prevent. `voice.move_member` needs no
+/// idempotency key: repeats re-evaluate live voice state and converge on the
+/// `already_in_room` no-op, so a key would add nothing but replay surface.
+pub const IMPLEMENTED_ACTIONS: [&str; 21] = [
     "role.assign",
     "guild.add_member",
     "announcement.post",
@@ -693,6 +706,7 @@ pub const IMPLEMENTED_ACTIONS: [&str; 20] = [
     "moderation.lockdown",
     "moderation.unlock",
     "voice.snapshot",
+    "voice.move_member",
 ];
 
 /// Actions where a repeat is not harmless, so the caller must send an
@@ -844,6 +858,12 @@ impl InternalFlags {
         // every other post-launch verb; absent or non-`1` stays refused.
         if flag("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT") {
             enabled.insert("voice.snapshot".to_owned());
+        }
+        // Self-only voice move: the caller names one member and one target
+        // room, never an actor, so there is no cross-member move to gate.
+        // Default off like every other post-launch verb.
+        if flag("TWO_INTERNAL_ALLOW_VOICE_MOVE") {
+            enabled.insert("voice.move_member".to_owned());
         }
         // Merely shipping the implementation must not widen the allowlist.
         if flag("TWO_INTERNAL_ALLOW_AUTOMATIONS") {
@@ -1402,6 +1422,103 @@ impl<'a> GuildAddMemberRequest<'a> {
     }
 }
 
+/// Validated voice-move subject: one member and one target room. The trusted
+/// website signer must derive `discord_id` from its authenticated session,
+/// never browser input. HMAC binds that subject to the request; this shape
+/// validator has no end-user session and does not itself prove consent.
+#[derive(Debug, Clone, Copy)]
+pub struct VoiceMoveRequest<'a> {
+    discord_id: &'a str,
+    channel_id: &'a str,
+}
+
+impl<'a> VoiceMoveRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        Ok(Self {
+            discord_id: require_snowflake(body, "discord_id")?,
+            channel_id: require_snowflake(body, "channel_id")?,
+        })
+    }
+
+    #[must_use]
+    pub fn discord_id(&self) -> &'a str {
+        self.discord_id
+    }
+
+    #[must_use]
+    pub fn channel_id(&self) -> &'a str {
+        self.channel_id
+    }
+}
+
+/// Closed outcome words for `voice.move_member`: the wire `result.outcome`,
+/// the audit `outcome`, and the completed-state receipt, all from one word.
+/// Never free text: these words feed the wire envelope. The seven domain
+/// answers are HTTP 200 `success` (the move ran or the room state already
+/// proved it unnecessary); the two refusals carry their own codes so the
+/// completed-state CHECK can tell a retryable Discord answer from a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceMoveOutcome {
+    Moved,
+    AlreadyInRoom,
+    NotConnected,
+    NotPermitted,
+    RoomFull,
+    RoomGone,
+    BotNotPermitted,
+    RateLimited,
+    DiscordUnavailable,
+}
+
+impl VoiceMoveOutcome {
+    /// Wire and audit word.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Moved => "moved",
+            Self::AlreadyInRoom => "already_in_room",
+            Self::NotConnected => "not_connected",
+            Self::NotPermitted => "not_permitted",
+            Self::RoomFull => "room_full",
+            Self::RoomGone => "room_gone",
+            Self::BotNotPermitted => "bot_not_permitted",
+            Self::RateLimited => "rate_limited",
+            Self::DiscordUnavailable => "discord_unavailable",
+        }
+    }
+
+    /// Audit `response_code`: the domain answers share `success`.
+    #[must_use]
+    pub fn response_code(self) -> &'static str {
+        match self {
+            Self::RateLimited => "rate_limited",
+            Self::DiscordUnavailable => "discord_unavailable",
+            _ => "success",
+        }
+    }
+
+    /// HTTP status for the response envelope.
+    #[must_use]
+    pub fn status(self) -> u16 {
+        match self {
+            Self::RateLimited => 429,
+            Self::DiscordUnavailable => 502,
+            _ => 200,
+        }
+    }
+
+    /// Audit `affected`: the move counts 1, every other domain answer 0,
+    /// and the two refusals stay NULL like every other refusal combo.
+    #[must_use]
+    pub fn affected(self) -> Option<i64> {
+        match self {
+            Self::Moved => Some(1),
+            Self::RateLimited | Self::DiscordUnavailable => None,
+            _ => Some(0),
+        }
+    }
+}
+
 /// `announcement.post` field validation: channel through the key map, body
 /// within Discord's ceiling. The message id comes back from Discord, so the
 /// stored idempotency result can still tell the website *which* message it has.
@@ -1655,13 +1772,17 @@ pub struct AuthHeaders<'a> {
 /// No derived `Debug`: the body may carry the `guild.add_member`
 /// `access_token`, which must never reach logs (see
 /// [`validate_guild_add_member`]). The hand-written impl names the routing
-/// fields and the body's top-level key count — enough to trace a request,
-/// never its secrets.
+/// fields, the body's top-level key count, and the nonce material hash —
+/// enough to trace a request, never its secrets. `nonce_hash` is
+/// `sha256_hex(nonce)`: the audit key material for verbs like
+/// `voice.move_member` that write audit rows without claiming an
+/// idempotency key.
 #[derive(Clone)]
 pub struct AuthDecision {
     pub key_id: String,
     pub action: String,
     pub body: Map<String, Value>,
+    pub nonce_hash: String,
 }
 
 impl std::fmt::Debug for AuthDecision {
@@ -1670,6 +1791,7 @@ impl std::fmt::Debug for AuthDecision {
             .field("key_id", &self.key_id)
             .field("action", &self.action)
             .field("body_fields", &self.body.len())
+            .field("nonce_hash", &self.nonce_hash)
             .finish()
     }
 }
@@ -1828,7 +1950,8 @@ fn replayed_nonce() -> ActionError {
 ///    read, so a replay can never reach Discord) → 5. per-key bucket → 6. body
 ///    parses as one JSON object with no repeated key at any depth → 7. action
 ///    allowlisted and enabled, store and
-///    settings present where required → 8. `guild.add_member`'s tighter bucket.
+///    settings present where required → 8. `guild.add_member`'s tighter
+///    per-key bucket and `voice.move_member`'s per-member bucket.
 ///
 /// Buckets 5 and 8 run after verification on purpose: rate-limiting an
 /// unverified key id would let anyone lock out a legitimate caller by spamming
@@ -1927,10 +2050,39 @@ fn authorize_burned(
         }
     }
 
+    // The self-only move is cheap to retry (repeats converge on the
+    // `already_in_room` no-op) but each attempt evaluates live voice state
+    // and can move a member, so the budget follows the member, not the
+    // caller — on top of the per-key bucket above. A body without a
+    // snowflake-shaped `discord_id` takes nothing here; the verb's field
+    // validation refuses it after this returns.
+    if action == "voice.move_member" {
+        if let Some(member) = body
+            .get("discord_id")
+            .and_then(Value::as_str)
+            .filter(|id| is_snowflake(id))
+        {
+            let per_member = buckets.take(
+                &format!("voice_move:{member}"),
+                MOVE_MEMBER_BUCKET,
+                verified.guarded_ms,
+            );
+            if !per_member.allowed {
+                return Err(ActionError::new(
+                    ErrorCode::RateLimited,
+                    "Rate limit exceeded for voice.move_member",
+                    "rate_limited_voice_move",
+                )
+                .with_retry_after(per_member.retry_after_secs));
+            }
+        }
+    }
+
     Ok(AuthDecision {
         key_id: verified.key_id.to_owned(),
         action,
         body,
+        nonce_hash: body_hash(verified.nonce.as_bytes()),
     })
 }
 
@@ -2049,11 +2201,13 @@ pub const ADMIN_SCOPE_ADMIN: &str = "admin";
 impl InternalFlags {
     /// Scope the admin API requires for `action` (scope map v0).
     ///
-    /// Covers the 20 verbs the endpoint runs today: 4 read, 8 moderate and
+    /// Covers the 21 verbs the endpoint runs today: 4 read, 9 moderate and
     /// 8 admin. `role.assign` is deliberately admin (a privilege grant, not
-    /// membership tooling). Later slices extend the map with new verbs;
-    /// anything unmapped — including strings that can never be verbs —
-    /// resolves to no scope, which every allowance check refuses.
+    /// membership tooling); `voice.move_member` is moderate (a reversible
+    /// member move, like the other member actions). Later slices extend the
+    /// map with new verbs; anything unmapped — including strings that can
+    /// never be verbs — resolves to no scope, which every allowance check
+    /// refuses.
     #[must_use]
     pub fn required_admin_scope(action: &str) -> Option<&'static str> {
         match action {
@@ -2067,7 +2221,8 @@ impl InternalFlags {
             | "moderation.slowmode"
             | "guild.add_member"
             | "event.upsert"
-            | "event.cancel" => Some(ADMIN_SCOPE_MODERATE),
+            | "event.cancel"
+            | "voice.move_member" => Some(ADMIN_SCOPE_MODERATE),
             "moderation.ban"
             | "moderation.tempban"
             | "moderation.lockdown"
@@ -2734,6 +2889,30 @@ mod tests {
     }
 
     #[test]
+    fn move_member_bucket_holds_six_moves_per_five_minutes() {
+        assert_eq!(MOVE_MEMBER_BUCKET.capacity, 6.0);
+        assert_eq!(MOVE_MEMBER_BUCKET.refill_per_second, 0.02);
+        let mut buckets = TokenBuckets::new();
+        for _ in 0..6 {
+            assert!(buckets.take("m", MOVE_MEMBER_BUCKET, 0).allowed);
+        }
+        let denied = buckets.take("m", MOVE_MEMBER_BUCKET, 0);
+        assert!(!denied.allowed);
+        assert_eq!(denied.retry_after_secs, 50);
+        let before_refill = buckets.take("m", MOVE_MEMBER_BUCKET, 25_000);
+        assert!(!before_refill.allowed);
+        assert_eq!(before_refill.retry_after_secs, 25);
+        // A seventh move is allowed after 50 s: this is a continuously
+        // refilled token bucket, not a strict rolling-window limit.
+        assert!(buckets.take("m", MOVE_MEMBER_BUCKET, 50_000).allowed);
+        assert!(!buckets.take("m", MOVE_MEMBER_BUCKET, 50_000).allowed);
+        for _ in 0..6 {
+            assert!(buckets.take("m", MOVE_MEMBER_BUCKET, 350_000).allowed);
+        }
+        assert!(!buckets.take("m", MOVE_MEMBER_BUCKET, 350_000).allowed);
+    }
+
+    #[test]
     fn buckets_refill_over_time() {
         let mut buckets = TokenBuckets::new();
         for _ in 0..20 {
@@ -2826,6 +3005,14 @@ mod tests {
         // Gated verbs stay dark by default.
         let err = assert_allowed("guild.add_member", &flags, true, true).expect_err("dark");
         assert_eq!(err.code, ErrorCode::ActionNotAllowed);
+        let err = assert_allowed("voice.move_member", &flags, true, true).expect_err("dark");
+        assert_eq!(err.code, ErrorCode::ActionNotAllowed);
+        // The move needs no store and no settings: it audits through the
+        // internal-action log, not the claim tables or the config store.
+        let mut vars = HashMap::new();
+        vars.insert("TWO_INTERNAL_ALLOW_VOICE_MOVE".to_owned(), "1".to_owned());
+        let flags = InternalFlags::from_map(&vars);
+        assert!(assert_allowed("voice.move_member", &flags, false, false).is_ok());
         // Key-requiring verbs refuse without a store instead of 500ing later.
         let mut vars = HashMap::new();
         vars.insert("TWO_INTERNAL_ALLOW_EVENT_CANCEL".to_owned(), "1".to_owned());
@@ -2854,6 +3041,9 @@ mod tests {
         assert!(on("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT").is_enabled("voice.snapshot"));
         // No flag, no read: the voice snapshot stays dark by default.
         assert!(!InternalFlags::from_map(&HashMap::new()).is_enabled("voice.snapshot"));
+        assert!(on("TWO_INTERNAL_ALLOW_VOICE_MOVE").is_enabled("voice.move_member"));
+        // No flag, no move: the self-only voice move stays dark by default.
+        assert!(!InternalFlags::from_map(&HashMap::new()).is_enabled("voice.move_member"));
         let auto = on("TWO_INTERNAL_ALLOW_AUTOMATIONS");
         assert!(auto.is_enabled("automations.import"));
         assert!(auto.is_enabled("automations.export"));
@@ -2877,6 +3067,86 @@ mod tests {
         let settings = on("TWO_INTERNAL_ALLOW_SETTINGS");
         assert!(settings.is_enabled("settings.get"));
         assert!(settings.is_enabled("settings.set"));
+    }
+
+    #[test]
+    fn voice_move_requires_moderate_scope() {
+        // The self-only move is a reversible member action: moderate like
+        // `guild.add_member`, never a read, never admin. A read-scoped token
+        // must not move members.
+        assert_eq!(
+            InternalFlags::required_admin_scope("voice.move_member"),
+            Some(ADMIN_SCOPE_MODERATE)
+        );
+        assert!(InternalFlags::admin_scope_allows(
+            &[ADMIN_SCOPE_MODERATE],
+            "voice.move_member"
+        ));
+        assert!(!InternalFlags::admin_scope_allows(
+            &[ADMIN_SCOPE_READ],
+            "voice.move_member"
+        ));
+    }
+
+    #[test]
+    fn voice_move_request_names_one_member_and_one_room() {
+        let body = map(json!({
+            "action": "voice.move_member",
+            "discord_id": "123456789012345678",
+            "channel_id": "123456789012345679",
+        }));
+        let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+        assert_eq!(request.discord_id(), "123456789012345678");
+        assert_eq!(request.channel_id(), "123456789012345679");
+        for body in [
+            map(json!({"action": "voice.move_member"})),
+            map(json!({"action": "voice.move_member", "discord_id": "abc"})),
+            map(json!({
+                "action": "voice.move_member",
+                "discord_id": "123456789012345678",
+                "channel_id": "12",
+            })),
+        ] {
+            assert_eq!(
+                VoiceMoveRequest::validate(&body)
+                    .expect_err("shapes refuse")
+                    .code,
+                ErrorCode::Malformed
+            );
+        }
+    }
+
+    #[test]
+    fn voice_move_outcome_table() {
+        use VoiceMoveOutcome::*;
+        for (outcome, word, code, status, affected) in [
+            (Moved, "moved", "success", 200, Some(1)),
+            (AlreadyInRoom, "already_in_room", "success", 200, Some(0)),
+            (NotConnected, "not_connected", "success", 200, Some(0)),
+            (NotPermitted, "not_permitted", "success", 200, Some(0)),
+            (RoomFull, "room_full", "success", 200, Some(0)),
+            (RoomGone, "room_gone", "success", 200, Some(0)),
+            (
+                BotNotPermitted,
+                "bot_not_permitted",
+                "success",
+                200,
+                Some(0),
+            ),
+            (RateLimited, "rate_limited", "rate_limited", 429, None),
+            (
+                DiscordUnavailable,
+                "discord_unavailable",
+                "discord_unavailable",
+                502,
+                None,
+            ),
+        ] {
+            assert_eq!(outcome.as_str(), word);
+            assert_eq!(outcome.response_code(), code);
+            assert_eq!(outcome.status(), status);
+            assert_eq!(outcome.affected(), affected, "{word}");
+        }
     }
 
     #[test]
@@ -2982,11 +3252,12 @@ mod tests {
         // slices add two env-only keys
         // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID). The
         // voice.snapshot read adds one env-only key
-        // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT).
+        // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT), and the self-only voice move
+        // adds one more (TWO_INTERNAL_ALLOW_VOICE_MOVE).
         for (class, expected) in [
             (SettingClass::Hot, 52),
             (SettingClass::Cold, 18),
-            (SettingClass::EnvOnly, 67),
+            (SettingClass::EnvOnly, 68),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),
@@ -3436,6 +3707,7 @@ mod tests {
             key_id: "web".to_owned(),
             action: "guild.add_member".to_owned(),
             body,
+            nonce_hash: body_hash(b"nonce-material"),
         };
         let rendered = format!("{decision:?}");
         assert!(rendered.contains("guild.add_member"));
@@ -4505,6 +4777,127 @@ mod tests {
         .expect_err("21st is limited");
         assert_eq!(err.code, ErrorCode::RateLimited);
         assert!(err.retry_after_secs.is_some_and(|s| s >= 1));
+    }
+
+    #[test]
+    fn pipeline_voice_move_bucket_follows_the_member() {
+        let keys = ring();
+        let mut vars = HashMap::new();
+        vars.insert("TWO_INTERNAL_ALLOW_VOICE_MOVE".to_owned(), "1".to_owned());
+        let flags = InternalFlags::from_map(&vars);
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
+        // A closure, not an inner fn: it borrows the ring, flags and
+        // fences, so the helper takes four arguments and needs no waiver.
+        let mut attempt = |member: Option<&str>,
+                           nonce: &str,
+                           timestamp: &str,
+                           now_ms: u64|
+         -> Result<AuthDecision, ActionError> {
+            let raw = match member {
+                Some(id) => format!(
+                    r#"{{"action":"voice.move_member","discord_id":"{id}","channel_id":"123456789012345679"}}"#
+                ),
+                None => {
+                    r#"{"action":"voice.move_member","channel_id":"123456789012345679"}"#.to_owned()
+                }
+            };
+            let sig = sign(vec1().secret.as_bytes(), timestamp, nonce, raw.as_bytes());
+            let headers = signed_headers("web", timestamp, nonce, &sig);
+            authorize(
+                &headers,
+                raw.as_bytes(),
+                &keys,
+                &flags,
+                true,
+                true,
+                SKEW_SECONDS,
+                now_ms,
+                &mut nonces,
+                &mut buckets,
+                &mut clock,
+            )
+        };
+        let now_ms = 1_720_000_000_000;
+        let timestamp = (now_ms / 1000).to_string();
+        for _ in 0..6 {
+            let nonce = test_nonce();
+            let decision = attempt(Some("123456789012345678"), &nonce, &timestamp, now_ms)
+                .expect("six moves fit the member budget");
+            assert_eq!(decision.action, "voice.move_member");
+            // The audit key material travels on the decision, hex of the nonce.
+            assert_eq!(decision.nonce_hash, body_hash(nonce.as_bytes()));
+        }
+        let err = attempt(
+            Some("123456789012345678"),
+            &test_nonce(),
+            &timestamp,
+            now_ms,
+        )
+        .expect_err("seventh move is limited");
+        assert_eq!(err.code, ErrorCode::RateLimited);
+        assert!(err.retry_after_secs.is_some_and(|s| s >= 1));
+        assert_eq!(err.log_reason, "rate_limited_voice_move");
+        // Another member keeps its own budget; the per-key bucket still has
+        // room (eight requests against a burst of twenty).
+        attempt(
+            Some("123456789012345679"),
+            &test_nonce(),
+            &timestamp,
+            now_ms,
+        )
+        .expect("member buckets are independent");
+        // A full window refills the member budget.
+        let later_ms = now_ms + 300_000;
+        let later_ts = (later_ms / 1000).to_string();
+        attempt(
+            Some("123456789012345678"),
+            &test_nonce(),
+            &later_ts,
+            later_ms,
+        )
+        .expect("five-minute window refills");
+    }
+
+    #[test]
+    fn pipeline_voice_move_without_member_id_takes_no_member_bucket() {
+        let keys = ring();
+        let mut vars = HashMap::new();
+        vars.insert("TWO_INTERNAL_ALLOW_VOICE_MOVE".to_owned(), "1".to_owned());
+        let flags = InternalFlags::from_map(&vars);
+        let mut nonces = NonceCache::new(NONCE_TTL_SECONDS);
+        let mut buckets = TokenBuckets::new();
+        let mut clock = ClockGuard::new();
+        let now_ms = 1_720_000_000_000;
+        let timestamp = (now_ms / 1000).to_string();
+        for raw in [
+            r#"{"action":"voice.move_member","channel_id":"123456789012345679"}"#,
+            r#"{"action":"voice.move_member","discord_id":"not-a-snowflake","channel_id":"123456789012345679"}"#,
+        ] {
+            let nonce = test_nonce();
+            let sig = sign(vec1().secret.as_bytes(), &timestamp, &nonce, raw.as_bytes());
+            let headers = signed_headers("web", &timestamp, &nonce, &sig);
+            authorize(
+                &headers,
+                raw.as_bytes(),
+                &keys,
+                &flags,
+                true,
+                true,
+                SKEW_SECONDS,
+                now_ms,
+                &mut nonces,
+                &mut buckets,
+                &mut clock,
+            )
+            .expect("field validation runs after authorize");
+        }
+        // Only the per-key bucket moved; no member bucket exists.
+        assert!(buckets
+            .buckets
+            .keys()
+            .all(|k| !k.starts_with("voice_move:")));
     }
 
     #[test]

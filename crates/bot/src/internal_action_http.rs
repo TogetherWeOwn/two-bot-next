@@ -64,13 +64,14 @@ use two_bot_core::{
     internal_action_config::InternalActionConfig,
     internal_action_store::{
         AuditSubject, DiscordId, EventOutcome, ExecutionClaim, InternalActionStore, InternalClaim,
-        InternalStoreError, RequestIdentity, TerminalFailure, TerminalResponse,
+        InternalStoreError, RequestIdentity, TerminalFailure, TerminalResponse, VoiceMoveAudit,
     },
     internal_actions::{
-        require_field_str, require_snowflake, unmapped_event_key, validate_announcement,
-        validate_event_input, validate_event_key, validate_idempotency_key, ActionError,
-        AuthDecision, AuthHeaders, AuthenticatedRequest, ErrorCode, GuildAddMemberRequest,
-        InternalFlags, RoleAssignRequest, TokenBuckets, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
+        is_snowflake, require_field_str, require_snowflake, unmapped_event_key,
+        validate_announcement, validate_event_input, validate_event_key, validate_idempotency_key,
+        ActionError, AuthDecision, AuthHeaders, AuthenticatedRequest, ErrorCode,
+        GuildAddMemberRequest, InternalFlags, RoleAssignRequest, TokenBuckets, VoiceMoveOutcome,
+        VoiceMoveRequest, ACTIONS_PATH, MAX_BODY_BYTES, SKEW_SECONDS,
     },
     internal_settings::SettingsCommand,
     member_moderation_store::PgMemberModerationStore,
@@ -79,9 +80,10 @@ use two_bot_core::{
         ActionLabel, KeyLabel, Rejection, RejectionClass, RejectionRecord, RejectionTelemetry,
     },
     ModerationAction, ModerationActor, ModerationGates, ModerationPolicy, ModerationTarget,
+    Snowflake,
 };
 use two_bot_cutover::{internal_settings::execute_settings, settings::SettingsStore};
-use two_bot_discord::executor::member::MemberOutcome;
+use two_bot_discord::executor::member::{MemberOutcome, VoiceMovePatch};
 use two_bot_discord::internal_actions::{
     supports_event_mutation, AnnouncementExecutor, ExecutionOutcome, Refusal,
 };
@@ -93,6 +95,7 @@ use two_bot_discord::internal_member_moderation::{
 };
 use two_bot_discord::{ActionExecutor, DiscordError, EventActionError, EventCall};
 
+use crate::voice_move::{occupancy, parse_override, ChannelFact, GuildRoleFact, VoiceMoveFacts};
 use crate::voice_snapshot::{self, SnapshotRefusal};
 
 const MAX_HEADER_BYTES: usize = 8192;
@@ -114,7 +117,7 @@ const EVENT_GATE_WAIT: Duration = Duration::from_secs(8);
 /// `metrics::INTERNAL_ACTION_FAMILIES`: `announcement.post` to
 /// `announcement`, `event.*` to `event`, `settings.*` to `settings`,
 /// `moderation.*` to `moderation`, `role.assign`/`guild.add_member` to
-/// `membership`, `voice.snapshot` to `voice`; anything else (including
+/// `membership`, `voice.snapshot`/`voice.move_member` to `voice`; anything else (including
 /// unwired catalog verbs and unknown verbs) to `other`. Takes only the
 /// bounded label, never raw request bytes, so no secret, token, key id or
 /// body can become a metric label.
@@ -125,7 +128,7 @@ fn internal_family(action: ActionLabel) -> &'static str {
             "event.read" | "event.upsert" | "event.cancel" => "event",
             "settings.get" | "settings.set" => "settings",
             "role.assign" | "guild.add_member" => "membership",
-            "voice.snapshot" => "voice",
+            "voice.snapshot" | "voice.move_member" => "voice",
             _ if name.starts_with("moderation.") => "moderation",
             _ => "other",
         },
@@ -255,6 +258,443 @@ impl MemberEffect for ActionExecutor {
                         format!("bot_identity_unavailable: {}", detail.cause()),
                     )
                 })
+        })
+    }
+}
+
+/// Self-only voice move: `voice.move_member` through the live gateway cache
+/// plus bounded REST snapshots. The test seam is module-private like
+/// [`ActionEffect`]: production gathers guild/channel/member facts and runs
+/// the single PATCH, mocks return a canned receipt, so HTTP-layer
+/// allow/deny/audit/replay tests stay offline. The receipt carries the closed
+/// domain word plus the audit columns; `retry_after_secs` rides only the
+/// Discord-429 `rate_limited` answer.
+#[derive(Debug)]
+pub(crate) struct VoiceMoveReceipt {
+    pub outcome: VoiceMoveOutcome,
+    pub from_channel_id: Option<String>,
+    pub retry_after_secs: Option<u64>,
+}
+
+trait VoiceMoveEffect: Send + Sync {
+    fn execute_move<'a>(
+        &'a self,
+        request: &'a VoiceMoveRequest<'a>,
+    ) -> BoxFuture<'a, Result<VoiceMoveReceipt, ActionError>>;
+}
+
+/// Unwired default: production `bind` always replaces this, and a verb without
+/// a wired effect adapter stays refused even when the flag gate authorizes it.
+struct UnwiredVoiceMove;
+
+impl VoiceMoveEffect for UnwiredVoiceMove {
+    fn execute_move<'a>(
+        &'a self,
+        _: &'a VoiceMoveRequest<'a>,
+    ) -> BoxFuture<'a, Result<VoiceMoveReceipt, ActionError>> {
+        Box::pin(async move {
+            Err(ActionError::new(
+                ErrorCode::ActionNotAllowed,
+                "voice.move_member has no wired effect adapter",
+                "voice_move_unwired",
+            ))
+        })
+    }
+}
+
+/// Production voice-move effect over the shared admitted transport, the live
+/// gateway cache and the supervisor's readiness state. Gathering runs inside
+/// the effect so the HTTP handler stays a thin validate-audit-answer fence.
+/// Every fact failure fails closed into `DiscordUnavailable` (retryable, still
+/// audited by the handler); only a definitive live decision becomes a domain
+/// word. A Discord 429 pauses like the local guard instead of bursting: it
+/// answers `rate_limited` with the Discord-supplied wait.
+struct VoiceMoveExecutor {
+    discord: ActionExecutor,
+    voice_cache: Arc<DefaultInMemoryCache>,
+    gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
+}
+
+impl VoiceMoveExecutor {
+    fn new(
+        discord: ActionExecutor,
+        voice_cache: Arc<DefaultInMemoryCache>,
+        gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
+    ) -> Self {
+        Self {
+            discord,
+            voice_cache,
+            gateway_state,
+        }
+    }
+
+    fn unavailable(message: &'static str, reason: &'static str) -> ActionError {
+        ActionError::new(ErrorCode::DiscordUnavailable, message, reason)
+    }
+
+    async fn voice_get(&self, path: &str) -> Result<Option<Value>, ActionError> {
+        self.discord.get_json_strict(path).await.map_err(|_| {
+            Self::unavailable(
+                "voice move snapshot unavailable; retryable",
+                "voice_move_snapshot_unavailable",
+            )
+        })
+    }
+
+    async fn resolve_bot_id(&self) -> Result<Snowflake, ActionError> {
+        self.discord.current_bot_user_id().await.map_err(|detail| {
+            ActionError::new(
+                ErrorCode::DiscordUnavailable,
+                "Discord bot identity is unavailable",
+                format!("bot_identity_unavailable: {}", detail.cause()),
+            )
+        })
+    }
+
+    /// Gather the whole live fact set in contract order: guild and target
+    /// channel first (a gone target answers `room_gone` before any membership
+    /// read), then the cache occupancy, then the subject, source and bot
+    /// snapshots the permission math needs. `early` is a domain answer with
+    /// nothing left to prove; `Err` is fail-closed retryable.
+    async fn gather_facts(
+        &self,
+        guild_id: &str,
+        guild_num: Snowflake,
+        bot_id: Snowflake,
+        member_id: &str,
+        target_id: &str,
+    ) -> Result<VoiceMoveGathered, ActionError> {
+        let fail = |reason: &'static str| {
+            Self::unavailable("voice move facts unavailable; retryable", reason)
+        };
+        let guild_value = self
+            .voice_get(&format!("/guilds/{guild_id}"))
+            .await?
+            .ok_or_else(|| fail("voice_move_guild_gone"))?;
+        let owner_id: Snowflake = guild_value
+            .get("owner_id")
+            .and_then(Value::as_str)
+            .filter(|id| is_snowflake(id))
+            .and_then(|id| id.parse().ok())
+            .filter(|id| *id != 0)
+            .ok_or_else(|| fail("voice_move_guild_unreadable"))?;
+        let afk_channel_id: Option<Snowflake> = guild_value
+            .get("afk_channel_id")
+            .and_then(Value::as_str)
+            .and_then(|id| id.parse().ok())
+            .filter(|id| *id != 0);
+        let mut guild_roles = Vec::new();
+        for role in guild_value
+            .get("roles")
+            .and_then(Value::as_array)
+            .ok_or_else(|| fail("voice_move_guild_unreadable"))?
+        {
+            guild_roles
+                .push(parse_guild_role(role).ok_or_else(|| fail("voice_move_guild_unreadable"))?);
+        }
+        // A channel the snapshot cannot prove is a room of this guild (wrong
+        // type, another guild, unreadable overwrites) reads as gone: the
+        // member cannot be moved somewhere the bot cannot see.
+        let target_value = self.voice_get(&format!("/channels/{target_id}")).await?;
+        let Some(target_value) = target_value else {
+            return Ok(VoiceMoveGathered::early(VoiceMoveOutcome::RoomGone));
+        };
+        let Some(target) = parse_room_channel(&target_value, guild_id, afk_channel_id, true) else {
+            return Ok(VoiceMoveGathered::early(VoiceMoveOutcome::RoomGone));
+        };
+        if target.is_afk {
+            return Ok(VoiceMoveGathered::early(VoiceMoveOutcome::RoomGone));
+        }
+        let member_num: Snowflake = member_id.parse().unwrap_or(0);
+        let (current, occupants) = occupancy(&self.voice_cache, guild_num, member_num, target.id)
+            .map_err(|_| fail("voice_move_cache_race"))?;
+        let Some(current) = current else {
+            return Ok(VoiceMoveGathered::early(VoiceMoveOutcome::NotConnected));
+        };
+        if current == target.id {
+            return Ok(VoiceMoveGathered::early_with_from(
+                VoiceMoveOutcome::AlreadyInRoom,
+                current,
+            ));
+        }
+        // The cache says connected, so the membership must exist: a 404 here
+        // is an inconsistent snapshot, never proof of absence.
+        let member_value = self
+            .voice_get(&format!("/guilds/{guild_id}/members/{member_id}"))
+            .await?
+            .ok_or_else(|| fail("voice_move_member_gone"))?;
+        let member_roles = parse_guild_member(&member_value, member_id)
+            .ok_or_else(|| fail("voice_move_member_unreadable"))?;
+        let source_value = self
+            .voice_get(&format!("/channels/{current}"))
+            .await?
+            .ok_or_else(|| fail("voice_move_source_gone"))?;
+        // The source only feeds the bot-grant math: the member is already
+        // there, so its kind never gates. A stage source still carries its
+        // overwrites for the Move Members check.
+        let source = parse_room_channel(&source_value, guild_id, afk_channel_id, false)
+            .ok_or_else(|| fail("voice_move_source_unreadable"))?;
+        let bot_value = self
+            .voice_get(&format!("/guilds/{guild_id}/members/{bot_id}"))
+            .await?
+            .ok_or_else(|| fail("voice_move_bot_gone"))?;
+        let bot_roles = parse_guild_member(&bot_value, &bot_id.to_string())
+            .ok_or_else(|| fail("voice_move_bot_unreadable"))?;
+        Ok(VoiceMoveGathered {
+            early: None,
+            facts: Some(VoiceMoveFacts {
+                guild_id: guild_num,
+                guild_owner_id: owner_id,
+                guild_roles,
+                target,
+                source,
+                member_channel_id: Some(current),
+                target_occupants: occupants,
+                member_id: member_num,
+                member_roles,
+                bot_id,
+                bot_roles,
+            }),
+        })
+    }
+}
+
+/// One gather pass: either a domain answer needing no PATCH, or the full fact
+/// set for [`crate::voice_move::decide`].
+struct VoiceMoveGathered {
+    early: Option<(VoiceMoveOutcome, Option<String>)>,
+    facts: Option<VoiceMoveFacts>,
+}
+
+impl VoiceMoveGathered {
+    fn early(outcome: VoiceMoveOutcome) -> Self {
+        Self {
+            early: Some((outcome, None)),
+            facts: None,
+        }
+    }
+
+    fn early_with_from(outcome: VoiceMoveOutcome, from: Snowflake) -> Self {
+        Self {
+            early: Some((outcome, Some(from.to_string()))),
+            facts: None,
+        }
+    }
+}
+
+/// One guild role with the fields permission evaluation needs. `None` fails
+/// the fact set closed: a role the bot cannot read is never treated as
+/// holding nothing.
+fn parse_guild_role(role: &Value) -> Option<GuildRoleFact> {
+    let id: Snowflake = role
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| is_snowflake(id))
+        .and_then(|id| id.parse().ok())?;
+    if id == 0 {
+        return None;
+    }
+    Some(GuildRoleFact {
+        id,
+        position: role.get("position")?.as_i64()?,
+        permissions: role.get("permissions")?.as_str()?.parse().ok()?,
+    })
+}
+
+/// Roles held by the named member. The `user.id` must match the requested id:
+/// a mismatched snapshot is unreadable, never another member's roles.
+fn parse_guild_member(member: &Value, expect_id: &str) -> Option<Vec<Snowflake>> {
+    if member.get("user")?.get("id")?.as_str()? != expect_id {
+        return None;
+    }
+    let mut roles = Vec::new();
+    for role in member.get("roles")?.as_array()? {
+        let id: Snowflake = role.as_str().filter(|id| is_snowflake(id))?.parse().ok()?;
+        if id == 0 {
+            return None;
+        }
+        roles.push(id);
+    }
+    Some(roles)
+}
+
+/// One channel with the fields the decision needs. `require_voice` gates the
+/// target: only a guild voice channel is a movable room. The source skips the
+/// kind gate (it only feeds the bot-grant math) but keeps the guild check and
+/// the overwrites. `None` fails the fact set closed.
+fn parse_room_channel(
+    channel: &Value,
+    guild_id: &str,
+    afk_channel_id: Option<Snowflake>,
+    require_voice: bool,
+) -> Option<ChannelFact> {
+    let id: Snowflake = channel
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| is_snowflake(id))
+        .and_then(|id| id.parse().ok())?;
+    if id == 0 {
+        return None;
+    }
+    // Discord channel types: 2 is a guild voice channel (stage is 13, text is
+    // 0). Source:
+    // <https://docs.discord.com/developers/resources/channel#channel-object-channel-types>
+    let is_voice = channel.get("type")?.as_u64()? == 2;
+    if require_voice && !is_voice {
+        return None;
+    }
+    if channel.get("guild_id")?.as_str()? != guild_id {
+        return None;
+    }
+    let mut overwrites = Vec::new();
+    for overwrite in channel
+        .get("permission_overwrites")
+        .and_then(Value::as_array)?
+    {
+        overwrites.push(parse_override(overwrite)?);
+    }
+    Some(ChannelFact {
+        id,
+        is_voice: true,
+        is_afk: afk_channel_id == Some(id),
+        user_limit: channel
+            .get("user_limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .try_into()
+            .unwrap_or(u32::MAX),
+        overwrites,
+    })
+}
+
+impl VoiceMoveEffect for VoiceMoveExecutor {
+    fn execute_move<'a>(
+        &'a self,
+        request: &'a VoiceMoveRequest<'a>,
+    ) -> BoxFuture<'a, Result<VoiceMoveReceipt, ActionError>> {
+        Box::pin(async move {
+            use crate::voice_move::{decide, VoiceMoveDecision};
+            if *self.gateway_state.read().await != crate::gateway::GatewayState::Connected {
+                return Err(VoiceMoveExecutor::unavailable(
+                    "gateway not ready; retryable",
+                    "voice_move_gateway_not_ready",
+                ));
+            }
+            let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+            let guild_num: Snowflake = guild_id.parse().unwrap_or(0);
+            if guild_num == 0 {
+                return Err(VoiceMoveExecutor::unavailable(
+                    "staging guild misconfigured",
+                    "voice_move_guild_misconfigured",
+                ));
+            }
+            let bot_id = self.resolve_bot_id().await?;
+            if bot_id == 0 {
+                return Err(VoiceMoveExecutor::unavailable(
+                    "Discord bot identity is unavailable",
+                    "voice_move_bot_identity_unavailable",
+                ));
+            }
+            let member_id = request.discord_id();
+            let target_id = request.channel_id();
+            let receipt_for =
+                |outcome: VoiceMoveOutcome, from: Option<String>, retry_after_secs: Option<u64>| {
+                    VoiceMoveReceipt {
+                        outcome,
+                        from_channel_id: from,
+                        retry_after_secs,
+                    }
+                };
+            let gathered = self
+                .gather_facts(guild_id, guild_num, bot_id, member_id, target_id)
+                .await?;
+            if let Some((outcome, from)) = gathered.early {
+                return Ok(receipt_for(outcome, from, None));
+            }
+            let Some(facts) = gathered.facts else {
+                return Err(VoiceMoveExecutor::unavailable(
+                    "voice move gather inconsistent",
+                    "voice_move_gather_inconsistent",
+                ));
+            };
+            let from = |facts: &VoiceMoveFacts| facts.member_channel_id.map(|id| id.to_string());
+            match decide(&facts) {
+                VoiceMoveDecision::Proceed { .. } => {}
+                VoiceMoveDecision::Refuse(outcome) => {
+                    return Ok(receipt_for(outcome, from(&facts), None));
+                }
+                VoiceMoveDecision::Incomplete => {
+                    return Err(VoiceMoveExecutor::unavailable(
+                        "voice move facts unprovable; retryable",
+                        "voice_move_facts_incomplete",
+                    ));
+                }
+            }
+            let from_string = from(&facts);
+            match self
+                .discord
+                .move_voice_member(guild_id, member_id, target_id)
+                .await
+            {
+                Ok(VoiceMovePatch::Moved) => {
+                    Ok(receipt_for(VoiceMoveOutcome::Moved, from_string, None))
+                }
+                Ok(VoiceMovePatch::Denied) => Ok(receipt_for(
+                    VoiceMoveOutcome::BotNotPermitted,
+                    from_string,
+                    None,
+                )),
+                Ok(VoiceMovePatch::Limited { retry_after_secs }) => Ok(receipt_for(
+                    VoiceMoveOutcome::RateLimited,
+                    from_string,
+                    Some(retry_after_secs),
+                )),
+                Ok(VoiceMovePatch::Unavailable) => Err(VoiceMoveExecutor::unavailable(
+                    "Discord move uncertain; retryable",
+                    "voice_move_discord_uncertain",
+                )),
+                Ok(VoiceMovePatch::Stale) => {
+                    // The room raced the PATCH: re-evaluate live state once. A
+                    // refusal then is the fresh answer; a still-proceed means
+                    // the live grant disagrees with the evaluated snapshot, so
+                    // fail closed into `bot_not_permitted` like a denial.
+                    let regathered = self
+                        .gather_facts(guild_id, guild_num, bot_id, member_id, target_id)
+                        .await?;
+                    if let Some((outcome, from)) = regathered.early {
+                        return Ok(receipt_for(outcome, from, None));
+                    }
+                    let Some(refacts) = regathered.facts else {
+                        return Err(VoiceMoveExecutor::unavailable(
+                            "voice move gather inconsistent",
+                            "voice_move_gather_inconsistent",
+                        ));
+                    };
+                    match decide(&refacts) {
+                        VoiceMoveDecision::Refuse(outcome) => {
+                            Ok(receipt_for(outcome, from(&refacts), None))
+                        }
+                        VoiceMoveDecision::Proceed { .. } => Ok(receipt_for(
+                            VoiceMoveOutcome::BotNotPermitted,
+                            from(&refacts),
+                            None,
+                        )),
+                        VoiceMoveDecision::Incomplete => Err(VoiceMoveExecutor::unavailable(
+                            "voice move facts unprovable; retryable",
+                            "voice_move_facts_incomplete",
+                        )),
+                    }
+                }
+                Err(error) if error.code == ErrorCode::RateLimited => Ok(receipt_for(
+                    VoiceMoveOutcome::RateLimited,
+                    from_string,
+                    error.retry_after_secs,
+                )),
+                Err(_) => Err(VoiceMoveExecutor::unavailable(
+                    "Discord move failed; retryable",
+                    "voice_move_discord_failed",
+                )),
+            }
         })
     }
 }
@@ -913,6 +1353,10 @@ struct ReceiverState {
     event_mutate: Arc<dyn EventMutateEffect>,
     moderation: Arc<dyn ModerationEffect>,
     channel: Arc<dyn ChannelModerationEffect>,
+    /// Self-only voice-move effect. Production `bind` attaches the live
+    /// executor below; the cold default refuses, so a verb without a wired
+    /// effect adapter stays refused even when the flag gate authorizes it.
+    voice_move: Arc<dyn VoiceMoveEffect>,
     /// Shared gateway voice-state cache feeding the keyless `voice.snapshot`
     /// read. The gateway loop owns the writes through its pipeline; the
     /// receiver only projects. A cold cache reads as `discord_unavailable`,
@@ -931,8 +1375,8 @@ struct ReceiverState {
     capacity: Arc<Semaphore>,
     event_gate: tokio::sync::Mutex<()>,
     event_gate_wait: Duration,
-    /// Receiver-owned lifecycle set for receipt-finishing event-mutation
-    /// children. Every spawned child is tracked here so shutdown can join it;
+    /// Receiver-owned lifecycle set for receipt-finishing event-mutation and
+    /// voice-move children. Every child is tracked here so shutdown can join it;
     /// the set holds no result, only the join, and each spawn reaps already
     /// finished entries so steady state keeps only in-flight work.
     children: tokio::sync::Mutex<JoinSet<()>>,
@@ -970,6 +1414,7 @@ impl ReceiverState {
             // default for the same reason: the readiness gate refuses until
             // the live gateway state is attached and connected.
             voice_cache: voice_snapshot::new_shared_cache(),
+            voice_move: Arc::new(UnwiredVoiceMove),
             gateway_state: Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
@@ -1001,6 +1446,15 @@ impl ReceiverState {
         gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
     ) -> Self {
         self.gateway_state = gateway_state;
+        self
+    }
+
+    /// Attach the live self-only voice-move effect. Production `bind` always
+    /// attaches the executor built from the admitted transport, the shared
+    /// gateway cache and the supervisor's readiness state; tests that exercise
+    /// the verb attach a mock. Anything else keeps the refusing default.
+    fn with_voice_move(mut self, voice_move: Arc<dyn VoiceMoveEffect>) -> Self {
+        self.voice_move = voice_move;
         self
     }
 
@@ -1256,13 +1710,25 @@ pub async fn bind(
         moderation_executor_from_env(pool.clone(), moderation_discord).map_err(|_| {
             std::io::Error::other("internal-action moderation executor configuration invalid")
         })?;
-    let channel_discord = ActionExecutor::with_admission(token.to_owned(), None, admission)
-        .map_err(|_| {
-            std::io::Error::other("internal-action channel executor configuration invalid")
-        })?;
+    let channel_discord =
+        ActionExecutor::with_admission(token.to_owned(), None, Arc::clone(&admission)).map_err(
+            |_| std::io::Error::other("internal-action channel executor configuration invalid"),
+        )?;
     let channel = channel_executor_from_env(pool.clone(), channel_discord).map_err(|_| {
         std::io::Error::other("internal-action channel executor configuration invalid")
     })?;
+    // Self-only voice moves share the same admitted transport as the other
+    // Discord-touching executors, and read the same gateway cache and
+    // readiness state the keyless snapshot read projects.
+    let voice_discord =
+        ActionExecutor::with_admission(token.to_owned(), None, Arc::clone(&admission)).map_err(
+            |_| std::io::Error::other("internal-action voice-move executor configuration invalid"),
+        )?;
+    let voice_move = VoiceMoveExecutor::new(
+        voice_discord,
+        Arc::clone(&voice_cache),
+        Arc::clone(&gateway_state),
+    );
     let listener = TcpListener::bind(config.listen_addr()).await?;
     Ok(BoundReceiver {
         listener,
@@ -1278,7 +1744,8 @@ pub async fn bind(
                 Arc::new(channel),
             )
             .with_voice_cache(voice_cache)
-            .with_gateway_state(gateway_state),
+            .with_gateway_state(gateway_state)
+            .with_voice_move(Arc::new(voice_move)),
         ),
     })
 }
@@ -1358,20 +1825,18 @@ impl BoundReceiver {
 
     /// Join tracked receipt-finishing children within `budget`, the remaining
     /// share of the shutdown deadline the Axum drain did not consume. Clean
-    /// completion needs every child reaped; a reaped failure is terminal work
-    /// (its claim fence keeps durable uncertainty), but work still in flight
-    /// at the deadline is aborted and reported unclean, never waited on past
-    /// the budget.
+    /// completion needs every child reaped. Event claims preserve uncertainty
+    /// after a child failure; claimless voice moves have no such fence, so a
+    /// failure can leave an audit gap. Work still in flight at the deadline is
+    /// aborted and reported unclean, never waited on past the budget.
     async fn drain_children(state: &ReceiverState, budget: Duration) -> bool {
         let mut children = state.children.lock().await;
         let outcome = tokio::time::timeout(budget, async {
             while let Some(finished) = children.join_next().await {
-                if let Err(join_error) = finished {
+                if finished.is_err() {
                     tracing::warn!(
                         msg = "internal_action_child_failed",
-                        error = %join_error,
-                        "receipt-finishing event mutation child failed; \
-                         its claim fence retains durable uncertainty"
+                        "receipt-finishing child failed; completion is unproven"
                     );
                 }
             }
@@ -1386,8 +1851,8 @@ impl BoundReceiver {
                     msg = "internal_action_drain_deadline",
                     pending = pending,
                     "receiver shutdown reached the drain deadline with tracked \
-                     mutation children still in flight; aborted, their claims \
-                     retain durable uncertainty"
+                     receipt-finishing children still in flight; aborted, \
+                     completion is unproven"
                 );
                 false
             }
@@ -1446,8 +1911,8 @@ async fn handle(State(state): State<Arc<ReceiverState>>, request: Request) -> Re
         match tokio::time::timeout(REQUEST_TIMEOUT, receive(&state, request, &id, permit)).await {
             Ok(response) => response,
             // Dropping the future retains an announcement claim (a fresh nonce sees
-            // InFlight or NeedsReconciliation); event mutations finish in their
-            // own receiver-tracked task, holding capacity to their receipt.
+            // InFlight or NeedsReconciliation); event mutations and voice moves
+            // finish in receiver-tracked tasks, holding capacity to their receipt.
             Err(_) => state.reject(
                 Failure::code(ErrorCode::UpstreamTimeout),
                 KeyLabel::Invalid,
@@ -1568,11 +2033,12 @@ async fn receive(
     if decision.action == "voice.snapshot" {
         return read_voice_snapshot(state, id, key, action).await;
     }
-    // Mutating event verbs take the same durable claim/audit path as
-    // announcements below, with their own validation and key mapping.
-    if supports_event_mutation(&decision.action) {
-        // Runs to its receipt even if the client has gone: a claimed create that
-        // was dropped mid-flight must still register its key mapping. The child
+    // Event mutations and claimless voice moves must finish their receipts
+    // even after HTTP cancellation: event creates still need their key mapping,
+    // and completed voice effects still need their terminal audit.
+    let voice_move = decision.action == "voice.move_member";
+    if supports_event_mutation(&decision.action) || voice_move {
+        // Runs to its receipt even if the client has gone. The child
         // is tracked under the receiver (never detached and ownerless) and
         // carries the admission permit with it, so capacity stays held through
         // receipt persistence and repeated timed-out clients cannot admit more
@@ -1593,19 +2059,39 @@ async fn receive(
             // Locked through `state`, not the child's clone: the guard borrows
             // while the spawned future moves its own Arc.
             let mut children = state.children.lock().await;
+            if voice_move && state.draining.load(Ordering::SeqCst) {
+                return state.reject(
+                    Failure::code(ErrorCode::DiscordUnavailable),
+                    key,
+                    action,
+                    id,
+                );
+            }
             children.spawn(
                 async move {
                     let _permit = permit;
-                    let response = mutate_event(
-                        &task_state,
-                        &task_decision,
-                        &task_raw,
-                        task_idempotency.as_deref(),
-                        &task_id,
-                        task_key,
-                        action,
-                    )
-                    .await;
+                    let response = if voice_move {
+                        execute_voice_move(
+                            &task_state,
+                            &task_decision,
+                            &task_raw,
+                            &task_id,
+                            task_key,
+                            action,
+                        )
+                        .await
+                    } else {
+                        mutate_event(
+                            &task_state,
+                            &task_decision,
+                            &task_raw,
+                            task_idempotency.as_deref(),
+                            &task_id,
+                            task_key,
+                            action,
+                        )
+                        .await
+                    };
                     let _ = done_tx.send(response);
                 }
                 .instrument(task_span),
@@ -1617,7 +2103,16 @@ async fn receive(
         }
         return match done_rx.await {
             Ok(response) => response,
-            Err(_) => state.reject(Failure::reconciliation(), key, action, id),
+            Err(_) => state.reject(
+                if voice_move {
+                    Failure::code(ErrorCode::DiscordUnavailable)
+                } else {
+                    Failure::reconciliation()
+                },
+                key,
+                action,
+                id,
+            ),
         };
     }
     if decision.action == "settings.get" {
@@ -1801,6 +2296,121 @@ async fn read_voice_snapshot(
         }
         Err(SnapshotRefusal::OverBudget) => reject(Failure::code(ErrorCode::Internal)),
     }
+}
+
+/// Self-only voice move: `voice.move_member` moves the subject into the target
+/// room after evaluating the live fact set bot-side. No Idempotency-Key: the
+/// committed nonce is the replay guard, and repeats re-evaluate live voice
+/// state and converge on the `already_in_room` no-op. The per-member bucket
+/// already ran in `authorize`; malformed bodies refuse before any Discord call
+/// or audit row. Every later answer — all seven domain words, the Discord-429
+/// `rate_limited`, and the fail-closed `discord_unavailable` — writes one
+/// claimless `completed` intent plus one `terminal` audit row through
+/// `record_voice_move`, then renders: domain words as HTTP 200
+/// `{"outcome": ...}` (plus `from_channel_id` on `moved`), `rate_limited` as
+/// 429 with `Retry-After`, `discord_unavailable` as 502. A store-write failure
+/// after the Discord call answers `discord_unavailable` so the site retries
+/// into the converged state. `bot_not_permitted` additionally warns for the
+/// operator with scalar fields only: no member, channel, key or body material
+/// ever reaches logs.
+async fn execute_voice_move(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    raw: &[u8],
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let request = match VoiceMoveRequest::validate(&decision.body) {
+        Ok(request) => request,
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let receipt = match state.voice_move.execute_move(&request).await {
+        Ok(receipt) => receipt,
+        // No wired effect adapter: the same fence as every other unwired verb.
+        Err(error) if error.code == ErrorCode::ActionNotAllowed => {
+            return reject(Failure::from_action(error));
+        }
+        // Every other effect failure is fail-closed retryable, still audited
+        // below so the attempt is named in the audit trail.
+        Err(_) => VoiceMoveReceipt {
+            outcome: VoiceMoveOutcome::DiscordUnavailable,
+            from_channel_id: None,
+            retry_after_secs: None,
+        },
+    };
+    if receipt.outcome == VoiceMoveOutcome::BotNotPermitted {
+        tracing::warn!(
+            msg = "voice_move_bot_grant_disagrees",
+            action = "voice.move_member",
+            outcome = "bot_not_permitted",
+            "voice move refused: live bot grant disagrees with evaluated snapshot",
+        );
+    }
+    let Some(caller) = state.config.caller_for(&decision.key_id) else {
+        return reject(Failure::code(ErrorCode::Internal));
+    };
+    if state
+        .store
+        .record_voice_move(VoiceMoveAudit {
+            caller,
+            nonce_hash: &decision.nonce_hash,
+            authenticated_payload: raw,
+            guild_id,
+            member_id: request.discord_id(),
+            from_channel_id: receipt.from_channel_id.as_deref(),
+            to_channel_id: request.channel_id(),
+            request_id: id,
+            outcome: receipt.outcome,
+        })
+        .await
+        .is_err()
+    {
+        return reject(Failure::code(ErrorCode::DiscordUnavailable));
+    }
+    match receipt.outcome {
+        VoiceMoveOutcome::Moved => {
+            metrics::global().internal_action(internal_family(action), "executed");
+            let Some(from_channel_id) = receipt.from_channel_id else {
+                return reject(Failure::code(ErrorCode::Internal));
+            };
+            voice_move_success(&from_channel_id, id)
+        }
+        VoiceMoveOutcome::RateLimited => {
+            let mut failure = Failure::from_action(ActionError::new(
+                ErrorCode::RateLimited,
+                "voice move slowed",
+                "voice_move_rate_limited",
+            ));
+            failure.retry_after = receipt.retry_after_secs;
+            state.reject(failure, key, action, id)
+        }
+        VoiceMoveOutcome::DiscordUnavailable => {
+            reject(Failure::code(ErrorCode::DiscordUnavailable))
+        }
+        outcome => {
+            metrics::global().internal_action(internal_family(action), "executed");
+            member_success(outcome.as_str(), id)
+        }
+    }
+}
+
+/// Voice-move success envelope: the legacy `{"outcome": ...}` result object
+/// plus `from_channel_id` on `moved`, in the same insertion order as
+/// [`member_success`] (`ok`, `result`, `request_id`).
+fn voice_move_success(from_channel_id: &str, id: &str) -> Response {
+    let mut response = Json(json!({
+        "ok": true,
+        "result": {"outcome": "moved", "from_channel_id": from_channel_id},
+        "request_id": id,
+    }))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Membership family: `role.assign` resolves a caller-supplied key through the
@@ -3487,10 +4097,14 @@ fn terminal_response(
 /// Insertion order (`ok`, `result`, `request_id`) matches the stored-member
 /// `success_body` wire contract.
 fn member_success(outcome: &str, id: &str) -> Response {
-    Json(json!({
+    let mut response = Json(json!({
         "ok": true, "result": {"outcome": outcome}, "request_id": id,
     }))
-    .into_response()
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// A failed write never releases the claim or resends; this only surfaces the gap.

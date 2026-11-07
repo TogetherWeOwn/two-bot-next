@@ -158,6 +158,7 @@ mod tracing_capture;
 // file is not loaded as two modules (clippy::duplicate_mod).
 #[cfg(test)]
 mod tuning_test_support;
+mod voice_move;
 mod voice_snapshot;
 mod website_jobs;
 #[cfg(test)]
