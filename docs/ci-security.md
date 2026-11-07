@@ -439,9 +439,11 @@ job to carry no job condition at all.
 
 ## Native Rust setup
 
-All 18 former Rust setup action calls now execute
+All former Rust setup action calls now execute
 `.github/scripts/install-rust-toolchain.sh` with an exact `RUST_TOOLCHAIN` and
-explicit `RUST_COMPONENTS`. Stable lanes match `rust-toolchain.toml`; the three
+explicit `RUST_COMPONENTS`. The split nightly sweep has four compiling jobs,
+bringing the installer inventory to 21 job definitions. Stable lanes match
+`rust-toolchain.toml`; the three
 libFuzzer lanes retain `nightly-2026-10-01` and `rust-src`. The setup installs the
 minimal profile without self-update, selects the same default, and verifies the
 explicit toolchain. Existing fail-closed retry steps and their conditions remain.

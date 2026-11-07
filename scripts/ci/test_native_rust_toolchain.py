@@ -166,7 +166,7 @@ class NativeRustToolchainTest(unittest.TestCase):
         self.assertNotIn("GITHUB_PATH", text)
         self.assertNotIn("GITHUB_STATE", text)
 
-    def test_all_eighteen_installers_keep_their_components_and_checkout_order(self):
+    def test_all_installers_keep_their_components_and_checkout_order(self):
         expected = {
             "check.yml": {
                 "check": "rustfmt, clippy", "rust-tests": "rustfmt, clippy", "coverage-plan": "",
@@ -177,7 +177,8 @@ class NativeRustToolchainTest(unittest.TestCase):
             "helix-token-fuzz-smoke.yml": {"helix-token-smoke": "rust-src"},
             "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke": "rust-src"},
             "help-embed-synthetic.yml": {"help-embed-smoke": ""},
-            "nightly.yml": {"sweep": ""}, "pipeline-benchmark.yml": {"benchmark": ""},
+            "nightly.yml": {"sweep-plan": "", "sweep-partition": "", "sweep-guarded": "", "sweep-docs": ""},
+            "pipeline-benchmark.yml": {"benchmark": ""},
             "reusable-rust-nextest.yml": {"nextest": ""},
         }
         actual = {}
