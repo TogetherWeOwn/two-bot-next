@@ -448,68 +448,54 @@ pub async fn close_attendance_session(
         return Ok(0);
     };
     lock_capture_in(&mut tx, &guild_id, &member_id).await?;
-    if event_keys.is_empty() {
-        // Finalization without expansion must not decode or rewrite metadata.
-        // This also drains malformed oversized rows without dropping evidence
-        // or allowing one bad row to park the guild actor indefinitely.
-        let affected = sqlx::query(
-            "UPDATE event_voice_sessions
-             SET left_at = GREATEST(joined_at, $2),
-                 channel_name = COALESCE($3, channel_name),
-                 name_observed_at = CASE WHEN $3::text IS NULL THEN name_observed_at ELSE clock_timestamp() END,
-                 changed_at = clock_timestamp()
-             WHERE id = $1 AND left_at IS NULL",
+    let tags = if event_keys.is_empty() {
+        // NULL keeps stored tags server-side, including oversized metadata.
+        // Both close paths share the same update and commit state machine.
+        None
+    } else {
+        let existing: Option<(Vec<String>, OffsetDateTime)> = sqlx::query_as(
+            "SELECT CASE WHEN cardinality(event_keys) <= 128 THEN
+                         CASE WHEN (SELECT COALESCE(sum(octet_length(k)), 0) FROM unnest(event_keys) k) <= 16384
+                              THEN event_keys ELSE ARRAY[repeat('x', 16385)] END
+                         ELSE ARRAY[repeat('x', 16385)] END,
+                    joined_at FROM event_voice_sessions WHERE id = $1 AND left_at IS NULL FOR UPDATE",
         )
         .bind(id)
-        .bind(left_at)
-        .bind(channel_name)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        tx.commit().await?;
-        return Ok(affected);
-    }
-    let existing: Option<(Vec<String>, OffsetDateTime)> = sqlx::query_as(
-        "SELECT CASE WHEN cardinality(event_keys) <= 128 THEN
-                     CASE WHEN (SELECT COALESCE(sum(octet_length(k)), 0) FROM unnest(event_keys) k) <= 16384
-                          THEN event_keys ELSE ARRAY[repeat('x', 16385)] END
-                     ELSE ARRAY[repeat('x', 16385)] END,
-                joined_at FROM event_voice_sessions WHERE id = $1 AND left_at IS NULL FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some((mut tags, joined_at)) = existing else {
-        return Ok(0);
-    };
-    if tags.iter().map(String::len).sum::<usize>() > ATTENDANCE_MAX_TAG_BYTES {
-        return Err(sqlx::Error::Protocol(
-            "attendance stored tags exceed budget".into(),
-        ));
-    }
-    let requested: Vec<String> = event_keys
-        .iter()
-        .filter(|key| !tags.contains(key))
-        .cloned()
-        .collect();
-    if !requested.is_empty() {
-        for tag in capture_tags_in(
-            &mut tx, &guild_id, &member_id, &requested, left_at, joined_at, true,
-        )
-        .await?
-        {
-            if !tags.contains(&tag) {
-                tags.push(tag);
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((mut tags, joined_at)) = existing else {
+            return Ok(0);
+        };
+        if tags.iter().map(String::len).sum::<usize>() > ATTENDANCE_MAX_TAG_BYTES {
+            return Err(sqlx::Error::Protocol(
+                "attendance stored tags exceed budget".into(),
+            ));
+        }
+        let requested: Vec<String> = event_keys
+            .iter()
+            .filter(|key| !tags.contains(key))
+            .cloned()
+            .collect();
+        if !requested.is_empty() {
+            for tag in capture_tags_in(
+                &mut tx, &guild_id, &member_id, &requested, left_at, joined_at, true,
+            )
+            .await?
+            {
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
             }
         }
-    }
-    tags.sort();
+        tags.sort();
+        Some(tags)
+    };
     let affected = sqlx::query(
         "UPDATE event_voice_sessions
          SET left_at = GREATEST(joined_at, $2),
              channel_name = COALESCE($3, channel_name),
              name_observed_at = CASE WHEN $3::text IS NULL THEN name_observed_at ELSE clock_timestamp() END,
-             event_keys = $4, changed_at = clock_timestamp()
+             event_keys = COALESCE($4::text[], event_keys), changed_at = clock_timestamp()
          WHERE id = $1 AND left_at IS NULL",
     )
     .bind(id)

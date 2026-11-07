@@ -469,14 +469,19 @@ impl AttendanceTransition {
     pub(crate) async fn turn_if(
         &mut self,
         store: &impl AttendanceStore,
-        may_open: impl Fn() -> bool,
+        may_open: impl Fn() -> bool + Send,
     ) {
         if self.complete {
             return;
         }
+        // Keep the multi-stage store future out of the actor's timeout/select
+        // state machine. One allocation per bounded turn; cancellation still
+        // drops the future while retained close evidence stays in `self`.
+        let advance: std::pin::Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> =
+            Box::pin(self.advance(store, may_open));
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS),
-            self.advance(store, may_open),
+            advance,
         )
         .await;
         if !matches!(result, Ok(Ok(()))) {

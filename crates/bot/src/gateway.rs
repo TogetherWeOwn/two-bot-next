@@ -2456,7 +2456,7 @@ pub async fn build_voice_runtime(
         token,
         db.pool().clone(),
         name_policy,
-        || crate::settings_jobs::live(),
+        crate::settings_jobs::live,
         attendance_reads,
     ) {
         Ok(runtime) => {

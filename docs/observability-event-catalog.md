@@ -554,6 +554,16 @@ and `activity_detected`, so "no game was ever seen" is distinguishable
 from "the rename was refused"; the retry-only `channel_unseen` decision
 logs at debug, since the naming pass retries it on every pass.
 
+Attendance continuation messages (debug, `guild` ID only):
+`attendance recovery deferred` (`AttendanceRecovery::turn` in
+`crates/bot/src/voice_rooms.rs`) means a bounded recovery page failed or timed
+out; the cursor stays unchanged for the next turn.
+`attendance transition deferred` (`AttendanceTransition::turn_if` in
+`crates/bot/src/event_attendance.rs`) means a normal transition turn failed or
+timed out; its original close evidence remains queued. Neither logs database
+errors, member IDs, room names or tag text. Signed reads remain fenced until
+recovery/finalization completes.
+
 Adjacent actor messages without a `voice_event` field:
 `voice actor load failed; retrying with capped backoff` and
 `voice actor load failed; credential refused, not retrying`
