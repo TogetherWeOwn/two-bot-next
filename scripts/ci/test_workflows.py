@@ -2976,25 +2976,68 @@ def production_errors(workflow):
     if jobs.get("production", {}).get("concurrency") != {"group": "deploy-production",
                                                          "cancel-in-progress": "false"}:
         errors.append(f"{name}:production: must hold the deploy-production lane without cancelling")
-    for job_id in ("guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck"):
+    for job_id in ("guard", "schema-gate", "roles-gate", "staging-soak-evidence", "recheck"):
         if "concurrency" in jobs.get(job_id, {}):
             errors.append(f"{name}:{job_id}: must not hold the deploy lane")
     expected_soak_if = ("needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' "
-                        "&& needs.guard.outputs.allow_unstaged != 'true' "
-                        "&& needs.guard.outputs.soak_seconds != '0'")
-    if soak.get("needs") != "guard":
-        errors.append(f"{name}:soak: must wait for the guard (it sleeps the guarded SHA's remainder)")
-    if soak.get("if") != expected_soak_if:
-        errors.append(f"{name}:soak: must sleep only for ordinary non-skipped deploys with soak remaining")
-    soak_script = "\n".join(step.get("run", "") for step in soak.get("steps", []))
-    for required in ("SOAK_SECONDS - int(time.time() - green_at)", "time.sleep(remaining)"):
-        if required not in soak_script:
-            errors.append(f"{name}:soak: must recompute the remainder from the staging-green time")
-    # The soak job records the soak-baseline counters before it sleeps, so
-    # GREEN_AT may live on the sleep step rather than the first step.
-    soak_env = "\n".join(str(step.get("env", "")) for step in soak.get("steps", []))
-    if "GREEN_AT" not in soak_env or "needs.guard.outputs.green_at" not in soak_env:
-        errors.append(f"{name}:soak: must read the staging-green timestamp from the guard")
+                        "&& needs.guard.outputs.allow_unstaged != 'true'")
+    if soak.get("needs") != "guard" or soak.get("if") != expected_soak_if:
+        errors.append(f"{name}:soak: every ordinary candidate needs the bounded live measurement job")
+    if soak.get("concurrency") != {"group": "staging-lifecycle", "cancel-in-progress": "false"}:
+        errors.append(f"{name}:soak: must hold the canonical staging lock, never the production lane")
+    if (soak.get("environment") != {"name": "staging", "deployment": "false"}
+            or soak.get("permissions") != {"contents": "read", "actions": "read"}
+            or soak.get("timeout-minutes") != "40"):
+        errors.append(f"{name}:soak: must retain the staging-only read scope and 40-minute budget")
+    soak_steps = soak.get("steps") or []
+    expected_names = [None, None, "Acquire and ready the guarded staging candidate",
+        "Record the soak-baseline REST counters", "Measure a fresh live staging interval",
+        "Read the candidate's staging journeys and soak REST counters",
+        "Recheck the original grant after final sampling", "Release the original staging soak window",
+        "Retain staging soak lifecycle and measurement evidence"]
+    if [step.get("name") for step in soak_steps] != expected_names:
+        errors.append(f"{name}:soak: must keep startup/baseline/measurement/sample/recheck/release/artifact order")
+    else:
+        checkout = soak_steps[0]
+        if checkout.get("with") != {"ref": "${{ github.sha }}", "persist-credentials": "false", "fetch-depth": "1"}:
+            errors.append(f"{name}:soak: tooling must come from the workflow head without persisted credentials")
+        receipt = "${{ runner.temp }}/staging-soak-use.ndjson"
+        control = {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+            "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+            "STAGING_USE_RECEIPT": receipt}
+        retained = {**control, "STAGING_USE_SHA": "${{ needs.guard.outputs.sha }}",
+            "STAGING_USE_DEPLOYMENT": "${{ steps.staging-use-begin.outputs.deployment_id }}",
+            "STAGING_USE_EXPIRES_AT": "${{ steps.staging-use-begin.outputs.expires_at }}"}
+        for index, command, env in (
+                (2, "node wrangler/scripts/staging-use-pipeline.mjs begin", {**control,
+                    "STAGING_USE_EXPECTED_SHA": "${{ needs.guard.outputs.sha }}", "STAGING_USE_MINUTES": "40"}),
+                (4, "node wrangler/scripts/staging-soak-window.mjs", {**retained, "AUTO": "${{ needs.guard.outputs.auto }}"}),
+                (6, "node wrangler/scripts/staging-use-pipeline.mjs consume", retained),
+                (7, "node wrangler/scripts/staging-use-pipeline.mjs finish", {**control,
+                    "STAGING_USE_EXPIRES_AT": "${{ steps.staging-use-begin.outputs.expires_at }}"})):
+            step = soak_steps[index]
+            if step.get("run") != command or step.get("env") != env or "continue-on-error" in step:
+                errors.append(f"{name}:soak:{index}: must use only the original run-bound lifecycle authority")
+            expected_if = "always() && steps.staging-use-begin.outputs.expires_at != ''" if index == 7 else None
+            if step.get("if") != expected_if:
+                errors.append(f"{name}:soak:{index}: lifecycle readiness is mandatory and release always runs")
+        if soak_steps[2].get("id") != "staging-use-begin" or soak_steps[5].get("id") != "judge":
+            errors.append(f"{name}:soak: lifecycle and regression output producers must stay bound")
+        for index in (3, 5):
+            if "OWNERSHIP_CONTROL_TOKEN" in str(soak_steps[index]) or "if" in soak_steps[index] \
+                    or "continue-on-error" in soak_steps[index]:
+                errors.append(f"{name}:soak:{index}: measurement has no lifecycle secret and must run")
+        sample = soak_steps[5].get("run", "")
+        if '--baseline-counters "$RUNNER_TEMP/staging-soak-baseline.json"' not in sample:
+            errors.append(f"{name}:soak: same-job baseline must always reach the regression gate")
+        artifact = soak_steps[8]
+        if (artifact.get("if") != "always()" or artifact.get("with") != {
+                "name": "staging-soak-${{ github.run_id }}-${{ github.run_attempt }}",
+                "path": "${{ runner.temp }}/staging-soak-use.ndjson\n${{ runner.temp }}/staging-soak-*.json\n",
+                "if-no-files-found": "error", "retention-days": "7"}):
+            errors.append(f"{name}:soak: always retain run/attempt lifecycle and measurement evidence")
+    if soak.get("outputs") != {"skip": "${{ steps.judge.outputs.skip }}", "evidence": "${{ steps.judge.outputs.evidence }}"}:
+        errors.append(f"{name}:soak: must publish the measured regression outputs")
     expected_recheck_if = (
         "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && "
         "needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.auto == 'true' && "
@@ -3007,18 +3050,27 @@ def production_errors(workflow):
                       "(the fresh read happens after the last long build)")
     if recheck.get("if") != expected_recheck_if:
         errors.append(f"{name}:recheck: must recheck only automatic deploys after the soak and both gates")
-    # The regression gate's staging leg reads only the staging scrape bearer,
-    # writes no deployment record and holds no lane; its skip never deploys.
+    # The live staging leg stays inside soak's lock; this job only forwards
+    # its completed verdict. A skipped/failed cleanup cannot certify promotion.
     evidence_job = jobs.get("staging-soak-evidence", {})
-    if evidence_job.get("needs") != ["guard", "soak"] \
-            or evidence_job.get("environment") != {"name": "staging", "deployment": "false"} \
-            or evidence_job.get("permissions") != {"contents": "read", "actions": "read"}:
-        errors.append(f"{name}:staging-soak-evidence: must follow the soak with contents:read plus "
-                      "actions:read and the staging Environment (deployment: false)")
-    evidence_text = str(evidence_job)
-    if re.findall(r"secrets\.[A-Z_]+", evidence_text) != ["secrets.STAGING_METRICS_SCRAPE_TOKEN"] \
-            or "PRODUCTION_" in evidence_text:
-        errors.append(f"{name}:staging-soak-evidence: must read only the staging scrape bearer")
+    expected_evidence_if = ("!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' "
+        "&& needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' "
+        "&& needs.soak.result == 'success'")
+    if (evidence_job.get("needs") != ["guard", "soak"] or "environment" in evidence_job
+            or evidence_job.get("permissions") != {"contents": "read"}
+            or evidence_job.get("if") != expected_evidence_if):
+        errors.append(f"{name}:staging-soak-evidence: only a successful bounded soak can publish evidence")
+    evidence_steps = evidence_job.get("steps") or []
+    if (len(evidence_steps) != 1 or evidence_steps[0].get("id") != "judge"
+            or evidence_steps[0].get("env") != {"SKIP": "${{ needs.soak.outputs.skip }}",
+                "EVIDENCE": "${{ needs.soak.outputs.evidence }}"}
+            or "secrets." in str(evidence_job) or "PRODUCTION_" in str(evidence_job)):
+        errors.append(f"{name}:staging-soak-evidence: verdict projection has no live credential or authority")
+    else:
+        publisher = evidence_steps[0].get("run", "")
+        if any(pin not in publisher for pin in ('json.loads(evidence)', 'os.environ["GITHUB_OUTPUT"]',
+                'skip={skip}', 'evidence={evidence}')):
+            errors.append(f"{name}:staging-soak-evidence: validate and forward the measured verdict")
     if (evidence_job.get("outputs") or {}) != {"skip": "${{ steps.judge.outputs.skip }}",
                                                "evidence": "${{ steps.judge.outputs.evidence }}"}:
         errors.append(f"{name}:staging-soak-evidence: must publish the skip and evidence outputs")
@@ -8171,6 +8223,20 @@ class WorkflowTests(unittest.TestCase):
             "recheck without the runs permission": lambda w: w["jobs"]["recheck"]["permissions"].pop(
                 "actions"),
             "soak without the guard": lambda w: w["jobs"]["soak"].__setitem__("needs", "recheck"),
+            "split staging soak lock": lambda w: w["jobs"]["soak"]["concurrency"].update({"group": "other-staging"}),
+            "soak cancels active use": lambda w: w["jobs"]["soak"]["concurrency"].update({"cancel-in-progress": "true"}),
+            "unbound soak SHA": lambda w: w["jobs"]["soak"]["steps"][2]["env"].pop("STAGING_USE_EXPECTED_SHA"),
+            "soak budget extended": lambda w: w["jobs"]["soak"]["steps"][2]["env"].update({"STAGING_USE_MINUTES": "360"}),
+            "soak skips fresh interval": lambda w: w["jobs"]["soak"]["steps"][4].update({"if": "false"}),
+            "soak changes original expiry": lambda w: w["jobs"]["soak"]["steps"][4]["env"].update({"STAGING_USE_EXPIRES_AT": "1"}),
+            "measurement gains lifecycle token": lambda w: w["jobs"]["soak"]["steps"][5]["env"].update({"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
+            "baseline becomes optional": lambda w: w["jobs"]["soak"]["steps"][5].__setitem__("run",
+                w["jobs"]["soak"]["steps"][5]["run"].replace('--baseline-counters "$RUNNER_TEMP/staging-soak-baseline.json"', '')),
+            "soak ignores release failure": lambda w: w["jobs"]["soak"]["steps"][7].update({"continue-on-error": "true"}),
+            "soak cancels without release": lambda w: w["jobs"]["soak"]["steps"][7].pop("if"),
+            "soak loses cleanup evidence": lambda w: w["jobs"]["soak"]["steps"][8]["with"].update({"path": "other.json"}),
+            "publisher accepts skipped soak": lambda w: w["jobs"]["staging-soak-evidence"].update({"if": "always()"}),
+            "publisher gains live authority": lambda w: w["jobs"]["staging-soak-evidence"]["steps"][0]["env"].update({"TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
             "guard without the auto output": lambda w: w["jobs"]["guard"]["outputs"].pop("auto"),
             "guard loses cutover hold": lambda w: w["jobs"]["guard"]["steps"][0]["env"].pop(
                 "CUTOVER_HOLD"),
@@ -10336,10 +10402,12 @@ class WorkflowTests(unittest.TestCase):
                         # Reads workflow runs to skip while an operator
                         # dispatch is active; the compare read needs contents.
                         expected = {"contents": "read", "actions": "read"}
-                    elif (name, job_id) == ("deploy-production.yml", "staging-soak-evidence"):
-                        # Reads deploy-staging runs to tell a promoted newer
-                        # build (skip green) from a stalled promotion (refuse).
+                    elif (name, job_id) == ("deploy-production.yml", "soak"):
+                        # Reads deploy-staging runs within the bounded staging lock.
                         expected = {"contents": "read", "actions": "read"}
+                    elif (name, job_id) == ("deploy-production.yml", "staging-soak-evidence"):
+                        # Pure forwarding of the completed measured verdict.
+                        expected = {"contents": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "promotion-skipped"):
                         # No checkout or API access: only report and upload a receipt.
                         expected = {}

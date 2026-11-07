@@ -22,6 +22,8 @@ export async function pipelineUse(args, invoke = stagingUse, now = Date.now, emi
     require(positive(args.minutes) && args.minutes <= MAX_WINDOW_MINUTES, "staging_window_invalid");
     require(args.expiresAt === undefined, "staging_pipeline_begin_inherited");
     require(args.acquireOnly === undefined || typeof args.acquireOnly === "boolean", "staging_pipeline_mode_invalid");
+    require(args.expectedSha === undefined || (typeof args.expectedSha === "string"
+      && /^[0-9a-f]{40}$/.test(args.expectedSha)), "staging_identity_invalid");
   } else require(positive(args.expiresAt), "staging_window_invalid");
   if (args.action === "consume" || args.action === "rebind"
     || (args.action === "begin" && (args.sha !== undefined || args.deploymentId !== undefined))) {
@@ -67,6 +69,9 @@ export async function pipelineUse(args, invoke = stagingUse, now = Date.now, emi
   }
   let expiresAt;
   if (args.action === "begin") {
+    // A promotion may discover the serving Worker UUID, but must refuse a
+    // superseded candidate before acquiring or starting any runtime.
+    if (args.expectedSha !== undefined) require(state.sha === args.expectedSha, "staging_identity_mismatch");
     // Deployment callers independently pin the receipt-validated new build;
     // standalone consumers may discover the currently serving build instead.
     if (args.sha !== undefined) require(state.sha === args.sha && state.deploymentId === args.deploymentId,
@@ -128,6 +133,7 @@ if (isDirectInvocation(process.argv[1], import.meta.url)) {
       runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT), minutes: Number(process.env.STAGING_USE_MINUTES),
       expiresAt: process.env.STAGING_USE_EXPIRES_AT === undefined ? undefined : Number(process.env.STAGING_USE_EXPIRES_AT),
       sha: process.env.STAGING_USE_SHA, deploymentId: process.env.STAGING_USE_DEPLOYMENT,
+      expectedSha: process.env.STAGING_USE_EXPECTED_SHA,
       acquireOnly: process.env.STAGING_USE_ACQUIRE_ONLY === "1" }, stagingUse, Date.now, emit);
   } catch (error) {
     const code = error instanceof StagingUseError ? error.code : "staging_pipeline_failed";

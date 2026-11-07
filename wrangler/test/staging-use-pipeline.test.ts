@@ -137,6 +137,84 @@ test("deploy begin pins the independent receipt before any mutation", async () =
   }
 });
 
+test("begin expectedSha must be a full lowercase 40 hex string before any call or receipt", async () => {
+  for (const expectedSha of ["", "A".repeat(40), "a".repeat(39), "a".repeat(41), "g".repeat(40),
+    ` ${SHA}`, null, 7, {}]) {
+    const f = fixture();
+    await assert.rejects(pipelineUse({ ...base, action: "begin", minutes: 30, expectedSha } as any,
+      f.invoke, clock, f.emit), code("staging_identity_invalid"), String(expectedSha));
+    assert.deepEqual(f.calls, [], String(expectedSha));
+    assert.deepEqual(f.emitted, [], String(expectedSha));
+  }
+});
+
+test("begin expectedSha mismatch refuses after status only, before window, acquire or ready", async () => {
+  const live = [null, grant({ runId: "99999" }), grant({ expiresAt: NOW + 3 * MINUTE })];
+  for (const use of live) {
+    for (const acquireOnly of [false, true]) {
+      const f = fixture({ use, sha: SHA2 });
+      await assert.rejects(pipelineUse({ ...base, action: "begin", minutes: 30, expectedSha: SHA, acquireOnly },
+        f.invoke, clock, f.emit), code("staging_identity_mismatch"));
+      assert.deepEqual(f.called(), ["status"]);
+      assert.equal(f.emitted.some((value) => value.action === "window"), false);
+      assert.deepEqual(f.state.use, use);
+    }
+  }
+});
+
+test("begin expectedSha match discovers the serving deployment UUID and uses it for the window", async () => {
+  const f = fixture({ deploymentId: "serving-uuid-9" });
+  const expiresAt = NOW + 30 * MINUTE;
+  const result = await pipelineUse({ ...base, action: "begin", minutes: 30, expectedSha: SHA },
+    f.invoke, clock, f.emit);
+  assert.deepEqual(f.calls, [
+    { ...base, action: "status" },
+    { ...base, action: "acquire", sha: SHA, deploymentId: "serving-uuid-9", expiresAt },
+    { ...base, action: "ready", sha: SHA, deploymentId: "serving-uuid-9", expiresAt },
+  ]);
+  assert.equal(f.emitted.find((value) => value.action === "window").deploymentId, "serving-uuid-9");
+  assert.equal(result.deploymentId, "serving-uuid-9");
+  assert.equal(result.use.expiresAt, expiresAt);
+
+  const only = fixture({ deploymentId: "serving-uuid-9" });
+  const acquired = await pipelineUse({ ...base, action: "begin", minutes: 30, expectedSha: SHA, acquireOnly: true },
+    only.invoke, clock, only.emit);
+  assert.deepEqual(only.called(), ["status", "acquire"]);
+  assert.equal(acquired.deploymentId, "serving-uuid-9");
+});
+
+test("begin expectedSha does not weaken the sha and deployment pin", async () => {
+  const f = fixture({ deploymentId: "dep-1" });
+  await pipelineUse({ ...base, action: "begin", minutes: 30, expectedSha: SHA, sha: SHA, deploymentId: "dep-1" },
+    f.invoke, clock, f.emit);
+  assert.deepEqual(f.called(), ["status", "acquire", "ready"]);
+  for (const over of [{ deploymentId: "dep-2" }, { sha: SHA2 }]) {
+    const bad = fixture({ deploymentId: "dep-1" });
+    await assert.rejects(pipelineUse({ ...base, action: "begin", minutes: 30, expectedSha: SHA,
+      sha: SHA, deploymentId: "dep-1", ...over }, bad.invoke, clock, bad.emit), code("staging_identity_mismatch"));
+    assert.deepEqual(bad.called(), ["status"]);
+    assert.equal(bad.state.use, null);
+  }
+});
+
+test("begin expectedSha retry keeps the immutable expiry and still refuses an ended attempt", async () => {
+  const original = NOW + 5 * MINUTE;
+  for (const phase of ["preparing", "active"] as const) {
+    const f = fixture({ use: grant({ phase, expiresAt: original }), deploymentId: "serving-uuid-9" });
+    await pipelineUse({ ...base, action: "begin", minutes: 360, expectedSha: SHA }, f.invoke, clock, f.emit);
+    assert.deepEqual(f.called(), ["status", "acquire", "ready"], phase);
+    assert.equal(f.calls[1].expiresAt, original, phase);
+    assert.equal(f.calls[1].deploymentId, "serving-uuid-9", phase);
+    assert.equal(f.calls[2].expiresAt, original, phase);
+  }
+  for (const use of [grant({ phase: "released" }), grant({ expiresAt: NOW })]) {
+    const f = fixture({ use });
+    await assert.rejects(pipelineUse({ ...base, action: "begin", minutes: 30, expectedSha: SHA },
+      f.invoke, clock, f.emit), code("staging_use_ended"));
+    assert.deepEqual(f.called(), ["status"]);
+  }
+});
+
 test("deploy acquire-only preserves the existing rollout gate and fault-injection verdict", async () => {
   const f = fixture({}, "ready");
   const result = await pipelineUse({ ...base, action: "begin", minutes: 30,
