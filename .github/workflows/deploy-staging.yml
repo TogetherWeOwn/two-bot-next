@@ -601,7 +601,9 @@ jobs:
           # the receipt member the stable gate pins (the restored build
           # reports the previous revision, not the failed SHA). A pre-stamp
           # snapshot carries none and identity rests on the version header.
-          python3 ../scripts/worker_container_rollback.py rollback \
+          # Recovery tooling belongs to the workflow head, never the historical
+          # deployed checkout: a pinned old helper must not bypass finite use.
+          python3 ../tooling/scripts/worker_container_rollback.py rollback \
             --variant staging \
             --worker-url "$STAGING_WORKER_URL" \
             --snapshot "$ROLLOUT_DIR/staging-rollback-snapshot.json" \

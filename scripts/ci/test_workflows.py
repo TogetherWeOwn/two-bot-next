@@ -1009,6 +1009,10 @@ def staging_full_window_errors(workflow, name="deploy-staging.yml"):
     if len(rollback) != 1 or (rollback[0].get("env") or {}).get("STAGING_USE_EXPIRES_AT") != \
             "${{ steps.use.outputs.expires_at }}":
         errors.append(f"{name}: rollback must retain the original finite-use expiry")
+    if len(rollback) != 1 or not re.search(
+            r"(?m)^\s*python3 \.\./tooling/scripts/worker_container_rollback\.py rollback \\\s*$",
+            str(rollback[0].get("run") or "")):
+        errors.append(f"{name}: rollback must use the workflow-head tooling checkout")
     declared = deploy.get("outputs") or {}
     bound = {}
     for job_id, workflow_file in (("voice-synthetic", "voice-synthetic.yml"),
@@ -7011,6 +7015,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(staging_full_window_errors(staging), [])
         job = lambda w, name: w["jobs"][name]
         mutations = {
+            "rollback uses deployed checkout": lambda w: next(s for s in job(w, "deploy")["steps"]
+                if s.get("id") == "auto_rollback").update({"run":
+                    "python3 ../scripts/worker_container_rollback.py rollback"}),
             "rollback expiry missing": lambda w: next(s for s in job(w, "deploy")["steps"]
                 if s.get("id") == "auto_rollback")["env"].pop("STAGING_USE_EXPIRES_AT"),
             "rollback expiry replaced": lambda w: next(s for s in job(w, "deploy")["steps"]

@@ -115,8 +115,9 @@ restore or image rollout, even for `--dry-run`. A pre-stamp/always-on staging
 target has no legacy bypass. Binding evidence is necessary, not sufficient:
 reviewed target implementation and runtime/release acceptance remain mandatory.
 
-The deploy's auto-rollback passes the original `steps.use.outputs.expires_at`;
-it never chooses new minutes. Before mutation, `restore-check` asserts the
+The deploy's auto-rollback runs the helper and its nested client from the
+workflow-head `tooling` checkout, never a historical deployed SHA's helper.
+It passes the original `steps.use.outputs.expires_at`; it never chooses new minutes. Before mutation, `restore-check` asserts the
 current run/attempt/window without probing the intentionally failed build. After
 restore and ownership takeover, `rebind` authorizes and readies the restored
 receipt's deployment/SHA under that **same** expiry; the unchanged consecutive
