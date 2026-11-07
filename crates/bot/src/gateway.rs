@@ -1685,6 +1685,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         let session = session_snapshot(&shard).ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing session".into()))?;
                         let resume_url = shard.resume_url().filter(|url| is_valid_resume_url(url))
                             .or_else(|| received.as_ref().filter(|saved| saved.session_id == session.id()).map(|saved| saved.resume_url.as_str()))
+                            .or_else(|| loopback_checkpoint_url(&shard))
                             .or_else(|| shard.resume_url())
                             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
                         let checkpoint = GatewaySession { session_id: session.id().to_owned(), sequence, resume_url: resume_url.to_owned(), updated_at_ms: two_bot_core::funnel::now_millis_for_test() };
@@ -2311,6 +2312,15 @@ pub fn is_loopback_gateway(url: &str) -> bool {
     url.strip_prefix("ws://")
         .and_then(|socket| socket.parse::<std::net::SocketAddr>().ok())
         .is_some_and(|socket| socket.ip().is_loopback() && socket.port() != 0)
+}
+
+// An explicitly injected loopback peer advertises its socket in READY so
+// Twilight's later reconnects stay local too. Persist only the synthetic
+// logical endpoint, never that socket; a normal shard cannot take this path.
+fn loopback_checkpoint_url(shard: &Shard) -> Option<&'static str> {
+    let transport = shard.config().proxy_url()?;
+    (is_loopback_gateway(transport) && shard.resume_url() == Some(transport))
+        .then_some("wss://gateway.discord.gg")
 }
 
 pub fn build_shard_config(
@@ -3152,6 +3162,32 @@ mod tests {
                 Some("wss://gateway.example.com"),
             );
             assert_eq!(remote.resume_url(), accepted.then_some(resume_url));
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_checkpoint_mapping_requires_the_injected_wire_endpoint() {
+        ensure_crypto_provider();
+        for (wire_url, proxy_url, expected) in [
+            ("ws://127.0.0.1:1", Some("ws://127.0.0.1:1"), true),
+            ("ws://[::1]:1", Some("ws://[::1]:1"), true),
+            ("ws://127.0.0.1:1", None, false),
+            ("ws://127.0.0.1:1", Some("ws://127.0.0.1:2"), false),
+            ("wss://gateway.discord.gg", Some("ws://127.0.0.1:1"), false),
+            ("wss://example.com", Some("wss://example.com"), false),
+        ] {
+            let mut config = twilight_gateway::ConfigBuilder::new("token".into(), Intents::empty())
+                .session(Session::new(1, "loopback-session".into()))
+                .resume_url(wire_url.into());
+            if let Some(proxy_url) = proxy_url {
+                config = config.proxy_url(proxy_url.into());
+            }
+            let shard = Shard::with_config(ShardId::ONE, config.build());
+            assert_eq!(
+                loopback_checkpoint_url(&shard),
+                expected.then_some("wss://gateway.discord.gg"),
+                "wire={wire_url} proxy={proxy_url:?}"
+            );
         }
     }
 

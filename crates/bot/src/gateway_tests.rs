@@ -44,9 +44,10 @@ mod voice;
 
 const GUILD: &str = "2222";
 const TOKEN: &str = "mock-token";
-/// Trusted synthetic logical resume endpoint. Fixtures persist and advertise
-/// this value; the mock's loopback socket is injected only at the transport
-/// seam ([`shard_with_transport`]), after the production config validation.
+/// Trusted synthetic LOGICAL resume endpoint: the value fixtures store in
+/// checkpoints. It is never dialed. The wire endpoint is the mock's loopback
+/// socket, which READY advertises ([`ready`]) and which is injected into
+/// restored shards only at the transport seam ([`shard_with_transport`]).
 const RESUME_URL: &str = "wss://gateway.discord.gg";
 
 /// `GatewaySessionStore` serializes every checkpoint on
@@ -312,6 +313,7 @@ async fn gateway_invalid_persisted_resume_url_is_cleared_before_boot() {
         "wss://user:pw@gateway.discord.gg",
         "wss://gateway.discord.gg:8443",
         "https://gateway.discord.gg",
+        "wss://gateway.discord.gg/<",
     ]
     .into_iter()
     .enumerate()
@@ -412,12 +414,14 @@ async fn gateway_invalid_persisted_resume_url_is_cleared_before_boot() {
     db.close().await;
 }
 
-/// READY always advertises the trusted logical [`RESUME_URL`]; the mock
-/// listener URL is accepted only so call sites name the peer they script.
-fn ready(_mock_url: &str, session: &str) -> Value {
+/// READY advertises the mock's loopback WIRE endpoint, because Twilight
+/// overwrites its internal resume endpoint from READY and dials it on later
+/// reconnects. The stored checkpoint endpoint stays the logical [`RESUME_URL`]
+/// (mapped by `run_shard`), never what READY carries here.
+fn ready(mock_url: &str, session: &str) -> Value {
     json!({"op":0,"s":1,"t":"READY","d":{
         "v":10,"user":{"id":"999","username":"mock-bot","discriminator":"0","mfa_enabled":false},
-        "session_id":session,"resume_gateway_url":RESUME_URL,"guilds":[],"application":{"id":"1111","flags":0}
+        "session_id":session,"resume_gateway_url":mock_url,"guilds":[],"application":{"id":"1111","flags":0}
     }})
 }
 
@@ -616,6 +620,125 @@ fn shard_with_transport(
         builder = builder.resume_url(resume_transport.to_owned());
     }
     Shard::with_config(ShardId::ONE, builder.build())
+}
+
+/// Non-DB regression: READY must never steer a reconnect to a remote host.
+/// One loopback listener serves IDENTIFY -> READY -> opcode 7, then the RESUME.
+#[tokio::test]
+async fn ready_loopback_endpoint_keeps_reconnect_resume_local() {
+    ensure_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("mock listen");
+    let url = format!("ws://{}", listener.local_addr().expect("address"));
+    let (auth_tx, mut auth) = mpsc::channel::<Value>(4);
+    let (reconnect_tx, reconnect_rx) = tokio::sync::oneshot::channel::<()>();
+    let ready_url = url.clone();
+    let server = tokio::spawn(async move {
+        let mut reconnect_rx = Some(reconnect_rx);
+        for connection in 0..2 {
+            let (stream, _) = listener.accept().await.expect("mock accept");
+            let (_, mut ws) = ServerBuilder::new()
+                .accept(stream)
+                .await
+                .expect("websocket");
+            ws.send(Message::text(
+                json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string(),
+            ))
+            .await
+            .expect("hello");
+            while let Some(Ok(message)) = ws.next().await {
+                if message.is_close() {
+                    break;
+                }
+                if !message.is_text() {
+                    continue;
+                }
+                let packet: Value =
+                    serde_json::from_str(message.as_text().expect("text")).expect("packet");
+                match packet["op"].as_u64() {
+                    Some(1) => ws
+                        .send(Message::text("{\"op\":11,\"d\":null}".to_owned()))
+                        .await
+                        .expect("ack"),
+                    Some(2 | 6) => {
+                        auth_tx.send(packet).await.expect("auth capture");
+                        if connection == 0 {
+                            ws.send(Message::text(
+                                ready(&ready_url, "loopback-session").to_string(),
+                            ))
+                            .await
+                            .expect("ready");
+                            // Hold opcode 7 until the test has checked the endpoint.
+                            reconnect_rx
+                                .take()
+                                .expect("single reconnect gate")
+                                .await
+                                .expect("reconnect gate");
+                            ws.send(Message::text("{\"op\":7,\"d\":null}".to_owned()))
+                                .await
+                                .expect("reconnect");
+                        } else {
+                            ws.send(Message::text(
+                                json!({"op":0,"s":2,"t":"RESUMED","d":{}}).to_string(),
+                            ))
+                            .await
+                            .expect("resumed");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let mut shard = shard_with_transport(None, Intents::empty(), &url, &url);
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut reconnect_tx = Some(reconnect_tx);
+        let mut identified = false;
+        let mut resume = None;
+        let mut resumed = false;
+        loop {
+            tokio::select! {
+                Some(packet) = auth.recv() => {
+                    if !identified {
+                        if packet["op"] != 2 {
+                            return Err("first local authentication was not IDENTIFY");
+                        }
+                        identified = true;
+                    } else {
+                        resume = Some(packet);
+                    }
+                }
+                item = shard.next() => {
+                    let Some(Ok(twilight_gateway::Message::Text(text))) = item else { continue };
+                    if text.contains("\"READY\"") {
+                        // Checked before opcode 7 is released, so a regression
+                        // fails here and never dials a remote host.
+                        if shard.resume_url() != Some(url.as_str()) {
+                            return Err("READY redirected the resume endpoint outside loopback");
+                        }
+                        if let Some(gate) = reconnect_tx.take() {
+                            gate.send(()).expect("release reconnect");
+                        }
+                    }
+                    if text.contains("\"RESUMED\"") {
+                        resumed = true;
+                    }
+                }
+            }
+            if let (true, Some(packet)) = (resumed, resume.as_ref()) {
+                return Ok(packet.clone());
+            }
+        }
+    })
+    .await;
+    server.abort();
+    let _ = server.await;
+    let resume = outcome
+        .expect("local RESUME deadline")
+        .expect("loopback-only reconnect");
+    assert_eq!(resume["op"], 6);
+    assert_eq!(resume["d"]["session_id"], "loopback-session");
+    assert_eq!(resume["d"]["seq"], 1);
 }
 
 async fn spawn_runner(
