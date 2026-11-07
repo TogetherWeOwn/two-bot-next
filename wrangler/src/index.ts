@@ -935,12 +935,23 @@ export class TwoBotContainer extends Container<Env> {
     await this.schedule(new Date(when * 1000), "stagingExpiry", null);
   }
 
+  private stagingReceipt(action: "acquire" | "release" | "expiry", use: StagingUse | undefined,
+    outcome: "authorized" | "stopped" | "stop_unconfirmed"): void {
+    // Project only validated finite-use correlation fields. Runner cancellation
+    // cannot upload artifacts, so native expiry also leaves a runtime receipt.
+    console.log(JSON.stringify({ event: "staging_use", action, outcome, environment: "staging",
+      observed_at: new Date().toISOString(), running: this.ctx.container?.running ?? false,
+      ...(use ? { run_id: use.runId, run_attempt: use.runAttempt, expires_at_ms: use.expiresAt,
+        deployment_id: use.deploymentId, sha: use.sha, epoch: use.epoch } : {}) }));
+  }
+
   /** The SDK owns alarm(); its persisted callback re-reads authority on every wake. */
   public async stagingExpiry(): Promise<void> {
     if (!this.boundedStaging()) return;
     await this.gated(async () => {
+      let use: StagingUse | undefined;
       try {
-        const use = await this.stagingUse.read();
+        use = await this.stagingUse.read();
         if (use?.phase === "active" && use.expiresAt > Date.now() && !this.recoveryFailed) {
           await this.scheduleStagingExpiry(use.expiresAt);
           return;
@@ -948,6 +959,7 @@ export class TwoBotContainer extends Container<Env> {
         await this.destroyInactive();
         this.deleteSchedules("stagingExpiry");
         this.recoveryFailed = false;
+        this.stagingReceipt("expiry", use, "stopped");
       } catch {
         // A storage failure is denial too. Do not keep a healthy gateway or
         // an idle retry loop alive just because authority could not be read.
@@ -957,12 +969,14 @@ export class TwoBotContainer extends Container<Env> {
           this.deleteSchedules("keepalive");
           this.deleteSchedules("stagingExpiry");
           this.recoveryFailed = false;
+          this.stagingReceipt("expiry", use, "stopped");
         } catch {
           // SDK 0.3.7 consumes a scheduled row even when its callback throws.
           // Persist a successor before returning; never revive the gateway.
           this.recoveryFailed = true;
           await this.scheduleStagingExpiry(Date.now() + 15_000);
           console.error(JSON.stringify({ event: "staging_stop_unconfirmed" }));
+          this.stagingReceipt("expiry", use, "stop_unconfirmed");
         }
       }
     });
@@ -1361,6 +1375,7 @@ export class TwoBotContainer extends Container<Env> {
             this.deleteSchedules("stagingExpiry");
             this.recoveryFailed = false;
           }
+          this.stagingReceipt(change.action, use, change.action === "acquire" ? "authorized" : "stopped");
         }
         // Acquisition authorizes, but does not itself start or certify the
         // container. The pipeline must probe and verify the exact build next.

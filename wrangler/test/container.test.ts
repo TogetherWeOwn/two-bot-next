@@ -265,6 +265,21 @@ test("bounded staging: authenticated acquire authorizes exact identity without s
   assert.equal((await h.bot.fetch(stagingUseRequest("acquire", window))).status, 503);
   assert.equal((await h.bot.fetch(probeRequest("https://worker.invalid/readyz"))).status, 503);
   assert.equal(h.starts.length, 1);
+  const receipts = h.logs.filter((line) => line.startsWith("{"))
+    .map((line) => JSON.parse(line)).filter((event) => event.event === "staging_use");
+  assert.deepEqual(receipts.map((event) => [event.action, event.outcome, event.running]),
+    [["acquire", "authorized", false], ["release", "stopped", false], ["release", "stopped", false]]);
+  for (const receipt of receipts) {
+    assert.equal(receipt.environment, "staging");
+    assert.equal(receipt.run_id, window.runId);
+    assert.equal(receipt.run_attempt, window.runAttempt);
+    assert.equal(receipt.expires_at_ms, window.expiresAt);
+    assert.equal(receipt.deployment_id, ID);
+    assert.equal(receipt.sha, BOUNDED_STAGING_ENV.CONTAINER_RELEASE);
+    assert.equal(receipt.epoch, 1);
+    assert.ok(Number.isFinite(Date.parse(receipt.observed_at)));
+    assert.equal(JSON.stringify(receipt).includes(CONTROL_TOKEN), false);
+  }
 });
 
 test("bounded staging: control authentication, version stamping and bounded body parsing precede acquisition", async (t) => {
@@ -314,6 +329,14 @@ test("bounded staging: native expiry stops a lost runner's container, consumes s
   assert.equal(h.runtime.running, false);
   assert.equal(h.pending().length, 0);
   assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 0);
+  const receipt = h.logs.filter((line) => line.startsWith("{"))
+    .map((line) => JSON.parse(line)).find((event) => event.event === "staging_use" && event.action === "expiry");
+  assert.ok(receipt, "a lost/cancelled runner still gets a native stop receipt");
+  assert.equal(receipt.outcome, "stopped");
+  assert.equal(receipt.running, false);
+  assert.equal(receipt.run_id, window.runId);
+  assert.equal(receipt.run_attempt, window.runAttempt);
+  assert.equal(receipt.expires_at_ms, window.expiresAt);
   const before = h.requests.length;
   await h.bot.keepalive(oldTick.payload as typeof KEEPALIVE, oldTick);
   await h.bot.stagingExpiry();
@@ -398,6 +421,12 @@ test("bounded staging: unconfirmed expiry teardown persists a stop-only successo
   await fireSdkAlarm(t, h.bot, 15_000);
   assert.equal(h.pending().length, 0);
   assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 1, "SDK consuming the failed row must not lose stop retry");
+  const failed = h.logs.filter((line) => line.startsWith("{"))
+    .map((line) => JSON.parse(line)).find((event) => event.event === "staging_use" && event.outcome === "stop_unconfirmed");
+  assert.ok(failed, "provider stop failure is not a successful cleanup receipt");
+  assert.equal(failed.action, "expiry");
+  assert.equal(failed.running, true);
+  assert.equal(failed.run_id, "123456");
   await assert.rejects(h.bot.start(), /shutdown_unconfirmed/);
   failing = false;
   t.mock.timers.tick(15_000);

@@ -56,6 +56,44 @@ ceiling accommodates a separately authorized four-ACTIVE-hour soak, not a
 permanent staging session. A provider stop failure is unconfirmed cleanup, never
 idle/zero-cost proof, and must be repaired through the existing incident path.
 
+### Trusted client and receipt contract (not wired yet)
+
+`wrangler/scripts/staging-use.mjs` is the pipeline client for the protocol.
+`status` reads only the authenticated control path and neither acquires nor
+starts staging. `acquire`, `assert`, `ready` and `release` pin the intended
+`STAGING_USE_SHA`, `STAGING_USE_DEPLOYMENT`, `GITHUB_RUN_ID`,
+`GITHUB_RUN_ATTEMPT` and absolute millisecond `STAGING_USE_EXPIRES_AT`. The
+origin must be the approved staging workers.dev origin, with no path, query or
+credentials. The dedicated `OWNERSHIP_CONTROL_TOKEN` stays on control requests,
+never on the public readiness probe. HTTP redirects, oversized/malformed replies
+and unknown provider errors refuse without printing remote bodies or secrets.
+
+`ready` requires the matching active window, probes `/readyz` for the exact
+Worker version and build SHA with all components ready, then rechecks the
+ownership epoch and window. This is **additional** to the existing image/digest,
+build/deploy identity and rollout qualification gates, not their replacement.
+`release` confirms native stop, can repeat after expiry or partial acquisition,
+and refuses a different run/attempt/window. It cannot renew an expiry.
+
+Every CLI invocation requires a pipeline-owned `STAGING_USE_RECEIPT` NDJSON path
+and writes an attempt receipt before network activity, followed by a projected
+success or fixed-code failure receipt. Upload these even on failed runs. Runtime
+`staging_use` events separately record acquisition, explicit release and native
+expiry/stop with UTC observation, run/attempt, immutable expiry, deployment/SHA,
+epoch and confirmed/unconfirmed stop outcome. Native expiry receipts are the
+runner-loss/cancellation evidence path when an artifact upload cannot execute;
+an `authorized` receipt is not startup/readiness or zero-cost proof.
+
+The required pipeline integration must hold one window and full-window exclusion
+through **all** `deploy`, `user-flow-synthetic`, `voice-synthetic`,
+`help-embed-synthetic` and `certify-promotion` jobs in the same `deploy-staging`
+run, including a push run reused by a post-merge drill. Reusable consumers must
+assert the caller's window without taking the caller's lock or releasing it.
+Standalone consumers and rollback use the same finite-use contract. Until that
+integration and the inventory/rollback gates below are complete, these client
+and runtime receipts are source-level support only, not a qualified workflow or
+activation receipt.
+
 Before activation, retain authorized live inventory for the staging and
 production Worker versions, namespaces, Container applications/instances,
 alarms/schedules, and active pipeline consumers. Inventory Neon suspend policy
