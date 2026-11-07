@@ -53,7 +53,8 @@ JOB_INVENTORY = {
                               "promotion-skipped", "production"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "help-embed-synthetic",
                            "user-flow-synthetic", "pinned-history-guard", "certify-promotion"},
-    "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
+    "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep-plan",
+                    "sweep-partition", "sweep-guarded", "sweep-docs", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"},
     # Daily digest release (docs/releases.md): at most one vYYYY.MDD.P tag a day,
@@ -4282,8 +4283,15 @@ BOOKWORM_JOBS = {
 }
 BOOKWORM_IMAGE = ("rust:1.99-bookworm@sha256:"
                   "9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b")
-CACHE_JOBS = {"nightly.yml": ("sweep", "nightly-cargo"),
-              "pipeline-benchmark.yml": ("benchmark", "pipeline-bench")}
+# (workflow, job, cache key prefix). The nightly sweep is split into four
+# compiling jobs; the `sweep` aggregate compiles nothing and has no cache.
+CACHE_JOBS = (("nightly.yml", "sweep-plan", "nightly-cargo"),
+              ("nightly.yml", "sweep-partition", "nightly-cargo"),
+              ("nightly.yml", "sweep-guarded", "nightly-cargo"),
+              ("nightly.yml", "sweep-docs", "nightly-cargo"),
+              ("pipeline-benchmark.yml", "benchmark", "pipeline-bench"))
+NIGHTLY_SWEEP_SPLIT_JOBS = {("nightly.yml", "sweep-plan"), ("nightly.yml", "sweep-partition"),
+                            ("nightly.yml", "sweep-guarded"), ("nightly.yml", "sweep-docs")}
 CACHE_PATHS = "~/.cargo/registry\n~/.cargo/git\ntarget\n"
 
 
@@ -4640,10 +4648,13 @@ class WorkflowTests(unittest.TestCase):
         })
 
     def test_compiler_cache_policy_inventory_is_complete(self):
-        self.assertEqual(CACHE_JOBS, {
-            "nightly.yml": ("sweep", "nightly-cargo"),
-            "pipeline-benchmark.yml": ("benchmark", "pipeline-bench"),
-        })
+        self.assertEqual(CACHE_JOBS, (
+            ("nightly.yml", "sweep-plan", "nightly-cargo"),
+            ("nightly.yml", "sweep-partition", "nightly-cargo"),
+            ("nightly.yml", "sweep-guarded", "nightly-cargo"),
+            ("nightly.yml", "sweep-docs", "nightly-cargo"),
+            ("pipeline-benchmark.yml", "benchmark", "pipeline-bench"),
+        ))
 
     def test_rust_bookworm_job_container_images_are_pinned(self):
         for workflow, jobs in BOOKWORM_JOBS.items():
@@ -4652,7 +4663,7 @@ class WorkflowTests(unittest.TestCase):
                     self.assert_bookworm_image(self.workflows, workflow, job)
 
     def test_primary_cargo_caches_include_compiler_input(self):
-        for workflow, (job, prefix) in CACHE_JOBS.items():
+        for workflow, job, prefix in CACHE_JOBS:
             with self.subTest(workflow=workflow, job=job):
                 self.assert_compiler_cache(self.workflows, workflow, job, prefix)
 
@@ -4663,7 +4674,7 @@ class WorkflowTests(unittest.TestCase):
             for job in jobs:
                 fixed[workflow]["jobs"][job]["container"]["image"] = BOOKWORM_IMAGE
                 self.assert_bookworm_image(fixed, workflow, job)
-        for workflow, (job, prefix) in CACHE_JOBS.items():
+        for workflow, job, prefix in CACHE_JOBS:
             step = next(step for step in fixed[workflow]["jobs"][job]["steps"]
                         if str(step.get("uses", "")).startswith("actions/cache@"))
             step["with"]["key"] = ("${{ runner.os }}-" + prefix +
@@ -4685,9 +4696,9 @@ class WorkflowTests(unittest.TestCase):
                     del mutated[workflow]["jobs"][job]["container"]
                     with self.assertRaises(AssertionError):
                         self.assert_bookworm_image(mutated, workflow, job)
-        for workflow, (job, prefix) in CACHE_JOBS.items():
+        for workflow, job, prefix in CACHE_JOBS:
             for missing in ("Cargo.lock", "rust-toolchain.toml"):
-                with self.subTest(workflow=workflow, missing=missing):
+                with self.subTest(workflow=workflow, job=job, missing=missing):
                     mutated = deepcopy(fixed)
                     step = next(step for step in mutated[workflow]["jobs"][job]["steps"]
                                 if str(step.get("uses", "")).startswith("actions/cache@"))
@@ -4698,7 +4709,7 @@ class WorkflowTests(unittest.TestCase):
                         self.assert_compiler_cache(mutated, workflow, job, prefix)
             for field, value in (("path", "target\n"),
                                  ("restore-keys", "wrong-prefix\n")):
-                with self.subTest(workflow=workflow, field=field):
+                with self.subTest(workflow=workflow, job=job, field=field):
                     mutated = deepcopy(fixed)
                     step = next(step for step in mutated[workflow]["jobs"][job]["steps"]
                                 if str(step.get("uses", "")).startswith("actions/cache@"))
@@ -6089,7 +6100,7 @@ class WorkflowTests(unittest.TestCase):
                 if "--test backfill_audit_log" in step.get("run", "")
             )
             nightly = next(
-                step for step in mutated["nightly.yml"]["jobs"]["sweep"]["steps"]
+                step for step in mutated["nightly.yml"]["jobs"]["sweep-plan"]["steps"]
                 if step.get("name") == "Full workspace sweep including ignored tests"
             )
             with patch.object(self, "workflows", mutated), patch(
@@ -6147,7 +6158,7 @@ class WorkflowTests(unittest.TestCase):
         store_skips = set(re.findall(r"--skip (\S+)", store_lane))
         [nightly_sweep] = [
             line
-            for candidate in self.workflows["nightly.yml"]["jobs"]["sweep"]["steps"]
+            for candidate in self.workflows["nightly.yml"]["jobs"]["sweep-plan"]["steps"]
             if candidate.get("name") == "Full workspace sweep including ignored tests"
             for line in shell_logical_lines(str(candidate.get("run", "")))
         ]
@@ -9317,7 +9328,11 @@ class WorkflowTests(unittest.TestCase):
                         self.assertNotIn("container", job)
                     else:
                         # Main #183 returned container smoke to the shared pool.
-                        self.assertTrue(runner_allowed(job_id, job["runs-on"]))
+                        # The four split nightly sweep jobs deliberately keep the
+                        # original logical overflow key `sweep`, preserving the
+                        # runner allow-list behavior of the pre-split job.
+                        route_key = "sweep" if (name, job_id) in NIGHTLY_SWEEP_SPLIT_JOBS else job_id
+                        self.assertTrue(runner_allowed(route_key, job["runs-on"]))
                     if job.get("services"):
                         self.assertIn("container", job)
                         for service in job["services"].values():
@@ -9582,11 +9597,14 @@ class WorkflowTests(unittest.TestCase):
             set(workflow.get("on") or {}),
             {"schedule", "workflow_dispatch", "pull_request"},
         )
-        job = workflow["jobs"]["sweep"]
-        self.assertEqual(
-            job.get("timeout-minutes"),
-            "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}",
-        )
+        # All four compiling jobs carry the ceiling; the `sweep` aggregate
+        # is not a compiling job and is not pinned here.
+        for name in ("sweep-plan", "sweep-partition", "sweep-guarded", "sweep-docs"):
+            with self.subTest(job=name):
+                self.assertEqual(
+                    workflow["jobs"][name].get("timeout-minutes"),
+                    "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}",
+                )
 
     def test_nextest_container_pins_disposable_database_service_address(self):
         # Same hardening as the check.yml lanes: the shared lane runs the

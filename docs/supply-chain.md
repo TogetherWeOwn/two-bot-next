@@ -19,8 +19,24 @@ recoverable by image analysis, so the separate lockfile scan is intentional.
 
 Both gates run in the `image` job and use SHA-pinned Trivy Action 0.36.0 with
 Trivy v0.69.3 (see the `uses: aquasecurity/trivy-action@... # 0.36.0` pins
-and `version: v0.69.3` in [`sbom.yml`](../.github/workflows/sbom.yml)). They
-fail on HIGH/CRITICAL in OS and library dependencies,
+and `version: v0.69.3` in [`sbom.yml`](../.github/workflows/sbom.yml)). Before
+checking out the source to scan, [`scripts/install-trivy.sh`](../scripts/install-trivy.sh)
+downloads the Linux/amd64 archive directly from the pinned GitHub release and
+checks its committed SHA-256 before extracting or executing the binary. Revalidate
+that pin against both the release checksum file and GitHub asset digest when
+bumping. Downloads require HTTPS (including redirects), allow at most three
+redirects and two retries, and cap the archive at 100 MiB. Each attempt has a
+10-second connect and 120-second total timeout; the whole retry sequence has a
+360-second deadline (with a five-second kill grace). Curl errors and HTTP status
+remain visible without logging signed redirect URLs or response bodies. A failed
+download, checksum, extraction or version check publishes no PATH entry and fails
+the job. All four pinned actions skip duplicate setup only after this install;
+the runtime gate's failure-tolerant condition also requires a successful install.
+The binary lives only in a fresh runner-temp directory; no shared cache is used.
+Offline installer and wiring fixtures run through `scripts/ci/test_trivy_install.py`
+in the existing `check` lane's Python discovery.
+
+Both gates fail on HIGH/CRITICAL in OS and library dependencies,
 **including unfixed findings**. A fresh vulnerability DB is downloaded by Trivy
 on every run. No shared cache is written or read: the BuildKit GitHub-Actions
 cache is disabled and every Trivy step sets `cache: false`, so a poisoned

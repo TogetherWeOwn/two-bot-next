@@ -38,6 +38,9 @@ jobs:
           python3 scripts/test-runtime-image-evidence.py
           python3 scripts/test_runtime_image_inspect_acceptance.py
           python3 scripts/test-vulnerability-preflight.py
+      - name: Install verified pinned Trivy
+        id: trivy
+        run: bash scripts/install-trivy.sh
       # Keep the workflow's validation tools while inventorying a historical
       # release tag that may predate those tools.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -69,6 +72,7 @@ jobs:
           version: v0.69.3
           cache: false
           cache-dir: ${{ runner.temp }}/trivy-cache
+          skip-setup-trivy: true
           scan-type: fs
           scan-ref: ${{ runner.temp }}/rust-workspace
           scanners: vuln
@@ -110,7 +114,7 @@ jobs:
       # gates are still attempted even if the first fails (`!cancelled()`),
       # and `verify` still validates/retains even when a gate fails.
       - name: Gate runtime image (HIGH/CRITICAL, including unfixed)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.trivy.outcome == 'success' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           version: v0.69.3
