@@ -935,6 +935,18 @@ export class TwoBotContainer extends Container<Env> {
     await this.schedule(new Date(when * 1000), "stagingExpiry", null);
   }
 
+  private async stopStagingUse(): Promise<void> {
+    try { await this.destroyInactive(); }
+    catch (error) {
+      // Acquisition has already persisted preparing denial; release has
+      // persisted released denial. Neither may wait for the original deadline
+      // after an unconfirmed stop. This successor can only retry teardown.
+      this.recoveryFailed = true;
+      await this.scheduleStagingExpiry(Date.now() + 15_000);
+      throw error;
+    }
+  }
+
   private stagingReceipt(action: "acquire" | "release" | "expiry", use: StagingUse | undefined,
     outcome: "authorized" | "stopped" | "stop_unconfirmed"): void {
     // Project only validated finite-use correlation fields. Runner cancellation
@@ -1368,10 +1380,10 @@ export class TwoBotContainer extends Container<Env> {
         if (change) {
           if (change.action === "acquire") {
             use = await this.stagingUse.acquire(change, identity,
-              () => this.destroyInactive(), (expiry) => this.scheduleStagingExpiry(expiry));
+              () => this.stopStagingUse(), (expiry) => this.scheduleStagingExpiry(expiry));
             this.recoveryFailed = false;
           } else {
-            use = await this.stagingUse.release(change, identity, () => this.destroyInactive());
+            use = await this.stagingUse.release(change, identity, () => this.stopStagingUse());
             this.deleteSchedules("stagingExpiry");
             this.recoveryFailed = false;
           }

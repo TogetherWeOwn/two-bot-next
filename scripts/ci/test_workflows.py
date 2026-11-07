@@ -2987,8 +2987,8 @@ def production_errors(workflow):
         errors.append(f"{name}:soak: must hold the canonical staging lock, never the production lane")
     if (soak.get("environment") != {"name": "staging", "deployment": "false"}
             or soak.get("permissions") != {"contents": "read", "actions": "read"}
-            or soak.get("timeout-minutes") != "40"):
-        errors.append(f"{name}:soak: must retain the staging-only read scope and 40-minute budget")
+            or soak.get("timeout-minutes") != "50"):
+        errors.append(f"{name}:soak: must retain the staging-only read scope and 50-minute job cleanup budget")
     soak_steps = soak.get("steps") or []
     expected_names = [None, None, "Acquire and ready the guarded staging candidate",
         "Record the soak-baseline REST counters", "Measure a fresh live staging interval",
@@ -4020,7 +4020,7 @@ def synthetic_user_flow_errors(workflow):
             errors.append(f"{name}:{job_id}: must run only from main")
         if job.get("permissions") != {"actions": "read", "contents": "read", "issues": "write"}:
             errors.append(f"{name}:{job_id}: must keep actions:read, contents:read and issues:write only")
-        expected_group = STAGING_LIFECYCLE_GROUP if job_id == "staging" else "synthetic-user-flow-production"
+        expected_group = f"synthetic-user-flow-{'staging' if job_id == 'staging' else 'production'}"
         if job.get("concurrency") != {"group": expected_group, "cancel-in-progress": "false"}:
             errors.append(f"{name}:{job_id}: must use its non-cancelling per-environment job lock")
         if job.get("timeout-minutes") != "10":
@@ -7780,6 +7780,53 @@ class WorkflowTests(unittest.TestCase):
                 with self.subTest(job=job_id, mutation=label):
                     self.assertTrue(check(changed))
 
+    def test_promotion_soak_keeps_cleanup_headroom_without_extending_authority(self):
+        workflow = self.workflows["deploy-production.yml"]
+        soak = workflow["jobs"]["soak"]
+        begin = next(step for step in soak["steps"] if step.get("id") == "staging-use-begin")
+        self.assertEqual(begin["env"]["STAGING_USE_MINUTES"], "40")
+        self.assertEqual(soak["timeout-minutes"], "50")
+        self.assertEqual(production_errors(workflow), [])
+        for timeout in ("40", "45", "51"):
+            changed = deepcopy(workflow)
+            changed["jobs"]["soak"]["timeout-minutes"] = timeout
+            with self.subTest(timeout=timeout):
+                self.assertTrue(production_errors(changed))
+        changed = deepcopy(workflow)
+        changed["jobs"]["soak"]["steps"][2]["env"]["STAGING_USE_MINUTES"] = "50"
+        self.assertTrue(production_errors(changed), "job headroom must not become extra use authority")
+
+    def test_scheduled_staging_observer_cannot_replace_pending_lifecycle_holders(self):
+        workflow = self.workflows["synthetic-user-flow.yml"]
+        self.assertEqual(workflow["jobs"]["staging"]["concurrency"],
+                         {"group": "synthetic-user-flow-staging", "cancel-in-progress": "false"})
+        self.assertNotIn("concurrency", workflow)
+        self.assertEqual(synthetic_user_flow_errors(workflow), [])
+        # GitHub group matching is case-insensitive, and expressions can alias
+        # the holder too. Only the fixed independent observer queue is accepted.
+        for group in ("staging-lifecycle", "STAGING-LIFECYCLE", "deploy-staging",
+                      "DEPLOY-STAGING", "synthetic-user-flow-production",
+                      "${{ 'staging-lifecycle' }}"):
+            for level in ("workflow", "job"):
+                changed = deepcopy(workflow)
+                target = changed if level == "workflow" else changed["jobs"]["staging"]
+                target["concurrency"] = {"group": group, "cancel-in-progress": "false"}
+                with self.subTest(group=group, level=level):
+                    self.assertTrue(synthetic_user_flow_errors(changed))
+        # Queue independence must not grant the observer lifecycle authority
+        # or turn refusal/unknown stop into an idle success.
+        for command in ("begin", "consume", "rebind", "finish", "acquire", "release"):
+            changed = deepcopy(workflow)
+            changed["jobs"]["staging"]["steps"][2]["run"] = (
+                "node wrangler/scripts/staging-use-pipeline.mjs " + command)
+            with self.subTest(command=command):
+                self.assertTrue(synthetic_user_flow_errors(changed))
+        for key, value in (("continue-on-error", "true"), ("if", "false")):
+            changed = deepcopy(workflow)
+            changed["jobs"]["staging"]["steps"][2][key] = value
+            with self.subTest(key=key):
+                self.assertTrue(synthetic_user_flow_errors(changed))
+
     def test_production_synthetic_has_no_shared_staging_queue(self):
         workflow = self.workflows["synthetic-user-flow.yml"]
         self.assertEqual(synthetic_user_flow_errors(workflow), [])
@@ -10535,8 +10582,8 @@ class WorkflowTests(unittest.TestCase):
             # promotion can never queue an operator rollback behind it (see
             # the header comment in the workflow).
             "deploy-production.yml",
-            # Staging holds the canonical lifecycle group at job level only;
-            # production samples have their own independent queue.
+            # Read-only staging observation and production alerting each use
+            # an independent queue, never the lifecycle holders' pending slot.
             "synthetic-user-flow.yml",
         }
         for name, workflow in self.workflows.items():
@@ -10551,7 +10598,7 @@ class WorkflowTests(unittest.TestCase):
                     "deploy-production", f"{name}:production")
             if name == "synthetic-user-flow.yml":
                 self.assertNotIn("concurrency", workflow)
-                for job_id, group in (("staging", "staging-lifecycle"),
+                for job_id, group in (("staging", "synthetic-user-flow-staging"),
                                       ("prod-passive", "synthetic-user-flow-production")):
                     self.assertEqual(workflow["jobs"][job_id].get("concurrency"),
                                      {"group": group, "cancel-in-progress": "false"})

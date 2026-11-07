@@ -54,9 +54,10 @@ jobs:
     environment:
       name: staging
       deployment: false
-    # Job-level only: production passive alerting never takes this group.
+    # Observe without the lifecycle lock: five-minute ticks must not replace
+    # pending deployments or promotion soaks in GitHub's single pending slot.
     concurrency:
-      group: staging-lifecycle
+      group: synthetic-user-flow-staging
       cancel-in-progress: false
     permissions:
       actions: read

@@ -463,6 +463,43 @@ test("bounded staging: unreadable authority in expiry stops rather than sustaini
   assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 0);
 });
 
+test("bounded staging: failed control teardown persists a prompt stop-only retry", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  for (const action of ["acquire", "release"] as const) {
+    const h = await harness(t, BOUNDED_STAGING_ENV);
+    const window = { ...stagingWindow(), expiresAt: Date.now() + 6 * 60 * 60 * 1000 };
+    if (action === "release") {
+      assert.equal((await h.bot.fetch(stagingUseRequest("acquire", window))).status, 200);
+    }
+    h.runtime.running = true;
+    const destroy = h.runtime.destroy.bind(h.runtime);
+    let failing = true;
+    t.mock.method(h.runtime, "destroy", async () => {
+      if (failing) throw new Error("synthetic provider stop failure");
+      await destroy();
+    });
+    assert.equal((await h.bot.fetch(stagingUseRequest(action, window))).status, 503);
+    assert.equal((h.values.get(STAGING_USE_KEY) as { phase: string }).phase,
+      action === "acquire" ? "preparing" : "released");
+    assert.equal(h.runtime.running, true, "unconfirmed shutdown is not idle");
+    const [retry] = await h.bot.listSchedules("stagingExpiry");
+    assert.ok(retry, `${action} failure must persist a stop retry before returning`);
+    assert.equal(retry.time, Math.ceil((Date.now() + 15_000) / 1000));
+    await assert.rejects(h.bot.start(), /shutdown_unconfirmed/);
+    t.mock.timers.tick(15_000);
+    await fireSdkAlarm(t, h.bot, 15_000);
+    assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 1,
+      "a failed retry must persist its successor, not wait for the six-hour grant");
+    failing = false;
+    t.mock.timers.tick(15_000);
+    await h.bot.alarm();
+    assert.equal(h.runtime.running, false);
+    assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 0);
+    assert.equal(h.starts.length, 0, "stop-only retries never start a process");
+    assert.equal(h.requests.length, 0);
+  }
+});
+
 test("bounded staging: unconfirmed expiry teardown persists a stop-only successor until confirmed", async (t) => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
   const h = await harness(t, BOUNDED_STAGING_ENV);

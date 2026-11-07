@@ -19,6 +19,13 @@ are restored (with takeover, which releases an intentional fence onto the
 restored version after a fenced takeover refusal), and the run still stays red — the restore
 recovers service, it never certifies the failed build. Without a successful
 deploy and snapshot there is nothing to restore, so no rollback is attempted.
+The helper additionally requires a proven finite-policy target and the original
+run's grant. Receipt/takeover failures precede grant acquisition, so their
+conditional rollback invocation refuses before mutation with
+`staging_restore_window_missing`. They do not restore the predecessor; reconcile
+serving version, rollout and ownership, then repair through roll-forward. A
+failed step alone proves neither that the new build is serving nor that the
+predecessor is unchanged.
 The gate does not
 accept a health response from an old singleton. This is a **staging-only** gate,
 not production authorization or a migration tool. Operators can preview the
@@ -57,6 +64,15 @@ container. Routine callers must request only their needed window; the runtime
 ceiling accommodates a separately authorized four-ACTIVE-hour soak, not a
 permanent staging session. A provider stop failure is unconfirmed cleanup, never
 idle/zero-cost proof, and must be repaired through the existing incident path.
+Unconfirmed acquire/release teardown persists a native stop-only retry after
+15 seconds instead of waiting for the original grant expiry; repeated failures
+retain successors and never authorize startup.
+
+Replay end markers currently retain one small DO storage key per workflow
+run/attempt without pruning. This storage-growth limitation is retained for this
+rollout: deleting a marker without an independent replay horizon would let a
+late retry mint another window. It is not ongoing Container/DO runtime-use
+proof or a claim that storage is free.
 
 ### Trusted client and receipt contract (partial wiring, not activated)
 
@@ -69,9 +85,10 @@ sample; an unconfirmed stop or invalid authority fails. It never acquires,
 renews, starts, probes or releases staging. The slow-burn workflow uses this
 observer in a separate credential-isolated step and skips both issue writes and
 cache saves during idle. Its five-minute cadence and active-use burn checks are
-unchanged. Scheduled user-flow also observes instead of acquiring a window;
-remaining readers, including the production promotion's live staging-soak
-samples, still need integration without weakening their qualification gates.
+unchanged. Scheduled user-flow also observes instead of acquiring a window.
+The production promotion's live staging-soak samples use one bounded grant
+through baseline, measurement, final sampling and release; their exact-head live
+qualification remains required.
 `acquire`, `assert`, `ready` and `release` pin the intended
 `STAGING_USE_SHA`, `STAGING_USE_DEPLOYMENT`, `GITHUB_RUN_ID`,
 `GITHUB_RUN_ATTEMPT` and absolute millisecond `STAGING_USE_EXPIRES_AT`. The
@@ -169,11 +186,13 @@ workflow or activation receipt.
 `deploy-staging` holds the fixed, non-cancelling `staging-lifecycle` group at
 workflow level, from baseline through all qualification jobs and
 `staging-use-release`. No job inside it re-holds the group. Both standalone drills,
-the manual MCP prove-out and the scheduled staging user-flow job use the same
-canonical group. The rollback-proof orchestrator does **not** hold it while
-waiting for its child.
-The user-flow group is job-level only: the passive production sibling never
-takes it or depends on the staging job. Production probe code is unchanged.
+standalone voice/help, the manual MCP prove-out and the production promotion soak
+use the same canonical group. The rollback-proof orchestrator does **not** hold
+it while waiting for its child.
+The read-only scheduled user-flow observer uses its independent job-level
+`synthetic-user-flow-staging` queue: it cannot replace pending lifecycle holders.
+The passive production sibling uses its own queue and never depends on staging.
+Production probe code is unchanged.
 
 The deploy job authorizes a 120-minute maximum window after receipt-validated
 ownership transfer and before its unchanged rollout/readiness gate. It exports
@@ -200,17 +219,21 @@ Retain start/assert and stop/refusal artifacts for the run and attempt. Verify
 on exact-head Actions that the existing staging control secret resolves in each
 called staging job; a missing token fails closed, never warrants a new credential.
 
-**Pending-slot replacement (accepted recovery, 2026-11-07):** GitHub preserves a
+**Pending-slot replacement (residual recovery, 2026-11-07):** GitHub preserves a
 running holder with `cancel-in-progress: false`, but keeps only one pending item
-per group. A newer five-minute probe or drill can replace a pending deployment;
-there is no FIFO/fairness guarantee. A cancelled deploy is not qualification or
-staging history. Re-dispatch `deploy-staging` from `main` with `sha` set to that
-exact merged 40-hex SHA, wait for all five qualifying jobs plus release, and
-retain the new attempt's receipts before considering promotion. The pin/history
-guard stays unchanged; an older pin still makes that run intentionally red and
-cannot certify a different workflow head. No scheduler or automatic redispatch
-is added. The five-minute consumer's idle/finite-use behavior remains an
-activation prerequisite, not permission for near-continuous staging windows.
+per group. The five-minute user-flow observer is outside that group and cannot
+replace a pending deploy or promotion soak. Actual holders (another deploy,
+drill or soak) can still replace one pending holder; there is no FIFO/fairness
+guarantee. A cancelled run is not qualification or staging history. Re-dispatch
+`deploy-staging` from `main` with `sha` set to that exact merged 40-hex SHA, wait
+for all five qualifying jobs plus release, and retain the new attempt's receipts
+before considering promotion. A cancelled production soak needs a new promotion
+run through its unchanged guard and fresh full-window measurement, never
+historical soak credit. The pin/history guard stays unchanged; an older pin
+still makes that deploy run intentionally red and cannot certify a different
+workflow head. No scheduler or automatic redispatch is added. The five-minute
+observer never grants a window; its cadence is not permission for
+near-continuous staging use.
 
 **Reruns:** use **Re-run all jobs**, never only failed jobs. A partial rerun has a
 new `run_attempt` but old grant outputs, so the inherited assert refuses with
@@ -314,8 +337,14 @@ merge or an unverified deployment is not `t0`.
    `verify`, or the error-rate gate), the workflow attempts an automatic rollback to the pre-deploy
    snapshot (Worker version **and** container image, with takeover) via
    `scripts/worker_container_rollback.py`; `scripts/staging_rollout.py` only reports
-   the failure. After a fenced takeover refusal the rollback's own takeover
-   releases the fence onto the restored version. A restored deployment still leaves the job red on `main`: the rollback
+   the failure. The helper refuses before mutation unless a finite-policy target
+   and the original run/attempt grant are proved. Receipt validation and initial
+   ownership takeover run **before** grant acquisition: their failures leave no
+   expiry, so automatic rollback refuses with `staging_restore_window_missing`
+   and recovery is roll-forward after reconciling remote state. This is not a
+   successful restore or proof that the predecessor is still serving. When the
+   grant exists, the rollback's own takeover can release a fence onto the restored
+   version. A restored deployment still leaves the job red on `main`: the rollback
    restores service, it never certifies the failed build. There is deliberately **no
    automatic permanent fence**: a successful restore ends with takeover (`active`), so
    the next push can hand off again without a manual `release_fence` dispatch. When

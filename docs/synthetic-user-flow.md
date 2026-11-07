@@ -15,9 +15,9 @@ expiry on cancellation or runner loss. A scheduled probe is not permission for
 idle keepalive or for an unauthorized cold start. Preserve the existing required
 active-use checks and incident evidence. Production's passive probes are unchanged.
 
-The scheduled staging job holds the lifecycle group while it makes one
-control-only `observe` read, using the existing staging Environment secret only
-in that step. It never acquires, starts, extends or releases staging. Confirmed
+The scheduled staging job uses its own `synthetic-user-flow-staging` queue,
+never the lifecycle holders' group. It makes one control-only `observe` read,
+using the existing staging Environment secret only in that step. It never acquires, starts, extends or releases staging. Confirmed
 idle retains an `intentional_idle` receipt with unknown health and skips the
 public probe, alert decision and incident write; idle never closes an incident
 or resets its failure history. A malformed/refused control read or an
@@ -25,13 +25,15 @@ unconfirmed stop fails the job rather than claiming idle. The fenced
 `force_fail` dispatch bypasses observation only to exercise the refused-origin
 alert path; it cannot contact staging.
 
-Active authority permits the unchanged health-contract probe. The scheduled
-job queues behind deploy qualification, so it does not independently sample
-inside that locked deployment window: the deploy workflow's exact-SHA
-user-flow job remains mandatory there. Production has an independent job queue
-and no staging Environment, control credential or dependency. Keep the
-five-minute schedule and the documented pending-slot/re-dispatch policy in the
-rollout gate.
+Active authority permits the unchanged health-contract probe, including during
+a deployment's or promotion soak's authorized window. Observation is not a
+reservation: release, expiry or takeover can race the subsequent public reads;
+runtime fencing refuses access after authority ends and a refused sample stays
+failed, never idle or recovery. The deploy workflow's exact-SHA user-flow job
+remains mandatory; scheduled samples cannot certify it. Production has an
+independent job queue and no staging Environment, control credential or
+dependency. Keep the five-minute schedule; its ticks can no longer cancel queued
+deployments or promotion soaks through the lifecycle group's pending slot.
 
 This protocol remains unactivated. The workflow change is not evidence of zero
 idle runtime cost. Do not claim activation until the live resource/consumer

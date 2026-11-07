@@ -294,10 +294,18 @@ starting a different build under the old candidate's authorization.
 The staging lock spans startup, baseline, measurement, final evidence and
 release in one job, including failed/cancelled cleanup. Native persisted expiry
 is still required if the runner disappears; `always()` alone is not cleanup
-proof. The original absolute expiry never moves. Lifecycle NDJSON and available
+proof. The original absolute expiry never moves. The grant remains capped at
+40 minutes; the job has a 50-minute timeout, leaving ten minutes for
+checkout/setup, stop and evidence rather than cancelling cleanup at the grant
+cap. Startup readiness can consume up to five minutes before the fresh
+30-minute interval; final sampling and original-grant readiness must still finish
+before expiry. A slow/unhealthy candidate that exhausts the grant fails closed;
+the extra job time never authorizes more sampling or extends the grant. Native
+expiry remains necessary if setup/provider calls exhaust the job budget.
+Lifecycle NDJSON and available
 measurement JSON are always retained as
 `staging-soak-<run_id>-<run_attempt>` for seven days. The soak runs outside the
-`deploy-production` lane — only the `production` and `release` jobs hold it —
+`deploy-production` lane — only the `production` job holds it —
 so a staging wait never queues an operator production rollback behind it. The lane keeps the default single pending slot, so a `recheck`
 job waits for the soak and both gates, then re-reads the hold, the live
 revision and the active dispatches immediately before the deploy: a hold set,
