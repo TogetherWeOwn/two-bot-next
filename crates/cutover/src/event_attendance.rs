@@ -49,6 +49,10 @@ pub struct AttendanceSession {
 
 /// Maximum open rows examined or conservatively finalized per recovery turn.
 pub const ATTENDANCE_RECOVERY_PAGE_SIZE: usize = 32;
+/// Maximum candidate windows and tags examined by a transition page.
+pub const ATTENDANCE_MAX_WINDOWS: usize = 128;
+/// Maximum aggregate tag text copied from one stored row.
+pub const ATTENDANCE_MAX_TAG_BYTES: usize = 16 * 1024;
 
 /// Minimal open-row identity for bounded presence recovery, without copying
 /// room names or tag arrays into the actor.
@@ -151,9 +155,10 @@ pub struct NewAttendanceSession {
 // attendance from different occurrences. Channel bindings are not schedules;
 // every channel counts, so a bound event room is not required here.
 const CAPTURE_WINDOWS_SQL: &str =
-    "SELECT k.event_key, w.starts_at, w.ends_at FROM internal_event_keys k
+    "SELECT CASE WHEN octet_length(k.event_key) <= 128 THEN k.event_key ELSE repeat('x', 129) END, w.starts_at, w.ends_at FROM internal_event_keys k
      JOIN event_instance_windows w ON w.guild_id = k.guild_id AND w.event_id = k.event_id
-     WHERE k.guild_id = $1 AND w.is_current AND NOT w.identity_ambiguous
+     WHERE k.guild_id = $1 AND ($4::text[] IS NULL OR k.event_key = ANY($4))
+       AND w.is_current AND NOT w.identity_ambiguous
        AND w.revoked_at IS NULL AND w.status IN ('scheduled', 'active', 'completed')
        AND w.ends_at IS NOT NULL AND w.ends_at >= w.starts_at
        AND w.starts_at <= clock_timestamp() + INTERVAL '15 minutes'
@@ -166,7 +171,7 @@ const CAPTURE_WINDOWS_SQL: &str =
        AND NOT EXISTS (SELECT 1 FROM event_attendance_windows h
                        WHERE h.guild_id = k.guild_id AND h.event_key = k.event_key
                          AND (h.event_id <> w.event_id OR h.instance_starts_at <> w.instance_starts_at))
-     ORDER BY w.starts_at, k.event_key";
+     ORDER BY w.starts_at, k.event_key LIMIT 129";
 
 /// Accepted candidate windows within raw retention for transition planning.
 /// Expired candidates can tag an existing overlapping span, never open one.
@@ -179,6 +184,7 @@ pub async fn attendance_windows_for_guild(
         .bind(guild_id)
         .bind(None::<OffsetDateTime>)
         .bind(true)
+        .bind(None::<Vec<String>>)
         .fetch_all(pool)
         .await
         .map(|rows| {
@@ -214,7 +220,8 @@ pub async fn attendance_window_for_key(
     })
 }
 
-/// The member's still-open session rows in the guild, oldest first.
+/// One bounded page of the member's still-open rows, oldest first. Call again
+/// only after finalizing this page; no new open may pass unfinished rows.
 pub async fn open_attendance_sessions(
     pool: &sqlx::PgPool,
     guild_id: &str,
@@ -235,11 +242,19 @@ pub async fn open_attendance_sessions(
             OffsetDateTime,
         ),
     >(
-        "SELECT id, member_id, channel_id, channel_name, is_bot, afk, \
-                joined_at, left_at, event_keys, COALESCE(name_observed_at, joined_at) \
-         FROM event_voice_sessions \
-         WHERE guild_id = $1 AND member_id = $2 AND left_at IS NULL \
-         ORDER BY joined_at, id",
+        "SELECT id,
+                CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE repeat('x', 21) END,
+                CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE repeat('x', 21) END,
+                CASE WHEN octet_length(channel_name) <= 4096 THEN channel_name ELSE repeat('x', 4097) END,
+                is_bot, afk, joined_at, left_at,
+                CASE WHEN cardinality(event_keys) <= 128 THEN
+                     CASE WHEN (SELECT COALESCE(sum(octet_length(k)), 0) FROM unnest(event_keys) k) <= 16384
+                          THEN event_keys ELSE ARRAY[repeat('x', 16385)] END
+                     ELSE ARRAY[repeat('x', 16385)] END,
+                COALESCE(name_observed_at, joined_at)
+         FROM event_voice_sessions
+         WHERE guild_id = $1 AND member_id = $2 AND left_at IS NULL
+         ORDER BY joined_at, id LIMIT 32",
     )
     .bind(guild_id)
     .bind(member_id)
@@ -319,8 +334,14 @@ async fn capture_tags_in(
             .bind(guild_id)
             .bind(since)
             .bind(closing)
+            .bind(requested)
             .fetch_all(&mut *connection)
             .await?;
+    if windows.len() > ATTENDANCE_MAX_WINDOWS || windows.iter().any(|(key, _, _)| key.len() > 128) {
+        return Err(sqlx::Error::Protocol(
+            "attendance candidates exceed budget".into(),
+        ));
+    }
     let grace = time::Duration::minutes(ATTENDANCE_WINDOW_GRACE_MINUTES);
     let tags: Vec<String> = windows
         .into_iter()
@@ -354,6 +375,14 @@ pub async fn insert_attendance_session(
     pool: &sqlx::PgPool,
     new: &NewAttendanceSession,
 ) -> Result<i64, sqlx::Error> {
+    if new.event_keys.len() > ATTENDANCE_MAX_WINDOWS
+        || new.event_keys.iter().any(|key| key.len() > 128)
+        || new.channel_name.len() > 4096
+    {
+        return Err(sqlx::Error::Protocol(
+            "attendance insert exceeds budget".into(),
+        ));
+    }
     let mut tx = pool.begin().await?;
     lock_capture_in(&mut tx, &new.guild_id, &new.member_id).await?;
     let tags = capture_tags_in(
@@ -400,6 +429,14 @@ pub async fn close_attendance_session(
     channel_name: Option<&str>,
     event_keys: &[String],
 ) -> Result<u64, sqlx::Error> {
+    if event_keys.len() > 2 * ATTENDANCE_MAX_WINDOWS
+        || event_keys.iter().map(String::len).sum::<usize>() > 2 * ATTENDANCE_MAX_TAG_BYTES
+        || channel_name.is_some_and(|name| name.len() > 4096)
+    {
+        return Err(sqlx::Error::Protocol(
+            "attendance close exceeds budget".into(),
+        ));
+    }
     let mut tx = pool.begin().await?;
     let owner: Option<(String, String)> = sqlx::query_as(
         "SELECT guild_id, member_id FROM event_voice_sessions WHERE id = $1 AND left_at IS NULL",
@@ -411,8 +448,33 @@ pub async fn close_attendance_session(
         return Ok(0);
     };
     lock_capture_in(&mut tx, &guild_id, &member_id).await?;
+    if event_keys.is_empty() {
+        // Finalization without expansion must not decode or rewrite metadata.
+        // This also drains malformed oversized rows without dropping evidence
+        // or allowing one bad row to park the guild actor indefinitely.
+        let affected = sqlx::query(
+            "UPDATE event_voice_sessions
+             SET left_at = GREATEST(joined_at, $2),
+                 channel_name = COALESCE($3, channel_name),
+                 name_observed_at = CASE WHEN $3::text IS NULL THEN name_observed_at ELSE clock_timestamp() END,
+                 changed_at = clock_timestamp()
+             WHERE id = $1 AND left_at IS NULL",
+        )
+        .bind(id)
+        .bind(left_at)
+        .bind(channel_name)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        return Ok(affected);
+    }
     let existing: Option<(Vec<String>, OffsetDateTime)> = sqlx::query_as(
-        "SELECT event_keys, joined_at FROM event_voice_sessions WHERE id = $1 AND left_at IS NULL FOR UPDATE",
+        "SELECT CASE WHEN cardinality(event_keys) <= 128 THEN
+                     CASE WHEN (SELECT COALESCE(sum(octet_length(k)), 0) FROM unnest(event_keys) k) <= 16384
+                          THEN event_keys ELSE ARRAY[repeat('x', 16385)] END
+                     ELSE ARRAY[repeat('x', 16385)] END,
+                joined_at FROM event_voice_sessions WHERE id = $1 AND left_at IS NULL FOR UPDATE",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -420,6 +482,11 @@ pub async fn close_attendance_session(
     let Some((mut tags, joined_at)) = existing else {
         return Ok(0);
     };
+    if tags.iter().map(String::len).sum::<usize>() > ATTENDANCE_MAX_TAG_BYTES {
+        return Err(sqlx::Error::Protocol(
+            "attendance stored tags exceed budget".into(),
+        ));
+    }
     let requested: Vec<String> = event_keys
         .iter()
         .filter(|key| !tags.contains(key))

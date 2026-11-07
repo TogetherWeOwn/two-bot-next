@@ -497,6 +497,19 @@ revokes readiness. Buffered pre-recovery joins stay missed. Maintenance detects
 recovery without new frames; an unchanged-generation snapshot cannot override
 queued transitions. Snapshots never open spans.
 
+Normal transitions also share one total one-second deadline across reads, gates
+and writes, with at most eight close attempts per turn. Open rows page 32 at a time;
+candidates cap at 128, names at 4 KiB and stored tag text at 16 KiB per row. An
+oversized candidate set grants no new capture; existing tags still finalize.
+Malformed oversized stored rows finalize by id without new tags or replacement
+metadata; oversized values remain intact server-side and disable this transition's
+new open. They cannot indefinitely park the guild inbox. The actor retains original observation, names, windows and uncertain close plans,
+resuming on maintenance before consuming later frames from its bounded inbox.
+Room dispatch/timers continue between turns. No new open passes unfinished closes;
+uncertain closes retry the same id/boundary/tags, while uncertain opens never retry.
+A gateway change during continuation permits retained closes but no new open,
+and requires recovery before reads/capture resume. Reads refuse while pending.
+
 Capture consumes the shared accepted `event_instance_windows` authority, not
 caller-requested upsert dates or a retained attendance window. New spans and new
 tags revalidate finite-window containment, lifecycle and privacy in a transaction.

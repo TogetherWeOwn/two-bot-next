@@ -18,7 +18,8 @@ use two_bot_cutover::event_attendance::{
     attendance_recovery_page, attendance_sessions_for_event_key, attendance_window_for_key,
     attendance_windows_for_guild, close_attendance_session, insert_attendance_session,
     is_attendance_suppressed, is_attendance_voice_enabled, open_attendance_sessions,
-    recover_attendance_sessions, NewAttendanceSession, ATTENDANCE_RECOVERY_PAGE_SIZE,
+    recover_attendance_sessions, NewAttendanceSession, ATTENDANCE_MAX_TAG_BYTES,
+    ATTENDANCE_MAX_WINDOWS, ATTENDANCE_RECOVERY_PAGE_SIZE,
 };
 use two_bot_cutover::{
     privacy::{opt_out_member, set_analytics_settings},
@@ -1381,6 +1382,265 @@ async fn recovery_rejects_oversize_batches_before_any_mutation() {
                  .5,
             None
         );
+    })
+    .await;
+}
+
+/// Seed one raw row for an explicit member, so many open rows share an owner.
+async fn seed_member_row(
+    pool: &PgPool,
+    guild: &str,
+    member: &str,
+    n: usize,
+    joined_at: OffsetDateTime,
+    left_at: Option<OffsetDateTime>,
+) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, channel_name,
+            name_observed_at, is_bot, afk, joined_at, left_at, event_keys)
+         VALUES ($1, $2, $3, $4, $5, FALSE, TRUE, $6, $7, ARRAY[$8]) RETURNING id",
+    )
+    .bind(guild)
+    .bind(member)
+    .bind(format!("{}", 40_000_000_000_000_000_u64 + n as u64))
+    .bind(format!("Room {n}"))
+    .bind(joined_at + Duration::minutes(1))
+    .bind(joined_at)
+    .bind(left_at)
+    .bind(format!("{}", 20_000_000_000_000_000_u64 + n as u64))
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn open_rows_page_oldest_first_and_closing_each_page_reaches_every_row() {
+    with_database(|pool| async move {
+        let base = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::hours(4);
+        let total = 32 * 2 + 5;
+        // Join order is the reverse of id order, so paging must follow
+        // (joined_at, id) rather than insertion order.
+        let mut expected = Vec::new();
+        for n in 0..total {
+            let joined = base + Duration::seconds((total - n) as i64);
+            expected.push((
+                joined,
+                seed_member_row(&pool, GUILD_A, MEMBER, n, joined, None).await,
+            ));
+        }
+        // A tied join sorts by id.
+        let tie_joined = base + Duration::seconds(1);
+        let tie_a = seed_member_row(&pool, GUILD_A, MEMBER, 700, tie_joined, None).await;
+        let tie_b = seed_member_row(&pool, GUILD_A, MEMBER, 701, tie_joined, None).await;
+        expected.push((tie_joined, tie_a));
+        expected.push((tie_joined, tie_b));
+        expected.sort();
+        let expected: Vec<i64> = expected.into_iter().map(|(_, id)| id).collect();
+
+        // Other member, other guild and a closed row of this member never appear.
+        let other_member =
+            seed_member_row(&pool, GUILD_A, "30000000000000999", 800, base, None).await;
+        let other_guild = seed_member_row(&pool, GUILD_B, MEMBER, 801, base, None).await;
+        let closed_left = base + Duration::minutes(3);
+        let closed = seed_member_row(&pool, GUILD_A, MEMBER, 802, base, Some(closed_left)).await;
+        let untouched = [
+            (other_member, raw_state(&pool, other_member).await),
+            (other_guild, raw_state(&pool, other_guild).await),
+            (closed, raw_state(&pool, closed).await),
+        ];
+        let rows_before = row_count(&pool).await;
+
+        let mut before = std::collections::HashMap::new();
+        for id in &expected {
+            before.insert(*id, raw_state(&pool, *id).await);
+        }
+        let mut seen: Vec<i64> = Vec::new();
+        let mut page_sizes = Vec::new();
+        loop {
+            let page = open_attendance_sessions(&pool, GUILD_A, MEMBER)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.len() <= 32, "a page never exceeds its bound");
+            assert!(page
+                .windows(2)
+                .all(|w| (w[0].joined_at, w[0].id) < (w[1].joined_at, w[1].id)));
+            assert!(
+                page.iter().all(|row| !seen.contains(&row.id)),
+                "no row repeats"
+            );
+            assert!(page.iter().all(|row| row.left_at.is_none()));
+            page_sizes.push(page.len());
+            for row in &page {
+                assert_eq!(
+                    close_attendance_session(
+                        &pool,
+                        row.id,
+                        row.joined_at + Duration::minutes(5),
+                        None,
+                        &[]
+                    )
+                    .await
+                    .unwrap(),
+                    1
+                );
+                seen.push(row.id);
+            }
+            assert!(page_sizes.len() <= 3, "paging must terminate");
+        }
+        assert_eq!(page_sizes, vec![32, 32, 7]);
+        assert_eq!(seen, expected, "no row skipped and oldest-first order held");
+
+        // Original boundary, name, observation and tags survive the close.
+        for id in &expected {
+            let (old, _) = &before[id];
+            let (new, changed) = raw_state(&pool, *id).await;
+            assert_eq!(new.5, Some(old.4 + Duration::minutes(5)));
+            assert_eq!(
+                (&new.0, &new.1, new.2, new.3, new.4, new.6, &new.7),
+                (&old.0, &old.1, old.2, old.3, old.4, old.6, &old.7)
+            );
+            assert!(changed >= before[id].1);
+        }
+        for (id, state) in &untouched {
+            assert_eq!(&raw_state(&pool, *id).await, state);
+        }
+        assert_eq!(raw_state(&pool, other_member).await.0 .5, None);
+        assert_eq!(raw_state(&pool, other_guild).await.0 .5, None);
+        assert_eq!(row_count(&pool).await, rows_before);
+        // The other open rows are now the only ones left for their owners.
+        assert_eq!(
+            open_attendance_sessions(&pool, GUILD_B, MEMBER)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn malformed_stored_names_ids_and_tags_read_as_oversize_sentinels_not_truncations() {
+    with_database(|pool| async move {
+        let joined = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::hours(1);
+        let name = seed_member_row(&pool, GUILD_A, MEMBER, 1, joined, None).await;
+        let channel = seed_member_row(&pool, GUILD_A, MEMBER, 2, joined + Duration::seconds(1), None).await;
+        let many = seed_member_row(&pool, GUILD_A, MEMBER, 3, joined + Duration::seconds(2), None).await;
+        let wide = seed_member_row(&pool, GUILD_A, MEMBER, 4, joined + Duration::seconds(3), None).await;
+        sqlx::query("UPDATE event_voice_sessions SET channel_name = repeat('n', 2000000) WHERE id = $1")
+            .bind(name).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE event_voice_sessions SET channel_id = repeat('9', 400) WHERE id = $1")
+            .bind(channel).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE event_voice_sessions
+                     SET event_keys = (SELECT array_agg('k' || g) FROM generate_series(1, $2::int) g)
+                     WHERE id = $1")
+            .bind(many).bind(ATTENDANCE_MAX_WINDOWS as i32 + 1).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE event_voice_sessions
+                     SET event_keys = ARRAY[repeat('w', $2::int)] WHERE id = $1")
+            .bind(wide).bind(ATTENDANCE_MAX_TAG_BYTES as i32 * 4).execute(&pool).await.unwrap();
+
+        let rows = open_attendance_sessions(&pool, GUILD_A, MEMBER).await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![name, channel, many, wide]);
+        // Oversize name: a sentinel just past the limit, never a clipped prefix.
+        assert_eq!(rows[0].channel_name.len(), 4097);
+        assert_eq!(rows[1].channel_id.len(), 21);
+        // Too many tags: one over-budget sentinel tag replaces the array.
+        assert!(rows[2].event_keys.iter().map(String::len).sum::<usize>() > ATTENDANCE_MAX_TAG_BYTES);
+        // Too much tag text: refused by the same total whether or not stored compressed.
+        assert!(rows[3].event_keys.iter().map(String::len).sum::<usize>() > ATTENDANCE_MAX_TAG_BYTES);
+        // Well-formed neighbours are unaffected by the malformed rows.
+        assert_eq!(rows[0].event_keys, vec!["20000000000000001"]);
+
+        // Expansion still refuses stored oversize tags and leaves the row open.
+        for id in [many, wide] {
+            let before = raw_state(&pool, id).await;
+            assert!(close_attendance_session(&pool, id, joined + Duration::hours(1), Some("Lobby"), &["new-tag".into()])
+                .await
+                .is_err());
+            assert_eq!(raw_state(&pool, id).await, before);
+            assert_eq!(before.0 .5, None);
+        }
+        assert_eq!(open_attendance_sessions(&pool, GUILD_A, MEMBER).await.unwrap().len(), 4);
+        // Empty expansion finalizes by id without decoding/rewriting oversized
+        // metadata. It must drain, not permanently park the actor's inbox.
+        for id in [name, channel, many, wide] {
+            let (before, _) = raw_state(&pool, id).await;
+            let left = if id == channel { before.4 } else { joined + Duration::hours(1) };
+            assert_eq!(close_attendance_session(&pool, id, left, None, &[]).await.unwrap(), 1);
+            let (after, changed) = raw_state(&pool, id).await;
+            assert_eq!(after.5, Some(left));
+            assert_eq!(
+                (&after.0, &after.1, after.2, after.3, after.4, after.6, &after.7),
+                (&before.0, &before.1, before.2, before.3, before.4, before.6, &before.7)
+            );
+            assert_eq!(close_attendance_session(&pool, id, left, None, &[]).await.unwrap(), 0);
+            assert_eq!(raw_state(&pool, id).await, (after, changed));
+        }
+        assert!(open_attendance_sessions(&pool, GUILD_A, MEMBER).await.unwrap().is_empty());
+        assert_eq!(count(&pool, "event_attendance_windows").await, 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn oversize_insert_and_close_inputs_are_rejected_without_mutation() {
+    with_database(|pool| async move {
+        let now = OffsetDateTime::now_utc();
+        upsert_event(&pool, GUILD_A, &iso(now), &event(now))
+            .await
+            .unwrap();
+        map(&pool, GUILD_A, "game-night", EVENT_A).await;
+        let valid = session(now, &["game-night"]);
+
+        let mut too_many = valid.clone();
+        too_many.event_keys = (0..=ATTENDANCE_MAX_WINDOWS)
+            .map(|n| format!("k{n}"))
+            .collect();
+        let mut long_key = valid.clone();
+        long_key.event_keys = vec!["k".repeat(129)];
+        let mut long_name = valid.clone();
+        long_name.channel_name = "n".repeat(4097);
+        for bad in [too_many, long_key, long_name] {
+            assert!(insert_attendance_session(&pool, &bad).await.is_err());
+            assert_eq!(row_count(&pool).await, 0);
+            assert_eq!(count(&pool, "event_attendance_windows").await, 0);
+        }
+
+        // The same inputs at the bound are accepted.
+        let mut at_bound = valid.clone();
+        at_bound.channel_name = "n".repeat(4096);
+        let id = insert_attendance_session(&pool, &at_bound).await.unwrap();
+        assert_eq!(row_count(&pool).await, 1);
+        let windows = count(&pool, "event_attendance_windows").await;
+
+        // Oversize close input leaves the open row and history untouched.
+        let before = raw_state(&pool, id).await;
+        let many: Vec<String> = (0..=2 * ATTENDANCE_MAX_WINDOWS)
+            .map(|n| format!("k{n}"))
+            .collect();
+        let wide: Vec<String> = (0..3)
+            .map(|n| format!("{n}{}", "w".repeat(ATTENDANCE_MAX_TAG_BYTES * 2 / 3)))
+            .collect();
+        let long_name = "n".repeat(4097);
+        let left = now + Duration::minutes(1);
+        assert!(close_attendance_session(&pool, id, left, None, &many)
+            .await
+            .is_err());
+        assert!(close_attendance_session(&pool, id, left, None, &wide)
+            .await
+            .is_err());
+        assert!(
+            close_attendance_session(&pool, id, left, Some(long_name.as_str()), &[])
+                .await
+                .is_err()
+        );
+        assert_eq!(raw_state(&pool, id).await, before);
+        assert_eq!(before.0 .5, None);
+        assert_eq!(count(&pool, "event_attendance_windows").await, windows);
+        assert_eq!(row_count(&pool).await, 1);
     })
     .await;
 }

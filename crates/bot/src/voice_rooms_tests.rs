@@ -286,7 +286,17 @@ struct Store {
     attendance_recovery_rows: Mutex<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>>,
     attendance_recovery_closed: Mutex<Vec<i64>>,
     attendance_recovery_delay: Mutex<Option<Duration>>,
+    /// Open attendance rows the logger may finalize; a successful close
+    /// removes the row (and its recovery mirror), a failed one keeps it.
+    attendance_open: Mutex<Vec<AttendanceSession>>,
+    attendance_window_rows: Mutex<Vec<AttendanceWindow>>,
+    /// Every close attempt in order, failed ones included.
+    attendance_close_log: Mutex<Vec<AttendanceCloseAttempt>>,
+    attendance_close_errors: Mutex<VecDeque<StoreError>>,
+    attendance_inserts: Mutex<Vec<NewAttendanceSession>>,
 }
+
+type AttendanceCloseAttempt = (i64, OffsetDateTime, Option<String>, Vec<String>);
 
 impl Store {
     fn new(trace: Trace) -> Self {
@@ -348,11 +358,72 @@ impl Store {
             attendance_recovery_rows: Mutex::new(Vec::new()),
             attendance_recovery_closed: Mutex::new(Vec::new()),
             attendance_recovery_delay: Mutex::new(None),
+            attendance_open: Mutex::new(Vec::new()),
+            attendance_window_rows: Mutex::new(Vec::new()),
+            attendance_close_log: Mutex::new(Vec::new()),
+            attendance_close_errors: Mutex::new(VecDeque::new()),
+            attendance_inserts: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl RoomPersistence for Store {
+    async fn attendance_windows(&self, _: Snowflake) -> Result<Vec<AttendanceWindow>, StoreError> {
+        Ok(self.attendance_window_rows.lock().unwrap().clone())
+    }
+
+    async fn open_attendance_sessions(
+        &self,
+        _: Snowflake,
+        member: Snowflake,
+    ) -> Result<Vec<AttendanceSession>, StoreError> {
+        Ok(self
+            .attendance_open
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row.member_id == member.to_string())
+            .take(two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE)
+            .cloned()
+            .collect())
+    }
+
+    async fn insert_attendance_session(
+        &self,
+        new: NewAttendanceSession,
+    ) -> Result<i64, StoreError> {
+        let mut inserts = self.attendance_inserts.lock().unwrap();
+        inserts.push(new);
+        Ok(inserts.len() as i64)
+    }
+
+    async fn close_attendance_session(
+        &self,
+        id: i64,
+        left_at: OffsetDateTime,
+        channel_name: Option<String>,
+        event_keys: &[String],
+    ) -> Result<u64, StoreError> {
+        self.attendance_close_log.lock().unwrap().push((
+            id,
+            left_at,
+            channel_name,
+            event_keys.to_vec(),
+        ));
+        if let Some(error) = self.attendance_close_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        self.attendance_open
+            .lock()
+            .unwrap()
+            .retain(|row| row.id != id);
+        self.attendance_recovery_rows
+            .lock()
+            .unwrap()
+            .retain(|row| row.id != id);
+        Ok(1)
+    }
+
     async fn attendance_recovery_page(
         &self,
         _: Snowflake,
@@ -1823,6 +1894,194 @@ async fn attendance_dark_recovery_never_touches_the_store() {
         .lock()
         .unwrap()
         .is_empty());
+}
+
+/// Seed `count` open rows for `MEMBER` in `CREATOR` plus one window covering
+/// now, mirroring each row into the recovery page so a premature conservative
+/// recovery would be visible. Returns the observation instant to use.
+fn seed_open_attendance(store: &Store, count: i64) -> OffsetDateTime {
+    let now = OffsetDateTime::now_utc();
+    store
+        .attendance_window_rows
+        .lock()
+        .unwrap()
+        .push(AttendanceWindow {
+            event_key: "evt".to_owned(),
+            starts_at: now - time::Duration::hours(1),
+            ends_at: now + time::Duration::hours(1),
+        });
+    for id in 1..=count {
+        store
+            .attendance_open
+            .lock()
+            .unwrap()
+            .push(AttendanceSession {
+                id,
+                member_id: MEMBER.to_string(),
+                channel_id: CREATOR.to_string(),
+                channel_name: "lobby".to_owned(),
+                name_observed_at: now - time::Duration::seconds(30),
+                is_bot: false,
+                afk: false,
+                joined_at: now - time::Duration::seconds(30),
+                left_at: None,
+                event_keys: Vec::new(),
+            });
+        store
+            .attendance_recovery_rows
+            .lock()
+            .unwrap()
+            .push(recovery_row(id, MEMBER, CREATOR));
+    }
+    now
+}
+
+/// A move out of `CREATOR` observed at `observed_at`.
+fn attendance_move(observed_at: OffsetDateTime) -> crate::event_attendance::VoiceTransition {
+    crate::event_attendance::VoiceTransition {
+        guild: GUILD,
+        member: MEMBER,
+        previous: Some(CREATOR),
+        current: Some(CREATOR + 1),
+        is_bot: false,
+        afk_channel: None,
+        previous_name: Some("lobby".to_owned()),
+        current_name: Some("room".to_owned()),
+        observed_at,
+        enabled: true,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_pending_closes_block_capture_and_reads_until_continuation_finishes() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    // More open rows than one turn's close budget (8).
+    let observed_at = seed_open_attendance(&store, 9);
+    store.attendance_recovery_rows.lock().unwrap().clear();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    assert!(recovery.capture_allowed(&worker.live));
+    let read = authority.ticket(GUILD).expect("recovered before the frame");
+
+    recovery.record(&worker, attendance_move(observed_at)).await;
+    assert!(recovery.pending.is_some(), "ninth close is outstanding");
+    assert_eq!(worker.store.attendance_close_log.lock().unwrap().len(), 8);
+    assert!(
+        worker.store.attendance_inserts.lock().unwrap().is_empty(),
+        "no open passes an unfinished close"
+    );
+    assert!(!recovery.capture_allowed(&worker.live));
+    assert!(!read.is_current(), "old read ticket is revoked");
+    assert!(
+        authority.ticket(GUILD).is_none(),
+        "no new read while pending"
+    );
+
+    recovery.turn(&worker, true).await;
+    assert!(recovery.pending.is_none());
+    assert_eq!(worker.store.attendance_close_log.lock().unwrap().len(), 9);
+    assert!(worker.store.attendance_open.lock().unwrap().is_empty());
+    let inserts = worker.store.attendance_inserts.lock().unwrap();
+    assert_eq!(inserts.len(), 1, "open happens once, after the last close");
+    assert_eq!(inserts[0].channel_id, (CREATOR + 1).to_string());
+    assert_eq!(inserts[0].joined_at, observed_at);
+    drop(inserts);
+    assert!(recovery.capture_allowed(&worker.live));
+    assert!(authority
+        .ticket(GUILD)
+        .expect("readiness restored")
+        .is_current());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_close_error_retries_the_exact_close_before_any_open() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    let observed_at = seed_open_attendance(&store, 2);
+    store.attendance_recovery_rows.lock().unwrap().clear();
+    store
+        .attendance_close_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::Unavailable);
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    assert!(authority.ticket(GUILD).is_some());
+
+    recovery.record(&worker, attendance_move(observed_at)).await;
+    assert!(recovery.pending.is_some());
+    assert!(!recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_none());
+    assert_eq!(worker.store.attendance_close_log.lock().unwrap().len(), 1);
+    assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+    assert_eq!(worker.store.attendance_open.lock().unwrap().len(), 2);
+
+    recovery.turn(&worker, true).await;
+    let log = worker.store.attendance_close_log.lock().unwrap().clone();
+    assert_eq!(log.len(), 3, "failed close, its retry, then the second row");
+    assert_eq!(log[0], log[1], "retry keeps id, stamp, name and tags");
+    assert_eq!(log[0].0, 1);
+    assert_eq!(log[0].3, vec!["evt".to_owned()]);
+    assert_eq!(log[2].0, 2);
+    assert_eq!(log[2].1, log[0].1, "every close keeps the observed stamp");
+    assert!(recovery.pending.is_none());
+    assert_eq!(worker.store.attendance_inserts.lock().unwrap().len(), 1);
+    assert!(recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_gateway_change_while_pending_finishes_closes_but_never_opens() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    assert!(recovery.capture_allowed(&worker.live));
+    // Seeded after startup recovery and mirrored in the recovery page, so
+    // running conservative recovery before the continuation would zero row 9.
+    let observed_at = seed_open_attendance(&worker.store, 9);
+    recovery.record(&worker, attendance_move(observed_at)).await;
+    assert!(recovery.pending.is_some());
+    assert_eq!(worker.store.attendance_close_log.lock().unwrap().len(), 8);
+
+    worker.live.disconnect();
+    worker.live.publish(snapshot(&[], vec![]));
+    recovery.turn(&worker, true).await;
+    assert!(recovery.pending.is_none(), "last close still finishes");
+    let log = worker.store.attendance_close_log.lock().unwrap().clone();
+    assert_eq!(log.len(), 9);
+    assert_eq!(log[8].1, log[0].1, "observation is retained, not zeroed");
+    assert_eq!(log[8].3, vec!["evt".to_owned()]);
+    assert!(
+        worker.store.attendance_inserts.lock().unwrap().is_empty(),
+        "a changed gateway never opens after the closes"
+    );
+    assert!(
+        worker
+            .store
+            .attendance_recovery_closed
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "conservative recovery did not zero the pending row first"
+    );
+    assert!(
+        !recovery.capture_allowed(&worker.live),
+        "next recovery required"
+    );
+    assert!(authority.ticket(GUILD).is_none());
+
+    recovery.turn(&worker, true).await;
+    assert!(recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_some());
+    assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
 }
 
 /// `snapshot` re-keyed to `guild`: channel guild ids and the @everyone

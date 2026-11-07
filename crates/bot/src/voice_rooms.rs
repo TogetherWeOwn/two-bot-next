@@ -10465,6 +10465,7 @@ struct AttendanceRecovery {
     resetting: bool,
     capture_since: Option<OffsetDateTime>,
     fence: Option<crate::event_attendance::AttendanceRecoveryGuard>,
+    pending: Option<crate::event_attendance::AttendanceTransition>,
 }
 
 impl AttendanceRecovery {
@@ -10480,11 +10481,58 @@ impl AttendanceRecovery {
 
     fn capture_allowed(&mut self, live: &LiveGuild) -> bool {
         self.observe_generation(live);
-        live.read_state().ready && !self.resetting
+        live.read_state().ready && !self.resetting && self.pending.is_none()
     }
 
     fn transition_allowed(&mut self, live: &LiveGuild, observed_at: OffsetDateTime) -> bool {
         self.capture_allowed(live) && self.capture_since.is_some_and(|since| observed_at >= since)
+    }
+
+    async fn record<S: RoomPersistence, H: RoomWrites>(
+        &mut self,
+        worker: &GuildRoomWorker<S, H>,
+        transition: crate::event_attendance::VoiceTransition,
+    ) {
+        if !transition.enabled || transition.previous == transition.current {
+            return;
+        }
+        self.fence = Some(worker.live.attendance_reads.begin_recovery());
+        self.pending = Some(crate::event_attendance::AttendanceTransition::new(
+            transition,
+        ));
+        self.resume_pending(worker).await;
+    }
+
+    async fn resume_pending<S: RoomPersistence, H: RoomWrites>(
+        &mut self,
+        worker: &GuildRoomWorker<S, H>,
+    ) {
+        let generation = self.generation;
+        if let Some(pending) = &mut self.pending {
+            pending
+                .turn_if(&worker.store, || {
+                    let live = worker.live.read_state();
+                    live.ready && generation == Some(live.generation)
+                })
+                .await;
+        }
+        self.finish_pending(&worker.live);
+    }
+
+    fn finish_pending(&mut self, live: &LiveGuild) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.is_complete())
+        {
+            self.pending = None;
+            let state = live.read_state();
+            if state.ready && self.generation == Some(state.generation) {
+                if let Some(fence) = &self.fence {
+                    fence.complete();
+                }
+            }
+        }
     }
 
     async fn turn<S: RoomPersistence, H: RoomWrites>(
@@ -10493,6 +10541,13 @@ impl AttendanceRecovery {
         enabled: bool,
     ) {
         if !enabled {
+            return;
+        }
+        if self.pending.is_some() {
+            // Finish the original observed close before interruption cleanup
+            // can zero any of its rows. Never spend two attendance budgets in
+            // the same maintenance turn, even when the last close completes.
+            self.resume_pending(worker).await;
             return;
         }
         self.observe_generation(&worker.live);
@@ -10637,110 +10692,54 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             }
         })
     };
-    // Commands buffered while the worker loaded (initialization retry)
-    // apply first, in arrival order, under the same read-through and
-    // apply path as inbox commands; stale joins are refused by the usual
-    // ticket guards inside `apply_command`.
-    for command in initial {
-        let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        if let ActorCommand::Join { ticket, .. } = &command {
-            worker.revalidate_creator(ticket.creator_id).await;
-        }
-        if let ActorCommand::EventVoicePresence {
-            member_id,
-            previous,
-            current,
-            is_bot,
-            afk_channel,
-            observed_at,
-        } = &command
-        {
-            crate::event_voice_channels::record_transition(
-                &worker.store,
-                worker.live.guild_id,
-                *member_id,
-                *previous,
-                *current,
-            )
-            .await;
-            // Attendance sessions persist on the same transition, after the
-            // event-voice write: names resolve from the actor's latest live
-            // view so renames converge at close time.
-            let (previous_name, current_name) = {
-                let live = worker.live.read_state();
-                (
-                    previous
-                        .and_then(|id| live.channels.get(&id).and_then(|room| room.name.clone())),
-                    current
-                        .and_then(|id| live.channels.get(&id).and_then(|room| room.name.clone())),
-                )
-            };
-            if !attendance_recovery.capture_allowed(&worker.live) {
-                attendance_recovery
-                    .turn(worker, crate::event_attendance::logger_enabled())
-                    .await;
-            }
-            crate::event_attendance::record_transition(
-                &worker.store,
-                crate::event_attendance::VoiceTransition {
-                    guild: worker.live.guild_id,
-                    member: *member_id,
-                    previous: *previous,
-                    current: *current,
-                    is_bot: *is_bot,
-                    afk_channel: *afk_channel,
-                    observed_at: *observed_at,
-                    previous_name,
-                    current_name,
-                    enabled: crate::event_attendance::logger_enabled()
-                        && attendance_recovery.transition_allowed(&worker.live, *observed_at),
-                },
-            )
-            .await;
-        }
-        let accepted = apply_command(worker, command, now_ms, backpressure);
-        // An Ownership command stages its reply on the durable commit;
-        // drive it before the next command so replies stay ordered.
-        worker.drive_staged_ownership(now_ms).await;
-        metrics::global().voice_actor_inbox_turn();
-        if accepted {
-            last_progress = tokio::time::Instant::now();
-        }
-        dispatch_ready |= accepted;
-    }
-    // Snapshot occupants never sent a transition (`publish_snapshot` only
-    // sends `Reconcile`): flush them join-only so a member already sitting
-    // in a bound event channel owns an open span. Collected before any
-    // await so no live-state lock crosses a store write; the helper caps
-    // the whole flush at one total budget and the 60s repair picks up any
-    // occupants skipped past it.
-    let snapshot_occupants: Vec<(Snowflake, Snowflake)> = {
-        let live = worker.live.read_state();
-        live.members
-            .iter()
-            .filter_map(|(member_id, member)| {
-                member.channel_id.map(|channel| (*member_id, channel))
-            })
-            .collect()
-    };
-    let _ = crate::event_voice_channels::flush_bootstrap_presence(
-        &worker.store,
-        worker.live.guild_id,
-        &snapshot_occupants,
-    )
-    .await;
+    let mut initial = initial;
+    let mut bootstrap_pending = true;
     stall.snapshot(worker, last_progress);
     loop {
         tokio::select! {
             biased;
+            _ = std::future::ready(()), if bootstrap_pending && initial.is_empty() => {
+                bootstrap_pending = false;
+                // Snapshot occupants never sent a transition (`publish_snapshot` only
+                // sends `Reconcile`): flush them join-only so a member already sitting
+                // in a bound event channel owns an open span. Collected before any
+                // await so no live-state lock crosses a store write; the helper caps
+                // the whole flush at one total budget and the 60s repair picks up any
+                // occupants skipped past it.
+                let snapshot_occupants: Vec<(Snowflake, Snowflake)> = {
+                    let live = worker.live.read_state();
+                    live.members
+                        .iter()
+                        .filter_map(|(member_id, member)| {
+                            member.channel_id.map(|channel| (*member_id, channel))
+                        })
+                        .collect()
+                };
+                let _ = crate::event_voice_channels::flush_bootstrap_presence(
+                    &worker.store,
+                    worker.live.guild_id,
+                    &snapshot_occupants,
+                )
+                .await;
+            }
             // Fair scheduling: park the inbox once the consecutive-turn
             // bound is reached so a ready dispatch, timer or maintenance
             // branch runs instead. The count resets on any timer or
             // maintenance turn, or on a no-op dispatch with none due; a
             // progressing dispatch keeps the park (see below).
-            command = inbox.recv(), if consecutive_inbox_turns < VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS => {
-                let Some(command) = command else { break };
-                backpressure.release_for(&command);
+            command = async {
+                if let Some(command) = initial.pop_front() {
+                    Some((command, false))
+                } else {
+                    inbox.recv().await.map(|command| (command, true))
+                }
+            }, if consecutive_inbox_turns < VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS
+                && attendance_recovery.pending.is_none() => {
+                let Some((command, release)) = command else { break };
+                // Initialization already released its inbox accounting.
+                if release {
+                    backpressure.release_for(&command);
+                }
                 let now_ms = start
                     .elapsed()
                     .as_millis()
@@ -10784,11 +10783,10 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                             }),
                         )
                     };
-                    if !attendance_recovery.capture_allowed(&worker.live) {
-                        attendance_recovery.turn(worker, crate::event_attendance::logger_enabled()).await;
-                    }
-                    crate::event_attendance::record_transition(
-                        &worker.store,
+                    let enabled = crate::event_attendance::logger_enabled()
+                        && attendance_recovery.transition_allowed(&worker.live, *observed_at);
+                    attendance_recovery.record(
+                        worker,
                         crate::event_attendance::VoiceTransition {
                             guild: worker.live.guild_id,
                             member: *member_id,
@@ -10799,8 +10797,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                             observed_at: *observed_at,
                             previous_name,
                             current_name,
-                            enabled: crate::event_attendance::logger_enabled()
-                        && attendance_recovery.transition_allowed(&worker.live, *observed_at),
+                            enabled,
                         },
                     )
                     .await;

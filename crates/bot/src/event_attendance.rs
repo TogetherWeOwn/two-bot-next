@@ -16,14 +16,14 @@
 //! their minutes, and `final` false until the window plus grace has passed.
 //!
 //! Hook discipline mirrors `crate::event_voice_channels`: the guild actor
-//! loop calls [`record_transition`] serially per transition (ordering
-//! preserved), each statement bounded by `REVALIDATE_TIMEOUT_MS` so a slow
-//! store cannot hold room handling. Failures and timeouts are debug-logged
+//! loop owns one [`AttendanceTransition`] at a time (ordering preserved),
+//! with one total deadline and close-work bound per turn so a
+//! slow store cannot monopolize room dispatch. Failures and timeouts are debug-logged
 //! with the guild only — no member or channel ids on this warm path, per
 //! docs/log-volume-guard.md — and never fail the actor loop. A missed open
-//! stays missed (the documented join-before-window gap); a missed close
-//! finalizes on the member's next transition, clamped so a stale row can
-//! never tag a later event (see `plan_transition`).
+//! stays missed (the documented join-before-window gap); unfinished closes
+//! retain their original evidence across bounded maintenance turns. Later
+//! frames wait in the bounded actor inbox; no open passes unfinished closes.
 //!
 //! Contract v2 §9 opt-out at capture: before opening a span the logger
 //! consults `privacy_opt_outs` (`suppressed_in`) and
@@ -32,7 +32,7 @@
 //! anonymised in it. Closes still finalize so no open row leaks; gate read
 //! failures fail closed by dropping the open.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -43,10 +43,7 @@ use two_bot_cutover::event_attendance::{
     AttendanceSession, AttendanceWindow, NewAttendanceSession,
 };
 
-/// Inbox-protection bound for each attendance statement, mirroring
-/// `voice_rooms::REVALIDATE_TIMEOUT_MS`: a slow statement must not hold room
-/// handling. Duplicated — not imported — so this module stays independent of
-/// the room actor.
+/// Total attendance work deadline per actor turn, including every store await.
 const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
 
 /// Per-process guild fences shared by gateway actors and signed reads. An
@@ -407,235 +404,275 @@ pub struct VoiceTransition {
     pub enabled: bool,
 }
 
-/// Record one voice-channel transition (join, leave or move) as attendance
-/// sessions. Called by the guild actor loop before room handling; each
-/// statement is bounded by `REVALIDATE_TIMEOUT_MS` (the same inbox-protection
-/// bound as creator revalidation) so a slow statement cannot hold room
-/// handling. Never fails the actor loop.
-pub async fn record_transition(store: &impl AttendanceStore, transition: VoiceTransition) {
-    let VoiceTransition {
-        guild,
-        member,
-        previous,
-        current,
-        is_bot,
-        afk_channel,
-        previous_name,
-        current_name,
-        observed_at,
-        enabled,
-    } = transition;
-    if !enabled || previous == current {
-        return;
+/// Maximum close attempts per actor turn, independent of statement latency.
+const CLOSES_PER_TURN: usize = 8;
+
+/// Bounded finalization continuation owned by the guild actor. It retains the
+/// original observation, names, candidate windows and any uncertain close plan.
+/// No new open is attempted until every old row is finalized. The actor keeps
+/// later frames in its existing bounded inbox while maintenance drains pages;
+/// room dispatch and timers continue between turns.
+pub struct AttendanceTransition {
+    transition: VoiceTransition,
+    windows: Option<Vec<AttendanceWindowMs>>,
+    closes: VecDeque<(ClosePlan, Option<String>)>,
+    rows_exhausted: bool,
+    allow_open: bool,
+    complete: bool,
+}
+
+impl AttendanceTransition {
+    /// Retain original transition evidence before the first cancellable await.
+    pub fn new(mut transition: VoiceTransition) -> Self {
+        // Discord names are bounded, but alternate callers must not retain
+        // unbounded text in the continuation. Unavailable metadata preserves
+        // the stored name rather than replacing it with a truncated value.
+        if transition
+            .previous_name
+            .as_ref()
+            .is_some_and(|name| name.len() > 4096)
+        {
+            transition.previous_name = None;
+        }
+        let allow_open = !transition
+            .current_name
+            .as_ref()
+            .is_some_and(|name| name.len() > 4096);
+        if !allow_open {
+            transition.current_name = None;
+        }
+        let complete = !transition.enabled || transition.previous == transition.current;
+        Self {
+            transition,
+            windows: None,
+            closes: VecDeque::new(),
+            rows_exhausted: false,
+            allow_open,
+            complete,
+        }
     }
-    let windows = match tokio::time::timeout(
-        std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS),
-        store.attendance_windows(guild),
-    )
-    .await
-    {
-        Ok(Ok(windows)) => windows,
-        Ok(Err(error)) => {
-            tracing::debug!(
-                guild = guild.to_string(),
-                error = %error,
-                "attendance windows read failed; transition skipped"
-            );
-            return;
-        }
-        Err(_) => {
-            tracing::debug!(
-                guild = guild.to_string(),
-                "attendance windows read timed out; transition skipped"
-            );
-            return;
-        }
-    };
-    let window_ms: Vec<AttendanceWindowMs> = windows
-        .iter()
-        .map(|window| AttendanceWindowMs {
-            event_key: window.event_key.clone(),
-            starts_ms: millis_of(window.starts_at),
-            ends_ms: millis_of(window.ends_at),
-        })
-        .collect();
-    let open_rows = match tokio::time::timeout(
-        std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS),
-        store.open_attendance_sessions(guild, member),
-    )
-    .await
-    {
-        Ok(Ok(rows)) => rows,
-        Ok(Err(error)) => {
-            tracing::debug!(
-                guild = guild.to_string(),
-                error = %error,
-                "attendance open rows read failed; transition skipped"
-            );
-            return;
-        }
-        Err(_) => {
-            tracing::debug!(
-                guild = guild.to_string(),
-                "attendance open rows read timed out; transition skipped"
-            );
-            return;
-        }
-    };
-    let rows: Vec<OpenRow> = open_rows
-        .iter()
-        .map(|row| OpenRow {
-            id: row.id,
-            channel_id: row.channel_id.parse::<Snowflake>().ok(),
-            joined_ms: millis_of(row.joined_at),
-            event_keys: row.event_keys.clone(),
-        })
-        .collect();
-    let now = observed_at;
-    let mut plan = plan_transition(&window_ms, &rows, previous, current, millis_of(now));
-    // Late opens fail closed: persist no replay/backfill after a minute or from
-    // a future clock. Closes retain their observed boundary even when delayed.
-    let age = OffsetDateTime::now_utc() - observed_at;
-    if age < time::Duration::ZERO || age > time::Duration::minutes(1) {
-        plan.open = None;
+
+    /// Whether the transition needs another bounded maintenance turn.
+    pub fn is_complete(&self) -> bool {
+        self.complete
     }
-    // Contract v2 §9 opt-out at capture: a suppressed member, or a guild
-    // with `voice_enabled = off`, opens no span — absent from the record,
-    // not anonymised in it. Checked only when an open is planned, so leaves
-    // and out-of-window transitions cost no extra read. Closes still
-    // finalize (no leaked open rows); failures and timeouts fail closed by
-    // dropping the open. Guild only in the warm-path logs, per
-    // docs/log-volume-guard.md.
-    if plan.open.is_some() {
-        let voice_on = tokio::time::timeout(
+
+    /// Resume under one deadline covering all reads, gates and writes. A close
+    /// advances only on a successful response; cancellation retries the exact
+    /// same id/boundary/tags, including after an uncertain commit.
+    pub async fn turn(&mut self, store: &impl AttendanceStore) {
+        self.turn_if(store, || true).await;
+    }
+
+    /// Revalidate live actor/gateway authority immediately before an open.
+    /// Closes retain their evidence even when that authority has been revoked.
+    pub(crate) async fn turn_if(
+        &mut self,
+        store: &impl AttendanceStore,
+        may_open: impl Fn() -> bool,
+    ) {
+        if self.complete {
+            return;
+        }
+        let result = tokio::time::timeout(
             std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS),
-            store.is_attendance_voice_enabled(guild),
+            self.advance(store, may_open),
         )
         .await;
-        let voice_off = match voice_on {
-            Ok(Ok(enabled)) => !enabled,
-            Ok(Err(error)) => {
-                tracing::debug!(
-                    guild = guild.to_string(),
-                    error = %error,
-                    "attendance voice gate read failed; open dropped"
-                );
-                true
-            }
-            Err(_) => {
-                tracing::debug!(
-                    guild = guild.to_string(),
-                    "attendance voice gate read timed out; open dropped"
-                );
-                true
-            }
+        if !matches!(result, Ok(Ok(()))) {
+            tracing::debug!(
+                guild = self.transition.guild.to_string(),
+                "attendance transition deferred"
+            );
+        }
+    }
+
+    async fn advance(
+        &mut self,
+        store: &impl AttendanceStore,
+        may_open: impl Fn() -> bool,
+    ) -> Result<(), ()> {
+        use two_bot_cutover::event_attendance::{
+            ATTENDANCE_MAX_TAG_BYTES, ATTENDANCE_MAX_WINDOWS, ATTENDANCE_RECOVERY_PAGE_SIZE,
         };
-        let suppressed = if voice_off {
-            false
-        } else {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS),
-                store.is_attendance_suppressed(guild, member),
-            )
+        let t = &self.transition;
+        if self.windows.is_none() {
+            let windows = store.attendance_windows(t.guild).await.map_err(|_| ())?;
+            // Alternate stores must obey the same bounds as the SQL adapter.
+            // An oversized candidate set grants no new tags or opens; existing
+            // tags and the observed close boundary are still finalized.
+            let bounded = windows.len() <= ATTENDANCE_MAX_WINDOWS
+                && windows.iter().all(|w| w.event_key.len() <= 128);
+            self.allow_open &= bounded;
+            self.windows = Some(if bounded {
+                windows
+                    .into_iter()
+                    .map(|w| AttendanceWindowMs {
+                        event_key: w.event_key,
+                        starts_ms: millis_of(w.starts_at),
+                        ends_ms: millis_of(w.ends_at),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            });
+        }
+        if self.closes.is_empty() && !self.rows_exhausted {
+            let rows = store
+                .open_attendance_sessions(t.guild, t.member)
+                .await
+                .map_err(|_| ())?;
+            if rows.len() > ATTENDANCE_RECOVERY_PAGE_SIZE {
+                return Err(());
+            }
+            let bounded: Vec<bool> = rows
+                .iter()
+                .map(|r| {
+                    r.event_keys.len() <= ATTENDANCE_MAX_WINDOWS
+                        && r.event_keys.iter().map(String::len).sum::<usize>()
+                            <= ATTENDANCE_MAX_TAG_BYTES
+                        && r.channel_name.len() <= 4096
+                        && r.channel_id.len() <= 20
+                        && r.member_id.len() <= 20
+                })
+                .collect();
+            self.allow_open &= bounded.iter().all(|bounded| *bounded);
+            self.rows_exhausted = rows.len() < ATTENDANCE_RECOVERY_PAGE_SIZE;
+            let open_rows: Vec<_> = rows
+                .iter()
+                .zip(&bounded)
+                .map(|(r, bounded)| OpenRow {
+                    id: r.id,
+                    channel_id: (r.channel_id.len() <= 20)
+                        .then(|| r.channel_id.parse().ok())
+                        .flatten(),
+                    joined_ms: millis_of(r.joined_at),
+                    event_keys: if *bounded {
+                        r.event_keys.clone()
+                    } else {
+                        Vec::new()
+                    },
+                })
+                .collect();
+            let plan = plan_transition(
+                self.windows.as_deref().unwrap_or_default(),
+                &open_rows,
+                t.previous,
+                t.current,
+                millis_of(t.observed_at),
+            );
+            self.closes = plan
+                .closes
+                .into_iter()
+                .zip(open_rows)
+                .zip(bounded)
+                .map(|((mut close, row), bounded)| {
+                    if !bounded {
+                        // Empty expansion means finalize by id, preserving the
+                        // original metadata server-side instead of sentinel text.
+                        close.tag_union.clear();
+                        return (close, None);
+                    }
+                    let name = (row.channel_id.is_some() && row.channel_id == t.previous)
+                        .then(|| t.previous_name.clone())
+                        .flatten();
+                    (close, name)
+                })
+                .collect();
+        }
+        for _ in 0..CLOSES_PER_TURN {
+            let Some((close, name)) = self.closes.front() else {
+                break;
+            };
+            store
+                .close_attendance_session(
+                    close.id,
+                    datetime_of(close.left_ms),
+                    name.clone(),
+                    &close.tag_union,
+                )
+                .await
+                .map_err(|_| ())?;
+            self.closes.pop_front();
+        }
+        if !self.closes.is_empty() || !self.rows_exhausted {
+            return Ok(());
+        }
+        let age = OffsetDateTime::now_utc() - t.observed_at;
+        let tags = plan_transition(
+            self.windows.as_deref().unwrap_or_default(),
+            &[],
+            t.previous,
+            t.current,
+            millis_of(t.observed_at),
+        )
+        .open
+        .map(|open| open.tags)
+        .unwrap_or_default();
+        if !self.allow_open
+            || t.current.is_none()
+            || tags.is_empty()
+            || age < time::Duration::ZERO
+            || age > time::Duration::minutes(1)
+        {
+            self.complete = true;
+            return Ok(());
+        }
+        // The write boundary repeats these checks under the actual privacy and
+        // lifecycle locks. An unavailable gate drops the open, never a close.
+        // Mark complete before awaiting gates/insert: a timeout here must not
+        // turn a missed open into a retry or duplicate an uncertain insert.
+        self.complete = true;
+        let voice = store
+            .is_attendance_voice_enabled(t.guild)
             .await
-            {
-                Ok(Ok(hit)) => hit,
-                Ok(Err(error)) => {
-                    tracing::debug!(
-                        guild = guild.to_string(),
-                        error = %error,
-                        "attendance suppression read failed; open dropped"
-                    );
-                    true
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        guild = guild.to_string(),
-                        "attendance suppression read timed out; open dropped"
-                    );
-                    true
-                }
-            }
+            .unwrap_or(false);
+        let suppressed = if voice {
+            store
+                .is_attendance_suppressed(t.guild, t.member)
+                .await
+                .unwrap_or(true)
+        } else {
+            true
         };
-        if voice_off || suppressed {
-            plan.open = None;
+        let age = OffsetDateTime::now_utc() - t.observed_at;
+        if !voice
+            || suppressed
+            || !may_open()
+            || age < time::Duration::ZERO
+            || age > time::Duration::minutes(1)
+        {
+            return Ok(());
         }
-    }
-    if plan.closes.is_empty() && plan.open.is_none() {
-        return;
-    }
-    for close in &plan.closes {
-        // The closed row keeps the latest name the logger saw: the live
-        // name when the row's channel is the transition's previous channel
-        // (rename convergence), the stored name otherwise.
-        let live_match = rows
-            .iter()
-            .find(|row| row.id == close.id)
-            .and_then(|row| row.channel_id)
-            .zip(previous)
-            .is_some_and(|(channel, previous)| channel == previous);
-        // None preserves both the known name and its observation stamp in SQL;
-        // reusing stored text is not a new observation of that channel.
-        let name = live_match.then(|| previous_name.clone()).flatten();
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS),
-            store.close_attendance_session(
-                close.id,
-                datetime_of(close.left_ms),
-                name,
-                &close.tag_union,
-            ),
-        )
-        .await;
-        match outcome {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                tracing::debug!(
-                    guild = guild.to_string(),
-                    error = %error,
-                    "attendance close write failed; the next transition finalizes it"
-                );
-            }
-            Err(_) => {
-                tracing::debug!(
-                    guild = guild.to_string(),
-                    "attendance close write timed out; the next transition finalizes it"
-                );
-            }
+        if let Some(channel) = t.current {
+            // An uncertain insert is never retried: missed opens stay missed.
+            let _ = store
+                .insert_attendance_session(NewAttendanceSession {
+                    guild_id: t.guild.to_string(),
+                    member_id: t.member.to_string(),
+                    channel_id: channel.to_string(),
+                    channel_name: t.current_name.clone().unwrap_or_default(),
+                    is_bot: t.is_bot,
+                    afk: t.afk_channel == Some(channel),
+                    joined_at: t.observed_at,
+                    event_keys: tags,
+                })
+                .await;
         }
+        Ok(())
     }
-    if let (Some(channel), Some(open)) = (current, &plan.open) {
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS),
-            store.insert_attendance_session(NewAttendanceSession {
-                guild_id: guild.to_string(),
-                member_id: member.to_string(),
-                channel_id: channel.to_string(),
-                channel_name: current_name.unwrap_or_default(),
-                is_bot,
-                afk: afk_channel.is_some_and(|afk| afk == channel),
-                joined_at: now,
-                event_keys: open.tags.clone(),
-            }),
-        )
-        .await;
-        match outcome {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                tracing::debug!(
-                    guild = guild.to_string(),
-                    error = %error,
-                    "attendance open write failed; the session stays unlogged"
-                );
-            }
-            Err(_) => {
-                tracing::debug!(
-                    guild = guild.to_string(),
-                    "attendance open write timed out; the session stays unlogged"
-                );
-            }
-        }
-    }
+}
+
+/// Start one transition and return its continuation, even on a timeout. The
+/// caller must retain unfinished work and resume it before consuming later
+/// attendance frames. Flag-off and same-channel frames touch no store.
+pub async fn record_transition(
+    store: &impl AttendanceStore,
+    transition: VoiceTransition,
+) -> AttendanceTransition {
+    let mut work = AttendanceTransition::new(transition);
+    work.turn(store).await;
+    work
 }
 
 /// Epoch millis of an instant. Public: the binary-only read verb builds its
@@ -1581,6 +1618,8 @@ mod tests {
         Fail,
         /// Never resolves, so the statement bound must fire.
         Hang,
+        /// A statement consumes most of the shared deadline.
+        Delay,
     }
 
     /// What the logger wrote through a `FaultStore`.
@@ -1589,6 +1628,7 @@ mod tests {
         calls: Vec<&'static str>,
         closes: Vec<(i64, OffsetDateTime, String, Vec<String>)>,
         inserts: Vec<NewAttendanceSession>,
+        closed: std::collections::HashSet<i64>,
     }
 
     /// Fake store with a per-statement fault, configurable windows and open
@@ -1655,6 +1695,10 @@ mod tests {
                 Fault::Pass => Ok(value),
                 Fault::Fail => Err("store down".to_owned()),
                 Fault::Hang => std::future::pending().await,
+                Fault::Delay => {
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                    Ok(value)
+                }
             }
         }
     }
@@ -1676,7 +1720,16 @@ mod tests {
             _member: Snowflake,
         ) -> Result<Vec<AttendanceSession>, Self::Error> {
             self.note("open_rows");
-            Self::apply(self.open_fault, self.open_rows.clone()).await
+            let rows = {
+                let writes = self.writes.lock().expect("writes lock");
+                self.open_rows
+                    .iter()
+                    .filter(|row| !writes.closed.contains(&row.id))
+                    .take(two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE)
+                    .cloned()
+                    .collect()
+            };
+            Self::apply(self.open_fault, rows).await
         }
 
         async fn insert_attendance_session(
@@ -1708,7 +1761,11 @@ mod tests {
                 }),
                 event_keys.to_vec(),
             ));
-            Self::apply(self.close_fault, 1).await
+            let result = Self::apply(self.close_fault, 1).await;
+            if result.is_ok() {
+                self.writes.lock().expect("writes lock").closed.insert(id);
+            }
+            result
         }
 
         async fn attendance_sessions_for_event_key(
@@ -1936,7 +1993,7 @@ mod tests {
         // The open is dropped fail-closed, but the old row is finalized.
         assert_eq!(
             store.calls(),
-            vec!["windows", "open_rows", "voice", "close"]
+            vec!["windows", "open_rows", "close", "voice"]
         );
     }
 
@@ -2031,9 +2088,9 @@ mod tests {
             vec![
                 "windows",
                 "open_rows",
+                "close",
                 "voice",
                 "suppressed",
-                "close",
                 "insert"
             ]
         );
@@ -2080,23 +2137,243 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_error_does_not_block_the_new_open() {
+    async fn close_error_blocks_open_and_retries_original_evidence() {
         let mut store = FaultStore::new().with_open_row("7", "lobby");
         store.close_fault = Fault::Fail;
-        record_transition(&store, move_transition()).await;
+        let mut pending = record_transition(&store, move_transition()).await;
+        assert!(!pending.is_complete());
+        {
+            let writes = store.writes.lock().expect("writes lock");
+            assert_eq!(writes.closes.len(), 1);
+            assert!(writes.inserts.is_empty());
+        }
+        store.close_fault = Fault::Pass;
+        pending.turn(&store).await;
+        assert!(pending.is_complete());
         let writes = store.writes.lock().expect("writes lock");
-        assert_eq!(writes.closes.len(), 1);
+        assert_eq!(writes.closes.len(), 2);
+        assert_eq!(writes.closes[0], writes.closes[1]);
         assert_eq!(writes.inserts.len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn close_timeout_does_not_block_the_new_open() {
+    async fn close_timeout_blocks_open_with_one_total_deadline() {
         let mut store = FaultStore::new().with_open_row("7", "lobby");
         store.close_fault = Fault::Hang;
-        record_transition(&store, move_transition()).await;
+        let start = tokio::time::Instant::now();
+        let mut pending = record_transition(&store, move_transition()).await;
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS)
+        );
+        assert!(!pending.is_complete());
+        {
+            let writes = store.writes.lock().expect("writes lock");
+            assert_eq!(writes.closes.len(), 1);
+            assert!(writes.inserts.is_empty());
+        }
+        store.close_fault = Fault::Pass;
+        pending.turn(&store).await;
+        assert!(pending.is_complete());
         let writes = store.writes.lock().expect("writes lock");
-        assert_eq!(writes.closes.len(), 1);
+        assert_eq!(writes.closes[0], writes.closes[1]);
         assert_eq!(writes.inserts.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multiple_slow_reads_share_the_same_deadline() {
+        let mut store = FaultStore::new();
+        store.windows_fault = Fault::Delay;
+        store.open_fault = Fault::Delay;
+        let start = tokio::time::Instant::now();
+        let mut pending = record_transition(&store, join_transition()).await;
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS)
+        );
+        assert!(!pending.is_complete());
+        assert_eq!(store.calls(), ["windows", "open_rows"]);
+        assert!(store.writes.lock().unwrap().inserts.is_empty());
+        store.open_fault = Fault::Pass;
+        pending.turn(&store).await;
+        assert!(pending.is_complete());
+        assert_eq!(
+            store
+                .calls()
+                .iter()
+                .filter(|call| **call == "windows")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn many_unfinished_rows_drain_in_bounded_turns_before_open() {
+        let mut store = FaultStore::new().with_open_row("7", "lobby");
+        let template = store.open_rows[0].clone();
+        store.open_rows = (1..=100)
+            .map(|id| AttendanceSession {
+                id,
+                ..template.clone()
+            })
+            .collect();
+        let observed_at = OffsetDateTime::now_utc();
+        let mut pending = record_transition(
+            &store,
+            VoiceTransition {
+                observed_at,
+                ..move_transition()
+            },
+        )
+        .await;
+        assert_eq!(store.writes.lock().unwrap().closes.len(), CLOSES_PER_TURN);
+        assert!(!pending.is_complete());
+        let mut turns = 1;
+        while !pending.is_complete() {
+            assert!(turns < 20, "bounded pages must eventually drain");
+            let before = store.writes.lock().unwrap().closes.len();
+            assert!(store.writes.lock().unwrap().inserts.is_empty());
+            pending.turn(&store).await;
+            assert!(store.writes.lock().unwrap().closes.len() - before <= CLOSES_PER_TURN);
+            turns += 1;
+        }
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.closes.len(), 100);
+        assert_eq!(writes.closed.len(), 100);
+        assert!(writes
+            .closes
+            .iter()
+            .all(
+                |(_, at, name, tags)| millis_of(*at) == millis_of(observed_at)
+                    && name == "lobby-renamed"
+                    && tags == &["game-night"]
+            ));
+        assert_eq!(writes.inserts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_candidates_finalize_existing_tags_without_open() {
+        let mut store = FaultStore::new().with_open_row("7", "lobby");
+        store.windows = vec![store.windows[0].clone(); 129];
+        let pending = record_transition(&store, move_transition()).await;
+        assert!(pending.is_complete());
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.closes.len(), 1);
+        assert_eq!(writes.closes[0].3, ["game-night"]);
+        assert!(writes.inserts.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn many_slow_closes_share_deadline_and_retry_only_unfinished_row() {
+        let mut store = FaultStore::new().with_open_row("7", "lobby");
+        let template = store.open_rows[0].clone();
+        store.open_rows = (1..=100)
+            .map(|id| AttendanceSession {
+                id,
+                ..template.clone()
+            })
+            .collect();
+        store.close_fault = Fault::Delay;
+        let started = tokio::time::Instant::now();
+        let mut pending = record_transition(&store, move_transition()).await;
+        assert_eq!(
+            started.elapsed(),
+            std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS)
+        );
+        assert!(!pending.is_complete());
+        {
+            let writes = store.writes.lock().unwrap();
+            assert_eq!(writes.closed.len(), 1);
+            assert_eq!(writes.closes.len(), 2);
+            assert_eq!(writes.closes[1].0, 2);
+            assert!(writes.inserts.is_empty());
+        }
+        store.close_fault = Fault::Pass;
+        pending.turn(&store).await;
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.closes.len(), 2 + CLOSES_PER_TURN);
+        assert_eq!(writes.closes[1], writes.closes[2]);
+        assert_eq!(writes.closes.iter().filter(|close| close.0 == 1).count(), 1);
+        assert!(writes.inserts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversize_live_metadata_never_retains_unbounded_text_or_opens() {
+        let store = FaultStore::new().with_open_row("7", "known-name");
+        let pending = record_transition(
+            &store,
+            VoiceTransition {
+                previous_name: Some("p".repeat(4097)),
+                current_name: Some("c".repeat(4097)),
+                ..move_transition()
+            },
+        )
+        .await;
+        assert!(pending.is_complete());
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.closes.len(), 1);
+        assert_eq!(writes.closes[0].2, "known-name");
+        assert!(writes.inserts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_stored_row_keeps_original_evidence_and_never_opens() {
+        let mut store = FaultStore::new().with_open_row("7", "known-name");
+        let template = store.open_rows[0].clone();
+        store.open_rows = (1..=40)
+            .map(|id| AttendanceSession {
+                id,
+                ..template.clone()
+            })
+            .collect();
+        store.open_rows[0].event_keys = vec!["k".repeat(16385)];
+        store.open_rows[1].channel_id = "x".repeat(21);
+        store.open_rows[2].channel_name = "n".repeat(4097);
+        let observed_at = OffsetDateTime::now_utc();
+        let mut pending = record_transition(
+            &store,
+            VoiceTransition {
+                observed_at,
+                ..move_transition()
+            },
+        )
+        .await;
+        for _ in 0..8 {
+            if pending.is_complete() {
+                break;
+            }
+            let before = store.writes.lock().unwrap().closes.len();
+            pending.turn(&store).await;
+            assert!(store.writes.lock().unwrap().closes.len() - before <= CLOSES_PER_TURN);
+            assert!(store.writes.lock().unwrap().inserts.is_empty());
+        }
+        assert!(
+            pending.is_complete(),
+            "malformed rows cannot permanently park the inbox"
+        );
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.closed.len(), 40);
+        assert_eq!(writes.closes.len(), 40);
+        assert_eq!(millis_of(writes.closes[0].1), millis_of(observed_at));
+        assert_eq!(millis_of(writes.closes[1].1), millis_of(template.joined_at));
+        assert!(writes.closes[..3].iter().all(|close| close.3.is_empty()));
+        assert_eq!(writes.closes[0].2, "known-name");
+        assert_eq!(writes.closes[2].2.len(), 4097);
+        assert!(
+            writes.inserts.is_empty(),
+            "later well-formed pages cannot re-enable opens"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_gateway_at_open_boundary_keeps_close_but_drops_open() {
+        let store = FaultStore::new().with_open_row("7", "lobby");
+        let mut pending = AttendanceTransition::new(move_transition());
+        pending.turn_if(&store, || false).await;
+        assert!(pending.is_complete());
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.closes.len(), 1);
+        assert!(writes.inserts.is_empty());
     }
 
     #[tokio::test]
