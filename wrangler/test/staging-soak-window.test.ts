@@ -259,7 +259,7 @@ test("emitted soak events carry only fixed fields and never the token or URL", a
   }
   const serialized = JSON.stringify(h.events);
   assert.equal(serialized.includes(TOKEN), false);
-  assert.equal(serialized.includes(URL_), false);
+  assert.doesNotMatch(serialized, /https?:\/\//);
   assert.equal(serialized.includes("token"), false);
 
   const failed = harness({ failOnConsume: 2 });
