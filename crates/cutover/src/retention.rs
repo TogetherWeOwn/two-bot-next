@@ -573,6 +573,10 @@ async fn run_retention_core(
             sqlx::query("SET LOCAL statement_timeout = '15s'")
                 .execute(&mut *tx)
                 .await?;
+            // Lifecycle writers touch instance evidence before capture history.
+            // Exclude them before taking sorted table locks, not after acquiring
+            // attendance's table lock and waiting for the instance table.
+            two_bot_core::event_instance_store::lock_retention(&mut tx).await?;
             // Same sorted-lock discipline as erase_member, covering every
             // table the time-window deletes, guild purges, and per-user
             // deletions can touch. The plan tables plus the raw probe and

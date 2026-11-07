@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS event_attendance_windows (
   starts_at  TIMESTAMPTZ NOT NULL,
   ends_at    TIMESTAMPTZ NOT NULL,
   capture_stops TIMESTAMPTZ[] NOT NULL DEFAULT '{}',
+  -- updated_at is last capture, used to coalesce stops; changed_at is mutation recency.
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  changed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   PRIMARY KEY (guild_id, event_key)
 );
 
@@ -46,6 +48,9 @@ CREATE TABLE IF NOT EXISTS event_voice_sessions (
   member_id    TEXT NOT NULL,
   channel_id   TEXT NOT NULL,
   channel_name TEXT NOT NULL DEFAULT '',
+  -- NULL is old/unknown observation order; readers fall back to the join.
+  name_observed_at TIMESTAMPTZ,
+  changed_at   TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   is_bot       BOOLEAN NOT NULL DEFAULT FALSE,
   afk          BOOLEAN NOT NULL DEFAULT FALSE,
   joined_at    TIMESTAMPTZ NOT NULL,

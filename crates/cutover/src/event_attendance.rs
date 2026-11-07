@@ -39,6 +39,7 @@ pub struct AttendanceSession {
     pub member_id: String,
     pub channel_id: String,
     pub channel_name: String,
+    pub name_observed_at: OffsetDateTime,
     pub is_bot: bool,
     pub afk: bool,
     pub joined_at: OffsetDateTime,
@@ -150,10 +151,11 @@ pub async fn open_attendance_sessions(
             OffsetDateTime,
             Option<OffsetDateTime>,
             Vec<String>,
+            OffsetDateTime,
         ),
     >(
         "SELECT id, member_id, channel_id, channel_name, is_bot, afk, \
-                joined_at, left_at, event_keys \
+                joined_at, left_at, event_keys, COALESCE(name_observed_at, joined_at) \
          FROM event_voice_sessions \
          WHERE guild_id = $1 AND member_id = $2 AND left_at IS NULL \
          ORDER BY joined_at, id",
@@ -175,11 +177,13 @@ pub async fn open_attendance_sessions(
                     joined_at,
                     left_at,
                     event_keys,
+                    name_observed_at,
                 )| AttendanceSession {
                     id,
                     member_id,
                     channel_id,
                     channel_name,
+                    name_observed_at,
                     is_bot,
                     afk,
                     joined_at,
@@ -252,7 +256,7 @@ async fn capture_tags_in(
            ON w.guild_id = k.guild_id AND w.event_id = k.event_id AND w.is_current
          WHERE k.guild_id = $1 AND k.event_key = ANY($2)
          ON CONFLICT (guild_id, event_key) DO UPDATE
-           SET starts_at = EXCLUDED.starts_at, ends_at = EXCLUDED.ends_at, updated_at = clock_timestamp()
+           SET starts_at = EXCLUDED.starts_at, ends_at = EXCLUDED.ends_at, updated_at = clock_timestamp(), changed_at = clock_timestamp()
          WHERE h.event_id = EXCLUDED.event_id AND h.instance_starts_at = EXCLUDED.instance_starts_at",
     )
     .bind(guild_id)
@@ -287,8 +291,8 @@ pub async fn insert_attendance_session(
     let id = sqlx::query_scalar(
         "INSERT INTO event_voice_sessions \
            (guild_id, member_id, channel_id, channel_name, is_bot, afk, \
-            joined_at, event_keys) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+            joined_at, event_keys, name_observed_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp()) \
          RETURNING id",
     )
     .bind(&new.guild_id)
@@ -312,7 +316,7 @@ pub async fn close_attendance_session(
     pool: &sqlx::PgPool,
     id: i64,
     left_at: OffsetDateTime,
-    channel_name: &str,
+    channel_name: Option<&str>,
     event_keys: &[String],
 ) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -354,7 +358,10 @@ pub async fn close_attendance_session(
     tags.sort();
     let affected = sqlx::query(
         "UPDATE event_voice_sessions
-         SET left_at = GREATEST(joined_at, $2), channel_name = $3, event_keys = $4
+         SET left_at = GREATEST(joined_at, $2),
+             channel_name = COALESCE($3, channel_name),
+             name_observed_at = CASE WHEN $3::text IS NULL THEN name_observed_at ELSE clock_timestamp() END,
+             event_keys = $4, changed_at = clock_timestamp()
          WHERE id = $1 AND left_at IS NULL",
     )
     .bind(id)
@@ -395,10 +402,11 @@ pub async fn attendance_sessions_for_event_key(
             OffsetDateTime,
             Option<OffsetDateTime>,
             Vec<String>,
+            OffsetDateTime,
         ),
     >(
         "SELECT id, member_id, channel_id, channel_name, is_bot, afk, \
-                joined_at, left_at, event_keys \
+                joined_at, left_at, event_keys, COALESCE(name_observed_at, joined_at) \
          FROM event_voice_sessions \
          WHERE guild_id = $1 AND event_keys @> ARRAY[$2] \
          ORDER BY joined_at, id",
@@ -420,11 +428,13 @@ pub async fn attendance_sessions_for_event_key(
                     joined_at,
                     left_at,
                     event_keys,
+                    name_observed_at,
                 )| AttendanceSession {
                     id,
                     member_id,
                     channel_id,
                     channel_name,
+                    name_observed_at,
                     is_bot,
                     afk,
                     joined_at,
@@ -529,7 +539,7 @@ impl PgRoomStore {
         &self,
         id: i64,
         left_at: OffsetDateTime,
-        channel_name: &str,
+        channel_name: Option<&str>,
         event_keys: &[String],
     ) -> Result<u64, sqlx::Error> {
         close_attendance_session(self.pool(), id, left_at, channel_name, event_keys).await

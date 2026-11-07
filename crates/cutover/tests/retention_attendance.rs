@@ -12,13 +12,16 @@
 #[path = "support/raw_expiry.rs"]
 mod support;
 
-use sqlx::PgPool;
+use std::time::Duration;
+
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use support::{with_database, GUILD_A, GUILD_B, MEMBER};
 use time::OffsetDateTime;
 use two_bot_core::{
+    event_instance_store::confirm_deleted,
     internal_action_store::InternalActionStore,
     scheduled_events::{EventStatus, ScheduledEvent},
-    website_store::upsert_event,
+    website_store::{replace_events, upsert_event},
 };
 use two_bot_cutover::{
     event_attendance::{insert_attendance_session, NewAttendanceSession},
@@ -240,4 +243,302 @@ async fn guild_purge_removes_attendance_window_history_so_the_key_can_be_reused(
         assert_eq!(session_count(&pool).await, 2);
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Retention versus the real lifecycle writers (observe, omit, delete).
+//
+// Each case drives the actual `run_retention(Execute)` future against one
+// actual writer future. Test-only statement triggers (installed after seeding,
+// in the disposable database) block on a test-held advisory lock, which parks a
+// side at a known point without sleeping or touching production code:
+//   * writer-first: the writer is parked after its instance-evidence write,
+//     before it touches attendance history, holding the shared retention gate.
+//   * retention-first: retention is parked after the gate and the sorted table
+//     locks, at its attendance-session delete.
+// The other side is then started and the test polls `pg_locks` (bounded, with
+// `yield_now`) for it waiting on the retention gate. Without the gate, retention
+// instead takes the attendance table lock and waits for the instance table
+// (writer-first, a lock-order deadlock once released), or the writer waits on a
+// relation lock (retention-first); neither ever waits on the gate, so the gate
+// assertion fails. Both sides must then commit and the history stop must exist.
+
+const BARRIER_CLASS: i32 = 7001;
+const WRITER_BARRIER: i32 = 1;
+const RETENTION_BARRIER: i32 = 2;
+const POLL_BOUND: Duration = Duration::from_secs(3);
+const JOIN_BOUND: Duration = Duration::from_secs(15);
+const LIFECYCLE_EVENT: &str = "20000000000000010";
+
+#[derive(Clone, Copy, Debug)]
+enum Writer {
+    Observe,
+    Omit,
+    Delete,
+}
+
+impl Writer {
+    fn status(self) -> &'static str {
+        match self {
+            Writer::Observe => "cancelled",
+            Writer::Omit => "missing",
+            Writer::Delete => "deleted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum First {
+    Writer,
+    Retention,
+}
+
+fn iso_at(at: OffsetDateTime) -> String {
+    two_bot_core::funnel::format_iso_millis((at.unix_timestamp_nanos() / 1_000_000) as i64)
+}
+
+/// Poll until `sql` (one scalar count, bound with `arg`) is positive.
+async fn poll_positive(control: &PgPool, sql: &str, arg: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + POLL_BOUND;
+    loop {
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+            .bind(arg)
+            .fetch_one(control)
+            .await
+            .expect("poll pg_locks");
+        if count > 0 {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A side is parked on the test-held barrier advisory lock.
+async fn barrier_parked(control: &PgPool, key: i32) -> bool {
+    let sql = format!(
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+         AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+         AND objsubid = 2 AND classid::int = {BARRIER_CLASS} AND objid::int = $1::text::int"
+    );
+    poll_positive(control, &sql, &key.to_string()).await
+}
+
+/// A side waits on the retention gate in `mode` (`ExclusiveLock` = retention,
+/// `ShareLock` = a lifecycle writer).
+async fn gate_waiter(control: &PgPool, mode: &str) -> bool {
+    poll_positive(
+        control,
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+         AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+         AND mode = $1 \
+         AND ((classid::bigint << 32) | objid::bigint) = hashtextextended('event_instance_retention', 0)",
+        mode,
+    )
+    .await
+}
+
+fn lifecycle_event(status: EventStatus, now: OffsetDateTime) -> ScheduledEvent {
+    ScheduledEvent {
+        id: LIFECYCLE_EVENT.to_owned(),
+        name: "Lifecycle night".to_owned(),
+        starts_at: iso_at(now - time::Duration::minutes(30)),
+        ends_at: Some(iso_at(now + time::Duration::minutes(30))),
+        channel_id: None,
+        description: None,
+        status,
+    }
+}
+
+fn spawn_writer(
+    writer: Writer,
+    pool: &PgPool,
+    observed_at: String,
+    now: OffsetDateTime,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        let result = match writer {
+            Writer::Observe => {
+                let event = lifecycle_event(EventStatus::Cancelled, now);
+                upsert_event(&pool, GUILD_A, &observed_at, &event).await
+            }
+            Writer::Omit => replace_events(&pool, GUILD_A, &observed_at, &[])
+                .await
+                .map(|skip| assert!(skip.is_none(), "the omission snapshot must be accepted")),
+            Writer::Delete => confirm_deleted(&pool, GUILD_A, LIFECYCLE_EVENT, &observed_at).await,
+        };
+        result.map_err(|error| error.to_string())
+    })
+}
+
+async fn join_bounded<T>(handle: tokio::task::JoinHandle<T>, what: &str) -> Option<T> {
+    match tokio::time::timeout(JOIN_BOUND, handle).await {
+        Ok(joined) => Some(joined.unwrap_or_else(|error| panic!("{what} task failed: {error}"))),
+        Err(_) => None,
+    }
+}
+
+async fn lifecycle_race(writer: Writer, first: First) {
+    with_database(move |pool| async move {
+        let now = OffsetDateTime::now_utc();
+        // Establish live evidence and a captured history row through the real
+        // writer, then arm the barriers for the racing pair only.
+        upsert_event(
+            &pool,
+            GUILD_A,
+            &iso_at(now - time::Duration::minutes(10)),
+            &lifecycle_event(EventStatus::Active, now),
+        )
+        .await
+        .expect("seed live instance evidence");
+        sqlx::query(
+            "INSERT INTO event_attendance_windows \
+             (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at) \
+             VALUES ($1, 'game-night', $2, $3::text::timestamptz, \
+                     $3::text::timestamptz, $4::text::timestamptz)",
+        )
+        .bind(GUILD_A)
+        .bind(LIFECYCLE_EVENT)
+        .bind(iso_at(now - time::Duration::minutes(30)))
+        .bind(iso_at(now + time::Duration::minutes(30)))
+        .execute(&pool)
+        .await
+        .expect("seed captured history");
+        sqlx::query(
+            "CREATE FUNCTION test_retention_barrier() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN PERFORM pg_advisory_xact_lock(7001, TG_ARGV[0]::int); RETURN NULL; END $$",
+        )
+        .execute(&pool)
+        .await
+        .expect("create barrier function");
+        for (name, table, key) in [
+            ("test_writer_barrier", "event_instance_windows", WRITER_BARRIER),
+            ("test_retention_barrier", "event_voice_sessions", RETENTION_BARRIER),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE TRIGGER {name} AFTER INSERT OR UPDATE OR DELETE ON {table} \
+                 FOR EACH STATEMENT EXECUTE FUNCTION test_retention_barrier('{key}')"
+            )))
+            .execute(&pool)
+            .await
+            .expect("create barrier trigger");
+        }
+
+        // Separate pool: barrier holder and poller never compete with the pair.
+        let control = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .expect("control pool");
+        let observed_at = iso_at(now);
+        let (parked_key, second_mode) = match first {
+            First::Writer => (WRITER_BARRIER, "ExclusiveLock"),
+            First::Retention => (RETENTION_BARRIER, "ShareLock"),
+        };
+        let mut barrier = control.begin().await.expect("barrier tx");
+        sqlx::query("SELECT pg_advisory_xact_lock(7001, $1)")
+            .bind(parked_key)
+            .execute(&mut *barrier)
+            .await
+            .expect("hold barrier");
+
+        let start_retention = |pool: &PgPool| {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                run_retention(&pool, RetentionMode::Execute)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        };
+        let (writer_task, retention_task, first_parked, second_waiting);
+        match first {
+            First::Writer => {
+                writer_task = spawn_writer(writer, &pool, observed_at.clone(), now);
+                first_parked = barrier_parked(&control, parked_key).await;
+                retention_task = start_retention(&pool);
+                second_waiting = gate_waiter(&control, second_mode).await;
+            }
+            First::Retention => {
+                retention_task = start_retention(&pool);
+                first_parked = barrier_parked(&control, parked_key).await;
+                writer_task = spawn_writer(writer, &pool, observed_at.clone(), now);
+                second_waiting = gate_waiter(&control, second_mode).await;
+            }
+        }
+        // Release before asserting so both futures finish and teardown is clean.
+        barrier.rollback().await.expect("release barrier");
+        let writer_result = join_bounded(writer_task, "writer").await;
+        let retention_result = join_bounded(retention_task, "retention").await;
+
+        assert!(first_parked, "{writer:?}/{first:?}: first side never parked");
+        assert!(
+            second_waiting,
+            "{writer:?}/{first:?}: the second side must wait on the retention gate ({second_mode}), \
+             not on table locks"
+        );
+        assert_eq!(writer_result, Some(Ok(())), "{writer:?}/{first:?}: writer must commit");
+        assert_eq!(
+            retention_result,
+            Some(Ok(())),
+            "{writer:?}/{first:?}: retention must commit"
+        );
+        let committed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event_instance_windows WHERE guild_id = $1 AND event_id = $2 \
+             AND status = $3",
+        )
+        .bind(GUILD_A)
+        .bind(LIFECYCLE_EVENT)
+        .bind(writer.status())
+        .fetch_one(&pool)
+        .await
+        .expect("read instance evidence");
+        assert_eq!(committed, 1, "{writer:?}/{first:?}: lifecycle write committed");
+        let stopped: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event_attendance_windows WHERE guild_id = $1 \
+             AND event_key = 'game-night' AND cardinality(capture_stops) = 1 \
+             AND capture_stops[1] = $2::text::timestamptz",
+        )
+        .bind(GUILD_A)
+        .bind(&observed_at)
+        .fetch_one(&pool)
+        .await
+        .expect("read history stop");
+        assert_eq!(stopped, 1, "{writer:?}/{first:?}: history stop at the observation");
+        control.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn retention_gate_writer_first_observe() {
+    lifecycle_race(Writer::Observe, First::Writer).await;
+}
+
+#[tokio::test]
+async fn retention_gate_writer_first_omit() {
+    lifecycle_race(Writer::Omit, First::Writer).await;
+}
+
+#[tokio::test]
+async fn retention_gate_writer_first_delete() {
+    lifecycle_race(Writer::Delete, First::Writer).await;
+}
+
+#[tokio::test]
+async fn retention_gate_retention_first_observe() {
+    lifecycle_race(Writer::Observe, First::Retention).await;
+}
+
+#[tokio::test]
+async fn retention_gate_retention_first_omit() {
+    lifecycle_race(Writer::Omit, First::Retention).await;
+}
+
+#[tokio::test]
+async fn retention_gate_retention_first_delete() {
+    lifecycle_race(Writer::Delete, First::Retention).await;
 }

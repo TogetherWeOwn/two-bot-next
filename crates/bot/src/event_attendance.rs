@@ -73,7 +73,7 @@ pub trait AttendanceStore: Send + Sync {
         &self,
         id: i64,
         left_at: OffsetDateTime,
-        channel_name: String,
+        channel_name: Option<String>,
         event_keys: &[String],
     ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
     fn attendance_sessions_for_event_key(
@@ -443,16 +443,9 @@ pub async fn record_transition(store: &impl AttendanceStore, transition: VoiceTr
             .and_then(|row| row.channel_id)
             .zip(previous)
             .is_some_and(|(channel, previous)| channel == previous);
-        let name = live_match
-            .then(|| previous_name.clone())
-            .flatten()
-            .unwrap_or_else(|| {
-                open_rows
-                    .iter()
-                    .find(|row| row.id == close.id)
-                    .map(|row| row.channel_name.clone())
-                    .unwrap_or_default()
-            });
+        // None preserves both the known name and its observation stamp in SQL;
+        // reusing stored text is not a new observation of that channel.
+        let name = live_match.then(|| previous_name.clone()).flatten();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS),
             store.close_attendance_session(
@@ -539,6 +532,7 @@ pub struct SessionMs {
     pub member_id: Snowflake,
     pub channel_id: Snowflake,
     pub channel_name: String,
+    pub name_observed_ns: i128,
     pub is_bot: bool,
     pub afk: bool,
     pub joined_ms: i64,
@@ -617,8 +611,8 @@ pub fn project_attendance(
     // Per-member aggregation over window-clamped intervals.
     let mut members: std::collections::BTreeMap<Snowflake, MemberSpans> =
         std::collections::BTreeMap::new();
-    // Channel names from the latest-joined human session per channel.
-    let mut rooms: std::collections::BTreeMap<Snowflake, (i64, String)> =
+    // Name order is independent of join and credit-capped leave times.
+    let mut rooms: std::collections::BTreeMap<Snowflake, (i128, String)> =
         std::collections::BTreeMap::new();
     // Sweep events for the peak: (instant, delta), ends before starts.
     let mut sweep: Vec<(i64, i32)> = Vec::new();
@@ -636,9 +630,9 @@ pub fn project_attendance(
         entry.first_joined_ms = entry.first_joined_ms.min(row.joined_ms);
         let room = rooms
             .entry(row.channel_id)
-            .or_insert((i64::MIN, String::new()));
-        if row.joined_ms >= room.0 {
-            *room = (row.joined_ms, row.channel_name.clone());
+            .or_insert((i128::MIN, String::new()));
+        if row.name_observed_ns >= room.0 {
+            *room = (row.name_observed_ns, row.channel_name.clone());
         }
         if from_ms < to_ms {
             entry.intervals.push((from_ms, to_ms));
@@ -707,6 +701,25 @@ mod tests {
     use super::*;
 
     const MIN: i64 = 60_000;
+
+    #[test]
+    fn room_name_follows_observation_order_not_join_or_credit_order() {
+        let event = window("event", 0, 60 * MIN);
+        // A closes after B despite joining first. Its credit was separately
+        // stopped before B's join; neither voice stamp orders the new name.
+        let mut a = session(1, 7, "Renamed", false, false, 0, Some(10 * MIN));
+        a.name_observed_ns = i128::from(40 * MIN) * 1_000_000;
+        let b = session(2, 7, "Old", false, false, 20 * MIN, Some(25 * MIN));
+        for rows in [vec![a.clone(), b.clone()], vec![b.clone(), a.clone()]] {
+            let result = project_attendance("event", &event, &rows, 80 * MIN).unwrap();
+            assert_eq!(result["rooms"][0]["name_at_close"], "Renamed");
+        }
+        // An open row's join is a real later observation too. Missing metadata
+        // at close retains the older persisted observation, tested in the store.
+        let open = session(3, 7, "Newest", false, false, 45 * MIN, None);
+        let result = project_attendance("event", &event, &[a, b, open], 50 * MIN).unwrap();
+        assert_eq!(result["rooms"][0]["name_at_close"], "Newest");
+    }
 
     #[test]
     fn raw_history_budget_refuses_before_aggregation_even_when_output_would_be_tiny() {
@@ -801,6 +814,7 @@ mod tests {
             member_id: member,
             channel_id: channel,
             channel_name: name.to_owned(),
+            name_observed_ns: i128::from(left_ms.unwrap_or(joined_ms)) * 1_000_000,
             is_bot,
             afk,
             joined_ms,
@@ -1182,6 +1196,7 @@ mod tests {
                 member_id: "11".to_owned(),
                 channel_id: "7".to_owned(),
                 channel_name: "lobby".to_owned(),
+                name_observed_at: OffsetDateTime::now_utc() - time::Duration::minutes(5),
                 is_bot: false,
                 afk: false,
                 joined_at: OffsetDateTime::now_utc() - time::Duration::minutes(5),
@@ -1202,7 +1217,7 @@ mod tests {
             &self,
             _id: i64,
             _left_at: OffsetDateTime,
-            _channel_name: String,
+            _channel_name: Option<String>,
             _event_keys: &[String],
         ) -> Result<u64, Self::Error> {
             *self.closes.lock().expect("closes lock") += 1;
@@ -1486,6 +1501,7 @@ mod tests {
                 member_id: "11".to_owned(),
                 channel_id: channel_id.to_owned(),
                 channel_name: name.to_owned(),
+                name_observed_at: OffsetDateTime::now_utc() - time::Duration::minutes(5),
                 is_bot: false,
                 afk: false,
                 joined_at: OffsetDateTime::now_utc() - time::Duration::minutes(5),
@@ -1545,14 +1561,20 @@ mod tests {
             &self,
             id: i64,
             left_at: OffsetDateTime,
-            channel_name: String,
+            channel_name: Option<String>,
             event_keys: &[String],
         ) -> Result<u64, Self::Error> {
             self.note("close");
             self.writes.lock().expect("writes lock").closes.push((
                 id,
                 left_at,
-                channel_name,
+                channel_name.unwrap_or_else(|| {
+                    self.open_rows
+                        .iter()
+                        .find(|row| row.id == id)
+                        .map(|row| row.channel_name.clone())
+                        .unwrap_or_default()
+                }),
                 event_keys.to_vec(),
             ));
             Self::apply(self.close_fault, 1).await

@@ -1926,6 +1926,7 @@ async fn read_event_attendance(
             member_id,
             channel_id,
             channel_name: session.channel_name.clone(),
+            name_observed_ns: session.name_observed_at.unix_timestamp_nanos(),
             is_bot: session.is_bot,
             afk: session.afk,
             joined_ms: two_bot::event_attendance::millis_of(session.joined_at),

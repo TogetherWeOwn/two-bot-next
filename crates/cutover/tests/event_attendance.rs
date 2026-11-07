@@ -66,6 +66,175 @@ async fn map(pool: &PgPool, guild: &str, key: &str, event_id: &str) {
 }
 
 #[tokio::test]
+async fn lifecycle_stop_is_exported_without_advancing_last_capture() {
+    with_database(|pool| async move {
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+        upsert_event(
+            &pool,
+            GUILD_A,
+            &iso(now - Duration::seconds(1)),
+            &event(now),
+        )
+        .await
+        .unwrap();
+        map(&pool, GUILD_A, "game-night", EVENT_A).await;
+        let id = insert_attendance_session(&pool, &session(now, &["game-night"]))
+            .await
+            .unwrap();
+        let capture = now - Duration::minutes(5);
+        let baseline = iso(now - Duration::minutes(1));
+        sqlx::query("UPDATE event_attendance_windows SET updated_at = $1, changed_at = $1")
+            .bind(capture)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A pre-baseline history row changes only through a real omission.
+        replace_events(&pool, GUILD_A, &iso(now), &[])
+            .await
+            .unwrap();
+        let (last_capture, changed, stops): (OffsetDateTime, OffsetDateTime, Vec<OffsetDateTime>) =
+            sqlx::query_as(
+                "SELECT updated_at, changed_at, capture_stops FROM event_attendance_windows",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(last_capture, capture);
+        assert!(changed > now - Duration::minutes(1));
+        assert_eq!(stops.len(), 1);
+        // A late-processed leave changes the raw row after baseline even when
+        // both of its gateway observation boundaries predate baseline.
+        sqlx::query("UPDATE event_voice_sessions SET changed_at = $1")
+            .bind(capture)
+            .execute(&pool)
+            .await
+            .unwrap();
+        close_attendance_session(&pool, id, now - Duration::minutes(2), None, &[])
+            .await
+            .unwrap();
+        let summary = two_bot_cutover::rollback_delta::report(&pool, &baseline)
+            .await
+            .unwrap();
+        let history = summary
+            .tables
+            .iter()
+            .find(|row| row.table == "event_attendance_windows")
+            .unwrap();
+        assert_eq!(history.count, Some(1));
+        assert_eq!(
+            summary
+                .tables
+                .iter()
+                .find(|row| row.table == "event_voice_sessions")
+                .unwrap()
+                .count,
+            Some(1)
+        );
+        let mut lines = Vec::new();
+        two_bot_cutover::rollback_delta::export_delta(&pool, &baseline, &mut |line: String| {
+            lines.push(line);
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .unwrap();
+        let history: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| row["table"] == "event_attendance_windows")
+            .collect();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0]["row"]["capture_stops"].as_array().unwrap().len(),
+            1
+        );
+        // Repeated omission coalesces against last capture, not the new mutation stamp.
+        replace_events(&pool, GUILD_A, &iso(now + Duration::seconds(1)), &[])
+            .await
+            .unwrap();
+        let after: (OffsetDateTime, OffsetDateTime, Vec<OffsetDateTime>) = sqlx::query_as(
+            "SELECT updated_at, changed_at, capture_stops FROM event_attendance_windows",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after, (capture, changed, stops));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn name_observation_survives_credit_caps_and_missing_metadata() {
+    with_database(|pool| async move {
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+        upsert_event(
+            &pool,
+            GUILD_A,
+            &iso(now - Duration::seconds(1)),
+            &event(now),
+        )
+        .await
+        .unwrap();
+        map(&pool, GUILD_A, "game-night", EVENT_A).await;
+        let a = session(now, &["game-night"]);
+        let a_id = insert_attendance_session(&pool, &a).await.unwrap();
+        let mut b = a.clone();
+        b.member_id = "30000000000000002".to_owned();
+        b.joined_at = now - Duration::minutes(5);
+        let b_id = insert_attendance_session(&pool, &b).await.unwrap();
+        close_attendance_session(&pool, b_id, now - Duration::minutes(3), Some("Old"), &[])
+            .await
+            .unwrap();
+        close_attendance_session(&pool, a_id, now, Some("Renamed"), &[])
+            .await
+            .unwrap();
+        // Another open row's known name is not re-observed by a missing-name close.
+        let mut c = b;
+        c.member_id = "30000000000000003".to_owned();
+        c.joined_at = now - Duration::minutes(2);
+        c.channel_name = "Older".to_owned();
+        let c_id = insert_attendance_session(&pool, &c).await.unwrap();
+        let original_stamp: OffsetDateTime =
+            sqlx::query_scalar("SELECT name_observed_at FROM event_voice_sessions WHERE id = $1")
+                .bind(c_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        close_attendance_session(&pool, c_id, now + Duration::seconds(1), None, &[])
+            .await
+            .unwrap();
+        let raw: (String, OffsetDateTime) = sqlx::query_as(
+            "SELECT channel_name, name_observed_at FROM event_voice_sessions WHERE id = $1",
+        )
+        .bind(c_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(raw, ("Older".to_owned(), original_stamp));
+        // Cap voice credit before the latest name observation. Read ordering must
+        // use the separate name stamp, never the capped left_at or join time.
+        sqlx::query("UPDATE event_attendance_windows SET capture_stops = ARRAY[$1::timestamptz]")
+            .bind(now - Duration::minutes(4))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let store = InternalActionStore::new(pool.clone());
+        let rows = store
+            .attendance_sessions_for_event_key(GUILD_A, "game-night")
+            .await
+            .unwrap();
+        let a = rows
+            .iter()
+            .find(|row| row.member_id == a.member_id)
+            .unwrap();
+        assert_eq!(a.channel_name, "Renamed");
+        assert!(a.name_observed_at >= now);
+        assert!(a.name_observed_at < original_stamp);
+        assert_eq!(a.left_at, Some(now - Duration::minutes(4)));
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn signed_read_store_refuses_large_raw_history_even_with_one_output_member() {
     with_database(|pool| async move {
         let now = OffsetDateTime::now_utc();
@@ -114,7 +283,7 @@ async fn continuous_captured_span_tags_a_later_window_already_past_grace() {
         map(&pool, GUILD_A, "b", EVENT_B).await;
         let windows = attendance_windows_for_guild(&pool, GUILD_A).await.unwrap();
         assert!(windows.iter().any(|window| window.event_key == "b"));
-        close_attendance_session(&pool, id, now, "Lobby", &["b".to_owned()])
+        close_attendance_session(&pool, id, now, Some("Lobby"), &["b".to_owned()])
             .await
             .unwrap();
         let rows = attendance_sessions_for_event_key(&pool, GUILD_A, "b")
@@ -368,13 +537,13 @@ async fn capture_rechecks_privacy_and_commits_overlap_history_with_the_session()
             .await
             .unwrap();
         assert_eq!(
-            close_attendance_session(&pool, id, now, "Renamed", &["unknown".to_owned()])
+            close_attendance_session(&pool, id, now, Some("Renamed"), &["unknown".to_owned()])
                 .await
                 .unwrap(),
             1
         );
         assert_eq!(
-            close_attendance_session(&pool, id, now, "Again", &[])
+            close_attendance_session(&pool, id, now, Some("Again"), &[])
                 .await
                 .unwrap(),
             0
@@ -484,7 +653,7 @@ async fn reschedules_omission_and_revocation_use_the_real_accepted_writers() {
                 .is_err()
         );
         assert_eq!(
-            close_attendance_session(&pool, id, now, "Lobby", &[])
+            close_attendance_session(&pool, id, now, Some("Lobby"), &[])
                 .await
                 .unwrap(),
             1
@@ -555,7 +724,7 @@ async fn repointed_keys_do_not_mix_instances_and_deletion_revokes_capture() {
             .unwrap()
             .is_empty());
         assert_eq!(
-            close_attendance_session(&pool, id, now, "Lobby", &[])
+            close_attendance_session(&pool, id, now, Some("Lobby"), &[])
                 .await
                 .unwrap(),
             1
@@ -598,12 +767,12 @@ async fn failed_session_write_rolls_back_history_and_new_close_tags_are_revalida
         overlap.id = EVENT_B.to_owned();
         upsert_event(&pool, GUILD_A, &iso(now - Duration::minutes(1)), &overlap).await.unwrap();
         map(&pool, GUILD_A, "overlap", EVENT_B).await;
-        assert_eq!(close_attendance_session(&pool, id, now, "Lobby", &["game-night".to_owned(), "overlap".to_owned(), "unknown".to_owned()]).await.unwrap(), 1);
+        assert_eq!(close_attendance_session(&pool, id, now, Some("Lobby"), &["game-night".to_owned(), "overlap".to_owned(), "unknown".to_owned()]).await.unwrap(), 1);
         assert!(attendance_window_for_key(&pool, GUILD_A, "overlap").await.unwrap().is_some());
         let rows = attendance_sessions_for_event_key(&pool, GUILD_A, "overlap").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event_keys, vec!["game-night", "overlap"]);
-        assert_eq!(close_attendance_session(&pool, i64::MAX, now, "Lobby", &[]).await.unwrap(), 0);
+        assert_eq!(close_attendance_session(&pool, i64::MAX, now, Some("Lobby"), &[]).await.unwrap(), 0);
     }).await;
 }
 
@@ -789,7 +958,7 @@ async fn queued_opt_out_or_voice_disable_blocks_new_close_time_tag() {
             async move { opt_out_member(&db, GUILD_A, MEMBER, "operator").await },
             {
                 let (pool, both) = (pool.clone(), both.clone());
-                async move { close_attendance_session(&pool, id, now, "Lobby", &both).await }
+                async move { close_attendance_session(&pool, id, now, Some("Lobby"), &both).await }
             },
         )
         .await;
@@ -820,7 +989,7 @@ async fn queued_opt_out_or_voice_disable_blocks_new_close_time_tag() {
             async move { set_analytics_settings(&db, GUILD_A, true, true, false).await },
             {
                 let (pool, both) = (pool.clone(), both.clone());
-                async move { close_attendance_session(&pool, id, now, "Lobby", &both).await }
+                async move { close_attendance_session(&pool, id, now, Some("Lobby"), &both).await }
             },
         )
         .await;
@@ -868,7 +1037,7 @@ async fn first_close_time_tag_across_an_omission_gets_no_backcredit() {
 
         let requested = vec!["a".to_owned(), "b".to_owned()];
         assert_eq!(
-            close_attendance_session(&pool, id, now, "Lobby", &requested)
+            close_attendance_session(&pool, id, now, Some("Lobby"), &requested)
                 .await
                 .unwrap(),
             1
@@ -897,7 +1066,7 @@ async fn first_close_time_tag_across_an_omission_gets_no_backcredit() {
         gap_a.joined_at = during_gap.joined_at;
         let gap_a_id = insert_attendance_session(&pool, &gap_a).await.unwrap();
         assert_eq!(
-            close_attendance_session(&pool, gap_a_id, now, "Lobby", &["b".to_owned()])
+            close_attendance_session(&pool, gap_a_id, now, Some("Lobby"), &["b".to_owned()])
                 .await
                 .unwrap(),
             1
@@ -947,7 +1116,7 @@ async fn positive_refresh_preserves_post_recovery_close_time_overlap() {
         let id = insert_attendance_session(&pool, &first).await.unwrap();
         upsert_event(&pool, GUILD_A, &stamp(10), &b).await.unwrap();
         assert_eq!(
-            close_attendance_session(&pool, id, now, "Lobby", &["b".to_owned()])
+            close_attendance_session(&pool, id, now, Some("Lobby"), &["b".to_owned()])
                 .await
                 .unwrap(),
             1

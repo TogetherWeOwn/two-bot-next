@@ -109,10 +109,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "containment_incidents", measure: TableMeasure::Columns(&["started_at"]) },
     // Same shape as guild_counters: one read-time per count, no updated_at.
     TableSpec { table: "counter_snapshots", measure: TableMeasure::Columns(&["human_member_count_at", "online_count_at"]) },
-    // Mapped event windows (0471): the upsert rewrites starts_at/ends_at and
-    // stamps updated_at, so the row's last write is the control-plane write
-    // (starts_at/ends_at are event source times, not write times).
-    TableSpec { table: "event_attendance_windows", measure: TableMeasure::Columns(&["updated_at"]) },
+    // Capture history (0471): changed_at covers capture and lifecycle stops.
+    // updated_at remains last capture for stop coalescing, not mutation recency.
+    TableSpec { table: "event_attendance_windows", measure: TableMeasure::Columns(&["changed_at"]) },
     // Event instance windows (0472): durable lifecycle, order and revocation
     // evidence for accepted Discord event observations. Confirmed lifecycle
     // writes stamp observed_at/revoked_at; status-only omissions stamp omitted_at
@@ -136,11 +135,9 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // leave rewrites left_at from NULL without touching joined_at, so the
     // maximum across both is the row's last write (same shape as tickets).
     TableSpec { table: "event_voice_presence", measure: TableMeasure::Columns(&["joined_at", "left_at"]) },
-    // Raw attendance sessions (0471): the join stamps joined_at once; the
-    // leave rewrites left_at from NULL without touching joined_at, so the
-    // maximum across both is the row's last write (same shape as
-    // event_voice_presence).
-    TableSpec { table: "event_voice_sessions", measure: TableMeasure::Columns(&["joined_at", "left_at"]) },
+    // Raw attendance sessions (0471): observation stamps may predate a delayed
+    // insert/close. changed_at records database mutation time, not voice time.
+    TableSpec { table: "event_voice_sessions", measure: TableMeasure::Columns(&["changed_at"]) },
     TableSpec { table: "feed_deliveries", measure: TableMeasure::Columns(&["first_seen_at"]) },
     TableSpec { table: "feed_relays", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "game_activity_guild_aggregates", measure: TableMeasure::Columns(&["updated_at"]) },

@@ -475,8 +475,9 @@ observation time, not actor processing time. Opens delayed over one minute or da
 in the future are dropped; closes keep their observed boundary. The write transaction
 still refuses new opens after grace. An existing continuous captured span can acquire
 a later accepted window's overlap even when that window closed before departure.
-`rooms` carries the latest name the logger saw per channel with at
-least one human session. Still-open rows clamp at `min(now, window close)`; `final`
+`rooms` selects each channel's latest persisted `name_observed_at`, independently
+of join order and credit caps. Names use database observation/write time, not the
+gateway frame's older voice boundary. Missing metadata preserves name and stamp. Still-open rows clamp at `min(now, window close)`; `final`
 is true only once the window plus its 15-minute grace has passed, and the website
 only writes an Echo from `final: true` reads. `not_found` covers unmapped keys and
 mapped windows with no tagged sessions — including every window that closed before
@@ -490,8 +491,10 @@ Capture consumes the shared accepted `event_instance_windows` authority, not
 caller-requested upsert dates or a retained attendance window. New spans and new
 tags revalidate finite-window containment, lifecycle and privacy in a transaction.
 Capture takes the analytics-settings lock, the opt-out/opt-in pair lock, then the
-guild ordering lock used by mirror writers, before session row locks. The actual
-settings and privacy writers share those locks, including when rows are absent;
+guild ordering lock used by mirror and reconciliation writers, before session
+row locks. Lifecycle/capture writers first share a retention gate; retention takes
+it exclusively before sorted table locks, avoiding instance/history lock inversion.
+The settings and privacy writers share their locks, including when rows are absent;
 committed suppression or voice-disable cannot race past the capture check. Cancellation, confirmed
 deletion, unconfirmed absence, ambiguous instances and unknown ends authorize no
 new capture. Positive completion keeps only its confirmed finite closing grace.

@@ -139,8 +139,8 @@ the event voice pair (`event_voice_channels` via
 `created_at`/`updated_at`, `event_voice_presence` via
 `joined_at`/`left_at`, the event instance windows
 (`event_instance_windows`) via `observed_at`/`omitted_at`/`revoked_at`, and the
-attendance pair (`event_attendance_windows` via `updated_at`,
-`event_voice_sessions` via `joined_at`/`left_at`)) need no
+attendance pair (both via database mutation time `changed_at`, independent of
+last-capture `updated_at` and voice observation times)) need no
 disposition: their counts are the evidence. The journal is not append-only
 deletion history: completion deletes non-current recipients and marks the
 retained row completed (`pending = FALSE`, `touched_at` refreshed), so the

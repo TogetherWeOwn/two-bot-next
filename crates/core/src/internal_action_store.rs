@@ -854,6 +854,9 @@ impl InternalActionStore {
             }
         }
         let mut tx = self.pool.begin().await?;
+        // Reconciliation is another key writer. Serialize before idempotency
+        // row locks so capture cannot validate one occurrence and persist another.
+        crate::event_instance_store::lock_guild(&mut tx, guild_id).await?;
         let row = sqlx::query(
             "SELECT state, action, guild_id FROM internal_idempotency \
              WHERE intent_id = $1 FOR UPDATE",
@@ -1071,10 +1074,10 @@ impl InternalActionStore {
         // overlong prefix remains invalid and cannot masquerade as a valid ID.
         let mut raw = sqlx::query_as::<
             _,
-            (String, String, String, bool, bool, OffsetDateTime, Option<OffsetDateTime>),
+            (String, String, String, bool, bool, OffsetDateTime, Option<OffsetDateTime>, OffsetDateTime),
         >(
             "SELECT LEFT(member_id, 21), LEFT(channel_id, 21), LEFT(channel_name, 65537), is_bot, afk,
-                    joined_at, left_at
+                    joined_at, left_at, COALESCE(name_observed_at, joined_at)
              FROM event_voice_sessions
              WHERE guild_id = $1 AND event_keys @> ARRAY[$2]
              ORDER BY joined_at, id LIMIT $3",
@@ -1085,8 +1088,16 @@ impl InternalActionStore {
         .fetch(&self.pool);
         let mut sessions = Vec::new();
         let mut name_bytes = 0usize;
-        while let Some((member_id, channel_id, channel_name, is_bot, afk, joined_at, left_at)) =
-            raw.try_next().await?
+        while let Some((
+            member_id,
+            channel_id,
+            channel_name,
+            is_bot,
+            afk,
+            joined_at,
+            left_at,
+            name_observed_at,
+        )) = raw.try_next().await?
         {
             name_bytes = name_bytes.saturating_add(channel_name.len());
             if sessions.len() == MAX_ATTENDANCE_INPUT_SESSIONS
@@ -1099,6 +1110,7 @@ impl InternalActionStore {
                 member_id,
                 channel_id,
                 channel_name,
+                name_observed_at,
                 is_bot,
                 afk,
                 joined_at,
@@ -1170,6 +1182,7 @@ pub struct AttendanceSession {
     pub member_id: String,
     pub channel_id: String,
     pub channel_name: String,
+    pub name_observed_at: OffsetDateTime,
     pub is_bot: bool,
     pub afk: bool,
     pub joined_at: OffsetDateTime,

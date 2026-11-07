@@ -9,8 +9,23 @@ use sqlx::{PgConnection, PgPool};
 
 use crate::scheduled_events::ScheduledEvent;
 
+/// Exclude lifecycle/capture writers before retention takes any table locks.
+/// Ordinary writers share this transaction lock across guilds; retention takes
+/// it exclusively. Acquire it before guild/event, mirror and history locks.
+pub async fn lock_retention(connection: &mut PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('event_instance_retention', 0))")
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
 /// Serialize mirror swaps, mutations and binding adoption for one guild.
 pub async fn lock_guild(connection: &mut PgConnection, guild_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended('event_instance_retention', 0))",
+    )
+    .execute(&mut *connection)
+    .await?;
     sqlx::query(
         "SELECT pg_advisory_xact_lock(hashtextextended('event_instance_windows:' || $1, 0))",
     )
@@ -115,7 +130,8 @@ async fn stop_attendance_in(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE event_attendance_windows h
-         SET capture_stops = array_append(h.capture_stops, s.stopped_at)
+         SET capture_stops = array_append(h.capture_stops, s.stopped_at),
+             changed_at = clock_timestamp()
          FROM event_instance_windows w
          CROSS JOIN LATERAL (
            SELECT LEAST(w.revoked_at::timestamptz,

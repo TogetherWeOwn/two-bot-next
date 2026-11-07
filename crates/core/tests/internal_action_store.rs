@@ -2651,6 +2651,59 @@ async fn unknown_event_list_names_only_guild_unknown_events_oldest_first() {
 }
 
 #[tokio::test]
+async fn resolve_event_mapping_waits_for_capture_guild_lock() {
+    let db = TestDb::new().await;
+    let store = db.store();
+    let claim = unknown_event(
+        &store,
+        "unknown-capture-lock:1",
+        "event.upsert",
+        EVENT_GUILD,
+    )
+    .await;
+    let receipt = created_receipt(MAPPED_EVENT);
+    let mut capture = db.pool.begin().await.unwrap();
+    two_bot_core::event_instance_store::lock_guild(&mut capture, EVENT_GUILD)
+        .await
+        .unwrap();
+    let waiting = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        store.resolve_event_intent(
+            claim.intent_id(),
+            "event.upsert",
+            EVENT_GUILD,
+            Some(("launch", MAPPED_EVENT)),
+            &receipt,
+            ReconciliationEvidence::DiscordConfirmedEffect,
+        ),
+    )
+    .await;
+    let unmapped = store.event_id_for_key(EVENT_GUILD, "launch").await.unwrap();
+    capture.rollback().await.unwrap();
+    assert!(
+        waiting.is_err(),
+        "key reconciliation must not race the capture transaction"
+    );
+    assert_eq!(unmapped, None, "blocked resolution commits no mapping");
+    store
+        .resolve_event_intent(
+            claim.intent_id(),
+            "event.upsert",
+            EVENT_GUILD,
+            Some(("launch", MAPPED_EVENT)),
+            &receipt,
+            ReconciliationEvidence::DiscordConfirmedEffect,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.event_id_for_key(EVENT_GUILD, "launch").await.unwrap(),
+        Some(MAPPED_EVENT.to_owned())
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn resolve_event_create_heals_mapping_and_replays_created() {
     let db = TestDb::new().await;
     let store = db.store();

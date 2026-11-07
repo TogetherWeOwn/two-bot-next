@@ -483,7 +483,7 @@ pub trait RoomPersistence: Send + Sync {
         &self,
         id: i64,
         left_at: OffsetDateTime,
-        channel_name: String,
+        channel_name: Option<String>,
         event_keys: &[String],
     ) -> impl Future<Output = Result<u64, StoreError>> + Send {
         let _ = (id, left_at, channel_name, event_keys);
@@ -551,7 +551,7 @@ impl<T: RoomPersistence> crate::event_attendance::AttendanceStore for T {
         &self,
         id: i64,
         left_at: OffsetDateTime,
-        channel_name: String,
+        channel_name: Option<String>,
         event_keys: &[String],
     ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
         <T as RoomPersistence>::close_attendance_session(
@@ -937,10 +937,10 @@ impl RoomPersistence for PgRoomStore {
         &self,
         id: i64,
         left_at: OffsetDateTime,
-        channel_name: String,
+        channel_name: Option<String>,
         event_keys: &[String],
     ) -> Result<u64, StoreError> {
-        self.close_attendance_session(id, left_at, &channel_name, event_keys)
+        self.close_attendance_session(id, left_at, channel_name.as_deref(), event_keys)
             .await
             .map_err(store_error)
     }
