@@ -1892,6 +1892,7 @@ def staging_rollback_drill_errors(workflow):
 
 
 CONTAINER_DRILL_ENV = {
+    "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-container-drill-use.ndjson",
     "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
     "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
     "CLOUDFLARE_API_TOKEN": "${{ secrets.CLOUDFLARE_API_TOKEN }}",
@@ -1909,7 +1910,7 @@ CONTAINER_DRILL_ENV = {
 # Dispatch input names are the full binding names lowercased
 # (BACKOUT_SOURCE_SHA <- inputs.backout_source_sha, and so on).
 CONTAINER_DRILL_INPUTS = {key.lower() for key in CONTAINER_DRILL_ENV if key not in
-                          ("STAGING_WORKER_URL", "OWNERSHIP_CONTROL_TOKEN",
+                          ("STAGING_USE_RECEIPT", "STAGING_WORKER_URL", "OWNERSHIP_CONTROL_TOKEN",
                            "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID")}
 
 
@@ -1919,12 +1920,13 @@ def staging_container_drill_errors(workflow):
     Dispatch-only with seven required backout pins, one required compatibility
     note and one optional session attestation. One job runs from main through the `staging`
     environment and holds the staging-lifecycle concurrency group (never
-    cancelling), so a push deploy cannot interleave. Exactly four steps:
+    cancelling), so a push deploy cannot interleave. Exactly five steps:
     pinned checkout, pinned setup-node, `npm ci` in wrangler/ (the repo-pinned
     wrangler binary the reviewed script drives for the full-container
-    deploy), and one Run step that passes every dispatch input through the
-    environment (never an inline expression) to the reviewed script. All
-    thirteen bindings are scoped to that step alone. No wrangler action, no
+    deploy), one Run step that passes every dispatch input through the
+    environment (never an inline expression) to the reviewed script, and
+    always-uploaded drill/finite-use evidence. All fourteen bindings are
+    scoped to the Run step alone. No wrangler action, no
     inline deploy command, no force flag: the only deploy route is the
     script's pinned-binary full-container deploy of the validated image pin.
     """
@@ -1964,10 +1966,19 @@ def staging_container_drill_errors(workflow):
         if key in job:
             errors.append(f"{name}:container-drill: must not set {key} (bindings stay on the single Run step)")
     steps = job.get("steps") or []
-    if len(steps) != 4 or any(key in step for step in steps for key in ("if", "continue-on-error")):
-        errors.append(f"{name}:container-drill: must run exactly checkout, setup-node, npm ci and the drill")
+    if len(steps) != 5 or any(key in step for step in steps[:4] for key in ("if", "continue-on-error")):
+        errors.append(f"{name}:container-drill: must run checkout, setup-node, npm ci, drill and evidence upload")
         return errors
-    checkout, node, install, run = steps
+    checkout, node, install, run, upload = steps
+    evidence = "${{ runner.temp }}/staging-container-drill-evidence.json"
+    if (upload.get("with") or {}) != {
+            "name": "staging-container-drill-${{ github.run_id }}-${{ github.run_attempt }}",
+            "path": evidence + "\n" + CONTAINER_DRILL_ENV["STAGING_USE_RECEIPT"] + "\n",
+            "if-no-files-found": "error"}:
+        errors.append(f"{name}:container-drill: must retain drill and finite-use receipts together")
+    if (upload.get("if") != "always()" or "continue-on-error" in upload
+            or not str(upload.get("uses") or "").startswith("actions/upload-artifact@")):
+        errors.append(f"{name}:container-drill: must always upload evidence, failing on missing files")
     if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
             or (checkout.get("with") or {}).get("persist-credentials") != "false":
         errors.append(f"{name}:container-drill: checkout must be pinned and must not persist credentials")
@@ -8730,6 +8741,17 @@ class WorkflowTests(unittest.TestCase):
             "other script": lambda w: job(w)["steps"][3].update(
                 {"run": 'python3 scripts/other.py --backout-image "$BACKOUT_IMAGE"'}),
             "dropped npm ci": lambda w: job(w)["steps"].__delitem__(2),
+            "lost lifecycle receipt": lambda w: job(w)["steps"][3]["env"].pop("STAGING_USE_RECEIPT"),
+            "misplaced lifecycle receipt": lambda w: job(w)["steps"][3]["env"].update(
+                {"STAGING_USE_RECEIPT": "unretained.ndjson"}),
+            "lost drill artifact": lambda w: job(w)["steps"][4]["with"].update(
+                {"path": CONTAINER_DRILL_ENV["STAGING_USE_RECEIPT"]}),
+            "lost lifecycle artifact": lambda w: job(w)["steps"][4]["with"].update(
+                {"path": "${{ runner.temp }}/staging-container-drill-evidence.json"}),
+            "lost failure artifact": lambda w: job(w)["steps"][4].pop("if"),
+            "ignored upload failure": lambda w: job(w)["steps"][4].update({"continue-on-error": "true"}),
+            "empty artifact accepted": lambda w: job(w)["steps"][4]["with"].update(
+                {"if-no-files-found": "ignore"}),
         }
         for label, change in changes.items():
             with self.subTest(change=label):

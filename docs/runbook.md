@@ -2932,10 +2932,31 @@ epoch-checked handoff, and verifies a converged `full_auto` rollout plus the
 exact Worker version, source revision, build id and running image digest
 before timing first ready. Old source is never checked out and no Dockerfile
 is rebuilt: the deploy config is generated from the reviewed `wrangler.toml`
-on `main` with the staging container image overridden to the digest-pinned
-registry reference (every other relative image path is absolutized, because
+on `main` with the staging image overridden to the digest-pinned registry
+reference plus the bounded-policy/environment/image-SHA bindings described
+below (every other relative image path is absolutized, because
 the generated file lives outside the wrangler directory and wrangler
 resolves config-relative paths against it).
+
+Finite use remains under the same [activation hold](staging-rollout-gate.md#no-always-on-staging-rule-and-activation-hold).
+Both historical Worker targets must prove immutable bounded/staging/SHA
+bindings before any startup; an indefinite rollback target is refused. The
+live drill acquires one 25-minute run/attempt grant and exact-SHA baseline
+readiness before fencing. A full deploy creates a **new Worker version UUID**:
+the generated staging config binds the intended image SHA and bounded policy,
+and the script proves the new version's immutable bindings and namespace
+before pinning takeover to it. Each takeover reacquires at its new epoch with
+the **original absolute expiry**, then runs the original rollout, readiness
+and session-witness checks. A partial fenced leg can restore only within that
+original grant; no recovery window is minted. Expiry also bounds confirmation
+probes. Final release must confirm native stop or the drill fails; control or
+authentication refusal stops subsequent controls/restore and leaves native
+expiry responsible, never claims stop. The always-uploaded
+`staging-container-drill-use.ndjson` and drill evidence retain the lifecycle
+and original expiry even on failed runs; runner loss/cancellation still rely
+on runtime expiry. `--dry-run` proves policy and pins but acquires nothing
+and refuses an idle baseline. Production configuration and behavior are
+unchanged, and this drill does not authorize the held activation.
 
 Dispatch contract (all pins immutable; `latest` and mutable tags are refused):
 `backout_source_sha` (40-hex), `backout_build_id`, `backout_image`

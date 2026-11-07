@@ -68,6 +68,7 @@ from urllib.request import Request
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import staging_rollout as rollout  # noqa: E402
 from staging_rollback_drill import ownership_control  # noqa: E402
+from staging_drill_use import StagingDrillUse
 
 GateError = rollout.GateError
 require = rollout.require
@@ -332,9 +333,11 @@ def validate_attestation(text):
 
 class Drill:
     def __init__(self, client, control, url, run_id, wrangler, *, now=time.time,
-                 sleep=time.sleep, log=print):
+                 sleep=time.sleep, log=print, staging_use=None):
         self.client, self.control, self.url = client, control, url
         self.run_id, self.now, self.sleep, self.log = run_id, now, sleep, log
+        self.staging_use = staging_use
+        self.namespace = None
         # (deploy config path, deploy closure, wrangler directory holding the
         # reviewed wrangler.toml) for the full-container deploy.
         self.deploy_path, self.deploy, self.wrangler_dir = wrangler
@@ -364,8 +367,9 @@ class Drill:
         """Full-container deploy of the pinned pre-built image, no rebuild.
 
         The deploy config is generated from the reviewed `wrangler.toml` on
-        main with only the container image overridden to the digest-pinned
-        registry reference (Cloudflare docs: for a registry image
+        main with the container image overridden to the digest-pinned
+        registry reference and staging-only finite policy/SHA bindings
+        (Cloudflare docs: for a registry image
         `wrangler deploy` uses the configured reference without building).
         Old source is never checked out and no Dockerfile is rebuilt.
         The version is stamped with the pinned source SHA (`--message`) so
@@ -373,7 +377,7 @@ class Drill:
         Wrangler's own output may carry paths or gleamed config, so it is
         discarded: only the exit code and duration are recorded.
         """
-        generate_deploy_config(self.deploy_path, image, self.wrangler_dir)
+        generate_deploy_config(self.deploy_path, image, self.wrangler_dir, source_sha)
         started = self.now()
         returncode = self.deploy(self.deploy_path, source_sha)
         elapsed = round(self.now() - started, 1)
@@ -427,6 +431,8 @@ class Drill:
         self._last_wait_timeline = []
         self._last_wait_observation = ""
         while True:
+            if self.staging_use:
+                self.staging_use.check(recovery=True)
             app = rollout.application(self.client)
             if pinned is None and expect_rollout:
                 rows = rollout.rollouts(self.client, app["id"])
@@ -442,6 +448,8 @@ class Drill:
                 # backout deploy): verify the still-serving singleton
                 # directly instead of waiting for a rollout that never comes.
                 status, health, headers, report = probe_report(self.client, self.url)
+                if self.staging_use:
+                    self.staging_use.check(recovery=True)
                 probes += 1
                 if status != 200:
                     non_200 += 1
@@ -486,7 +494,11 @@ class Drill:
                 elif accepted_now:
                     stale = 0
                     rollout.active_worker(self.client, worker)
+                    if self.staging_use:
+                        self.staging_use.check(recovery=True)
                     status, health, headers, report = probe_report(self.client, self.url)
+                    if self.staging_use:
+                        self.staging_use.check(recovery=True)
                     probes += 1
                     if status != 200:
                         non_200 += 1
@@ -526,7 +538,11 @@ class Drill:
         self.confirm_timeline = []
         for _ in range(CONFIRM_PROBES):
             self.sleep(POLL_SECONDS)
+            if self.staging_use:
+                self.staging_use.check(recovery=True)
             status, health, headers, report = probe_report(self.client, self.url)
+            if self.staging_use:
+                self.staging_use.check(recovery=True)
             _, revision_seen, build_seen = report_identity(report, headers)
             agreed = (status == 200 and health == 200
                       and headers.get("x-two-worker-version") == worker
@@ -538,7 +554,7 @@ class Drill:
         return True
 
     # -- phases -------------------------------------------------------------
-    def preflight(self, pin):
+    def preflight(self, pin, *, dry_run=False):
         app = rollout.application(self.client)
         history = deployments(self.client)
         pre_worker = serving_version(self.client)
@@ -576,9 +592,19 @@ class Drill:
             rollout.mapping(app.get("durable_objects")).get("namespace_id"))
         require(rollout.worker_namespace(self.client, pin["worker_version"]) == namespace,
                 "incompatible_worker_binding")
+        self.namespace = namespace
+        if self.staging_use:
+            self.staging_use.validate(self.client, (pre_worker, pin["worker_version"]))
+            require(self.staging_use.shas[pin["worker_version"]] == pin["source_sha"],
+                    "staging_drill_image_mismatch")
         state = self.control("status")
-        require(self.owner(state).get("phase") == "active" and state.get("running") is True,
-                "singleton_not_active_and_running")
+        require(self.owner(state).get("phase") == "active", "singleton_not_active_and_running")
+        # A dry-run never wakes an idle baseline. Live use can start it only
+        # after proving both immutable policies, under one bounded grant.
+        if self.staging_use and not dry_run:
+            self.staging_use.begin(pre_worker)
+            state = self.control("status")
+        require(state.get("running") is True, "singleton_not_active_and_running")
         status, health, headers, report = probe_report(self.client, self.url)
         require(status == 200 and health == 200, "baseline_not_ready",
                 f"readyz={status} health={health}")
@@ -588,6 +614,8 @@ class Drill:
         require(isinstance(revision, str) and SHA.fullmatch(revision)
                 and isinstance(build_id, str) and BUILD_ID.fullmatch(build_id),
                 "baseline_revision_unproven")
+        if self.staging_use:
+            require(revision == self.staging_use.shas[pre_worker], "staging_drill_image_mismatch")
         epoch = self.owner(state).get("epoch")
         baseline = {"worker_version": pre_worker, "image": pre_image,
                     "source_sha": revision, "build_id": build_id}
@@ -608,6 +636,8 @@ class Drill:
 
     def leg(self, name, pin, attestation):
         """Fence, full-container deploy of `pin`, takeover, verify, witness."""
+        if self.staging_use:
+            self.staging_use.check(recovery=name == "restore")
         state = self.control("status")
         phase = self.owner(state).get("phase")
         require(phase in ("active", "fenced"), "owner_state_unexpected",
@@ -617,6 +647,8 @@ class Drill:
                                      "source_sha": pin["source_sha"],
                                      "build_id": pin["build_id"],
                                      "intended_image": pin["image"]}
+        if self.staging_use:
+            self.staging_use.check(recovery=True)
         self.mutated = True
         started = self.stamp(f"{name}: start")
         leg["start"] = iso(started)
@@ -634,6 +666,8 @@ class Drill:
             # restore deploy and leave staging on the backout image. Deploy
             # the baseline then verify instead.
             current = None
+        if self.staging_use:
+            self.staging_use.check(recovery=True)
         if current != pin["image"]:
             deployed, deploy_elapsed = self.deploy_image(pin["image"], name, pin["source_sha"])
             expect_rollout = True
@@ -642,11 +676,27 @@ class Drill:
             deployed, deploy_elapsed, expect_rollout = fenced, 0.0, False
         leg["deployed"] = iso(deployed)
         leg["deploy_elapsed_seconds"] = deploy_elapsed
+        target_worker = serving_version(self.client)
+        if self.staging_use:
+            # A full deploy creates a NEW version UUID. The historical pin
+            # proves image provenance, not the identity answering takeover.
+            try:
+                self.staging_use.validate(self.client, (target_worker,))
+                require(self.staging_use.shas[target_worker] == pin["source_sha"],
+                        "staging_drill_image_mismatch")
+                require(rollout.worker_namespace(self.client, target_worker) == self.namespace,
+                        "incompatible_worker_binding")
+            except GateError:
+                self.staging_use.failed = True
+                raise
+            self.staging_use.check(recovery=True)
         self.control("deployment-takeover", release_fence=True,
-                     expected_deployment=pin["worker_version"])
+                     expected_deployment=target_worker)
         taken = self.stamp(f"{name}: ownership taken")
         leg["takeover"] = iso(taken)
-        target_worker = serving_version(self.client)
+        if self.staging_use:
+            self.staging_use.check(recovery=True)
+            self.staging_use.rebind(target_worker)
         try:
             first_ready, counts, timeline = self.wait_ready(
                 target_worker, pin["source_sha"], pin["build_id"], pin["image"],
@@ -666,6 +716,8 @@ class Drill:
                     "outage_seconds": round(first_ready - fenced, 1), **counts})
         running = serving_image(self.client, rollout.application(self.client))
         leg["running_image"] = running
+        if self.staging_use:
+            self.staging_use.check(recovery=True)
         require(running == pin["image"], "running_image_mismatch")
         leg["budget_met"] = leg["time_to_ready_seconds"] <= READY_BUDGET_SECONDS
         leg["session_witness"] = evaluate_session(
@@ -687,7 +739,8 @@ class Drill:
             failures.append(self.failed("drill", error))
         except Exception:  # noqa: BLE001 - no traceback: it may carry request data
             failures.append(self.failed("drill", GateError("unexpected_error")))
-        if self.mutated and baseline and not self.auth_failed:
+        control_refused = self.auth_failed or bool(self.staging_use and self.staging_use.failed)
+        if self.mutated and baseline and not control_refused:
             restore_pin = {"source_sha": baseline["source_sha"],
                            "build_id": baseline["build_id"],
                            "image": baseline["image"],
@@ -702,11 +755,25 @@ class Drill:
                 failures.append(self.failed("restore", error))
             except Exception:  # noqa: BLE001
                 failures.append(self.failed("restore", GateError("unexpected_error")))
-        elif self.mutated and self.auth_failed:
-            failures.append("restore_skipped_after_auth_failure")
-            self.log("restore skipped: authentication failed; never substitute credentials. "
+        elif self.mutated and control_refused:
+            failures.append("restore_skipped_after_auth_failure" if self.auth_failed
+                            else "restore_skipped_after_control_refusal")
+            self.log("restore skipped: control refused; never substitute credentials. "
                      "Recover with deploy-staging workflow_dispatch (release_fence=true) once the "
                      "staging ownership binding is fixed.")
+        if self.staging_use:
+            if self.staging_use.expires_at is None:
+                self.evidence["staging_cleanup"] = "not_acquired"
+            elif self.auth_failed or self.staging_use.failed:
+                self.evidence["staging_cleanup"] = "native_expiry_after_control_refusal"
+            else:
+                try:
+                    self.staging_use.finish()
+                    self.evidence["staging_cleanup"] = "release_confirmed"
+                except GateError as error:
+                    failures.append(self.failed("cleanup", error))
+                    self.evidence["staging_cleanup"] = "native_expiry_release_unconfirmed"
+            self.evidence["staging_expires_at"] = self.staging_use.expires_at
         self.evidence["failures"] = failures
         return failures
 
@@ -742,9 +809,10 @@ def evaluate_session(timeline, attestation, fenced, first_ready):
             "reason": "one_ready_version_across_handoff_with_covering_log_count"}
 
 
-def generate_deploy_config(path, image, wrangler_dir):
+def generate_deploy_config(path, image, wrangler_dir, source_sha):
     """Write a staging deploy config identical to `staging_rollout.prepare`
-    except the container image is the pinned pre-built digest reference.
+    except the image is the pinned pre-built digest reference and staging's
+    bounded policy/environment/compiled-image SHA are bound explicitly.
 
     Read from the reviewed `wrangler.toml` on main; the staging image is
     overridden so no old Dockerfile is rebuilt and no old source is checked
@@ -763,6 +831,11 @@ def generate_deploy_config(path, image, wrangler_dir):
             and containers[0].get("max_instances") == 1, "wrong_staging_config")
     require(rollout.mapping(staging.get("version_metadata")).get("binding")
             == "CF_VERSION_METADATA", "missing_worker_version_binding")
+    require(isinstance(source_sha, str) and SHA.fullmatch(source_sha), "invalid_source_sha")
+    staging_vars = rollout.mapping(staging.get("vars", {}))
+    staging_vars.update(STAGING_RUNTIME_POLICY="bounded", TWO_DEPLOY_ENV="staging",
+                        CONTAINER_RELEASE=source_sha)
+    staging["vars"] = staging_vars
     config["main"] = str((source.parent / config["main"]).resolve())
     seen = set()
 
@@ -863,7 +936,7 @@ def dry_run_plan(drill, pin):
     over, or writing evidence.
     """
     try:
-        baseline = drill.preflight(pin)
+        baseline = drill.preflight(pin, dry_run=True)
     except GateError as error:
         drill.failed("drill", error)
         return 1
@@ -879,18 +952,21 @@ def dry_run_plan(drill, pin):
         f"backout rollout_id: {pin['rollout_id']}",
         f"baseline worker_version: {baseline['worker_version']}",
         f"baseline image: {baseline['image']}",
+        "live use: one 25-minute run/attempt window, exact-SHA baseline readiness",
+        "each new deployed Worker is policy/SHA-proved, then rebound to the original expiry",
         "legs in order:",
         f"1. drill: fence singleton, deploy {pin['image']}, "
-        f"takeover to {pin['worker_version']}, wait converged ready",
+        f"takeover to newly proved Worker (historical {pin['worker_version']}), wait converged ready",
         f"2. restore: fence singleton, deploy {baseline['image']}, "
-        f"takeover to {baseline['worker_version']}, wait converged ready",
+        f"takeover to newly proved Worker (baseline {baseline['worker_version']}), wait converged ready",
         "mutations: none (plan only; no deploy, no fence, no takeover)",
     ]))
     return 0
 
 
 def main(argv=None, *, environ=None, make_control=ownership_control,
-         client_factory=ContainerDrillClient, deploy_factory=wrangler_deploy):
+         client_factory=ContainerDrillClient, deploy_factory=wrangler_deploy,
+         make_staging_use=StagingDrillUse):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backout-source-sha", required=True)
     parser.add_argument("--backout-build-id", required=True)
@@ -932,11 +1008,12 @@ def main(argv=None, *, environ=None, make_control=ownership_control,
             Path(__file__).resolve().parents[1] / "wrangler")
         client = client_factory(env.get("CLOUDFLARE_ACCOUNT_ID"),
                                 env.get("CLOUDFLARE_API_TOKEN"))
+        use = make_staging_use(env, url, token)
         drill = Drill(client, make_control(token, url, actor), url, run_id,
                       (args.deploy_config,
                        deploy_factory(args.wrangler_bin, wrangler_dir, env),
                        wrangler_dir),
-                      log=print)
+                      log=print, staging_use=use)
         if args.dry_run:
             return dry_run_plan(drill, pin)
         failures = drill.run(pin, attestation)
