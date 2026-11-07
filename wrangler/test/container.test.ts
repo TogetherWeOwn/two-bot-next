@@ -386,6 +386,38 @@ test("bounded staging: DO reconstruction after expiry stops a reattached process
   assert.equal((await reconstructed.bot.listSchedules("stagingExpiry")).length, 0);
 });
 
+test("bounded staging: first activation drains a running predecessor and its ungranted legacy keepalive", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
+  const predecessor = await harness(t, WORKER_ENV, { running: true });
+  await predecessor.bot.onStart();
+  const [oldTick] = await predecessor.bot.listSchedules<typeof KEEPALIVE>("keepalive");
+  assert.ok(oldTick);
+  for (const key of ["runId", "runAttempt", "expiresAt"]) {
+    assert.equal(key in oldTick.payload!, false, "legacy rows carry no finite-use identity");
+  }
+  assert.equal(predecessor.runtime.running, true);
+  assert.equal(predecessor.values.has(STAGING_USE_KEY), false, "no grant has ever been stored");
+
+  const activated = await harness(t, BOUNDED_STAGING_ENV,
+    { values: predecessor.values, running: true }, predecessor.database);
+  assert.equal(activated.runtime.running, false, "construction drains before ingress or alarm delivery");
+  assert.equal(activated.runtime.destroys, 1);
+  assert.equal(activated.pending().length, 0, "construction deletes persisted legacy rows");
+  assert.equal((await activated.bot.listSchedules("stagingExpiry")).length, 0);
+  assert.equal(activated.starts.length, 0);
+  assert.equal(activated.requests.length, 0);
+
+  await activated.bot.keepalive(oldTick.payload!, oldTick);
+  t.mock.timers.tick(60_000);
+  await activated.bot.alarm();
+  assert.equal(activated.runtime.running, false);
+  assert.equal(activated.pending().length, 0, "a queued legacy callback cannot rearm");
+  assert.equal((await activated.bot.listSchedules("stagingExpiry")).length, 0);
+  assert.equal(activated.values.has(STAGING_USE_KEY), false);
+  assert.equal(activated.starts.length, 0, "a queued legacy callback cannot restart");
+  assert.equal(activated.requests.length, 0, "a queued legacy callback cannot probe");
+});
+
 test("bounded staging: cleanup from an older run cannot stop the new consumer", async (t) => {
   const h = await harness(t, BOUNDED_STAGING_ENV);
   const first = stagingWindow();

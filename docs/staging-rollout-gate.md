@@ -2,7 +2,7 @@
 
 `deploy-staging.yml` runs `scripts/staging_rollout.py` before and after a
 successful Wrangler deployment (the `deploy` job was re-enabled by
-[TOG-12856](/TOG/issues/TOG-12856)). Order: ownership-control `preflight`,
+the earlier deploy re-enable). Order: ownership-control `preflight`,
 `prepare`, Wrangler deploy, `receipt`, ownership-control `deployment-takeover`,
 `verify`. `preflight` and `deployment-takeover` live outside
 `staging_rollout.py`. Readiness cannot be proven before the takeover, because a
@@ -36,13 +36,15 @@ cleanup is useful but cannot be the cancellation/runner-loss backstop. Productio
 behavior, probes and release gates are unchanged. Never add a host timer, idle
 keepalive or scheduled probe that resurrects staging outside an authorized window.
 
-**Rollout status: incomplete, not activated.** The staging-use protocol in
-`wrangler/src/staging-lifecycle.ts` is gated by the staging-only
-`STAGING_RUNTIME_POLICY=bounded` configuration. That setting is not installed by
-this protocol checkpoint. The existing deployment and synthetic workflows below
-are not yet evidence of the complete bounded lifecycle; pipeline integration and
-live acceptance are still required. Do not enable the policy or claim savings
-from source code or a sleeping container alone.
+**Rollout status: activation by merge, not yet verified.** The staging-use
+protocol in `wrangler/src/staging-lifecycle.ts` is gated by the staging-only
+`STAGING_RUNTIME_POLICY=bounded` configuration. The policy ships in the staging
+vars of the activating change, so merging it activates the policy through the
+ordinary `deploy-staging` push run. Nothing here records that activation as done.
+Source, a merge or a sleeping container is not evidence of the bounded lifecycle:
+only the live qualification, rollback proof and measurement gates below establish
+it. Claim no savings until they pass. See
+[First activation roll-forward bootstrap](#first-activation-roll-forward-bootstrap).
 
 The protocol binds a finite window to staging, an exact Worker deployment and
 container SHA, the current ownership epoch, and a workflow run/attempt. It
@@ -134,13 +136,14 @@ The deploy, reusable voice/help, manual Worker/container drills, MCP proof and
 production staging-soak workflows now declare the bounded contract. Scheduled
 user-flow and slow-burn readers observe authority without starting or extending
 it; confirmed idle skips live sampling and incident decisions, not active-use
-checks. This is **source integration, not activation or live qualification**.
-Exact-head Actions, live inventory, finite-safe bootstrap/rollback and independent
-review still gate rollout. The wrappers replace no existing qualification. The binding checker
+checks. This is source integration whose merge is the activation trigger, not a recorded
+activation or live qualification. Exact-head Actions, live inventory, the
+first-activation bootstrap and rollback proof, and independent review still gate
+rollout. The wrappers replace no existing qualification. The binding checker
 permits only an absent policy or the exact `"bounded"` value in staging with
 `TWO_DEPLOY_ENV="staging"`; it rejects top-level, production and other named
-environment placement and plaintext ownership-control tokens. No checked-in
-configuration enables the policy at this checkpoint.
+environment placement and plaintext ownership-control tokens. The staging vars
+carry `bounded`; no top-level, production or other environment sets it.
 
 Every CLI invocation requires a pipeline-owned `STAGING_USE_RECEIPT` NDJSON path
 and writes an attempt receipt before network activity, followed by a projected
@@ -233,7 +236,53 @@ image, SHA, ownership epoch, configuration and migration ledger. A rollback
 target must preserve finite-use expiry; reverting to indefinite always-on staging
 requires an explicit dated owner cost exception naming scope, recurring cost and
 expiry/review date. No such exception is supplied here. Bootstrap/rollback
-compatibility must be resolved before activation, not after a failed rollout.
+compatibility is resolved by the roll-forward rule below, before the merge.
+
+### First activation roll-forward bootstrap
+
+Activation is the ordinary `deploy-staging` push run for the change that ships
+`STAGING_RUNTIME_POLICY=bounded` in the staging vars. There is no wrapper or
+separate activation step and no baseline taken beforehand.
+
+- **Predecessors are not restore targets.** The currently deployed staging
+  versions (v875, v876 and v877) predate the policy and are unbounded. They are
+  never valid restore targets, because restoring one reverts to indefinite
+  always-on staging. Only a dated owner cost exception could change this, and none
+  exists.
+- **The first bounded deploy has no restore target.** Automatic rollback refuses
+  with `staging_restore_policy_unproved` before any mutation (fence, Worker
+  restore or image rollout).
+- **If a step fails after a successful deploy**, the bounded code is already
+  serving and stops through release, native expiry and the constructor refusing
+  ungranted legacy ticks. Expiry and stop receipts are the evidence; the red run
+  never certifies the build.
+- **If `wrangler deploy` itself fails**, remote state is unconfirmed. A lost
+  response can follow an accepted publication; a failed command proves neither
+  that the predecessor remained serving nor that bounded code was installed.
+  Automatic rollback runs only when the deploy step reports success. Reconcile
+  the actual serving Worker version/policy and Container rollout/image through
+  authorized read-only inventory before recovery. Claim no stop or qualification
+  from this branch; bounded roll-forward-only recovery still applies.
+- **Recovery is roll-forward only.** Fix forward with a new bounded build. Never
+  revert the policy or restore an unbounded version to recover.
+- **Baseline B1.** The first run that passes all five qualifying jobs
+  (`deploy`, `user-flow-synthetic`, `voice-synthetic`, `help-embed-synthetic`,
+  `certify-promotion`) plus `staging-use-release` becomes baseline B1 and supplies
+  the first rollback receipt.
+- **Rollback proof before any savings claim.** A fault-injection deploy must show
+  a finite rollback to B1 that keeps the original expiry and ends with confirmed
+  stopped status. Until it passes, make no savings claim.
+- **Later red builds.** An existing snapshot may select a prior bounded build that
+  was red, since the policy bindings are what matter. The unchanged 18-pass stable
+  restore gate still applies to it.
+
+Every gate in this document stays in force: exact-head Actions, Security then QA,
+separate per-PR exact-head Release Manager acceptance before merge, fresh inventory
+of the actual database, shared policy and applied migration ledger, exact-head
+qualification, and the `t0`, pre-7-day and post-7-day evidence below. The bootstrap
+sequence is a technical recovery decision, not approval to merge, deploy production
+or waive missing qualification. The merge-push qualification and rollback drill
+remain required live activation evidence.
 
 At verified activation record UTC `t0`, actual resource/version/SHA identities,
 finite expiry, exact-head startup/qualification evidence, stop/idle convergence
@@ -254,7 +303,7 @@ merge or an unverified deployment is not `t0`.
 3. `receipt` (steps 3-4 below) needs only Wrangler's output file, local Docker and
    the Worker versions API, so it runs **before** ownership moves. A malformed,
    stale or wrong-environment receipt therefore never hands ownership to an
-   unverified version ([TOG-12939](/TOG/issues/TOG-12939): the first real run
+   unverified version (the first real run
    failed here, after takeover, because the receipt gate had never seen real
    Wrangler output).
 4. `verify` (steps 5-7) needs an owning singleton: a parked singleton answers
@@ -495,7 +544,9 @@ pinned client documents a `last` input but does not establish a trustworthy
 next-cursor/ordering contract, so a saturated page fails with
 `rollout_snapshot_truncated` rather than pretending the baseline is complete.
 First-deploy/bootstrap and no-new-rollout cases also fail; they are not evidence
-that a new revision was rolled out. No automatic rollback or secret mutation is
+that a new revision was rolled out. The first bounded activation is handled by the
+[roll-forward bootstrap](#first-activation-roll-forward-bootstrap), not by this
+gate's rollback. No automatic rollback or secret mutation is
 performed by `scripts/staging_rollout.py` itself; rollback is a workflow step that
 invokes `scripts/worker_container_rollback.py`. The local baseline receipt is
 type- and shape-validated before `select_rollout`, `receipt` or `verify` acts

@@ -820,8 +820,8 @@ next active window the unchanged evaluator still detects real gaps and requires
 full history before clearing a burn. A running container after expiry/release,
 malformed authority or a failed control read fails closed, not idle/healthy.
 The existing `STAGING_OWNERSHIP_CONTROL_TOKEN` is isolated in the observer step;
-it never reaches the scrape/evaluator. This integration remains unactivated
-until the [lifecycle activation gates](staging-rollout-gate.md#no-always-on-staging-rule-and-activation-hold)
+it never reaches the scrape/evaluator. This integration is not verified
+until the [lifecycle activation gates](staging-rollout-gate.md#first-activation-roll-forward-bootstrap)
 pass; an idle receipt proves neither database suspension nor zero billed usage.
 
 #### Alert: voice creator-map stale
@@ -2902,7 +2902,7 @@ measurement and cannot prove B2's under-60-second recovery criterion. An empty
 which also runs on a daily schedule and verifies both Worker and image restoration.
 Gateway-session count is not observable from probes; read the Worker logs for it.
 
-The finite-use implementation (still under the [activation hold](staging-rollout-gate.md#no-always-on-staging-rule-and-activation-hold))
+The finite-use implementation (activated by merge through the ordinary staging deploy; see the [first-activation bootstrap](staging-rollout-gate.md#first-activation-roll-forward-bootstrap) and its unmet live gates)
 validates immutable bounded-policy/environment/SHA bindings on **both** Worker
 versions before startup. Both must stamp the same compiled-image SHA: a
 Worker-only rollback cannot change the image. Old always-on, unstamped or
@@ -2938,7 +2938,7 @@ below (every other relative image path is absolutized, because
 the generated file lives outside the wrangler directory and wrangler
 resolves config-relative paths against it).
 
-Finite use remains under the same [activation hold](staging-rollout-gate.md#no-always-on-staging-rule-and-activation-hold).
+Finite use follows the same [roll-forward bootstrap](staging-rollout-gate.md#first-activation-roll-forward-bootstrap): the pre-policy v875-v877 versions are never restore targets, and only B1 or later bounded builds are.
 Both historical Worker targets must prove immutable bounded/staging/SHA
 bindings before any startup; an indefinite rollback target is refused. The
 live drill acquires one 25-minute run/attempt grant and exact-SHA baseline
@@ -2956,7 +2956,7 @@ expiry responsible, never claims stop. The always-uploaded
 and original expiry even on failed runs; runner loss/cancellation still rely
 on runtime expiry. `--dry-run` proves policy and pins but acquires nothing
 and refuses an idle baseline. Production configuration and behavior are
-unchanged, and this drill does not authorize the held activation.
+unchanged, and this drill does not record or authorize activation.
 
 Dispatch contract (all pins immutable; `latest` and mutable tags are refused):
 `backout_source_sha` (40-hex), `backout_build_id`, `backout_image`

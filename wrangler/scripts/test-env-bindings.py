@@ -214,6 +214,16 @@ class AlertBindingTests(unittest.TestCase):
                 config = BASE.replace('TWO_DEPLOY_ENV = "staging"', f"TWO_DEPLOY_ENV = {value}")
                 self.assertTrue(any('must be exactly "staging"' in e for e in self.check_config(config)))
 
+    def test_deployed_staging_config_enables_bounded_policy_only_in_staging(self):
+        path = Path(__file__).parents[1] / "wrangler.toml"
+        config = checker.tomllib.loads(path.read_text())
+        self.assertEqual(checker.check(path), [])
+        staging_vars = config["env"]["staging"]["vars"]
+        self.assertEqual(staging_vars["STAGING_RUNTIME_POLICY"], "bounded")
+        self.assertEqual(staging_vars["TWO_DEPLOY_ENV"], "staging")
+        self.assertNotIn("STAGING_RUNTIME_POLICY", config.get("vars", {}))
+        self.assertNotIn("STAGING_RUNTIME_POLICY", config["env"]["production"]["vars"])
+
     def test_staging_runtime_policy_is_opt_in_and_staging_only(self):
         self.assertNotIn("STAGING_RUNTIME_POLICY", BASE)
         self.assertEqual(self.check_config(BASE), [])

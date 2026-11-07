@@ -123,8 +123,9 @@ startup, every required ACTIVE hour and cleanup. Independently verify the exact
 SHA/environment and readiness before starting qualification. Keep native runtime
 expiry as the runner-loss backstop; release on success, failure and cancellation.
 Inventory DO alarms, Containers, database compute/suspend and shared consumers;
-a stopped bot alone is not zero idle cost. This does not authorize activation or
-satisfy any unverified precondition above.
+a stopped bot alone is not zero idle cost. Policy activation is by merge through the
+[roll-forward bootstrap](staging-rollout-gate.md#first-activation-roll-forward-bootstrap);
+this does not record activation or satisfy any unverified precondition above.
 
 Expiry or stop during required ACTIVE evidence is an interruption, not a passing
 sample or an implicit pause/reset. Preserve the original acceptance criteria and
