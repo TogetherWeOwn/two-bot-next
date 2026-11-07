@@ -29,6 +29,7 @@ async fn fixture() -> TestDb {
         "order-fixture-b",
         "order-fixture-c",
         "order-fixture-d",
+        "order-fixture-e",
     ] {
         claimed(
             db.store()
@@ -164,8 +165,10 @@ async fn allocation_uses_fence_arrival_not_transaction_start_and_clamps_clock() 
         "SELECT 1, '2000-01-01Z'",
         "SELECT 5000, clock_timestamp() + interval '1 day'",
     );
+    // Reserve a separate intent for the historical row: the four allocations
+    // in this test must retain distinct (intent_id, phase) terminal identities.
     let high_water: (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(old_sql))
-        .bind(1_i64)
+        .bind(4_i64)
         .fetch_one(&other)
         .await
         .unwrap();
