@@ -31,6 +31,8 @@ point and its deletion budget are unchanged) and the exclusion window grows:
   ordinary guarded deploys enter it (never rollback or the live-SHA cure),
   one original grant bound to the guarded SHA covers every live read from
   baseline through the fresh interval, final probe and post-sample recheck,
+  that grant is capped at 40 minutes while the job ceiling (at most 50) keeps
+  at least 10 minutes past it for checkout, stop and evidence,
   an always-run release closes it, only lifecycle-only steps see the control
   credential and the run/attempt evidence is always retained. No other
   deploy-production node (workflow, guard, gates, recheck, production lane)
@@ -618,7 +620,12 @@ SOAK_CLAUSES = ("needs.guard.outputs.skip == ''", "needs.guard.outputs.mode == '
                 "needs.guard.outputs.allow_unstaged != 'true'")
 # Any of these can re-admit a failed/cancelled/rollback path into a condition.
 WIDENING = ("||", "always()", "cancelled()", "failure()")
+# The grant (original authority) stays capped at 40 minutes. The job ceiling is
+# separate and must leave at least 10 minutes past the grant for checkout and
+# the always-run stop/artifact steps; expiry is never renewed to fit.
 MAX_SOAK_MINUTES = 40
+MAX_SOAK_JOB_MINUTES = 50
+MIN_SOAK_STOP_MARGIN_MINUTES = 10
 # A credential-bearing step may run exactly one lifecycle client command.
 LIFECYCLE_ONLY = re.compile(r"node wrangler/scripts/(?:staging-use(?:-pipeline)?\.mjs [a-z]+|"
                             r"staging-soak-window\.mjs)")
@@ -650,11 +657,18 @@ def soak_step_errors(job):
         errors.append("soak: acquire must refuse any build but the guarded SHA")
     if str(env.get("OWNERSHIP_CONTROL_TOKEN", "")) != OWNERSHIP_TOKEN:
         errors.append("soak: acquire must use the staging control credential")
+    # Budget findings never short-circuit the structural checks below.
+    budget = []
     minutes, timeout = str(env.get("STAGING_USE_MINUTES", "")), str(job.get("timeout-minutes", ""))
-    if not (minutes.isdigit() and timeout.isdigit()
-            and 0 < int(minutes) <= int(timeout) <= MAX_SOAK_MINUTES):
-        errors.append("soak: grant and job must hold one literal bounded expiry "
-                      f"(0 < minutes <= timeout <= {MAX_SOAK_MINUTES})")
+    if not (minutes.isdigit() and 0 < int(minutes) <= MAX_SOAK_MINUTES):
+        budget.append("soak: grant must hold one literal bounded expiry "
+                      f"(0 < minutes <= {MAX_SOAK_MINUTES})")
+    if not (timeout.isdigit() and 0 < int(timeout) <= MAX_SOAK_JOB_MINUTES):
+        budget.append("soak: job must hold one literal bounded timeout "
+                      f"(0 < timeout <= {MAX_SOAK_JOB_MINUTES})")
+    elif minutes.isdigit() and int(timeout) - int(minutes) < MIN_SOAK_STOP_MARGIN_MINUTES:
+        budget.append("soak: job timeout must exceed the grant by at least "
+                      f"{MIN_SOAK_STOP_MARGIN_MINUTES} minutes for stop and evidence")
     binding = {"STAGING_USE_EXPIRES_AT": expr(f"steps.{gid}.outputs.expires_at"),
                "STAGING_USE_DEPLOYMENT": expr(f"steps.{gid}.outputs.deployment_id"),
                "STAGING_USE_SHA": GUARD_SHA}
@@ -680,7 +694,7 @@ def soak_step_errors(job):
     if len(releases) != 1:
         errors.append(f"soak: must release the original grant exactly once (found {len(releases)})")
     if errors:
-        return errors
+        return errors + budget
     window, judge, release = windows[0], judges[0], releases[0]
     after = [i for i in readies if judge < i < release]
     if not (any(start < i < window for i in baselines) and start < window < judge):
@@ -722,7 +736,7 @@ def soak_step_errors(job):
                and str(receipt) in str((step.get("with") or {}).get("path"))
                for step in retained):
         errors.append("soak: lifecycle evidence must always be retained per run attempt")
-    return errors
+    return errors + budget
 
 
 def promotion_soak_errors(wfs, canonical):
@@ -882,7 +896,7 @@ def soak_fixture(lock):
     metrics = {**url, "METRICS_SCRAPE_TOKEN": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"}
     return {
         "needs": "guard", "if": " && ".join(SOAK_CLAUSES), "concurrency": lock,
-        "environment": {"name": "staging", "deployment": "false"}, "timeout-minutes": "40",
+        "environment": {"name": "staging", "deployment": "false"}, "timeout-minutes": "45",
         "outputs": {"skip": expr("steps.verdict.outputs.skip"),
                     "evidence": expr("steps.verdict.outputs.evidence")},
         "steps": [
@@ -1582,12 +1596,29 @@ class PromotionSoakControls(unittest.TestCase):
                 "refuse any build but the guarded SHA")
         self.assert_mutation_rejected(lambda w, j, s, p: acquire(s).update({"if": "success()"}),
                                       "acquire must be an unconditional step")
-        for minutes, timeout in (("0", "40"), ("41", "41"), ("${{ inputs.minutes }}", "40"),
-                                 ("40", "39"), ("360", "360"), ("40", "")):
-            def bound(w, j, s, p, m=minutes, t=timeout):
+        def bound(m, t):
+            def mutate(w, j, s, p):
                 acquire(s)["env"]["STAGING_USE_MINUTES"] = m
                 s["timeout-minutes"] = t
-            self.assert_mutation_rejected(bound, "one literal bounded expiry")
+            return mutate
+        # Grant (original authority) cap, even when the job ceiling fits.
+        for minutes, timeout in (("0", "40"), ("41", "50"), ("41", "41"), ("360", "360"),
+                                 ("${{ inputs.minutes }}", "50"), ("", "50")):
+            self.assert_mutation_rejected(bound(minutes, timeout), "grant must hold one literal bounded expiry")
+        with mock.patch(f"{__name__}.MAX_SOAK_JOB_MINUTES", 60):
+            self.assert_mutation_rejected(bound("41", "55"), "grant must hold one literal bounded expiry")
+        # Job ceiling.
+        for minutes, timeout in (("40", "51"), ("40", ""), ("40", "${{ inputs.timeout }}"), ("40", "0")):
+            self.assert_mutation_rejected(bound(minutes, timeout), "job must hold one literal bounded timeout")
+        # Stop/evidence margin: equal, shorter or under-margin timeouts fail.
+        for minutes, timeout in (("40", "40"), ("40", "39"), ("40", "49"), ("35", "44"), ("1", "10")):
+            self.assert_mutation_rejected(bound(minutes, timeout), "exceed the grant by at least 10 minutes")
+        for minutes, timeout in (("40", "50"), ("30", "40"), ("1", "11")):
+            for label, wfs in self.variants():
+                soak = wfs[PRODUCTION]["jobs"][SOAK]
+                bound(minutes, timeout)(wfs, None, soak, None)
+                with self.subTest(source=label, minutes=minutes, timeout=timeout):
+                    self.assertFalse([e for e in soak_step_errors(soak) if "minutes" in e or "timeout" in e])
         for needle in (SOAK_WINDOW, "mjs consume", "mjs finish"):
             for var, value in (("STAGING_USE_EXPIRES_AT", "${{ github.run_id }}"),
                                ("STAGING_USE_RECEIPT", "/tmp/other.ndjson")):
