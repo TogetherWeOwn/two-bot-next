@@ -97,7 +97,7 @@ separate authorization.
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.152.0 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.156.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.

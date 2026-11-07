@@ -363,6 +363,13 @@ jobs:
           # Deploys must not consume caches populated by untrusted PR checks.
           package-manager-cache: false
       - run: npm ci
+      - name: Select Wrangler from the deploy checkout
+        id: wrangler
+        run: |
+          set -euo pipefail
+          version=$(node -p 'require("./package-lock.json").packages["node_modules/wrangler"].version')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Deploy lockfile must pin an exact Wrangler version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       # Validate the dedicated staging control binding BEFORE replacing a healthy
       # deployment. Missing credentials are not permission to auto-claim an owner.
       - name: Require staging ownership-control configuration
@@ -453,7 +460,9 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           environment: staging
-          wranglerVersion: "4.152.0"
+          # A pinned drill uses its deploy checkout's CLI and receipt guard,
+          # not the version belonging to this workflow's newer main commit.
+          wranglerVersion: ${{ steps.wrangler.outputs.version }}
           # --message stamps the version's immutable workers/message
           # annotation with the deployed commit, the SHA member of the
           # rollback provenance receipt the next snapshot records (as
