@@ -9,6 +9,7 @@ import copy
 import io
 import json
 import os
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -43,6 +44,18 @@ OVERFLOW_SENTENCE = "This release is too large to preview in the pull request bo
 PR_HEAD = "release-please--branches--main--components--two-bot-next"
 STORED_NOTES = f"## 0.2.0\n\n### Added\n\n* generated feature\n\n---\nFixes #12.\n"
 OVERFLOW_LINK = f"{OVERFLOW_SENTENCE} https://github.com/TogetherWeOwn/two-bot-next/blob/{PR_HEAD}--release-notes/release-notes.md"
+# A neutered working-tree gate: no attestation findings, always passes. The
+# check step must never import this copy: it always judges PRs with the
+# base-branch copy, so staging it proves which copy the step loads (a step
+# that imported the head copy would pass a T0 gate edit with no attestation).
+WEAKENED_HEAD_GATE = (
+    "def attestation_findings(body, paths):\n"
+    "    return []\n"
+    "\n"
+    "def main(env=None):\n"
+    "    print('PR conventions OK')\n"
+    "    return 0\n"
+)
 PR = {
     "title": TITLE, "body": BODY, "author": {"login": "github-actions[bot]"},
     "state": "OPEN", "baseRefName": "main", "headRefOid": "a" * 40,
@@ -124,7 +137,7 @@ class PRLintTests(unittest.TestCase):
             self.assertLess(output.stat().st_size, 4096, "Step outputs must stay small even for oversized notes")
             return metadata
 
-    def validate(self, metadata, success=True):
+    def validate(self, metadata, success=True, base_gate=True, head_gate=None):
         metadata = dict(metadata)
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             if "body" in metadata:
@@ -133,15 +146,39 @@ class PRLintTests(unittest.TestCase):
                 path = Path(tmp) / "body.md"
                 path.write_text(metadata.pop("body"), encoding="utf-8")
                 metadata["body_file"] = str(path)
+            if "changed_files" in metadata:
+                # CHECK reads the changed-file list from a file, never env.
+                changed_path = Path(tmp) / "changed-files.txt"
+                changed_path.write_text(metadata.pop("changed_files"), encoding="utf-8")
+                metadata["changed_files_file"] = str(changed_path)
+            # Mirror CI: the check step imports the gate from the base-branch
+            # checkout (base-gate/), never the working tree. The base copy is
+            # a symlink to this repo; a head_gate fixture stages a weakened
+            # working-tree copy to prove the head copy is never imported.
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            if base_gate:
+                (ws / "base-gate").symlink_to(ROOT)
+            if head_gate is not None:
+                scripts = ws / ".github" / "scripts"
+                scripts.mkdir(parents=True)
+                (scripts / "pr_standards.py").write_text(head_gate, encoding="utf-8")
+            else:
+                (ws / ".github").symlink_to(ROOT / ".github")
             env = {key.upper(): value for key, value in metadata.items()}
             # Mirror the check step's env in supply-chain.yml: this repo is
             # public, requires no card reference, and starts the new
-            # body/reference rules in warn mode. The bridge resolves the
-            # scripts from the workspace root, as CI does.
+            # body/reference rules in warn mode. The workspace is the staged
+            # CI layout above, not the repo root.
             env.setdefault("REPO_PRIVATE", "false")
             env.setdefault("REQUIRE_CARD_REF", "false")
             env.setdefault("PR_STANDARDS_MODE", "warn")
-            env.setdefault("GITHUB_WORKSPACE", str(ROOT))
+            env["GITHUB_WORKSPACE"] = str(ws)
+            if head_gate is not None:
+                # Drop the cached gate so this exec really imports through the
+                # staged layout: with the head copy weakened, only the base
+                # copy fails the gate, proving which copy the step loads.
+                sys.modules.pop("pr_standards", None)
             stdout = io.StringIO()
             with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(stdout):
                 if success:
@@ -171,7 +208,13 @@ class PRLintTests(unittest.TestCase):
             env.setdefault("REPO_PRIVATE", "false")
             env.setdefault("REQUIRE_CARD_REF", "false")
             env.setdefault("PR_STANDARDS_MODE", "warn")
-            env.setdefault("GITHUB_WORKSPACE", str(ROOT))
+            # Mirror CI: the child imports the gate from the base-branch
+            # checkout, never the working tree.
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            (ws / "base-gate").symlink_to(ROOT)
+            (ws / ".github").symlink_to(ROOT / ".github")
+            env["GITHUB_WORKSPACE"] = str(ws)
             for key, value in env.items():
                 if key != "BODY_FILE":
                     self.assertLess(len(value), 4096, f"Child env {key} must stay small")
@@ -312,6 +355,32 @@ class PRLintTests(unittest.TestCase):
 
     def test_unconventional_title_fails(self):
         self.validate({**self.resolve(), "title": "Ship release"}, success=False)
+
+    def test_gate_edit_without_attestation_fails(self):
+        # End to end through the real check step: a PR that edits the gate
+        # with no attestation fails, judged by the base-branch copy.
+        metadata = self.resolve(EVENT_NAME="pull_request", EVENT_HEAD_REF="fix/harden-gate",
+                                EVENT_AUTHOR="contributor")
+        output = self.validate({**metadata, "changed_files": ".github/scripts/pr_standards.py\n"},
+                               success=False)
+        self.assertIn("::error title=Attestation::", output)
+
+    def test_missing_base_gate_fails_closed(self):
+        # Without the base-branch checkout the step must fail, never fall back
+        # to the PR's own copy.
+        metadata = self.resolve()
+        output = self.validate({**metadata}, success=False, base_gate=False)
+        self.assertIn("Base-branch gate checkout is missing", output)
+
+    def test_weakened_head_copy_is_ignored(self):
+        # The working-tree gate is neutered, but the step still fails a T0
+        # gate edit: it imports the base-branch copy, never the head copy.
+        metadata = self.resolve(EVENT_NAME="pull_request", EVENT_HEAD_REF="fix/harden-gate",
+                                EVENT_AUTHOR="contributor")
+        output = self.validate(
+            {**metadata, "changed_files": ".github/workflows/supply-chain.yml\n"},
+            success=False, head_gate=WEAKENED_HEAD_GATE)
+        self.assertIn("::error title=Attestation::", output)
 
     def test_delimiter_cannot_spoof_dependency_bot_exemption(self):
         self.validate(self.resolve({**copy.deepcopy(PR), "title": "Invalid title"}), success=False)

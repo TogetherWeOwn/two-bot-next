@@ -38,6 +38,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from email.message import Message
 from pathlib import Path
@@ -554,6 +555,87 @@ class ColdAndLagServingTests(unittest.TestCase):
                 result = self.attempt(routes=routes, preflight=True, url=None)
                 self.assert_refused(result)
                 self.assertEqual(result[3].runtime_calls, [])
+
+    def test_preflight_timeout_names_rollout_listing_wait(self):
+        routes = self.live_routes(converged_row(ROLL_ID, PROD_IMAGE))
+        routes[f"/containers/applications/{APP_ID}/rollouts?limit=100"] = \
+            lambda: []
+        code, message, proof, plane, _ = self.attempt(
+            routes=routes, preflight=True, url=None)
+        self.assert_refused((code, message, proof, plane, None))
+        self.assertIn("(awaiting_rollout_listing)", message)
+        self.assertEqual(plane.runtime_calls, [])
+
+    def test_preflight_timeout_names_application_config_wait(self):
+        routes = self.live_routes(converged_row(ROLL_ID, PROD_IMAGE),
+                                  app_image=OLD_IMAGE)
+        code, message, proof, plane, _ = self.attempt(
+            routes=routes, preflight=True, url=None)
+        self.assert_refused((code, message, proof, plane, None))
+        self.assertIn("(awaiting_application_config)", message)
+        self.assertEqual(plane.runtime_calls, [])
+
+    def test_final_timeout_without_url_names_runtime_convergence_wait(self):
+        result = self.attempt(self.lag_row(), url=None)
+        self.assert_refused(result)
+        self.assertIn("(awaiting_runtime_convergence)", result[1])
+        self.assertEqual(result[3].runtime_calls, [])
+
+    def test_rollout_timeout_after_unaccepted_poll_names_wait(self):
+        # A control-plane read straddling the shared 600s deadline raises
+        # rollout_timeout after unaccepted polls: the same expiry as the
+        # clean while-exit, so it takes the timeout verdict with the last
+        # wait class. No proof, no runtime probes. The stub consults the
+        # mocked clock (patched over time.monotonic during the attempt)
+        # and raises only on a poll starting inside the final 5s, modelling
+        # the real deadline straddle instead of failing an early poll.
+        started = []
+        routes = self.live_routes(converged_row(ROLL_ID, PROD_IMAGE))
+
+        def listing():
+            now = time.monotonic()
+            if not started:
+                started.append(now)
+                return []
+            if now - started[0] < 595.0:
+                return []
+            raise base.GateError("rollout_timeout")
+
+        routes[f"/containers/applications/{APP_ID}/rollouts?limit=100"] = listing
+        result = self.attempt(routes=routes, preflight=True, url=None)
+        self.assert_refused(result)
+        code, message, proof, plane, clock = result
+        self.assertGreaterEqual(len(clock.sleeps), 100)
+        self.assertIn("; image did not converge (awaiting_rollout_listing)",
+                      message)
+        self.assertIsNone(proof)
+        self.assertEqual(plane.runtime_calls, [])
+
+    def test_non_timeout_gate_error_stays_bare_refusal(self):
+        # Every other GateError keeps the byte-identical bare refusal,
+        # even when raised at the same deadline boundary after unaccepted
+        # polls set the wait class.
+        started = []
+        routes = self.live_routes(converged_row(ROLL_ID, PROD_IMAGE))
+
+        def listing():
+            now = time.monotonic()
+            if not started:
+                started.append(now)
+                return []
+            if now - started[0] < 595.0:
+                return []
+            raise base.GateError("api_http_failure")
+
+        routes[f"/containers/applications/{APP_ID}/rollouts?limit=100"] = listing
+        result = self.attempt(routes=routes, preflight=True, url=None)
+        self.assert_refused(result)
+        code, message, proof, plane, clock = result
+        self.assertGreaterEqual(len(clock.sleeps), 100)
+        self.assertEqual(message.strip(),
+                         "serving: promoted production identity refused")
+        self.assertIsNone(proof)
+        self.assertEqual(plane.runtime_calls, [])
 
     def test_both_lag_shapes_need_two_exact_live_health_and_readyz_confirmations(self):
         for active, healthy in ((0, 1), (1, 0)):

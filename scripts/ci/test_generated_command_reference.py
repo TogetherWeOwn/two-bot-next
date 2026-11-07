@@ -15,6 +15,7 @@ silently skipped: supplying both binaries explicitly selects that suite.
 
 import argparse
 import contextlib
+import errno
 import importlib.util
 import io
 import os
@@ -57,7 +58,37 @@ def logical_lines(script):
             if line.strip() and not line.lstrip().startswith("#")]
 
 
+NIGHTLY_HELPER = ".github/scripts/nightly_partition.py"
+
+
+def helper_compile_modes():
+    """Helper modes that spawn `cargo test --workspace` (compile or doctest).
+
+    Read from the helper itself so the census follows the implementation: plan
+    and run call discover(), whose CARGO build uses --no-run; docs runs CARGO
+    with --doc. Aggregate never spawns cargo.
+    """
+    import ast
+    source = (ROOT / NIGHTLY_HELPER).read_text()
+    tree = ast.parse(source)
+    cargo = next(ast.literal_eval(node.value) for node in ast.walk(tree)
+                 if isinstance(node, ast.Assign)
+                 and any(getattr(t, "id", "") == "CARGO" for t in node.targets))
+    if cargo[:3] != ["cargo", "test", "--workspace"]:
+        return set()
+    modes = set()
+    consts = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant)}
+    if "--no-run" in consts:
+        modes |= {"plan", "run"}
+    if "--doc" in consts:
+        modes.add("docs")
+    return modes
+
+
 def compiles_reference_consumers(line):
+    helper = re.search(r"nightly_partition\.py\s+(plan|run|docs|aggregate)\b", line)
+    if helper:
+        return helper.group(1) in helper_compile_modes()
     executable = r'(?:\bcargo|"\$COV")\s+'
     if not re.search(executable + r"(?:test|clippy|build|check|nextest\s+run|llvm-cov)\b", line):
         return False
@@ -106,25 +137,107 @@ with mock.patch.object(unittest.TextTestRunner, "run") as run:
             capture_output=True, text=True, check=False, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_controller_mode_is_explicit_opt_in_only(self):
+    def test_controller_mode_selection(self):
         generator = load_script("generate_command_reference")
         cases = (
-            ([], {"PAPERCLIP_RUN_ID": "run"}, False),
-            ([], {"TWO_CARGO_CONTROLLER": "0"}, False),
-            ([], {"TWO_CARGO_CONTROLLER": "1"}, True),
-            (["--controller"], {}, True),
+            # (argv, environment, pool present, expected controller mode)
+            ([], {"PAPERCLIP_RUN_ID": "run"}, False, False),
+            ([], {"TWO_CARGO_CONTROLLER": "0"}, False, False),
+            ([], {"TWO_CARGO_CONTROLLER": "0"}, True, False),
+            ([], {"TWO_CARGO_CONTROLLER": "1"}, False, True),
+            ([], {"TWO_CARGO_CONTROLLER": "1"}, True, True),
+            (["--controller"], {}, False, True),
+            (["--controller"], {}, True, True),
+            # An explicit flag wins over a conflicting environment opt-out.
+            (["--controller"], {"TWO_CARGO_CONTROLLER": "0"}, False, True),
+            # Implicit selection follows the bounded pool policy only.
+            ([], {}, False, False),
+            ([], {}, True, True),
+            ([], {"PAPERCLIP_RUN_ID": "run"}, True, True),
+            # Hosted CI keeps plain cargo even where a pool policy exists.
+            ([], {"GITHUB_ACTIONS": "true"}, True, False),
+            ([], {"GITHUB_ACTIONS": "true", "TWO_CARGO_CONTROLLER": "1"}, True, True),
+            (["--controller"], {"GITHUB_ACTIONS": "true"}, True, True),
         )
-        for argv, environment, controller in cases:
-            with self.subTest(argv=argv, environment=environment):
+        for argv, environment, pool, controller in cases:
+            with self.subTest(argv=argv, environment=environment, pool=pool):
                 clean = {key: value for key, value in os.environ.items()
-                         if key not in ("PAPERCLIP_RUN_ID", "TWO_CARGO_CONTROLLER")}
+                         if key not in ("PAPERCLIP_RUN_ID", "TWO_CARGO_CONTROLLER",
+                                        "GITHUB_ACTIONS")}
                 with mock.patch.dict(os.environ, clean | environment, clear=True), \
+                        mock.patch.object(generator, "bounded_pool_present",
+                                          return_value=pool), \
                         mock.patch.object(generator, "build_executable",
                                           return_value=(None, 1)) as build:
                     self.assertEqual(generator.main(argv), 1)
                 cargo = build.call_args.args[0]
                 self.assertEqual("scripts/cargo_cache.py" in " ".join(cargo), controller)
                 self.assertEqual(cargo == ["cargo"], not controller)
+
+    def test_unreadable_pool_policy_fails_closed(self):
+        generator = load_script("generate_command_reference")
+        clean = {key: value for key, value in os.environ.items()
+                 if key not in ("PAPERCLIP_RUN_ID", "TWO_CARGO_CONTROLLER",
+                                "GITHUB_ACTIONS")}
+        with mock.patch.dict(os.environ, clean, clear=True), \
+                mock.patch.object(generator, "bounded_pool_present",
+                                  side_effect=PermissionError(13, "denied")), \
+                mock.patch.object(generator, "build_executable") as build:
+            self.assertEqual(generator.main([]), 1)
+        build.assert_not_called()
+
+    def test_pool_probe_reads_the_filesystem(self):
+        generator = load_script("generate_command_reference")
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "policy.json"
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", missing):
+                self.assertFalse(generator.bounded_pool_present())
+            missing.write_text("{}", encoding="utf-8")
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", missing):
+                self.assertTrue(generator.bounded_pool_present())
+            denied = mock.MagicMock(spec=Path)
+            denied.stat.side_effect = PermissionError(13, "denied")
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", denied), \
+                    self.assertRaises(PermissionError):
+                generator.bounded_pool_present()
+
+    def test_pool_probe_fails_closed_on_broken_lookup(self):
+        generator = load_script("generate_command_reference")
+        with tempfile.TemporaryDirectory() as tmp:
+            # A regular file where a directory component is expected: stat()
+            # raises ENOTDIR, which must not be mistaken for "no pool here".
+            blocker = Path(tmp) / "blocker"
+            blocker.write_text("not a directory", encoding="utf-8")
+            broken = blocker / "policy.json"
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", broken):
+                with self.assertRaises(OSError) as caught:
+                    generator.bounded_pool_present()
+                self.assertEqual(caught.exception.errno, errno.ENOTDIR)
+            # A symlink loop at the policy path: stat() raises ELOOP, which
+            # Path.is_file() would have swallowed into a fail-open False.
+            loop = Path(tmp) / "loop.json"
+            loop.symlink_to(loop)
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", loop):
+                with self.assertRaises(OSError) as caught:
+                    generator.bounded_pool_present()
+                self.assertEqual(caught.exception.errno, errno.ELOOP)
+            # A directory at the policy path is not a regular file: the probe
+            # raises EINVAL, and end to end the generator refuses to build
+            # instead of falling back to plain cargo.
+            directory = Path(tmp) / "policy-dir"
+            directory.mkdir()
+            with mock.patch.object(generator, "BOUNDED_POOL_POLICY", directory):
+                with self.assertRaises(OSError) as caught:
+                    generator.bounded_pool_present()
+                self.assertEqual(caught.exception.errno, errno.EINVAL)
+            clean = {key: value for key, value in os.environ.items()
+                     if key not in ("PAPERCLIP_RUN_ID", "TWO_CARGO_CONTROLLER",
+                                    "GITHUB_ACTIONS")}
+            with mock.patch.dict(os.environ, clean, clear=True), \
+                    mock.patch.object(generator, "BOUNDED_POOL_POLICY", directory), \
+                    mock.patch.object(generator, "build_executable") as build:
+                self.assertEqual(generator.main([]), 1)
+            build.assert_not_called()
 
     def test_consumer_census_covers_standalone_coverage_and_filtered_bot_tests(self):
         for command in (
@@ -142,6 +255,35 @@ with mock.patch.object(unittest.TextTestRunner, "run") as run:
             "cargo test -p two-bot-core --test reference_docs",
         ):
             self.assertFalse(compiles_reference_consumers(command), command)
+
+    def test_nightly_helper_modes_are_compile_consumers(self):
+        self.assertEqual(helper_compile_modes(), {"plan", "run", "docs"})
+        prefix = "python3 .github/scripts/nightly_partition.py "
+        for command in (
+            prefix + "plan -- --include-ignored --test-threads=1 --skip x",
+            prefix + 'run --partition "$NIGHTLY_PARTITION" --receipt r.json',
+            prefix + "docs",
+        ):
+            self.assertTrue(compiles_reference_consumers(command), command)
+        for command in (
+            prefix + "aggregate --needs nightly-needs.json",
+            "python3 .github/scripts/other.py plan",
+        ):
+            self.assertFalse(compiles_reference_consumers(command), command)
+        # The census sees the real workflow's helper compile calls and each
+        # still has a prior generator step (the census test above enforces it).
+        workflow = load_workflow(ROOT / ".github/workflows/nightly.yml")
+        seen = {
+            job_id for job_id, job in workflow["jobs"].items()
+            for step in job.get("steps", [])
+            for line in logical_lines(step.get("run", ""))
+            if re.search(r"nightly_partition\.py\s+(plan|run|docs)\b", line)
+            and compiles_reference_consumers(line)
+        }
+        self.assertEqual(seen, {"sweep-plan", "sweep-partition", "sweep-docs"})
+        # A helper that stopped compiling cargo tests would drop out, not pass vacuously.
+        with mock.patch(f"{__name__}.helper_compile_modes", return_value=set()):
+            self.assertFalse(compiles_reference_consumers(prefix + "plan"))
 
     def test_generated_output_is_ignored_but_authored_contracts_stay_tracked(self):
         tracked = set(subprocess.check_output(

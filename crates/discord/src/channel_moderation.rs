@@ -60,6 +60,9 @@ pub fn register_channel_handlers(router: &mut InteractionRouter) {
         HandlerId::PurgePreview,
         HandlerId::ChannelInspect,
         HandlerId::LockdownPreview,
+        // Dark until the publication slice: routed and adjudicated like the
+        // other private reads, with no published definition yet.
+        HandlerId::AutomodPreview,
     ] {
         router.register(Box::new(ChannelHandler(handler)));
     }

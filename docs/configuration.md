@@ -212,7 +212,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 136.
+Catalog entries: 137.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -300,6 +300,7 @@ Catalog entries: 136.
 | `TWO_INTERNAL_ALLOW_EVENT_READ` | env_only | Not specified in Next | environment only | Capability gate for event reads. |
 | `TWO_INTERNAL_ALLOW_MODERATION` | env_only | Not specified in Next | environment only | Capability gate for internal moderation actions. |
 | `TWO_INTERNAL_ALLOW_SETTINGS` | env_only | Not specified in Next | environment only | Capability gate for internal settings actions. |
+| `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | env_only | Not specified in Next | environment only | Capability gate for voice snapshot reads. |
 | `TWO_INTERNAL_BIND` | env_only | Not specified in Next | environment only | Canonical combined IP:port for receiver configuration; a wildcard bind requires the Worker-set container marker (TOG-16851). |
 | `TWO_INTERNAL_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy split internal-action listener interface; receiver configuration uses TWO_INTERNAL_BIND instead. |
 | `TWO_INTERNAL_CALLERS` | env_only | Not specified in Next | environment only | Signing-key-to-stable-caller mappings for receiver configuration; environment-only identity boundary, not loaded by Container bootstrap. |

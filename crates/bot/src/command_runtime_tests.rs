@@ -2357,9 +2357,9 @@ async fn leveling_interaction_fence_precedes_any_store_read() {
     mock.shutdown().await;
 }
 
-/// The 21 voice names that publish beside the builtins (`kick` is
+/// The 23 voice names that publish beside the builtins (`kick` is
 /// moderation's under first-wins).
-const VOICE_ONLY_NAMES: [&str; 21] = [
+const VOICE_ONLY_NAMES: [&str; 23] = [
     "create",
     "setup",
     "ping",
@@ -2381,6 +2381,8 @@ const VOICE_ONLY_NAMES: [&str; 21] = [
     "public",
     "limit",
     "unlimit",
+    "myroom",
+    "room-access-inspect",
 ];
 
 #[tokio::test]
@@ -4450,6 +4452,7 @@ fn production_router_matches_composed_production_wiring() {
             HandlerId::PurgePreview,
             HandlerId::ChannelInspect,
             HandlerId::LockdownPreview,
+            HandlerId::AutomodPreview,
             HandlerId::TempbanList,
         ];
         ids.extend(ModerationAction::ALL.map(HandlerId::Moderation));

@@ -283,6 +283,20 @@ class AttestationFloor(unittest.TestCase):
         for changed in ("src/main.rs\ndocs/guide.md", ""):
             self.assertEqual([], ps.evaluate(env(BODY=body, CHANGED_FILES=changed)))
 
+    def test_gate_files_are_t0(self):
+        # The gate judges itself: editing the floor or the workflow that runs
+        # it needs an attestation, so a PR cannot weaken its own floor and
+        # pass itself. The supply-chain pr-lint job enforces this with the
+        # already-merged copy of the gate.
+        for changed in (".github/scripts/pr_standards.py",
+                        ".github/workflows/supply-chain.yml"):
+            with self.subTest(changed=changed):
+                f = ps.evaluate(env(BODY=GOOD_BODY, CHANGED_FILES=changed))
+                self.assertIn(("error", "Attestation"), levels(f))
+                f = ps.evaluate(env(BODY=GOOD_BODY + FULL_ATTESTATION,
+                                    CHANGED_FILES=changed))
+                self.assertEqual([], f)
+
     def test_leftover_placeholders_fail(self):
         base = GOOD_BODY + FULL_ATTESTATION
         bodies = [
@@ -448,6 +462,7 @@ class AttestationFloor(unittest.TestCase):
         t0 = ("migrations/0001.sql", "sql/web_v1.sql", "db/schema.sql",
               "src/auth.rs", "crates/core/src/session_controller.rs",
               "crates/cutover/src/parse.rs", ".github/workflows/deploy-production.yml",
+              ".github/workflows/supply-chain.yml", ".github/scripts/pr_standards.py",
               "wrangler.toml", "config/wrangler.production.json",
               "migrations/notes.md")
         for path in t0:
@@ -529,6 +544,14 @@ class Template(unittest.TestCase):
         # The strict subset scans raw text (including comments), so the shipped
         # template must carry no strict hit at all.
         self.assertEqual([], ps.strict_hits(self.text, "TOG|PAP|PAPA"))
+
+    def test_template_names_the_gate_files_as_t0(self):
+        # The template's T0 list and T0_PATH_PATTERNS must stay in sync: the
+        # gate files need an attestation to change.
+        for path in (".github/scripts/pr_standards.py",
+                     ".github/workflows/supply-chain.yml"):
+            self.assertIn(path, self.text)
+            self.assertTrue(ps.is_t0_path(path), path)
 
 
 class Main(unittest.TestCase):

@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use two_bot_core::automation_transfer::{
     max_import_entries, parse_import_document, ImportParseError,
 };
-use two_bot_core::custom_commands::{max_custom_commands, reserved_command_names};
+use two_bot_core::custom_commands::{max_custom_commands, publishable_builtin_names};
 
 /// Drive one decoded body through the parser and assert the fuzzer's
 /// accounting invariants: determinism, the envelope gate before planning, and
@@ -267,7 +267,7 @@ fn oversized_entry_lists_fail_bounded() {
     // The envelope never derives from reservations: the per-guild budget is
     // enforced in planning, where stored rows are known (no-growth re-imports
     // of rows saved under an older budget must reach it).
-    assert!(max > max_custom_commands(reserved_command_names().len()));
+    assert!(max > max_custom_commands(publishable_builtin_names().len()));
 }
 
 #[test]

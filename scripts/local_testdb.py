@@ -17,6 +17,12 @@ host Postgres, and no secret is read.
 
 Each checkout gets its own network, containers and target volume, so parallel
 worktrees do not share a database. The Cargo/rustup cache volume is shared.
+
+Retention: run `down` when the checkout is done, adding `--volumes` once its
+target cache is no longer needed. A volume whose workspace no longer exists
+and whose containers are gone is a removal candidate for the operator (exact
+volume name only, after re-verifying no container references it); never prune
+another checkout's live volume.
 """
 
 import argparse

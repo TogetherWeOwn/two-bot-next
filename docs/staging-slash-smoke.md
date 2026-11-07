@@ -44,7 +44,7 @@ block, and transport factories must remain lightweight and local.
 | --- | --- | --- |
 | `/rank` | Checks the compiled publish set and actual router handler; builds the fixture reply with `rank_reply`; runs the shared reply dispatcher | PostgreSQL reads, actual gateway dispatch, deployed reply delivery |
 | `/leaderboard` | Same route/dispatcher path with `leaderboard_reply`; covers populated and empty fixtures and mention suppression | Live leaderboard state or Discord receipt |
-| `/help` | Records `skipped / covered-by-offline-tests`; no fabricated interaction or fixture call | Live picker listing: `/help` is a compiled core command answered from the live publish set, pinned by offline router and renderer tests rather than this fixture smoke |
+| `/help` | Records `skipped / covered-by-offline-tests`; no fabricated interaction or fixture call | Live picker listing and interaction delivery. A separate [help embed smoke](staging-help-embed-smoke.md) proves the two builders' branded embeds on a rendered Discord read-back, without claiming a slash invocation |
 | `/ping` | Records `skipped / voice-command-out-of-scope`; no fixture call | Voice-family ping gates and latency behavior |
 | health/readiness | Classifies local liveness/readiness snapshots; healthy but unready fails | No HTTP endpoint is requested or measured |
 
@@ -192,6 +192,14 @@ and in agent environments, not in a GitHub environment. Adding it there would
 distribute a credential, so the run stays a manual, operator/QA step. The
 credential-free half (`/health`, `/readyz`, build identity) is already enforced
 on every deploy by the `deploy-staging` gate.
+
+This decision is about the product bot's token only. The
+[help embed smoke](staging-help-embed-smoke.md) is a GitHub workflow because
+it posts as the dedicated staging test bot (TWO Voice Synthetic (staging)),
+whose token already lives in the `voice-synthetic` GitHub environment for
+the voice synthetic; reusing it distributes no new credential, and the smoke
+refuses a product-bot token outright. Do not read that workflow as licence
+to place the staging product bot token in GitHub.
 
 Offline coverage: `scripts/test_staging_smoke_run.py` (live-guild refusal before
 any request, container down, parked, checkpoint-read failure without a root-cause

@@ -591,9 +591,9 @@ mod tests {
         let all_on = desired_definitions(2222, &env).expect("desired registry assembles");
         assert_eq!(
             all_on.len(),
-            // 45 all-gate builtins: 7 core + 1 scorecard + 12 automation
+            // 47 all-gate builtins: 7 core + 1 scorecard + 14 automation
             // + 12 announcements + 9 moderation mutations + 4 private reads.
-            45
+            47
         );
         assert!(
             all_on.iter().any(|def| def.name == "reopen"),
@@ -637,7 +637,9 @@ mod tests {
         );
         env.insert("TWO_VOICE".into(), "1".into());
         let with_voice = desired_definitions(2222, &env).expect("desired registry assembles");
-        assert_eq!(with_voice.len(), 66);
+        // 47 all-gate builtins plus the 23 voice names (voice `kick`
+        // loses first-wins to moderation `/kick`), `/myroom` included.
+        assert_eq!(with_voice.len(), 70);
         assert!(
             with_voice.iter().any(|def| def.name == "tempban-list"),
             "tempban-list survives the voice registry"
@@ -727,7 +729,7 @@ mod tests {
                     }
                     let definitions =
                         desired_definitions(2222, &env).expect("desired registry assembles");
-                    for name in ["command-inspect", "giveaway"] {
+                    for name in ["command-inspect", "command-edit", "giveaway"] {
                         assert_eq!(
                             definitions.iter().filter(|def| def.name == name).count(),
                             usize::from(automations == Some("1")),

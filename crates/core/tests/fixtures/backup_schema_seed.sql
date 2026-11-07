@@ -557,11 +557,26 @@ INSERT INTO voice_logging_mention_members (guild_id, member_id)
 VALUES ('100000000000000001', '100000000000000002');
 INSERT INTO voice_logging_mention_roles (guild_id, role_id)
 VALUES ('100000000000000001', '100000000000000043');
+-- The creation_enabled / command_role_id pairs are the pre-0470 shape:
+-- restore replays the 0470 translation over them, so they exercise every
+-- merge case against the voice_access_controls rows above. Guild ...001:
+-- the enforced store is already tighter (FALSE, ...040), so it wins
+-- unchanged and the mirror syncs to it. Guild ...002: creation off and a
+-- command role land on a permissive enforced row. Guild ...003: a command
+-- role lands on the row the 0469 replay inserts. Guild ...004: creation
+-- off with no enforced row at all, so the translation inserts one. After
+-- restore the mirror columns match the enforced values for every guild.
 INSERT INTO voice_guild_settings (guild_id, creation_enabled, unique_names, no_game_label,
   force_single_game, count_members_without_activity, time_zone, text_channel_name,
   text_viewer_role_id, command_role_id)
 VALUES ('100000000000000001', TRUE, TRUE, 'General', FALSE, TRUE, 'Europe/London',
-        'voice-chat', NULL, '100000000000000043');
+        'voice-chat', NULL, '100000000000000043'),
+       ('100000000000000002', FALSE, TRUE, 'General', FALSE, TRUE, 'Europe/London',
+        'voice-chat', NULL, '100000000000000045'),
+       ('100000000000000003', TRUE, TRUE, 'General', FALSE, TRUE, 'Europe/London',
+        'voice-chat', NULL, '100000000000000046'),
+       ('100000000000000004', FALSE, TRUE, 'General', FALSE, TRUE, 'Europe/London',
+        'voice-chat', NULL, NULL);
 -- Legacy per-command restrictions (0229), pre-0469 shape: restore replays
 -- the 0469 translation over these rows, so they exercise every merge case
 -- against the voice_access_controls rows above. Guild ...001: 'kick' is

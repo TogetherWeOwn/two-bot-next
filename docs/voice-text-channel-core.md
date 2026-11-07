@@ -25,8 +25,14 @@ It requires no `db` feature, Discord wire types, clock, or external I/O.
   resolves the roles live from its role snapshot at plan time, and passes them
   as `protected` alongside the viewer role and the bot. The `/textchannels`
   command (Manage Channels, a required creator channel plus optional `enabled`,
-  `name` and `viewer-role`; `enabled` defaults to on) edits the creator row
-  only, so open companions keep their creation-time snapshot.
+  `name` and `viewer-role`, plus the boolean `reset-name` and
+  `reset-viewer-role` that store the default again) edits the creator row
+  only, so open companions keep their creation-time snapshot. A new creator
+  starts with companions off; an omitted `enabled` keeps the saved toggle, and
+  a reset does not turn companions on. A reset set to true cannot be combined
+  with a replacement for the same field, false or omitted keeps the stored
+  value, and the reply states the saved name and audience even while
+  companions are off.
 - `sanitise_channel_name`: lowercase, whitespace runs collapse to one `-` with
   edges trimmed, at most 100 characters; codepoints with no lowercase mapping
   (e.g. U+1D400) are dropped; blank or empty results fall back to

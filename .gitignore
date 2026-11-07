@@ -16,3 +16,5 @@ __pycache__/
 /slow-burn-ring-prev.json
 /slow-burn-tracker-evidence.json
 /slow-burn-exposition.prom
+# Generated from live source by tests/gateway_lifecycle/prepare.py; never commit.
+/crates/bot/tests/gateway_lifecycle_generated.rs

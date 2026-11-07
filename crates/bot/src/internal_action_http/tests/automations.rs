@@ -4,6 +4,7 @@
 //! replay without a second apply. Only guarded TestDatabase pools; never
 //! staging or production.
 use super::*;
+use two_bot_core::custom_commands::{max_custom_commands, publishable_builtin_names};
 
 const AUTOMATIONS_ACTOR: &str = "111111111111111111";
 
@@ -74,6 +75,138 @@ async fn audit_count(pool: &sqlx::PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+fn capacity_import_payload(count: usize, overwrite: bool, updated: bool) -> String {
+    let commands: Vec<Value> = (0..count).map(|index| {
+        json!({
+            "name": format!("zzbackup{index:02}"),
+            "description": format!("Backup {index}"),
+            "template": if updated { format!("Updated {index}") } else { format!("Original {index}") },
+            "text_trigger": format!("!zzbackup{index:02}"),
+        })
+    }).collect();
+    json!({
+        "action": "automations.import", "actor_id": AUTOMATIONS_ACTOR,
+        "version": 1, "overwrite": overwrite, "commands": commands,
+    })
+    .to_string()
+}
+
+async fn capacity_command_rows(pool: &sqlx::PgPool) -> Vec<Value> {
+    sqlx::query_scalar(
+        "SELECT to_jsonb(c) FROM automation_commands c WHERE guild_id = $1 ORDER BY name",
+    )
+    .bind(staging_guild())
+    .fetch_all(pool)
+    .await
+    .expect("owned fixture rows")
+}
+
+#[tokio::test]
+async fn import_at_budget_backup_updates_and_replays_but_over_budget_never_writes() {
+    // The import planner budget follows the live publishable set. A
+    // budget-sized backup imports, bulk-updates and replays idempotently;
+    // one row more never writes.
+    let budget = max_custom_commands(publishable_builtin_names().len());
+    let db = database()
+        .await
+        .expect("explicit disposable test bootstrap required");
+    let _flag = AUTOMATIONS_FLAG_LOCK.lock().await;
+    set_automations_flags(true, true);
+    let app = automations_app(db.pool().clone());
+    let raw = capacity_import_payload(budget, false, false);
+    let (first_status, first_headers, first) =
+        answer(app.clone(), signed(&raw, "old", "backup-budget-initial")).await;
+    let initial_rows = capacity_command_rows(db.pool()).await;
+    let update = capacity_import_payload(budget, true, true);
+    let (update_status, _, updated) =
+        answer(app.clone(), signed(&update, "old", "backup-budget-update")).await;
+    let updated_rows = capacity_command_rows(db.pool()).await;
+    let audit_before_replay = audit_count(db.pool()).await;
+    let (replay_status, replay_headers, replay) =
+        answer(app.clone(), signed(&raw, "new", "backup-budget-initial")).await;
+    let replay_rows = capacity_command_rows(db.pool()).await;
+    let audit_after_replay = audit_count(db.pool()).await;
+    let overflow = capacity_import_payload(budget + 1, true, true);
+    let (overflow_status, _, refused) =
+        answer(app, signed(&overflow, "old", "backup-over-budget")).await;
+    let after_overflow = capacity_command_rows(db.pool()).await;
+    let audit_after_overflow = audit_count(db.pool()).await;
+    // The over-budget document fits the parser envelope, so planning refuses
+    // it and mints the same audited rejection the service owes every refused
+    // write; nothing else is applied.
+    let rejection: (String, Option<String>) =
+        sqlx::query_as("SELECT outcome, reason FROM automation_audit_log WHERE id = $1")
+            .bind("internal:automations.import:backup-over-budget")
+            .fetch_one(db.pool())
+            .await
+            .expect("rejection audit");
+    set_automations_flags(false, false);
+    db.close()
+        .await
+        .expect("drop only owned disposable fixture");
+
+    assert_eq!(
+        first_status,
+        StatusCode::OK,
+        "budget-sized backup is legal: {first}"
+    );
+    assert!(!first_headers.contains_key("idempotent-replay"));
+    assert_eq!(first["result"]["imported"], json!(budget));
+    assert_eq!(initial_rows.len(), budget);
+    assert_eq!(
+        update_status,
+        StatusCode::OK,
+        "no-growth bulk update: {updated}"
+    );
+    assert_eq!(updated["result"]["imported"], json!(budget));
+    assert_eq!(updated_rows.len(), budget);
+    assert!(updated_rows
+        .iter()
+        .all(|row| row["template"].as_str().unwrap().starts_with("Updated ")));
+    assert_eq!(
+        replay_status,
+        StatusCode::OK,
+        "replay still parses the budget: {replay}"
+    );
+    assert_eq!(
+        replay_headers
+            .get("idempotent-replay")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        replay["result"], first["result"],
+        "original receipt, not a new diff"
+    );
+    assert_eq!(
+        replay_rows, updated_rows,
+        "replay does not restore original templates"
+    );
+    assert_eq!(
+        audit_before_replay, audit_after_replay,
+        "no second replay audit/apply"
+    );
+    assert_eq!(
+        overflow_status,
+        StatusCode::BAD_REQUEST,
+        "over budget exceeds the real bound: {refused}"
+    );
+    assert_eq!(refused["error"]["code"], "malformed");
+    assert_eq!(
+        after_overflow, updated_rows,
+        "overflow writes no rows or timestamps"
+    );
+    assert_eq!(
+        audit_after_overflow,
+        audit_after_replay + 1,
+        "one rejection audit, no apply"
+    );
+    assert_eq!(
+        rejection,
+        ("rejected".to_owned(), Some("over_capacity".to_owned()))
+    );
 }
 
 #[tokio::test]

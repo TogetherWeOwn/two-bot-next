@@ -43,8 +43,13 @@ def jobs(text):
     return found
 
 
-def violations(text):
+def violations(text, workflow_name=""):
     """Every way a workflow can leave a job on an unroutable runner label."""
+    # The split nightly legs retain the original logical sweep overflow switch.
+    # Pin only these four aliases in this file; all other jobs keep their own key.
+    aliases = dict.fromkeys(
+        ("sweep-plan", "sweep-partition", "sweep-guarded", "sweep-docs"), "sweep"
+    ) if workflow_name == "nightly.yml" else {}
     problems = []
     for job, lines in jobs(text).items():
         keys = {
@@ -57,7 +62,7 @@ def violations(text):
             if "runs-on" in keys:
                 problems.append(f"{job}: reusable call must not set runs-on")
             continue
-        if keys.get("runs-on") != routed(job):
+        if keys.get("runs-on") != routed(aliases.get(job, job)):
             problems.append(f"{job}: runs-on is {keys.get('runs-on')!r}, not the routed expression")
     # Catch a runs-on hidden anywhere else (nested, flow style, odd indent).
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
@@ -81,7 +86,7 @@ class RepositoryWorkflowTests(unittest.TestCase):
         routed_jobs = 0
         for path in files:
             text = path.read_text()
-            self.assertEqual(violations(text), [], path.name)
+            self.assertEqual(violations(text, path.name), [], path.name)
             routed_jobs += text.count("'[\"self-hosted\",\"two-selfhosted\"]'")
         self.assertGreaterEqual(routed_jobs, 19)
 
@@ -121,6 +126,25 @@ class CheckerMutationTests(unittest.TestCase):
 
     def test_another_jobs_switch_id_fails(self):
         self.assertTrue(violations(workflow("build", routed("check"))))
+
+    def test_nightly_partitions_keep_exact_original_sweep_routing(self):
+        for job in ("sweep-plan", "sweep-partition", "sweep-guarded", "sweep-docs"):
+            with self.subTest(job=job):
+                self.assertEqual(violations(workflow(job, routed("sweep")), "nightly.yml"), [])
+                self.assertTrue(violations(workflow(job, routed(job)), "nightly.yml"))
+                self.assertTrue(violations(workflow(job, routed("check")), "nightly.yml"))
+                self.assertTrue(violations(workflow(job, "ubuntu-latest"), "nightly.yml"))
+
+    def test_nightly_aliases_are_not_valid_in_other_workflows(self):
+        for filename in ("check.yml", "nightly-other.yml", ""):
+            for job in ("sweep-plan", "sweep-partition", "sweep-guarded", "sweep-docs"):
+                with self.subTest(filename=filename, job=job):
+                    self.assertTrue(violations(workflow(job, routed("sweep")), filename))
+                    self.assertEqual(violations(workflow(job, routed(job)), filename), [])
+
+    def test_unlisted_nightly_jobs_cannot_inherit_sweep_routing(self):
+        self.assertTrue(violations(workflow("sweep-extra", routed("sweep")), "nightly.yml"))
+        self.assertEqual(violations(workflow("sweep-extra", routed("sweep-extra")), "nightly.yml"), [])
 
     def test_missing_runs_on_fails(self):
         text = "name: t\non:\n  push:\njobs:\n  build:\n    steps:\n      - run: true\n"

@@ -323,3 +323,19 @@ test("the new rules do not disturb unrelated rules sharing the same scrape", () 
   assert.deepEqual([...fired.firing].sort(),
     ["job_consecutive_failures:counter", HALTED, SELF_HEAL, NOT_READY, STALL].sort());
 });
+
+test("the live-not-ready evidence flag is true only for a current valid age sample", () => {
+  // The keepalive freezes the remediation scope on this flag, so it must
+  // track the sample itself, not the (possibly retained) firing state.
+  assert.equal(ev([line(NOT_READY_SERIES, 0)]).voiceLiveNotReadyEvidence, true);
+  assert.equal(ev([line(NOT_READY_SERIES, 121)]).voiceLiveNotReadyEvidence, true);
+  assert.equal(ev([]).voiceLiveNotReadyEvidence, false);
+  for (const malformed of ["-1", "1.5", "NaN"]) {
+    assert.equal(ev([line(NOT_READY_SERIES, malformed)]).voiceLiveNotReadyEvidence, false, `age ${malformed}`);
+  }
+  // Retained firing carries no evidence: the alert holds, the flag stays false.
+  const fired = ev([line(NOT_READY_SERIES, 121)]);
+  const held = ev([], fired.state);
+  assert.deepEqual(held.firing, [NOT_READY]);
+  assert.equal(held.voiceLiveNotReadyEvidence, false);
+});

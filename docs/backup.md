@@ -125,7 +125,7 @@ position when the dump read it, at or beyond every value in the snapshot. The
 dump role needs `SELECT` on those sequences. It also needs `SELECT` on the
 cutover migration ledger (`_sqlx_migrations`) when that table exists: the
 manifest records the applied cutover migrations as restore's evidence for the
-0469 replay gate, and an existing ledger the dump role cannot read refuses the
+0469/0470 replay gates, and an existing ledger the dump role cannot read refuses the
 dump rather than recording it as absent. Values are stored in Postgres text-output
 form with a `$n::type` cast on restore — faithful for every owned type
 without per-type decoding. `column_types` is additive to the legacy envelope.
@@ -383,6 +383,35 @@ written before the evidence field existed carry no proof either way and
 replay fail-closed; the restore report and CLI name the translated counts,
 so check them after restoring such an archive taken shortly after 0469
 shipped and re-lift anything the translation reinstated.
+
+### Pre-0470 voice creation switch and command role
+
+Backups taken before migration 0470 can hold the guild-wide voice creation
+switch and command role only in `voice_guild_settings.creation_enabled` /
+`command_role_id` (written by `/import`). The runtime gates read only
+`voice_access_controls.room_creation_enabled` / `required_role_id`, so after
+loading the rows restore replays the 0470 translation over them, right after
+the 0469 one — same tighten-only merge (creation stays off if either store
+says off; a role already enforced wins over the imported one) — then syncs
+the legacy columns back to the enforced values, as 0470 does, so the
+previous binary's `/export` after a backout shows what is enforced. Only
+legacy rows that can tighten merge; a missing `voice_access_controls` row
+already means the permissive defaults. The row-count check expects any
+inserted `voice_access_controls` guild rows on top of the manifest count;
+`voice_guild_settings` keeps its rows (only the two mirror columns change),
+the report names how many guilds the replay tightened, and the CLI names
+the translation in both dry-run and apply output.
+
+The evidence gate is the 0469 one at version 470: the replay runs only for
+archives whose recorded cutover migrations do not prove 0470 was applied,
+so an archive taken between 0469 and 0470 replays only this translation.
+After 0470 the legacy columns are a mirror `/access` does not keep current,
+so a post-0470 archive can hold a switch or role an admin has since lifted;
+those archives restore both voice stores verbatim and the lifted gates stay
+lifted. Archives written before the evidence field existed replay
+fail-closed; the restore report and CLI name the tightened-guild count, so
+check it after restoring such an archive taken shortly after 0470 shipped
+and re-lift anything the translation reinstated.
 
 ### Migration-backed regression suite
 
