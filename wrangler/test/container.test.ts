@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { setImmediate } from "node:timers/promises";
-import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
+import worker, { AVATAR_SYNC_CONSUMED_KEY, TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
 import { EMPTY_STATE, LOG_QUERY_URL, type MetricsAlertState } from "../src/alert-rules.ts";
 import { metricsBody, metricsLines } from "./fixtures/metrics.ts";
@@ -2779,4 +2779,384 @@ test("background metrics: metrics storage failure cannot notify and retains the 
   assert.equal(h.events().length, 0);
   assert.ok(h.logs.includes(SCRAPE_FAILURE));
   assert.equal(h.schedules.mock.callCount(), 1);
+});
+
+// ---------------------------------------------------------------------------
+// Staging bot avatar one-shot: durable per-icon consumed receipt.
+// Real SDK; storage failures and health behavior are injected per test by
+// mocking the harness storage/runtime. Synthetic values only.
+// ---------------------------------------------------------------------------
+const AVATAR_VAR = "TWO_SET_BOT_AVATAR_ONCE";
+const AVATAR_WORKER_ENV = { ...WORKER_ENV, TWO_DEPLOY_ENV: "staging", [AVATAR_VAR]: "1" };
+const DISARMED_ENV = { ...EXPECTED_ENV, TWO_DEPLOY_ENV: "staging" };
+const ARMED_ENV = { ...DISARMED_ENV, [AVATAR_VAR]: "1" };
+const AVATAR_DISARMED_LOG = JSON.stringify({ event: "bot_avatar_sync_disarmed", reason: "storage_unavailable" });
+const RAW_STORAGE_ERROR = "synthetic-raw-avatar-storage-error-marker";
+const NO_INSTANCE = "There is no container instance that can be provided to this Durable Object";
+
+type AvatarHarness = Awaited<ReturnType<typeof harness>>;
+const AVATAR_ENTRIES: Record<string, (h: AvatarHarness) => Promise<unknown>> = {
+  start: (h) => h.bot.start(),
+  "positional startAndWaitForPorts": (h) => h.bot.startAndWaitForPorts(8080),
+  "object startAndWaitForPorts": (h) => h.bot.startAndWaitForPorts({ ports: 8080 }),
+  containerFetch: (h) => h.bot.containerFetch(probeRequest("https://worker.invalid/health")),
+};
+
+function freshValues(): Map<string, unknown> {
+  return new Map<string, unknown>([[OWNER_KEY, ACTIVE_OWNER]]);
+}
+
+/** Fail only the avatar receipt operations; ownership/SDK storage is untouched.
+ * The SDK also calls sync(), so sync fails once, right after the receipt put. */
+function failAvatarStorage(t: TestContext, h: AvatarHarness, op: "get" | "put" | "sync") {
+  const storage = h.ctx.storage as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+  const original = storage[op]!;
+  let receiptPut = false;
+  if (op === "sync") {
+    const put = storage.put!;
+    t.mock.method(storage, "put", async (...args: unknown[]) => {
+      if (args[0] === AVATAR_SYNC_CONSUMED_KEY) receiptPut = true;
+      return put(...args);
+    });
+  }
+  t.mock.method(storage, op, async (...args: unknown[]) => {
+    if (op === "sync") {
+      if (!receiptPut) return original(...args);
+      receiptPut = false;
+      throw new Error(RAW_STORAGE_ERROR);
+    }
+    if (args[0] === AVATAR_SYNC_CONSUMED_KEY) throw new Error(RAW_STORAGE_ERROR);
+    return original(...args);
+  });
+}
+
+function assertQuietAboutStorage(h: AvatarHarness) {
+  assert.ok(h.logs.every((line) => !line.includes(RAW_STORAGE_ERROR)), "raw storage error must never be logged");
+  assert.ok(h.logs.includes(AVATAR_DISARMED_LOG));
+}
+
+/** First health probe of the start path fails and the instance is gone, so
+ * only the SDK's internal restart loop could start a second process. */
+function settledMonitor(t: TestContext, h: AvatarHarness) {
+  // The harness monitor never settles; SDK error handling awaits it, so a
+  // failed start would hang. A settled no-instance monitor lets it finish.
+  t.mock.method(h.runtime, "monitor", () => {
+    const gone = Promise.reject(new Error(NO_INSTANCE));
+    gone.catch(() => {});
+    return gone;
+  });
+}
+
+function crashFirstHealthCheck(t: TestContext, h: AvatarHarness) {
+  const getTcpPort = h.runtime.getTcpPort.bind(h.runtime);
+  let probes = 0;
+  t.mock.method(h.runtime, "getTcpPort", (port: number) => {
+    const real = getTcpPort(port);
+    return {
+      fetch: async (...args: Parameters<typeof real.fetch>) => {
+        if (++probes === 1) {
+          h.runtime.running = false;
+          throw new Error("synthetic first health probe failure");
+        }
+        return real.fetch(...args);
+      },
+    };
+  });
+  settledMonitor(t, h);
+}
+
+test("class defaults never carry the avatar switch, even for staging with the switch set", async (t) => {
+  const h = await harness(t, AVATAR_WORKER_ENV, freshValues());
+  assert.equal(h.bot.envVars[AVATAR_VAR], undefined);
+  assert.equal(h.bot.envVars.TWO_DEPLOY_ENV, "staging");
+});
+
+for (const [name, run] of Object.entries(AVATAR_ENTRIES)) {
+  test(`avatar one-shot ${name}: transient acquisition failure keeps the normal SDK budget`, async (t) => {
+    const h = await harness(t, AVATAR_WORKER_ENV, freshValues());
+    const getTcpPort = h.runtime.getTcpPort.bind(h.runtime);
+    let probes = 0;
+    t.mock.method(h.runtime, "getTcpPort", (port: number) => {
+      const real = getTcpPort(port);
+      return {
+        fetch: async (...args: Parameters<typeof real.fetch>) => {
+          if (++probes === 1) throw new Error("synthetic transient acquisition failure");
+          return real.fetch(...args);
+        },
+      };
+    });
+    settledMonitor(t, h);
+    const result = await run(h);
+    if (result instanceof Response) assert.equal(result.status, 200);
+    assert.ok(probes >= 2, "acquisition must survive the first failed probe");
+    assert.deepEqual(h.starts.map((s) => s.env), [ARMED_ENV]);
+    assert.equal(h.values.get(AVATAR_SYNC_CONSUMED_KEY), true);
+  });
+
+  test(`avatar one-shot arms exactly once via ${name}, receipt synced before process start`, async (t) => {
+    const h = await harness(t, AVATAR_WORKER_ENV, freshValues());
+    const events: string[] = [];
+    const realPut = h.ctx.storage.put;
+    t.mock.method(h.ctx.storage, "put", async (...args: Parameters<typeof realPut>) => {
+      if (args[0] === AVATAR_SYNC_CONSUMED_KEY) events.push("put");
+      return realPut(...args);
+    });
+    t.mock.method(h.ctx.storage, "sync", async () => { events.push("sync"); });
+    const start = h.runtime.start.bind(h.runtime);
+    t.mock.method(h.runtime, "start", (config: StartConfig) => { events.push("start"); start(config); });
+
+    await run(h);
+    // The SDK/ownership path also syncs; require a sync between put and start.
+    const put = events.indexOf("put");
+    assert.ok(put >= 0 && events.indexOf("sync", put) > put && events.indexOf("sync", put) < events.indexOf("start"),
+      JSON.stringify(events));
+    assert.equal(h.values.get(AVATAR_SYNC_CONSUMED_KEY), true);
+    assert.equal(h.starts.length, 1);
+    assert.deepEqual(h.starts[0]?.env, ARMED_ENV);
+    assert.equal(h.bot.envVars[AVATAR_VAR], undefined, "arming must not mutate class defaults");
+  });
+
+  test(`avatar one-shot ${name}: same-instance restart is disarmed`, async (t) => {
+    const h = await harness(t, AVATAR_WORKER_ENV, freshValues());
+    await run(h);
+    h.runtime.running = false;
+    await run(h);
+    assert.equal(h.starts.length, 2);
+    assert.deepEqual(h.starts[0]?.env, ARMED_ENV);
+    assert.deepEqual(h.starts[1]?.env, DISARMED_ENV);
+  });
+
+  test(`avatar one-shot ${name}: reconstructed Durable Object sees the receipt`, async (t) => {
+    const values = freshValues();
+    const database = new DatabaseSync(":memory:");
+    t.after(() => database.close());
+    const first = await harness(t, AVATAR_WORKER_ENV, values, database);
+    await run(first);
+    const second = await harness(t, AVATAR_WORKER_ENV, values, database);
+    await run(second);
+    assert.deepEqual(first.starts.map((s) => s.env?.[AVATAR_VAR]), ["1"]);
+    assert.equal(second.starts.length, 1);
+    assert.deepEqual(second.starts[0]?.env, DISARMED_ENV);
+  });
+
+  test(`avatar one-shot ${name}: consumed when startup fails`, async (t) => {
+    const values = freshValues();
+    const h = await harness(t, AVATAR_WORKER_ENV, values);
+    t.mock.method(h.runtime, "start", () => { throw new Error("synthetic native start failure"); });
+    await run(h).catch(() => {});
+    assert.equal(values.get(AVATAR_SYNC_CONSUMED_KEY), true);
+    const retry = await harness(t, AVATAR_WORKER_ENV, values);
+    await run(retry);
+    assert.deepEqual(retry.starts[0]?.env, DISARMED_ENV);
+  });
+
+  test(`avatar one-shot ${name}: consumed when the outcome is uncertain`, async (t) => {
+    const values = freshValues();
+    const h = await harness(t, AVATAR_WORKER_ENV, values);
+    // Process started, readiness unknown: health probe fails while running.
+    settledMonitor(t, h);
+    t.mock.method(h.runtime, "getTcpPort", () => ({
+      fetch: async () => { throw new Error("synthetic unknown outcome"); },
+    }));
+    await run(h).catch(() => {});
+    assert.equal(h.starts.length, 1);
+    assert.deepEqual(h.starts[0]?.env, ARMED_ENV);
+    assert.equal(values.get(AVATAR_SYNC_CONSUMED_KEY), true);
+  }, { timeout: 15_000 });
+
+  test(`avatar one-shot ${name}: ownership refusal does not consume`, async (t) => {
+    const values = freshValues();
+    values.set(OWNER_KEY, { ...ACTIVE_OWNER, deploymentId: "deployment-B" });
+    const h = await harness(t, AVATAR_WORKER_ENV, values);
+    await assert.rejects(run(h), /not_owner/);
+    assert.equal(values.has(AVATAR_SYNC_CONSUMED_KEY), false);
+    assert.equal(h.starts.length, 0);
+    values.set(OWNER_KEY, ACTIVE_OWNER);
+    await run(h);
+    assert.deepEqual(h.starts[0]?.env, ARMED_ENV, "refusal must not set the process-local claim");
+  });
+
+  for (const [label, op] of [["read", "get"], ["put", "put"], ["sync", "sync"]] as const) {
+    test(`avatar one-shot ${name}: receipt ${label} failure boots unarmed without raw error`, async (t) => {
+      const h = await harness(t, AVATAR_WORKER_ENV, freshValues());
+      failAvatarStorage(t, h, op);
+      await run(h);
+      assert.equal(h.starts.length, 1);
+      assert.deepEqual(h.starts[0]?.env, DISARMED_ENV);
+      assertQuietAboutStorage(h);
+    });
+  }
+
+  test(`avatar one-shot ${name}: a failed receipt is not retried by this instance`, async (t) => {
+    const h = await harness(t, AVATAR_WORKER_ENV, freshValues());
+    const put = h.ctx.storage.put;
+    let failing = true;
+    t.mock.method(h.ctx.storage, "put", async (...args: Parameters<typeof put>) => {
+      if (failing && args[0] === AVATAR_SYNC_CONSUMED_KEY) throw new Error(RAW_STORAGE_ERROR);
+      return put(...args);
+    });
+    await run(h);
+    failing = false;
+    h.runtime.running = false;
+    await run(h);
+    assert.deepEqual(h.starts.map((s) => s.env?.[AVATAR_VAR]), [undefined, undefined]);
+  });
+
+  test(`avatar one-shot ${name}: SDK internal restart loop cannot replay an armed start`, async (t) => {
+    const h = await harness(t, AVATAR_WORKER_ENV, freshValues());
+    crashFirstHealthCheck(t, h);
+    const result = await run(h);
+    if (result instanceof Response) assert.equal(result.status, 200);
+    assert.equal(h.starts.length, 2, "normal SDK recovery must still start the replacement process");
+    assert.deepEqual(h.starts.map((s) => s.env), [ARMED_ENV, DISARMED_ENV]);
+    assert.equal(h.values.get(AVATAR_SYNC_CONSUMED_KEY), true);
+  }, { timeout: 15_000 });
+
+  test(`control: unarmed ${name} does replay inside the SDK restart loop`, async (t) => {
+    const h = await harness(t, { ...WORKER_ENV, TWO_DEPLOY_ENV: "staging" }, freshValues());
+    crashFirstHealthCheck(t, h);
+    await run(h);
+    assert.equal(h.starts.length, 2, "the fixture must be able to observe an SDK replay");
+    assert.ok(h.starts.every((s) => s.env?.[AVATAR_VAR] === undefined));
+  }, { timeout: 15_000 });
+}
+
+test("avatar one-shot stays disarmed unless Worker env and class env are both exactly staging with switch 1", async (t) => {
+  const cases: [string, Partial<Env>][] = [
+    ["no marker", { ...WORKER_ENV, [AVATAR_VAR]: "1" }],
+    ["production marker", { ...WORKER_ENV, TWO_DEPLOY_ENV: "production", [AVATAR_VAR]: "1" }],
+    ["marker with space", { ...WORKER_ENV, TWO_DEPLOY_ENV: "staging ", [AVATAR_VAR]: "1" }],
+    ["switch absent", { ...WORKER_ENV, TWO_DEPLOY_ENV: "staging" }],
+    ["switch 0", { ...WORKER_ENV, TWO_DEPLOY_ENV: "staging", [AVATAR_VAR]: "0" }],
+    ["switch true", { ...WORKER_ENV, TWO_DEPLOY_ENV: "staging", [AVATAR_VAR]: "true" }],
+    ["switch with space", { ...WORKER_ENV, TWO_DEPLOY_ENV: "staging", [AVATAR_VAR]: "1 " }],
+  ];
+  for (const [label, env] of cases) {
+    const values = freshValues();
+    const h = await harness(t, env, values);
+    await h.bot.start();
+    assert.equal(h.starts[0]?.env?.[AVATAR_VAR], undefined, label);
+    assert.equal(values.has(AVATAR_SYNC_CONSUMED_KEY), false, label);
+  }
+});
+
+for (const receipt of [false, 0, null, "", "1", "true", {}, []] as const) {
+  test(`avatar one-shot: any existing receipt value denies: ${JSON.stringify(receipt)}`, async (t) => {
+    const values = freshValues();
+    values.set(AVATAR_SYNC_CONSUMED_KEY, receipt);
+    const h = await harness(t, AVATAR_WORKER_ENV, values);
+    await h.bot.start();
+    assert.deepEqual(h.starts[0]?.env, DISARMED_ENV);
+    assert.equal(values.get(AVATAR_SYNC_CONSUMED_KEY), receipt, "denial must not rewrite the receipt");
+  });
+}
+
+test("avatar one-shot: reattaching to a running container neither arms nor consumes", async (t) => {
+  const values = freshValues();
+  const h = await harness(t, AVATAR_WORKER_ENV, values, undefined);
+  h.runtime.running = true;
+  await h.bot.start();
+  await h.bot.startAndWaitForPorts();
+  assert.equal(h.starts.length, 0);
+  assert.equal(values.has(AVATAR_SYNC_CONSUMED_KEY), false);
+});
+
+test("avatar one-shot: concurrent entries in one instance claim the receipt once and start one process", async (t) => {
+  const h = await harness(t, AVATAR_WORKER_ENV, freshValues());
+  const put = h.ctx.storage.put;
+  const puts: unknown[] = [];
+  t.mock.method(h.ctx.storage, "put", async (...args: Parameters<typeof put>) => {
+    if (args[0] === AVATAR_SYNC_CONSUMED_KEY) puts.push(args[1]);
+    return put(...args);
+  });
+  await Promise.all([h.bot.start(), h.bot.startAndWaitForPorts(), h.bot.containerFetch("https://worker.invalid/health")]);
+  assert.deepEqual(puts, [true]);
+  // The losing callers disarm synchronously and may reach the SDK first, so
+  // the single process can start without the switch (fail closed); it can
+  // never start armed twice.
+  assert.equal(h.starts.length, 1);
+  assert.ok(h.starts[0]?.env?.[AVATAR_VAR] === "1" || h.starts[0]?.env?.[AVATAR_VAR] === undefined);
+  assert.equal(h.values.get(AVATAR_SYNC_CONSUMED_KEY), true);
+});
+
+for (const method of ["start", "startAndWaitForPorts"] as const) {
+  const run = (h: AvatarHarness, envVars: Record<string, string>) => method === "start"
+    ? h.bot.start({ envVars }) : h.bot.startAndWaitForPorts({ startOptions: { envVars } });
+
+  test(`${method}: caller-supplied avatar switch is stripped when the Worker is not armed`, async (t) => {
+    for (const env of [WORKER_ENV, { ...WORKER_ENV, TWO_DEPLOY_ENV: "staging" },
+      { ...WORKER_ENV, TWO_DEPLOY_ENV: "production", [AVATAR_VAR]: "1" }]) {
+      const values = freshValues();
+      const h = await harness(t, env, values);
+      await run(h, { ONLY_EXPLICIT: "synthetic-override", TWO_DEPLOY_ENV: "staging", [AVATAR_VAR]: "1" });
+      assert.deepEqual(h.starts[0]?.env, { ONLY_EXPLICIT: "synthetic-override", TWO_DEPLOY_ENV: "staging" });
+      assert.equal(values.has(AVATAR_SYNC_CONSUMED_KEY), false);
+    }
+  });
+
+  test(`${method}: caller-supplied avatar switch cannot bypass a consumed receipt`, async (t) => {
+    const values = freshValues();
+    values.set(AVATAR_SYNC_CONSUMED_KEY, true);
+    const h = await harness(t, AVATAR_WORKER_ENV, values);
+    await run(h, { TWO_DEPLOY_ENV: "staging", [AVATAR_VAR]: "1" });
+    assert.deepEqual(h.starts[0]?.env, { TWO_DEPLOY_ENV: "staging" });
+  });
+
+  test(`${method}: explicit replacement without the staging marker is never armed or consumed`, async (t) => {
+    const values = freshValues();
+    const h = await harness(t, AVATAR_WORKER_ENV, values);
+    await run(h, { ONLY_EXPLICIT: "synthetic-override", [AVATAR_VAR]: "1" });
+    assert.deepEqual(h.starts[0]?.env, { ONLY_EXPLICIT: "synthetic-override" });
+    assert.equal(values.has(AVATAR_SYNC_CONSUMED_KEY), false);
+    assert.equal(h.bot.envVars[AVATAR_VAR], undefined);
+  });
+
+  test(`${method}: armed explicit replacement keeps only caller values plus the switch`, async (t) => {
+    const values = freshValues();
+    const h = await harness(t, { ...AVATAR_WORKER_ENV, ...PUBLICATION_ENV }, values);
+    const envVars = { ONLY_EXPLICIT: "synthetic-override", TWO_DEPLOY_ENV: "staging" };
+    await run(h, envVars);
+    assert.deepEqual(h.starts[0]?.env, { ...envVars, [AVATAR_VAR]: "1" });
+    assert.deepEqual(envVars, { ONLY_EXPLICIT: "synthetic-override", TWO_DEPLOY_ENV: "staging" },
+      "caller object must not be mutated");
+    assert.equal(values.get(AVATAR_SYNC_CONSUMED_KEY), true);
+  });
+
+  test(`${method}: unrelated non-env options keep SDK precedence while armed`, async (t) => {
+    const h = await harness(t, AVATAR_WORKER_ENV, freshValues());
+    if (method === "start") {
+      await h.bot.start({ enableInternet: false, entrypoint: ["synthetic-entrypoint"] });
+    } else {
+      await h.bot.startAndWaitForPorts({ startOptions: { enableInternet: false, labels: { test: "synthetic" } } });
+    }
+    assert.deepEqual(h.starts[0]?.env, ARMED_ENV);
+    assert.equal(h.starts[0]?.enableInternet, false);
+  });
+}
+
+test("armed and unarmed start preserve caller acquisition wait options", async (t) => {
+  const sdk = Object.getPrototypeOf(TwoBotContainer.prototype) as { start: (...args: unknown[]) => Promise<void> };
+  const signal = new AbortController().signal;
+  for (const armed of [true, false]) {
+    const h = await harness(t, armed ? AVATAR_WORKER_ENV : WORKER_ENV, freshValues());
+    const spy = t.mock.method(sdk, "start");
+    await h.bot.start(undefined, { signal, waitInterval: 50 });
+    const [, wait] = spy.mock.calls[0]!.arguments as [unknown, Record<string, unknown>];
+    assert.deepEqual(wait, { signal, waitInterval: 50 });
+    spy.mock.restore();
+  }
+});
+
+test("armed and unarmed startAndWaitForPorts preserve caller acquisition and readiness budgets", async (t) => {
+  const sdk = Object.getPrototypeOf(TwoBotContainer.prototype) as { startAndWaitForPorts: (...args: unknown[]) => Promise<void> };
+  const abort = new AbortController().signal;
+  for (const armed of [true, false]) {
+    const h = await harness(t, armed ? AVATAR_WORKER_ENV : WORKER_ENV, freshValues());
+    const spy = t.mock.method(sdk, "startAndWaitForPorts");
+    await h.bot.startAndWaitForPorts({ ports: 8080, cancellationOptions: { abort, portReadyTimeoutMS: 900 } });
+    const [ports, wait] = spy.mock.calls[0]!.arguments as [unknown, Record<string, unknown>];
+    assert.equal(ports, 8080);
+    assert.deepEqual(wait, { abort, portReadyTimeoutMS: 900 });
+    spy.mock.restore();
+  }
 });

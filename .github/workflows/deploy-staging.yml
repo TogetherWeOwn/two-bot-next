@@ -18,6 +18,13 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_ra
 # drill switches (staging fault injector): same dispatch-only, staging-only
 # plumbing, arming a stale creator map and/or an unpaired disconnect with
 # guard recommendations for the soak.
+# `set_bot_avatar_once` is the staging bot avatar one-shot
+# (docs/runbook.md#staging-bot-avatar-one-shot): same dispatch-only,
+# staging-only plumbing,
+# arming one Icon 1 avatar PATCH from the staging bot at boot. It never marks
+# the run promotion-unclean: the served bytes are identical, the effect is a
+# single Discord-side change, and Discord rate-limits avatar changes, so the
+# dispatch is run once, then left off again.
 # `sha` pins the deployed commit so arm and disarm run at one exact revision:
 # a dispatch-only string, empty by default (empty deploys the workflow head).
 # Every job checks out that ref and refuses anything that is not a full
@@ -73,6 +80,10 @@ on:
         default: false
       inject_unpaired_disconnect:
         description: STAGING remediation drill only - deployed build holds an unpaired gateway disconnect so gateway_unpaired_disconnect fires with guard recommendations
+        type: boolean
+        default: false
+      set_bot_avatar_once:
+        description: STAGING bot avatar one-shot only - deployed staging bot PATCHes its own avatar to Icon 1 once at boot, then never again
         type: boolean
         default: false
       sha:
@@ -391,6 +402,12 @@ jobs:
           INJECT_GATEWAY_FAILURE: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_gateway_failure && 'true' || 'false' }}
           INJECT_VOICE_STALL: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_voice_stall && 'true' || 'false' }}
           INJECT_UNPAIRED_DISCONNECT: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_unpaired_disconnect && 'true' || 'false' }}
+          # Dispatch-only one-shot switch: a push run has no inputs and this
+          # expression requires workflow_dispatch besides, so it is 'false'
+          # on every push. test_workflows.py pins this exact expression.
+          # Kept out of `inject` below (and off promotion_clean): the served
+          # bytes are identical, so a one-shot avatar deploy still certifies.
+          SET_BOT_AVATAR_ONCE: ${{ github.event_name == 'workflow_dispatch' && inputs.set_bot_avatar_once && 'true' || 'false' }}
         run: |
           set -euo pipefail
           mkdir -p "$ROLLOUT_DIR"
@@ -404,10 +421,14 @@ jobs:
           if [ "$INJECT_UNPAIRED_DISCONNECT" = "true" ]; then
             inject+=(--inject-unpaired-disconnect)
           fi
+          avatar=()
+          if [ "$SET_BOT_AVATAR_ONCE" = "true" ]; then
+            avatar=(--set-bot-avatar-once)
+          fi
           python3 ../scripts/staging_rollout.py prepare \
             --receipt "$ROLLOUT_DIR/baseline.json" \
             --output "$WRANGLER_OUTPUT_FILE_PATH" \
-            --deploy-config "$ROLLOUT_DIR/staging-deploy.json" "${inject[@]}"
+            --deploy-config "$ROLLOUT_DIR/staging-deploy.json" "${inject[@]}" "${avatar[@]}"
           if [ "${#inject[@]}" -eq 0 ]; then
             echo "promotion_clean=true" >> "$GITHUB_OUTPUT"
           else
