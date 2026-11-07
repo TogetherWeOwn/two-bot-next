@@ -86,6 +86,7 @@ jobs:
               - 'docs/voice-conditions-core.md'
               - 'docs/soak-checklist.json'
               - 'docs/soak-checklist.md'
+              - 'docs/staging-soak.md'
               - 'docs/staging-e2e-command-matrix.md'
               - 'docs/smoke-expected-responses.md'
               - 'docs/smoke-run-record.md'
