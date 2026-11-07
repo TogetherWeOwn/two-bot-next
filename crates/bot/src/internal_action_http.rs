@@ -930,6 +930,7 @@ struct ReceiverState {
     /// reads as `discord_unavailable` with a fresh `observed_at` never
     /// stamped on stale occupancy.
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
+    attendance_reads: two_bot::event_attendance::AttendanceReadAuthority,
     clock: Mutex<ClockGuard>,
     buckets: Mutex<TokenBuckets>,
     telemetry: Mutex<RejectionTelemetry>,
@@ -980,6 +981,7 @@ impl ReceiverState {
             voice_cache: voice_snapshot::new_shared_cache(),
             voice_clock: VoiceOccupancyClock::new(),
             gateway_state: Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
+            attendance_reads: Default::default(),
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
             telemetry: Mutex::new(RejectionTelemetry::default()),
@@ -1020,6 +1022,14 @@ impl ReceiverState {
     /// which reads every room as `null`.
     fn with_voice_clock(mut self, voice_clock: Arc<VoiceOccupancyClock>) -> Self {
         self.voice_clock = voice_clock;
+        self
+    }
+
+    fn with_attendance_reads(
+        mut self,
+        attendance_reads: two_bot::event_attendance::AttendanceReadAuthority,
+    ) -> Self {
+        self.attendance_reads = attendance_reads;
         self
     }
 
@@ -1241,6 +1251,7 @@ pub async fn bind(
     voice_cache: Arc<DefaultInMemoryCache>,
     voice_clock: Arc<VoiceOccupancyClock>,
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
+    attendance_reads: two_bot::event_attendance::AttendanceReadAuthority,
 ) -> std::io::Result<BoundReceiver> {
     use two_bot_core::send_admission::{PgSendAdmission, SendAdmission};
     use two_bot_discord::internal_actions::CooldownGovernor;
@@ -1299,7 +1310,8 @@ pub async fn bind(
             )
             .with_voice_cache(voice_cache)
             .with_voice_clock(voice_clock)
-            .with_gateway_state(gateway_state),
+            .with_gateway_state(gateway_state)
+            .with_attendance_reads(attendance_reads),
         ),
     })
 }
@@ -1887,6 +1899,13 @@ async fn read_event_attendance(
         return reject(Failure::code(ErrorCode::InProgress));
     };
     let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let Some(ticket) = guild_id
+        .parse()
+        .ok()
+        .and_then(|guild| state.attendance_reads.ticket(guild))
+    else {
+        return reject(Failure::code(ErrorCode::DiscordUnavailable));
+    };
     let window = match state
         .store
         .attendance_window_for_key(guild_id, &event_key)
@@ -1936,8 +1955,14 @@ async fn read_event_attendance(
     let now_ms = i64::try_from(now_ms()).unwrap_or(i64::MAX);
     match two_bot::event_attendance::project_attendance(&event_key, &window_ms, &rows, now_ms) {
         Ok(result) => {
+            let response = event_read_response(result, id);
+            // A recovery may have completed while these SQL reads or the
+            // projection ran. Its readiness cannot validate an older epoch.
+            if !ticket.is_current() {
+                return reject(Failure::code(ErrorCode::DiscordUnavailable));
+            }
             metrics::global().internal_action(internal_family(action), "executed");
-            event_read_response(result, id)
+            response
         }
         // No tagged sessions (including every pre-enable window): the key
         // names nothing the logger saw.

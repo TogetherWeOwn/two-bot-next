@@ -452,6 +452,7 @@ async fn run(cli_args: &[String]) {
     // never saw reads `null`, never a fabricated start.
     let voice_cache = voice_snapshot::new_shared_cache();
     let voice_clock = voice_snapshot::VoiceOccupancyClock::new();
+    let attendance_reads = two_bot::event_attendance::AttendanceReadAuthority::default();
     // Capture the authoritative pool before the gateway's async move owns it.
     // Bind privately before starting tasks; enabled failures never fall back.
     let receiver = match receiver_config {
@@ -471,6 +472,7 @@ async fn run(cli_args: &[String]) {
                     Arc::clone(&voice_cache),
                     Arc::clone(&voice_clock),
                     Arc::clone(&gateway),
+                    attendance_reads.clone(),
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -578,11 +580,17 @@ async fn run(cli_args: &[String]) {
     // service watch: frames the draining writer still applies, and the spans
     // its voice guard closes on exit, must land before that pass.
     let (activity_drained, activity_drain) = tokio::sync::watch::channel(false);
-    let (voice, flush_task) =
-        match build_voice_runtime(&config, VoiceGates::from_env().enabled, activity_drain).await {
-            Some((sink, flush)) => (Some(sink), Some(flush)),
-            None => (None, None),
-        };
+    let (voice, flush_task) = match build_voice_runtime(
+        &config,
+        VoiceGates::from_env().enabled,
+        activity_drain,
+        attendance_reads,
+    )
+    .await
+    {
+        Some((sink, flush)) => (Some(sink), Some(flush)),
+        None => (None, None),
+    };
 
     // M3.3 reconcile: once at startup plus a bounded interval while
     // `TWO_EVENTSUB` is exactly `1`. The loop shares the bound receiver's

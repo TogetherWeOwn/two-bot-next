@@ -32,8 +32,9 @@
 //! anonymised in it. Closes still finalize so no open row leaks; gate read
 //! failures fail closed by dropping the open.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{json, Value};
 use time::OffsetDateTime;
@@ -47,6 +48,136 @@ use two_bot_cutover::event_attendance::{
 /// handling. Duplicated — not imported — so this module stays independent of
 /// the room actor.
 const REVALIDATE_TIMEOUT_MS: u64 = 1_000;
+
+/// Per-process guild fences shared by gateway actors and signed reads. An
+/// unwired guild refuses reads, including before its first actor has loaded.
+#[derive(Clone, Default)]
+pub struct AttendanceReadAuthority {
+    guilds: Arc<Mutex<HashMap<Snowflake, AttendanceReadFence>>>,
+}
+
+impl AttendanceReadAuthority {
+    /// Register an actor's fence before publishing that actor. Replacing an
+    /// actor also invalidates tickets issued by its previous incarnation.
+    pub fn register(&self, guild: Snowflake, fence: AttendanceReadFence) {
+        let mut guilds = self
+            .guilds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(previous) = guilds.insert(guild, fence) {
+            previous.invalidate();
+        }
+    }
+
+    /// Acquire permission to read only after this actor's recovery completed.
+    pub fn ticket(&self, guild: Snowflake) -> Option<AttendanceReadTicket> {
+        let fence = self
+            .guilds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&guild)
+            .cloned()?;
+        fence.ticket()
+    }
+}
+
+#[derive(Debug, Default)]
+struct AttendanceFenceState {
+    epoch: u64,
+    ready: bool,
+}
+
+/// One guild's read/capture recovery epoch. Gateway interruption invalidates
+/// it synchronously; actor recovery owns readiness, never the receiver.
+#[derive(Debug, Clone, Default)]
+pub struct AttendanceReadFence {
+    inner: Arc<Mutex<AttendanceFenceState>>,
+}
+
+impl AttendanceReadFence {
+    /// Revoke readiness and every outstanding read ticket, without a DB await.
+    pub fn invalidate(&self) {
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        state.epoch += 1;
+        state.ready = false;
+    }
+
+    /// Start a new recovery incarnation. Keep its guard alive for the actor's
+    /// lifetime; dropping it revokes readiness on normal exit or panic unwind.
+    pub fn begin_recovery(&self) -> AttendanceRecoveryGuard {
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        state.epoch += 1;
+        state.ready = false;
+        AttendanceRecoveryGuard {
+            fence: self.clone(),
+            epoch: state.epoch,
+        }
+    }
+
+    fn ticket(&self) -> Option<AttendanceReadTicket> {
+        let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        state.ready.then(|| AttendanceReadTicket {
+            fence: self.clone(),
+            epoch: state.epoch,
+        })
+    }
+}
+
+/// Actor-owned completion authority for exactly one recovery incarnation.
+pub struct AttendanceRecoveryGuard {
+    fence: AttendanceReadFence,
+    epoch: u64,
+}
+
+impl AttendanceRecoveryGuard {
+    /// Called only after the final bounded page commits and gateway evidence
+    /// is revalidated. A disconnect or replacement meanwhile refuses completion.
+    pub fn complete(&self) -> bool {
+        let mut state = self
+            .fence
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.epoch != self.epoch {
+            return false;
+        }
+        state.ready = true;
+        true
+    }
+}
+
+impl Drop for AttendanceRecoveryGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .fence
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.epoch == self.epoch {
+            state.epoch += 1;
+            state.ready = false;
+        }
+    }
+}
+
+/// A read must revalidate its original epoch immediately before returning,
+/// even if a newer recovery has already finished by then.
+pub struct AttendanceReadTicket {
+    fence: AttendanceReadFence,
+    epoch: u64,
+}
+
+impl AttendanceReadTicket {
+    /// Whether the read still belongs to the recovered incarnation it began in.
+    pub fn is_current(&self) -> bool {
+        let state = self
+            .fence
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.ready && state.epoch == self.epoch
+    }
+}
 
 /// Store surface the session logger needs. Narrower than
 /// `voice_rooms::RoomPersistence`, which forwards every store through a

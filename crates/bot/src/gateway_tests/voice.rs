@@ -590,7 +590,8 @@ async fn voice_startup_uses_dml_role_without_migration_ledger_access() {
         guild_id: Some(100),
     };
     let (shutdown, latched) = tokio::sync::watch::channel(false);
-    let sink = crate::gateway::build_voice_runtime(&config, true, latched).await;
+    let sink =
+        crate::gateway::build_voice_runtime(&config, true, latched, Default::default()).await;
     let enabled = sink.is_some();
     if let Some((_, flush)) = sink {
         shutdown.send(true).expect("flush loop holds the receiver");

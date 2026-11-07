@@ -489,7 +489,11 @@ stops capture guild-wide; closes still finalize so no open row leaks.
 Actor starts and gateway-generation changes drain old open spans at their joins:
 unknown offline time earns no credit, even if the occupant is present again.
 Recovery processes 32 rows per one-second turn, retries failed pages, and blocks
-capture until drained. Buffered pre-recovery joins stay missed. Maintenance detects
+capture until drained. Signed reads share that recovery fence: an unwired actor,
+cold start, disconnected gateway, or unfinished drain refuses `discord_unavailable`,
+not a partial list. Reads revalidate their original epoch after projection, so even
+a completed newer recovery cannot validate an in-flight old result. Actor exit
+revokes readiness. Buffered pre-recovery joins stay missed. Maintenance detects
 recovery without new frames; an unchanged-generation snapshot cannot override
 queued transitions. Snapshots never open spans.
 

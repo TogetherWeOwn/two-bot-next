@@ -2270,6 +2270,7 @@ fn write_permission_findings(
 pub struct LiveGuild {
     guild_id: Snowflake,
     inner: Arc<RwLock<LiveState>>,
+    attendance_reads: crate::event_attendance::AttendanceReadFence,
 }
 
 impl LiveGuild {
@@ -2277,6 +2278,7 @@ impl LiveGuild {
         Self {
             guild_id,
             inner: Arc::new(RwLock::new(LiveState::default())),
+            attendance_reads: crate::event_attendance::AttendanceReadFence::default(),
         }
     }
 
@@ -2343,6 +2345,7 @@ impl LiveGuild {
         }
         let mut live = self.write_state();
         live.generation += 1;
+        self.attendance_reads.invalidate();
         live.channels = snapshot
             .channels
             .into_iter()
@@ -2385,6 +2388,7 @@ impl LiveGuild {
         let mut live = self.write_state();
         live.ready = false;
         live.generation += 1;
+        self.attendance_reads.invalidate();
         live.empty_since.clear();
     }
 
@@ -8703,6 +8707,7 @@ pub struct VoiceRuntime<S, H> {
     synthetic_humans: HashSet<Snowflake>,
     seeds: AtomicU64,
     actors: Mutex<HashMap<Snowflake, GuildActor>>,
+    attendance_reads: crate::event_attendance::AttendanceReadAuthority,
     /// The gateway is connected as far as voice is concerned: set once READY
     /// or RESUMED is handled, cleared by every transport `disconnect`. While
     /// set, a live view that is not ready is a fault, not an outage, and
@@ -8751,6 +8756,7 @@ where
             synthetic_humans: HashSet::new(),
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
+            attendance_reads: crate::event_attendance::AttendanceReadAuthority::default(),
             gateway_connected: AtomicBool::new(false),
             access_lock: tokio::sync::Mutex::new(()),
             pending_imports: Mutex::new(HashMap::new()),
@@ -8765,6 +8771,16 @@ where
     fn parse_voice_command(&self, interaction: &Interaction) -> Option<VoiceCommand> {
         let identities = self.command_identities.read().ok()?;
         parse_voice_command_with_registry(interaction, &identities)
+    }
+
+    /// Share attendance recovery readiness with the signed receiver. Install
+    /// before any actors exist; an unwired receiver remains conservative.
+    pub fn with_attendance_reads(
+        mut self,
+        authority: crate::event_attendance::AttendanceReadAuthority,
+    ) -> Self {
+        self.attendance_reads = authority;
+        self
     }
 
     /// Install boot configuration before spawning any actors.
@@ -8947,6 +8963,8 @@ where
             tx,
             backpressure: ActorInboxBackpressure::default(),
         };
+        self.attendance_reads
+            .register(guild, actor.live.attendance_reads.clone());
         actor
             .live
             .protect_channels(self.protected_channels.iter().copied());
@@ -10446,21 +10464,23 @@ struct AttendanceRecovery {
     after_id: i64,
     resetting: bool,
     capture_since: Option<OffsetDateTime>,
+    fence: Option<crate::event_attendance::AttendanceRecoveryGuard>,
 }
 
 impl AttendanceRecovery {
-    fn observe_generation(&mut self, generation: u64) {
-        if self.generation != Some(generation) {
-            self.generation = Some(generation);
+    fn observe_generation(&mut self, live: &LiveGuild) {
+        let state = live.read_state();
+        if self.generation != Some(state.generation) {
+            self.generation = Some(state.generation);
             self.after_id = 0;
             self.resetting = true;
+            self.fence = Some(live.attendance_reads.begin_recovery());
         }
     }
 
     fn capture_allowed(&mut self, live: &LiveGuild) -> bool {
-        let state = live.read_state();
-        self.observe_generation(state.generation);
-        state.ready && !self.resetting
+        self.observe_generation(live);
+        live.read_state().ready && !self.resetting
     }
 
     fn transition_allowed(&mut self, live: &LiveGuild, observed_at: OffsetDateTime) -> bool {
@@ -10475,11 +10495,11 @@ impl AttendanceRecovery {
         if !enabled {
             return;
         }
+        self.observe_generation(&worker.live);
         let (generation, ready) = {
             let live = worker.live.read_state();
             (live.generation, live.ready)
         };
-        self.observe_generation(generation);
         if !ready || !self.resetting {
             return;
         }
@@ -10512,15 +10532,22 @@ impl AttendanceRecovery {
         .await;
         match result {
             Ok(Ok(Some((after_id, count)))) => {
+                let live = worker.live.read_state();
+                if live.generation != generation
+                    || self.generation != Some(generation)
+                    || !live.ready
+                {
+                    return;
+                }
                 self.after_id = after_id;
-                if count < two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE {
+                if count < two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE
+                    && self.fence.as_ref().is_some_and(|fence| fence.complete())
+                {
                     self.after_id = 0;
-                    if self.resetting && ready {
-                        // Buffered pre-recovery frames are not new evidence;
-                        // never replay their joins into the repaired epoch.
-                        self.capture_since = Some(OffsetDateTime::now_utc());
-                    }
-                    self.resetting = !ready;
+                    // Buffered pre-recovery frames are not new evidence;
+                    // never replay their joins into the repaired epoch.
+                    self.capture_since = Some(OffsetDateTime::now_utc());
+                    self.resetting = false;
                 }
             }
             _ => {
@@ -11159,6 +11186,7 @@ pub fn build_production_runtime(
     pool: sqlx::PgPool,
     name_policy: AutomodPolicy,
     live_source: impl Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync + 'static,
+    attendance_reads: crate::event_attendance::AttendanceReadAuthority,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
     // Fatal settings name only the first refused key, in existing validation
     // order, before the gateway's generic `voice HTTP setup failed` event.
@@ -11195,7 +11223,8 @@ pub fn build_production_runtime(
             .with_admission_config(configured_admission(|key| std::env::var(key).ok()))
             .with_synthetic_humans(synthetic_humans)
             .with_name_policy(name_policy)
-            .with_live_source(live_source),
+            .with_live_source(live_source)
+            .with_attendance_reads(attendance_reads),
         ),
         Arc::new(replies),
     ))

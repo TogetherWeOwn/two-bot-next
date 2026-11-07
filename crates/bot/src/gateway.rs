@@ -2411,6 +2411,7 @@ pub async fn build_voice_runtime(
     config: &Config,
     voice_enabled: bool,
     drained: tokio::sync::watch::Receiver<bool>,
+    attendance_reads: two_bot::event_attendance::AttendanceReadAuthority,
 ) -> Option<(Arc<dyn VoiceEventSink>, tokio::task::JoinHandle<()>)> {
     if !voice_enabled {
         return None;
@@ -2451,9 +2452,13 @@ pub async fn build_voice_runtime(
     // Name restrictions are independent of chat counts, sanctions and gates:
     // a malformed unrelated setting must not discard the configured word list.
     let name_policy = AutomodPolicy::name_policy_from_map(&std::env::vars().collect());
-    match build_production_runtime(token, db.pool().clone(), name_policy, || {
-        crate::settings_jobs::live()
-    }) {
+    match build_production_runtime(
+        token,
+        db.pool().clone(),
+        name_policy,
+        || crate::settings_jobs::live(),
+        attendance_reads,
+    ) {
         Ok(runtime) => {
             info!("voice rooms enabled; gateway sink attached");
             // Hourly guild-aggregate persist for the game-activity collector
@@ -3299,31 +3304,40 @@ mod tests {
     #[tokio::test]
     async fn voice_runtime_off_without_gate() {
         let config = voice_config(Some("token"), Some("postgres://localhost/unused"));
-        assert!(
-            build_voice_runtime(&config, false, tokio::sync::watch::channel(false).1)
-                .await
-                .is_none()
-        );
+        assert!(build_voice_runtime(
+            &config,
+            false,
+            tokio::sync::watch::channel(false).1,
+            Default::default()
+        )
+        .await
+        .is_none());
     }
 
     #[tokio::test]
     async fn voice_runtime_off_without_token() {
         let config = voice_config(None, Some("postgres://localhost/unused"));
-        assert!(
-            build_voice_runtime(&config, true, tokio::sync::watch::channel(false).1)
-                .await
-                .is_none()
-        );
+        assert!(build_voice_runtime(
+            &config,
+            true,
+            tokio::sync::watch::channel(false).1,
+            Default::default()
+        )
+        .await
+        .is_none());
     }
 
     #[tokio::test]
     async fn voice_runtime_off_without_database() {
         let config = voice_config(Some("token"), None);
-        assert!(
-            build_voice_runtime(&config, true, tokio::sync::watch::channel(false).1)
-                .await
-                .is_none()
-        );
+        assert!(build_voice_runtime(
+            &config,
+            true,
+            tokio::sync::watch::channel(false).1,
+            Default::default()
+        )
+        .await
+        .is_none());
     }
 
     #[tokio::test]
@@ -3354,11 +3368,14 @@ mod tests {
         // remain useful without exposing the rejected credential-bearing value.
         let url = "fixture-invalid-scheme://fixture-user:fixture-db-password@agent-testdb/db";
         let config = voice_config(Some("fixture-discord-token"), Some(url));
-        assert!(
-            build_voice_runtime(&config, true, tokio::sync::watch::channel(false).1)
-                .await
-                .is_none()
-        );
+        assert!(build_voice_runtime(
+            &config,
+            true,
+            tokio::sync::watch::channel(false).1,
+            Default::default()
+        )
+        .await
+        .is_none());
         let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert!(output.contains("voice database unavailable; voice rooms disabled"));
         for secret in [

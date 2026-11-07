@@ -1556,6 +1556,99 @@ fn recovery_row(
 }
 
 #[tokio::test(start_paused = true)]
+async fn attendance_read_authority_tracks_actor_recovery_and_gateway_epochs() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    assert!(authority.ticket(GUILD).is_none(), "actor not loaded yet");
+    store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .extend((1..=33).map(|id| recovery_row(id, MEMBER, CREATOR)));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    assert!(authority.ticket(GUILD).is_none(), "second page outstanding");
+    recovery.turn(&worker, true).await;
+    let old_read = authority.ticket(GUILD).expect("all pages committed");
+    assert!(old_read.is_current());
+    worker.live.disconnect();
+    assert!(
+        !old_read.is_current(),
+        "gateway invalidates before actor runs"
+    );
+    assert!(authority.ticket(GUILD).is_none());
+    worker.live.publish(snapshot(&[], vec![]));
+    assert!(
+        authority.ticket(GUILD).is_none(),
+        "snapshot is not recovery"
+    );
+    recovery.turn(&worker, true).await;
+    let new_read = authority.ticket(GUILD).expect("new epoch recovered");
+    assert!(new_read.is_current());
+    assert!(
+        !old_read.is_current(),
+        "new readiness cannot revive old reads"
+    );
+    drop(recovery);
+    assert!(!new_read.is_current(), "actor exit revokes readiness");
+    assert!(authority.ticket(GUILD).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_recovery_completion_cannot_publish_after_gateway_changes_during_commit() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .push(recovery_row(1, MEMBER, CREATOR));
+    *store.attendance_recovery_delay.lock().unwrap() = Some(Duration::from_millis(100));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    let interruption = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        worker.live.disconnect();
+        worker.live.publish(snapshot(&[], vec![]));
+    };
+    tokio::join!(recovery.turn(&worker, true), interruption);
+    assert!(authority.ticket(GUILD).is_none());
+    assert!(recovery.resetting);
+    assert_eq!(
+        recovery.after_id, 0,
+        "no cursor advance on stale generation"
+    );
+    recovery.turn(&worker, true).await;
+    assert!(authority.ticket(GUILD).is_some());
+}
+
+#[test]
+fn attendance_replacing_an_actor_revokes_old_reads_and_old_completion() {
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    let old = crate::event_attendance::AttendanceReadFence::default();
+    authority.register(GUILD, old.clone());
+    let old_actor = old.begin_recovery();
+    assert!(old_actor.complete());
+    let old_read = authority.ticket(GUILD).unwrap();
+    let replacement = crate::event_attendance::AttendanceReadFence::default();
+    authority.register(GUILD, replacement.clone());
+    assert!(!old_read.is_current());
+    assert!(!old_actor.complete());
+    assert!(authority.ticket(GUILD).is_none());
+    let new_actor = replacement.begin_recovery();
+    assert!(new_actor.complete());
+    drop(old_actor);
+    assert!(authority.ticket(GUILD).unwrap().is_current());
+    assert!(
+        authority.ticket(GUILD + 1).is_none(),
+        "guild-scoped readiness"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn attendance_restart_recovery_drains_bounded_pages_before_capture() {
     let (live, store, http, _) = fixture();
     store
