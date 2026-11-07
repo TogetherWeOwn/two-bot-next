@@ -204,9 +204,11 @@ the first EOF as final. Regression tests cover oversized setup records spanning
 chunks, rejection of oversized measured records, a delayed stop marker and awaited
 first-fixture cleanup when observer setup fails. These database regressions live
 in the non-ignored `testsupport/tests/pipeline_integrity.rs` integration target.
-Normal integration, nightly and coverage sweeps provide a JSON collector, retain
-maintenance defaults and enable completion logging only on the log-reader test's
-single synthetic connection, not across unrelated suites.
+Normal integration, nightly `sweep-partition` matrix lanes and coverage sweeps
+provide a JSON collector, retain maintenance defaults and enable completion logging
+only on the log-reader test's single synthetic connection, not across unrelated
+suites. Nightly planning, guarded reruns, doctests and the aggregate do not execute
+this integration guard and do not enable a collector.
 Only fingerprints/counts are published. Full raw
 logs may contain parameter values and remain inside the disposable server;
 never upload them. Missing instrumentation is INVALID/NOT RUN, not a score.

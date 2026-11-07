@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -55,23 +56,82 @@ class RevisionTests(unittest.TestCase):
         self.assertEqual((self.root / "pipeline-benchmark-revision.txt").read_text(), "")
         self.assertFalse((self.root / "pipeline-benchmark-pr-head.txt").exists())
 
+    def job_blocks(self, workflow):
+        jobs = workflow.split("\njobs:\n", 1)[1]
+        headers = list(re.finditer(r"^  ([\w-]+):\n", jobs, re.MULTILINE))
+        return {match.group(1): jobs[match.start():headers[index + 1].start()
+                                   if index + 1 < len(headers) else len(jobs)]
+                for index, match in enumerate(headers)}
+
+    def assert_collector(self, workflow, job):
+        jobs = self.job_blocks(workflow)
+        self.assertIn(job, jobs)
+        block = jobs[job]
+        self.assertIn("    steps:\n", block, job)
+        service = block.split("    steps:\n", 1)[0]
+        self.assertIn("    services:\n", service, job)
+        service = service.split("    services:\n", 1)[1]
+        self.assertIn("POSTGRES_INITDB_ARGS:", service, job)
+        self.assertIn("-c logging_collector=on -c log_destination=jsonlog", service, job)
+        self.assertIn("-c log_rotation_age=0 -c log_rotation_size=0", service, job)
+        if job == "benchmark":
+            self.assertIn("-c autovacuum=off", service)
+            self.assertIn("-c log_min_duration_statement=0", service)
+        else:
+            self.assertNotIn("-c autovacuum=off", service)
+            self.assertNotIn("-c log_min_duration_statement=0", service)
+
     def test_benchmark_and_normal_sweeps_provide_disposable_log_collectors(self):
         for filename, job in [("pipeline-benchmark.yml", "benchmark"),
                               ("check.yml", "rust-tests"), ("check.yml", "coverage-shard"),
-                              ("nightly.yml", "sweep")]:
+                              ("nightly.yml", "sweep-partition")]:
             workflow = (ROOT / ".github/workflows" / filename).read_text()
-            service = workflow.split(f"  {job}:\n", 1)[1].split("    services:\n", 1)[1]
-            service = service.split("    steps:\n", 1)[0]
             with self.subTest(workflow=filename, job=job):
-                self.assertIn("POSTGRES_INITDB_ARGS:", service)
-                self.assertIn("-c logging_collector=on -c log_destination=jsonlog", service)
-                self.assertIn("-c log_rotation_age=0 -c log_rotation_size=0", service)
-                if job == "benchmark":
-                    self.assertIn("-c autovacuum=off", service)
-                    self.assertIn("-c log_min_duration_statement=0", service)
-                else:
-                    self.assertNotIn("-c autovacuum=off", service)
-                    self.assertNotIn("-c log_min_duration_statement=0", service)
+                self.assert_collector(workflow, job)
+
+    def test_nightly_collectors_follow_guard_execution(self):
+        workflow = (ROOT / ".github/workflows/nightly.yml").read_text()
+        jobs = self.job_blocks(workflow)
+        execution_jobs = [job for job, block in jobs.items()
+                          if "    steps:\n" in block and any(
+                              command in block.split("    steps:\n", 1)[1]
+                              for command in ("nightly_partition.py run", "pipeline_integrity",
+                                              "pipeline_durability"))]
+        self.assertTrue(execution_jobs, "no nightly integrity guard execution lane found")
+        for job in execution_jobs:
+            with self.subTest(job=job):
+                self.assert_collector(workflow, job)
+        for job in ("sweep-plan", "sweep-guarded", "sweep-docs"):
+            with self.subTest(nonexecuting_job=job):
+                self.assertNotIn("POSTGRES_INITDB_ARGS", jobs[job])
+
+    def test_nightly_collector_rejection_controls(self):
+        workflow = (ROOT / ".github/workflows/nightly.yml").read_text()
+        jobs = self.job_blocks(workflow)
+        collector = (
+            "          # Only the log-reader regression's connection enables completions.\n"
+            "          POSTGRES_INITDB_ARGS: >-\n"
+            "            -c logging_collector=on -c log_destination=jsonlog\n"
+            "            -c log_rotation_age=0 -c log_rotation_size=0\n"
+        )
+        self.assertIn(collector, jobs["sweep-partition"])
+        removed = workflow.replace(jobs["sweep-partition"],
+                                   jobs["sweep-partition"].replace(collector, "", 1), 1)
+        moved = removed.replace(jobs["sweep-guarded"], jobs["sweep-guarded"].replace(
+            "          POSTGRES_HOST_AUTH_METHOD: trust\n",
+            "          POSTGRES_HOST_AUTH_METHOD: trust\n" + collector, 1), 1)
+        moved_partition = self.job_blocks(moved)["sweep-partition"]
+        service = moved_partition.split("    services:\n", 1)[1].split("    steps:\n", 1)[0]
+        no_service = moved.replace(moved_partition, moved_partition.replace(
+            "    services:\n" + service, "", 1), 1)
+        self.assertNotIn("    services:\n", self.job_blocks(no_service)["sweep-partition"])
+        self.assertIn(collector, self.job_blocks(no_service)["sweep-guarded"])
+        for name, candidate, job in [("removed", removed, "sweep-partition"),
+                                     ("moved", moved, "sweep-partition"),
+                                     ("later service", no_service, "sweep-partition"),
+                                     ("aggregate", workflow, "sweep")]:
+            with self.subTest(mutation=name), self.assertRaises(AssertionError):
+                self.assert_collector(candidate, job)
 
     def test_pipeline_database_guards_run_without_ignored_test_opt_ins(self):
         durability = (ROOT / "crates/cutover/tests/pipeline_durability.rs").read_text()
