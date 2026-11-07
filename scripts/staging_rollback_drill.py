@@ -249,7 +249,11 @@ class Drill:
         deadline = started + READY_TIMEOUT_SECONDS
         probes = non_200 = 0
         while True:
+            if self.staging_use:
+                self.staging_use.check(recovery=True)
             status, health, passed = self.probe(version)
+            if self.staging_use:
+                self.staging_use.check(recovery=True)
             probes += 1
             if status != 200:
                 non_200 += 1
@@ -453,6 +457,8 @@ def dry_run_plan(drill, target):
         "staging rollback drill dry-run plan",
         f"target_version: {target}",
         f"pre_version: {pre}",
+        "live use: one 25-minute run/attempt window, exact-SHA baseline readiness",
+        "each takeover retains the original expiry; final release confirms stop",
         "legs in order:",
         f"1. drill: fence singleton, rollback Worker to {target}, "
         f"takeover to {target}, wait first ready",
