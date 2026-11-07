@@ -5528,11 +5528,12 @@ async fn event_attendance_read_malformed_key_is_refused_and_replay_is_conflict()
 
 #[tokio::test]
 async fn event_attendance_read_busy_event_gate_refuses_without_claiming() {
+    let Some(db) = database().await else { return };
     let _flag = INTERNAL_FLAG_LOCK.lock().await;
     set_attendance_read_flag(true);
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let reads = Arc::new(MockEventRead::default());
-    let mut state = state_with_reads(lazy_pool(), effect.clone(), reads.clone());
+    let mut state = state_with_reads(db.pool().clone(), effect.clone(), reads.clone());
     Arc::get_mut(&mut state).unwrap().event_gate_wait = Duration::from_millis(10);
     let held = state.event_gate.lock().await;
     let (status, _, body) = answer(
@@ -5547,6 +5548,8 @@ async fn event_attendance_read_busy_event_gate_refuses_without_claiming() {
     assert!(body.get("result").is_none());
     assert_eq!(effect.calls(), 0);
     assert_eq!(reads.calls(), 0);
+    assert_eq!(idempotency_rows(db.pool()).await, 0);
+    db.close().await.unwrap();
 }
 
 #[tokio::test]

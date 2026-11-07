@@ -1232,6 +1232,10 @@ mod tests {
             .unwrap();
         let pool = db.pool();
         let store = PgRoomStore::new(pool.clone());
+        let guild: Snowflake = 10000000000000001;
+        let member: Snowflake = 10000000000000002;
+        let guild_id = guild.to_string();
+        let member_id = member.to_string();
         let now = OffsetDateTime::now_utc();
         let stamp = |at| two_bot_core::funnel::format_iso_millis(millis_of(at));
         let observed = ScheduledEvent {
@@ -1245,23 +1249,23 @@ mod tests {
         };
         upsert_event(
             pool,
-            "1",
+            &guild_id,
             &stamp(now - time::Duration::minutes(1)),
             &observed,
         )
         .await
         .unwrap();
         InternalActionStore::new(pool.clone())
-            .put_event_key("1", "game-night", &observed.id)
+            .put_event_key(&guild_id, "game-night", &observed.id)
             .await
             .unwrap();
         let mut transition = join_transition();
-        transition.guild = 1;
-        transition.member = 2;
+        transition.guild = guild;
+        transition.member = member;
         transition.current = Some(7);
         transition.current_name = Some("Lobby".to_owned());
         record_transition(&store, transition.clone()).await;
-        let rows = AttendanceStore::open_attendance_sessions(&store, 1, 2)
+        let rows = AttendanceStore::open_attendance_sessions(&store, guild, member)
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -1274,7 +1278,7 @@ mod tests {
         transition.current_name = Some("AFK".to_owned());
         transition.afk_channel = Some(8);
         record_transition(&store, transition.clone()).await;
-        let rows = AttendanceStore::attendance_sessions_for_event_key(&store, 1, "game-night")
+        let rows = AttendanceStore::attendance_sessions_for_event_key(&store, guild, "game-night")
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
@@ -1282,7 +1286,7 @@ mod tests {
         assert!(closed.left_at.is_some());
         assert_eq!(closed.channel_name, "Renamed lobby");
         assert!(rows.iter().find(|row| row.channel_id == "8").unwrap().afk);
-        let open = AttendanceStore::open_attendance_sessions(&store, 1, 2)
+        let open = AttendanceStore::open_attendance_sessions(&store, guild, member)
             .await
             .unwrap();
         assert_eq!(open.len(), 1);
@@ -1292,8 +1296,8 @@ mod tests {
 
         two_bot_cutover::privacy::opt_out_member(
             &two_bot_cutover::CutoverDb::from_pool(pool.clone()),
-            "1",
-            "2",
+            &guild_id,
+            &member_id,
             "operator",
         )
         .await
@@ -1301,11 +1305,13 @@ mod tests {
         transition.previous = Some(8);
         transition.current = Some(9);
         record_transition(&store, transition).await;
-        assert!(AttendanceStore::open_attendance_sessions(&store, 1, 2)
-            .await
-            .unwrap()
-            .is_empty());
-        let rows = AttendanceStore::attendance_sessions_for_event_key(&store, 1, "game-night")
+        assert!(
+            AttendanceStore::open_attendance_sessions(&store, guild, member)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let rows = AttendanceStore::attendance_sessions_for_event_key(&store, guild, "game-night")
             .await
             .unwrap();
         assert_eq!(
@@ -1314,12 +1320,14 @@ mod tests {
             "suppression closes existing rows but opens no new row"
         );
         assert!(rows.iter().all(|row| row.left_at.is_some()));
-        assert!(
-            AttendanceStore::attendance_sessions_for_event_key(&store, 3, "game-night")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(AttendanceStore::attendance_sessions_for_event_key(
+            &store,
+            guild + 1,
+            "game-night"
+        )
+        .await
+        .unwrap()
+        .is_empty());
         db.close().await.unwrap();
     }
 
