@@ -2901,6 +2901,24 @@ measurement and cannot prove B2's under-60-second recovery criterion. An empty
 `target_version` instead selects the [daily automatic rollback proof](production-deploy.md#daily-staging-proof),
 which also runs on a daily schedule and verifies both Worker and image restoration.
 Gateway-session count is not observable from probes; read the Worker logs for it.
+
+The finite-use implementation (still under the [activation hold](staging-rollout-gate.md#no-always-on-staging-rule-and-activation-hold))
+validates immutable bounded-policy/environment/SHA bindings on **both** Worker
+versions before startup. Both must stamp the same compiled-image SHA: a
+Worker-only rollback cannot change the image. Old always-on, unstamped or
+incompatible versions refuse; do not substitute them to get a green drill.
+Live use acquires at most 25 minutes and verifies the exact baseline before the
+first fence. Each takeover rebinds the same run/attempt/absolute expiry before
+readiness probes; restoring after a partial fenced leg retains the original
+authorization and deadline, never mints recovery time. The original outage and
+readiness budgets still apply. Final release confirms native stop. The separate
+`staging-worker-drill-use.ndjson` artifact records acquire/readiness/rebind/release;
+runner loss and cancellation rely on persisted native expiry, not a host timer.
+`--dry-run` remains read-only: it validates the same target policies but acquires
+nothing, so an idle baseline refuses rather than waking it for a plan.
+
+Any lifecycle-control refusal conservatively stops later controls and leaves
+native expiry responsible for teardown; a refusal is not stop confirmation.
 If the run stops on a 401/403 it skips the restore: recover with a
 `deploy-staging` dispatch with `release_fence=true` after the binding is fixed.
 

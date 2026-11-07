@@ -32,6 +32,7 @@ from urllib.request import Request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import staging_rollout as rollout  # noqa: E402
+from staging_drill_use import StagingDrillUse
 
 GateError = rollout.GateError
 require = rollout.require
@@ -205,9 +206,11 @@ def ready(status, headers, body, version):
 
 
 class Drill:
-    def __init__(self, client, control, url, run_id, *, now=time.time, sleep=time.sleep, log=print):
+    def __init__(self, client, control, url, run_id, *, now=time.time, sleep=time.sleep, log=print,
+                 staging_use=None):
         self.client, self.control, self.url = client, control, url
         self.run_id, self.now, self.sleep, self.log = run_id, now, sleep, log
+        self.staging_use = staging_use
         self.mutated = False
         self.auth_failed = False
         self.evidence = {"worker": WORKER, "code_update_strategy": CODE_UPDATE_STRATEGY["mode"],
@@ -226,7 +229,10 @@ class Drill:
     def probe(self, version):
         status, headers, body = self.client.request(self.url + "/readyz")
         health, _, _ = self.client.request(self.url + "/health")
-        return status, health, ready(status, headers, body, version)
+        passed = ready(status, headers, body, version)
+        if passed and self.staging_use:
+            passed = rollout.mapping(rollout.decode(body)).get("build_revision") == self.staging_use.shas[version]
+        return status, health, passed
 
     def rollback(self, version, label):
         """Deploy `version` to 100% without `force`; read the deployment back."""
@@ -253,15 +259,26 @@ class Drill:
             self.sleep(POLL_SECONDS)
 
     # -- phases -------------------------------------------------------------
-    def preflight(self, target):
+    def preflight(self, target, *, dry_run=False):
         require(isinstance(target, str) and VERSION_ID.fullmatch(target), "invalid_target_version")
         history = deployments(self.client)
         pre = serving_version(self.client)
         require(target != pre, "target_is_serving_version")
         require(target in history, "target_never_served_traffic")
+        if self.staging_use:
+            self.staging_use.validate(self.client, (pre, target))
+            # Worker-only rollback never changes the compiled container image.
+            require(self.staging_use.shas[pre] == self.staging_use.shas[target],
+                    "staging_drill_image_mismatch")
         state = self.control("status")
-        require(self.owner(state).get("phase") == "active" and state.get("running") is True,
-                "singleton_not_active_and_running")
+        require(self.owner(state).get("phase") == "active", "singleton_not_active_and_running")
+        if self.staging_use and state.get("running") is True:
+            status, health, passed = self.probe(pre)
+            require(passed and health == 200, "baseline_not_ready", f"readyz={status} health={health}")
+        if self.staging_use and not dry_run:
+            self.staging_use.begin(pre)
+            state = self.control("status")
+        require(state.get("running") is True, "singleton_not_active_and_running")
         status, health, passed = self.probe(pre)
         require(passed and health == 200, "baseline_not_ready", f"readyz={status} health={health}")
         epoch = self.owner(state).get("epoch")
@@ -272,6 +289,8 @@ class Drill:
 
     def leg(self, name, version):
         """Fence, move the Worker to `version`, hand ownership to it, time first ready."""
+        if self.staging_use:
+            self.staging_use.check(recovery=name == "restore")
         state = self.control("status")
         phase = self.owner(state).get("phase")
         require(phase in ("active", "fenced"), "owner_state_unexpected",
@@ -293,6 +312,8 @@ class Drill:
         self.control("deployment-takeover", release_fence=True, expected_deployment=version)
         taken = self.stamp(f"{name}: ownership taken")
         leg["takeover"] = iso(taken)
+        if self.staging_use:
+            self.staging_use.rebind(version)
         first_ready, counts = self.wait_ready(version, rolled)
         leg.update({"first_ready": iso(first_ready),
                     "time_to_ready_seconds": round(first_ready - rolled, 1),
@@ -324,6 +345,19 @@ class Drill:
             self.log("restore skipped: authentication failed; never substitute credentials. "
                      "Recover with deploy-staging workflow_dispatch (release_fence=true) once the "
                      "staging ownership binding is fixed.")
+        if self.staging_use:
+            if self.staging_use.expires_at is None:
+                self.evidence["staging_cleanup"] = "not_acquired"
+            elif self.auth_failed or self.staging_use.failed:
+                self.evidence["staging_cleanup"] = "native_expiry_after_control_refusal"
+            else:
+                try:
+                    self.staging_use.finish()
+                    self.evidence["staging_cleanup"] = "release_confirmed"
+                except GateError as error:
+                    failures.append(self.failed("cleanup", error))
+                    self.evidence["staging_cleanup"] = "native_expiry_release_unconfirmed"
+            self.evidence["staging_expires_at"] = self.staging_use.expires_at
         self.evidence["failures"] = failures
         return failures
 
@@ -408,7 +442,7 @@ def dry_run_plan(drill, target):
     fencing, taking over, or writing evidence.
     """
     try:
-        pre = drill.preflight(target)
+        pre = drill.preflight(target, dry_run=True)
     except GateError as error:
         drill.failed("drill", error)
         return 1
@@ -429,7 +463,8 @@ def dry_run_plan(drill, target):
     return 0
 
 
-def main(argv=None, *, environ=None, make_control=ownership_control, client_factory=DrillClient):
+def main(argv=None, *, environ=None, make_control=ownership_control, client_factory=DrillClient,
+         make_staging_use=StagingDrillUse):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-version", required=True)
     parser.add_argument("--dry-run", action="store_true",
@@ -447,7 +482,8 @@ def main(argv=None, *, environ=None, make_control=ownership_control, client_fact
         actor = f"github-actions:{run_id}:rollback-drill"
         require(ACTOR.fullmatch(actor), "invalid_actor")
         client = client_factory(env.get("CLOUDFLARE_ACCOUNT_ID"), env.get("CLOUDFLARE_API_TOKEN"))
-        drill = Drill(client, make_control(token, url, actor), url, run_id, log=print)
+        use = make_staging_use(env, url, token)
+        drill = Drill(client, make_control(token, url, actor), url, run_id, log=print, staging_use=use)
         if args.dry_run:
             return dry_run_plan(drill, args.target_version)
         failures = drill.run(args.target_version)
