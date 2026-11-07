@@ -205,7 +205,7 @@ async fn activation_barrier_drains_old_inserts_and_preserves_their_tuples() {
         .unwrap();
     let installer = tokio::spawn(async move {
         sqlx::raw_sql(include_str!(
-            "../../../cutover/migrations/0472_internal_audit_order.sql"
+            "../../../cutover/migrations/0474_internal_audit_order.sql"
         ))
         .execute(&mut *migration)
         .await

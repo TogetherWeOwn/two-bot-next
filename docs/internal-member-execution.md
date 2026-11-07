@@ -58,7 +58,7 @@ Rank identity for the public log comes from the Discord hierarchy role snapshot
 this executor already reads, with no extra REST call. The whole ladder is
 matched by `match_rank_roles`, and the typed `RoleAssignmentReport` is kept
 across the PUT and persisted atomically at `finish_role_assignment` as
-`audit_rank_key` (migration `0471`). The wire result and replay are unchanged.
+`audit_rank_key` (migration `0473`). The wire result and replay are unchanged.
 A missing or ambiguous ladder and a non-rank grant stay authorized as before
 but record no rank key and publish no rank line. `already_held` makes no extra
 reads and publishes nothing. A crash or lost local proof, and a legacy or

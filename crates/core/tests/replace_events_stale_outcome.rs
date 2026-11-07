@@ -75,6 +75,7 @@ fn event(id: &str, name: &str) -> ScheduledEvent {
         id: id.to_owned(),
         name: name.to_owned(),
         starts_at: STARTS_AT.to_owned(),
+        ends_at: None,
         channel_id: Some("voice-1".to_owned()),
         description: None,
         status: EventStatus::Scheduled,

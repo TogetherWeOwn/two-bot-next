@@ -16,7 +16,7 @@ terminal result replay; these executors neither add an HTTP route nor implement
 that mapping/replay policy. A replay must not invoke the executor again.
 
 The validated request `event_key` is pinned on the claim (`audit_event_key`,
-migration `0471`) and copied into the terminal audit, so the public log names
+migration `0473`) and copied into the terminal audit, so the public log names
 the event from that pinned value, not from the mutable key mapping. Reconcile
 must match a non-null pinned key when repairing the mapping. A legacy NULL
 intent may still have its operational mapping repaired, but its audit stays

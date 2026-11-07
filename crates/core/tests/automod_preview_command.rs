@@ -96,6 +96,8 @@ fn definition_has_the_spec_option_shape() {
         .unwrap();
     assert_eq!(attachments.kind, 3, "attachments is a string option");
     assert_eq!(attachments.required, None);
+    assert_eq!(attachments.description, "1-10 bare filenames separated only by comma + ASCII space (e.g. a.txt, b.png); no trimming");
+    assert!(attachments.description.len() <= 100);
     assert_eq!(
         attachments.max_length,
         Some(AUTOMOD_PREVIEW_ATTACHMENTS_MAX_UTF16)

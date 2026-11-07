@@ -965,7 +965,7 @@ async fn malformed_edits_are_owned_refusals_with_no_definition_mutation_or_publi
                     "unknown template variable",
                     vec![
                         option("name", "faq"),
-                        option("template", "EDITED_CONTENT_SENTINEL {args}"),
+                        option("template", "EDITED_CONTENT_SENTINEL {guild}"),
                     ],
                 ),
                 (
@@ -1058,7 +1058,7 @@ async fn a_trigger_held_by_a_disabled_sibling_is_still_a_conflict() {
 #[tokio::test]
 async fn final_complete_definition_is_validated_even_when_invalid_template_was_omitted() {
     with_fixture(false, |h| Box::pin(async move {
-        for (i, invalid) in ["ORIGINAL_CONTENT_SENTINEL {args}".to_owned(), "😀".repeat(1001)].into_iter().enumerate() {
+        for (i, invalid) in ["ORIGINAL_CONTENT_SENTINEL {guild}".to_owned(), "😀".repeat(1001)].into_iter().enumerate() {
             sqlx::query("UPDATE automation_commands SET template = $1 WHERE guild_id = '2222' AND name = 'faq'")
                 .bind(invalid).execute(h.db.pool()).await.expect("imported shape-valid but domain-invalid template");
             let before = definitions(h.db.pool()).await;

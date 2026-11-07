@@ -420,12 +420,34 @@ Success (`200` only, `result` always an object, no `error` key):
 | announcement.post | `{message_id}` | |
 | event.upsert/cancel | `{outcome, event_id}` | `outcome` replayed from the stored receipt |
 | event.read | full observed event | behind its allowlist flag |
-| voice.snapshot | live voice-room listing | behind its allowlist flag; refuses `discord_unavailable` unless the gateway is connected, so a warm cache never serves stale occupancy mid-reconnect |
+| voice.snapshot | live voice-room listing | behind its allowlist flag; refuses `discord_unavailable` unless the gateway is connected, so a warm cache never serves stale occupancy mid-reconnect. Each room carries `occupied_since` (Zulu instant the current continuous occupancy began, or `null` when unknown — empty rooms and joins the gateway never witnessed are unknown, never guessed) and, only on the room bound to a currently-windowed event's voice channel, `event_key` (absent means unlinked). A store error behind the key map refuses `internal` instead of serving key-omitted rooms |
 | botlog.read | publishable log page `{v, entries, next}` | behind its allowlist flag; closed projection over terminal successes only (see below) |
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
 | moderation.\* | `{outcome[, affected]}` | |
+
+Snapshot event links use accepted, non-member `event_instance_windows`
+evidence (migration 0472), not channel-claim dates or the continued existence
+of a mirror row. Poll swaps and confirmed action responses synchronize it in
+the mirror transaction. Rescheduling updates the window, never the immutable
+instance identity. A completed event with a confirmed end retains only its
+original end + 15 minutes after ordinary mirror omission; omission of a live
+or unknown event does not manufacture completion. The committed guild snapshot
+epoch fences stale/equal liveness replays, even for a never-mirrored legacy
+binding. Ordinary omission records a separate `omitted_at` fence for ordering
+and rollback recency without advancing the last confirmed lifecycle stamp:
+a delayed terminal observation newer than that stamp still applies to an
+established instance. Confirmed completion with a finite end proves grace;
+cancellation or confirmed deletion revokes it, even if a compatibility-only
+mirror replay has a newer stamp. Ambiguous instances or multiple site aliases omit
+`event_key`; database failure still refuses the snapshot. Legacy bindings
+alone never backfill live evidence. This does not add end times to `event.read`,
+change v1, persist occupancy or require a new privileged gateway intent.
+Confirmed deletion has a transactional store seam; no gateway deletion consumer
+or additional gateway intent is added here. An ordinary missing poll row is
+never treated as a confirmed deletion.
+The production snapshot flag remains off pending separate rollout acceptance.
 
 ### botlog.read result shape
 
@@ -458,7 +480,7 @@ channel key are dropped in Rust while still advancing `next`, so config drift
 cannot leak raw snowflakes or stall resumption.
 
 Event and rank names no longer come from the mutable `rank_ladder` or
-`internal_event_keys` tables. Migration `0471` adds nullable
+`internal_event_keys` tables. Migration `0473` adds nullable
 `audit_event_key` and `audit_rank_key` to `internal_idempotency` and
 `internal_action_log`, and the feed reads those pinned columns:
 
@@ -478,7 +500,7 @@ Event and rank names no longer come from the mutable `rank_ladder` or
 - On `internal_action_log`, an UPDATE cannot change the identity or publication
   facts once written. The authorized erasure DELETE remains.
 
-Migration `0472` establishes commit-visible ordering for every audit INSERT,
+Migration `0474` establishes commit-visible ordering for every audit INSERT,
 including old images and direct SQL. Under a draining write-conflicting table
 lock it seeds one global `internal_audit_order` row above the committed maxima,
 leaves historical tuples unchanged and attaches the insert trigger atomically.

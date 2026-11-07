@@ -1,16 +1,16 @@
-//! Schema-aware internal audit migration regressions (0471 identity, 0472 order).
+//! Schema-aware internal audit migration regressions (0473 identity, 0474 order).
 //!
 //! Real-database support for `website_contract.rs`. The shipped chain runs in
 //! isolated scratch schemas there; this module also applies the raw, unshipped
-//! 0471/0472 files with hostile installer state. `raw_sql` sends each file as
+//! 0473/0474 files with hostile installer state. `raw_sql` sends each file as
 //! one simple-query batch, which Postgres executes as one implicit
 //! transaction, so a refusal must leave the catalog byte-for-byte unchanged.
 
 use sqlx::{migrate::Migrator, AssertSqlSafe, PgPool};
 use two_bot_testsupport::TestDatabase;
 
-const M471: &str = include_str!("../../../cutover/migrations/0471_internal_audit_identity.sql");
-const M472: &str = include_str!("../../../cutover/migrations/0472_internal_audit_order.sql");
+const M473: &str = include_str!("../../../cutover/migrations/0473_internal_audit_identity.sql");
+const M474: &str = include_str!("../../../cutover/migrations/0474_internal_audit_order.sql");
 
 pub const HELPERS: [&str; 3] = [
     "internal_audit_identity_immutable",
@@ -291,25 +291,25 @@ struct Case {
     extra: Vec<String>,
     path: String,
     setup: String,
-    through_471: bool,
+    through_473: bool,
     targets: Vec<(&'static str, &'static str)>,
 }
 
 fn cases(role: &str) -> Vec<Case> {
-    let both = vec![("0471", M471), ("0472", M472)];
-    let only_471 = vec![("0471", M471)];
-    let only_472 = vec![("0472", M472)];
+    let both = vec![("0473", M473), ("0474", M474)];
+    let only_473 = vec![("0473", M473)];
+    let only_474 = vec![("0474", M474)];
     let plain = |name: &'static str,
                  base: &str,
                  setup: String,
-                 through_471: bool,
+                 through_473: bool,
                  targets: Vec<(&'static str, &'static str)>| Case {
         name,
         base: base.to_owned(),
         extra: Vec::new(),
         path: qi(base),
         setup,
-        through_471,
+        through_473,
         targets,
     };
     let function = |base: &str, helper: &str| {
@@ -343,7 +343,7 @@ fn cases(role: &str) -> Vec<Case> {
             extra: vec!["tog10090_h_empty".to_owned()],
             path: "tog10090_h_empty, tog10090_h_real".to_owned(),
             setup: String::new(),
-            through_471: false,
+            through_473: false,
             targets: both.clone(),
         },
     ];
@@ -359,7 +359,7 @@ fn cases(role: &str) -> Vec<Case> {
             base,
             extra: Vec::new(),
             setup,
-            through_471: false,
+            through_473: false,
             targets: both.clone(),
         });
     }
@@ -381,49 +381,49 @@ fn cases(role: &str) -> Vec<Case> {
         "tog10090_h_state",
         "CREATE TABLE \"tog10090_h_state\".internal_audit_order (singleton boolean);".to_owned(),
         true,
-        only_472.clone(),
+        only_474.clone(),
     ));
     out.push(plain(
         "overloaded identity helper",
         "tog10090_h_over_a",
         overload("tog10090_h_over_a", HELPERS[0]),
         false,
-        only_471.clone(),
+        only_473.clone(),
     ));
     out.push(plain(
         "overloaded allocator helper",
         "tog10090_h_over_b",
         overload("tog10090_h_over_b", HELPERS[1]),
         true,
-        only_472.clone(),
+        only_474.clone(),
     ));
     out.push(plain(
         "overloaded guard helper",
         "tog10090_h_over_c",
         overload("tog10090_h_over_c", HELPERS[2]),
         true,
-        only_472.clone(),
+        only_474.clone(),
     ));
     out.push(plain(
         "foreign-owned identity helper",
         "tog10090_h_own_a",
         foreign("tog10090_h_own_a", HELPERS[0]),
         false,
-        only_471,
+        only_473,
     ));
     out.push(plain(
         "foreign-owned allocator helper",
         "tog10090_h_own_b",
         foreign("tog10090_h_own_b", HELPERS[1]),
         true,
-        only_472.clone(),
+        only_474.clone(),
     ));
     out.push(plain(
         "foreign-owned guard helper",
         "tog10090_h_own_c",
         foreign("tog10090_h_own_c", HELPERS[2]),
         true,
-        only_472,
+        only_474,
     ));
     for (catalog, columns) in [
         (
@@ -433,9 +433,9 @@ fn cases(role: &str) -> Vec<Case> {
         ("pg_namespace", "oid oid, nspname name"),
         ("pg_roles", "oid oid, rolname name"),
     ] {
-        for (version, helper, through_471, migration) in [
-            (471, HELPERS[0], false, M471),
-            (472, HELPERS[1], true, M472),
+        for (version, helper, through_473, migration) in [
+            (473, HELPERS[0], false, M473),
+            (474, HELPERS[1], true, M474),
         ] {
             let base = format!("tog10090_shadow_{catalog}_{version}");
             let collision = if catalog == "pg_roles" {
@@ -447,8 +447,8 @@ fn cases(role: &str) -> Vec<Case> {
                 "temporary catalog shadow must not bypass collision guard",
                 &base,
                 format!("{collision} CREATE TEMP TABLE {catalog} ({columns});"),
-                through_471,
-                vec![(if through_471 { "0472" } else { "0471" }, migration)],
+                through_473,
+                vec![(if through_473 { "0474" } else { "0473" }, migration)],
             ));
         }
     }
@@ -467,7 +467,7 @@ async fn prepare_schemas(admin: &PgPool, schemas: &[&str]) {
     }
 }
 
-/// Raw 0471/0472 refuse hostile installer state transactionally. Needs a
+/// Raw 0473/0474 refuse hostile installer state transactionally. Needs a
 /// role-creating test identity, as the disposable CI service provides.
 pub async fn refuses_hostile_installs_without_catalog_change(fixture: &TestDatabase) {
     let admin = fixture.pool();
@@ -478,7 +478,7 @@ pub async fn refuses_hostile_installs_without_catalog_change(fixture: &TestDatab
             .await
             .expect("reserved schema pool");
         let before = snapshot(admin, "public").await;
-        for migration in [M471, M472] {
+        for migration in [M473, M474] {
             let error = sqlx::raw_sql(migration)
                 .execute(&hostile)
                 .await
@@ -500,10 +500,10 @@ pub async fn refuses_hostile_installs_without_catalog_change(fixture: &TestDatab
             .pool_with_search_path(&qi(&case.base))
             .await
             .expect("base pool");
-        chain_below(471)
+        chain_below(473)
             .run(&base_pool)
             .await
-            .unwrap_or_else(|e| panic!("{}: pre-471 chain: {e}", case.name));
+            .unwrap_or_else(|e| panic!("{}: pre-473 chain: {e}", case.name));
         let hostile = fixture
             .pool_with_search_path(&case.path)
             .await
@@ -516,11 +516,11 @@ pub async fn refuses_hostile_installs_without_catalog_change(fixture: &TestDatab
                 .await
                 .unwrap_or_else(|e| panic!("{}: setup: {e}", case.name));
         }
-        if case.through_471 {
-            sqlx::raw_sql(M471)
+        if case.through_473 {
+            sqlx::raw_sql(M473)
                 .execute(&mut *conn)
                 .await
-                .unwrap_or_else(|e| panic!("{}: 0471 prerequisite: {e}", case.name));
+                .unwrap_or_else(|e| panic!("{}: 0473 prerequisite: {e}", case.name));
         }
         let mut before = Vec::new();
         for schema in &schemas {
@@ -589,10 +589,10 @@ pub async fn install_and_insert_bind_catalog_builtins(fixture: &TestDatabase) {
         .pool_with_search_path(&qi(schema))
         .await
         .expect("base pool");
-    chain_below(471)
+    chain_below(473)
         .run(&base_pool)
         .await
-        .expect("pre-471 chain");
+        .expect("pre-473 chain");
     sqlx::raw_sql(
         "CREATE FUNCTION tog10090_shadow.clock_timestamp() RETURNS timestamptz
              LANGUAGE plpgsql AS $f$ BEGIN RAISE EXCEPTION 'shadowed clock_timestamp'; END; $f$;
@@ -606,7 +606,7 @@ pub async fn install_and_insert_bind_catalog_builtins(fixture: &TestDatabase) {
         .pool_with_search_path("tog10090_absent_first, tog10090_shadow, pg_catalog")
         .await
         .expect("hostile pool");
-    for (label, sql) in [("0471", M471), ("0472", M472)] {
+    for (label, sql) in [("0473", M473), ("0474", M474)] {
         sqlx::raw_sql(sql)
             .execute(&hostile)
             .await

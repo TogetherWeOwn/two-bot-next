@@ -112,6 +112,14 @@ do carry member columns (`created_by`, `user_id`, `winner_ids`, and the
 and guild purge cover all three tables in the reviewed erasure plan; there
 is no reader grant beyond the app pool.
 
+The event instance window table (`event_instance_windows`) is ordinary `table`
+kind for the same reason: the transactional event-observation writers and the
+voice lookup read and write it through the app pool. It holds non-member
+durable lifecycle, order and revocation evidence keyed by guild, event and
+instance start, with no member column, so there is nothing to erase and no
+reader grant beyond the app pool. Backups archive it (v16); an old-format
+restore clears it and never backfills liveness.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not
@@ -257,7 +265,7 @@ their login status or silently removing memberships. It contains no passwords.
 1. For the first bootstrap, the order is fixed: first apply `sql/web_v1.sql`
    as described below. Then the existing authorized provisioning identity
    prints/reviews/applies `sql/internal_audit_bootstrap_helpers.sql` before
-   either introducing audit migration (0471/0472) is recorded. This explicit
+   either introducing audit migration (0473/0474) is recorded. This explicit
    artifact installs only the three real, private SECURITY INVOKER trigger
    definitions; it installs no columns, triggers, state or ledger entries.
    It refuses definition/security/ownership/ACL drift, overloads, dependencies
@@ -297,7 +305,7 @@ their login status or silently removing memberships. It contains no passwords.
    schema-qualified helpers and allocator state, not access to public's state.
    This does not broaden the production role matrix: its three exact `public`
    signatures, missing-function refusals, private ACLs and read-only verification
-   remain unchanged. See [audit migration boundaries](migrations.md#private-audit-helpers-migrations-0471-and-0472).
+   remain unchanged. See [audit migration boundaries](migrations.md#private-audit-helpers-migrations-0473-and-0474).
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
    tables are not transferred or granted to the runtime.

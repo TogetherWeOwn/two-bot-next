@@ -90,7 +90,7 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
 committed intent/audit transaction before REST. Every later audit copies that
 original scalar, not a newly evaluated role map. Migration `0351` adds nullable
 columns; older intents remain NULL and must not be guessed from current config.
-Migration `0471` likewise adds nullable `audit_event_key` and `audit_rank_key`
+Migration `0473` likewise adds nullable `audit_event_key` and `audit_rank_key`
 to `internal_idempotency` and `internal_action_log`. The validated event
 request key is pinned at claim and copied into the terminal audit; reconcile
 must match a non-null pinned key when repairing the mapping. A legacy NULL

@@ -996,7 +996,7 @@ async fn apply_import_guild_settings_ignores_destination_owned_cas() -> TestResu
 /// Minimal identity-bearing audit table for the pre-activation import case.
 const AUDIT_TABLE_SQL: &str = "CREATE TABLE internal_action_log (
     audit_id BIGINT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL)";
-const AUDIT_TRIGGER_SQL: &str = include_str!("../migrations/0472_internal_audit_order.sql");
+const AUDIT_TRIGGER_SQL: &str = include_str!("../migrations/0474_internal_audit_order.sql");
 
 fn audit_line() -> String {
     line(

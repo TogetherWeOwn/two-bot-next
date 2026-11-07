@@ -235,8 +235,8 @@ class MigrationFindingTests(unittest.TestCase):
     def test_private_audit_migrations_use_reviewed_whole_file_markers(self):
         migrations = Path(__file__).resolve().parents[1] / "crates/cutover/migrations"
         helpers = {
-            "0471_internal_audit_identity.sql": ("internal_audit_identity_immutable",),
-            "0472_internal_audit_order.sql": (
+            "0473_internal_audit_identity.sql": ("internal_audit_identity_immutable",),
+            "0474_internal_audit_order.sql": (
                 "internal_audit_allocate_order", "internal_audit_order_guard"),
         }
         for name, functions in helpers.items():

@@ -138,7 +138,7 @@ DROP TABLE IF EXISTS guild_legacy_flags;
 The reason must be at least ten characters. The marker covers the whole
 file, so keep a reviewed contract migration in its own file.
 
-### Private audit helpers: migrations 0471 and 0472
+### Private audit helpers: migrations 0473 and 0474
 
 These whole-file markers classify the new private trigger helpers, not a live
 rollback-preflight result or a release approval. Every REVOKE remains in place;
@@ -147,7 +147,7 @@ review for any later edit, and never rewrite these migrations after rollout.
 
 Both migrations resolve `current_schema()` once before DDL. They refuse unsafe
 names, missing or shadowed audit/intent tables, helper overloads or foreign
-owners; 0472 also refuses pre-existing allocator state. All helpers, triggers,
+owners; 0474 also refuses pre-existing allocator state. All helpers, triggers,
 state and seeding bind to that schema, never a fallback `public`. Installation
 pins catalog-first resolution after capturing and checking the caller's table
 bindings, then restores the caller's search path. Guard catalog relations are
@@ -162,11 +162,11 @@ changes neither the allocator's fence nor the private SECURITY INVOKER contract.
 Dollar-quoted DDL keeps actual revokes visible to the rollback parser; unmarked
 files still refuse as `revoke`, without changing or waiving the gate.
 
-- **0471:** nullable, bounded event/rank keys preserve legacy explicit-column
+- **0473:** nullable, bounded event/rank keys preserve legacy explicit-column
   INSERTs and unknown history. Ordinary prior-image claim, finish and reconcile
   writes leave pinned identity unchanged. The log trigger permits identical
   UPDATEs and authorized erasure DELETE, but refuses relabeling existing facts.
-- **0472:** the activation lock drains old inserts before seeding and attaching
+- **0474:** the activation lock drains old inserts before seeding and attaching
   the allocator atomically, without rewriting historical tuples. Every later
   INSERT, including old-image SQL, uses the transaction-held global fence.
   Image rollback retains the expanded schema, triggers, allocator state and

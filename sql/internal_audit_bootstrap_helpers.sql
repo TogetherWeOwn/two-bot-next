@@ -12,7 +12,7 @@ DECLARE
     introduced BOOLEAN;
 BEGIN
     FOR helper IN SELECT * FROM (VALUES
-        (471, 'internal_audit_identity_immutable', $definition$CREATE OR REPLACE FUNCTION public.internal_audit_identity_immutable() RETURNS trigger
+        (473, 'internal_audit_identity_immutable', $definition$CREATE OR REPLACE FUNCTION public.internal_audit_identity_immutable() RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, public AS $body$
 BEGIN
     IF TG_TABLE_NAME = 'internal_action_log' THEN
@@ -29,7 +29,7 @@ BEGIN
     RETURN NEW;
 END;
 $body$;$definition$),
-        (472, 'internal_audit_allocate_order', $definition$CREATE OR REPLACE FUNCTION public.internal_audit_allocate_order() RETURNS trigger
+        (474, 'internal_audit_allocate_order', $definition$CREATE OR REPLACE FUNCTION public.internal_audit_allocate_order() RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, public AS $body$
 DECLARE
     last_time TIMESTAMPTZ;
@@ -57,7 +57,7 @@ BEGIN
     RETURN NEW;
 END;
 $body$;$definition$),
-        (472, 'internal_audit_order_guard', $definition$CREATE OR REPLACE FUNCTION public.internal_audit_order_guard() RETURNS trigger
+        (474, 'internal_audit_order_guard', $definition$CREATE OR REPLACE FUNCTION public.internal_audit_order_guard() RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, public AS $body$
 BEGIN
     IF TG_OP <> 'UPDATE' THEN

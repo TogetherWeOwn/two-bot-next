@@ -268,6 +268,20 @@ INSERT INTO giveaway_draws
      winner_ids, reroll_kind)
 VALUES ('100000000000000001', '100000000000000021', 0, '2026-08-02T18:00:00.000Z', 1,
         'eligible', 'seed', '["100000000000000005"]', NULL);
+-- Event instance windows (0472, v16): non-member lifecycle/order/revocation
+-- evidence. One current open-ended window and one revoked, superseded and
+-- identity-ambiguous window, so the roundtrip covers the nullable ends_at and
+-- omitted_at/revoked_at, both booleans and the partial unique current index.
+INSERT INTO event_instance_windows
+    (guild_id, event_id, instance_starts_at, starts_at, ends_at, status, observed_at,
+     omitted_at, revoked_at, is_current, identity_ambiguous)
+VALUES ('100000000000000001', '100000000000000011', '2026-08-02T18:00:00.000Z',
+        '2026-08-02T18:30:00.000Z', NULL, 'active', '2026-08-02T18:31:00.000Z',
+        NULL, NULL, TRUE, FALSE),
+       ('100000000000000001', '100000000000000011', '2026-08-01T18:00:00.000Z',
+        '2026-08-01T18:00:00.000Z', '2026-08-01T20:00:00.000Z', 'completed',
+        '2026-08-01T20:01:00.000Z', '2026-08-01T20:10:00.000Z',
+        '2026-08-01T20:05:00.000Z', FALSE, TRUE);
 -- Event voice pair (0455, v13): one claimed instance plus one closed and one
 -- open presence span, so the roundtrip covers the nullable lease/left_at.
 INSERT INTO event_voice_channels

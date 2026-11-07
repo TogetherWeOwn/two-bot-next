@@ -33,8 +33,8 @@ const AUDIT_HELPERS: [&str; 3] = [
 ];
 
 const AUDIT_IDENTITY: &str =
-    include_str!("../../cutover/migrations/0471_internal_audit_identity.sql");
-const AUDIT_ORDER: &str = include_str!("../../cutover/migrations/0472_internal_audit_order.sql");
+    include_str!("../../cutover/migrations/0473_internal_audit_identity.sql");
+const AUDIT_ORDER: &str = include_str!("../../cutover/migrations/0474_internal_audit_order.sql");
 
 fn audit_definition(name: &str) -> &str {
     AUDIT_PREPARATION
@@ -1664,8 +1664,8 @@ async fn audit_preparation_guards(pool: &PgPool) {
         ("ALTER FUNCTION public.internal_audit_allocate_order() SET search_path = public", "ALTER FUNCTION public.internal_audit_allocate_order() SET search_path = pg_catalog, public"),
         ("GRANT EXECUTE ON FUNCTION public.internal_audit_allocate_order() TO PUBLIC", "REVOKE ALL ON FUNCTION public.internal_audit_allocate_order() FROM PUBLIC"),
         ("CREATE FUNCTION public.internal_audit_allocate_order(integer) RETURNS integer LANGUAGE SQL AS 'SELECT 1'", "DROP FUNCTION public.internal_audit_allocate_order(integer)"),
-        ("INSERT INTO public._two_bot_migrations VALUES (472)", "DELETE FROM public._two_bot_migrations WHERE version = 472"),
-        ("INSERT INTO public._sqlx_migrations VALUES (471)", "DELETE FROM public._sqlx_migrations WHERE version = 471"),
+        ("INSERT INTO public._two_bot_migrations VALUES (474)", "DELETE FROM public._two_bot_migrations WHERE version = 474"),
+        ("INSERT INTO public._sqlx_migrations VALUES (473)", "DELETE FROM public._sqlx_migrations WHERE version = 473"),
         ("CREATE TABLE public.preparation_probe (id integer); CREATE TRIGGER preparation_probe BEFORE UPDATE ON public.preparation_probe FOR EACH ROW EXECUTE FUNCTION public.internal_audit_identity_immutable()", "DROP TABLE public.preparation_probe"),
     ] {
         sqlx::raw_sql(sqlx::AssertSqlSafe(change)).execute(pool).await.unwrap();
@@ -2074,7 +2074,7 @@ async fn scratch_current_migrator_installs_private_audit_helpers() {
         .await
         .unwrap();
     for (version, migration) in migration_files() {
-        if version < 471 {
+        if version < 473 {
             execute(&pool, isolated(&migration, &roles)).await.unwrap();
         }
     }
@@ -2099,7 +2099,7 @@ async fn scratch_current_migrator_installs_private_audit_helpers() {
     )
     .await
     .unwrap();
-    // Bootstrap is strict even on this pre-471 fixture. Remove only its
+    // Bootstrap is strict even on this pre-473 fixture. Remove only its
     // unactivated preparation functions as their owner to exercise a later
     // migrator creating the new definitions, not replacing prepared objects.
     let mut tx = pool.begin().await.unwrap();
