@@ -55,16 +55,60 @@ instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
 
-Who merges (owner decision 2026-10-31): the agent that did the work merges a PR
-once every required check is green and each review finding is fixed or answered
-with evidence. A merge to `main` that touches a path outside the
-`paths-ignore` list in `deploy-staging.yml` starts `deploy-staging`, and
-`deploy-production` then promotes that commit on its own once staging and
-`ci-ok` are green. That merge therefore needs the owner's approval through
-`request_confirmation` on the card first, and the approval covers the automatic
-promotion that follows. A merge that only touches ignored paths (root `*.md`,
-`docs/**` and the rest of that list) starts no deploy and needs no owner
-approval. A manual production dispatch or rollback needs its own approval.
+### Production merge evidence
+
+The final-stage reviewer squash-merges the exact reviewed head after all required
+checks pass and every review finding is fixed or answered with evidence. The
+author merges only when there is no review stage. Pin the merge to that head SHA;
+record the squash SHA and the release decision in the release log.
+
+`main` reaches production through staging and automatic promotion. A path ignored
+by `deploy-staging.yml` does not exempt a merge from production safeguards: even a
+docs-only PR needs a fresh, per-PR Release Manager `request_confirmation` on its
+exact head before merge. A manual production dispatch or rollback needs its own
+Release Manager confirmation too.
+
+Exact-head staging qualification remains the default. The artifact-identical
+rule (owner decision 2026-11-05) removes only that staging prerequisite, and only
+when **all** of the following hold:
+
+1. **Qualifying actual diff.** Every change is only tests (`test/`, `e2e/`,
+   `*.test.*`, fixtures), documentation (`docs/`, `*.md`), or CI unrelated to
+   build, deploy, release or promotion. Inspect content, not just paths or PR
+   labels. Deploy/release workflows, Wrangler/Worker configuration, Dockerfiles,
+   migrations, package manifests and lockfiles are excluded, even under an
+   otherwise qualifying path. Any runtime, dependency or deployment change is
+   outside this rule.
+2. **Byte-identical production artifacts.** Compare the complete production build
+   artifacts for the exact PR head and current `main`, using the existing
+   production build and artifact definitions. Record both full head SHAs, both
+   bundle/image hashes, and evidence identifying the compared artifacts on the
+   confirmation card. For multiple deployed components, record the paired hashes
+   for each: this bot's container image and Worker bundle must both be covered,
+   including all deployed assets and image metadata. An identical source tree,
+   file label, PR title, isolated Rust binary, or partial build output is not
+   artifact proof. Do not strip provenance stamps to manufacture equality.
+3. **Exact-head gates pass.** Required CI and Devin Review pass on that same PR
+   head, and all review findings are fixed or answered with evidence.
+
+The Release Manager verifies the classification and records it with both SHAs
+and both hashes (per deployed component) in each decision. Missing/incomplete
+proof, any hash mismatch, or a non-qualifying diff retains the full exact-head
+staging requirement. Supply the normal staging/e2e evidence in that case; in
+either case retain the migration ledger entry (or `no migration`) and rollback
+target with the decision.
+
+This rule waives no required check, review gate or red deterministic gate. Keep
+incident, freeze and hold safeguards, identity/capability holds, exact-head
+per-PR confirmation, SHA-pinned squash merge and release-log recording. Any new
+PR head needs fresh review/check evidence and a new Release Manager confirmation;
+if the `main` comparison SHA changes, revalidate the artifact comparison before
+merge. Previously rejected requests remain historical rejections, not approvals:
+qualifying candidates must supply hashes and be freshly submitted. This policy
+authorizes no pipeline skip/no-op implementation, deployment or other production
+action. On owner revocation, revert this documented rule through normal gates.
+
+### CI lanes
 
 `check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
 finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
