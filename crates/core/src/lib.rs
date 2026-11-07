@@ -21,7 +21,9 @@ pub mod automation_quota;
 pub mod automation_transfer;
 pub mod automod;
 pub mod automod_preview;
+pub mod automod_preview_input;
 pub mod automod_preview_limiter;
+pub mod automod_preview_report;
 pub mod automod_runtime;
 #[cfg(feature = "db")]
 pub mod automod_store;
@@ -144,6 +146,8 @@ pub mod scheduled_store;
 pub mod secret;
 pub mod tempban_inventory;
 pub use secret::Secret;
+#[cfg(feature = "db")]
+pub mod event_instance_store;
 pub mod self_roles;
 pub mod send_admission;
 pub mod settings;

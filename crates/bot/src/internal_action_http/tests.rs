@@ -2127,6 +2127,53 @@ async fn voice_snapshot_warm_cache_while_reconnecting_is_discord_unavailable() {
 }
 
 #[tokio::test]
+async fn voice_snapshot_disconnect_during_key_lookup_refuses_stale_cache() {
+    let Some(db) = database().await else { return };
+    let gateway = connected_gateway();
+    let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    let state = ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        effect.clone(),
+        effect,
+        Arc::new(MockEventRead::default()),
+        Arc::new(MockEventMutate),
+        Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
+    )
+    .with_voice_cache(seeded_voice_cache())
+    .with_gateway_state(gateway.clone());
+    // Exhaust the fixture pool so the handler yields at the new key query,
+    // after its initial readiness check. No sleeps or timing assumptions.
+    let mut held = Vec::new();
+    for _ in 0..db.pool().options().get_max_connections() {
+        held.push(db.pool().acquire().await.unwrap());
+    }
+    let mut read = std::pin::pin!(read_voice_snapshot(
+        &state,
+        "fixture",
+        KeyLabel::Invalid,
+        ActionLabel::Unknown,
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(read.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    *gateway.write().await = crate::gateway::GatewayState::Armed;
+    drop(held);
+    let response = tokio::time::timeout(Duration::from_secs(5), read)
+        .await
+        .expect("snapshot read completes");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let raw = to_bytes(response.into_body(), 8192).await.unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(body["error"]["code"], "discord_unavailable");
+    assert_eq!(body["error"]["retryable"], true);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn voice_snapshot_serves_pipeline_fed_shared_cache() {
     // End to end across the contract's integration risk: the same cache
     // handle feeds the gateway pipeline and the signed receiver read. The
@@ -2222,6 +2269,289 @@ async fn voice_snapshot_projects_the_live_cache_shape() {
     assert!(rooms[0].get("afk").is_none());
     assert_eq!(rooms[4]["member_ids"], serde_json::json!([]));
     db.close().await.unwrap();
+}
+
+/// Same shared cache but with a caller-owned join clock: the pipeline's
+/// transition observer stamps the clock, and the receiver stamps rooms from
+/// it. Tests that exercise witnessed joins attach their own clock; the plain
+/// `voice_app` keeps the empty default, which reads every room as `null`.
+fn voice_app_with_clock(
+    pool: sqlx::PgPool,
+    cache: Arc<two_bot_discord::SharedCache>,
+    clock: Arc<voice_snapshot::VoiceOccupancyClock>,
+) -> Router {
+    let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    router(Arc::new(
+        ReceiverState::new(
+            config(),
+            pool,
+            effect.clone(),
+            effect,
+            Arc::new(MockEventRead::default()),
+            Arc::new(MockEventMutate),
+            Arc::new(MockModeration::default()),
+            Arc::new(MockChannel::default()),
+        )
+        .with_voice_cache(cache)
+        .with_voice_clock(clock)
+        .with_gateway_state(connected_gateway()),
+    ))
+}
+
+#[tokio::test]
+async fn voice_snapshot_unwitnessed_rooms_read_null_without_event_keys() {
+    // A directly-seeded cache proves no joins: the default (unwired) clock
+    // stamps nothing, so every room carries explicit `occupied_since: null`,
+    // and with no windowed event rows no room carries `event_key`.
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    let (status, _, body) = answer(
+        voice_app(db.pool().clone(), seeded_voice_cache()),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    let rooms = body["result"]["rooms"].as_array().expect("rooms array");
+    assert_eq!(rooms.len(), 5);
+    for room in rooms {
+        assert_eq!(
+            room["occupied_since"],
+            serde_json::Value::Null,
+            "unwitnessed room {} reads null, never a guess",
+            room["channel_id"]
+        );
+        assert!(
+            room.get("event_key").is_none(),
+            "unlinked room {} omits the key",
+            room["channel_id"]
+        );
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_snapshot_pipeline_witnessed_join_stamps_occupied_since() {
+    // The gateway witnessed member 46 join the empty quiet room after boot
+    // (a member the seed never listed), so that room proves a start. The
+    // preoccupied lobby stays unknown. Same cache feeds pipeline and read.
+    use two_bot_discord::{NoInvites, OrderedLevelingPipeline, PipelineSnapshots};
+
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    let cache = voice_snapshot::new_shared_cache();
+    let clock = voice_snapshot::VoiceOccupancyClock::new();
+    let pipeline = OrderedLevelingPipeline::with_shared_cache(
+        two_bot_core::MemStore::new(),
+        None,
+        NoInvites,
+        PipelineSnapshots::new(),
+        Arc::clone(&cache),
+    );
+    pipeline.set_voice_transition_observer(clock.clone());
+    pipeline
+        .handle(&seeded_guild_event())
+        .await
+        .expect("pipeline feeds the shared cache");
+    pipeline
+        .handle(&Event::VoiceStateUpdate(Box::new(voice_state(
+            "46",
+            Some("35"),
+        ))))
+        .await
+        .expect("pipeline observes the witnessed join");
+    let (status, _, body) = answer(
+        voice_app_with_clock(db.pool().clone(), cache, clock),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    let rooms = body["result"]["rooms"].as_array().expect("rooms array");
+    let lobby = &rooms[0];
+    assert_eq!(lobby["member_ids"], serde_json::json!(["41"]));
+    assert_eq!(lobby["occupied_since"], serde_json::Value::Null);
+    let quiet = &rooms[4];
+    assert_eq!(quiet["member_ids"], serde_json::json!(["46"]));
+    let since = quiet["occupied_since"].as_str().expect("witnessed start");
+    assert!(
+        since.len() == 20 && since.ends_with('Z') && since.contains('T'),
+        "whole-second Zulu shape: {since}"
+    );
+    assert_eq!(rooms[1]["occupied_since"], serde_json::Value::Null);
+    assert_eq!(rooms[2]["member_ids"], serde_json::json!([]));
+    assert_eq!(rooms[2]["occupied_since"], serde_json::Value::Null);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_snapshot_windowed_event_key_stamps_the_linked_room() {
+    // Room 31 has an open-ended live event, room 35 a completed event
+    // inside its finite closing grace. Unknown ends, expired grace, future,
+    // cancelled and orphaned bindings all stay out.
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    for (event_id, event_key, channel, status, starts_in, ends_in) in [
+        (
+            "100000000000000001",
+            "showcase",
+            "31",
+            "scheduled",
+            "-1 hour",
+            None,
+        ),
+        (
+            "100000000000000002",
+            "afterparty",
+            "32",
+            "completed",
+            "-3 hours",
+            None,
+        ),
+        (
+            "100000000000000003",
+            "later",
+            "33",
+            "scheduled",
+            "+2 hours",
+            Some("+3 hours"),
+        ),
+        (
+            "100000000000000004",
+            "closing-grace",
+            "35",
+            "completed",
+            "-1 hour",
+            Some("-5 minutes"),
+        ),
+        (
+            "100000000000000005",
+            "expired",
+            "34",
+            "completed",
+            "-2 hours",
+            Some("-16 minutes"),
+        ),
+        (
+            "100000000000000006",
+            "cancelled",
+            "36",
+            "cancelled",
+            "-1 hour",
+            Some("+5 minutes"),
+        ),
+        (
+            "100000000000000007",
+            "orphaned",
+            "37",
+            "active",
+            "-1 hour",
+            Some("+5 minutes"),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO internal_event_keys (guild_id, event_key, event_id) VALUES ($1, $2, $3)",
+        )
+        .bind(staging_guild())
+        .bind(event_key)
+        .bind(event_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO event_voice_channels (event_id, instance_starts_at, starts_at, ends_at, status, voice_channel_id) \
+             VALUES ($1, NOW() + $3::text::interval, NOW() + $3::text::interval, NOW() + $4::text::interval, 'creating', $2)",
+        )
+        .bind(event_id)
+        .bind(channel)
+        .bind(starts_in)
+        .bind(ends_in)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let (starts_at, ends_at): (String, Option<String>) = sqlx::query_as(
+            "SELECT to_char(starts_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+                    to_char(ends_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+             FROM event_voice_channels WHERE event_id = $1",
+        )
+        .bind(event_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let event = two_bot_core::scheduled_events::ScheduledEvent {
+            id: event_id.to_owned(),
+            name: "fixture".to_owned(),
+            starts_at,
+            ends_at,
+            channel_id: Some(channel.to_owned()),
+            description: None,
+            status: match status {
+                "completed" => two_bot_core::scheduled_events::EventStatus::Completed,
+                "active" => two_bot_core::scheduled_events::EventStatus::Active,
+                "cancelled" => two_bot_core::scheduled_events::EventStatus::Cancelled,
+                _ => two_bot_core::scheduled_events::EventStatus::Scheduled,
+            },
+        };
+        two_bot_core::website_store::upsert_event(
+            db.pool(),
+            staging_guild(),
+            "2026-11-03T10:00:00.000Z",
+            &event,
+        )
+        .await
+        .unwrap();
+        if event_key == "orphaned" {
+            sqlx::query("UPDATE event_voice_channels SET status = 'orphaned' WHERE event_id = $1")
+                .bind(event_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+    }
+    let keys = InternalActionStore::new(db.pool().clone())
+        .windowed_event_voice_keys(staging_guild())
+        .await
+        .unwrap();
+    assert_eq!(
+        keys.len(),
+        2,
+        "only live and finite completed grace windows"
+    );
+    assert_eq!(keys.get("35").map(String::as_str), Some("closing-grace"));
+    let (status, _, body) = answer(
+        voice_app(db.pool().clone(), seeded_voice_cache()),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    let rooms = body["result"]["rooms"].as_array().expect("rooms array");
+    assert_eq!(rooms[0]["event_key"], serde_json::json!("showcase"));
+    assert!(rooms[1].get("event_key").is_none());
+    assert!(rooms[2].get("event_key").is_none());
+    assert!(rooms[3].get("event_key").is_none());
+    assert_eq!(rooms[4]["event_key"], serde_json::json!("closing-grace"));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_snapshot_key_store_error_propagates_unavailable() {
+    // Fail-closed key map, store half: when the store is gone the window
+    // query propagates instead of yielding an empty map the handler could
+    // mistake for "no room linked". The handler maps this to `internal`,
+    // never key-omitted rooms.
+    let Some(db) = database().await else { return };
+    let pool = db.pool().clone();
+    db.close().await.unwrap();
+    let store = InternalActionStore::new(pool);
+    let err = store
+        .windowed_event_voice_keys(staging_guild())
+        .await
+        .expect_err("closed store propagates");
+    assert!(matches!(err, InternalStoreError::Unavailable));
 }
 
 #[tokio::test]

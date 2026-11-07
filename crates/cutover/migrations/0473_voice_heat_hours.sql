@@ -1,4 +1,4 @@
--- 0472_voice_heat_hours: guild-wide voice occupancy samples per UTC hour.
+-- 0473_voice_heat_hours: guild-wide voice occupancy samples per UTC hour.
 --
 -- Cutover mirror of the store 0471 voice-heat table (contract v2 B5): the
 -- website-job sampler writes through the cutover pool, so the table must

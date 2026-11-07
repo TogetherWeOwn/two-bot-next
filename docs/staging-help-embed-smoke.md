@@ -49,6 +49,17 @@ dispatch or as the `help-embed-synthetic` job called by `deploy-staging` after
 the deploy. Failed assertions fail that staging run and prevent
 `certify-promotion` from certifying it.
 
+Before consumption, a separate main-only `staging-window` job in the existing
+`staging` environment checks the [finite-use grant and exact readiness](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
+The smoke job needs that job and keeps only its test-bot credential. A called run
+uses the deploy's exact SHA/deployment/expiry under a disjoint nested group and
+never acquires or releases the parent's grant. A standalone run owns the canonical
+workflow lock, acquires at most 45 minutes, and releases after smoke success or
+failure. Start/assert and cleanup receipts are retained for 14 days. Re-run all
+jobs, not only failed jobs; the latter changes the attempt and fails binding.
+This source wiring is not activation: the linked inventory, rollback and
+live-acceptance holds still apply.
+
 No new credential is created or copied for this smoke. Only an operator or
 staging guild admin may place the bindings; agents must never receive, copy
 or print any token value:
@@ -57,14 +68,44 @@ or print any token value:
 - Environment secret: the existing `TWO_VOICE_SYNTHETIC_BOT_TOKEN` (the
   dedicated test bot's token, already placed for the voice synthetic); no
   new secret
-- A dedicated staging text channel where the test bot has a channel
-  overwrite granting View Channel, Send Messages, Embed Links and Read
-  Message History; deleting its own messages needs no Manage Messages
-  permission
+- A dedicated staging text channel named `help-embed-smoke` where the test
+  bot has a channel overwrite granting View Channel, Send Messages, Embed
+  Links and Read Message History; deleting its own messages needs no Manage
+  Messages permission. Nobody creates this channel by hand: the staging
+  product bot reconciles it at boot (see below), so the channel always
+  exists before the smoke runs
 - Repository variable: `DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID`, naming that
   channel
 - Repository variable: `HELP_EMBED_SYNTHETIC_REQUIRED=true`, set only after
   the channel variable above
+
+## Boot reconcile (staging only)
+
+At boot, after the command-registry sync, the staging bot finds or creates
+the `help-embed-smoke` text channel in the TWO Staging guild and ensures a
+member overwrite for the staging test bot with exactly View Channel, Send
+Messages, Embed Links and Read Message History. The reconcile runs only
+when `TWO_DEPLOY_ENV` is exactly `staging` and the configured guild is the
+staging guild; every other combination returns quietly, so production can
+never create this channel. It uses the token the process already holds,
+never touches the database, and never blocks or fails boot: every error is
+logged and startup continues.
+
+The test-bot user ids come from the existing staging setting
+`TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS`; only listed ids whose guild member
+is a bot get the overwrite. If the setting is unset, empty, or holds no
+staging-guild bot member, the reconcile logs an error naming the setting
+and skips the overwrite while still reporting the channel.
+
+On every successful staging reconciliation the reconcile emits one
+structured info line with the channel id and the outcome (`created`,
+`already_present` or `overwrite_ensured`). A failed or timed-out pass logs
+an error instead. A channel id is a public snowflake and safe to log. If
+database initialization fails, boot drains the in-flight pass within a
+bounded budget before exiting; the next healthy boot retries it.
+The operator reads that id from the staging boot log and places it in
+`DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID`, then sets
+`HELP_EMBED_SYNTHETIC_REQUIRED=true`.
 
 Until provisioning is complete and the required variable is `true`, missing
 bindings produce a notice and a green run. The workflow decides this in a

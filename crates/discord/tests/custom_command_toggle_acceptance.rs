@@ -815,7 +815,7 @@ async fn toggle_refuses_reserved_or_invalid_saved_definition_without_reactivatio
         refusals.push(f.observe(&toggle(501 + index as u64, true, name)).await);
         checks.push((before, definitions(f.db.pool()).await));
     }
-    for (index, template, trigger) in [(0, "Unknown {args}", "!faq"), (1, TEMPLATE, "!rank")] {
+    for (index, template, trigger) in [(0, "Unknown {guild}", "!faq"), (1, TEMPLATE, "!rank")] {
         seed(f.db.pool(), "2222", "faq", trigger, template, false).await;
         let before = definitions(f.db.pool()).await;
         refusals.push(f.observe(&toggle(510 + index, true, "faq")).await);

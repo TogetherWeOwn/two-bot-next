@@ -112,6 +112,14 @@ do carry member columns (`created_by`, `user_id`, `winner_ids`, and the
 and guild purge cover all three tables in the reviewed erasure plan; there
 is no reader grant beyond the app pool.
 
+The event instance window table (`event_instance_windows`) is ordinary `table`
+kind for the same reason: the transactional event-observation writers and the
+voice lookup read and write it through the app pool. It holds non-member
+durable lifecycle, order and revocation evidence keyed by guild, event and
+instance start, with no member column, so there is nothing to erase and no
+reader grant beyond the app pool. Backups archive it (v16); an old-format
+restore clears it and never backfills liveness.
+
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's
 base-table privileges: only the reviewed `web_v1` projection is exposed. Do not

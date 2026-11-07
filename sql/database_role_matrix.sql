@@ -116,6 +116,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'scheduled_events_tombstone', 'table'),
     ('public', 'event_voice_channels', 'table'),
     ('public', 'event_voice_presence', 'table'),
+    ('public', 'event_instance_windows', 'table'),
     ('public', 'admin_api_tokens', 'table'),
     ('public', 'starboard_config', 'table'),
     ('public', 'starboard_starrers', 'table'),

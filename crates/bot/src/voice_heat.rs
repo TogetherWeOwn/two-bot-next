@@ -531,7 +531,12 @@ mod tests {
             serde_json::from_value(guild).unwrap(),
         ))));
         assert_eq!(
-            voice_snapshot::read_voice_snapshot(&cache, 2222),
+            voice_snapshot::read_voice_snapshot(
+                &cache,
+                &voice_snapshot::VoiceOccupancyClock::default(),
+                2222,
+                &std::collections::HashMap::new(),
+            ),
             Err(voice_snapshot::SnapshotRefusal::OverBudget),
             "HTTP limit remains enforced"
         );

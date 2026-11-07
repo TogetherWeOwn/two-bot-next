@@ -11,7 +11,8 @@
 //! like `event.read`):
 //! `{"v":1,"observed_at":"<Zulu whole seconds>","total_in_voice":N,
 //! "rooms":[{"channel_id":"<snowflake>","name":"...","position":N|null,
-//! "user_limit":N,"member_ids":["<snowflake>",...],"afk":true?}]}`.
+//! "user_limit":N,"member_ids":["<snowflake>",...],"afk":true?,
+//! "occupied_since":"<Zulu whole seconds>"|null,"event_key":"..."?}]}`.
 //!
 //! Projection rules: guild voice channels only (stage and text excluded);
 //! every voice channel is a room even when empty; the AFK channel carries
@@ -20,10 +21,16 @@
 //! cache has not populated counts as human (never delete on incomplete bot
 //! data); member ids are snowflake decimal strings only — no usernames,
 //! nicknames, presence or activity; rooms sort by position then name.
-//! Member ids never reach logs; the read audits through the receiver's
-//! counters only.
+//! `occupied_since` is the ISO-8601 UTC instant the room's current
+//! continuous human occupancy began (retained until the room empties), or
+//! `null` when unknown — an empty room, or a join the gateway never
+//! witnessed (process start, reconnect reseed) is unknown, never guessed.
+//! `event_key` rides only on the room bound to a currently-windowed event's
+//! voice channel and is omitted elsewhere. Member ids never reach logs; the
+//! read audits through the receiver's counters only.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use twilight_cache_inmemory::{DefaultInMemoryCache, ResourceType};
@@ -64,6 +71,122 @@ pub(crate) struct RoomDraft {
     /// Sorted ascending before serializing so the wire shape is stable.
     pub member_ids: Vec<Snowflake>,
     pub afk: bool,
+    /// Whole-second Zulu join time of the room's current continuous
+    /// occupancy (`None` = unknown: empty room, or a join the gateway never
+    /// witnessed). Always serialized: a string when proven, else JSON null.
+    pub occupied_since: Option<String>,
+    /// `internal_event_keys` key for the currently-windowed event bound to
+    /// this room's voice channel (`None` = unlinked room, omitted on the
+    /// wire).
+    pub event_key: Option<String>,
+}
+
+/// A room's current interval, never a per-member join history. Unknown starts
+/// remain unknown until the room empties, even if all original occupants leave.
+#[derive(Debug)]
+struct OccupiedRoom {
+    members: HashSet<Snowflake>,
+    since_ms: Option<u64>,
+}
+
+/// Memory-only continuous occupancy clock, independent of the gated room actor.
+/// The pipeline supplies the affected rooms' post-transition human rosters.
+/// A witnessed join into an empty room starts an interval; overlapping joins
+/// and leaves preserve it until empty. Reconnects and reseeds discard evidence.
+/// Reads compare rosters before using evidence, so a cache/observer race is
+/// unknown rather than a fabricated start.
+#[derive(Debug, Default)]
+pub(crate) struct VoiceOccupancyClock {
+    rooms: Mutex<HashMap<(Snowflake, Snowflake), OccupiedRoom>>,
+}
+
+impl VoiceOccupancyClock {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn update_room(
+        rooms: &mut HashMap<(Snowflake, Snowflake), OccupiedRoom>,
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        members: &[Snowflake],
+        member_id: Snowflake,
+        joining: bool,
+        occurred_at_ms: Option<u64>,
+    ) {
+        let key = (guild_id, channel_id);
+        let members: HashSet<_> = members.iter().copied().collect();
+        if members.is_empty() {
+            rooms.remove(&key);
+            return;
+        }
+        let mut before = members.clone();
+        if joining {
+            before.remove(&member_id);
+        } else {
+            before.insert(member_id);
+        }
+        let since_ms = match rooms.get(&key) {
+            Some(room) if room.members == before => room.since_ms,
+            _ if joining && before.is_empty() && members.contains(&member_id) => occurred_at_ms,
+            _ => None,
+        };
+        rooms.insert(key, OccupiedRoom { members, since_ms });
+    }
+
+    fn stamp_rooms(&self, guild_id: Snowflake, drafts: &mut [RoomDraft]) {
+        let rooms = self.rooms.lock().expect("voice occupancy clock");
+        // Drafts may predate a gateway mutation. Reads must not delete newer
+        // evidence; witnessed leaves and lifecycle resets own all pruning.
+        for draft in drafts {
+            let members: HashSet<_> = draft.member_ids.iter().copied().collect();
+            draft.occupied_since = rooms
+                .get(&(guild_id, draft.channel_id))
+                .filter(|room| room.members == members)
+                .and_then(|room| room.since_ms)
+                .and_then(format_whole_second_zulu);
+        }
+    }
+}
+
+impl two_bot_discord::VoiceTransitionObserver for VoiceOccupancyClock {
+    fn observe_voice_transition(&self, transition: two_bot_discord::VoiceTransitionObservation) {
+        if transition.is_bot {
+            return;
+        }
+        let mut rooms = self.rooms.lock().expect("voice occupancy clock");
+        if let Some(channel) = transition.previous_channel_id {
+            Self::update_room(
+                &mut rooms,
+                transition.guild_id,
+                channel,
+                &transition.previous_channel_members,
+                transition.member_id,
+                false,
+                transition.occurred_at_ms,
+            );
+        }
+        if let Some(channel) = transition.current_channel_id {
+            Self::update_room(
+                &mut rooms,
+                transition.guild_id,
+                channel,
+                &transition.current_channel_members,
+                transition.member_id,
+                true,
+                transition.occurred_at_ms,
+            );
+        }
+    }
+
+    fn reset_voice_occupancy(&self, guild_id: Option<u64>, channel_id: Option<u64>) {
+        let mut rooms = self.rooms.lock().expect("voice occupancy clock");
+        rooms.retain(|(guild, channel), _| {
+            guild_id.is_some_and(|reset_guild| *guild != reset_guild)
+                || (guild_id.is_some()
+                    && channel_id.is_some_and(|reset_channel| *channel != reset_channel))
+        });
+    }
 }
 
 /// Read the §1 snapshot from the live gateway cache. `None` anywhere on the
@@ -72,17 +195,28 @@ pub(crate) struct RoomDraft {
 /// deliberate exception (a guild the cache holds whose voice-state set went
 /// missing reads as empty, not incomplete).
 ///
+/// `event_keys` carries the currently-windowed voice-channel → event-key map
+/// behind the read; each draft takes its room's key, or none when unlinked.
+/// The clock stamps `occupied_since` from the witnessed joins before
+/// projection.
+///
 /// The cache alone cannot prove freshness: a transport loss leaves the last
 /// occupancy readable, so callers gate on the supervisor's readiness first
 /// and only call this while the gateway is connected.
 pub(crate) fn read_voice_snapshot(
     cache: &two_bot_discord::SharedCache,
+    clock: &VoiceOccupancyClock,
     guild_id: Snowflake,
+    event_keys: &HashMap<Snowflake, String>,
 ) -> Result<Value, SnapshotRefusal> {
-    let rooms = cache
+    let mut rooms = cache
         .with_guild_snapshot(guild_id, |cache| collect_rooms(cache, guild_id))
         .flatten()
         .ok_or(SnapshotRefusal::CacheIncomplete)?;
+    clock.stamp_rooms(guild_id, &mut rooms);
+    for room in &mut rooms {
+        room.event_key = event_keys.get(&room.channel_id).cloned();
+    }
     project(observed_at_now(), rooms)
 }
 
@@ -111,8 +245,7 @@ fn total_in_voice(rooms: &[RoomDraft]) -> usize {
 /// Whole-second Zulu timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for `observed_at`.
 fn observed_at_now() -> String {
     let now = time::OffsetDateTime::now_utc();
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+    format_whole_second_zulu_parts(
         now.year(),
         u8::from(now.month()),
         now.day(),
@@ -120,6 +253,34 @@ fn observed_at_now() -> String {
         now.minute(),
         now.second(),
     )
+}
+
+/// Whole-second Zulu timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for a receipt-time
+/// millis value. Out-of-range inputs leave the start unknown rather than
+/// substituting a timestamp the gateway never witnessed.
+fn format_whole_second_zulu(millis: u64) -> Option<String> {
+    let at = i64::try_from(millis.div_euclid(1000))
+        .ok()
+        .and_then(|secs| time::OffsetDateTime::from_unix_timestamp(secs).ok())?;
+    Some(format_whole_second_zulu_parts(
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+    ))
+}
+
+fn format_whole_second_zulu_parts(
+    year: i32,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+) -> String {
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// Shared-cache handle constructor for the binary wiring (kept beside the
@@ -166,6 +327,10 @@ fn collect_rooms(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Option<Ve
             user_limit: channel.user_limit.unwrap_or(0),
             member_ids: Vec::new(),
             afk: Some(*channel_id) == afk_channel,
+            // Stamped by the occupancy clock and the event-key map on the
+            // read path; collection alone proves neither.
+            occupied_since: None,
+            event_key: None,
         });
     }
     let occupants: Vec<Id<UserMarker>> = match cache.guild_voice_states(guild_key) {
@@ -227,9 +392,17 @@ pub(crate) fn project(
                 "position": room.position,
                 "user_limit": room.user_limit,
                 "member_ids": room.member_ids.iter().map(Snowflake::to_string).collect::<Vec<_>>(),
+                // Always present: a proven join instant, else explicit null.
+                // Unknown occupancy is data, not an absent field.
+                "occupied_since": room.occupied_since.clone(),
             });
             if room.afk {
                 wire["afk"] = Value::Bool(true);
+            }
+            // Present only on the room bound to a currently-windowed event's
+            // voice channel; unlinked rooms omit the key entirely.
+            if let Some(key) = room.event_key.as_deref() {
+                wire["event_key"] = Value::String(key.to_owned());
             }
             wire
         })
@@ -301,7 +474,12 @@ mod tests {
             Err(SnapshotRefusal::CacheIncomplete)
         );
         assert_eq!(
-            read_voice_snapshot(&cache, 100),
+            read_voice_snapshot(
+                &cache,
+                &VoiceOccupancyClock::default(),
+                100,
+                &HashMap::new()
+            ),
             Err(SnapshotRefusal::CacheIncomplete)
         );
         cache.update(&full());
@@ -317,7 +495,13 @@ mod tests {
         cache.update(&full());
         assert_eq!(read_voice_total(&cache, 100), Ok(1));
         assert_eq!(
-            read_voice_snapshot(&cache, 100).expect("full snapshot")["total_in_voice"],
+            read_voice_snapshot(
+                &cache,
+                &VoiceOccupancyClock::default(),
+                100,
+                &HashMap::new()
+            )
+            .expect("full snapshot")["total_in_voice"],
             1
         );
         let mut empty = guild_snapshot();
@@ -344,7 +528,14 @@ mod tests {
             user_limit: 0,
             member_ids: member_ids.to_vec(),
             afk,
+            occupied_since: None,
+            event_key: None,
         }
+    }
+
+    /// Whole-second Zulu for a fixed instant: 2026-11-03T10:00:00Z.
+    fn stamp_ms() -> u64 {
+        1_793_700_000_000
     }
 
     fn rooms_of(value: &Value) -> Vec<(String, String, bool, Vec<String>)> {
@@ -435,6 +626,355 @@ mod tests {
         assert_eq!(value["observed_at"], json!("2026-11-03T10:00:00Z"));
         assert_eq!(value["rooms"][0]["channel_id"], json!("10"));
         assert_eq!(value["rooms"][0]["position"], json!(0));
+    }
+
+    #[test]
+    fn rooms_without_proof_read_null_occupied_since() {
+        // Collection alone proves no join: the wire carries explicit null,
+        // never an absent field and never a guess.
+        let value = project(
+            "2026-11-03T10:00:00Z".to_owned(),
+            vec![
+                draft(10, "lobby", Some(0), &[7], false),
+                draft(11, "quiet", Some(1), &[], false),
+            ],
+        )
+        .expect("small projection fits");
+        assert_eq!(value["rooms"][0]["occupied_since"], json!(null));
+        assert_eq!(value["rooms"][1]["occupied_since"], json!(null));
+    }
+
+    #[test]
+    fn event_key_rides_only_on_the_linked_room() {
+        let mut rooms = vec![
+            draft(10, "lobby", Some(0), &[7], false),
+            draft(11, "stage-linked", Some(1), &[8], false),
+        ];
+        rooms[1].event_key = Some("autumn-showcase".to_owned());
+        let value =
+            project("2026-11-03T10:00:00Z".to_owned(), rooms).expect("small projection fits");
+        assert!(value["rooms"][0].get("event_key").is_none());
+        assert_eq!(value["rooms"][1]["event_key"], json!("autumn-showcase"));
+    }
+
+    fn transition(
+        member_id: u64,
+        previous: Option<(u64, &[u64])>,
+        current: Option<(u64, &[u64])>,
+        occurred_at_ms: Option<u64>,
+    ) -> two_bot_discord::VoiceTransitionObservation {
+        two_bot_discord::VoiceTransitionObservation {
+            guild_id: 9,
+            member_id,
+            previous_channel_id: previous.map(|(channel, _)| channel),
+            current_channel_id: current.map(|(channel, _)| channel),
+            previous_channel_members: previous
+                .map(|(_, members)| members.to_vec())
+                .unwrap_or_default(),
+            current_channel_members: current
+                .map(|(_, members)| members.to_vec())
+                .unwrap_or_default(),
+            is_bot: false,
+            occurred_at_ms,
+        }
+    }
+
+    #[test]
+    fn clock_stamps_the_oldest_tracked_join() {
+        use two_bot_discord::VoiceTransitionObserver;
+        let clock = VoiceOccupancyClock::new();
+        clock.observe_voice_transition(transition(7, None, Some((10, &[7])), Some(stamp_ms())));
+        clock.observe_voice_transition(transition(
+            8,
+            None,
+            Some((10, &[7, 8])),
+            Some(stamp_ms() + 60_000),
+        ));
+        let mut rooms = vec![draft(10, "lobby", Some(0), &[7, 8], false)];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(
+            rooms[0].occupied_since.as_deref(),
+            Some("2026-11-03T10:00:00Z")
+        );
+        let value =
+            project("2026-11-03T10:00:00Z".to_owned(), rooms).expect("small projection fits");
+        assert_eq!(
+            value["rooms"][0]["occupied_since"],
+            json!("2026-11-03T10:00:00Z")
+        );
+    }
+
+    #[test]
+    fn clock_out_of_range_stamp_reads_null() {
+        use two_bot_discord::VoiceTransitionObserver;
+        let clock = VoiceOccupancyClock::new();
+        clock.observe_voice_transition(transition(7, None, Some((10, &[7])), Some(u64::MAX)));
+        let mut rooms = vec![draft(10, "lobby", Some(0), &[7], false)];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(rooms[0].occupied_since, None);
+    }
+
+    #[test]
+    fn clock_moves_restamp_and_leaves_clear() {
+        use two_bot_discord::VoiceTransitionObserver;
+        let clock = VoiceOccupancyClock::new();
+        clock.observe_voice_transition(transition(7, None, Some((10, &[7])), Some(stamp_ms())));
+        clock.observe_voice_transition(transition(
+            7,
+            Some((10, &[])),
+            Some((11, &[7])),
+            Some(stamp_ms() + 60_000),
+        ));
+        let mut rooms = vec![
+            draft(10, "lobby", Some(0), &[], false),
+            draft(11, "breakout", Some(1), &[7], false),
+        ];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(rooms[0].occupied_since, None);
+        assert_eq!(
+            rooms[1].occupied_since.as_deref(),
+            Some("2026-11-03T10:01:00Z")
+        );
+        clock.observe_voice_transition(transition(
+            7,
+            Some((11, &[])),
+            None,
+            Some(stamp_ms() + 120_000),
+        ));
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(rooms[1].occupied_since, None);
+        assert!(clock.rooms.lock().expect("clock lock").is_empty());
+    }
+
+    #[test]
+    fn clock_unknown_stamp_or_member_reads_null() {
+        use two_bot_discord::VoiceTransitionObserver;
+        let clock = VoiceOccupancyClock::new();
+        clock.observe_voice_transition(transition(7, None, Some((10, &[7])), None));
+        let mut rooms = vec![draft(10, "lobby", Some(0), &[7, 8], false)];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(rooms[0].occupied_since, None);
+        clock.observe_voice_transition(transition(8, None, Some((11, &[8])), Some(stamp_ms())));
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(rooms[0].occupied_since, None);
+    }
+
+    #[test]
+    fn clock_read_refuses_roster_mismatch_without_deleting_newer_evidence() {
+        use two_bot_discord::VoiceTransitionObserver;
+        let clock = VoiceOccupancyClock::new();
+        clock.observe_voice_transition(transition(7, None, Some((10, &[7])), Some(stamp_ms())));
+        clock.observe_voice_transition(transition(8, None, Some((10, &[7, 8])), Some(stamp_ms())));
+        let mut rooms = vec![draft(10, "lobby", Some(0), &[7], false)];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(
+            rooms[0].occupied_since, None,
+            "unwitnessed change is unknown"
+        );
+        assert_eq!(clock.rooms.lock().expect("clock lock").len(), 1);
+        // An older read may omit a newly created channel. It cannot erase
+        // an interval recorded by the gateway after collection began.
+        clock.stamp_rooms(9, &mut []);
+        rooms[0].member_ids = vec![7, 8];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(
+            rooms[0].occupied_since.as_deref(),
+            Some("2026-11-03T10:00:00Z")
+        );
+        clock.reset_voice_occupancy(Some(9), Some(10));
+        assert!(clock.rooms.lock().expect("clock lock").is_empty());
+    }
+
+    #[test]
+    fn clock_retains_known_and_unknown_starts_across_overlapping_members() {
+        use two_bot_discord::VoiceTransitionObserver;
+        for witnessed_first in [false, true] {
+            let clock = VoiceOccupancyClock::new();
+            if witnessed_first {
+                clock.observe_voice_transition(transition(
+                    7,
+                    None,
+                    Some((10, &[7])),
+                    Some(stamp_ms()),
+                ));
+            }
+            clock.observe_voice_transition(transition(
+                8,
+                None,
+                Some((10, &[7, 8])),
+                Some(stamp_ms() + 60_000),
+            ));
+            // The first occupant leaves. The room never emptied, so its start
+            // cannot become B's later join (nor known if A predates startup).
+            clock.observe_voice_transition(transition(
+                7,
+                Some((10, &[8])),
+                None,
+                Some(stamp_ms() + 120_000),
+            ));
+            let mut rooms = vec![draft(10, "lobby", Some(0), &[8], false)];
+            clock.stamp_rooms(9, &mut rooms);
+            assert_eq!(
+                rooms[0].occupied_since.as_deref(),
+                witnessed_first.then_some("2026-11-03T10:00:00Z")
+            );
+            clock.observe_voice_transition(transition(
+                8,
+                Some((10, &[])),
+                None,
+                Some(stamp_ms() + 180_000),
+            ));
+            clock.observe_voice_transition(transition(
+                9,
+                None,
+                Some((10, &[9])),
+                Some(stamp_ms() + 240_000),
+            ));
+            rooms[0].member_ids = vec![9];
+            clock.stamp_rooms(9, &mut rooms);
+            assert_eq!(
+                rooms[0].occupied_since.as_deref(),
+                Some("2026-11-03T10:04:00Z")
+            );
+        }
+    }
+
+    #[test]
+    fn clock_resets_scoped_evidence_and_ignores_bots() {
+        use two_bot_discord::VoiceTransitionObserver;
+        let clock = VoiceOccupancyClock::new();
+        for channel in [10, 11] {
+            clock.observe_voice_transition(transition(
+                7,
+                None,
+                Some((channel, &[7])),
+                Some(stamp_ms()),
+            ));
+        }
+        let mut other = transition(7, None, Some((10, &[7])), Some(stamp_ms()));
+        other.guild_id = 99;
+        clock.observe_voice_transition(other);
+        clock.reset_voice_occupancy(Some(9), Some(10));
+        let mut rooms = vec![
+            draft(10, "a", Some(0), &[7], false),
+            draft(11, "b", Some(1), &[7], false),
+        ];
+        clock.stamp_rooms(9, &mut rooms);
+        assert_eq!(rooms[0].occupied_since, None);
+        assert!(rooms[1].occupied_since.is_some());
+        clock.reset_voice_occupancy(Some(9), None);
+        assert_eq!(
+            clock.rooms.lock().expect("clock lock").len(),
+            1,
+            "other guild survives"
+        );
+        clock.reset_voice_occupancy(None, None);
+        assert!(clock.rooms.lock().expect("clock lock").is_empty());
+        let mut bot = transition(88, None, Some((10, &[])), Some(stamp_ms()));
+        bot.is_bot = true;
+        clock.observe_voice_transition(bot);
+        assert!(clock.rooms.lock().expect("clock lock").is_empty());
+    }
+
+    fn pipeline_voice(member: u64, channel: Option<u64>) -> twilight_model::gateway::event::Event {
+        twilight_model::gateway::event::Event::VoiceStateUpdate(Box::new(
+            serde_json::from_value(json!({
+                "guild_id": "100", "user_id": member.to_string(),
+                "channel_id": channel.map(|id| id.to_string()), "session_id": "fixture",
+                "deaf": false, "mute": false, "self_deaf": false,
+                "self_mute": false, "self_video": false, "suppress": false
+            }))
+            .expect("voice frame"),
+        ))
+    }
+
+    fn pipeline_guild(members: &[u64]) -> twilight_model::gateway::event::Event {
+        use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
+        let mut guild: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json"))
+                .expect("guild fixture");
+        guild["voice_states"] = Value::Array(
+            members
+                .iter()
+                .map(|member| {
+                    let Event::VoiceStateUpdate(state) = pipeline_voice(*member, Some(200)) else {
+                        unreachable!("voice fixture")
+                    };
+                    serde_json::to_value(state).expect("voice state")
+                })
+                .collect(),
+        );
+        Event::GuildCreate(Box::new(GuildCreate::Available(
+            serde_json::from_value(guild).expect("guild fixture"),
+        )))
+    }
+
+    #[test]
+    fn pipeline_clock_preserves_intervals_and_forgets_same_member_after_a_gap() {
+        use twilight_model::gateway::event::Event;
+        for reseed in [false, true] {
+            let cache = new_shared_cache();
+            let pipeline = two_bot_discord::MemPipeline::with_shared_cache(
+                two_bot_core::MemStore::new(),
+                Some(two_bot_core::NoopLeveling),
+                Some(two_bot_core::NoopFacts),
+                two_bot_discord::ScriptedInvites::new(),
+                two_bot_discord::NoClassification,
+                two_bot_discord::PipelineSnapshots::new(),
+                cache.clone(),
+            );
+            let clock = VoiceOccupancyClock::new();
+            pipeline.set_voice_transition_observer(clock.clone());
+            pipeline.handle_at(&pipeline_guild(&[]), "2026-11-03T09:59:00Z");
+            pipeline.handle_at(&pipeline_voice(7, Some(200)), "2026-11-03T10:00:00Z");
+            pipeline.handle_at(&pipeline_voice(8, Some(200)), "2026-11-03T10:01:00Z");
+            let snapshot = || {
+                read_voice_snapshot(&cache, &clock, 100, &HashMap::new()).expect("complete guild")
+            };
+            for member in [99, 7] {
+                // An unrelated guild departure cannot erase this interval.
+                // For an occupant, Twilight retains the voice state until the
+                // actual leave frame; that leave must still preserve overlap.
+                let removed = Event::MemberRemove(
+                    serde_json::from_value(json!({
+                        "guild_id": "100", "user": {"id": member.to_string(),
+                        "username": "fixture", "discriminator": "0", "bot": false}
+                    }))
+                    .expect("member remove"),
+                );
+                pipeline.handle_at(&removed, "2026-11-03T10:01:30Z");
+                assert_eq!(
+                    snapshot()["rooms"][0]["occupied_since"],
+                    json!("2026-11-03T10:00:00Z")
+                );
+            }
+            pipeline.handle_at(&pipeline_voice(7, None), "2026-11-03T10:02:00Z");
+            assert_eq!(
+                snapshot()["rooms"][0]["occupied_since"],
+                json!("2026-11-03T10:00:00Z")
+            );
+            let reset = if reseed {
+                pipeline_guild(&[8])
+            } else {
+                Event::Resumed
+            };
+            pipeline.handle_at(&reset, "2026-11-03T10:03:00Z");
+            assert_eq!(snapshot()["rooms"][0]["member_ids"], json!(["8"]));
+            assert_eq!(
+                snapshot()["rooms"][0]["occupied_since"],
+                Value::Null,
+                "the same cached occupant cannot prove continuity after a gap"
+            );
+            pipeline.handle_at(&pipeline_voice(9, Some(200)), "2026-11-03T10:04:00Z");
+            pipeline.handle_at(&pipeline_voice(8, None), "2026-11-03T10:05:00Z");
+            assert_eq!(snapshot()["rooms"][0]["occupied_since"], Value::Null);
+            pipeline.handle_at(&pipeline_voice(9, None), "2026-11-03T10:06:00Z");
+            pipeline.handle_at(&pipeline_voice(10, Some(200)), "2026-11-03T10:07:00Z");
+            assert_eq!(
+                snapshot()["rooms"][0]["occupied_since"],
+                json!("2026-11-03T10:07:00Z")
+            );
+        }
     }
 
     #[test]

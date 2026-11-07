@@ -834,6 +834,7 @@ fn raw_event(value: &Value, guild: &str) -> Result<RawScheduledEvent, ErrorClass
         id: Some(id.to_owned()),
         name: optional("name")?,
         scheduled_start_time: optional("scheduled_start_time")?,
+        scheduled_end_time: optional("scheduled_end_time")?,
         channel_id,
         description: optional("description")?,
         status: value["status"].as_i64(),

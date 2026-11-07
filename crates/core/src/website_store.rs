@@ -34,7 +34,7 @@ use sqlx::{Pool, Postgres, Transaction};
 
 use super::community_snapshots::{window_bounds, CommunitySnapshot, RaidWindow, RAID_ANOMALIES};
 use super::funnel::{format_iso_millis, parse_iso_millis};
-use super::scheduled_events::{ScheduledEvent, ScheduledEventsSkip};
+use super::scheduled_events::{EventStatus, ScheduledEvent, ScheduledEventsSkip};
 
 /// The contract version this build publishes with the views in `sql/web_v1.sql`.
 /// Migration 0300 seeds 1.0; only successful view installation advances it.
@@ -308,8 +308,10 @@ pub async fn write_rank_snapshot(
 /// snapshot earns a tombstone stamped with this tick's `observed_at`.
 /// Suppression is tick-level, not per-id: a stale
 /// replay may also carry never-before-seen ids with no tombstone of their
-/// own. The mutation path ([`upsert_event`]) is untouched: an internal action
-/// completing after a delete still lands its row.
+/// own. The mutation path ([`upsert_event`]) retains its mirror acceptance:
+/// an internal action completing after an omission still lands its mirror row.
+/// Retained instance evidence independently rejects stale/equal resurrection;
+/// both writer paths commit mirror and evidence persistence atomically.
 pub async fn replace_events(
     pool: &Pool<Postgres>,
     guild_id: &str,
@@ -317,6 +319,16 @@ pub async fn replace_events(
     events: &[ScheduledEvent],
 ) -> Result<Option<ScheduledEventsSkip>, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    crate::event_instance_store::lock_guild(&mut tx, guild_id).await?;
+    // Equal snapshots keep their mirror compatibility, but cannot establish
+    // lifecycle evidence after a same-time omission, even without a tombstone.
+    let advancing_snapshot: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM scheduled_events_claim WHERE guild_id = $1 AND epoch >= $2)",
+    )
+    .bind(guild_id)
+    .bind(observed_at)
+    .fetch_one(&mut *tx)
+    .await?;
     // A conflicting row whose stored epoch is newer fails the WHERE, updates
     // nothing and returns no row: that is the stale case. Genesis (no row)
     // inserts and returns, as do newer and equal stamps.
@@ -351,6 +363,23 @@ pub async fn replace_events(
     .fetch_one(&mut *tx)
     .await?;
     if !suppressed {
+        // Fence claims/binds against omissions as well as incoming observations.
+        // Lock the whole affected set in one order, including legacy adoption.
+        let mut event_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT event_id FROM event_instance_windows WHERE guild_id = $1 AND is_current",
+        )
+        .bind(guild_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        event_ids.extend(events.iter().map(|event| event.id.clone()));
+        event_ids.sort_unstable();
+        event_ids.dedup();
+        for event_id in &event_ids {
+            crate::event_instance_store::lock_event(&mut tx, event_id).await?;
+        }
+        if let Some(cutoff) = tombstone_purge_cutoff(observed_at) {
+            crate::event_instance_store::maintain_in(&mut tx, guild_id, &cutoff).await?;
+        }
         let removed: Vec<String> = sqlx::query_scalar(
             "DELETE FROM scheduled_events WHERE guild_id = $1 AND updated_at <= $2
              RETURNING event_id",
@@ -380,8 +409,10 @@ pub async fn replace_events(
             .execute(&mut *tx)
             .await?;
         }
+        let live_ids: Vec<&str> = live.iter().copied().collect();
+        crate::event_instance_store::omit_in(&mut tx, guild_id, observed_at, &live_ids).await?;
         for event in events {
-            sqlx::query(
+            let written = sqlx::query(
                 "INSERT INTO scheduled_events
                    (guild_id, event_id, name, starts_at, channel_id, description, status, updated_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -401,6 +432,21 @@ pub async fn replace_events(
             .bind(observed_at)
             .execute(&mut *tx)
             .await?;
+            if written.rows_affected() != 0
+                || matches!(
+                    event.status,
+                    EventStatus::Completed | EventStatus::Cancelled
+                )
+            {
+                crate::event_instance_store::observe_in(
+                    &mut tx,
+                    guild_id,
+                    observed_at,
+                    event,
+                    advancing_snapshot,
+                )
+                .await?;
+            }
         }
     }
     // Hygiene runs on every claiming tick, suppressed or not: tombstones older
@@ -470,16 +516,19 @@ fn tombstone_purge_cutoff(observed_at: &str) -> Option<String> {
 /// own completion — never a pre-send reading that a newer snapshot could beat
 /// despite landing earlier. A stale mutation whose mirror write loses the race
 /// against a newer poller snapshot (or a newer mutation) becomes a silent
-/// no-op: the Discord effect already happened, so this still returns `Ok` —
-/// the mirror simply keeps the newer row. Inserts (no conflicting row) always
-/// apply.
+/// mirror no-op: the Discord effect already happened, so this still returns
+/// `Ok` if evidence persistence succeeds. Terminal observations are evaluated
+/// against the authority's own confirmed stamp even when the mirror keeps a
+/// newer compatibility-only replay. Inserts (no conflicting row) always apply.
 pub async fn upsert_event(
     pool: &Pool<Postgres>,
     guild_id: &str,
     observed_at: &str,
     event: &ScheduledEvent,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    let mut tx = pool.begin().await?;
+    crate::event_instance_store::lock_guild(&mut tx, guild_id).await?;
+    let written = sqlx::query(
         "INSERT INTO scheduled_events
            (guild_id, event_id, name, starts_at, channel_id, description, status, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -497,9 +546,18 @@ pub async fn upsert_event(
     .bind(&event.description)
     .bind(event.status.as_str())
     .bind(observed_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(())
+    if written.rows_affected() != 0
+        || matches!(
+            event.status,
+            EventStatus::Completed | EventStatus::Cancelled
+        )
+    {
+        crate::event_instance_store::observe_in(&mut tx, guild_id, observed_at, event, false)
+            .await?;
+    }
+    tx.commit().await
 }
 
 impl crate::scheduled_events::ScheduledEventMirror for Pool<Postgres> {

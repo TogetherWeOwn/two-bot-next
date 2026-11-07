@@ -537,9 +537,13 @@
       "sha256": "d462fd0a1571db897c1b35046040343b7f46df073a8605152b63324701a757be",
       "justification": "Voice-heat hourly aggregates: guild-wide occupancy samples per UTC hour; the 1.0 to 1.1 contract-version bump is published with the web_v1 views, not here; aggregate-only, no member or channel columns."
     },
-    "crates/cutover/migrations/0472_voice_heat_hours.sql": {
-      "sha256": "090e157d17b50b42082431671edb8bfc0b28f7d227d2676ba68b77f54f6b3c59",
-      "justification": "Cutover mirror of the store 0471 voice-heat hourly aggregates table so both chains cross-run in either order; aggregate-only, no member or channel columns."
+    "crates/cutover/migrations/0472_event_instance_windows.sql": {
+      "sha256": "ff2af4cb454c9fa569fb2722593ff35f3af3c347dc55fcea82ddeff0c21bd671",
+      "justification": "Retain accepted event instance windows and independent lifecycle, omission and revocation fences outside the exact-replacement mirror; omission stamps preserve rollback recency without masking delayed terminal observations."
+    },
+    "crates/cutover/migrations/0473_voice_heat_hours.sql": {
+      "sha256": "132b57b2b827cbd0d57e3ca96f14289e3043fe9177284f961099ac46b677dbb1",
+      "justification": "Renumber the unshipped cutover heat migration to 0473 because main owns 0472 for event-instance windows; retain the aggregate-only store 0471 mirror so both chains cross-run in either order, with no member or channel columns."
     }
   }
 }
