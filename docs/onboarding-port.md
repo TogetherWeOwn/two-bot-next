@@ -272,27 +272,19 @@ Framework references:
 
 ## Verification
 
-These are runnable recipes, not new execution evidence for the checkpoint above.
-On the persistent controller, use the
-[bounded build-cache wrapper](build-cache.md#local-builds) from the isolated
-worktree, with a 600000 ms Bash timeout or in the background. If admission is
-refused or missing, stop and follow the
-[Operator path](build-cache.md#operator-handoff-and-rollback-one-host-step);
-never use direct compiling Cargo, another cache or a speculative target.
-`cargo fmt` does not compile and may run directly.
+These commands describe hosted-CI coverage, not new execution evidence for the
+checkpoint above or a local pre-push checklist. Push the PR branch and record
+exact-head Actions run/job links. The full suite is CI-owned; do not reproduce
+it as a series of local crate commands.
 
-```sh
-# Persistent controller only (fmt may run anywhere).
-python3 scripts/cargo_cache.py run -- test -p two-bot-core --locked
-python3 scripts/cargo_cache.py run -- clippy -p two-bot-core --features db --all-targets --locked -- -D warnings
-cargo fmt --all -- --check
-python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --test onboarding_store --locked -- --ignored
-python3 scripts/cargo_cache.py run -- test -p two-bot-discord --test onboarding_wire --locked
-TWO_GATEWAY_TEST_DATABASE_URL=postgres://agent_test@agent-testdb:5432/agent_test \
-  python3 scripts/cargo_cache.py run -- test -p two-bot --locked onboarding_ -- --include-ignored
-```
+Local execution is only for one failing test or crate under the
+[focused reproduction policy](../CONTRIBUTING.md#focused-failure-reproduction-only).
+Heavy focused work uses guarded Boat; fallback never permits a full suite or
+heavy raw-host build. Permitted non-heavy controller fallback still uses the
+[bounded cache wrapper](build-cache.md#local-builds), never another cache or
+speculative target. `cargo fmt` does not compile and may run directly.
 
-Ephemeral hosted CI keeps its direct Cargo variants and the same filters:
+Ephemeral hosted CI retains these direct Cargo commands:
 
 ```sh
 # Ephemeral hosted CI only, not a controller fallback.
