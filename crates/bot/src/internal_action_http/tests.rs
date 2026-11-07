@@ -5532,9 +5532,8 @@ async fn event_attendance_read_busy_event_gate_refuses_without_claiming() {
     set_attendance_read_flag(true);
     let effect = Arc::new(MockEffect::new(MockOutcome::Success));
     let reads = Arc::new(MockEventRead::default());
-    let mut receiver = state_with_reads(lazy_pool(), effect.clone(), reads.clone());
-    receiver.event_gate_wait = Duration::from_millis(10);
-    let state = Arc::new(receiver);
+    let mut state = state_with_reads(lazy_pool(), effect.clone(), reads.clone());
+    Arc::get_mut(&mut state).unwrap().event_gate_wait = Duration::from_millis(10);
     let held = state.event_gate.lock().await;
     let (status, _, body) = answer(
         router(state.clone()),
