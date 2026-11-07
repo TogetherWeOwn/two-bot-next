@@ -43,13 +43,23 @@ class ScheduledStagingIdleTests(unittest.TestCase):
                 mutate(changed["jobs"]["staging"]["steps"])
                 self.assertTrue(policy.synthetic_user_flow_errors(changed))
 
-    def test_callee_control_declaration_is_optional_and_not_forwarded(self):
+    def test_callers_forward_exactly_the_two_named_tokens(self):
+        workflows = policy.load_workflows()
+        expected = {
+            "TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}",
+            "STAGING_OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+        }
+        for job_id in ("voice-synthetic", "help-embed-synthetic"):
+            with self.subTest(job=job_id):
+                self.assertEqual(workflows["deploy-staging.yml"]["jobs"][job_id]["secrets"], expected)
+
+    def test_callee_control_declaration_is_required(self):
         workflows = policy.load_workflows()
         for name, consumer in (("voice-synthetic.yml", "synthetic"),
                                ("help-embed-synthetic.yml", "help-embed-smoke")):
             real = workflows[name]
             self.assertEqual(policy.staging_callee_window_errors(name, real, consumer), [])
-            for required in (None, "true"):
+            for required in (None, "false"):
                 changed = deepcopy(real)
                 secrets = changed["on"]["workflow_call"]["secrets"]
                 if required is None:
@@ -58,9 +68,28 @@ class ScheduledStagingIdleTests(unittest.TestCase):
                     secrets["STAGING_OWNERSHIP_CONTROL_TOKEN"]["required"] = required
                 with self.subTest(workflow=name, required=required):
                     self.assertTrue(policy.staging_callee_window_errors(name, changed, consumer))
+
+    def test_caller_token_wiring_mutations_fail_closed(self):
+        real = policy.load_workflows()["deploy-staging.yml"]
+        self.assertEqual(policy.staging_full_window_errors(real), [])
+        mutations = {
+            "inherit": lambda j: j.update(secrets="inherit"),
+            "missing control": lambda j: j["secrets"].pop("STAGING_OWNERSHIP_CONTROL_TOKEN"),
+            "missing test bot": lambda j: j["secrets"].pop("TWO_VOICE_SYNTHETIC_BOT_TOKEN"),
+            "extra secret": lambda j: j["secrets"].update(UNREVIEWED_TOKEN="${{ secrets.UNREVIEWED_TOKEN }}"),
+            "control from test bot": lambda j: j["secrets"].update(
+                STAGING_OWNERSHIP_CONTROL_TOKEN="${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"),
+            "test bot from control": lambda j: j["secrets"].update(
+                TWO_VOICE_SYNTHETIC_BOT_TOKEN="${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"),
+            "renamed control": lambda j: j["secrets"].update(
+                STAGING_OWNERSHIP_CONTROL_TOKEN="${{ secrets.OTHER_CONTROL_TOKEN }}"),
+        }
         for job_id in ("voice-synthetic", "help-embed-synthetic"):
-            self.assertEqual(set(workflows["deploy-staging.yml"]["jobs"][job_id]["secrets"]),
-                             {"TWO_VOICE_SYNTHETIC_BOT_TOKEN"})
+            for label, mutate in mutations.items():
+                with self.subTest(job=job_id, mutation=label):
+                    changed = deepcopy(real)
+                    mutate(changed["jobs"][job_id])
+                    self.assertTrue(policy.staging_full_window_errors(changed))
 
     def test_idle_history_never_creates_sample_or_closed_checkpoint(self):
         history = policy._HISTORY_MODULE

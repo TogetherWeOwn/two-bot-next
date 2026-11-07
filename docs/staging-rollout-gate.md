@@ -204,9 +204,14 @@ failure stays red; native expiry remains mandatory for cancelled or lost runners
 Called voice/help receive three required `workflow_call`-only string inputs from
 `needs.deploy.outputs`; dispatch cannot inject an inherited grant. They use
 provably disjoint per-run nested groups and a separate main-only
-`environment: staging` job for authenticated readiness. Their live consumer job
-keeps only the test-bot credential. Standalone voice/help acquire at most 45
-minutes under the canonical workflow lock and release after their consumer,
+`environment: staging` job for authenticated readiness. The caller must pass both
+`TWO_VOICE_SYNTHETIC_BOT_TOKEN` and `STAGING_OWNERSHIP_CONTROL_TOKEN` by name,
+never `secrets: inherit`; declaring the control name in the callee alone does not
+make the environment secret available on the called path. The control declaration
+is required. Their live consumer job stays in `voice-synthetic`, references only
+the test-bot credential, and never receives a control-token environment variable.
+Standalone voice/help acquire at most 45 minutes under the canonical workflow lock
+and release after their consumer,
 even if it fails. Called jobs never acquire or release the parent's grant.
 The manual [MCP prove-out](mcp.md#staging-prove-out) acquires and verifies at most
 15 minutes under the same canonical workflow lock, then releases its original
