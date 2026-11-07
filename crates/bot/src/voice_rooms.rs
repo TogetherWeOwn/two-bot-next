@@ -930,13 +930,9 @@ impl RoomPersistence for PgRoomStore {
         guild: Snowflake,
         after_id: i64,
     ) -> Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError> {
-        two_bot_cutover::event_attendance::attendance_recovery_page(
-            self.pool(),
-            &guild.to_string(),
-            after_id,
-        )
-        .await
-        .map_err(store_error)
+        self.attendance_recovery_page(&guild.to_string(), after_id)
+            .await
+            .map_err(store_error)
     }
 
     async fn recover_attendance_sessions(
@@ -944,13 +940,9 @@ impl RoomPersistence for PgRoomStore {
         guild: Snowflake,
         ids: &[i64],
     ) -> Result<u64, StoreError> {
-        two_bot_cutover::event_attendance::recover_attendance_sessions(
-            self.pool(),
-            &guild.to_string(),
-            ids,
-        )
-        .await
-        .map_err(store_error)
+        self.recover_attendance_sessions(&guild.to_string(), ids)
+            .await
+            .map_err(store_error)
     }
 
     async fn attendance_windows(

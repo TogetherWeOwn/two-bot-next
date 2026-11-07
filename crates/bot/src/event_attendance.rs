@@ -1559,6 +1559,60 @@ mod tests {
         .await
         .unwrap()
         .is_empty());
+        let recovery_member = member + 1;
+        record_transition(
+            &store,
+            VoiceTransition {
+                guild,
+                member: recovery_member,
+                ..join_transition()
+            },
+        )
+        .await;
+        let page = crate::voice_rooms::RoomPersistence::attendance_recovery_page(&store, guild, 0)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].member_id, recovery_member.to_string());
+        assert_eq!(page[0].channel_id, "7");
+        let ids = [page[0].id];
+        assert_eq!(
+            crate::voice_rooms::RoomPersistence::recover_attendance_sessions(
+                &store,
+                guild + 1,
+                &ids
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::voice_rooms::RoomPersistence::recover_attendance_sessions(&store, guild, &ids)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            crate::voice_rooms::RoomPersistence::attendance_recovery_page(&store, guild, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let (joined_at, left_at, channel_name, event_keys): (
+            OffsetDateTime,
+            OffsetDateTime,
+            String,
+            Vec<String>,
+        ) = sqlx::query_as(
+            "SELECT joined_at, left_at, channel_name, event_keys FROM event_voice_sessions WHERE id = $1",
+        )
+        .bind(ids[0])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(left_at, joined_at);
+        assert_eq!(channel_name, "lobby");
+        assert_eq!(event_keys, ["game-night"]);
         db.close().await.unwrap();
     }
 

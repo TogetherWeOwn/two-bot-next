@@ -657,6 +657,24 @@ pub async fn is_attendance_voice_enabled(
 }
 
 impl PgRoomStore {
+    /// [`attendance_recovery_page`] over this store's pool.
+    pub async fn attendance_recovery_page(
+        &self,
+        guild_id: &str,
+        after_id: i64,
+    ) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
+        attendance_recovery_page(self.pool(), guild_id, after_id).await
+    }
+
+    /// [`recover_attendance_sessions`] over this store's pool.
+    pub async fn recover_attendance_sessions(
+        &self,
+        guild_id: &str,
+        ids: &[i64],
+    ) -> Result<u64, sqlx::Error> {
+        recover_attendance_sessions(self.pool(), guild_id, ids).await
+    }
+
     /// [`attendance_windows_for_guild`] over this store's pool.
     pub async fn attendance_windows_for_guild(
         &self,
