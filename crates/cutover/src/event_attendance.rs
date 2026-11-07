@@ -306,19 +306,27 @@ async fn lock_capture_in(
     two_bot_core::event_instance_store::lock_guild(connection, guild_id).await
 }
 
+type CaptureTagsFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<String>, sqlx::Error>> + Send + 'a>,
+>;
+
 // Called under privacy, settings and lifecycle locks. A stale actor read cannot
 // grant capture. For first close-time tags, reject spans crossing an omission:
 // before the first capture there is no complete history of earlier credit stops.
-async fn capture_tags_in(
-    connection: &mut sqlx::PgConnection,
-    guild_id: &str,
-    member_id: &str,
-    requested: &[String],
+fn capture_tags_in<'a>(
+    connection: &'a mut sqlx::PgConnection,
+    guild_id: &'a str,
+    member_id: &'a str,
+    requested: &'a [String],
     at: OffsetDateTime,
     since: OffsetDateTime,
     closing: bool,
-) -> Result<Vec<String>, sqlx::Error> {
-    let permitted: bool = sqlx::query_scalar(
+) -> CaptureTagsFuture<'a> {
+    // Share the SQL future behind one allocation instead of embedding its
+    // state in both insert and close transactions. Dropping it still cancels
+    // the same borrowed connection work; the caller retains its transaction.
+    Box::pin(async move {
+        let permitted: bool = sqlx::query_scalar(
         "SELECT NOT EXISTS (SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)
            AND COALESCE((SELECT voice_enabled FROM guild_analytics_settings WHERE guild_id = $1), TRUE)",
     )
@@ -326,31 +334,33 @@ async fn capture_tags_in(
     .bind(member_id)
     .fetch_one(&mut *connection)
     .await?;
-    if !permitted {
-        return Ok(Vec::new());
-    }
-    let windows: Vec<(String, OffsetDateTime, OffsetDateTime)> =
-        sqlx::query_as(CAPTURE_WINDOWS_SQL)
-            .bind(guild_id)
-            .bind(since)
-            .bind(closing)
-            .bind(requested)
-            .fetch_all(&mut *connection)
-            .await?;
-    if windows.len() > ATTENDANCE_MAX_WINDOWS || windows.iter().any(|(key, _, _)| key.len() > 128) {
-        return Err(sqlx::Error::Protocol(
-            "attendance candidates exceed budget".into(),
-        ));
-    }
-    let grace = time::Duration::minutes(ATTENDANCE_WINDOW_GRACE_MINUTES);
-    let tags: Vec<String> = windows
-        .into_iter()
-        .filter(|(key, start, end)| {
-            requested.contains(key) && *start - grace <= at && since <= *end + grace
-        })
-        .map(|(key, _, _)| key)
-        .collect();
-    sqlx::query(
+        if !permitted {
+            return Ok(Vec::new());
+        }
+        let windows: Vec<(String, OffsetDateTime, OffsetDateTime)> =
+            sqlx::query_as(CAPTURE_WINDOWS_SQL)
+                .bind(guild_id)
+                .bind(since)
+                .bind(closing)
+                .bind(requested)
+                .fetch_all(&mut *connection)
+                .await?;
+        if windows.len() > ATTENDANCE_MAX_WINDOWS
+            || windows.iter().any(|(key, _, _)| key.len() > 128)
+        {
+            return Err(sqlx::Error::Protocol(
+                "attendance candidates exceed budget".into(),
+            ));
+        }
+        let grace = time::Duration::minutes(ATTENDANCE_WINDOW_GRACE_MINUTES);
+        let tags: Vec<String> = windows
+            .into_iter()
+            .filter(|(key, start, end)| {
+                requested.contains(key) && *start - grace <= at && since <= *end + grace
+            })
+            .map(|(key, _, _)| key)
+            .collect();
+        sqlx::query(
         "INSERT INTO event_attendance_windows AS h
            (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at)
          SELECT k.guild_id, k.event_key, w.event_id, w.instance_starts_at, w.starts_at, w.ends_at
@@ -365,7 +375,8 @@ async fn capture_tags_in(
     .bind(&tags)
     .execute(&mut *connection)
     .await?;
-    Ok(tags)
+        Ok(tags)
+    })
 }
 
 /// Open one session row after revalidating shared lifecycle and privacy evidence
