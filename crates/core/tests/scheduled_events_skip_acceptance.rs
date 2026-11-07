@@ -22,6 +22,7 @@ fn raw(id: &str, name: &str, start: &str, status: i64) -> RawScheduledEvent {
         id: Some(id.to_owned()),
         name: Some(name.to_owned()),
         scheduled_start_time: Some(start.to_owned()),
+        scheduled_end_time: None,
         channel_id: Some("voice-1".to_owned()),
         description: Some("Join the weekly games night.".to_owned()),
         status: Some(status),
@@ -58,6 +59,7 @@ fn malformed_payload_is_invalid_response_and_keeps_last_good_snapshot() {
     let malformed_rows = [
         RawScheduledEvent {
             scheduled_start_time: Some("not-a-date".to_owned()),
+            scheduled_end_time: None,
             ..raw("bad-1", "Bad start", START, 1)
         },
         RawScheduledEvent {
