@@ -405,6 +405,18 @@ class RuntimeContractTests(unittest.TestCase):
         self.image.entries[evidence.BINARY] = ("file", elf(("libc.so.6",)))
         self.assertEqual(set(self.inspect()["binary"]["needed"]), {"libc.so.6"})
 
+    def test_libgcc_ownership_is_required(self):
+        name = evidence.STATUS_DIR + "libgcc-s1.md5sums"
+        manifest = self.image.entries.pop(name)
+        with self.assertRaisesRegex(ValueError, "libgcc_s.so.1 lacks libgcc-s1 ownership"):
+            self.inspect()
+        self.image.entries[name] = ("file", ("2" * 32 + "  usr/lib/other/libgcc_s.so.1\n").encode())
+        with self.assertRaisesRegex(ValueError, "libgcc_s.so.1 lacks libgcc-s1 ownership"):
+            self.inspect()
+        self.image.entries[name] = manifest
+        needed = self.inspect()["binary"]["needed"]
+        self.assertEqual(needed["libgcc_s.so.1"]["packages"], ["libgcc-s1"])
+
     def test_unexpected_needed_fails_even_when_it_resolves(self):
         self.image.entries[f"{LIBS}/libssl.so.3"] = ("file", b"libssl")
         self.image.entries[evidence.BINARY] = ("file", elf(("libc.so.6", "libssl.so.3")))

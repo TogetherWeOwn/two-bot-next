@@ -44,7 +44,8 @@ RUN cargo build --release --locked
 
 # Compose only the GCC runtime needed by the binary, from the immutable
 # official Trixie builder. Keep native package/source/version metadata for
-# scanners; no package is installed, modified or relabelled.
+# scanners, with native checksums for only the copied files; no package is
+# installed, modified or relabelled.
 RUN . /etc/os-release && test "$VERSION_CODENAME" = trixie \
     && mkdir -p /runtime-root/var/lib/dpkg/status.d \
     && for package in libgcc-s1 gcc-14-base; do \
@@ -56,7 +57,16 @@ RUN . /etc/os-release && test "$VERSION_CODENAME" = trixie \
        done \
     && libgcc="$(dpkg-query -L libgcc-s1 | grep '/libgcc_s.so.1$')" \
     && test -f "$libgcc" \
-    && cp -L --parents "$libgcc" /runtime-root/
+    && cp -L --parents "$libgcc" /runtime-root/ \
+    && for package in libgcc-s1 gcc-14-base; do \
+         dpkg-query --control-show "$package" md5sums > "/runtime-$package.md5sums" \
+         && while read -r checksum path; do \
+              if test -f "/runtime-root/$path"; then printf '%s  %s\n' "$checksum" "$path"; fi; \
+            done < "/runtime-$package.md5sums" > "/runtime-root/var/lib/dpkg/status.d/$package.md5sums" \
+         && test -s "/runtime-root/var/lib/dpkg/status.d/$package.md5sums" \
+         || exit 1; \
+       done \
+    && (cd /runtime-root && md5sum -c var/lib/dpkg/status.d/*.md5sums)
 
 # The base provides glibc, CA trust data and uid/gid 65532. Add only the
 # official libgcc library, copyright files and truthful status.d records.

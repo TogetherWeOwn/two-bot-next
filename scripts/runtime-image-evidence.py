@@ -248,6 +248,9 @@ def check_runtime_filesystem(members, filesystem):
     unexpected = set(binary["needed"]) - RUNTIME_NEEDED
     if unexpected:
         raise ValueError(f"Runtime DT_NEEDED outside the allowed set: {sorted(unexpected)}")
+    libgcc = binary["needed"].get("libgcc_s.so.1")
+    if libgcc is not None and libgcc["packages"] != ["libgcc-s1"]:
+        raise ValueError("libgcc_s.so.1 lacks libgcc-s1 ownership")
     if any(name.rsplit("/", 1)[-1].startswith("libz.so") for name in members):
         raise ValueError("Runtime contains a libz.so file or link")
     packages = {row["package"]: row for row in filesystem["installed_packages"]}

@@ -171,9 +171,12 @@ or the current PR diff.
   over. Automated Docker updates track both pinned references; the unversioned
   `nonroot` tag needs a manual digest refresh if no bump arrives after a
   Debian point release.
-- Trust data is the base image's own `ca-certificates` bundle; nothing is
-  installed or copied into the runtime except the release binary. The bot runs
-  as `nonroot` and its only in-image exec is its own `--healthcheck`.
+- Trust data is the base image's own `ca-certificates` bundle. The measured
+  `cc-debian13` sample copied only the release binary; the selected base-nossl
+  composition also copies the official GCC runtime library, copyright files,
+  installed package records and matching file-checksum manifests. Nothing is
+  installed in the runtime stage. The bot runs as `nonroot` and its only
+  in-image exec is its own `--healthcheck`.
 
 ## What remains for cutover readiness
 
