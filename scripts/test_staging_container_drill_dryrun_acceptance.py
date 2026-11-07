@@ -66,6 +66,7 @@ import importlib.util
 import io
 import json
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -78,8 +79,9 @@ spec = importlib.util.spec_from_file_location(
 container_drill = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(container_drill)
 GateError = container_drill.GateError
-# Imported by the drill module itself (scripts/ is on sys.path after load).
-import staging_drill_use  # noqa: E402
+# The drill module imports its finite-use adapter itself; bind that exact
+# module object so the transport patch lands where the drill looks it up.
+staging_drill_use = sys.modules[container_drill.StagingDrillUse.__module__]
 
 PRE = "11111111-1111-4111-8111-111111111111"
 BACKOUT_WORKER = "22222222-2222-4222-8222-222222222222"
