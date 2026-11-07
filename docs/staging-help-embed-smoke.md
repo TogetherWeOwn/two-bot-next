@@ -85,6 +85,17 @@ dispatch or as the `help-embed-synthetic` job called by `deploy-staging` after
 the deploy. Failed assertions fail that staging run and prevent
 `certify-promotion` from certifying it.
 
+Before consumption, a separate main-only `staging-window` job in the existing
+`staging` environment checks the [finite-use grant and exact readiness](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
+The smoke job needs that job and keeps only its test-bot credential. A called run
+uses the deploy's exact SHA/deployment/expiry under a disjoint nested group and
+never acquires or releases the parent's grant. A standalone run owns the canonical
+workflow lock, acquires at most 45 minutes, and releases after smoke success or
+failure. Start/assert and cleanup receipts are retained for 14 days. Re-run all
+jobs, not only failed jobs; the latter changes the attempt and fails binding.
+This source wiring is not activation: the linked inventory, rollback and
+live-acceptance holds still apply.
+
 No new credential is created or copied for this smoke. Only an operator or
 staging guild admin may place the bindings; agents must never receive, copy
 or print any token value:

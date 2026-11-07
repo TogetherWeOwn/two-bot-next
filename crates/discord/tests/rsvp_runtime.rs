@@ -1946,6 +1946,98 @@ fn published_names_remain_unique() {
     }
 }
 
+fn rsvp_totals(id: u64) -> Interaction {
+    slash(
+        id,
+        "rsvp-attendance",
+        0,
+        json!([{ "name": "event-id", "type": 3, "value": EVENT }]),
+    )
+}
+
+/// Pool handle for the prepare-only pins below: the refused and deferred
+/// paths never touch the store, so a lazy pool performs no I/O.
+fn lazy_pool() -> Pool<Postgres> {
+    sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://agent_test@127.0.0.1:1/agent_test")
+        .expect("lazy pool")
+}
+
+#[tokio::test]
+async fn prepare_refuses_rsvp_commands_while_live_announcements_off() {
+    // Boot ON in the router gates, but the ordered path resolves live-off:
+    // both RSVP commands refuse with the disabled reply, with no defer and
+    // no deferred completion enqueued.
+    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let pool = lazy_pool();
+    let runtime = runtime(&pool, &mock);
+    for interaction in [rsvp(800, "going"), rsvp_totals(801)] {
+        let prepared = runtime
+            .prepare(interaction, false)
+            .await
+            .expect("prepare refusal");
+        assert!(
+            runtime.complete(prepared).await.expect("complete refusal"),
+            "refused, never deferred"
+        );
+    }
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2, "one refusal callback per command");
+    for request in &requests {
+        assert_eq!(request.method, "POST");
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["type"], 4);
+        assert_eq!(body["data"]["flags"], 64);
+        assert_eq!(body["data"]["content"], ANNOUNCEMENTS_DISABLED_REPLY);
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn prepare_defers_rsvp_commands_while_live_announcements_on() {
+    // Live-on resolves through the boot value: prepare defers exactly as
+    // before (completion owns the store work, so this pin stops at the
+    // defer and never touches the pool).
+    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let pool = lazy_pool();
+    let runtime = runtime(&pool, &mock);
+    for interaction in [rsvp(810, "going"), rsvp_totals(811)] {
+        runtime
+            .prepare(interaction, true)
+            .await
+            .expect("prepare defer");
+    }
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2, "one defer callback per command");
+    for request in &requests {
+        assert_eq!(request.method, "POST");
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["type"], 5, "deferred, not refused");
+    }
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn prepare_ignores_the_live_bit_for_scorecard_attendance() {
+    // Scorecard `attendance` answers to its own gate, not the announcements
+    // one: live-off never refuses it.
+    let mock = MockRest::start(vec![], ScriptedResponse::status(204)).await;
+    let pool = lazy_pool();
+    let runtime = runtime(&pool, &mock);
+    runtime
+        .prepare(
+            attendance(820, MANAGE_EVENTS, USER, &anchored("2026-09-30")),
+            false,
+        )
+        .await
+        .expect("prepare defer");
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1, "one defer callback");
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["type"], 5, "deferred, not refused");
+    mock.shutdown().await;
+}
+
 #[tokio::test]
 async fn mismatched_application_identity_is_refused_before_any_callback_or_store_work() {
     let Some(fixture) = pool().await else {
@@ -1957,8 +2049,12 @@ async fn mismatched_application_identity_is_refused_before_any_callback_or_store
     let mut foreign = rsvp(700, "going");
     foreign.application_id = twilight_model::id::Id::new(9999);
     // Same fence as `handle`/`handle_routed`: the split prepare path refuses
-    // before any callback or store work, and complete stays a no-op.
-    let prepared = runtime.prepare(foreign).await.expect("prepare refusal");
+    // before any callback or store work, and complete stays a no-op. Live-on
+    // keeps the boot outcome the fence refuses on.
+    let prepared = runtime
+        .prepare(foreign, true)
+        .await
+        .expect("prepare refusal");
     assert!(!runtime.complete(prepared).await.expect("complete refusal"));
     assert!(mock.requests().is_empty());
     assert_eq!(counts(fixture.pool()).await, (0, 0, 0));
@@ -2044,7 +2140,7 @@ async fn rsvp_candidate_parity_accepted_rsvp_defers() {
         "accepted RSVP is a candidate"
     );
     let prepared = runtime
-        .prepare(interaction)
+        .prepare(interaction, runtime.router.gates().announcements)
         .await
         .expect("prepare accepted RSVP");
     let shown = format!("{prepared:?}");
@@ -2103,7 +2199,7 @@ async fn rsvp_candidate_parity_rsvp_refusal_answers_without_deferring() {
     let candidate = runtime.is_rsvp_candidate(&interaction);
     assert_eq!(candidate, EXPECTED_CANDIDATE, "refused RSVP is a candidate");
     let prepared = runtime
-        .prepare(interaction)
+        .prepare(interaction, runtime.router.gates().announcements)
         .await
         .expect("prepare refused RSVP");
     let shown = format!("{prepared:?}");
@@ -2142,7 +2238,7 @@ async fn rsvp_candidate_parity_foreign_application_is_ignored() {
         "foreign app is never a candidate"
     );
     let prepared = runtime
-        .prepare(foreign)
+        .prepare(foreign, runtime.router.gates().announcements)
         .await
         .expect("prepare foreign interaction");
     let shown = format!("{prepared:?}");
@@ -2180,7 +2276,7 @@ async fn rsvp_candidate_parity_unknown_command_identity_is_ignored() {
         "unresolvable identity is never a candidate"
     );
     let prepared = runtime
-        .prepare(interaction)
+        .prepare(interaction, runtime.router.gates().announcements)
         .await
         .expect("prepare unresolvable interaction");
     let shown = format!("{prepared:?}");
@@ -2217,7 +2313,7 @@ async fn rsvp_candidate_parity_non_rsvp_slash_is_ignored() {
         "non-RSVP slash is never a candidate"
     );
     let prepared = runtime
-        .prepare(interaction)
+        .prepare(interaction, runtime.router.gates().announcements)
         .await
         .expect("prepare non-RSVP slash");
     let shown = format!("{prepared:?}");
@@ -2254,7 +2350,7 @@ async fn rsvp_candidate_parity_component_is_ignored() {
         "components are never candidates"
     );
     let prepared = runtime
-        .prepare(interaction)
+        .prepare(interaction, runtime.router.gates().announcements)
         .await
         .expect("prepare component");
     let shown = format!("{prepared:?}");

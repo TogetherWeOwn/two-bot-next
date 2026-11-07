@@ -300,6 +300,7 @@ fn raw_event(id: &str) -> RawScheduledEvent {
         id: Some(id.to_owned()),
         name: Some("Sunday Squad".to_owned()),
         scheduled_start_time: Some("2026-09-06T18:30:00+01:00".to_owned()),
+        scheduled_end_time: None,
         channel_id: Some("voice-1".to_owned()),
         description: Some("Join the weekly games night.".to_owned()),
         status: Some(1),

@@ -202,6 +202,11 @@ gh run download <run-id> -n supply-chain -D <run-owned-scratch-directory>
 gh workflow run release.yml --ref main -f release_tag=vX.Y.Z
 ```
 
+Repair works only for a tag built at or after `9d064fa38` (#2004). `verify`
+runs `--check-runtime` on every ref, so an older tag fails the zlib-free
+composition check at the inventory step by design, with no per-tag waiver.
+`v0.2.0` stays without SBOM assets; see `docs/releases.md`.
+
 On a selected PR, the dry-run inventories the exact PR head SHA and records
 source SHA and image ID before scanning; `verify` then validates lockfile
 coverage and Debian image components and records SHA256SUMS after the image

@@ -83,8 +83,10 @@ on:
 
 permissions: {}
 
+# One lock spans baseline through all qualification jobs and final release.
+# Callees use disjoint per-run groups; no job re-holds this workflow lock.
 concurrency:
-  group: deploy-staging
+  group: staging-lifecycle
   cancel-in-progress: false
 
 jobs:
@@ -283,6 +285,9 @@ jobs:
     needs: [schema-gate, roles-gate]
     outputs:
       promotion_clean: ${{ steps.prepare.outputs.promotion_clean }}
+      staging_use_expires_at: ${{ steps.use.outputs.expires_at }}
+      staging_use_sha: ${{ steps.use.outputs.sha }}
+      staging_use_deployment: ${{ steps.use.outputs.deployment_id }}
     permissions:
       contents: read # checkout only; the deploy authenticates with `staging` environment secrets
       deployments: write # derive the deploy ID from today's staging Deployments, then record this one
@@ -291,13 +296,6 @@ jobs:
     # TOG-11143: STAGING_OWNERSHIP_CONTROL_TOKEN is a `staging` environment
     # secret (TOG-12030); the job must declare the environment to read it.
     environment: staging
-    # Staging lifecycle exclusion: this job and the voice synthetic execution
-    # job share one fixed non-cancelling group, so a deploy cannot restart the
-    # container mid-lifecycle. Workflow-level serialization stays unchanged;
-    # the reusable caller must never hold this group in any form (it waits on this job).
-    concurrency:
-      group: staging-lifecycle
-      cancel-in-progress: false
     # Sized for the worst case: the deploy, a failing verify and the
     # auto-rollback budget (600 s image + 900 s gate). A 30 min cap can
     # cancel the run mid-rollback and leave staging fenced.
@@ -365,6 +363,13 @@ jobs:
           # Deploys must not consume caches populated by untrusted PR checks.
           package-manager-cache: false
       - run: npm ci
+      - name: Select Wrangler from the deploy checkout
+        id: wrangler
+        run: |
+          set -euo pipefail
+          version=$(node -p 'require("./package-lock.json").packages["node_modules/wrangler"].version')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Deploy lockfile must pin an exact Wrangler version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       # Validate the dedicated staging control binding BEFORE replacing a healthy
       # deployment. Missing credentials are not permission to auto-claim an owner.
       - name: Require staging ownership-control configuration
@@ -455,7 +460,9 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           environment: staging
-          wranglerVersion: "4.152.0"
+          # A pinned drill uses its deploy checkout's CLI and receipt guard,
+          # not the version belonging to this workflow's newer main commit.
+          wranglerVersion: ${{ steps.wrangler.outputs.version }}
           # --message stamps the version's immutable workers/message
           # annotation with the deployed commit, the SHA member of the
           # rollback provenance receipt the next snapshot records (as
@@ -519,6 +526,21 @@ jobs:
             esac
             exit 1
           fi
+      # Takeover transfers ownership but cannot start the container. Authorize
+      # only that receipt-validated version before the first readiness probe.
+      - name: Acquire the finite staging window before the exact rollout gate
+        id: use
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_SHA: ${{ env.DEPLOY_SHA }}
+          STAGING_USE_MINUTES: '120'
+          STAGING_USE_ACQUIRE_ONLY: '1'
+          STAGING_USE_RECEIPT: ${{ env.ROLLOUT_DIR }}/staging-use.jsonl
+        run: |
+          set -euo pipefail
+          export STAGING_USE_DEPLOYMENT="$(python3 -c 'import json,os;print(json.load(open(os.environ["ROLLOUT_DIR"]+"/receipt.json"))["worker_version"])')"
+          node ../tooling/wrangler/scripts/staging-use-pipeline.mjs begin
       - name: Verify exact new rollout and serving Worker/container readiness
         id: verify
         env:
@@ -581,13 +603,16 @@ jobs:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           ROLLBACK_ACTOR: github-actions:${{ github.run_id }}:${{ env.DEPLOY_SHA }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_EXPIRES_AT: ${{ steps.use.outputs.expires_at }}
         run: |
           set -euo pipefail
           # No --expected-sha flag: the snapshot's recorded serving SHA is
           # the receipt member the stable gate pins (the restored build
-          # reports the previous revision, not the failed SHA). A pre-stamp
-          # snapshot carries none and identity rests on the version header.
-          python3 ../scripts/worker_container_rollback.py rollback \
+          # reports the previous revision, not the failed SHA). Staging refuses
+          # pre-stamp targets: both the SHA and bounded-policy proof are required.
+          # Recovery tooling belongs to the workflow head, never the historical
+          # deployed checkout: a pinned old helper must not bypass finite use.
+          python3 ../tooling/scripts/worker_container_rollback.py rollback \
             --variant staging \
             --worker-url "$STAGING_WORKER_URL" \
             --snapshot "$ROLLOUT_DIR/staging-rollback-snapshot.json" \
@@ -636,9 +661,14 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
-    # By name, not `inherit`: only the test bot token crosses the boundary.
+    with:
+      staging_use_expires_at: ${{ needs.deploy.outputs.staging_use_expires_at }}
+      staging_use_sha: ${{ needs.deploy.outputs.staging_use_sha }}
+      staging_use_deployment: ${{ needs.deploy.outputs.staging_use_deployment }}
+    # By name, not `inherit`: each callee job resolves its Environment's token.
     secrets:
       TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
+      STAGING_OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
 
   # Live /help embed smoke against staging (docs/staging-help-embed-smoke.md):
   # the dedicated test bot posts both help builders' embeds to a staging test
@@ -651,9 +681,14 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/help-embed-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
-    # By name, not `inherit`: only the test bot token crosses the boundary.
+    with:
+      staging_use_expires_at: ${{ needs.deploy.outputs.staging_use_expires_at }}
+      staging_use_sha: ${{ needs.deploy.outputs.staging_use_sha }}
+      staging_use_deployment: ${{ needs.deploy.outputs.staging_use_deployment }}
+    # By name, not `inherit`: each callee job resolves its Environment's token.
     secrets:
       TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
+      STAGING_OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
 
   # Promotion prerequisite (docs/synthetic-user-flow.md): the same read-only
   # user-flow probe the five-minute synthetic runs, pinned to the exact SHA
@@ -666,6 +701,7 @@ jobs:
   user-flow-synthetic:
     name: staging user-flow synthetic (exact SHA)
     needs: deploy
+    environment: staging
     permissions:
       contents: read
     # Runner routing: see the note on `check` in check.yml.
@@ -679,6 +715,27 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Assert the deploy grant and readiness before user-flow consumption
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_SHA: ${{ needs.deploy.outputs.staging_use_sha }}
+          STAGING_USE_DEPLOYMENT: ${{ needs.deploy.outputs.staging_use_deployment }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.deploy.outputs.staging_use_expires_at }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-user-flow.jsonl
+        run: node wrangler/scripts/staging-use.mjs ready
+      - name: Retain the user-flow window assertion
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-use-user-flow-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-use-user-flow.jsonl
+          if-no-files-found: error
+          retention-days: 14
       - name: Probe the staging user flow on the exact deployed SHA
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
@@ -736,6 +793,7 @@ jobs:
   # run that passed every downstream gate can publish these immutable bytes.
   certify-promotion:
     name: certify immutable staging bytes
+    environment: staging
     needs: [deploy, voice-synthetic, help-embed-synthetic, user-flow-synthetic, pinned-history-guard]
     if: success() && needs.deploy.outputs.promotion_clean == 'true' && vars.VOICE_SYNTHETIC_REQUIRED != 'false'
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'certify-promotion') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
@@ -753,6 +811,27 @@ jobs:
         with:
           name: staging-rollout-evidence
           path: ${{ runner.temp }}/promotion-source
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Assert the exact active window before certification
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_SHA: ${{ needs.deploy.outputs.staging_use_sha }}
+          STAGING_USE_DEPLOYMENT: ${{ needs.deploy.outputs.staging_use_deployment }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.deploy.outputs.staging_use_expires_at }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-certify.jsonl
+        run: node wrangler/scripts/staging-use.mjs ready
+      - name: Retain the certification window assertion
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-use-certify-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-use-certify.jsonl
+          if-no-files-found: error
+          retention-days: 14
       - name: Certify the served module bytes and verified rollout
         env:
           GH_TOKEN: ${{ github.token }}
@@ -778,3 +857,39 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+
+  # Courtesy cleanup after every consumer, including failed/cancelled runs.
+  # The persisted native expiry remains the authority if no runner survives.
+  staging-use-release:
+    needs: [deploy, voice-synthetic, help-embed-synthetic, user-flow-synthetic, pinned-history-guard, certify-promotion]
+    if: always() && needs.deploy.outputs.staging_use_expires_at != ''
+    permissions:
+      contents: read
+    environment: staging
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'staging-use-release') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Release only this run's immutable staging window
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.deploy.outputs.staging_use_expires_at }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-release.jsonl
+        run: node wrangler/scripts/staging-use-pipeline.mjs finish
+      - name: Retain the release or refusal receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-use-deploy-stop-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-use-release.jsonl
+          if-no-files-found: error
+          retention-days: 14
