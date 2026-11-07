@@ -1019,6 +1019,10 @@ def staging_full_window_errors(workflow, name="deploy-staging.yml"):
     for job_id, workflow_file in (("voice-synthetic", "voice-synthetic.yml"),
                                   ("help-embed-synthetic", "help-embed-synthetic.yml")):
         job = jobs.get(job_id) or {}
+        if job.get("secrets") != {
+                "TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}",
+                "STAGING_OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}:
+            errors.append(f"{name}:{job_id}: must forward exactly the test and control tokens by name")
         grant = job.get("with") or {}
         if set(grant) != set(STAGING_USE_INPUTS):
             errors.append(f"{name}:{job_id}: must pass exactly the three staging_use inputs")
@@ -3615,7 +3619,7 @@ def staging_callee_window_errors(name, workflow, consumer):
     """Pin the independent full-window shape of a reusable staging consumer.
 
     The callee takes exactly three required string inputs (the caller's grant),
-    the test token and a declaration for its Environment-only control token,
+    the optional test token and required Environment-resolved control token,
     and a group that is disjoint when called and the
     canonical lifecycle group when standalone. Three jobs only: `staging-window`
     (the only holder of the staging control credential before consumption;
@@ -3627,13 +3631,12 @@ def staging_callee_window_errors(name, workflow, consumer):
     on = workflow.get("on") or {}
     call = on.get("workflow_call") or {}
     if on.get("workflow_dispatch") or set(call) != {"secrets", "inputs"}:
-        errors.append(f"{name}: workflow_call takes exactly the token secret and the three grant inputs; "
+        errors.append(f"{name}: workflow_call takes exactly the two token secrets and the three grant inputs; "
                       "workflow_dispatch takes no inputs")
     if call.get("secrets") != {
             "TWO_VOICE_SYNTHETIC_BOT_TOKEN": {"required": "false"},
-            "STAGING_OWNERSHIP_CONTROL_TOKEN": {"required": "false"}}:
-        errors.append(f"{name}: workflow_call must declare only the optional test and staging-control tokens; "
-                      "the caller still forwards only the test token")
+            "STAGING_OWNERSHIP_CONTROL_TOKEN": {"required": "true"}}:
+        errors.append(f"{name}: workflow_call must declare only the optional test and required staging-control tokens")
     inputs = call.get("inputs")
     if not isinstance(inputs, dict) or list(inputs) != list(STAGING_USE_INPUTS) or any(
             field != {"type": "string", "required": "true"} for field in inputs.values()):
@@ -7006,8 +7009,8 @@ class WorkflowTests(unittest.TestCase):
                     {"UNREVIEWED_CONTROL_TOKEN": {"required": "false"}}),
                 "control declaration missing": lambda w: w["on"]["workflow_call"]["secrets"].pop(
                     "STAGING_OWNERSHIP_CONTROL_TOKEN"),
-                "control declaration required": lambda w: w["on"]["workflow_call"]["secrets"][
-                    "STAGING_OWNERSHIP_CONTROL_TOKEN"].update({"required": "true"}),
+                "control declaration optional": lambda w: w["on"]["workflow_call"]["secrets"][
+                    "STAGING_OWNERSHIP_CONTROL_TOKEN"].update({"required": "false"}),
                 "window job dropped": lambda w: w["jobs"].pop("staging-window"),
                 "release job dropped": lambda w: w["jobs"].pop("staging-use-release"),
                 "extra job": lambda w: w["jobs"].__setitem__("extra", {}),
@@ -7140,10 +7143,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(job.get("uses"), "./.github/workflows/voice-synthetic.yml")
         self.assertNotIn("if", job)
         # An environment secret is empty in a called workflow unless the caller
-        # passes it; pass exactly the test bot token, never `inherit`.
+        # passes it; pass exactly the two token names, never `inherit`.
         self.assertEqual(
             job.get("secrets"),
-            {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"},
+            {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}",
+             "STAGING_OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"},
         )
 
     def test_help_embed_synthetic_shape_is_pinned_and_mutations_fail(self):
@@ -7174,10 +7178,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(job.get("uses"), "./.github/workflows/help-embed-synthetic.yml")
         self.assertNotIn("if", job)
         # An environment secret is empty in a called workflow unless the caller
-        # passes it; pass exactly the test bot token, never `inherit`.
+        # passes it; pass exactly the two token names, never `inherit`.
         self.assertEqual(
             job.get("secrets"),
-            {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"},
+            {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}",
+             "STAGING_OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"},
         )
         needs = staging["jobs"]["certify-promotion"]["needs"]
         needs = [needs] if isinstance(needs, str) else needs
