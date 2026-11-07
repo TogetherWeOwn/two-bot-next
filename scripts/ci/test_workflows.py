@@ -1764,6 +1764,7 @@ ROLLBACK_DRILL_ENV = {
     "CLOUDFLARE_API_TOKEN": "${{ secrets.CLOUDFLARE_API_TOKEN }}",
     "CLOUDFLARE_ACCOUNT_ID": "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}",
     "TARGET_VERSION": "${{ inputs.target_version }}",
+    "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-worker-drill-use.ndjson",
 }
 
 
@@ -1866,6 +1867,12 @@ def staging_rollback_drill_errors(workflow):
         errors.append(f"{name}:drill: must run checkout, setup-node, drill and evidence upload")
         return errors
     checkout, node, run, upload = steps
+    evidence = "${{ runner.temp }}/staging-rollback-drill-evidence.json"
+    if (upload.get("with") or {}) != {
+            "name": "staging-worker-rollback-drill",
+            "path": evidence + "\n" + ROLLBACK_DRILL_ENV["STAGING_USE_RECEIPT"] + "\n",
+            "if-no-files-found": "error", "retention-days": "14", "compression-level": "0"}:
+        errors.append(f"{name}:drill: must retain drill and finite-use receipts together")
     if (upload.get("if") != "always()" or "continue-on-error" in upload
             or not str(upload.get("uses") or "").startswith("actions/upload-artifact@")
             or (upload.get("with") or {}).get("if-no-files-found") != "error"):
@@ -1877,7 +1884,7 @@ def staging_rollback_drill_errors(workflow):
         errors.append(f"{name}:drill: second step must be the pinned setup-node")
     command = str(run.get("run", ""))
     if run.get("env") != ROLLBACK_DRILL_ENV:
-        errors.append(f"{name}:drill: Run step must bind exactly the four staging bindings plus TARGET_VERSION")
+        errors.append(f"{name}:drill: Run step must bind exactly the staging credentials, target and finite-use receipt")
     if ("scripts/staging_rollback_drill.py" not in command or '--target-version "$TARGET_VERSION"' not in command
             or "${{" in command or "uses" in run):
         errors.append(f"{name}:drill: Run step must call the script with the input via the environment only")
@@ -8607,6 +8614,16 @@ class WorkflowTests(unittest.TestCase):
             "persisted credentials": lambda w: job(w)["steps"][0]["with"].update({"persist-credentials": "true"}),
             "extra binding": lambda w: job(w)["steps"][2]["env"].update(
                 {"X": "${{ secrets.TWO_BOT_STAGING_MIGRATOR_DATABASE_URL }}"}),
+            "missing finite-use receipt": lambda w: job(w)["steps"][2]["env"].pop("STAGING_USE_RECEIPT"),
+            "misplaced finite-use receipt": lambda w: job(w)["steps"][2]["env"].update(
+                {"STAGING_USE_RECEIPT": "${{ github.workspace }}/staging-use.ndjson"}),
+            "lost finite-use artifact": lambda w: job(w)["steps"][3]["with"].update(
+                {"path": "${{ runner.temp }}/staging-rollback-drill-evidence.json"}),
+            "lost drill artifact": lambda w: job(w)["steps"][3]["with"].update(
+                {"path": ROLLBACK_DRILL_ENV["STAGING_USE_RECEIPT"]}),
+            "lost receipt on failure": lambda w: job(w)["steps"][3].pop("if"),
+            "empty receipt accepted": lambda w: job(w)["steps"][3]["with"].update(
+                {"if-no-files-found": "warn"}),
             "inline expression": lambda w: job(w)["steps"][2].update(
                 {"run": 'python3 scripts/staging_rollback_drill.py --target-version "${{ inputs.target_version }}"'}),
             "forced rollback": lambda w: job(w)["steps"][2].update(
