@@ -48,9 +48,13 @@ Fail-closed rules, each pinned by scripts/test_worker_container_rollback.py:
   non-passing poll resets the streak, and the deadline fails the run.
 - The provenance receipt is immutable once built and is fully validated
   before the fence: no restore POST happens on an incomplete or mismatched
-  (version, SHA, image) tuple. Snapshot rollbacks of builds deployed
+  (version, SHA, image) tuple. Production snapshot rollbacks of builds deployed
   before SHA stamping keep the legacy version-header identity and say so
   in the evidence; manual rollbacks have no legacy path.
+- Staging additionally requires immutable bounded-policy/environment/SHA bindings
+  on the restore target and the caller's original finite run/attempt/expiry.
+  Assert the source window before mutation, rebind after takeover before probes;
+  never begin a new recovery window or restore an always-on/pre-stamp target.
 """
 
 import argparse
@@ -459,6 +463,57 @@ def control_client(variant, token, worker_url, staging_url, actor, root=None):
     return control
 
 
+def validate_staging_restore_policy(client, worker, version, sha):
+    """Reject an indefinite/unknown restore target before any mutation.
+
+    Version bindings are immutable control-plane evidence, not a caller's
+    promise. Runtime/release acceptance of the target is still required.
+    """
+    require(worker == WORKERS["staging"] and isinstance(sha, str)
+            and SHA.fullmatch(sha), "staging_restore_identity_invalid")
+    data = base.mapping(client.api(
+        f"/workers/scripts/{worker}/versions/{base.identifier(version)}"))
+    require(data.get("id") == version, "staging_restore_identity_invalid")
+    resources = data.get("resources")
+    require(isinstance(resources, dict), "staging_restore_policy_unproved")
+    bindings = resources.get("bindings")
+    require(isinstance(bindings, list), "staging_restore_policy_unproved")
+    for name, value in (("STAGING_RUNTIME_POLICY", "bounded"),
+                        ("TWO_DEPLOY_ENV", "staging"), ("CONTAINER_RELEASE", sha)):
+        matches = [row for row in bindings if isinstance(row, dict) and row.get("name") == name]
+        require(len(matches) == 1 and matches[0].get("type") == "plain_text"
+                and matches[0].get("text") == value, "staging_restore_policy_unproved")
+
+
+def staging_restore_client(env, url, token, version, sha, receipt, root=None):
+    """Use only the retained run/attempt/expiry; never begin a recovery window."""
+    root = Path(root or Path(__file__).resolve().parents[1])
+    values = {key: env.get(key, "") for key in
+              ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "STAGING_USE_EXPIRES_AT")}
+    require(all(isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,19}", value)
+                for value in values.values()), "staging_restore_window_missing")
+    require(int(values["STAGING_USE_EXPIRES_AT"]) <= 2 ** 53 - 1
+            and int(values["GITHUB_RUN_ATTEMPT"]) <= 2 ** 53 - 1,
+            "staging_restore_window_invalid")
+    child_env = dict(values, PATH=env.get("PATH", os.defpath),
+                     STAGING_WORKER_URL=url, OWNERSHIP_CONTROL_TOKEN=token,
+                     STAGING_USE_DEPLOYMENT=version, STAGING_USE_SHA=sha,
+                     STAGING_USE_RECEIPT=str(receipt))
+
+    def use(action):
+        require(action in ("restore-check", "rebind"), "staging_restore_action_invalid")
+        try:
+            result = subprocess.run(
+                ["node", str(root / "wrangler/scripts/staging-use-pipeline.mjs"), action],
+                env=child_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=CONTROL_TIMEOUT_SECONDS, check=False)
+        except (OSError, subprocess.SubprocessError):
+            raise GateError("staging_restore_control_unavailable") from None
+        require(result.returncode == 0, "staging_restore_control_failed")
+
+    return use
+
+
 def owner_of(state):
     owner = state.get("owner")
     return owner if isinstance(owner, dict) else {}
@@ -466,12 +521,14 @@ def owner_of(state):
 
 class Rollback:
     def __init__(self, client, control, url, variant, worker, application, app_id,
-                 expected_sha, run_id, *, now=time.time, sleep=time.sleep, log=print):
+                 expected_sha, run_id, *, now=time.time, sleep=time.sleep, log=print,
+                 staging_use=None):
         self.client, self.control, self.url = client, control, url
         self.variant, self.worker, self.application, self.app_id = (
             variant, worker, application, app_id)
         self.expected_sha, self.run_id = expected_sha, run_id
         self.now, self.sleep, self.log = now, sleep, log
+        self.staging_use = staging_use
         self.evidence = {"worker": worker, "application": application, "variant": variant}
 
     def stamp(self, name):
@@ -611,6 +668,11 @@ class Rollback:
             self.sleep(POLL_SECONDS)
 
     def run(self, restore_version, restore_image):
+        if self.variant == "staging":
+            validate_staging_restore_policy(self.client, self.worker, restore_version, self.expected_sha)
+            require(callable(self.staging_use), "staging_restore_window_missing")
+            self.staging_use("restore-check")
+            self.evidence["staging_use"] = "retained-window-checked"
         started = self.stamp("rollback start")
         current = serving_version(self.client, self.worker)
         if current != restore_version:
@@ -620,6 +682,9 @@ class Rollback:
             self.log("worker already serves the restore version; image leg only")
         self.restore_image(restore_image)
         self.take_over(restore_version)
+        if self.variant == "staging":
+            self.staging_use("rebind")
+            self.evidence["staging_use"] = "retained-window-rebound-ready"
         self.wait_stable(restore_version, self.now())
         self.evidence.update({
             "restored_version": restore_version,
@@ -778,6 +843,8 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
             receipt = ProvenanceReceipt(worker, application, restore_version,
                                         expected_sha, restore_image)
             validate_receipt_against_live(client, receipt)
+        if args.variant == "staging":
+            validate_staging_restore_policy(client, worker, restore_version, expected_sha)
         if args.dry_run:
             # The receipt is validated identically to the live path above; the
             # plan below reads the serving version only and never POSTs, never
@@ -791,10 +858,13 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
         require(len(token) >= 32, "missing_ownership_token")
         require(ACTOR.fullmatch(args.actor), "invalid_actor")
         control = control_client(args.variant, token, url, args.staging_url, args.actor)
+        staging_use = (staging_restore_client(
+            env, url, token, restore_version, expected_sha, args.evidence + ".staging-use.jsonl")
+            if args.variant == "staging" else None)
         rollback = Rollback(client, control, url, args.variant, worker, application,
                             application_by_name(client, application)["id"],
                             expected_sha, env.get("GITHUB_RUN_ID", ""),
-                            log=print)
+                            log=print, staging_use=staging_use)
         evidence = rollback.run(restore_version, restore_image)
         if receipt is not None:
             evidence.update({"provenance": "validated", "provenance_sha": receipt.sha})
