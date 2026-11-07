@@ -3543,7 +3543,8 @@ def staging_callee_window_errors(name, workflow, consumer):
     """Pin the independent full-window shape of a reusable staging consumer.
 
     The callee takes exactly three required string inputs (the caller's grant),
-    one explicit token secret and a group that is disjoint when called and the
+    the test token and a declaration for its Environment-only control token,
+    and a group that is disjoint when called and the
     canonical lifecycle group when standalone. Three jobs only: `staging-window`
     (the only holder of the staging control credential before consumption;
     asserts the inherited grant, or begins a bounded standalone one), the
@@ -3556,8 +3557,11 @@ def staging_callee_window_errors(name, workflow, consumer):
     if on.get("workflow_dispatch") or set(call) != {"secrets", "inputs"}:
         errors.append(f"{name}: workflow_call takes exactly the token secret and the three grant inputs; "
                       "workflow_dispatch takes no inputs")
-    if call.get("secrets") != {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": {"required": "false"}}:
-        errors.append(f"{name}: workflow_call secrets must be exactly the optional TWO_VOICE_SYNTHETIC_BOT_TOKEN")
+    if call.get("secrets") != {
+            "TWO_VOICE_SYNTHETIC_BOT_TOKEN": {"required": "false"},
+            "STAGING_OWNERSHIP_CONTROL_TOKEN": {"required": "false"}}:
+        errors.append(f"{name}: workflow_call must declare only the optional test and staging-control tokens; "
+                      "the caller still forwards only the test token")
     inputs = call.get("inputs")
     if not isinstance(inputs, dict) or list(inputs) != list(STAGING_USE_INPUTS) or any(
             field != {"type": "string", "required": "true"} for field in inputs.values()):
@@ -3844,11 +3848,50 @@ SYNTHETIC_MISSING_BINDING_RUN = {
 }
 
 
+SYNTHETIC_WINDOW_STEP = {
+    "name": "Observe the staging window without starting it", "id": "window",
+    "if": "!inputs.force_fail",
+    "env": {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+            "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+            "STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-use-observer.jsonl"},
+    "run": "node wrangler/scripts/staging-use.mjs observe",
+}
+SYNTHETIC_STAGING_PROBE_IF = ("(vars.STAGING_WORKER_URL != '' && "
+                              "steps.window.outputs.sample == 'true') || inputs.force_fail")
+SYNTHETIC_STAGING_DECIDE_IF = "always() && (steps.window.outputs.sample != 'false' || inputs.force_fail)"
+
+
+def synthetic_staging_observer_errors(job):
+    """Only confirmed idle may suppress health sampling and incident decisions."""
+    errors = []
+    steps = job.get("steps") or []
+    if len(steps) != 9:
+        return ["synthetic-user-flow.yml:staging: must retain the observer, probe/alert and receipt steps"]
+    if steps[1] != {"uses": STAGING_SETUP_NODE_USES,
+                    "with": {"node-version": "24", "package-manager-cache": "false"}}:
+        errors.append("synthetic-user-flow.yml:staging: must use the pinned Node setup")
+    if steps[2] != SYNTHETIC_WINDOW_STEP:
+        errors.append("synthetic-user-flow.yml:staging: must isolate the exact read-only observer")
+    if steps[3].get("if") != SYNTHETIC_STAGING_PROBE_IF:
+        errors.append("synthetic-user-flow.yml:staging: only an active window or fenced force-failure may probe")
+    if steps[6].get("if") != SYNTHETIC_STAGING_DECIDE_IF:
+        errors.append("synthetic-user-flow.yml:staging: idle must not decide recovery; refusal must fail closed")
+    if steps[8] != {
+            "name": "Retain the idle, active or refusal receipt", "if": "always() && !inputs.force_fail",
+            "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+            "with": {"name": "staging-use-user-flow-${{ github.run_id }}-${{ github.run_attempt }}",
+                     "path": "${{ runner.temp }}/staging-use-observer.jsonl",
+                     "if-no-files-found": "error", "retention-days": "14"}}:
+        errors.append("synthetic-user-flow.yml:staging: must always retain non-fixture authority evidence")
+    return errors
+
+
 def synthetic_user_flow_errors(workflow):
     """Five-minute user-flow synthetic (docs/synthetic-user-flow.md).
 
-    Runs on a 5-minute schedule and manual dispatch, only from main, with no
-    environment or secret beyond the job token. Two jobs: `staging` runs the reviewed
+    Runs on a 5-minute schedule and manual dispatch, only from main. Staging
+    observes authority in one isolated step before sampling; confirmed idle is
+    unknown health, not incident recovery. Two jobs: `staging` runs the reviewed
     staging health-contract probe, `prod-passive` runs the reviewed passive
     production probe (observe and alert only, never a deploy gate). Each job
     has an optional target probe, a fail-closed error when its binding is
@@ -3892,9 +3935,14 @@ def synthetic_user_flow_errors(workflow):
         return errors
     expected_script = {"staging": "scripts/staging_health_contract_probe.py",
                        "prod-passive": "scripts/prod_passive_probe.py"}
+    checked_jobs = {}
     for job_id in ("staging", "prod-passive"):
         job = jobs[job_id]
-        if "environment" in job:
+        if job_id == "staging":
+            if job.get("environment") != {"name": "staging", "deployment": "false"}:
+                errors.append(f"{name}:{job_id}: only the staging Environment without deployment records is allowed")
+            errors.extend(synthetic_staging_observer_errors(job))
+        elif "environment" in job:
             errors.append(f"{name}:{job_id}: the incident issue sink needs no Environment")
         if job.get("if") != "github.ref == 'refs/heads/main'":
             errors.append(f"{name}:{job_id}: must run only from main")
@@ -3911,6 +3959,11 @@ def synthetic_user_flow_errors(workflow):
             if key in job:
                 errors.append(f"{name}:{job_id}: must not set {key}")
         steps = job.get("steps") or []
+        # Validate the observer exactly above, then apply the unchanged
+        # probe/alert credential and command restrictions to every other step.
+        if job_id == "staging" and len(steps) == 9:
+            steps = steps[:1] + steps[3:8]
+        checked_jobs[job_id] = {**job, "steps": steps}
         if len(steps) != 6:
             errors.append(f"{name}:{job_id}: must run checkout, probe, notice, upload, decide and alert")
             continue
@@ -3931,6 +3984,8 @@ def synthetic_user_flow_errors(workflow):
         expected_notice_if = (
             f"steps.probe.outcome == 'skipped' && vars.{expected_target} == ''"
             + (" && !inputs.force_fail" if job_id == "staging" else ""))
+        if job_id == "staging":
+            expected_notice_if = "always() && " + expected_notice_if
         if notice.get("if") != expected_notice_if:
             errors.append(f"{name}:{job_id}: missing-binding notice must keep its probe-skipped gate")
         if "continue-on-error" in notice:
@@ -3940,8 +3995,9 @@ def synthetic_user_flow_errors(workflow):
             errors.append(f"{name}:{job_id}: upload must run with if: always() so failures keep their artifact")
         if not str(upload.get("uses", "")).startswith("actions/upload-artifact@"):
             errors.append(f"{name}:{job_id}: must upload the run evidence artifact")
-        if decide_step.get("if") != "always()":
-            errors.append(f"{name}:{job_id}: decide step must run with if: always()")
+        expected_decide_if = SYNTHETIC_STAGING_DECIDE_IF if job_id == "staging" else "always()"
+        if decide_step.get("if") != expected_decide_if:
+            errors.append(f"{name}:{job_id}: decide step must retain its failure/idle-safe gate")
         if "scripts/synthetic_alert.py" not in str(decide_step.get("run", "")) \
                 or "--decide-only" not in str(decide_step.get("run", "")):
             errors.append(f"{name}:{job_id}: decide step must call scripts/synthetic_alert.py --decide-only")
@@ -3986,7 +4042,7 @@ def synthetic_user_flow_errors(workflow):
         for step in steps:
             if step not in (decide_step, alert_step) and "secrets." in str(step):
                 errors.append(f"{name}:{job_id}: only the decide and alert steps may hold a secret")
-    text = str(jobs).lower().replace(" ", "")
+    text = str(checked_jobs).lower().replace(" ", "")
     for marker in ("wrangler", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
                    "cloudflare_api_token", "ownership_control"):
         if marker in text:
@@ -9236,7 +9292,8 @@ class WorkflowTests(unittest.TestCase):
                 "exit 1", "cat <<'EOF'\nexit 1\nEOF"),
         }
         for job_id in ("staging", "prod-passive"):
-            original = self.workflows["synthetic-user-flow.yml"]["jobs"][job_id]["steps"][2]
+            original = next(step for step in self.workflows["synthetic-user-flow.yml"]["jobs"][job_id]["steps"]
+                            if step.get("name", "").startswith("Fail closed when the "))
             baseline = subprocess.run(
                 ["bash", "--noprofile", "--norc", "-c", original["run"]],
                 env={"PATH": os.defpath}, capture_output=True, text=True, timeout=5)
@@ -9245,7 +9302,8 @@ class WorkflowTests(unittest.TestCase):
             for label, transform in mutations.items():
                 with self.subTest(job=job_id, mutation=label):
                     changed = deepcopy(self.workflows)
-                    notice = changed["synthetic-user-flow.yml"]["jobs"][job_id]["steps"][2]
+                    notice = next(step for step in changed["synthetic-user-flow.yml"]["jobs"][job_id]["steps"]
+                                  if step.get("name", "").startswith("Fail closed when the "))
                     notice["run"] = transform(notice["run"])
                     result = subprocess.run(
                         ["bash", "--noprofile", "--norc", "-c", notice["run"]],
@@ -9260,7 +9318,8 @@ class WorkflowTests(unittest.TestCase):
                     workflow = changed["synthetic-user-flow.yml"]
                     job = workflow["jobs"][job_id]
                     if scope == "step":
-                        job["steps"][2]["shell"] = "echo {0}"
+                        next(step for step in job["steps"]
+                             if step.get("name", "").startswith("Fail closed when the "))["shell"] = "echo {0}"
                     else:
                         holder = job if scope == "job" else workflow
                         holder["defaults"] = {"run": {"shell": "echo {0}"}}

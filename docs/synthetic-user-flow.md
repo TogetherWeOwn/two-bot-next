@@ -15,11 +15,27 @@ expiry on cancellation or runner loss. A scheduled probe is not permission for
 idle keepalive or for an unauthorized cold start. Preserve the existing required
 active-use checks and incident evidence. Production's passive probes are unchanged.
 
-The protocol checkpoint is not activated and the scheduled consumer integration
-is still outstanding. The five-minute cadence below describes the existing
-workflow, not proof that staging has reached zero idle runtime cost. Do not claim
-activation until the live resource/consumer inventory and startup/stop evidence
-in the rollout gate have been recorded.
+The scheduled staging job holds the lifecycle group while it makes one
+control-only `observe` read, using the existing staging Environment secret only
+in that step. It never acquires, starts, extends or releases staging. Confirmed
+idle retains an `intentional_idle` receipt with unknown health and skips the
+public probe, alert decision and incident write; idle never closes an incident
+or resets its failure history. A malformed/refused control read or an
+unconfirmed stop fails the job rather than claiming idle. The fenced
+`force_fail` dispatch bypasses observation only to exercise the refused-origin
+alert path; it cannot contact staging.
+
+Active authority permits the unchanged health-contract probe. The scheduled
+job queues behind deploy qualification, so it does not independently sample
+inside that locked deployment window: the deploy workflow's exact-SHA
+user-flow job remains mandatory there. Production has an independent job queue
+and no staging Environment, control credential or dependency. Keep the
+five-minute schedule and the documented pending-slot/re-dispatch policy in the
+rollout gate.
+
+This protocol remains unactivated. The workflow change is not evidence of zero
+idle runtime cost. Do not claim activation until the live resource/consumer
+inventory and startup/stop evidence in the rollout gate have been recorded.
 
 ## What runs
 
@@ -28,8 +44,10 @@ in the rollout gate have been recorded.
 | `staging` | `scripts/staging_health_contract_probe.py` | `$STAGING_WORKER_URL` (repo var) |
 | `prod-passive` | `scripts/prod_passive_probe.py` | `$PRODUCTION_WORKER_URL` (repo var) |
 
-Each job writes one JSON evidence receipt (`synthetic-staging-<run>.json`,
-`synthetic-prod-<run>.json`, 14-day artifacts) and fails on any check FAIL
+Each sampled job writes one JSON evidence receipt (`synthetic-staging-<run>.json`,
+`synthetic-prod-<run>.json`, 14-day artifacts). Non-fixture staging runs also
+retain `staging-use-user-flow-<run>-<attempt>` authority receipts, including idle
+and refusal; an idle run has no health sample. Each probe fails on any check FAIL
 or fence refusal. Production is passive: the prod job observes and alerts
 only, and never blocks a deploy. The production promotion reuses the same
 probe once as a baseline (see
@@ -83,6 +101,11 @@ a delivery.
 
 Incident state is rebuilt from this workflow's own completed scheduled runs
 on `main` (the only state store; no extra permissions or infrastructure).
+Skipped idle probes produce no sample or known-closed checkpoint. A long idle
+interval may exhaust the existing bounded reconstruction window; this remains
+unknown history, not evidence that an old incident recovered. The next active
+failure follows the existing fail-open alert policy and a healthy probe with
+unknown history fails its decision step. No idle sample may manufacture recovery.
 Reconstruction pages the runs list 15 runs at a time — a page is sized to
 the 1 MiB cap on history responses, since one Actions run object measures
 15–40 KB and a maximal 100-run page would exceed the cap; an oversized

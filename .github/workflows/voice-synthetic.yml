@@ -38,6 +38,10 @@ on:
     secrets:
       TWO_VOICE_SYNTHETIC_BOT_TOKEN:
         required: false
+      # Declared for workflow_call expression validation; resolved only by the
+      # staging Environment below, not forwarded by the caller.
+      STAGING_OWNERSHIP_CONTROL_TOKEN:
+        required: false
   schedule:
     - cron: '41 */6 * * *'
   workflow_dispatch:
