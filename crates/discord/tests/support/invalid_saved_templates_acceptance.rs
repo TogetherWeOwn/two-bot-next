@@ -59,28 +59,39 @@ impl Case {
     fn valid(self) -> bool {
         matches!(
             self,
-            Self::FourVariables | Self::LiteralBraces | Self::Utf16Ceiling
+            Self::Args | Self::FourVariables | Self::LiteralBraces | Self::Utf16Ceiling
         )
     }
 
     fn expected(self) -> String {
         match self {
+            // The slash fixture passes no `arguments` option, so `{args}`
+            // substitutes empty on that surface.
+            Self::Args => format!("{MARKER} "),
             Self::FourVariables => "Hi <@3333> tester in Test guild <#4444>".to_owned(),
             Self::LiteralBraces => "Literal {User} {bad_name} {9} {unfinished".to_owned(),
             Self::Utf16Ceiling => "😀".repeat(1000),
             _ => panic!("invalid definitions have no public output"),
         }
     }
+
+    fn prefix_expected(self) -> String {
+        match self {
+            // The prefix fixture invokes `!FaQ ignored arguments`, so the
+            // captured remainder renders through `{args}` on that surface.
+            Self::Args => format!("{MARKER} ignored arguments"),
+            _ => self.expected(),
+        }
+    }
 }
 
-const INVALID: [Case; 5] = [
-    Case::Unknown,
+const INVALID: [Case; 4] = [Case::Unknown, Case::Empty, Case::AsciiOver, Case::Utf16Over];
+const VALID: [Case; 4] = [
     Case::Args,
-    Case::Empty,
-    Case::AsciiOver,
-    Case::Utf16Over,
+    Case::FourVariables,
+    Case::LiteralBraces,
+    Case::Utf16Ceiling,
 ];
-const VALID: [Case; 3] = [Case::FourVariables, Case::LiteralBraces, Case::Utf16Ceiling];
 
 async fn database() -> TestDatabase {
     let url = match std::env::var("TWO_TEST_DATABASE_URL") {
@@ -397,12 +408,31 @@ async fn prefix_refuses_unknown_saved_placeholder() {
     refuses(Case::Unknown, Surface::Prefix).await;
 }
 #[tokio::test]
-async fn slash_does_not_expand_args_language() {
-    refuses(Case::Args, Surface::Slash).await;
+async fn slash_renders_args_row_with_empty_substitution() {
+    // `{args}` rows validate now; with no invocation capture wired yet they
+    // deliver the empty substitution through the neutralizing path.
+    let observed = observe(Case::Args, Surface::Slash, true, Some("Test guild")).await;
+    assert_eq!(observed.after, observed.before);
+    assert!(matches!(observed.result, Ok(Outcome::Slash(true))));
+    let completion = slash_completion(&observed.requests);
+    no_mentions(&completion);
+    assert_eq!(completion["content"], Case::Args.expected());
+    audit(Surface::Slash, &observed.facts, "ok", None);
 }
 #[tokio::test]
-async fn prefix_does_not_expand_args_language() {
-    refuses(Case::Args, Surface::Prefix).await;
+async fn prefix_renders_args_row_with_captured_remainder() {
+    // The captured remainder renders through `{args}`: one POST, no refusal.
+    let observed = observe(Case::Args, Surface::Prefix, true, Some("Test guild")).await;
+    assert_eq!(observed.after, observed.before);
+    assert!(matches!(
+        observed.result,
+        Ok(Outcome::Prefix(TextCommandOutcome::Delivered))
+    ));
+    assert_eq!(observed.requests.len(), 1);
+    let payload = body(&observed.requests[0]);
+    no_mentions(&payload);
+    assert_eq!(payload["content"], Case::Args.prefix_expected());
+    audit(Surface::Prefix, &observed.facts, "ok", None);
 }
 #[tokio::test]
 async fn slash_refuses_zero_length_saved_template() {
@@ -436,6 +466,7 @@ fn matrix_preserves_validator_and_literal_renderer_contracts() {
         username: "tester".to_owned(),
         server: "Test guild".to_owned(),
         channel: "<#4444>".to_owned(),
+        args: String::new(),
     };
     for case in INVALID.into_iter().chain(VALID) {
         assert_eq!(
@@ -449,8 +480,8 @@ fn matrix_preserves_validator_and_literal_renderer_contracts() {
         "saved-private-marker <@3333> {usre}"
     );
     assert_eq!(
-        render_template(&Case::Args.template(), &context).expect("args stays literal"),
-        "saved-private-marker {args}"
+        render_template(&Case::Args.template(), &context).expect("args substitutes empty"),
+        "saved-private-marker "
     );
     assert_eq!(
         render_template(&Case::AsciiOver.template(), &context)
@@ -465,7 +496,7 @@ fn matrix_preserves_validator_and_literal_renderer_contracts() {
 }
 
 #[tokio::test]
-async fn valid_four_variables_literal_braces_and_utf16_ceiling_stay_byte_identical() {
+async fn valid_templates_including_args_stay_byte_identical() {
     for case in VALID {
         for surface in [Surface::Slash, Surface::Prefix] {
             let observed = observe(case, surface, true, Some("Test guild")).await;
@@ -492,7 +523,11 @@ async fn valid_four_variables_literal_braces_and_utf16_ceiling_stay_byte_identic
                     payload
                 }
             };
-            assert_eq!(payload["content"], case.expected(), "{case:?} {surface:?}");
+            let wanted = match surface {
+                Surface::Slash => case.expected(),
+                Surface::Prefix => case.prefix_expected(),
+            };
+            assert_eq!(payload["content"], wanted, "{case:?} {surface:?}");
             audit(surface, &observed.facts, "ok", None);
         }
     }
