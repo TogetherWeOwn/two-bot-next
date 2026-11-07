@@ -1,4 +1,8 @@
 use super::*;
+
+#[path = "live_settings_context_fixture.rs"]
+mod live_settings_context_fixture;
+
 use serde_json::json;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use two_bot_core::{activation::LiveCapability, apply_web_contract, RankKey};
