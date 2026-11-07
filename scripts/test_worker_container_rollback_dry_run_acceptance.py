@@ -30,6 +30,15 @@ Contract under test (scripts/worker_container_rollback.py `rollback`):
    not broken harness. A missing `--dry-run` flag surfaces as argparse
    SystemExit(2); the helpers convert it to an assertion failure naming
    the flag so the suite reports FAIL, not ERROR.
+6. Finite-use staging prerequisites (on-demand staging, no always-on
+   target): the restore target's immutable Worker-version
+   `resources.bindings` must hold exactly one `plain_text` row each for
+   `STAGING_RUNTIME_POLICY=bounded`, `TWO_DEPLOY_ENV=staging` and
+   `CONTAINER_RELEASE=<receipt SHA>`. Dry-run reads that version (a GET)
+   and refuses an absent, duplicate, secret-typed or wrong binding, or a
+   pre-stamp target, with the same code, exit and zero POSTs as live mode.
+   Neither mode builds the finite-use adapter or runs any
+   `staging-use-pipeline.mjs` action on a refusal, and dry-run never does.
 
 Offline only: in-memory FakeClient, temp snapshot files, recording
 control stubs and subprocess mocks. No network, no credentials, no
@@ -99,8 +108,24 @@ def rollout_row(rollout_id, image, created="2026-10-15T00:00:00Z", status="compl
             "steps": [{"status": "completed"}]}
 
 
-def version_route(version=GOOD_VERSION, message=SHA):
+def policy_bindings(policy="bounded", env="staging", release=SHA):
+    """The finite-use binding set; None drops that row (an absent binding)."""
+    rows = []
+    for name, value in (("STAGING_RUNTIME_POLICY", policy), ("TWO_DEPLOY_ENV", env),
+                        ("CONTAINER_RELEASE", release)):
+        if value is not None:
+            rows.append({"name": name, "type": "plain_text", "text": value})
+    return rows
+
+
+NO_RESOURCES = object()
+
+
+def version_route(version=GOOD_VERSION, message=SHA, bindings=None):
     result = {"id": version}
+    if bindings is not NO_RESOURCES:
+        result["resources"] = {
+            "bindings": policy_bindings() if bindings is None else bindings}
     if message is not None:
         result["annotations"] = {"workers/message": message}
     return lambda: {"success": True, "result": result}
@@ -149,19 +174,25 @@ def control_stub(epoch=9):
 
 
 def base_env(**extra):
+    # A complete finite-use window, so a live refusal below is never a
+    # missing-window artifact.
     env = {"CLOUDFLARE_ACCOUNT_ID": ACCOUNT, "CLOUDFLARE_API_TOKEN": CF_CANARY,
-           "OWNERSHIP_CONTROL_TOKEN": OWNERSHIP_CANARY, "GITHUB_RUN_ID": "700"}
+           "OWNERSHIP_CONTROL_TOKEN": OWNERSHIP_CANARY, "GITHUB_RUN_ID": "700",
+           "GITHUB_RUN_ATTEMPT": "1", "STAGING_USE_EXPIRES_AT": "1700001000000"}
     env.update(extra)
     return env
 
 
-def live_routes(message=SHA, history=(BAD_VERSION, GOOD_VERSION), served_image=None):
+VERSION_PATH = f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}"
+
+
+def live_routes(message=SHA, history=(BAD_VERSION, GOOD_VERSION), served_image=None,
+                bindings=None):
     served_image = good_image() if served_image is None else served_image
     deployments = [{"versions": [{"version_id": v, "percentage": 100}]}
                    for v in history]
     return {
-        ("GET", f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}"):
-            version_route(message=message),
+        ("GET", VERSION_PATH): version_route(message=message, bindings=bindings),
         ("GET", f"/workers/scripts/{WORKER}/deployments"): lambda: {
             "success": True, "result": {"deployments": deployments}},
         ("GET", "/containers/applications"): lambda: {
@@ -207,12 +238,23 @@ def posts_of(client):
     return [call for call in client.calls if call[0] == "POST"]
 
 
+def finite_use_recorder(record):
+    """Acceptance-only stand-in for main's finite-use adapter factory: it
+    records construction and every action and never runs node. The
+    production adapter is not edited; only this test replaces it."""
+    def factory(env, url, token, version, sha, receipt, root=None):
+        record.append(("adapter", version, sha))
+        return lambda action: record.append(("use", action))
+    return mock.patch.object(rollback, "staging_restore_client", factory)
+
+
 class DryRunCase(unittest.TestCase):
     """Helpers that turn a missing --dry-run flag into FAIL, not ERROR."""
 
     def run_live(self, argv, client, env=None):
         stdout = io.StringIO()
-        with redirect_stdout(stdout):
+        self.live_finite_use = []
+        with finite_use_recorder(self.live_finite_use), redirect_stdout(stdout):
             code = rollback.main(argv, environ=env or base_env(),
                                  client_factory=lambda _a, _t: client)
         return code, stdout.getvalue()
@@ -220,8 +262,10 @@ class DryRunCase(unittest.TestCase):
     def run_dry(self, argv, client, env=None):
         """Run argv with --dry-run; fail behaviorally if the flag is missing."""
         stdout, stderr = io.StringIO(), io.StringIO()
+        self.dry_finite_use = []
         try:
-            with redirect_stdout(stdout), redirect_stderr(stderr):
+            with (finite_use_recorder(self.dry_finite_use),
+                  redirect_stdout(stdout), redirect_stderr(stderr)):
                 code = rollback.main([*argv, "--dry-run"],
                                      environ=env or base_env(),
                                      client_factory=lambda _a, _t: client)
@@ -247,6 +291,40 @@ class DryRunCase(unittest.TestCase):
                      if call[0] in ("fence", "takeover", "deployment-takeover")]
         self.assertEqual(mutations, [],
                          f"dry-run must not mutate ownership: {mutations}; out={out[:400]}")
+        # A preview never asserts, consumes or rebinds the finite-use window.
+        self.assertEqual(getattr(self, "dry_finite_use", []), [],
+                         f"dry-run must not touch the finite-use window; out={out[:400]}")
+
+    def assert_policy_read(self, client):
+        self.assertIn(("GET", VERSION_PATH), client.calls,
+                      "staging restore must read the target version's bindings")
+
+    def assert_same_refusal(self, live_out, dry_out, code_text, member=None):
+        for label, out in (("live", live_out), ("dry-run", dry_out)):
+            self.assertIn(code_text, out,
+                          f"{label} must refuse with {code_text}: {out[:400]}")
+            if member is not None:
+                self.assertIn(member, out,
+                              f"{label} must name {member}: {out[:400]}")
+
+    def run_both(self, argv, routes):
+        live_client, dry_client = FakeClient(routes()), FakeClient(routes())
+        live_control, live_calls = control_stub()
+        with mock.patch.object(rollback, "control_client",
+                               lambda *a, **k: live_control):
+            live_code, live_out = self.run_live(list(argv), live_client)
+        # Every receipt/policy refusal precedes ownership control and the
+        # finite-use adapter in live mode too: no fence, no window use.
+        self.assertEqual(live_calls, [],
+                         f"live refusal reached ownership control: {live_out[:400]}")
+        self.assertEqual(self.live_finite_use, [],
+                         f"live refusal reached the finite-use window: {live_out[:400]}")
+        control, calls = control_stub()
+        with mock.patch.object(rollback, "control_client",
+                               lambda *a, **k: control):
+            dry_code, dry_out = self.run_dry(list(argv), dry_client)
+        return (live_code, live_out, live_client,
+                dry_code, dry_out, dry_client, calls)
 
 
 class DryRunPlanTests(DryRunCase):
@@ -268,6 +346,7 @@ class DryRunPlanTests(DryRunCase):
         self.assertNotIn("Traceback", out)
         self.assert_no_posts(client, out)
         self.assert_no_mutations(calls, out)
+        self.assert_policy_read(client)
 
     def test_snapshot_dry_run_prints_ordered_plan_with_resolved_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -290,6 +369,7 @@ class DryRunPlanTests(DryRunCase):
         self.assertNotIn("Traceback", out)
         self.assert_no_posts(client, out)
         self.assert_no_mutations(calls, out)
+        self.assert_policy_read(client)
 
     def test_dry_run_skips_worker_step_when_already_serving(self):
         # Live run logs "worker already serves the restore version; image leg
@@ -317,27 +397,37 @@ class DryRunPlanTests(DryRunCase):
     def test_dry_run_performs_zero_subprocess_mutations(self):
         # No control_client stub here: the real client runs against a
         # recording subprocess, so a fence/takeover subprocess invocation
-        # would be observed. Status reads answer success.
+        # would be observed. Status reads answer success. Any finite-use
+        # pipeline invocation (whatever the action) is recorded separately.
         def fake_run(command, **kwargs):
             action = command[2] if len(command) > 2 else ""
             fake_run.calls.append(action)
+            if len(command) > 1 and Path(str(command[1])).name == "staging-use-pipeline.mjs":
+                fake_run.finite_use.append(action)
             return rollback.subprocess.CompletedProcess(
                 args=command, returncode=0,
                 stdout=json.dumps({"owner": {"phase": "active", "epoch": 9}}),
                 stderr="")
         fake_run.calls = []
+        fake_run.finite_use = []
         with tempfile.TemporaryDirectory() as tmp:
             evidence = Path(tmp) / "evidence.json"
             client = FakeClient(live_routes())
             with mock.patch.object(rollback.subprocess, "run", side_effect=fake_run):
                 code, out = self.run_dry(manual_argv(evidence), client)
+            written = list(Path(tmp).iterdir())
         self.assertEqual(code, 0, out)
         self.plan_lines(out)
         self.assert_no_posts(client, out)
         mutations = [a for a in fake_run.calls
-                     if a in ("fence", "takeover", "deployment-takeover")]
+                     if a in ("fence", "takeover", "deployment-takeover",
+                              "begin", "consume", "restore-check", "rebind", "finish")]
         self.assertEqual(mutations, [],
                          f"dry-run must not invoke mutating subprocess: {fake_run.calls}")
+        self.assertEqual(fake_run.finite_use, [],
+                         f"dry-run must not run the finite-use pipeline: {fake_run.calls}")
+        self.assertEqual(self.dry_finite_use, [])
+        self.assertEqual(written, [], "dry-run must write no evidence or use receipt")
 
     def test_dry_run_never_echoes_credentials(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -400,24 +490,6 @@ class PlanLiveParityTests(DryRunCase):
 
 class InvalidParityTests(DryRunCase):
     """Each invalid receipt member refuses identically in both modes."""
-
-    def assert_same_refusal(self, live_out, dry_out, code_text, member=None):
-        for label, out in (("live", live_out), ("dry-run", dry_out)):
-            self.assertIn(code_text, out,
-                          f"{label} must refuse with {code_text}: {out[:400]}")
-            if member is not None:
-                self.assertIn(member, out,
-                              f"{label} must name {member}: {out[:400]}")
-
-    def run_both(self, argv, routes):
-        live_client, dry_client = FakeClient(routes()), FakeClient(routes())
-        live_code, live_out = self.run_live(list(argv), live_client)
-        control, calls = control_stub()
-        with mock.patch.object(rollback, "control_client",
-                               lambda *a, **k: control):
-            dry_code, dry_out = self.run_dry(list(argv), dry_client)
-        return (live_code, live_out, live_client,
-                dry_code, dry_out, dry_client, calls)
 
     def test_manual_invalid_members_refuse_identically_in_both_modes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -512,6 +584,8 @@ class InvalidParityTests(DryRunCase):
             snap_ok = write_snapshot(tmp, "ok.json")
             snap_bad_sha = write_snapshot(tmp, "bad-sha.json", serving_sha="zzz")
             snap_no_prev = write_snapshot(tmp, "no-prev.json", has_previous=False)
+            snap_pre_stamp = write_snapshot(tmp, "pre-stamp.json", serving_sha=None,
+                                            provenance_complete=False)
 
             def conflicting_routes():
                 table = live_routes()
@@ -541,6 +615,11 @@ class InvalidParityTests(DryRunCase):
                 ("has-no-previous", argv_for(snap_no_prev),
                  snapshot_reread_routes,
                  "snapshot_has_no_previous", None),
+                # Staging has no pre-stamp/legacy restore: an unstamped
+                # target cannot prove its finite-use release binding.
+                ("pre-stamp-staging", argv_for(snap_pre_stamp),
+                 conflicting_routes,
+                 "staging_restore_identity_invalid", None),
             ]
 
             for name, argv, routes_fn, code_text, member in cases:
@@ -553,6 +632,84 @@ class InvalidParityTests(DryRunCase):
                     self.assertEqual(posts_of(live_client), [])
                     self.assertEqual(posts_of(dry_client), [])
                     self.assert_no_mutations(calls, dry_out)
+
+
+def without(name):
+    return [row for row in policy_bindings() if row["name"] != name]
+
+
+def policy_row(name, value, kind="plain_text"):
+    return {"name": name, "type": kind, "text": value}
+
+
+# Each world is an always-on, foreign or unprovable target; none may restore.
+POLICY_REFUSALS = [
+    ("no-resources", NO_RESOURCES),
+    ("empty-bindings", []),
+    ("policy-absent-always-on", without("STAGING_RUNTIME_POLICY")),
+    ("policy-wrong-value", without("STAGING_RUNTIME_POLICY")
+     + [policy_row("STAGING_RUNTIME_POLICY", "always-on")]),
+    ("policy-duplicate-identical", policy_bindings()
+     + [policy_row("STAGING_RUNTIME_POLICY", "bounded")]),
+    ("policy-duplicate-conflicting", policy_bindings()
+     + [policy_row("STAGING_RUNTIME_POLICY", "always-on")]),
+    ("policy-secret-typed", without("STAGING_RUNTIME_POLICY")
+     + [policy_row("STAGING_RUNTIME_POLICY", "bounded", "secret_text")]),
+    ("env-absent", without("TWO_DEPLOY_ENV")),
+    ("env-production", without("TWO_DEPLOY_ENV")
+     + [policy_row("TWO_DEPLOY_ENV", "production")]),
+    ("release-absent", without("CONTAINER_RELEASE")),
+    ("release-other-sha", without("CONTAINER_RELEASE")
+     + [policy_row("CONTAINER_RELEASE", OTHER_SHA)]),
+    ("release-duplicate", policy_bindings() + [policy_row("CONTAINER_RELEASE", SHA)]),
+]
+
+
+class StagingPolicyParityTests(DryRunCase):
+    """Finite-use binding refusals: identical in both modes, before any mutation."""
+
+    def assert_policy_refusal(self, argv, routes):
+        (live_code, live_out, live_client,
+         dry_code, dry_out, dry_client, calls) = self.run_both(argv, routes)
+        self.assertEqual(live_code, 1, live_out)
+        self.assertEqual(dry_code, 1, dry_out)
+        self.assert_same_refusal(live_out, dry_out, "staging_restore_policy_unproved")
+        for out in (live_out, dry_out):
+            self.assertNotIn(PLAN_PREFIX, out, f"refused target printed a plan: {out[:400]}")
+            self.assertNotIn("diagnostic", out)
+            self.assertNotIn("always-on", out, "binding text must not echo")
+            self.assertNotIn(OWNERSHIP_CANARY, out)
+            self.assertNotIn(CF_CANARY, out)
+        self.assertEqual(posts_of(live_client), [])
+        self.assertEqual(posts_of(dry_client), [])
+        self.assert_policy_read(live_client)
+        self.assert_policy_read(dry_client)
+        self.assert_no_mutations(calls, dry_out)
+
+    def test_manual_policy_refusals_match_in_both_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "evidence.json"
+            for name, bindings in POLICY_REFUSALS:
+                with self.subTest(case=name):
+                    self.assert_policy_refusal(
+                        manual_argv(evidence), lambda b=bindings: live_routes(bindings=b))
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_snapshot_policy_refusals_match_in_both_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_snapshot(tmp)
+            evidence = Path(tmp) / "evidence.json"
+
+            def routes(bindings):
+                table = live_routes(bindings=bindings)
+                table.update(snapshot_reread_routes())
+                return table
+
+            for name, bindings in POLICY_REFUSALS:
+                with self.subTest(case=name):
+                    self.assert_policy_refusal(snapshot_argv(path, evidence),
+                                               lambda b=bindings: routes(b))
+            self.assertEqual(list(Path(tmp).iterdir()), [path])
 
 
 class ControlTests(unittest.TestCase):
@@ -579,6 +736,18 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("provenance_mismatch", stdout.getvalue())
         self.assertEqual(posts_of(client), [])
+
+    def test_control_live_policy_bindings_hold(self):
+        # GREEN control: the fixture's binding set is exactly what the live
+        # validator accepts, and dropping the policy row is what it refuses.
+        client = FakeClient(live_routes())
+        rollback.validate_staging_restore_policy(client, WORKER, GOOD_VERSION, SHA)
+        self.assertEqual(client.calls, [("GET", VERSION_PATH)])
+        with self.assertRaises(base.GateError) as raised:
+            rollback.validate_staging_restore_policy(
+                FakeClient(live_routes(bindings=without("STAGING_RUNTIME_POLICY"))),
+                WORKER, GOOD_VERSION, SHA)
+        self.assertEqual(str(raised.exception), "staging_restore_policy_unproved")
 
     def test_control_receipt_shape_pins_hold(self):
         receipt = rollback.ProvenanceReceipt(WORKER, APPLICATION, GOOD_VERSION,
