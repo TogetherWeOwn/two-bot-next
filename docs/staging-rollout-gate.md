@@ -130,9 +130,13 @@ expiry remains the cancellation backstop. The extra projected receipts are
 `auto-rollback-evidence.json.staging-use.jsonl` in the existing rollout artifact;
 production rollback never invokes this staging contract.
 
-The deploy and reusable voice/help workflows now declare the bounded contract,
-but the rollout is **incomplete and not activated**. Manual drill integration,
-remaining readers and the live inventory still gate activation. The wrappers replace no existing qualification. The binding checker
+The deploy, reusable voice/help, manual Worker/container drills, MCP proof and
+production staging-soak workflows now declare the bounded contract. Scheduled
+user-flow and slow-burn readers observe authority without starting or extending
+it; confirmed idle skips live sampling and incident decisions, not active-use
+checks. This is **source integration, not activation or live qualification**.
+Exact-head Actions, live inventory, finite-safe bootstrap/rollback and independent
+review still gate rollout. The wrappers replace no existing qualification. The binding checker
 permits only an absent policy or the exact `"bounded"` value in staging with
 `TWO_DEPLOY_ENV="staging"`; it rejects top-level, production and other named
 environment placement and plaintext ownership-control tokens. No checked-in
@@ -152,10 +156,10 @@ through **all** `deploy`, `user-flow-synthetic`, `voice-synthetic`,
 `help-embed-synthetic` and `certify-promotion` jobs in the same `deploy-staging`
 run, including a push run reused by a post-merge drill. Reusable consumers must
 assert the caller's window without taking the caller's lock or releasing it.
-Standalone consumers and rollback use the same finite-use contract. Until that
-integration and the inventory/rollback gates below are complete, these client
-and runtime receipts are source-level support only, not a qualified workflow or
-activation receipt.
+Standalone consumers and rollback use the same finite-use contract. That wiring
+is present, but its exact-head live acceptance and the inventory/rollback gates
+below remain required. Client and runtime source support alone is not a qualified
+workflow or activation receipt.
 
 ### Full-window workflow and recovery semantics
 
@@ -217,7 +221,12 @@ alarms/schedules, and active pipeline consumers. Inventory Neon suspend policy
 and every shared database consumer too. A sleeping bot cannot establish that a
 shared database or another consumer stopped billing. Unsupported controls are
 real prerequisites, not permission to weaken active-use security, health or
-qualification checks.
+qualification checks. A zero cron count does not prove there are no per-object
+DO alarms; retain source inspection and runtime stop/expiry evidence for those.
+A database endpoint's idle state or default-autosuspend setting does not identify
+the Worker's secret-backed database or prove the effective suspend delay. Obtain
+a non-secret provider/resource label and resolved policy, inventory its shared
+consumers, and do not suspend shared compute on the bot's authority alone.
 
 Retain a rollback receipt with the exact staging Worker version, immutable
 image, SHA, ownership epoch, configuration and migration ledger. A rollback
