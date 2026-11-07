@@ -119,12 +119,15 @@ choice from its timer effect:
 - `reconnect_delay(policy, attempt)` is the separate, bounded exponential
   schedule for the test-only supervised runner, not the live receive loop.
 
-Before changing this boundary, run the pure `gateway_backoff::spread_tests`
-unit tests and the existing `reconnect_spread_runtime_acceptance` and
-`reconnect_adoption_guard` integration targets through the bounded cache.
-Together they check seeded draws and extreme attempts, the actual awaited
-500 ms–1 s timer, and receive-loop adoption. Keep exact-head CI and independent
-review as gates; this seam does not enable broader automation or retry authority.
+Changes to this boundary need exact-head GitHub Actions coverage from the pure
+`gateway_backoff::spread_tests` unit tests and the existing
+`reconnect_spread_runtime_acceptance` and `reconnect_adoption_guard` integration
+targets, not a routine local bounded-cache run. Together they check seeded draws
+and extreme attempts, the actual awaited 500 ms–1 s timer, and receive-loop
+adoption. Local execution remains limited to one failing test or crate under the
+[focused reproduction policy](../CONTRIBUTING.md#focused-failure-reproduction-only).
+Keep exact-head CI and independent review as gates; this seam does not enable
+broader automation or retry authority.
 
 ## Verification (test containers only)
 

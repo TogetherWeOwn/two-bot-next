@@ -79,6 +79,13 @@ that passes staging deploy, e2e and soak, enforced by the promotion guard. See t
 [production deploy gate](docs/production-deploy.md) and
 [staging rollout gate](docs/staging-rollout-gate.md) for the pipeline evidence.
 This describes the required gate, not a claim that any SHA has qualified.
+Automatic qualification starts on runtime-input pushes to `main`;
+`deploy-staging.yml` ignores docs-only merges. To promote an otherwise unqualified
+exact main SHA, including a docs-only squash SHA, first obtain authorized staging
+dispatch/qualification using the existing
+[dispatch/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
+Do not wait for a docs-only push to trigger it, skip qualification or dispatch
+through an existing hold.
 
 This contract supersedes the earlier artifact-identical staging exception.
 Unmerged-head staging and paired artifact-equality proofs are not substitute
@@ -287,7 +294,11 @@ These are Actions steps, not a local command checklist. For an allowed focused
 controller reproduction only, the generator's `--controller` option enforces
 bounded cache admission; it never authorizes a local CI mirror. The generator never
 rewrites tracked configuration or independent publication fixtures. See the
-[command-reference landing page](docs/commands.md) for same-head CI artifacts.
+[command-reference landing page](docs/commands.md#read-the-reference) for artifact
+identity: a PR run is associated with its head, but default checkout generates
+from the synthetic merge commit. Retain the checkout-log source SHA as well as
+the PR head and run/job links; exact-head CI evidence is not proof of artifact
+bytes from the PR-head tree.
 CI isolates the environment-mutating ops-override acceptance test from parallel
 workspace tests; nextest already isolates tests in separate processes. Reuse the
 workflow's steps and logs rather than mirroring those lanes locally.

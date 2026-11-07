@@ -25,6 +25,14 @@ substitute merge prerequisites; the earlier artifact-identical exception is
 superseded. Neither CI nor artifact equality replaces post-merge qualification
 or the pipeline's exact-SHA artifact and promotion evidence.
 
+Automatic qualification starts on runtime-input pushes to `main`;
+`deploy-staging.yml` ignores docs-only merges. Before promoting an otherwise
+unqualified exact main SHA (including a docs-only squash SHA), an authorized
+staging dispatch must qualify it through the same gate. Use the existing
+[dispatch/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
+and retain its exact-SHA receipts; this is not pre-merge staging or permission
+to dispatch through a hold.
+
 Before merge, verify required GitHub Actions checks and Devin Review on the
 exact PR head, all applicable specialist and native review, and finding
 dispositions. Require fresh per-PR exact-head Release Manager acceptance with

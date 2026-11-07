@@ -142,9 +142,12 @@ Rust-selected check run. CI generates it explicitly before compiling workspace
 tests or all-targets Clippy. The generator validates tracked configuration first and
 never rewrites it or the saved publication fixtures.
 
-Use the exact-head Actions artifact when Rust is selected; docs-only runs may
-have no command artifact. For those runs, use exact-head `ci-ok`, selector results
-and selected jobs as CI evidence, not local generation. CI runs
+Use the Actions artifact when Rust is selected, distinguishing the associated
+PR head from the checkout source SHA: default PR runs generate from GitHub's
+synthetic merge tree, not the PR-head tree. Follow the
+[artifact identity guidance](docs/commands.md#read-the-reference), including for
+historical references. Docs-only runs may have no command artifact; use exact-head
+`ci-ok`, selector results and selected jobs as CI evidence, not local generation. CI runs
 `python3 scripts/generate_command_reference.py` and read-only reference tests. Local execution is only for focused
 reproduction of one failing test or crate under the
 [verification policy](CONTRIBUTING.md#focused-failure-reproduction-only), not a
@@ -154,13 +157,26 @@ uses the bounded Cargo cache. The generator builds the small core example using
 the canonical renderer; no database, deployment or live values are needed.
 
 Configuration remains tracked. Deliberate catalog/supplement changes require
-explicit regeneration through the canonical
-`reference_docs::regenerate_reference_docs` test, within an approved execution
-environment; this is not permission for a shared-host build or CI mirror.
-Review and commit only the configuration change, never generated command rows.
-Ordinary reference tests compare bytes and never regenerate silently: absent,
-stale or malformed generated output fails, and configuration drift remains a
-failure. CI generates before consumers, then runs these read-only tests.
+explicit regeneration through the canonical `regenerate_reference_docs` test in
+`crates/core/tests/reference_docs.rs`, which writes both references. **There is no
+configured Actions route that runs this writer and returns the updated
+configuration.** The ordinary generator only validates tracked configuration;
+it fails on drift before writing commands, and nightly explicitly skips the
+writer to avoid hiding drift.
+
+For a catalog-change task, the author must first arrange narrowly scoped hosted
+regeneration and output retrieval with the CI maintainer through normal
+PR/review gates: bind the writer to the task's exact source SHA, retain run/job
+links and retrieve `docs/configuration.md` for review and commit. This is an
+unmet agent prerequisite, not an already approved command or workflow. Route any
+disputed technical permission to the Engineering Lead; do not invent an approved
+environment, grant a local exception, or silently hand-edit around the writer.
+This documentation does not add that route or authorize regeneration. Never run
+a shared-host build or CI mirror. Review and commit only the configuration
+change, never generated command rows. Ordinary reference tests compare bytes
+and never regenerate silently: absent, stale or malformed generated output and
+configuration drift remain failures. Normal CI generates commands only after
+configuration validation, then runs read-only tests.
 
 ## Contributing
 
@@ -184,7 +200,12 @@ it can reach production through the promotion path. For web/bot, staging
 qualification is the automatic **post-merge, pre-production exact-main
 staging/e2e/soak gate**, enforced by the promotion guard. Staging accepts only
 main-ancestor SHAs; unmerged-head staging and artifact-equality proofs are not
-substitute merge prerequisites. See
+substitute merge prerequisites. Runtime-input pushes to `main` start automatic
+qualification; docs-only merges do not trigger `deploy-staging`. Promoting an
+otherwise unqualified exact main SHA (including a docs-only squash SHA) requires
+authorized staging dispatch/qualification first; follow the existing
+[dispatch/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
+without bypassing holds. See
 [Production merge evidence](CONTRIBUTING.md#production-merge-evidence) for the
 superseding contract. Exact-PR-head Actions/Devin, specialist/native review,
 existing production holds, migration/no-migration and rollback evidence, fresh

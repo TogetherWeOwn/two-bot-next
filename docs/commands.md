@@ -8,16 +8,22 @@ A fresh checkout intentionally has no generated reference.
 ## Read the reference
 
 Open the [check workflow](https://github.com/TogetherWeOwn/two-bot-next/actions/workflows/check.yml),
-choose a Rust-selected run for the exact commit, and download its
-**command-reference** artifact. The artifact contains the rendered `commands.md`;
-verify the run's full head SHA rather than treating another run as current. This
-is the normal reference path, including for readers with a local checkout.
+choose a Rust-selected run, and download its **command-reference** artifact.
+The artifact contains the rendered `commands.md` from the `check` job's checkout.
+For a PR run, verify that the run's full head SHA matches the PR head for CI
+association, then read the checkout step's logs for the tested source SHA.
+The default PR checkout is GitHub's synthetic merge commit, not the PR-head tree;
+its artifact can include base-branch command changes absent from that head.
+Record both SHAs and the run/job links when citing it. For a push run, likewise
+verify the checkout source SHA against the requested commit. The run head alone
+is not artifact-source proof. This is the normal reference path, including for
+readers with a local checkout; it requires no local generation.
 
 Docs-only changes may deselect Rust and produce no command-reference artifact.
 Use that exact head's `ci-ok`, selector results and selected jobs as CI evidence;
-do not generate locally to compensate. A reference from another Rust-selected
-commit can be read as a clearly labelled historical reference, not as evidence
-for the current head.
+do not generate locally to compensate. Another Rust-selected run's reference
+can be read as historical only: label it with its run/job links, PR head (if
+applicable) and checkout source SHA, not as evidence for the current head.
 
 CI runs `python3 scripts/generate_command_reference.py` before test-target
 compilation or all-targets Clippy, then runs read-only reference tests. These are
