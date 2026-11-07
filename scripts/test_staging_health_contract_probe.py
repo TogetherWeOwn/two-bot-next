@@ -131,6 +131,195 @@ class HealthContractProbeTests(unittest.TestCase):
         self.assertEqual([(check["check"], check["verdict"]) for check in receipt["checks"]],
                          [("health", "pass"), ("readyz", "pass"), ("build", "pass")])
 
+    def test_receipt_retains_every_valid_component_without_inferring_cause(self):
+        cases = ({}, {"gateway": "starting"}, {"gateway": "down"},
+                 {"database": "down"},
+                 {"gateway": "starting", "database": "down", "token_invalid": "down"})
+        for changes in cases:
+            for failure_class in (None, "gateway_runtime_failed", "checkpoint_load_failed"):
+                with self.subTest(changes=changes, failure_class=failure_class):
+                    state = {name: changes.get(name, "ready") for name in probe.REQUIRED_COMPONENTS}
+                    value = dict(READY, components=components(*state.items()))
+                    if failure_class:
+                        value["gateway_failure"] = {"phase": "durable_gateway", "class": failure_class}
+                    status = 503 if changes else 200
+                    routes = {STAGING + "/health": body({"status": "ok"}),
+                              STAGING + "/readyz": body(value, status)}
+                    before = len(self.requested)
+                    with mock.patch.object(probe.time, "sleep", side_effect=AssertionError("retry sleep")):
+                        code, results, _ = self.drive(routes, "--expected-sha", READY["build_revision"])
+                    receipt = json.loads(Path(self.evidence).read_text())
+                    self.assertEqual(code, 1 if changes else 0)
+                    self.assertEqual(receipt["readiness"], {
+                        "http_status": status, "failure_class": "unready" if changes else None,
+                        "components": state})
+                    self.assertIsNone(receipt["build_failure_class"])
+                    self.assertEqual(receipt["gateway_failure_class"], failure_class)
+                    self.assertEqual(receipt["gateway_failure_root_cause"],
+                                     "unverified" if changes and failure_class == "checkpoint_load_failed"
+                                     else None)
+                    self.assertEqual(self.requested[before:], [STAGING + "/health", STAGING + "/readyz"])
+                    text = "\n".join(results.values())
+                    self.assertNotIn("parked", text)
+                    if changes:
+                        for name, state_value in changes.items():
+                            self.assertIn(f"{name}={state_value}", text)
+                        self.assertEqual(receipt["result"], "fail")
+                    if changes and failure_class != "checkpoint_load_failed":
+                        self.assertIn("lifecycle cause not observed", text)
+                        self.assertNotIn("checkpoint", text)
+
+    def test_contract_failures_have_receipts_not_invented_states(self):
+        invalid = [None, [], "secret-like-invalid-body", 42,
+                   dict(READY, components=None), dict(READY, jobs=[]),
+                   dict(READY, gateway_failure={"phase": "secret-like-phase", "class": "down"})]
+        for bad_state in ("secret-like-state", None, [], {}, 1, True):
+            invalid.append(dict(READY, components=components(
+                ("process", "ready"), ("gateway", bad_state),
+                ("database", "ready"), ("token_invalid", "ready"))))
+        invalid.extend([
+            dict(READY, components=READY["components"][:-1]),
+            dict(READY, components=READY["components"] + [["secret-like-component", "ready"]]),
+            dict(READY, components=READY["components"] + [["gateway", "down"]]),
+        ])
+        responses = [body(value, 503) for value in invalid]
+        responses.extend([(503, {}, b'secret-like-malformed-json'),
+                          (503, {}, b'{"components":[],"components":[]}'),
+                          (503, {}, b'X' * (probe.BODY_CAP + 1))])
+        for response in responses:
+            with self.subTest(response=response[:1]):
+                before = len(self.requested)
+                code, results, _ = self.drive({STAGING + "/health": body({"status": "ok"}),
+                                              STAGING + "/readyz": response})
+                self.assertEqual(code, 1)
+                receipt = json.loads(Path(self.evidence).read_text())
+                self.assertEqual(receipt["readiness"], {"http_status": 503,
+                                 "failure_class": "contract_failure", "components": {}})
+                self.assertEqual(receipt["build_failure_class"], "build_identity_unavailable")
+                self.assertIsNone(receipt["gateway_failure_class"])
+                self.assertEqual(self.requested[before:], [STAGING + "/health", STAGING + "/readyz"])
+                self.assertNotIn("secret-like", json.dumps(receipt) + str(results))
+
+    def test_inconsistent_or_unexpected_status_retains_only_valid_observations(self):
+        down = dict(READY, components=components(("process", "ready"), ("gateway", "down"),
+                                                ("database", "ready"), ("token_invalid", "ready")))
+        for status, value in ((503, READY), (200, down), (201, READY), (302, READY), (500, down)):
+            with self.subTest(status=status):
+                code, _, _ = self.drive({STAGING + "/health": body({"status": "ok"}),
+                                        STAGING + "/readyz": body(value, status)})
+                receipt = json.loads(Path(self.evidence).read_text())
+                self.assertEqual(code, 1)
+                self.assertEqual(receipt["readiness"], {"http_status": status,
+                                 "failure_class": "contract_failure",
+                                 "components": dict(value["components"])})
+                self.assertIsNone(receipt["build_failure_class"])
+
+    def test_transport_failure_receipt_drops_raw_error(self):
+        for error in (OSError("secret-like-error"), probe.urllib.error.URLError("secret-like-url"),
+                      probe.http.client.IncompleteRead(b"secret-like-partial-body")):
+            with self.subTest(error=type(error).__name__):
+                before = len(self.requested)
+                code, results, _ = self.drive({STAGING + "/health": body({"status": "ok"}),
+                                              STAGING + "/readyz": error})
+                receipt = json.loads(Path(self.evidence).read_text())
+                self.assertEqual(code, 1)
+                self.assertEqual(receipt["readiness"], {"http_status": None,
+                                 "failure_class": "transport_failure", "components": {}})
+                self.assertEqual(receipt["build_failure_class"], "build_identity_unavailable")
+                self.assertNotIn("secret-like", json.dumps(receipt) + str(results))
+                self.assertEqual(self.requested[before:], [STAGING + "/health", STAGING + "/readyz"])
+
+    def test_transport_boundary_retains_status_only_after_headers(self):
+        for status in (None, 200, 503):
+            for error in (OSError("secret-like-error"), TimeoutError("secret-like-timeout"),
+                          probe.urllib.error.URLError("secret-like-url"),
+                          probe.http.client.IncompleteRead(b"secret-like-partial-body")):
+                with self.subTest(status=status, error=type(error).__name__):
+                    reads = []
+                    requested = []
+
+                    class Response(io.BytesIO):
+                        headers = {"secret-like-header": "secret-like-value"}
+
+                        def read(self, n=-1):
+                            reads.append(n)
+                            raise error
+
+                    response = Response(b"secret-like-body")
+                    response.status = status
+                    self.addCleanup(response.close)
+
+                    def open_response(request, timeout=None):
+                        requested.append(request.full_url)
+                        self.assertEqual(timeout, probe.TIMEOUT_SECONDS)
+                        if request.full_url == STAGING + "/health":
+                            health = io.BytesIO(b'{"status":"ok"}')
+                            health.status, health.headers = 200, {}
+                            return health
+                        self.assertEqual(request.full_url, STAGING + "/readyz")
+                        if status is None:
+                            raise error
+                        if status == 503:
+                            raise probe.urllib.error.HTTPError(
+                                request.full_url, status, "secret-like-reason",
+                                response.headers, response)
+                        return response
+
+                    opener = mock.Mock()
+                    opener.open.side_effect = open_response
+                    out = io.StringIO()
+                    with mock.patch.object(probe.urllib.request, "build_opener", return_value=opener), \
+                            mock.patch.object(probe.time, "sleep", side_effect=AssertionError("retry sleep")), \
+                            mock.patch.dict(os.environ, {}, clear=True), redirect_stdout(out):
+                        code = probe.main(["--staging-url", STAGING, "--evidence", self.evidence],
+                                          fetch_fn=probe.fetch)
+                    raw = Path(self.evidence).read_text()
+                    receipt = json.loads(raw)
+                    self.assertEqual(code, 1)
+                    self.assertEqual(receipt["result"], "fail")
+                    self.assertEqual(receipt["readiness"], {"http_status": status,
+                                     "failure_class": "transport_failure", "components": {}})
+                    self.assertEqual(receipt["build_failure_class"], "build_identity_unavailable")
+                    self.assertIsNone(receipt["build_revision"])
+                    self.assertIsNone(receipt["build_id"])
+                    self.assertIsNone(receipt["gateway_failure_class"])
+                    self.assertIsNone(receipt["gateway_failure_root_cause"])
+                    self.assertEqual(requested, [STAGING + "/health", STAGING + "/readyz"])
+                    self.assertEqual(reads, [] if status is None else [probe.BODY_CAP + 1])
+                    self.assertLess(len(raw), 4096)
+                    self.assertNotIn("secret-like", raw + out.getvalue())
+
+    def test_build_failure_is_separate_from_readiness(self):
+        for value, failure_class in (
+                (dict(READY, build_revision="f" * 40), "build_mismatch"),
+                ({k: v for k, v in READY.items() if k != "build_revision"}, "build_identity_invalid"),
+                (dict(READY, build_id="secret-like-build"), "build_identity_invalid"),
+                (dict(READY, build_revision="unknown", build_id="unknown"), "build_identity_unstamped")):
+            with self.subTest(failure_class=failure_class):
+                code, _, _ = self.drive({STAGING + "/health": body({"status": "ok"}),
+                                        STAGING + "/readyz": body(value)},
+                                       "--expected-sha", READY["build_revision"])
+                receipt = json.loads(Path(self.evidence).read_text())
+                self.assertEqual(code, 1)
+                self.assertEqual(receipt["readiness"], {"http_status": 200, "failure_class": None,
+                                                       "components": dict(READY["components"])})
+                self.assertEqual(receipt["build_failure_class"], failure_class)
+                self.assertNotIn("secret-like", json.dumps(receipt))
+
+    def test_receipt_is_bounded_and_drops_arbitrary_fields(self):
+        sentinel = "secret-like-token-user-message-raw-error"
+        value = dict(READY, jobs={sentinel: [sentinel] * 100}, unknown=sentinel,
+                     gateway_failure={"phase": "durable_gateway", "class": "gateway_runtime_failed",
+                                      "root_cause": sentinel, "detail": sentinel})
+        code, results, _ = self.drive({STAGING + "/health": body({"status": "ok"}),
+                                      STAGING + "/readyz": body(value)},
+                                     "--expected-sha", READY["build_revision"])
+        receipt = Path(self.evidence).read_text()
+        self.assertEqual(code, 0)
+        self.assertLess(len(receipt), 4096)
+        self.assertNotIn(sentinel, receipt + str(results))
+        self.assertEqual(json.loads(receipt)["readiness"]["components"], dict(READY["components"]))
+
     def test_expected_sha_match_and_mismatch(self):
         routes = {STAGING + "/health": body({"status": "ok"}),
                   STAGING + "/readyz": body(dict(READY))}
@@ -444,7 +633,7 @@ class HealthContractProbeTests(unittest.TestCase):
         routes = {STAGING + "/health": OSError("down"),
                   STAGING + "/readyz": body(dict(READY))}
         code, results, _ = self.drive(routes)
-        self.assert_only_failure("health", "did not respond (OSError)", code, results)
+        self.assert_only_failure("health", "did not respond (transport failure)", code, results)
 
     def test_redirect_target_is_observed_not_followed(self):
         routes = {STAGING + "/health": body({"status": "ok"}),
