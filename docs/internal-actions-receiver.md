@@ -486,6 +486,12 @@ roll off 90 days after joining. Capture consults the opt-out at open time
 (contract v2 §9): a suppressed member opens no span — absent from the record,
 not anonymised in it — and `guild_analytics_settings.voice_enabled = off`
 stops capture guild-wide; closes still finalize so no open row leaks.
+Actor starts and gateway-generation changes drain old open spans at their joins:
+unknown offline time earns no credit, even if the occupant is present again.
+Recovery processes 32 rows per one-second turn, retries failed pages, and blocks
+capture until drained. Buffered pre-recovery joins stay missed. Maintenance detects
+recovery without new frames; an unchanged-generation snapshot cannot override
+queued transitions. Snapshots never open spans.
 
 Capture consumes the shared accepted `event_instance_windows` authority, not
 caller-requested upsert dates or a retained attendance window. New spans and new

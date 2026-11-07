@@ -283,6 +283,9 @@ struct Store {
     /// Scripted live event-voice bindings for the guild repair; empty by
     /// default, so the repair is a no-op unless the test seeds a binding.
     ev_bindings: Mutex<Vec<EventVoiceBinding>>,
+    attendance_recovery_rows: Mutex<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>>,
+    attendance_recovery_closed: Mutex<Vec<i64>>,
+    attendance_recovery_delay: Mutex<Option<Duration>>,
 }
 
 impl Store {
@@ -342,11 +345,50 @@ impl Store {
             kick_audit: Mutex::new(Vec::new()),
             kick_audit_errors: Mutex::new(VecDeque::new()),
             ev_bindings: Mutex::new(Vec::new()),
+            attendance_recovery_rows: Mutex::new(Vec::new()),
+            attendance_recovery_closed: Mutex::new(Vec::new()),
+            attendance_recovery_delay: Mutex::new(None),
         }
     }
 }
 
 impl RoomPersistence for Store {
+    async fn attendance_recovery_page(
+        &self,
+        _: Snowflake,
+        after_id: i64,
+    ) -> Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError> {
+        Ok(self
+            .attendance_recovery_rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row.id > after_id)
+            .take(two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE)
+            .cloned()
+            .collect())
+    }
+
+    async fn recover_attendance_sessions(
+        &self,
+        _: Snowflake,
+        ids: &[i64],
+    ) -> Result<u64, StoreError> {
+        let delay = self.attendance_recovery_delay.lock().unwrap().take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.attendance_recovery_rows
+            .lock()
+            .unwrap()
+            .retain(|row| !ids.contains(&row.id));
+        self.attendance_recovery_closed
+            .lock()
+            .unwrap()
+            .extend_from_slice(ids);
+        Ok(ids.len() as u64)
+    }
+
     async fn creators(&self, _: u64) -> Result<Vec<CreatorChannel>, StoreError> {
         match self.creators_error {
             Some(error) => Err(error),
@@ -1499,6 +1541,195 @@ fn fixture() -> (LiveGuild, Store, Http, Trace) {
         Http::new(trace.clone()),
         trace,
     )
+}
+
+fn recovery_row(
+    id: i64,
+    member: Snowflake,
+    channel: Snowflake,
+) -> two_bot_cutover::event_attendance::AttendanceRecoveryRow {
+    two_bot_cutover::event_attendance::AttendanceRecoveryRow {
+        id,
+        member_id: member.to_string(),
+        channel_id: channel.to_string(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_restart_recovery_drains_bounded_pages_before_capture() {
+    let (live, store, http, _) = fixture();
+    store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .extend((1..=69).map(|id| recovery_row(id, MEMBER, CREATOR)));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    assert!(!recovery.capture_allowed(&worker.live));
+    for (closed, allowed) in [(32, false), (64, false), (69, true)] {
+        recovery.turn(&worker, true).await;
+        assert_eq!(
+            worker
+                .store
+                .attendance_recovery_closed
+                .lock()
+                .unwrap()
+                .len(),
+            closed
+        );
+        assert_eq!(recovery.capture_allowed(&worker.live), allowed);
+    }
+    assert!(worker
+        .store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_gateway_recovery_does_not_bridge_a_snapshot_occupant() {
+    let (live, store, http, _) = fixture();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    worker.live.voice_update(MEMBER, Some(CREATOR), Some(false));
+    worker
+        .store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .push(recovery_row(1, MEMBER, CREATOR));
+    // Uninterrupted presence preserves an open span.
+    recovery.turn(&worker, true).await;
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
+    worker.live.disconnect();
+    worker.live.publish(snapshot(
+        &[],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: CREATOR,
+            bot: false,
+        }],
+    ));
+    assert!(!recovery.capture_allowed(&worker.live));
+    // Being present again does not establish continuous presence while offline.
+    recovery.turn(&worker, true).await;
+    assert_eq!(
+        *worker.store.attendance_recovery_closed.lock().unwrap(),
+        vec![1]
+    );
+    assert!(recovery.capture_allowed(&worker.live));
+    let since = recovery.capture_since.unwrap();
+    assert!(!recovery.transition_allowed(&worker.live, since - time::Duration::seconds(1)));
+    assert!(recovery.transition_allowed(&worker.live, since));
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_periodic_recovery_catches_a_missed_leave_without_new_frames() {
+    let (live, store, http, _) = fixture();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    worker.live.voice_update(MEMBER, Some(CREATOR), Some(false));
+    worker
+        .store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .extend([
+            recovery_row(1, MEMBER, CREATOR),
+            recovery_row(2, MEMBER + 1, CREATOR),
+            recovery_row(3, MEMBER, CREATOR + 1),
+        ]);
+    recovery.turn(&worker, true).await;
+    // A newer live view does not trump queued transitions in this generation.
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
+    worker.live.disconnect();
+    recovery.turn(&worker, true).await;
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
+    worker.live.publish(snapshot(&[], vec![]));
+    // The maintenance call alone discovers recovery; no new voice frame.
+    recovery.turn(&worker, true).await;
+    assert_eq!(
+        *worker.store.attendance_recovery_closed.lock().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert!(worker
+        .store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_recovery_timeout_retains_cursor_and_retries_without_capture() {
+    let (live, store, http, _) = fixture();
+    store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .push(recovery_row(1, MEMBER, CREATOR));
+    *store.attendance_recovery_delay.lock().unwrap() = Some(Duration::from_secs(10));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    let start = tokio::time::Instant::now();
+    recovery.turn(&worker, true).await;
+    assert_eq!(start.elapsed(), Duration::from_secs(1));
+    assert_eq!(recovery.after_id, 0);
+    assert!(!recovery.capture_allowed(&worker.live));
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
+    recovery.turn(&worker, true).await;
+    assert_eq!(
+        *worker.store.attendance_recovery_closed.lock().unwrap(),
+        vec![1]
+    );
+    assert!(recovery.capture_allowed(&worker.live));
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_dark_recovery_never_touches_the_store() {
+    let (live, store, http, _) = fixture();
+    store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .push(recovery_row(1, MEMBER, CREATOR));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, false).await;
+    assert_eq!(recovery.generation, None);
+    assert_eq!(
+        worker.store.attendance_recovery_rows.lock().unwrap().len(),
+        1
+    );
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
 }
 
 /// `snapshot` re-keyed to `guild`: channel guild ids and the @everyone

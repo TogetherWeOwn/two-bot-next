@@ -449,6 +449,26 @@ pub trait RoomPersistence: Send + Sync {
         let _ = (event_id, instance, present);
         async { Ok::<u64, StoreError>(0) }
     }
+    /// Minimal bounded recovery page, never an unbounded guild session read.
+    fn attendance_recovery_page(
+        &self,
+        guild: Snowflake,
+        after_id: i64,
+    ) -> impl Future<
+        Output = Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError>,
+    > + Send {
+        let _ = (guild, after_id);
+        async { Ok(Vec::new()) }
+    }
+    /// Conservative recovery only: no new rows, tags or inferred leave times.
+    fn recover_attendance_sessions(
+        &self,
+        guild: Snowflake,
+        ids: &[i64],
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send {
+        let _ = (guild, ids);
+        async { Ok(0) }
+    }
     /// Mapped attendance windows for one guild, for the session logger.
     /// Default empty for stores without the attendance tables.
     fn attendance_windows(
@@ -903,6 +923,34 @@ impl RoomPersistence for PgRoomStore {
         self.close_event_voice_spans_absent(event_id, instance, &present)
             .await
             .map_err(store_error)
+    }
+
+    async fn attendance_recovery_page(
+        &self,
+        guild: Snowflake,
+        after_id: i64,
+    ) -> Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError> {
+        two_bot_cutover::event_attendance::attendance_recovery_page(
+            self.pool(),
+            &guild.to_string(),
+            after_id,
+        )
+        .await
+        .map_err(store_error)
+    }
+
+    async fn recover_attendance_sessions(
+        &self,
+        guild: Snowflake,
+        ids: &[i64],
+    ) -> Result<u64, StoreError> {
+        two_bot_cutover::event_attendance::recover_attendance_sessions(
+            self.pool(),
+            &guild.to_string(),
+            ids,
+        )
+        .await
+        .map_err(store_error)
     }
 
     async fn attendance_windows(
@@ -10387,6 +10435,103 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     run_actor_inner(worker, inbox, tick, limits, VecDeque::new(), backpressure).await;
 }
 
+/// A new process/actor or gateway generation cannot prove continuity of any
+/// prior open span. Drain those spans conservatively before accepting new
+/// captures. Maintenance detects recovery even without another voice frame;
+/// it must not infer leaves from a live view ahead of queued actor commands.
+/// One page per turn, with a single deadline across both reads and writes.
+#[derive(Default)]
+struct AttendanceRecovery {
+    generation: Option<u64>,
+    after_id: i64,
+    resetting: bool,
+    capture_since: Option<OffsetDateTime>,
+}
+
+impl AttendanceRecovery {
+    fn observe_generation(&mut self, generation: u64) {
+        if self.generation != Some(generation) {
+            self.generation = Some(generation);
+            self.after_id = 0;
+            self.resetting = true;
+        }
+    }
+
+    fn capture_allowed(&mut self, live: &LiveGuild) -> bool {
+        let state = live.read_state();
+        self.observe_generation(state.generation);
+        state.ready && !self.resetting
+    }
+
+    fn transition_allowed(&mut self, live: &LiveGuild, observed_at: OffsetDateTime) -> bool {
+        self.capture_allowed(live) && self.capture_since.is_some_and(|since| observed_at >= since)
+    }
+
+    async fn turn<S: RoomPersistence, H: RoomWrites>(
+        &mut self,
+        worker: &GuildRoomWorker<S, H>,
+        enabled: bool,
+    ) {
+        if !enabled {
+            return;
+        }
+        let (generation, ready) = {
+            let live = worker.live.read_state();
+            (live.generation, live.ready)
+        };
+        self.observe_generation(generation);
+        if !ready || !self.resetting {
+            return;
+        }
+        let guild = worker.live.guild_id;
+        let result = tokio::time::timeout(Duration::from_millis(1_000), async {
+            let rows = worker
+                .store
+                .attendance_recovery_page(guild, self.after_id)
+                .await?;
+            // A buggy alternate store cannot defeat the per-turn row bound.
+            if rows.len() > two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE {
+                return Ok::<_, StoreError>(None);
+            }
+            let ids: Vec<i64> = {
+                let live = worker.live.read_state();
+                if live.generation != generation || live.ready != ready {
+                    return Ok(None);
+                }
+                rows.iter().map(|row| row.id).collect()
+            };
+            worker
+                .store
+                .recover_attendance_sessions(guild, &ids)
+                .await?;
+            Ok(Some((
+                rows.last().map(|row| row.id).unwrap_or(self.after_id),
+                rows.len(),
+            )))
+        })
+        .await;
+        match result {
+            Ok(Ok(Some((after_id, count)))) => {
+                self.after_id = after_id;
+                if count < two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE {
+                    self.after_id = 0;
+                    if self.resetting && ready {
+                        // Buffered pre-recovery frames are not new evidence;
+                        // never replay their joins into the repaired epoch.
+                        self.capture_since = Some(OffsetDateTime::now_utc());
+                    }
+                    self.resetting = !ready;
+                }
+            }
+            _ => {
+                // No cursor advance on failure/cancellation; next actor turn
+                // retries the same page, including an uncertain commit.
+                debug!(guild = guild.to_string(), "attendance recovery deferred");
+            }
+        }
+    }
+}
+
 async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     worker: &mut GuildRoomWorker<S, H>,
     mut inbox: mpsc::UnboundedReceiver<ActorCommand>,
@@ -10402,6 +10547,10 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     let mut dispatch_ready = false;
     let mut maintenance_ready = false;
     let mut ev_repair_due_ms: u64 = 0;
+    let mut attendance_recovery = AttendanceRecovery::default();
+    attendance_recovery
+        .turn(worker, crate::event_attendance::logger_enabled())
+        .await;
     let mut dispatch_budget = 8u8;
     let mut consecutive_inbox_turns = 0u8;
     let mut complete_join_pair = false;
@@ -10499,6 +10648,11 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                         .and_then(|id| live.channels.get(&id).and_then(|room| room.name.clone())),
                 )
             };
+            if !attendance_recovery.capture_allowed(&worker.live) {
+                attendance_recovery
+                    .turn(worker, crate::event_attendance::logger_enabled())
+                    .await;
+            }
             crate::event_attendance::record_transition(
                 &worker.store,
                 crate::event_attendance::VoiceTransition {
@@ -10511,7 +10665,8 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                     observed_at: *observed_at,
                     previous_name,
                     current_name,
-                    enabled: crate::event_attendance::logger_enabled(),
+                    enabled: crate::event_attendance::logger_enabled()
+                        && attendance_recovery.transition_allowed(&worker.live, *observed_at),
                 },
             )
             .await;
@@ -10602,6 +10757,9 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                             }),
                         )
                     };
+                    if !attendance_recovery.capture_allowed(&worker.live) {
+                        attendance_recovery.turn(worker, crate::event_attendance::logger_enabled()).await;
+                    }
                     crate::event_attendance::record_transition(
                         &worker.store,
                         crate::event_attendance::VoiceTransition {
@@ -10614,7 +10772,8 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                             observed_at: *observed_at,
                             previous_name,
                             current_name,
-                            enabled: crate::event_attendance::logger_enabled(),
+                            enabled: crate::event_attendance::logger_enabled()
+                        && attendance_recovery.transition_allowed(&worker.live, *observed_at),
                         },
                     )
                     .await;
@@ -10753,6 +10912,9 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 worker.refresh_empty_grace();
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
+                // Recovery pages continue on maintenance even with no more
+                // voice frames. Do not invent joins from the snapshot.
+                attendance_recovery.turn(worker, crate::event_attendance::logger_enabled()).await;
                 // Event-voice presence repair (at most every 60s): re-open a
                 // lost join and close a lost leave against the live occupant
                 // snapshot. The snapshot is collected before any await so no

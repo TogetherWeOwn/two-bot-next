@@ -15,9 +15,10 @@ use two_bot_core::{
     website_store::{replace_events, upsert_event},
 };
 use two_bot_cutover::event_attendance::{
-    attendance_sessions_for_event_key, attendance_window_for_key, attendance_windows_for_guild,
-    close_attendance_session, insert_attendance_session, is_attendance_suppressed,
-    is_attendance_voice_enabled, open_attendance_sessions, NewAttendanceSession,
+    attendance_recovery_page, attendance_sessions_for_event_key, attendance_window_for_key,
+    attendance_windows_for_guild, close_attendance_session, insert_attendance_session,
+    is_attendance_suppressed, is_attendance_voice_enabled, open_attendance_sessions,
+    recover_attendance_sessions, NewAttendanceSession, ATTENDANCE_RECOVERY_PAGE_SIZE,
 };
 use two_bot_cutover::{
     privacy::{opt_out_member, set_analytics_settings},
@@ -1134,6 +1135,252 @@ async fn positive_refresh_preserves_post_recovery_close_time_overlap() {
             .await
             .unwrap()
             .is_some());
+    })
+    .await;
+}
+
+type RawRow = (
+    String,
+    String,
+    bool,
+    bool,
+    OffsetDateTime,
+    Option<OffsetDateTime>,
+    Option<OffsetDateTime>,
+    Vec<String>,
+);
+
+/// Seed one raw row with a distinctive name, tags and observation stamp.
+async fn seed_raw(
+    pool: &PgPool,
+    guild: &str,
+    n: usize,
+    joined_at: OffsetDateTime,
+    left_at: Option<OffsetDateTime>,
+) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, channel_name,
+            name_observed_at, is_bot, afk, joined_at, left_at, event_keys)
+         VALUES ($1, $2, $3, $4, $5, FALSE, TRUE, $6, $7, ARRAY[$8]) RETURNING id",
+    )
+    .bind(guild)
+    .bind(format!("{}", 30_000_000_000_000_000_u64 + n as u64))
+    .bind(format!("{}", 40_000_000_000_000_000_u64 + n as u64))
+    .bind(format!("Room {n}"))
+    .bind(joined_at + Duration::minutes(1))
+    .bind(joined_at)
+    .bind(left_at)
+    .bind(format!("{}", 20_000_000_000_000_000_u64 + n as u64))
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn raw_state(pool: &PgPool, id: i64) -> (RawRow, OffsetDateTime) {
+    let row: RawRow = sqlx::query_as(
+        "SELECT channel_id, channel_name, is_bot, afk, joined_at, left_at, name_observed_at,
+                event_keys FROM event_voice_sessions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let changed = sqlx::query_scalar("SELECT changed_at FROM event_voice_sessions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (row, changed)
+}
+
+async fn row_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM event_voice_sessions")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn recovery_pages_and_disposes_more_than_one_page_of_open_rows() {
+    with_database(|pool| async move {
+        let base = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::hours(2);
+        let total = ATTENDANCE_RECOVERY_PAGE_SIZE * 2 + 5;
+        let mut expected = Vec::new();
+        for n in 0..total {
+            expected
+                .push(seed_raw(&pool, GUILD_A, n, base + Duration::seconds(n as i64), None).await);
+        }
+        // Closed rows and other-guild open rows never appear in the page.
+        seed_raw(&pool, GUILD_A, 900, base, Some(base + Duration::minutes(5))).await;
+        let other = seed_raw(&pool, GUILD_B, 901, base, None).await;
+        let before = row_count(&pool).await;
+
+        let mut seen = Vec::new();
+        let mut cursor = 0_i64;
+        let mut pages = 0;
+        loop {
+            let page = attendance_recovery_page(&pool, GUILD_A, cursor)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.len() <= ATTENDANCE_RECOVERY_PAGE_SIZE);
+            assert!(page.windows(2).all(|w| w[0].id < w[1].id));
+            assert!(page.iter().all(|r| r.id > cursor));
+            pages += 1;
+            let ids: Vec<i64> = page.iter().map(|r| r.id).collect();
+            cursor = *ids.last().unwrap();
+            assert_eq!(
+                recover_attendance_sessions(&pool, GUILD_A, &ids)
+                    .await
+                    .unwrap(),
+                ids.len() as u64
+            );
+            seen.extend(page);
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(seen.iter().map(|r| r.id).collect::<Vec<_>>(), expected);
+        // Minimal identity only, matching the seeded raw columns.
+        let first = &seen[0];
+        assert_eq!(first.member_id, "30000000000000000");
+        assert_eq!(first.channel_id, "40000000000000000");
+        // Everything in the guild is now disposed; the other guild is untouched.
+        assert!(attendance_recovery_page(&pool, GUILD_A, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(raw_state(&pool, other).await.0 .5, None);
+        assert_eq!(row_count(&pool).await, before, "no manufactured joins");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn recovery_closes_at_join_preserving_names_tags_and_observation() {
+    with_database(|pool| async move {
+        let joined = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::hours(1);
+        let id = seed_raw(&pool, GUILD_A, 1, joined, None).await;
+        let (before, changed_before) = raw_state(&pool, id).await;
+        assert_eq!(
+            recover_attendance_sessions(&pool, GUILD_A, &[id])
+                .await
+                .unwrap(),
+            1
+        );
+        let (after, changed_after) = raw_state(&pool, id).await;
+        assert_eq!(
+            after.5,
+            Some(joined),
+            "left_at equals joined_at: zero credit"
+        );
+        assert_eq!(
+            (&after.0, &after.1, after.2, after.3, after.4, after.6, &after.7),
+            (&before.0, &before.1, before.2, before.3, before.4, before.6, &before.7)
+        );
+        assert_eq!(after.1, "Room 1");
+        assert_eq!(after.7, vec!["20000000000000001"]);
+        assert!(changed_after > changed_before, "changed_at must advance");
+        // No capture window or tag is created by recovery.
+        let windows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_attendance_windows")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(windows, 0);
+        assert_eq!(row_count(&pool).await, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn recovery_preserves_closed_rows_refuses_cross_guild_ids_and_is_idempotent() {
+    with_database(|pool| async move {
+        let base = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::hours(3);
+        let closed_left = base + Duration::minutes(30);
+        let closed = seed_raw(&pool, GUILD_A, 1, base, Some(closed_left)).await;
+        let open = seed_raw(&pool, GUILD_A, 2, base, None).await;
+        let foreign = seed_raw(&pool, GUILD_B, 3, base, None).await;
+        let closed_before = raw_state(&pool, closed).await;
+        let foreign_before = raw_state(&pool, foreign).await;
+
+        // Only the guild-local open row is affected; closed and foreign IDs are ignored.
+        assert_eq!(
+            recover_attendance_sessions(&pool, GUILD_A, &[closed, open, foreign])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(raw_state(&pool, closed).await, closed_before);
+        assert_eq!(raw_state(&pool, closed).await.0 .5, Some(closed_left));
+        assert_eq!(raw_state(&pool, foreign).await, foreign_before);
+        assert_eq!(raw_state(&pool, foreign).await.0 .5, None);
+        let opened = raw_state(&pool, open).await;
+        assert_eq!(opened.0 .5, Some(base));
+
+        // Repeating, or replaying the same page, changes nothing further.
+        assert_eq!(
+            recover_attendance_sessions(&pool, GUILD_A, &[closed, open, foreign])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(raw_state(&pool, open).await, opened);
+        assert_eq!(raw_state(&pool, closed).await, closed_before);
+        assert_eq!(raw_state(&pool, foreign).await, foreign_before);
+        // Empty input is a no-op.
+        assert_eq!(
+            recover_attendance_sessions(&pool, GUILD_A, &[])
+                .await
+                .unwrap(),
+            0
+        );
+        // The foreign guild can still dispose of its own row.
+        assert_eq!(
+            recover_attendance_sessions(&pool, GUILD_B, &[foreign])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(raw_state(&pool, foreign).await.0 .5, Some(base));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn recovery_rejects_oversize_batches_before_any_mutation() {
+    with_database(|pool| async move {
+        let base = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::hours(1);
+        let mut ids = Vec::new();
+        for n in 0..=ATTENDANCE_RECOVERY_PAGE_SIZE {
+            ids.push(seed_raw(&pool, GUILD_A, n, base, None).await);
+        }
+        assert_eq!(ids.len(), ATTENDANCE_RECOVERY_PAGE_SIZE + 1);
+        let mut before = Vec::new();
+        for id in &ids {
+            before.push(raw_state(&pool, *id).await);
+        }
+        assert!(recover_attendance_sessions(&pool, GUILD_A, &ids)
+            .await
+            .is_err());
+        for (id, expected) in ids.iter().zip(&before) {
+            let state = raw_state(&pool, *id).await;
+            assert_eq!(&state, expected);
+            assert_eq!(state.0 .5, None);
+        }
+        // Exactly one page is accepted.
+        assert_eq!(
+            recover_attendance_sessions(&pool, GUILD_A, &ids[..ATTENDANCE_RECOVERY_PAGE_SIZE])
+                .await
+                .unwrap(),
+            ATTENDANCE_RECOVERY_PAGE_SIZE as u64
+        );
+        assert_eq!(
+            raw_state(&pool, ids[ATTENDANCE_RECOVERY_PAGE_SIZE])
+                .await
+                .0
+                 .5,
+            None
+        );
     })
     .await;
 }

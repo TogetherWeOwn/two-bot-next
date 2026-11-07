@@ -47,6 +47,87 @@ pub struct AttendanceSession {
     pub event_keys: Vec<String>,
 }
 
+/// Maximum open rows examined or conservatively finalized per recovery turn.
+pub const ATTENDANCE_RECOVERY_PAGE_SIZE: usize = 32;
+
+/// Minimal open-row identity for bounded presence recovery, without copying
+/// room names or tag arrays into the actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttendanceRecoveryRow {
+    pub id: i64,
+    pub member_id: String,
+    pub channel_id: String,
+}
+
+/// Read the next bounded recovery page. The cursor advances only after the
+/// corresponding finalization commits; failed pages can be retried safely.
+pub async fn attendance_recovery_page(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    after_id: i64,
+) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '900ms'")
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT id,
+                CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE '' END,
+                CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE '' END
+         FROM event_voice_sessions
+         WHERE guild_id = $1 AND left_at IS NULL AND id > $2 ORDER BY id LIMIT $3",
+    )
+    .bind(guild_id)
+    .bind(after_id)
+    .bind(ATTENDANCE_RECOVERY_PAGE_SIZE as i64)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, member_id, channel_id)| AttendanceRecoveryRow {
+            id,
+            member_id,
+            channel_id,
+        })
+        .collect())
+}
+
+/// Finalize only the supplied bounded page with no inferred offline credit.
+/// An interruption supplies no trustworthy leave boundary, so these rows close
+/// at their own join. Keep original tags and name-observation evidence intact;
+/// a snapshot never authorizes new capture or historical tags.
+pub async fn recover_attendance_sessions(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    ids: &[i64],
+) -> Result<u64, sqlx::Error> {
+    if ids.len() > ATTENDANCE_RECOVERY_PAGE_SIZE {
+        return Err(sqlx::Error::Protocol(
+            "attendance recovery page too large".into(),
+        ));
+    }
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '900ms'")
+        .execute(&mut *tx)
+        .await?;
+    two_bot_core::event_instance_store::lock_guild(&mut tx, guild_id).await?;
+    let affected = sqlx::query(
+        "UPDATE event_voice_sessions SET left_at = joined_at, changed_at = clock_timestamp()
+         WHERE guild_id = $1 AND id = ANY($2) AND left_at IS NULL",
+    )
+    .bind(guild_id)
+    .bind(ids)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(affected)
+}
+
 /// One session row to open, tagged with the windows containing the join.
 /// Owned Strings so the caller's Snowflake-to-text conversion happens once
 /// at the boundary; bundling the row keeps the insert surface under the
