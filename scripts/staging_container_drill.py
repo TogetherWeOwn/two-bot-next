@@ -901,7 +901,7 @@ def summary(evidence, failures):
         leg = evidence.get(name)
         if not leg:
             continue
-        if "first_ready" not in leg:
+        if "session_witness" not in leg:
             lines += ["", f"### {name} leg → `{leg.get('intended_image', 'unknown')}`",
                       "- incomplete; reached: " + ", ".join(key for key in
                                                             ("start", "fenced", "deployed",
