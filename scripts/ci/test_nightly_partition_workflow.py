@@ -431,9 +431,12 @@ class NightlyPartitionWorkflow(unittest.TestCase):
     def test_compiling_jobs_install_pinned_toolchain_and_commandref(self):
         for name in COMPILING:
             job = self.job(name)
-            tc = uses(job, "dtolnay/rust-toolchain")
-            self.assertTrue(tc, name)
-            self.assertEqual(tc[0]["with"]["toolchain"], "1.99.1", name)
+            tc = [s for s in job["steps"]
+                  if s.get("run") == "bash .github/scripts/install-rust-toolchain.sh"]
+            self.assertEqual(len(tc), 1, name)
+            self.assertEqual(tc[0]["shell"], "bash", name)
+            self.assertEqual(tc[0]["env"], {"RUST_TOOLCHAIN": "1.99.1", "RUST_COMPONENTS": ""}, name)
+            self.assertFalse(uses(job, "dtolnay/rust-toolchain"), name)
             self.assertIn("generate_command_reference.py", self.all_runs(name), name)
             # Generation must precede the first step that compiles or runs tests.
             names = [norm(s.get("run", "")) for s in job["steps"]]
@@ -522,6 +525,7 @@ class NightlyPartitionWorkflow(unittest.TestCase):
                 expensive = ("apt-get" in run or "createdb" in run
                              or "generate_command_reference.py" in run
                              or HELPER in run or "cargo " in run
+                             or "install-rust-toolchain.sh" in run
                              or "rust-toolchain@" in step.get("uses", "")
                              or "actions/cache@" in step.get("uses", ""))
                 if not expensive:

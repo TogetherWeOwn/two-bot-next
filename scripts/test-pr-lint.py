@@ -24,6 +24,15 @@ TOG = "TO" + "G"
 PAP = "PA" + "P"
 
 
+def python_source(script):
+    prefix = "python3 -I - <<'PY'\n"
+    suffix = "\nPY"
+    script = script.rstrip("\n")
+    if not script.startswith(prefix) or not script.endswith(suffix):
+        raise ValueError("Expected the isolated Python heredoc transport")
+    return script[len(prefix):-len(suffix)]
+
+
 def inline_script(name):
     # TOG-11810: the pr-lint steps live in the folded supply-chain workflow;
     # the exercised text must be the exact inline script CI runs.
@@ -33,7 +42,7 @@ def inline_script(name):
     end = start
     while end < len(lines) and (not lines[end].strip() or lines[end].startswith("          ")):
         end += 1
-    return textwrap.dedent("\n".join(lines[start:end]))
+    return python_source(textwrap.dedent("\n".join(lines[start:end])))
 
 
 RESOLVE = inline_script("Resolve PR title/body")
@@ -79,6 +88,18 @@ def outputs(text):
             raise AssertionError("Unterminated workflow output")
         result[key] = "\n".join(value)
     return result
+
+
+class InlineScriptTests(unittest.TestCase):
+    def test_extracts_python_without_rewriting_its_source(self):
+        source = "import os\n\nprint('$VALUE', '${{ data }}', os.getcwd())"
+        self.assertEqual(python_source("python3 -I - <<'PY'\n" + source + "\nPY\n"), source)
+
+    def test_rejects_changed_or_missing_transport(self):
+        for script in ("print('raw Python')", "python3 - <<'PY'\npass\nPY",
+                       "python3 -I - <<'PY'\npass", "python3 -I - <<'PY'\npass\nPY\nother"):
+            with self.subTest(script=script), self.assertRaises(ValueError):
+                python_source(script)
 
 
 class PRLintTests(unittest.TestCase):

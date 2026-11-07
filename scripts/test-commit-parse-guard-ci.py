@@ -8,7 +8,11 @@ import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-INSTALL = 'npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0'
+INSTALL = 'npm ci --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund'
+STAGE = [
+    'mkdir -p "$RUNNER_TEMP/release-fixture"',
+    'cp ../scripts/fixtures/commit-parser/package.json ../scripts/fixtures/commit-parser/package-lock.json "$RUNNER_TEMP/release-fixture/"',
+]
 GUARD = 'NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-commit-parse-guard.cjs'
 SELECTED = "        if: needs.job-inputs.outputs.worker != 'false'"
 
@@ -41,7 +45,8 @@ class CommitParserWorkflowTests(unittest.TestCase):
             commands = [line.strip() for line in step.splitlines()
                         if line.startswith("          ") and not line.lstrip().startswith("#")]
             inline = re.search(r"(?m)^        run: (?!\|)(.+)$", step)
-            self.assertEqual(commands if inline is None else [inline.group(1)], [command])
+            expected = [*STAGE, command] if index == installs[0] else [command]
+            self.assertEqual(commands if inline is None else [inline.group(1)], expected)
 
     def test_ci_runs_this_offline_suite(self):
         invocation = "python3 ../scripts/test-commit-parse-guard-ci.py"
