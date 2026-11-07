@@ -8091,6 +8091,7 @@ enum ActorCommand {
         current: Option<Snowflake>,
         is_bot: bool,
         afk_channel: Option<Snowflake>,
+        observed_at: time::OffsetDateTime,
     },
     /// A new or edited creator row (`/create`, `/textchannels`): the worker
     /// swaps it in for rooms created from here on.
@@ -9112,6 +9113,11 @@ where
                 // Unknown identity counts as human, like the snapshot.
                 is_bot: bot.unwrap_or(false),
                 afk_channel,
+                observed_at: time::OffsetDateTime::now_utc()
+                    .checked_sub(
+                        time::Duration::try_from(received.elapsed()).unwrap_or(time::Duration::MAX),
+                    )
+                    .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
             });
         }
         actor.try_send_command(command)
@@ -10470,6 +10476,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             current,
             is_bot,
             afk_channel,
+            observed_at,
         } = &command
         {
             crate::event_voice_channels::record_transition(
@@ -10501,6 +10508,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                     current: *current,
                     is_bot: *is_bot,
                     afk_channel: *afk_channel,
+                    observed_at: *observed_at,
                     previous_name,
                     current_name,
                     enabled: crate::event_attendance::logger_enabled(),
@@ -10569,6 +10577,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                     current,
                     is_bot,
                     afk_channel,
+                    observed_at,
                 } = &command
                 {
                     crate::event_voice_channels::record_transition(
@@ -10602,6 +10611,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                             current: *current,
                             is_bot: *is_bot,
                             afk_channel: *afk_channel,
+                            observed_at: *observed_at,
                             previous_name,
                             current_name,
                             enabled: crate::event_attendance::logger_enabled(),

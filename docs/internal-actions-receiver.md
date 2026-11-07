@@ -176,7 +176,7 @@ No migration or flag enablement is authorized by this guide alone.
 1. Merge this change after its release gates. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values), only under the separately authorized enablement contract; no role keys or optional capability gates travel through this Worker.
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
-4. Operator applies migrations `0423` (settings CAS), `0424` (event outcome) and `0471` (event-attendance windows/sessions) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns, and `event.attendance.read` answers `internal` without its tables), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
+4. Operator applies migrations `0423` (settings CAS), `0424` (event outcome), `0471` (attendance windows/sessions), `0472` (accepted event instances) and `0475` (attendance recovery boundary) first, as required above even for a dark attendance build (the bot does not apply migrations; an enabled receiver's finish fails without the columns, and `event.attendance.read` answers `internal` without its tables), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
 5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete --env staging TWO_INTERNAL_ACTIONS --message <sha>`, same precheck and stamp as above), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
 
 Migration `0424` adds the nullable `internal_idempotency.outcome` column that
@@ -469,6 +469,12 @@ minutes; their non-AFK intervals are unioned separately for peak concurrency, so
 failed move-close cannot count that member twice. `sessions` still counts the
 stored rows. A direct room move preserves the old span when its channel matches
 the observed previous channel, even after that span's original event window ends.
+A fresh rejoin or foreign-channel leave cannot prove continuity for a missed close;
+that stale span finalizes at its join with original tags only. Boundaries use gateway
+observation time, not actor processing time. Opens delayed over one minute or dated
+in the future are dropped; closes keep their observed boundary. The write transaction
+still refuses new opens after grace. An existing continuous captured span can acquire
+a later accepted window's overlap even when that window closed before departure.
 `rooms` carries the latest name the logger saw per channel with at
 least one human session. Still-open rows clamp at `min(now, window close)`; `final`
 is true only once the window plus its 15-minute grace has passed, and the website
@@ -505,6 +511,12 @@ recovery history is unknown; no attendance is backfilled. Newly accepted instanc
 start without a recovery fence until an actual absence/recovery. The logger still
 finalizes existing rows when the shared lookup returns no live windows. Both
 attendance migrations are additive; shipped migration `0472` is unchanged.
+
+Signed attendance reads admit at most 4,096 raw spans and 1 MiB of aggregate
+room-name bytes before projection. SQL bounds individual text cells and streams
+rows; an extra span, overlong name or exhausted byte budget refuses the entire
+read as `internal`, never a silently truncated positive list. The independent
+serialized-result budget still reserves the relay envelope below 64 KiB.
 
 | Code | Status | Retryable |
 | --- | --- | --- |

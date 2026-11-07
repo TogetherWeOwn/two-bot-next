@@ -183,13 +183,11 @@ fn overlapping_keys(windows: &[AttendanceWindowMs], from_ms: i64, to_ms: i64) ->
 /// without a database:
 ///
 /// - same-channel frames plan nothing (the caller filters them already);
-/// - closes finalize every open row at now, except a stale row a missed
-///   close left behind: when the member's next join/move opens a new row in
-///   a window the old row never overlapped and the observed previous channel
-///   does not match the row, the stale row closes at its own
-///   `joined_at` (zero length, original tags only) so it can never inflate
-///   the new event's minutes. Leaves always close at now — the member just
-///   left — as do joins/moves when no window is open;
+/// - a row matching the observed previous channel finalizes at observation
+///   time, preserving continuous moves and leaves even after grace;
+/// - every foreign row closes at its own `joined_at` (zero length, original
+///   tags only). Neither a shared event nor a fresh join proves continuity
+///   after a missed close;
 /// - the tag union widens to every window overlapping `[joined_at, left_at]`,
 ///   which tags campers that never transition mid-event when they finally
 ///   leave during a later window;
@@ -211,20 +209,18 @@ pub(crate) fn plan_transition(
         .collect();
     let mut closes = Vec::new();
     for row in open_rows {
-        let same_event = open_now
-            .iter()
-            .any(|window| contains_ms(window.starts_ms, window.ends_ms, row.joined_ms));
-        // A row in the observed previous channel is continuous, even when its
-        // join predates every currently-open window. Only a foreign row without
-        // that evidence can be treated as a missed close on a new join/move.
-        // Leaves and out-of-window transitions close at now.
+        // Only the observed previous channel proves continuity. A shared event
+        // cannot distinguish a continuous move from a fresh rejoin after a lost
+        // leave. Foreign rows (including on leaves) conservatively lose credit.
         let continuous = row.channel_id.is_some() && row.channel_id == previous;
-        let stale = current.is_some() && !open_now.is_empty() && !same_event && !continuous;
+        let stale = !continuous;
         let left_ms = if stale { row.joined_ms } else { now_ms };
         let mut tag_union = row.event_keys.clone();
-        for key in overlapping_keys(windows, row.joined_ms, left_ms) {
-            if !tag_union.contains(&key) {
-                tag_union.push(key);
+        if continuous {
+            for key in overlapping_keys(windows, row.joined_ms, left_ms) {
+                if !tag_union.contains(&key) {
+                    tag_union.push(key);
+                }
             }
         }
         tag_union.sort();
@@ -275,6 +271,8 @@ pub struct VoiceTransition {
     pub afk_channel: Option<Snowflake>,
     pub previous_name: Option<String>,
     pub current_name: Option<String>,
+    /// Gateway observation time, never the actor's later processing time.
+    pub observed_at: OffsetDateTime,
     pub enabled: bool,
 }
 
@@ -293,6 +291,7 @@ pub async fn record_transition(store: &impl AttendanceStore, transition: VoiceTr
         afk_channel,
         previous_name,
         current_name,
+        observed_at,
         enabled,
     } = transition;
     if !enabled || previous == current {
@@ -361,8 +360,14 @@ pub async fn record_transition(store: &impl AttendanceStore, transition: VoiceTr
             event_keys: row.event_keys.clone(),
         })
         .collect();
-    let now = OffsetDateTime::now_utc();
+    let now = observed_at;
     let mut plan = plan_transition(&window_ms, &rows, previous, current, millis_of(now));
+    // Late opens fail closed: persist no replay/backfill after a minute or from
+    // a future clock. Closes retain their observed boundary even when delayed.
+    let age = OffsetDateTime::now_utc() - observed_at;
+    if age < time::Duration::ZERO || age > time::Duration::minutes(1) {
+        plan.open = None;
+    }
     // Contract v2 §9 opt-out at capture: a suppressed member, or a guild
     // with `voice_enabled = off`, opens no span — absent from the record,
     // not anonymised in it. Checked only when an open is planned, so leaves
@@ -438,15 +443,16 @@ pub async fn record_transition(store: &impl AttendanceStore, transition: VoiceTr
             .and_then(|row| row.channel_id)
             .zip(previous)
             .is_some_and(|(channel, previous)| channel == previous);
-        let name = if live_match {
-            previous_name.clone().unwrap_or_default()
-        } else {
-            open_rows
-                .iter()
-                .find(|row| row.id == close.id)
-                .map(|row| row.channel_name.clone())
-                .unwrap_or_default()
-        };
+        let name = live_match
+            .then(|| previous_name.clone())
+            .flatten()
+            .unwrap_or_else(|| {
+                open_rows
+                    .iter()
+                    .find(|row| row.id == close.id)
+                    .map(|row| row.channel_name.clone())
+                    .unwrap_or_default()
+            });
         let outcome = tokio::time::timeout(
             std::time::Duration::from_millis(REVALIDATE_TIMEOUT_MS),
             store.close_attendance_session(
@@ -591,6 +597,18 @@ pub fn project_attendance(
     sessions: &[SessionMs],
     now_ms: i64,
 ) -> Result<Value, AttendanceRefusal> {
+    if sessions.len() > two_bot_core::internal_action_store::MAX_ATTENDANCE_INPUT_SESSIONS
+        || sessions
+            .iter()
+            .try_fold(0usize, |total, row| {
+                total.checked_add(row.channel_name.len())
+            })
+            .is_none_or(|bytes| {
+                bytes > two_bot_core::internal_action_store::MAX_ATTENDANCE_INPUT_NAME_BYTES
+            })
+    {
+        return Err(AttendanceRefusal::OverBudget);
+    }
     let (open_ms, close_ms) = window_open_ms(window.starts_ms, window.ends_ms);
     let human: Vec<&SessionMs> = sessions.iter().filter(|row| !row.is_bot).collect();
     if human.is_empty() {
@@ -689,6 +707,22 @@ mod tests {
     use super::*;
 
     const MIN: i64 = 60_000;
+
+    #[test]
+    fn raw_history_budget_refuses_before_aggregation_even_when_output_would_be_tiny() {
+        let row = session(1, 7, "Lobby", false, false, 0, Some(MIN));
+        let limit = two_bot_core::internal_action_store::MAX_ATTENDANCE_INPUT_SESSIONS;
+        let mut rows = vec![row; limit];
+        let event = window("event", 0, MIN);
+        let at_limit = project_attendance("event", &event, &rows, 20 * MIN).unwrap();
+        assert_eq!(at_limit["members"].as_array().unwrap().len(), 1);
+        assert_eq!(at_limit["members"][0]["sessions"], limit);
+        rows.push(rows[0].clone());
+        assert_eq!(
+            project_attendance("event", &event, &rows, 20 * MIN),
+            Err(AttendanceRefusal::OverBudget)
+        );
+    }
 
     #[test]
     fn partial_minutes_accumulate_across_sessions_before_rounding() {
@@ -902,6 +936,19 @@ mod tests {
         let stale = plan_transition(&windows, &foreign, Some(7), Some(9), 80 * MIN);
         assert_eq!(stale.closes[0].left_ms, 0);
         assert_eq!(stale.closes[0].tag_union, vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn fresh_same_event_rejoin_and_foreign_leave_do_not_bridge_failed_closes() {
+        let windows = vec![window("game-night", 0, 60 * MIN)];
+        let open = vec![row(1, 7, 10 * MIN, &["game-night"])];
+        for (previous, current) in [(None, Some(7)), (Some(9), None), (None, Some(9))] {
+            let plan = plan_transition(&windows, &open, previous, current, 40 * MIN);
+            assert_eq!(plan.closes[0].left_ms, 10 * MIN);
+            assert_eq!(plan.closes[0].tag_union, ["game-night"]);
+        }
+        let continuous = plan_transition(&windows, &open, Some(7), Some(9), 40 * MIN);
+        assert_eq!(continuous.closes[0].left_ms, 40 * MIN);
     }
 
     #[test]
@@ -1205,6 +1252,7 @@ mod tests {
             afk_channel: None,
             previous_name: None,
             current_name: Some("lobby".to_owned()),
+            observed_at: OffsetDateTime::now_utc(),
             enabled: true,
         }
     }
@@ -1740,6 +1788,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_processing_preserves_observed_join_and_leave_boundaries() {
+        let store = FaultStore::new().with_open_row("7", "lobby");
+        let observed_at = OffsetDateTime::now_utc() - time::Duration::seconds(20);
+        record_transition(
+            &store,
+            VoiceTransition {
+                observed_at,
+                ..move_transition()
+            },
+        )
+        .await;
+        let writes = store.writes.lock().expect("writes lock");
+        assert_eq!(millis_of(writes.closes[0].1), millis_of(observed_at));
+        assert_eq!(writes.inserts[0].joined_at, observed_at);
+    }
+
+    #[tokio::test]
+    async fn excessively_late_or_future_frames_finalize_but_never_backfill_opens() {
+        for offset in [-120, 30] {
+            let store = FaultStore::new().with_open_row("7", "lobby");
+            let observed_at = OffsetDateTime::now_utc() + time::Duration::seconds(offset);
+            record_transition(
+                &store,
+                VoiceTransition {
+                    observed_at,
+                    ..move_transition()
+                },
+            )
+            .await;
+            let writes = store.writes.lock().expect("writes lock");
+            assert!(writes.inserts.is_empty());
+            assert_eq!(writes.closes.len(), 1);
+            assert_eq!(millis_of(writes.closes[0].1), millis_of(observed_at));
+        }
+    }
+
+    #[tokio::test]
     async fn join_inserts_tagged_row_with_afk_and_bot_flags() {
         let store = FaultStore::new();
         record_transition(
@@ -1804,6 +1889,22 @@ mod tests {
         assert_eq!(writes.closes[0].2, "lobby-renamed");
         assert_eq!(writes.inserts[0].channel_id, "9");
         assert_eq!(writes.inserts[0].channel_name, "stage");
+    }
+
+    #[tokio::test]
+    async fn close_keeps_known_name_when_matching_channel_metadata_is_missing() {
+        let store = FaultStore::new().with_open_row("7", "known-room");
+        record_transition(
+            &store,
+            VoiceTransition {
+                previous_name: None,
+                ..move_transition()
+            },
+        )
+        .await;
+        let writes = store.writes.lock().expect("writes lock");
+        assert_eq!(writes.closes.len(), 1);
+        assert_eq!(writes.closes[0].2, "known-room");
     }
 
     #[tokio::test]

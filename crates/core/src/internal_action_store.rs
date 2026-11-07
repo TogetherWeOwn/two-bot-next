@@ -3,6 +3,7 @@
 //! Stale/unknown intents are never reclaimed. Reconciliation records a proven
 //! terminal outcome, not a new execution lease. See `docs/internal-action-store.md`.
 
+use futures_util::TryStreamExt;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::str::FromStr as _;
@@ -1065,45 +1066,54 @@ impl InternalActionStore {
         let Some((bound, stops)) = bound else {
             return Ok(Vec::new());
         };
-        Ok(sqlx::query_as::<
+        // Stream a bounded prefix and refuse an overflow, never truncate totals.
+        // Bound each text cell in SQL before the driver materializes it; an
+        // overlong prefix remains invalid and cannot masquerade as a valid ID.
+        let mut raw = sqlx::query_as::<
             _,
-            (
-                String,
-                String,
-                String,
-                bool,
-                bool,
-                OffsetDateTime,
-                Option<OffsetDateTime>,
-            ),
+            (String, String, String, bool, bool, OffsetDateTime, Option<OffsetDateTime>),
         >(
-            "SELECT member_id, channel_id, channel_name, is_bot, afk, \
-                    joined_at, left_at \
-             FROM event_voice_sessions \
-             WHERE guild_id = $1 AND event_keys @> ARRAY[$2] \
-             ORDER BY joined_at, id",
+            "SELECT LEFT(member_id, 21), LEFT(channel_id, 21), LEFT(channel_name, 65537), is_bot, afk,
+                    joined_at, left_at
+             FROM event_voice_sessions
+             WHERE guild_id = $1 AND event_keys @> ARRAY[$2]
+             ORDER BY joined_at, id LIMIT $3",
         )
         .bind(guild_id)
         .bind(event_key)
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(
-            |(member_id, channel_id, channel_name, is_bot, afk, joined_at, left_at)| {
-                AttendanceSession {
-                    member_id,
-                    channel_id,
-                    channel_name,
-                    is_bot,
-                    afk,
-                    joined_at,
-                    left_at: Some(cap_attendance_session(joined_at, left_at, bound, &stops)),
-                }
-            },
-        )
-        .collect())
+        .bind((MAX_ATTENDANCE_INPUT_SESSIONS + 1) as i64)
+        .fetch(&self.pool);
+        let mut sessions = Vec::new();
+        let mut name_bytes = 0usize;
+        while let Some((member_id, channel_id, channel_name, is_bot, afk, joined_at, left_at)) =
+            raw.try_next().await?
+        {
+            name_bytes = name_bytes.saturating_add(channel_name.len());
+            if sessions.len() == MAX_ATTENDANCE_INPUT_SESSIONS
+                || channel_name.len() > 65536
+                || name_bytes > MAX_ATTENDANCE_INPUT_NAME_BYTES
+            {
+                return Err(InternalStoreError::Unavailable);
+            }
+            sessions.push(AttendanceSession {
+                member_id,
+                channel_id,
+                channel_name,
+                is_bot,
+                afk,
+                joined_at,
+                left_at: Some(cap_attendance_session(joined_at, left_at, bound, &stops)),
+            });
+        }
+        Ok(sessions)
     }
 }
+
+/// Maximum raw spans admitted to one signed attendance read. Overflow refuses
+/// the complete read; it never yields a truncated positive list.
+pub const MAX_ATTENDANCE_INPUT_SESSIONS: usize = 4096;
+/// Aggregate room-name bytes admitted before projection/copying.
+pub const MAX_ATTENDANCE_INPUT_NAME_BYTES: usize = 1024 * 1024;
 
 /// Shared historical-window projection used by both attendance stores.
 /// Identity is fixed at capture; key repointing cannot redirect a past record.

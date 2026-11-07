@@ -66,6 +66,78 @@ async fn map(pool: &PgPool, guild: &str, key: &str, event_id: &str) {
 }
 
 #[tokio::test]
+async fn signed_read_store_refuses_large_raw_history_even_with_one_output_member() {
+    with_database(|pool| async move {
+        let now = OffsetDateTime::now_utc();
+        upsert_event(&pool, GUILD_A, &iso(now), &event(now)).await.unwrap();
+        map(&pool, GUILD_A, "game-night", EVENT_A).await;
+        let id = insert_attendance_session(&pool, &session(now, &["game-night"])).await.unwrap();
+        sqlx::query("INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, channel_name, is_bot, afk, joined_at, left_at, event_keys)
+            SELECT s.guild_id, s.member_id, s.channel_id, s.channel_name, s.is_bot, s.afk, s.joined_at, s.left_at, s.event_keys
+            FROM event_voice_sessions s CROSS JOIN generate_series(1, $2::int) WHERE s.id = $1")
+            .bind(id).bind(two_bot_core::internal_action_store::MAX_ATTENDANCE_INPUT_SESSIONS as i32)
+            .execute(&pool).await.unwrap();
+        let store = InternalActionStore::new(pool.clone());
+        assert!(store.attendance_sessions_for_event_key(GUILD_A, "game-night").await.is_err());
+        sqlx::query("DELETE FROM event_voice_sessions WHERE id = $1").bind(id).execute(&pool).await.unwrap();
+        let rows = store.attendance_sessions_for_event_key(GUILD_A, "game-night").await.unwrap();
+        assert_eq!(rows.len(), two_bot_core::internal_action_store::MAX_ATTENDANCE_INPUT_SESSIONS);
+        sqlx::query("UPDATE event_voice_sessions SET channel_name = repeat('x', 2000000) WHERE id = (SELECT MIN(id) FROM event_voice_sessions)")
+            .execute(&pool).await.unwrap();
+        assert!(store.attendance_sessions_for_event_key(GUILD_A, "game-night").await.is_err());
+    }).await;
+}
+
+#[tokio::test]
+async fn continuous_captured_span_tags_a_later_window_already_past_grace() {
+    with_database(|pool| async move {
+        let now = OffsetDateTime::now_utc();
+        let mut a = event(now);
+        a.starts_at = iso(now - Duration::hours(3));
+        a.ends_at = Some(iso(now + Duration::hours(1)));
+        upsert_event(&pool, GUILD_A, &iso(now), &a).await.unwrap();
+        map(&pool, GUILD_A, "a", EVENT_A).await;
+        let mut new = session(now, &["a"]);
+        new.joined_at = now - Duration::minutes(150);
+        let id = insert_attendance_session(&pool, &new).await.unwrap();
+        let mut b = event(now);
+        b.id = EVENT_B.to_owned();
+        b.starts_at = iso(now - Duration::hours(2));
+        b.ends_at = Some(iso(now - Duration::hours(1)));
+        // Establish accepted live evidence before its positive completion.
+        b.status = EventStatus::Active;
+        upsert_event(&pool, GUILD_A, &iso(now - Duration::seconds(1)), &b)
+            .await
+            .unwrap();
+        b.status = EventStatus::Completed;
+        upsert_event(&pool, GUILD_A, &iso(now), &b).await.unwrap();
+        map(&pool, GUILD_A, "b", EVENT_B).await;
+        let windows = attendance_windows_for_guild(&pool, GUILD_A).await.unwrap();
+        assert!(windows.iter().any(|window| window.event_key == "b"));
+        close_attendance_session(&pool, id, now, "Lobby", &["b".to_owned()])
+            .await
+            .unwrap();
+        let rows = attendance_sessions_for_event_key(&pool, GUILD_A, "b")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].joined_at.unix_timestamp(),
+            new.joined_at.unix_timestamp()
+        );
+        assert_eq!(
+            rows[0].left_at.unwrap().unix_timestamp(),
+            (now - Duration::minutes(45)).unix_timestamp()
+        );
+        // The same expired schedule never authorizes a new span.
+        assert!(insert_attendance_session(&pool, &session(now, &["b"]))
+            .await
+            .is_err());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn raw_retention_store_count_and_delete_share_the_strict_cutoff() {
     with_database(|pool| async move {
         let store = two_bot_cutover::voice_rooms::PgRoomStore::new(pool.clone());
@@ -163,10 +235,14 @@ async fn mappings_and_historical_windows_never_authorize_capture() {
         upsert_event(&pool, GUILD_A, &iso(now - Duration::minutes(2)), &observed)
             .await
             .unwrap();
-        assert!(attendance_windows_for_guild(&pool, GUILD_A)
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            attendance_windows_for_guild(&pool, GUILD_A)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "an expired candidate may finalize existing spans, never open one"
+        );
         assert!(
             insert_attendance_session(&pool, &session(now, &["game-night"]))
                 .await

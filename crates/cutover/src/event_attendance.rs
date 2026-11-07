@@ -62,7 +62,9 @@ pub struct NewAttendanceSession {
     pub event_keys: Vec<String>,
 }
 
-// Only accepted, finite, currently open instances can authorize capture.
+// Only accepted, finite instances can authorize tags. Planning/closing may
+// consider expired windows overlapping an already-captured continuous span;
+// opening a new span still requires a currently open window ($3 = false).
 // A key may alias an instance, but repointing a captured key never combines
 // attendance from different occurrences. Channel bindings are not schedules;
 // every channel counts, so a bound event room is not required here.
@@ -73,7 +75,8 @@ const CAPTURE_WINDOWS_SQL: &str =
        AND w.revoked_at IS NULL AND w.status IN ('scheduled', 'active', 'completed')
        AND w.ends_at IS NOT NULL AND w.ends_at >= w.starts_at
        AND w.starts_at <= clock_timestamp() + INTERVAL '15 minutes'
-       AND w.ends_at >= clock_timestamp() - INTERVAL '15 minutes'
+       AND w.ends_at >= clock_timestamp() - INTERVAL '90 days'
+       AND ($3::boolean OR w.ends_at >= clock_timestamp() - INTERVAL '15 minutes')
        AND ($2::timestamptz IS NULL OR w.attendance_recovered_at IS NULL
             OR w.attendance_recovered_at <= $2)
        AND NOT EXISTS (SELECT 1 FROM event_voice_channels c WHERE c.event_id = w.event_id
@@ -83,7 +86,8 @@ const CAPTURE_WINDOWS_SQL: &str =
                          AND (h.event_id <> w.event_id OR h.instance_starts_at <> w.instance_starts_at))
      ORDER BY w.starts_at, k.event_key";
 
-/// Currently capturable mapped windows from shared accepted-instance evidence.
+/// Accepted candidate windows within raw retention for transition planning.
+/// Expired candidates can tag an existing overlapping span, never open one.
 /// Historical attendance records cannot authorize a new span or tag.
 pub async fn attendance_windows_for_guild(
     pool: &sqlx::PgPool,
@@ -92,6 +96,7 @@ pub async fn attendance_windows_for_guild(
     sqlx::query_as::<_, (String, OffsetDateTime, OffsetDateTime)>(CAPTURE_WINDOWS_SQL)
         .bind(guild_id)
         .bind(None::<OffsetDateTime>)
+        .bind(true)
         .fetch_all(pool)
         .await
         .map(|rows| {
@@ -211,6 +216,7 @@ async fn capture_tags_in(
     requested: &[String],
     at: OffsetDateTime,
     since: OffsetDateTime,
+    closing: bool,
 ) -> Result<Vec<String>, sqlx::Error> {
     let permitted: bool = sqlx::query_scalar(
         "SELECT NOT EXISTS (SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)
@@ -227,13 +233,14 @@ async fn capture_tags_in(
         sqlx::query_as(CAPTURE_WINDOWS_SQL)
             .bind(guild_id)
             .bind(since)
+            .bind(closing)
             .fetch_all(&mut *connection)
             .await?;
     let grace = time::Duration::minutes(ATTENDANCE_WINDOW_GRACE_MINUTES);
     let tags: Vec<String> = windows
         .into_iter()
         .filter(|(key, start, end)| {
-            requested.contains(key) && *start - grace <= at && at <= *end + grace
+            requested.contains(key) && *start - grace <= at && since <= *end + grace
         })
         .map(|(key, _, _)| key)
         .collect();
@@ -271,6 +278,7 @@ pub async fn insert_attendance_session(
         &new.event_keys,
         new.joined_at,
         new.joined_at,
+        false,
     )
     .await?;
     if tags.is_empty() {
@@ -334,7 +342,7 @@ pub async fn close_attendance_session(
         .collect();
     if !requested.is_empty() {
         for tag in capture_tags_in(
-            &mut tx, &guild_id, &member_id, &requested, left_at, joined_at,
+            &mut tx, &guild_id, &member_id, &requested, left_at, joined_at, true,
         )
         .await?
         {

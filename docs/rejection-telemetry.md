@@ -63,17 +63,17 @@ bodies hands callers free JSON work.
 Suppression runs per `(class, key, action)` bucket inside a tumbling window
 (default 60 s). At most `max_tracked` buckets are tracked (default 32,
 ceiling 1024); overflow folds into one `other` bucket per class, so memory is
-at most `max_tracked` keyed buckets plus 11 fixed overflow buckets. Each
+at most `max_tracked` keyed buckets plus 12 fixed overflow buckets. Each
 bucket emits at most `samples_per_window` samples (default 1, ceiling 100)
 plus one summary when the window closes.
 
 One window emits at most
 
 ```
-(max_tracked + 11) * (samples_per_window + 1)
+(max_tracked + 12) * (samples_per_window + 1)
 ```
 
-records however large the flood — 86 with defaults. Across windows each
+records however large the flood — 88 with defaults. Across windows each
 window re-arms samples and closes with its own summaries. `close_window`
 (and the rollover inside `record`) emits one summary per bucket that
 suppressed anything; call `flush` from a periodic tick so a flood that stops
