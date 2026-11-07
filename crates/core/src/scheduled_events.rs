@@ -94,6 +94,8 @@ pub struct RawScheduledEvent {
     pub id: Option<String>,
     pub name: Option<String>,
     pub scheduled_start_time: Option<String>,
+    /// Confirmed finite end; `None` when Discord gave none or it is unknown.
+    pub scheduled_end_time: Option<String>,
     pub channel_id: Option<String>,
     pub description: Option<String>,
     pub status: Option<i64>,
@@ -106,6 +108,9 @@ pub struct ScheduledEvent {
     pub name: String,
     /// UTC millis ISO-8601 (`toISOString` shape, e.g. `2026-09-06T17:30:00.000Z`).
     pub starts_at: String,
+    /// Confirmed finite end in the same shape as `starts_at`; `None` when
+    /// unknown or not provided.
+    pub ends_at: Option<String>,
     pub channel_id: Option<String>,
     pub description: Option<String>,
     pub status: EventStatus,
@@ -163,10 +168,22 @@ pub fn normalize_event(raw: &RawScheduledEvent) -> Option<ScheduledEvent> {
     {
         return None;
     }
+    let start_millis = timestamp_millis(start)?;
+    let ends_at = match raw.scheduled_end_time.as_deref() {
+        None => None,
+        Some(end) => {
+            let end_millis = timestamp_millis(end)?;
+            if end_millis < start_millis {
+                return None;
+            }
+            Some(crate::funnel::format_iso_millis(end_millis))
+        }
+    };
     Some(ScheduledEvent {
         id: id.to_owned(),
         name: name.to_owned(),
-        starts_at: normalize_timestamp(start)?,
+        starts_at: crate::funnel::format_iso_millis(start_millis),
+        ends_at,
         channel_id: raw.channel_id.clone(),
         description: raw.description.clone(),
         status,
@@ -195,15 +212,15 @@ pub fn normalize_events(raw: &[RawScheduledEvent]) -> Option<Vec<ScheduledEvent>
     Some(events)
 }
 
-/// Parse the complete RFC 3339 instant fallibly, then reuse the UTC millis
-/// renderer (legacy `new Date(s).toISOString()`). Malformed timestamps must
-/// reject the whole response, not panic or silently ignore trailing input.
+/// Parse the complete RFC 3339 instant fallibly into UTC epoch millis (the
+/// input of the legacy `new Date(s).toISOString()` renderer). Malformed
+/// timestamps must reject the whole response, not panic or silently ignore
+/// trailing input.
 /// Source: <https://docs.rs/time/0.3.55/time/format_description/well_known/struct.Rfc3339.html>
-fn normalize_timestamp(s: &str) -> Option<String> {
+fn timestamp_millis(s: &str) -> Option<i64> {
     let instant =
         time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;
-    let millis = i64::try_from(instant.unix_timestamp_nanos().div_euclid(1_000_000)).ok()?;
-    Some(crate::funnel::format_iso_millis(millis))
+    i64::try_from(instant.unix_timestamp_nanos().div_euclid(1_000_000)).ok()
 }
 
 #[cfg(test)]
@@ -215,6 +232,7 @@ mod tests {
             id: Some(id.to_owned()),
             name: Some(name.to_owned()),
             scheduled_start_time: Some(start.to_owned()),
+            scheduled_end_time: None,
             channel_id: Some("voice-1".to_owned()),
             description: Some("Join the weekly games night.".to_owned()),
             status: Some(status),
@@ -319,6 +337,7 @@ mod tests {
             id: Some("event-1".to_owned()),
             name: Some("Good event".to_owned()),
             scheduled_start_time: Some("2026-09-06T18:00:00.000Z".to_owned()),
+            scheduled_end_time: None,
             channel_id: None,
             description: None,
             status: Some(1),
@@ -375,5 +394,40 @@ mod tests {
             0,
             "a successful empty response is a valid empty mirror"
         );
+    }
+
+    #[test]
+    fn confirmed_end_is_normalized_and_absent_end_stays_none() {
+        let with_end = RawScheduledEvent {
+            scheduled_end_time: Some("2026-09-06T20:30:00.5+01:00".to_owned()),
+            ..raw("x", "n", "2026-09-06T18:00:00.000Z", 1)
+        };
+        let event = normalize_event(&with_end).expect("normalizes");
+        assert_eq!(event.ends_at.as_deref(), Some("2026-09-06T19:30:00.500Z"));
+        let equal = RawScheduledEvent {
+            scheduled_end_time: Some("2026-09-06T18:00:00Z".to_owned()),
+            ..raw("x", "n", "2026-09-06T18:00:00.000Z", 1)
+        };
+        assert_eq!(
+            normalize_event(&equal).expect("equal end is valid").ends_at,
+            Some("2026-09-06T18:00:00.000Z".to_owned())
+        );
+        let none = normalize_event(&raw("x", "n", "2026-09-06T18:00:00.000Z", 1)).expect("ok");
+        assert_eq!(none.ends_at, None);
+    }
+
+    #[test]
+    fn malformed_or_earlier_end_rejects_the_event_and_snapshot() {
+        for end in ["not-a-date", "2026-09-06T20:00:00", "2026-09-06T17:59:59Z"] {
+            let bad = RawScheduledEvent {
+                scheduled_end_time: Some(end.to_owned()),
+                ..raw("bad", "n", "2026-09-06T18:00:00.000Z", 1)
+            };
+            assert!(normalize_event(&bad).is_none(), "{end}");
+            assert!(
+                normalize_events(&[raw("good", "n", "2026-09-06T18:00:00.000Z", 1), bad]).is_none(),
+                "{end}"
+            );
+        }
     }
 }

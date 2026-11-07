@@ -776,7 +776,9 @@ close it as "fast burn resolved": the fast window can clear while the slow
 grind continues.
 
 The first firing also files one tracking issue by itself. Every five minutes
-the `slow-burn-tracker` workflow scrapes staging `/ops/metrics`, replays the
+the `slow-burn-tracker` workflow observes the authenticated staging control state
+without starting staging or acquiring/extending a window. During a validated
+active window it scrapes staging `/ops/metrics`, replays the
 checked-in slow-burn verdict over its cached ring and reconciles the
 `slow-burn` label: no open card means file one, an open card stays untouched
 (a refresh comment lands at most every six hours, so a refire never
@@ -809,6 +811,18 @@ binding. Prove the path by dispatching the workflow with the fire and
 clear fixtures: a separate `fixture` job, which binds no environment and
 holds no scrape bearer, runs the real verdict and the real issue calls under
 the `slow-burn-test` label without touching the live ring.
+
+Intentional idle retains a `staging-use-observer.jsonl` receipt with
+`sample: false`, `code: intentional_idle` and `health: unknown`. It skips the
+scrape, evaluator, issue writes and cache save: no zero/healthy sample is
+invented, no incident is closed and no coverage timestamp is refreshed. On the
+next active window the unchanged evaluator still detects real gaps and requires
+full history before clearing a burn. A running container after expiry/release,
+malformed authority or a failed control read fails closed, not idle/healthy.
+The existing `STAGING_OWNERSHIP_CONTROL_TOKEN` is isolated in the observer step;
+it never reaches the scrape/evaluator. This integration is not verified
+until the [lifecycle activation gates](staging-rollout-gate.md#first-activation-roll-forward-bootstrap)
+pass; an idle receipt proves neither database suspension nor zero billed usage.
 
 #### Alert: voice creator-map stale
 
@@ -2889,6 +2903,24 @@ measurement and cannot prove B2's under-60-second recovery criterion. An empty
 `target_version` instead selects the [daily automatic rollback proof](production-deploy.md#daily-staging-proof),
 which also runs on a daily schedule and verifies both Worker and image restoration.
 Gateway-session count is not observable from probes; read the Worker logs for it.
+
+The finite-use implementation (activated by merge through the ordinary staging deploy; see the [first-activation bootstrap](staging-rollout-gate.md#first-activation-roll-forward-bootstrap) and its unmet live gates)
+validates immutable bounded-policy/environment/SHA bindings on **both** Worker
+versions before startup. Both must stamp the same compiled-image SHA: a
+Worker-only rollback cannot change the image. Old always-on, unstamped or
+incompatible versions refuse; do not substitute them to get a green drill.
+Live use acquires at most 25 minutes and verifies the exact baseline before the
+first fence. Each takeover rebinds the same run/attempt/absolute expiry before
+readiness probes; restoring after a partial fenced leg retains the original
+authorization and deadline, never mints recovery time. The original outage and
+readiness budgets still apply. Final release confirms native stop. The separate
+`staging-worker-drill-use.ndjson` artifact records acquire/readiness/rebind/release;
+runner loss and cancellation rely on persisted native expiry, not a host timer.
+`--dry-run` remains read-only: it validates the same target policies but acquires
+nothing, so an idle baseline refuses rather than waking it for a plan.
+
+Any lifecycle-control refusal conservatively stops later controls and leaves
+native expiry responsible for teardown; a refusal is not stop confirmation.
 If the run stops on a 401/403 it skips the restore: recover with a
 `deploy-staging` dispatch with `release_fence=true` after the binding is fixed.
 
@@ -2902,10 +2934,31 @@ epoch-checked handoff, and verifies a converged `full_auto` rollout plus the
 exact Worker version, source revision, build id and running image digest
 before timing first ready. Old source is never checked out and no Dockerfile
 is rebuilt: the deploy config is generated from the reviewed `wrangler.toml`
-on `main` with the staging container image overridden to the digest-pinned
-registry reference (every other relative image path is absolutized, because
+on `main` with the staging image overridden to the digest-pinned registry
+reference plus the bounded-policy/environment/image-SHA bindings described
+below (every other relative image path is absolutized, because
 the generated file lives outside the wrangler directory and wrangler
 resolves config-relative paths against it).
+
+Finite use follows the same [roll-forward bootstrap](staging-rollout-gate.md#first-activation-roll-forward-bootstrap): the pre-policy v875-v877 versions are never restore targets, and only B1 or later bounded builds are.
+Both historical Worker targets must prove immutable bounded/staging/SHA
+bindings before any startup; an indefinite rollback target is refused. The
+live drill acquires one 25-minute run/attempt grant and exact-SHA baseline
+readiness before fencing. A full deploy creates a **new Worker version UUID**:
+the generated staging config binds the intended image SHA and bounded policy,
+and the script proves the new version's immutable bindings and namespace
+before pinning takeover to it. Each takeover reacquires at its new epoch with
+the **original absolute expiry**, then runs the original rollout, readiness
+and session-witness checks. A partial fenced leg can restore only within that
+original grant; no recovery window is minted. Expiry also bounds confirmation
+probes. Final release must confirm native stop or the drill fails; control or
+authentication refusal stops subsequent controls/restore and leaves native
+expiry responsible, never claims stop. The always-uploaded
+`staging-container-drill-use.ndjson` and drill evidence retain the lifecycle
+and original expiry even on failed runs; runner loss/cancellation still rely
+on runtime expiry. `--dry-run` proves policy and pins but acquires nothing
+and refuses an idle baseline. Production configuration and behavior are
+unchanged, and this drill does not record or authorize activation.
 
 Dispatch contract (all pins immutable; `latest` and mutable tags are refused):
 `backout_source_sha` (40-hex), `backout_build_id`, `backout_image`

@@ -113,6 +113,13 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     // stamps updated_at, so the row's last write is the control-plane write
     // (starts_at/ends_at are event source times, not write times).
     TableSpec { table: "event_attendance_windows", measure: TableMeasure::Columns(&["updated_at"]) },
+    // Event instance windows (0472): durable lifecycle, order and revocation
+    // evidence for accepted Discord event observations. Confirmed lifecycle
+    // writes stamp observed_at/revoked_at; status-only omissions stamp omitted_at
+    // without masking delayed terminal evidence. All three are canonical UTC
+    // text, cast like scheduled_events_claim.epoch; their maximum covers each
+    // write. The fences carry no member column.
+    TableSpec { table: "event_instance_windows", measure: TableMeasure::Columns(&["observed_at", "omitted_at", "revoked_at"]) },
     TableSpec { table: "event_rsvps", measure: TableMeasure::Columns(&["responded_at"]) },
     // Append-only event-store capture (0427 voice + 0428 presence + 0429 thread
     // lifecycle + 0430 message/reaction + 0431 stage/interaction/audit + 0432

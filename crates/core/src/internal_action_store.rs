@@ -4,6 +4,7 @@
 //! terminal outcome, not a new execution lease. See `docs/internal-action-store.md`.
 
 use sqlx::{PgPool, Row};
+use std::collections::HashMap;
 use std::str::FromStr as _;
 use time::OffsetDateTime;
 
@@ -1144,6 +1145,60 @@ pub struct AttendanceSession {
     pub left_at: Option<OffsetDateTime>,
 }
 
+impl InternalActionStore {
+    /// Voice-channel → website event-key map for the currently-windowed
+    /// events of one guild. `voice.snapshot` stamps `rooms[].event_key` from
+    /// this so the site can join heat rows to its event metadata: one entry
+    /// per bound voice channel, only while the channel's event sits inside
+    /// `[starts_at − 15 min, ends_at + 15 min]` per contract §9.
+    ///
+    /// Accepted `event_instance_windows` evidence supplies the window, guild
+    /// and lifecycle; `event_voice_channels` supplies only the exact-instance
+    /// binding. Missing, revoked, ambiguous and orphaned rows never surface.
+    /// Positively completed events with a known end keep their finite grace
+    /// even after ordinary exact-mirror omission. Unknown ends cannot prove
+    /// completed grace; scheduled/active evidence may be open-ended.
+    /// A channel with more than one site key has no canonical address, so it
+    /// is omitted rather than choosing an arbitrary alias. Store errors
+    /// propagate so the caller refuses `internal` instead of serving
+    /// key-omitted rooms as if no room were linked.
+    pub async fn windowed_event_voice_keys(
+        &self,
+        guild_id: &str,
+    ) -> Result<HashMap<String, String>, InternalStoreError> {
+        if !is_snowflake(guild_id) {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        let rows: Vec<(Option<String>, String)> = sqlx::query_as(
+            "SELECT c.voice_channel_id, MIN(k.event_key) \
+             FROM event_voice_channels c \
+             JOIN internal_event_keys k \
+               ON k.guild_id = $1 AND k.event_id = c.event_id \
+             JOIN event_instance_windows w \
+               ON w.guild_id = $1 AND w.event_id = c.event_id \
+              AND w.instance_starts_at = c.instance_starts_at \
+             WHERE c.voice_channel_id IS NOT NULL \
+             AND c.status <> 'orphaned' \
+             AND w.is_current AND NOT w.identity_ambiguous AND w.revoked_at IS NULL \
+             AND NOT EXISTS (SELECT 1 FROM event_voice_channels other \
+                             WHERE other.event_id = c.event_id \
+                               AND other.instance_starts_at <> w.instance_starts_at) \
+             AND (w.status IN ('scheduled', 'active') \
+                  OR (w.status = 'completed' AND w.ends_at IS NOT NULL)) \
+             AND w.starts_at <= NOW() + INTERVAL '15 minutes' \
+             AND (w.ends_at IS NULL OR w.ends_at >= NOW() - INTERVAL '15 minutes') \
+             GROUP BY c.voice_channel_id HAVING COUNT(*) = 1",
+        )
+        .bind(guild_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(channel, key)| channel.map(|channel| (channel, key)))
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1176,6 +1231,19 @@ mod tests {
         assert_eq!(error.to_string(), "internal-action storage unavailable");
         assert_eq!(format!("{error:?}"), "Unavailable");
         assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[tokio::test]
+    async fn windowed_event_voice_keys_rejects_non_snowflake_guild_without_querying() {
+        // The shape guard runs before any query: a lazy pool that could never
+        // connect still yields `InvalidInput`, never a connection error.
+        let pool = PgPool::connect_lazy("postgres://127.0.0.1:9/unused")
+            .expect("lazy pool builds without connecting");
+        let err = InternalActionStore::new(pool)
+            .windowed_event_voice_keys("not-a-snowflake")
+            .await
+            .expect_err("shape guard runs before any query");
+        assert_eq!(err, InternalStoreError::InvalidInput);
     }
 
     #[test]

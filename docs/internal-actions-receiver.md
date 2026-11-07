@@ -420,11 +420,33 @@ Success (`200` only, `result` always an object, no `error` key):
 | event.upsert/cancel | `{outcome, event_id}` | `outcome` replayed from the stored receipt |
 | event.read | full observed event | behind its allowlist flag |
 | event.attendance.read | §4 attendance shape below | behind its allowlist flag; unmapped keys and mapped windows with no tagged sessions refuse `not_found` |
-| voice.snapshot | live voice-room listing | behind its allowlist flag; refuses `discord_unavailable` unless the gateway is connected, so a warm cache never serves stale occupancy mid-reconnect |
+| voice.snapshot | live voice-room listing | behind its allowlist flag; refuses `discord_unavailable` unless the gateway is connected, so a warm cache never serves stale occupancy mid-reconnect. Each room carries `occupied_since` (Zulu instant the current continuous occupancy began, or `null` when unknown — empty rooms and joins the gateway never witnessed are unknown, never guessed) and, only on the room bound to a currently-windowed event's voice channel, `event_key` (absent means unlinked). A store error behind the key map refuses `internal` instead of serving key-omitted rooms |
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
 | moderation.\* | `{outcome[, affected]}` | |
+
+Snapshot event links use accepted, non-member `event_instance_windows`
+evidence (migration 0472), not channel-claim dates or the continued existence
+of a mirror row. Poll swaps and confirmed action responses synchronize it in
+the mirror transaction. Rescheduling updates the window, never the immutable
+instance identity. A completed event with a confirmed end retains only its
+original end + 15 minutes after ordinary mirror omission; omission of a live
+or unknown event does not manufacture completion. The committed guild snapshot
+epoch fences stale/equal liveness replays, even for a never-mirrored legacy
+binding. Ordinary omission records a separate `omitted_at` fence for ordering
+and rollback recency without advancing the last confirmed lifecycle stamp:
+a delayed terminal observation newer than that stamp still applies to an
+established instance. Confirmed completion with a finite end proves grace;
+cancellation or confirmed deletion revokes it, even if a compatibility-only
+mirror replay has a newer stamp. Ambiguous instances or multiple site aliases omit
+`event_key`; database failure still refuses the snapshot. Legacy bindings
+alone never backfill live evidence. This does not add end times to `event.read`,
+change v1, persist occupancy or require a new privileged gateway intent.
+Confirmed deletion has a transactional store seam; no gateway deletion consumer
+or additional gateway intent is added here. An ordinary missing poll row is
+never treated as a confirmed deletion.
+The production snapshot flag remains off pending separate rollout acceptance.
 
 Refusals keep their code, status and retry policy with the fixed message
 `request refused`:

@@ -1222,6 +1222,14 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.pipeline.set_audit_entry_observer(observer);
     }
 
+    /// Register the voice-transition observer (snapshot occupancy). First wins.
+    pub fn set_voice_transition_observer(
+        &self,
+        observer: std::sync::Arc<dyn crate::pipeline::VoiceTransitionObserver>,
+    ) {
+        self.pipeline.set_voice_transition_observer(observer);
+    }
+
     /// Drain deferred XP awards without holding the async dispatch lock.
     /// The caller owns ordering (the serial checkpoint writer); this only
     /// preserves the funnel-before-award sequence per dispatch. A fault

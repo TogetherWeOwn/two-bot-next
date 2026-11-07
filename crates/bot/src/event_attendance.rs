@@ -22,7 +22,7 @@
 //! docs/log-volume-guard.md — and never fail the actor loop. A missed open
 //! stays missed (the documented join-before-window gap); a missed close
 //! finalizes on the member's next transition, clamped so a stale row can
-//! never tag a later event (see [`plan_transition`]).
+//! never tag a later event (see `plan_transition`).
 //!
 //! Contract v2 §9 opt-out at capture: before opening a span the logger
 //! consults `privacy_opt_outs` (`suppressed_in`) and

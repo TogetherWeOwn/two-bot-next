@@ -585,6 +585,7 @@ async fn run_retention_core(
                 .map(|entry| entry.table.as_str())
                 .collect();
             lock_tables.push("presence_probe");
+            lock_tables.extend(EVENT_INSTANCE_GUILD_PURGE_TABLES);
             lock_tables.push("retention_guild_purge_queue");
             lock_tables.sort_unstable();
             lock_tables.dedup();
@@ -1278,6 +1279,15 @@ async fn complete_request(
     Ok((receipt_id, requested_at_unix, completed_at_unix))
 }
 
+// Non-member event authority is not part of member erasure. A guild purge
+// removes references before its durable fences, including omitted events.
+// Never purge these rows merely because the exact mirror drops an event.
+const EVENT_INSTANCE_GUILD_PURGE_TABLES: &[&str] = &[
+    "event_voice_channels",
+    "internal_event_keys",
+    "event_instance_windows",
+];
+
 /// Guild-scope predicate for one erasure-plan table: child tables without
 /// their own `guild_id` purge via their parent's guild scope, and the
 /// operator-released replay fence is never selected. Table names come from
@@ -1295,10 +1305,12 @@ fn guild_purge_predicate(table: &str) -> String {
         "self_role_exchanges" => {
             "event_id IN (SELECT event_id FROM self_role_audit WHERE guild_id = $1)".to_owned()
         }
-        // Presence spans carry no guild column: scope through the
-        // scheduled-event mirror, mirroring the erasure-plan predicate.
+        // Retained instance evidence also scopes spans after mirror omission.
         "event_voice_presence" => {
-            "event_id IN (SELECT event_id FROM scheduled_events WHERE guild_id = $1)".to_owned()
+            "event_id IN (SELECT event_id FROM scheduled_events WHERE guild_id = $1 UNION SELECT event_id FROM event_instance_windows WHERE guild_id = $1)".to_owned()
+        }
+        "event_voice_channels" => {
+            "event_id IN (SELECT event_id FROM event_instance_windows WHERE guild_id = $1)".to_owned()
         }
         // Keep the operator-released replay fence: only executions whose
         // parent idempotency row is itself purged go here.
@@ -1475,6 +1487,13 @@ async fn purge_guild(
             .await?
             .rows_affected();
     }
+    for table in EVENT_INSTANCE_GUILD_PURGE_TABLES {
+        purged += sqlx::query(sqlx::AssertSqlSafe(guild_purge_sql(table)))
+            .bind(guild_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+    }
     sqlx::query("DELETE FROM retention_guild_purge_queue WHERE guild_id = $1")
         .bind(guild_id)
         .execute(&mut **tx)
@@ -1592,6 +1611,17 @@ async fn count_queued_guild_rows(
         .fetch_one(&mut **tx)
         .await?;
         total += count as u64;
+        for table in EVENT_INSTANCE_GUILD_PURGE_TABLES {
+            let sql = format!(
+                "SELECT count(*) FROM {table} WHERE {}",
+                guild_purge_predicate(table)
+            );
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .bind(guild)
+                .fetch_one(&mut **tx)
+                .await?;
+            total += count as u64;
+        }
         for entry in &erasure.tables {
             if entry.table == "retention_deletion_requests" {
                 continue;

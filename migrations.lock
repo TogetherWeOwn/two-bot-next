@@ -536,6 +536,10 @@
     "crates/cutover/migrations/0471_event_attendance.sql": {
       "sha256": "a97fc6c555d2c5eb01ec6ff7cfb730a3526baf4eb7beaf17a5501e3541cad049",
       "justification": "Event-window voice-session log for the keyless attendance read: one control-plane windows row per mapped event plus one raw session row per member, channel, join and leave recorded only while a window is open, with open-row and event-key indexes; additive CREATE TABLE/INDEX IF NOT EXISTS so chains cross-run in either order; raw sessions roll off 90 days after joining."
+    },
+    "crates/cutover/migrations/0472_event_instance_windows.sql": {
+      "sha256": "ff2af4cb454c9fa569fb2722593ff35f3af3c347dc55fcea82ddeff0c21bd671",
+      "justification": "Retain accepted event instance windows and independent lifecycle, omission and revocation fences outside the exact-replacement mirror; omission stamps preserve rollback recency without masking delayed terminal observations."
     }
   }
 }

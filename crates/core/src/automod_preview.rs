@@ -136,7 +136,7 @@ pub fn automod_preview_definition() -> CommandDefinition {
         .int_range(0, AUTOMOD_PREVIEW_MENTIONS_MAX),
         CommandOption::new(
             "attachments",
-            "Comma-separated bare filenames, at most 10 (no slashes or commas in names)",
+            "1-10 bare filenames separated only by comma + ASCII space (e.g. a.txt, b.png); no trimming",
             CommandOptionType::String,
         )
         .max_length(AUTOMOD_PREVIEW_ATTACHMENTS_MAX_UTF16),

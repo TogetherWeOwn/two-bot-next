@@ -149,6 +149,7 @@ mod self_role_runtime;
 mod shutdown;
 #[cfg(test)]
 mod smoke_error_contract_tests;
+mod staging_help_smoke_reconcile;
 #[cfg(test)]
 mod ticket_component_admission_acceptance_tests;
 mod ticket_runtime;
@@ -344,6 +345,22 @@ async fn run(cli_args: &[String]) {
         }
     }
 
+    // Staging-only boot reconcile for the /help embed smoke channel: uses
+    // the token the process already holds, runs only when the staging
+    // deployment marker and staging guild both match, and never blocks or
+    // fails boot. Spawned detached so a slow Discord never delays gateway
+    // startup or database init. Needs the token alone, never the database.
+    // The handle is retained so a startup-failure exit below can drain an
+    // in-flight pass within a bounded budget instead of abandoning it; the
+    // happy path never waits on it, and every staging boot retries the pass.
+    let smoke_reconcile = staging_help_smoke_reconcile::maybe_reconcile_on_boot(
+        config
+            .discord_token
+            .as_ref()
+            .map(|secret| secret.expose().clone()),
+        config.guild_id,
+    );
+
     let store = match gateway_prerequisites(&config).ok().map(|(_, url, _)| url) {
         Some(url) => match tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -358,6 +375,11 @@ async fn run(cli_args: &[String]) {
                 Some(store)
             }
             _ => {
+                // Drain the in-flight smoke reconcile within a bounded
+                // budget so this failed boot never abandons a channel
+                // create or overwrite mid-flight; the supervisor restart
+                // retries the pass on the next healthy boot.
+                staging_help_smoke_reconcile::drain_reconcile_on_failure(smoke_reconcile).await;
                 tracing::error!(
                     startup_phase = "database_init",
                     error_class = "database_connect_failed",
@@ -425,7 +447,11 @@ async fn run(cli_args: &[String]) {
     // data. The receiver also binds the supervisor's gateway state below, so
     // a warm cache while the gateway is disconnected (not `Connected`)
     // refuses instead of serving stale occupancy with a fresh timestamp.
+    // Beside it, the join clock the pipeline observes through: witnessed
+    // voice joins stamp `rooms[].occupied_since`, and anything the gateway
+    // never saw reads `null`, never a fabricated start.
     let voice_cache = voice_snapshot::new_shared_cache();
+    let voice_clock = voice_snapshot::VoiceOccupancyClock::new();
     // Capture the authoritative pool before the gateway's async move owns it.
     // Bind privately before starting tasks; enabled failures never fall back.
     let receiver = match receiver_config {
@@ -443,6 +469,7 @@ async fn run(cli_args: &[String]) {
                     pool,
                     token,
                     Arc::clone(&voice_cache),
+                    Arc::clone(&voice_clock),
                     Arc::clone(&gateway),
                 )
                 .await
@@ -751,6 +778,12 @@ async fn run(cli_args: &[String]) {
                             )
                         })?,
                     );
+                    // Voice-session clock: register the pipeline's transition
+                    // observer so witnessed joins stamp `voice.snapshot`
+                    // `rooms[].occupied_since`. Always on and ungated like the
+                    // cache writes themselves — tracking is memory-only, and
+                    // unwitnessed occupancy still reads `null`.
+                    pipeline.set_voice_transition_observer(voice_clock.clone());
                     // Community voice + message capture: arm the Postgres
                     // facts sink only when the scorecard job is enabled, so a
                     // staging-gated rollout captures exactly while it scores.

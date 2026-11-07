@@ -45,6 +45,67 @@ async fn count(pool: &PgPool, sql: &'static str) -> i64 {
     sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
 }
 
+#[tokio::test]
+async fn guild_purge_removes_omitted_instance_fences_and_references_together() {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test database required");
+    let db = TestDatabase::create(&url, &sqlx::migrate!("./migrations"))
+        .await
+        .unwrap();
+    for (guild, event, channel) in [
+        (GONE_GUILD, "200000000000000001", "300000000000000001"),
+        (
+            "333333333333333334",
+            "200000000000000002",
+            "300000000000000002",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO event_instance_windows
+             (guild_id, event_id, instance_starts_at, starts_at, ends_at, status, observed_at)
+             VALUES ($1, $2, '2026-11-03T09:00:00Z', '2026-11-03T09:00:00Z', NULL, 'missing', '2026-11-03T10:00:00.000Z')",
+        ).bind(guild).bind(event).execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO event_voice_channels (event_id, instance_starts_at, starts_at, voice_channel_id)
+             VALUES ($1, '2026-11-03T09:00:00Z', '2026-11-03T09:00:00Z', $2)",
+        ).bind(event).bind(channel).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO internal_event_keys (guild_id, event_key, event_id) VALUES ($1, 'fixture', $2)")
+            .bind(guild).bind(event).execute(db.pool()).await.unwrap();
+        // A delayed span has no mirror parent, but still has durable guild
+        // scope for member erasure and guild deletion through its instance.
+        sqlx::query("INSERT INTO event_voice_presence (event_id, instance, user_id, joined_at) VALUES ($1, '2026-11-03T09:00:00Z', $2, NOW())")
+            .bind(event).bind(MEMBER).execute(db.pool()).await.unwrap();
+    }
+    handle_guild_delete(db.pool(), GONE_GUILD, None)
+        .await
+        .unwrap();
+    let dry = run_retention(db.pool(), RetentionMode::DryRun)
+        .await
+        .unwrap();
+    let live = run_retention(db.pool(), RetentionMode::Execute)
+        .await
+        .unwrap();
+    assert_eq!(dry.guild_rows_purged, 4);
+    assert_eq!(live.guild_rows_purged, dry.guild_rows_purged);
+    assert_eq!(
+        (live.guild_purges_failed, live.guild_purges_deferred),
+        (0, 0)
+    );
+    for table in [
+        "event_instance_windows",
+        "event_voice_channels",
+        "internal_event_keys",
+        "event_voice_presence",
+    ] {
+        let sql = format!("SELECT count(*) FROM {table}");
+        let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1, "the other guild's {table} survives");
+    }
+    db.close().await.unwrap();
+}
+
 /// A queued guild purge with an unresolved replay guard deletes nothing and
 /// stays queued; once the guard settles the purge proceeds.
 #[tokio::test]

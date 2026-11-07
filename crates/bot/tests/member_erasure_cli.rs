@@ -138,6 +138,9 @@ async fn real_erasure_cli_dry_execute_and_second_execute_counts() {
             "dry-run count for {line}; event_store seeds 5, others 1"
         );
     }
+    assert!(dry_lines
+        .iter()
+        .any(|line| line == "event_voice_sessions\t1"));
     let execute = cli(&execute_args, Some(&url), Some("fixture-privacy-operator")).await;
     assert_eq!(table_lines(&execute, "ERASURE COMMITTED"), dry_lines);
     let second = cli(&execute_args, Some(&url), Some("fixture-privacy-operator")).await;

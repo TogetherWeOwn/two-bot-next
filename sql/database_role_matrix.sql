@@ -117,6 +117,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'event_voice_presence', 'table'),
     ('public', 'event_attendance_windows', 'table'),
     ('public', 'event_voice_sessions', 'table'),
+    ('public', 'event_instance_windows', 'table'),
     ('public', 'admin_api_tokens', 'table'),
     ('public', 'starboard_config', 'table'),
     ('public', 'starboard_starrers', 'table'),

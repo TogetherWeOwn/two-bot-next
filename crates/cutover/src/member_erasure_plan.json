@@ -283,7 +283,7 @@
     {
       "table": "event_voice_presence",
       "columns": ["user_id"],
-      "predicate": "user_id = $2 AND event_id IN (SELECT event_id FROM scheduled_events WHERE guild_id = $1)"
+      "predicate": "user_id = $2 AND event_id IN (SELECT event_id FROM scheduled_events WHERE guild_id = $1 UNION SELECT event_id FROM event_instance_windows WHERE guild_id = $1)"
     },
     {
       "table": "event_voice_sessions",

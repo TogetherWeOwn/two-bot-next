@@ -12,9 +12,20 @@ spelling — refuses with the existing fixed vocabulary
 with a nonzero exit, no evidence file, and no echo of the hostile keys or
 values. Duplicate-free stdout parses byte-identically to ``json.loads``.
 
+Staging restores also run inside the caller's finite-use window: the
+target version carries the bounded policy bindings, and the rollback's
+``restore-check`` precedes the fence-first status read. The duplicate
+refusal therefore happens after a passing window check and before any
+mutation, and never reaches ``rebind``. The finite-use pipeline is answered
+by its own acceptance stand-in, never by the ownership stdout stub, so a
+duplicate-key status cannot be graded as (or masked by) a window answer.
+Missing, other-attempt and expired windows refuse before any ownership
+call or POST.
+
 Stdlib only: the Cloudflare API is faked in memory, time is scripted, and
-the ownership helper is a stubbed ``subprocess.run``. Nothing here moves
-traffic or touches credentials.
+the ownership helper and finite-use pipeline are a stubbed
+``subprocess.run`` dispatched by script name. Nothing here moves traffic or
+touches credentials.
 
 This file is the contract: satisfy it by changing the rollback script, not
 by editing these tests.
@@ -22,6 +33,7 @@ by editing these tests.
 
 import io
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -46,6 +58,12 @@ SHA = "0123456789abcdef0123456789abcdef01234567"
 IMAGE_AT = "registry.cloudflare.com/acct/two-bot-next-twobotcontainer-staging@sha256:"
 WORKER_URL = "https://two-bot-next-staging.acceptance-fixture.workers.dev"
 STAGING_URL = "https://two-bot-next-staging.acceptance-fixture.workers.dev"
+OWNERSHIP_SCRIPT = "ownership-control.mjs"
+FINITE_USE_SCRIPT = "staging-use-pipeline.mjs"
+# The deploy's original finite-use window; rollback must keep it, not mint one.
+RUN_ID, RUN_ATTEMPT, EXPIRES_AT = "700", "2", "1700001000000"
+TOKEN = "t" * 40
+CF_CANARY = "dup" + "key" + "-cf-canary-1234567890abcdef"
 
 # Hostile markers are assembled at run time so the file stays scanner-clean.
 HOSTILE_KEY = "hos" + "tile" + "-dup-key"
@@ -153,13 +171,62 @@ class Clock:
         self.t += seconds
 
 
-def scripted_control(status_stdout):
+def window_env(**overrides):
+    env = {"GITHUB_RUN_ID": RUN_ID, "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
+           "STAGING_USE_EXPIRES_AT": EXPIRES_AT, "PATH": "/usr/bin"}
+    env.update(overrides)
+    return {key: value for key, value in env.items() if value is not None}
+
+
+class FiniteUseWindow:
+    """Acceptance-only stand-in for wrangler/scripts/staging-use-pipeline.mjs.
+
+    It holds one granted (run, attempt, expiry) and answers restore-check and
+    rebind with exit 0 only inside that grant; anything else (another
+    attempt, a later expiry, an expired grant, any other action such as a
+    fresh `begin`) exits 1. `trace` interleaves its actions with ownership
+    actions; `client` (when set) is snapshotted at each action.
+    """
+
+    def __init__(self, attempt=RUN_ATTEMPT, expired=False, refuse=()):
+        self.grant = (RUN_ID, attempt, EXPIRES_AT)
+        self.expired, self.refuse = expired, set(refuse)
+        self.calls, self.trace, self.client = [], [], None
+
+    def __call__(self, command, **kwargs):
+        env = kwargs.get("env") or {}
+        action = command[2]
+        window = tuple(env.get(key) for key in
+                       ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "STAGING_USE_EXPIRES_AT"))
+        self.calls.append({"action": action, "window": window, "env": dict(env),
+                           "stdout": kwargs.get("stdout"), "stderr": kwargs.get("stderr"),
+                           "client_calls": list(self.client.calls) if self.client else []})
+        self.trace.append(("use", action))
+        ok = (action in ("restore-check", "rebind") and window == self.grant
+              and not self.expired and action not in self.refuse)
+        return rollback.subprocess.CompletedProcess(args=command, returncode=0 if ok else 1)
+
+    @property
+    def actions(self):
+        return [call["action"] for call in self.calls]
+
+
+def scripted_control(status_stdout, window=None):
     """The real control client with a stubbed helper: status answers the
-    canned stdout, every other action answers a valid fenced record."""
+    canned stdout, every other action answers a valid fenced record. The
+    finite-use pipeline goes to `window`, never to this canned stdout; any
+    other subprocess fails the test."""
     control = rollback.control_client("staging", "t" * 32, WORKER_URL, STAGING_URL,
                                       "test-actor")
+    window = FiniteUseWindow() if window is None else window
 
     def fake_run(command, **kwargs):
+        script = Path(str(command[1])).name
+        if script == FINITE_USE_SCRIPT:
+            return window(command, **kwargs)
+        if script != OWNERSHIP_SCRIPT:
+            raise AssertionError(f"unexpected subprocess: {script}")
+        window.trace.append(("control", command[2]))
         stdout = status_stdout if command[2] == "status" else FENCE_OK
         return rollback.subprocess.CompletedProcess(args=command, returncode=0,
                                                     stdout=stdout, stderr="")
@@ -167,6 +234,13 @@ def scripted_control(status_stdout):
     patcher = mock.patch.object(rollback.subprocess, "run", side_effect=fake_run)
     patcher.start()
     return control, patcher
+
+
+def staging_use(window, receipt="evidence.json.staging-use.jsonl"):
+    """The real finite-use adapter for direct Rollback runs; its subprocess
+    is answered by `window` through scripted_control's dispatcher."""
+    return rollback.staging_restore_client(window_env(), WORKER_URL, "t" * 32,
+                                           GOOD_VERSION, SHA, receipt)
 
 
 def world_routes():
@@ -199,7 +273,12 @@ def world_routes():
         ("POST", f"/workers/scripts/{WORKER}/deployments"): post_deployments,
         ("GET", f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}"):
             lambda: {"success": True, "result": {
-                "id": GOOD_VERSION, "annotations": {"workers/message": SHA}}},
+                "id": GOOD_VERSION, "annotations": {"workers/message": SHA},
+                "resources": {"bindings": [
+                    {"name": "STAGING_RUNTIME_POLICY", "type": "plain_text",
+                     "text": "bounded"},
+                    {"name": "TWO_DEPLOY_ENV", "type": "plain_text", "text": "staging"},
+                    {"name": "CONTAINER_RELEASE", "type": "plain_text", "text": SHA}]}}},
         ("GET", "/containers/applications"): lambda: {
             "success": True, "result": [{"id": APP_ID, "name": APPLICATION,
                                          "durable_objects": {"namespace_id": NAMESPACE},
@@ -249,7 +328,8 @@ class RefusalBeforeActuationTests(unittest.TestCase):
     def test_duplicate_status_refuses_before_any_restore_post(self):
         for name, stdout in DUPLICATE_STDOUTS.items():
             with self.subTest(name):
-                control, patcher = scripted_control(stdout)
+                window = FiniteUseWindow()
+                control, patcher = scripted_control(stdout, window)
                 self.addCleanup(patcher.stop)
                 log = io.StringIO()
                 client = FakeClient(world_routes())
@@ -257,51 +337,79 @@ class RefusalBeforeActuationTests(unittest.TestCase):
                 instance = rollback.Rollback(
                     client, control, WORKER_URL, "staging", WORKER, APPLICATION,
                     APP_ID, SHA, "700", now=clock.now, sleep=clock.sleep,
-                    log=lambda msg: log.write(msg + "\n"))
+                    log=lambda msg: log.write(msg + "\n"), staging_use=staging_use(window))
                 with self.assertRaises(base.GateError) as caught:
                     instance.run(GOOD_VERSION, good_image())
                 self.assertEqual(str(caught.exception),
                                  "ownership_control_invalid_response")
                 self.assertEqual(posts_of(client), [])
+                # The window check passed first; the duplicate, not the
+                # window, is what refused, and nothing rebinds after it.
+                self.assertEqual(window.actions, ["restore-check"])
+                self.assertEqual(window.trace[0], ("use", "restore-check"))
+                self.assertNotIn(("control", "fence"), window.trace)
 
     def test_unique_status_completes_the_restore(self):
         # Control: the world above is valid, so a duplicate-free status runs
         # the whole restore green, pre- and post-fix.
-        control, patcher = scripted_control(UNIQUE_STDOUT)
+        window = FiniteUseWindow()
+        control, patcher = scripted_control(UNIQUE_STDOUT, window)
         self.addCleanup(patcher.stop)
         log = io.StringIO()
         client = FakeClient(world_routes())
+        window.client = client
         clock = Clock()
         instance = rollback.Rollback(
             client, control, WORKER_URL, "staging", WORKER, APPLICATION,
             APP_ID, SHA, "700", now=clock.now, sleep=clock.sleep,
-            log=lambda msg: log.write(msg + "\n"))
+            log=lambda msg: log.write(msg + "\n"), staging_use=staging_use(window))
         evidence = instance.run(GOOD_VERSION, good_image())
         self.assertEqual(evidence["restored_version"], GOOD_VERSION)
         self.assertTrue(posts_of(client))
+        self.assertEqual(evidence["staging_use"], "retained-window-rebound-ready")
+        check, rebind = window.calls
+        self.assertEqual((check["action"], rebind["action"]), ("restore-check", "rebind"))
+        # Same run/attempt/expiry for both; restore-check precedes every
+        # ownership action and POST; rebind follows takeover, precedes probes.
+        self.assertEqual(check["window"], (RUN_ID, RUN_ATTEMPT, EXPIRES_AT))
+        self.assertEqual(rebind["window"], check["window"])
+        self.assertEqual(window.trace[0], ("use", "restore-check"))
+        self.assertFalse([c for c in check["client_calls"] if c[0] in ("POST", "PROBE")])
+        rebind_at = window.trace.index(("use", "rebind"))
+        self.assertTrue(any(entry[0] == "control" and "takeover" in entry[1]
+                            for entry in window.trace[:rebind_at]), window.trace)
+        self.assertTrue([c for c in rebind["client_calls"] if c[0] == "POST"])
+        self.assertFalse([c for c in rebind["client_calls"] if c[0] == "PROBE"])
+        self.assertTrue([c for c in client.calls if c[0] == "PROBE"])
 
 
 class MainTests(unittest.TestCase):
-    def drive(self, status_stdout):
-        control, patcher = scripted_control(status_stdout)
+    def drive(self, status_stdout, window=None, env=None):
+        self.window = FiniteUseWindow() if window is None else window
+        control, patcher = scripted_control(status_stdout, self.window)
         self.addCleanup(patcher.stop)
         client = FakeClient(world_routes())
-        with tempfile.TemporaryDirectory() as tmp:
-            evidence = str(Path(tmp) / "evidence.json")
-            argv = ["rollback", "--variant", "staging", "--worker-url", WORKER_URL,
-                   "--expected-sha", SHA, "--target-version", GOOD_VERSION,
-                   "--target-image", good_image(), "--actor", "test-actor",
-                   "--evidence", evidence]
-            env = {"OWNERSHIP_CONTROL_TOKEN": "t" * 40, "GITHUB_RUN_ID": "700"}
-            out = io.StringIO()
-            with mock.patch.object(rollback, "control_client", return_value=control):
-                # Timing is not pinned here: main() builds its own clock, so
-                # collapse the poll interval and keep the pre-fix full run instant.
-                with mock.patch.object(rollback, "POLL_SECONDS", 0):
-                    with redirect_stdout(out):
-                        code = rollback.main(argv, environ=env,
-                                             client_factory=lambda account, token: client)
-            return code, out.getvalue(), Path(evidence), posts_of(client)
+        self.window.client = client
+        # A per-call directory that outlives drive(), so the evidence
+        # assertions below observe the run instead of a deleted tempdir.
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        evidence = str(Path(tmp) / "evidence.json")
+        argv = ["rollback", "--variant", "staging", "--worker-url", WORKER_URL,
+               "--expected-sha", SHA, "--target-version", GOOD_VERSION,
+               "--target-image", good_image(), "--actor", "test-actor",
+               "--evidence", evidence]
+        env = dict(window_env(), OWNERSHIP_CONTROL_TOKEN=TOKEN,
+                   CLOUDFLARE_API_TOKEN=CF_CANARY) if env is None else env
+        out = io.StringIO()
+        with mock.patch.object(rollback, "control_client", return_value=control):
+            # Timing is not pinned here: main() builds its own clock, so
+            # collapse the poll interval and keep the pre-fix full run instant.
+            with mock.patch.object(rollback, "POLL_SECONDS", 0):
+                with redirect_stdout(out):
+                    code = rollback.main(argv, environ=env,
+                                         client_factory=lambda account, token: client)
+        return code, out.getvalue(), Path(evidence), posts_of(client)
 
     def test_duplicate_status_fails_closed_with_no_evidence_or_posts(self):
         for name, stdout in DUPLICATE_STDOUTS.items():
@@ -313,6 +421,69 @@ class MainTests(unittest.TestCase):
                 self.assertNotIn("diagnostic", out)
                 self.assertFalse(evidence.exists(), out)
                 self.assertEqual(posts, [])
+                self.assertEqual(self.window.actions, ["restore-check"])
+                self.assertNotIn(("control", "fence"), self.window.trace)
+
+    def test_unique_status_main_restores_inside_the_retained_window(self):
+        # GREEN control: the only difference from the duplicate runs is the
+        # status stdout, so they fail on the duplicate, not on harness.
+        code, out, evidence, posts = self.drive(UNIQUE_STDOUT)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(posts)
+        written = json.loads(evidence.read_text())
+        self.assertEqual(written["staging_use"], "retained-window-rebound-ready")
+        self.assertEqual(written["restored_version"], GOOD_VERSION)
+        self.assertEqual(self.window.actions, ["restore-check", "rebind"])
+        for call in self.window.calls:
+            self.assertEqual(call["window"], (RUN_ID, RUN_ATTEMPT, EXPIRES_AT))
+            self.assertEqual(call["env"]["STAGING_USE_DEPLOYMENT"], GOOD_VERSION)
+            self.assertEqual(call["env"]["STAGING_USE_SHA"], SHA)
+            self.assertEqual(call["env"]["STAGING_USE_RECEIPT"],
+                             str(evidence) + ".staging-use.jsonl")
+            # Redacting adapter: no ambient Cloudflare credential, no
+            # captured child output that could reach the log.
+            self.assertNotIn("CLOUDFLARE_API_TOKEN", call["env"])
+            self.assertEqual(call["stdout"], rollback.subprocess.DEVNULL)
+            self.assertEqual(call["stderr"], rollback.subprocess.DEVNULL)
+        self.assertNotIn(TOKEN, out)
+        self.assertNotIn(CF_CANARY, out)
+
+    def test_missing_window_refuses_before_any_control_or_post(self):
+        for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "STAGING_USE_EXPIRES_AT"):
+            with self.subTest(missing=key):
+                env = dict(window_env(**{key: None}), OWNERSHIP_CONTROL_TOKEN=TOKEN)
+                code, out, evidence, posts = self.drive(UNIQUE_STDOUT, env=env)
+                self.assertEqual(code, 1, out)
+                self.assertIn("worker-container rollback failed: "
+                              "staging_restore_window_missing", out)
+                self.assertEqual(posts, [])
+                self.assertEqual(self.window.trace, [])
+                self.assertFalse(evidence.exists(), out)
+
+    def test_other_attempt_or_expired_window_refuses_before_mutation(self):
+        worlds = {"other-attempt": FiniteUseWindow(attempt="1"),
+                  "expired": FiniteUseWindow(expired=True)}
+        for name, window in worlds.items():
+            with self.subTest(name):
+                code, out, evidence, posts = self.drive(UNIQUE_STDOUT, window=window)
+                self.assertEqual(code, 1, out)
+                self.assertIn("worker-container rollback failed: "
+                              "staging_restore_control_failed", out)
+                self.assertNotIn("diagnostic", out)
+                self.assertEqual(posts, [])
+                # No fresh recovery window, no ownership call of any kind.
+                self.assertEqual(window.trace, [("use", "restore-check")])
+                self.assertFalse(evidence.exists(), out)
+
+    def test_refused_rebind_never_probes_or_writes_evidence(self):
+        window = FiniteUseWindow(refuse={"rebind"})
+        code, out, evidence, posts = self.drive(UNIQUE_STDOUT, window=window)
+        self.assertEqual(code, 1, out)
+        self.assertIn("worker-container rollback failed: staging_restore_control_failed", out)
+        self.assertEqual(window.actions, ["restore-check", "rebind"])
+        self.assertTrue(posts)
+        self.assertFalse([call for call in window.client.calls if call[0] == "PROBE"])
+        self.assertFalse(evidence.exists(), out)
 
     def test_hostile_keys_and_values_never_echo(self):
         stdout = ('{"owner": {"phase": "active", "epoch": 7}, '

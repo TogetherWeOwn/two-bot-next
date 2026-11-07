@@ -102,18 +102,18 @@ upload command; argv and child output never echoed):
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v15** (including durable voice-create reservations, the retention
+write **v16** (including durable voice-create reservations, the retention
 queues, the seasonal XP projection, the event store: voice capture plus
 presence capture plus member-capture deltas plus message/reaction capture
 plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
 invite/scheduled-event capture, the stream go-live ledger, guild game-activity
 aggregates, the assistant monthly-cap ledger, the scheduled-event
 epoch-claim guard, the scheduled-event delete tombstones and the admin API
-token registry, event voice pair, three starboard tables and three giveaway tables); the reader also accepts
+token registry, event voice pair, three starboard tables, three giveaway tables and the event instance windows); the reader also accepts
 frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**, pre-seasonal **v6**,
 pre-stream-ledger **v7**, pre-guild-counters **v8**, pre-epoch-claim **v9**,
 pre-tombstone **v10**, pre-registry **v11**, pre-event-voice **v12** and
-pre-starboard **v13** and pre-giveaways **v14**.
+pre-starboard **v13**, pre-giveaways **v14** and pre-instance-windows **v15**.
 Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
@@ -181,33 +181,36 @@ admin API token registry (`admin_api_tokens`: 0456/0457, named-holder and
 (`event_voice_channels`, `event_voice_presence`: 0455), plus starboard
 configuration, distinct starrers and post state (`starboard_config`,
 `starboard_starrers`, `starboard_posts`: 0458/0459), plus giveaway definitions,
-entries and draw rounds (`giveaways`, `giveaway_entries`, `giveaway_draws`: 0460/0461).
+entries and draw rounds (`giveaways`, `giveaway_entries`, `giveaway_draws`: 0460/0461),
+plus the non-member event instance lifecycle, order and revocation evidence
+(`event_instance_windows`: 0472).
 The [registry contract](admin-registry.md) adds no table or archive version:
-new v15 dumps discover `holder_id` / `holder_kind` dynamically. Populated
+new v16 dumps discover `holder_id` / `holder_kind` dynamically. Populated
 pre-holder archives refuse transactionally on the required authority columns
 instead of inventing holders; older readable archives that omit the table
 retain their versioned clearing behavior.
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 107 table entries. A missing current table refuses a dump/restore: migrate
+has 108 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 Each readable version requires its historical inventory and waives only
 versioned additions introduced later:
 
 | Version | Tables it may omit |
 | --- | --- |
-| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (game-activity aggregates and assistant monthly-cap ledger), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
-| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
-| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
-| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
-| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables) |
-| v9 | `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
-| v10 | `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
-| v11 | `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
-| v12 | `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables) |
-| v13 | `V14_ADDED_TABLES`: `starboard_config`, `starboard_starrers`, `starboard_posts`, `V15_ADDED_TABLES` (giveaway tables) |
-| v14 | `V15_ADDED_TABLES`: `giveaways`, `giveaway_entries`, `giveaway_draws` |
-| v15 | None: the full current inventory is required |
+| v4 | `V5_ADDED_TABLES` (reservations and privacy controls), `V6_ADDED_TABLES` (event store), `V7_ADDED_TABLES` (seasonal XP and retention queues), `V8_ADDED_TABLES` (stream ledger), `V9_ADDED_TABLES` (game-activity aggregates and assistant monthly-cap ledger), `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (event instance windows) |
+| v5 | `V6_ADDED_TABLES`, `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (event instance windows) |
+| v6 | `V7_ADDED_TABLES`, `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (event instance windows) |
+| v7 | `V8_ADDED_TABLES`, `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (event instance windows) |
+| v8 | `V9_ADDED_TABLES`, `V10_ADDED_TABLES`, `V11_ADDED_TABLES`, `V12_ADDED_TABLES`, `V13_ADDED_TABLES`, `V14_ADDED_TABLES`, `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (event instance windows) |
+| v9 | `V10_ADDED_TABLES` (epoch-claim guard), `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (event instance windows) |
+| v10 | `V11_ADDED_TABLES` (delete tombstones), `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (event instance windows) |
+| v11 | `V12_ADDED_TABLES` (token registry), `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (event instance windows) |
+| v12 | `V13_ADDED_TABLES` (event voice pair), `V14_ADDED_TABLES` (starboard tables), `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (event instance windows) |
+| v13 | `V14_ADDED_TABLES`: `starboard_config`, `starboard_starrers`, `starboard_posts`, `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (event instance windows) |
+| v14 | `V15_ADDED_TABLES`: `giveaways`, `giveaway_entries`, `giveaway_draws`, `V16_ADDED_TABLES` (event instance windows) |
+| v15 | `V16_ADDED_TABLES`: `event_instance_windows` |
+| v16 | None: the full current inventory is required |
 
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
@@ -232,9 +235,14 @@ preserve starboard settings, starrers and post records too. Restoring a pre-v14
 archive clears those three tables, so the board is off until configured again.
 Restoring v14 clears giveaway definitions, entries and draw rounds while
 preserving starboard, event voice and issued tokens. Use v15 to preserve giveaways.
-Current v15 archives must include the monthly cap, both mirror-fence tables,
-the registry, event voice pair, starboard and giveaway tables, so routine restores
-retain their archived state. Tombstone `deleted_at` cells must be real dates in
+Restoring v15 clears `event_instance_windows` and never backfills it: a
+binding or timestamp alone cannot prove a live window, so a restored pre-v16
+recovery point fails closed (no instance is treated as live, and the revocation
+and order fences are gone) until a fresh accepted Discord observation
+re-establishes each instance. Use v16 to preserve that evidence.
+Current v16 archives must include the monthly cap, both mirror-fence tables,
+the registry, event voice pair, starboard, giveaway and event instance window
+tables, so routine restores retain their archived state. Tombstone `deleted_at` cells must be real dates in
 exact `YYYY-MM-DDTHH:MM:SS.sssZ` form: inspection refuses missing, null,
 non-string or noncanonical values before restore opens a write transaction.
 Rollback-delta import enforces the same rule during parsing and revalidates the
