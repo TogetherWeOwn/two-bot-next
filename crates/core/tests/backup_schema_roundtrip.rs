@@ -1547,7 +1547,7 @@ async fn audit_bearing_restore_refuses_when_allocator_is_outside_public() {
     seed(&pool).await;
     dirty_target(&pool).await;
     // A non-initial allocator position, so a reset or overwrite is visible.
-    sqlx::raw_sql("UPDATE internal_audit_order SET last_audit_id = 41")
+    sqlx::raw_sql("DO $$ BEGIN WHILE (SELECT last_audit_id FROM internal_audit_order) < 41 LOOP UPDATE internal_audit_order SET last_audit_id = last_audit_id + 1; END LOOP; END $$")
         .execute(&pool)
         .await
         .unwrap();
@@ -1624,7 +1624,7 @@ async fn audit_free_restore_into_non_public_allocator_target_keeps_the_allocator
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::raw_sql("UPDATE internal_audit_order SET last_audit_id = 41")
+    sqlx::raw_sql("DO $$ BEGIN WHILE (SELECT last_audit_id FROM internal_audit_order) < 41 LOOP UPDATE internal_audit_order SET last_audit_id = last_audit_id + 1; END LOOP; END $$")
         .execute(&pool)
         .await
         .unwrap();

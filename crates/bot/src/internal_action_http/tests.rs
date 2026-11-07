@@ -62,6 +62,10 @@ fn secret(index: usize) -> String {
 }
 
 fn config() -> InternalActionConfig {
+    config_with_channel_keys("ann:333333333333333333")
+}
+
+fn config_with_channel_keys(channel_keys: &str) -> InternalActionConfig {
     InternalActionConfig::from_map(&HashMap::from([
         ("TWO_INTERNAL_ACTIONS".to_owned(), "1".to_owned()),
         ("TWO_INTERNAL_BIND".to_owned(), "127.0.0.1:8091".to_owned()),
@@ -75,7 +79,7 @@ fn config() -> InternalActionConfig {
         ),
         (
             "TWO_INTERNAL_CHANNEL_KEYS".to_owned(),
-            "ann:333333333333333333".to_owned(),
+            channel_keys.to_owned(),
         ),
         (
             "TWO_INTERNAL_ROLE_KEYS".to_owned(),
@@ -2821,6 +2825,55 @@ async fn botlog_read_projects_seeded_terminal_rows_keyless() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(tail["result"]["entries"].as_array().unwrap().len(), 0);
     assert_eq!(tail["result"]["next"], next);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn botlog_read_omits_ambiguous_channels_but_consumes_their_cursor() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_botlog_read_flag(true);
+    for (key, channel) in [
+        ("botlog:unique", "444444444444444444"),
+        ("botlog:ambiguous", "333333333333333333"),
+        ("botlog:missing", "555555555555555555"),
+    ] {
+        seed_botlog_row(db.pool(), key, "announcement.post", Some(channel)).await;
+    }
+    // Rebuild config in both orders, including a third alias: ambiguity must
+    // never become a process-dependent key or overwrite a previous refusal.
+    for channels in [
+        "ann:333333333333333333,alias:333333333333333333,third:333333333333333333,unique:444444444444444444",
+        "unique:444444444444444444,third:333333333333333333,alias:333333333333333333,ann:333333333333333333",
+    ] {
+        let mut app_state = state(
+            db.pool().clone(),
+            Arc::new(MockEffect::new(MockOutcome::Success)),
+        );
+        Arc::get_mut(&mut app_state).unwrap().config = config_with_channel_keys(channels);
+        let app = router(app_state);
+        let (status, _, body) = answer(app.clone(), signed_read(&botlog_payload(), "old")).await;
+        assert_eq!(status, StatusCode::OK);
+        let result = &body["result"];
+        let entries = result["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["kind"], "announcement.posted");
+        assert_eq!(entries[0]["detail"], "unique");
+        let next = result["next"].as_str().unwrap();
+        assert_ne!(next, entries[0]["seq"].as_str().unwrap());
+        let (status, _, tail) = answer(
+            app,
+            signed_read(
+                &serde_json::json!({"action": "botlog.read", "after": next}).to_string(),
+                "old",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(tail["result"]["entries"].as_array().unwrap().is_empty());
+        assert_eq!(tail["result"]["next"], next);
+    }
+    set_botlog_read_flag(false);
     db.close().await.unwrap();
 }
 

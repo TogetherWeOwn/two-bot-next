@@ -542,8 +542,8 @@
       "justification": "Held unshipped expansion: qualify collision-guard catalogs against temporary shadows, validate current-schema table bindings and helper ownership, and render the unchanged private invoker identity definition with qualified triggers; exact public bootstrap preparation and nullable-key rollback compatibility remain, with actual serving-image release proof required."
     },
     "crates/cutover/migrations/0474_internal_audit_order.sql": {
-      "sha256": "228b1b928534d08608948ff963f32e2100ae1231467391edc31cf52fccff1b33",
-      "justification": "Held unshipped expansion: qualify collision-guard catalogs against temporary shadows while binding the draining lock, seed, state and triggers to one validated schema; unchanged private invoker templates render exactly as public preparation, with commit-held fencing, all revokes and actual serving-image rollback qualification retained."
+      "sha256": "afb498e9390bcaff45150135f0a19fe04ebb3adf3cfea8eb36f0878c3021392d",
+      "justification": "Held unshipped expansion: refuse forward ID jumps and direct timestamp changes with overflow-safe comparison; the guarded transition owns the sole clock sample and allocation consumes its UPDATE RETURNING value. No-op updates, final single-step allocation and seeded clock retreat remain valid. Update explicit bootstrap definitions identically, retaining schema isolation, invoker rights, revokes, commit-held fencing and actual serving-image rollback qualification; no deployed history is rewritten."
     }
   }
 }

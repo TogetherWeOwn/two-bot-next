@@ -200,7 +200,10 @@ two-bot operator commands
   two-bot restore <backup.ndjson.gz> --force [--dry-run]
       --dry-run reads and validates the file, reports what it holds, and
       writes nothing (TWO_RESTORE_URL optional: with it you also get the
-      target's current counts). Without --dry-run, --force is required and
+      target's current counts). It does not simulate the database apply: an
+      archive with internal_action_log rows is refused by apply on a target
+      with the audit ordering allocator, which --dry-run cannot see.
+      Without --dry-run, --force is required and
       TWO_RESTORE_URL must name the target. The target variable is
       deliberately NOT TWO_DATABASE_URL: restoring replaces target data.
       A target that normalizes to the live database, or whose database
@@ -746,6 +749,18 @@ fn voice_replay_warnings(manifest: &dump_file::DumpManifest) -> Vec<&'static str
     warnings
 }
 
+/// Archived audit rows cannot be applied to a target that has the audit
+/// ordering allocator installed (the apply-time identity fence refuses), and a
+/// dry run never opens a write transaction to find out. Say so instead of
+/// letting `DRY RUN VERIFIED` read as "apply will succeed".
+fn audit_identity_warning(manifest: &dump_file::DumpManifest) -> Option<&'static str> {
+    manifest
+        .tables
+        .iter()
+        .any(|table| table.name == dump_file::AUDIT_LOG_TABLE && table.count > 0)
+        .then_some("restore: WARNING: this archive holds internal_action_log rows; apply refuses to import them into a target with the audit ordering allocator installed. This dry run does not check that target state and verifies the file only")
+}
+
 fn warn_missing_dump_tables(manifest: &dump_file::DumpManifest) {
     let missing = manifest.missing_tables();
     if !missing.is_empty() {
@@ -783,6 +798,9 @@ async fn cmd_restore_dry_run(file: &str, url: Option<&str>) -> i32 {
         eprintln!("restore: old v3 has no member-ban ownership; apply does not infer acceptance; keep moderation off pending reconciliation");
     }
     for warning in voice_replay_warnings(&contents.manifest) {
+        eprintln!("{warning}");
+    }
+    if let Some(warning) = audit_identity_warning(&contents.manifest) {
         eprintln!("{warning}");
     }
     println!(
@@ -1790,6 +1808,31 @@ mod tests {
             notes[2].contains("inserted 2 voice_access_controls"),
             "{notes:?}"
         );
+    }
+
+    #[test]
+    fn audit_identity_warning_fires_only_for_audit_bearing_archives() {
+        use super::dump_file::{DumpManifest, DumpTableInfo, DUMP_VERSION};
+        let manifest = |count: u64| DumpManifest {
+            kind: "manifest".to_owned(),
+            version: DUMP_VERSION,
+            created_at: String::new(),
+            tables: vec![DumpTableInfo {
+                name: "internal_action_log".to_owned(),
+                columns: Vec::new(),
+                column_types: Vec::new(),
+                count,
+            }],
+            events_sequence: 0,
+            schema_migrations: Vec::new(),
+            cutover_migrations: Vec::new(),
+            sequence_marks: Vec::new(),
+        };
+        let warning = super::audit_identity_warning(&manifest(1)).expect("audit rows warn");
+        assert!(warning.contains("internal_action_log"), "{warning}");
+        assert!(warning.contains("apply refuses"), "{warning}");
+        assert!(super::audit_identity_warning(&manifest(0)).is_none());
+        assert!(super::USAGE.contains("does not simulate the database apply"));
     }
 
     #[test]

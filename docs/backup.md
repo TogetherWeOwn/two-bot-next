@@ -224,7 +224,7 @@ instead of inventing holders; older readable archives that omit the table
 retain their versioned clearing behavior.
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 108 table entries. A missing current table refuses a dump/restore: migrate
+has 109 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 Each readable version requires its historical inventory and waives only
 versioned additions introduced later:

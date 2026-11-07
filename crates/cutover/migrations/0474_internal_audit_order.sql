@@ -59,17 +59,17 @@ BEGIN
        OR extract(epoch FROM last_time) * 1000000 > 9223372036854775807 THEN
         RAISE EXCEPTION 'invalid or exhausted internal audit order';
     END IF;
-    -- Sample only after obtaining the global fence. The UPDATE lock is held
-    -- until outer commit/rollback, including direct SQL and old-image inserts.
-    allocated_time := greatest(last_time, clock_timestamp());
+    -- The guarded UPDATE owns the sole clock sample after obtaining the fence.
+    -- Its lock lasts until outer commit/rollback, including old-image inserts.
+    NEW.audit_id := last_id + 1;
+    UPDATE @audit_schema@.internal_audit_order
+    SET last_audit_id = NEW.audit_id WHERE singleton
+    RETURNING last_created_at INTO STRICT allocated_time;
     IF NOT isfinite(allocated_time)
        OR extract(epoch FROM allocated_time) * 1000000 > 9223372036854775807 THEN
         RAISE EXCEPTION 'internal audit time outside cursor range';
     END IF;
     NEW.created_at := allocated_time;
-    NEW.audit_id := last_id + 1;
-    UPDATE @audit_schema@.internal_audit_order
-    SET last_created_at = allocated_time, last_audit_id = NEW.audit_id WHERE singleton;
     RETURN NEW;
 END;
 $body$;$definition$, '@audit_schema@', quote_ident(schema_name));
@@ -82,9 +82,13 @@ BEGIN
         RAISE EXCEPTION 'internal audit order cannot be removed';
     END IF;
     IF NEW.singleton IS DISTINCT FROM OLD.singleton
-       OR NEW.last_created_at < OLD.last_created_at
-       OR NEW.last_audit_id < OLD.last_audit_id THEN
-        RAISE EXCEPTION 'internal audit order cannot move backwards';
+       OR NEW.last_created_at IS DISTINCT FROM OLD.last_created_at
+       OR NEW.last_audit_id < OLD.last_audit_id
+       OR NEW.last_audit_id::numeric > OLD.last_audit_id::numeric + 1 THEN
+        RAISE EXCEPTION 'invalid internal audit order transition';
+    END IF;
+    IF NEW.last_audit_id > OLD.last_audit_id THEN
+        NEW.last_created_at := greatest(OLD.last_created_at, clock_timestamp());
     END IF;
     RETURN NEW;
 END;

@@ -156,13 +156,29 @@ async fn allocation_uses_fence_arrival_not_transaction_start_and_clamps_clock() 
     let mut later = other.begin().await.unwrap();
     let first = insert(&mut later, 0).await;
     later.commit().await.unwrap();
-    // Simulate a clock retreat without replacing clock_timestamp: advance the
-    // transactional high water past wall clock and require exact ties + IDs.
-    sqlx::query("UPDATE public.internal_audit_order SET last_created_at = clock_timestamp() + interval '1 day'")
+    // Simulate a clock retreat through real activation of a future-dated
+    // historical row, not a forward UPDATE that the runtime must refuse.
+    sqlx::raw_sql("DROP TRIGGER internal_audit_allocate_order ON public.internal_action_log; DROP TABLE public.internal_audit_order")
         .execute(&other).await.unwrap();
+    let old_sql = INSERT.replace(
+        "SELECT 1, '2000-01-01Z'",
+        "SELECT 5000, clock_timestamp() + interval '1 day'",
+    );
+    let high_water: (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(old_sql))
+        .bind(1_i64)
+        .fetch_one(&other)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../cutover/migrations/0474_internal_audit_order.sql"
+    ))
+    .execute(&other)
+    .await
+    .unwrap();
     let second = insert(&mut early, 1).await;
     let third = insert(&mut early, 2).await;
     assert!(second > first);
+    assert_eq!(second, (high_water.0, high_water.1 + 1));
     assert_eq!(third, (second.0, second.1 + 1));
     early.commit().await.unwrap();
     // A conflict/no-op can consume a gap; a later successful row stays above it.
@@ -254,6 +270,10 @@ async fn allocator_refuses_missing_overflow_and_state_reset_but_allows_erasure()
         "UPDATE public.internal_audit_order SET last_created_at = '1970-01-01Z'",
         "UPDATE public.internal_audit_order SET singleton = false",
         "UPDATE public.internal_audit_order SET last_created_at = 'infinity'",
+        "UPDATE public.internal_audit_order SET last_created_at = '200000-01-01Z'",
+        "UPDATE public.internal_audit_order SET last_audit_id = last_audit_id + 2",
+        "UPDATE public.internal_audit_order SET last_audit_id = 9223372036854775806",
+        "UPDATE public.internal_audit_order SET last_audit_id = 9223372036854775807",
     ] {
         assert!(
             sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
@@ -266,10 +286,11 @@ async fn allocator_refuses_missing_overflow_and_state_reset_but_allows_erasure()
     let before: (i64, i64) = sqlx::query_as("SELECT (extract(epoch FROM last_created_at) * 1000000)::bigint, last_audit_id FROM public.internal_audit_order")
         .fetch_one(&db.pool).await.unwrap();
     let mut tx = db.pool.begin().await.unwrap();
-    sqlx::query("UPDATE public.internal_audit_order SET last_audit_id = 9223372036854775807")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
+    // Owner-only fault injection reaches the boundary without weakening the
+    // runtime guard. A final legal increment succeeds; the next insert refuses.
+    sqlx::raw_sql("ALTER TABLE public.internal_audit_order DISABLE TRIGGER internal_audit_order_guard; UPDATE public.internal_audit_order SET last_audit_id = 9223372036854775806; ALTER TABLE public.internal_audit_order ENABLE TRIGGER internal_audit_order_guard")
+        .execute(&mut *tx).await.unwrap();
+    assert_eq!(insert(&mut tx, 0).await.1, i64::MAX);
     assert!(sqlx::query(INSERT)
         .bind(0_i64)
         .execute(&mut *tx)

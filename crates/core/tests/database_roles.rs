@@ -114,6 +114,14 @@ fn audit_preparation_uses_complete_migration_definitions() {
         }
     }
     assert_eq!(names, AUDIT_HELPERS);
+    // A second wall-clock sample in allocation could disagree after a clock
+    // retreat. Only the guarded transition samples time; allocation uses it.
+    let allocate = audit_definition("internal_audit_allocate_order");
+    let guard = audit_definition("internal_audit_order_guard");
+    assert!(!allocate.contains("clock_timestamp()"));
+    assert!(allocate.contains("RETURNING last_created_at INTO STRICT allocated_time"));
+    assert_eq!(guard.matches("clock_timestamp()").count(), 1);
+    assert!(guard.contains("NEW.last_created_at IS DISTINCT FROM OLD.last_created_at"));
     assert!(!AUDIT_ORDER.contains("public."));
     assert!(!AUDIT_ORDER.contains("IF NOT EXISTS"));
     let mut previous = 0;
@@ -2017,6 +2025,35 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
             execute(&scratch_admin, undo).await.unwrap();
         }
     }
+    // Runtime UPDATE rights must not permit allocator jumps. Require the
+    // trigger's refusal, not a missing grant, and verify the state is retained.
+    let before: (String, i64) = sqlx::query_as(
+        "SELECT last_created_at::text, last_audit_id FROM public.internal_audit_order",
+    )
+    .fetch_one(&scratch_admin)
+    .await
+    .unwrap();
+    for statement in [
+        "UPDATE public.internal_audit_order SET last_created_at = '200000-01-01Z'",
+        "UPDATE public.internal_audit_order SET last_audit_id = last_audit_id + 2",
+        "UPDATE public.internal_audit_order SET last_audit_id = 9223372036854775806",
+    ] {
+        let error = as_role(&scratch_admin, &roles[1], statement)
+            .await
+            .expect_err("runtime allocator jump must refuse");
+        assert!(
+            matches!(error, sqlx::Error::Database(ref error)
+            if error.code().as_deref() == Some("P0001")),
+            "{error}"
+        );
+    }
+    let after: (String, i64) = sqlx::query_as(
+        "SELECT last_created_at::text, last_audit_id FROM public.internal_audit_order",
+    )
+    .fetch_one(&scratch_admin)
+    .await
+    .unwrap();
+    assert_eq!(after, before);
     // Trigger execution is allowed by runtime DML without direct function
     // EXECUTE. The transaction also exercises immutable no-change UPDATE and
     // authorized audit erasure while keeping the state singleton installed.

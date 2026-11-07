@@ -217,9 +217,11 @@ pub struct BotlogAuditRow {
     pub resource_id: Option<String>,
     pub outcome: Option<String>,
     pub affected: Option<i64>,
-    /// Reverse key lookup: `internal_event_keys` row for `resource_id`.
+    /// Event key frozen in the audit row's own metadata when it was written;
+    /// not resolved from a mutable `internal_event_keys` mapping.
     pub event_key: Option<String>,
-    /// Rank rung whose `role_id` matches `resolved_role_id`, if any.
+    /// Rank key frozen in the audit row's own metadata when it was written;
+    /// not re-derived from the current rank ladder.
     pub rank_key: Option<String>,
     /// Subject present in `privacy_opt_outs`: emit the entry without it.
     pub suppressed: bool,
@@ -258,7 +260,7 @@ fn valid_detail_scalar(value: &str) -> bool {
 /// Project one audit row to its publishable entry, or `None` when the row
 /// cannot be named in the closed vocabulary. The store query already admits
 /// only publishable (action, outcome) pairs; this is the naming layer:
-/// reverse key lookups and the opt-out backstop.
+/// validating the frozen audit metadata names and the opt-out backstop.
 #[must_use]
 pub fn classify_botlog_row(
     row: &BotlogAuditRow,
@@ -547,7 +549,7 @@ mod tests {
         other.event_key = Some("raid-night-2026-11-07".to_owned());
         assert!(classify_botlog_row(&other, &channels()).is_none());
 
-        // A success the reverse lookup cannot name fails closed.
+        // A success with no frozen event key fails closed.
         let mut unmapped = row("event.cancel");
         unmapped.outcome = Some("cancelled".to_owned());
         assert!(classify_botlog_row(&unmapped, &channels()).is_none());

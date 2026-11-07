@@ -154,8 +154,8 @@ bindings, then restores the caller's search path. Guard catalog relations are
 explicitly qualified: implicit temporary-schema lookup cannot bypass collision
 or ownership refusals. Each helper has one fixed
 schema-token template: its `public` rendering is byte-identical to
-`sql/internal_audit_bootstrap_helpers.sql`. That public-only preparation artifact
-and both strict role phases are unchanged. Non-public same-database regression
+`sql/internal_audit_bootstrap_helpers.sql`. The public-only explicit preparation
+boundary and both strict role phases are unchanged. Non-public same-database regression
 schemas run the real migration chain alongside populated public audit state.
 The lock, seed and activation remain in one migration transaction; rendering
 changes neither the allocator's fence nor the private SECURITY INVOKER contract.
@@ -169,6 +169,16 @@ files still refuse as `revoke`, without changing or waiving the gate.
 - **0474:** the activation lock drains old inserts before seeding and attaching
   the allocator atomically, without rewriting historical tuples. Every later
   INSERT, including old-image SQL, uses the transaction-held global fence.
+  The state guard permits no-op updates and single ID increments, but refuses
+  ID jumps and direct timestamp changes. It owns the sole wall-clock sample;
+  the allocator obtains that clamped timestamp through UPDATE RETURNING, so a
+  clock step between two independent samples cannot reject a valid INSERT.
+  Numeric comparison avoids overflow at the final bigint increment; previously
+  seeded future timestamps still clamp later inserts after clock retreat.
+  This tightens only invalid direct state changes: ordinary prior-image INSERTs
+  still use the same invoker allocator, grants, lock and identity contract.
+  The held, unshipped migration and explicit bootstrap definition are updated
+  together; no deployed migration history is changed or repaired implicitly.
   Image rollback retains the expanded schema, triggers, allocator state and
   candidate role grants; it does not import rows or reapply an old role plan.
 - The three zero-argument helpers return `trigger`, use SECURITY INVOKER and a

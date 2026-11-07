@@ -1133,7 +1133,7 @@ async fn apply_import_refuses_audit_rows_when_allocator_is_outside_public() -> T
         // An unrelated destination row and a non-initial allocator position.
         let seeded = parse_import(&line("tickets", &ticket_row("t-pre"))).expect("valid");
         assert_eq!(apply_import(pool, &seeded).await?.inserted, 1);
-        sqlx::raw_sql("UPDATE internal_audit_order SET last_audit_id = 41")
+        sqlx::raw_sql("DO $$ BEGIN WHILE (SELECT last_audit_id FROM internal_audit_order) < 41 LOOP UPDATE internal_audit_order SET last_audit_id = last_audit_id + 1; END LOOP; END $$")
             .execute(pool)
             .await?;
         let contents = format!(

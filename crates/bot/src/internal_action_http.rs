@@ -1864,8 +1864,8 @@ async fn read_voice_snapshot(
 /// audit for the staging guild. A disabled flag refuses earlier in
 /// `authorize`. Field validation runs before the store page, so malformed
 /// cursors and limits refuse with no database read. The channel map inverts
-/// here (configured keys run key→channel): a channel the map no longer names
-/// publishes nothing rather than a raw snowflake. The read itself is the
+/// here (configured keys run key→channel): an unnamed or ambiguously named
+/// channel publishes nothing rather than a raw snowflake. The read itself is the
 /// only effect: no store write, no audit row, no Discord call.
 async fn read_botlog(
     state: &ReceiverState,
@@ -1879,11 +1879,16 @@ async fn read_botlog(
         Ok(request) => request,
         Err(error) => return reject(Failure::from_action(error)),
     };
-    let channel_by_id: std::collections::HashMap<String, String> = state
-        .config
-        .channel_keys()
-        .iter()
-        .map(|(name, channel_id)| (channel_id.clone(), name.clone()))
+    let mut channel_by_id = std::collections::HashMap::new();
+    for (name, channel_id) in state.config.channel_keys() {
+        channel_by_id
+            .entry(channel_id.clone())
+            .and_modify(|key| *key = None)
+            .or_insert_with(|| Some(name.clone()));
+    }
+    let channel_by_id = channel_by_id
+        .into_iter()
+        .filter_map(|(channel, key)| key.map(|key| (channel, key)))
         .collect();
     let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
     let rows = match state
