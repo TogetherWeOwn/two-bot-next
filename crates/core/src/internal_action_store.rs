@@ -990,6 +990,8 @@ impl InternalActionStore {
         if !is_snowflake(event_id) {
             return Err(InternalStoreError::InvalidInput);
         }
+        let mut tx = self.pool.begin().await?;
+        crate::event_instance_store::lock_guild(&mut tx, guild_id).await?;
         sqlx::query(
             "INSERT INTO internal_event_keys (guild_id, event_key, event_id) \
              VALUES ($1, $2, $3) \
@@ -999,8 +1001,9 @@ impl InternalActionStore {
         .bind(guild_id)
         .bind(event_key)
         .bind(event_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1022,55 +1025,26 @@ impl InternalActionStore {
         .await?)
     }
 
-    /// Persist the mapped window at `event.upsert` confirm, next to the key
-    /// mapping. Sessions only open inside a persisted window, so windows that
-    /// closed before the logger shipped answer `not_found` by construction:
-    /// no backfill, ever.
-    pub async fn put_attendance_window(
-        &self,
-        guild_id: &str,
-        event_key: &str,
-        starts_at: OffsetDateTime,
-        ends_at: OffsetDateTime,
-    ) -> Result<(), InternalStoreError> {
-        Self::check_event_key_shape(guild_id, event_key)?;
-        sqlx::query(
-            "INSERT INTO event_attendance_windows (guild_id, event_key, starts_at, ends_at) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (guild_id, event_key) DO UPDATE \
-             SET starts_at = EXCLUDED.starts_at, ends_at = EXCLUDED.ends_at, \
-                 updated_at = clock_timestamp()",
-        )
-        .bind(guild_id)
-        .bind(event_key)
-        .bind(starts_at)
-        .bind(ends_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// One mapped window by key. `Ok(None)` is an unmapped key: the attendance
-    /// read refuses `not_found` before touching sessions.
+    /// Historical captured window by key, never permission to start capture.
+    /// An upsert or reconciliation alone creates no attendance record.
     pub async fn attendance_window_for_key(
         &self,
         guild_id: &str,
         event_key: &str,
     ) -> Result<Option<AttendanceWindow>, InternalStoreError> {
         Self::check_event_key_shape(guild_id, event_key)?;
-        Ok(sqlx::query_as::<_, (OffsetDateTime, OffsetDateTime)>(
-            "SELECT starts_at, ends_at FROM event_attendance_windows \
-             WHERE guild_id = $1 AND event_key = $2",
+        Ok(
+            sqlx::query_as::<_, (OffsetDateTime, OffsetDateTime)>(ATTENDANCE_WINDOW_FOR_KEY_SQL)
+                .bind(guild_id)
+                .bind(event_key)
+                .fetch_optional(&self.pool)
+                .await?
+                .map(|(starts_at, ends_at)| AttendanceWindow {
+                    event_key: event_key.to_owned(),
+                    starts_at,
+                    ends_at,
+                }),
         )
-        .bind(guild_id)
-        .bind(event_key)
-        .fetch_optional(&self.pool)
-        .await?
-        .map(|(starts_at, ends_at)| AttendanceWindow {
-            event_key: event_key.to_owned(),
-            starts_at,
-            ends_at,
-        }))
     }
 
     /// Every session row tagged with the event key, oldest first. Empty means
@@ -1082,6 +1056,15 @@ impl InternalActionStore {
         event_key: &str,
     ) -> Result<Vec<AttendanceSession>, InternalStoreError> {
         Self::check_event_key_shape(guild_id, event_key)?;
+        let bound: Option<(OffsetDateTime, Vec<OffsetDateTime>)> =
+            sqlx::query_as(ATTENDANCE_SESSION_BOUND_SQL)
+                .bind(guild_id)
+                .bind(event_key)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((bound, stops)) = bound else {
+            return Ok(Vec::new());
+        };
         Ok(sqlx::query_as::<
             _,
             (
@@ -1114,7 +1097,7 @@ impl InternalActionStore {
                     is_bot,
                     afk,
                     joined_at,
-                    left_at,
+                    left_at: Some(cap_attendance_session(joined_at, left_at, bound, &stops)),
                 }
             },
         )
@@ -1122,8 +1105,46 @@ impl InternalActionStore {
     }
 }
 
-/// One mapped event window for the attendance logger, in DB time. The
-/// receiver converts to epoch millis for the read projection.
+/// Shared historical-window projection used by both attendance stores.
+/// Identity is fixed at capture; key repointing cannot redirect a past record.
+pub const ATTENDANCE_WINDOW_FOR_KEY_SQL: &str =
+    "SELECT COALESCE(w.starts_at, h.starts_at), COALESCE(w.ends_at, h.ends_at)
+     FROM event_attendance_windows h LEFT JOIN event_instance_windows w
+       ON w.guild_id = h.guild_id AND w.event_id = h.event_id
+      AND w.instance_starts_at = h.instance_starts_at
+     WHERE h.guild_id = $1 AND h.event_key = $2";
+
+/// Shared per-key upper bound for session projection. Revocation/unknown absence
+/// stops credit immediately, even if a leave is missed; finite windows never
+/// credit voice after grace. This is finalization, not capture permission.
+pub const ATTENDANCE_SESSION_BOUND_SQL: &str =
+    "SELECT LEAST(clock_timestamp(), COALESCE(w.ends_at, h.ends_at) + INTERVAL '15 minutes',
+                  w.revoked_at::timestamptz,
+                  CASE WHEN w.status = 'missing' THEN w.omitted_at::timestamptz END) AS capture_end,
+            h.capture_stops
+     FROM event_attendance_windows h LEFT JOIN event_instance_windows w
+       ON w.guild_id = h.guild_id AND w.event_id = h.event_id
+      AND w.instance_starts_at = h.instance_starts_at
+     WHERE h.guild_id = $1 AND h.event_key = $2";
+
+/// Cap one span at the first loss of capture authority after its join. A later
+/// accepted observation may permit new spans, but cannot fill the missing gap
+/// of an already-open span, even after the shared lifecycle becomes live again.
+pub fn cap_attendance_session(
+    joined_at: OffsetDateTime,
+    left_at: Option<OffsetDateTime>,
+    bound: OffsetDateTime,
+    stops: &[OffsetDateTime],
+) -> OffsetDateTime {
+    stops
+        .iter()
+        .copied()
+        .filter(|stop| *stop >= joined_at)
+        .fold(left_at.unwrap_or(bound).min(bound), OffsetDateTime::min)
+}
+
+/// One historical captured event window, in DB time. The receiver converts
+/// to epoch millis for the read projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttendanceWindow {
     pub event_key: String,
@@ -1202,6 +1223,24 @@ impl InternalActionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attendance_caps_preserve_missing_gaps_but_allow_later_spans() {
+        let at = |minutes| OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(minutes);
+        let stops = [at(20), at(40)];
+        assert_eq!(cap_attendance_session(at(10), None, at(60), &stops), at(20));
+        assert_eq!(cap_attendance_session(at(30), None, at(60), &stops), at(40));
+        assert_eq!(cap_attendance_session(at(50), None, at(60), &stops), at(60));
+        assert_eq!(
+            cap_attendance_session(at(10), Some(at(15)), at(60), &stops),
+            at(15)
+        );
+        assert_eq!(
+            cap_attendance_session(at(10), Some(at(90)), at(60), &[]),
+            at(60)
+        );
+        assert_eq!(cap_attendance_session(at(20), None, at(60), &stops), at(20));
+    }
 
     #[test]
     fn boundary_and_debug_are_secret_safe() {

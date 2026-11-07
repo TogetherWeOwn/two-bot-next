@@ -125,6 +125,7 @@ only while `TWO_INTERNAL_ACTIONS` is exactly `1`:
 | `TWO_INTERNAL_CONTAINER` | Worker constant `1`: the Worker sets it to mark the process as running inside the container network, where the wildcard bind is reachable only via `containerFetch` and the startup port check. That network is presumed private but unverified. The marker is a deployment claim, not a proof: the bot trusts it only because the Worker (not the Operator) sets it. A wildcard bind without exactly this marker is refused. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Worker secret, e.g. `smoke-throwaway:<channel snowflake in the TWO Staging guild>` |
 | `TWO_INTERNAL_KEYS` | Worker secret `web-staging:<64 hex>`; never a var, never logged |
+| `TWO_INTERNAL_ALLOW_ATTENDANCE_READ` | Optional exact `1`, forwarded explicitly only while the receiver is enabled; absent by default and left off after merge pending separate staging/production rollout approval |
 
 `NOT_FORWARDED` in `wrangler/src/container-env.ts` deliberately excludes the
 following. Setting them as Worker secrets cannot change the container's
@@ -134,7 +135,6 @@ capabilities; this table is not an instruction to create or stage them.
 | --- | --- |
 | `TWO_INTERNAL_ROLE_KEYS` | No allowlisted role target; `role.assign` refuses |
 | `TWO_INTERNAL_ALLOW_ADD_MEMBER` | `guild.add_member` stays gated off |
-| `TWO_INTERNAL_ALLOW_ATTENDANCE_READ` | `event.attendance.read` stays gated off |
 | `TWO_INTERNAL_ALLOW_AUTOMATIONS` | Automation export/import stay gated off |
 | `TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE` | Automation overwrite stays gated off |
 | `TWO_INTERNAL_ALLOW_EVENT_CANCEL` | `event.cancel` stays gated off |
@@ -469,6 +469,23 @@ roll off 90 days after joining. Capture consults the opt-out at open time
 (contract v2 §9): a suppressed member opens no span — absent from the record,
 not anonymised in it — and `guild_analytics_settings.voice_enabled = off`
 stops capture guild-wide; closes still finalize so no open row leaks.
+
+Capture consumes the shared accepted `event_instance_windows` authority, not
+caller-requested upsert dates or a retained attendance window. New spans and new
+tags revalidate finite-window containment, lifecycle and privacy in a transaction
+under the guild ordering lock used by mirror writers. Cancellation, confirmed
+deletion, unconfirmed absence, ambiguous instances and unknown ends authorize no
+new capture. Positive completion keeps only its confirmed finite closing grace.
+The historical `(guild, event_key, event_id, instance_starts_at)` capture record
+is written atomically with a session/tag, never by key registration or
+reconciliation; a repointed key cannot combine different occurrences. Historical
+reads remain available after revocation, with session credit capped by the
+accepted revocation/absence instant. Lifecycle writers retain historical credit
+stops in their existing mirror transaction, so later re-observation cannot fill
+an unconfirmed gap in an older span; fresh spans may start after re-observation.
+The logger still finalizes existing rows
+when the shared lookup returns no live windows. The unshipped attendance
+migration is additive; the shipped shared-instance migration is unchanged.
 
 | Code | Status | Retryable |
 | --- | --- | --- |

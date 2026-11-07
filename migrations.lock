@@ -534,8 +534,8 @@
       "justification": "Expand step: copy the imported voice creation switch and guild-wide command role from voice_guild_settings into voice_access_controls, the columns the runtime gates enforce, tightening only (creation off wins, an enforced role wins) and syncing the legacy columns as a mirror for the previous binary until a contract migration drops them; data copy only, no DDL."
     },
     "crates/cutover/migrations/0471_event_attendance.sql": {
-      "sha256": "a97fc6c555d2c5eb01ec6ff7cfb730a3526baf4eb7beaf17a5501e3541cad049",
-      "justification": "Event-window voice-session log for the keyless attendance read: one control-plane windows row per mapped event plus one raw session row per member, channel, join and leave recorded only while a window is open, with open-row and event-key indexes; additive CREATE TABLE/INDEX IF NOT EXISTS so chains cross-run in either order; raw sessions roll off 90 days after joining."
+      "sha256": "efb12decce4cc1caa0dcda67e6c4d46150bc231f1961e044d3f93e68293c1b61",
+      "justification": "Event-window voice-session log for the keyless attendance read: historical captured-instance schedules and credit-stop boundaries, never a second live authority, plus raw sessions recorded only under accepted lifecycle and privacy evidence; additive tables and indexes, no backfill; raw sessions roll off 90 days after joining."
     },
     "crates/cutover/migrations/0472_event_instance_windows.sql": {
       "sha256": "ff2af4cb454c9fa569fb2722593ff35f3af3c347dc55fcea82ddeff0c21bd671",

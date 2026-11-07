@@ -20,8 +20,10 @@ const CHANNEL: &str = "444444444444444444";
 
 async fn seed_attendance(pool: &PgPool) {
     sqlx::query(
-        "INSERT INTO event_attendance_windows (guild_id, event_key, starts_at, ends_at) \
-         VALUES ($1, 'game-night', now() - make_interval(days => 100), now() - make_interval(days => 99))",
+        "INSERT INTO event_attendance_windows \
+         (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at) \
+         VALUES ($1, 'game-night', '2001', now() - make_interval(days => 100), \
+                 now() - make_interval(days => 100), now() - make_interval(days => 99))",
     )
     .bind(GUILD_A)
     .execute(pool)

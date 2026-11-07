@@ -2671,25 +2671,6 @@ async fn mutate_event(
     } else {
         None
     };
-    // The attendance window persists at confirm from the validated input:
-    // `validate_event_input` renders both stamps as UTC-millis ISO, so this
-    // parse only fails on input the validator already accepted — `internal`
-    // before any claim or Discord call.
-    let window = if upsert {
-        let validated = input.as_ref().expect("upsert validated its event input");
-        match (
-            two_bot_core::funnel::parse_iso_millis(&validated.starts_at),
-            two_bot_core::funnel::parse_iso_millis(&validated.ends_at),
-        ) {
-            (Some(starts_ms), Some(ends_ms)) => Some((
-                two_bot::event_attendance::datetime_of(starts_ms),
-                two_bot::event_attendance::datetime_of(ends_ms),
-            )),
-            _ => return reject(Failure::code(ErrorCode::Internal)),
-        }
-    } else {
-        None
-    };
     let Ok(_gate) = tokio::time::timeout(state.event_gate_wait, state.event_gate.lock()).await
     else {
         return reject(Failure::code(ErrorCode::InProgress));
@@ -2808,21 +2789,9 @@ async fn mutate_event(
                     mark_unknown_best_effort(&state.store, &claim, action).await;
                     return reject(Failure::reconciliation());
                 }
-                // The mapped window persists next to the key mapping, only
-                // after Discord confirms: a refused create maps nothing and
-                // logs nothing, so windows that closed before the logger
-                // shipped stay unmapped and read `not_found` by construction.
-                if let Some((starts_at, ends_at)) = window {
-                    if let Err(window_error) = state
-                        .store
-                        .put_attendance_window(guild_id, &event_key, starts_at, ends_at)
-                        .await
-                    {
-                        log_terminal_persist_failed(action, "attendance_window", window_error);
-                        mark_unknown_best_effort(&state.store, &claim, action).await;
-                        return reject(Failure::reconciliation());
-                    }
-                }
+                // The executor's accepted Discord response already committed
+                // lifecycle evidence with the mirror. A key is only an address:
+                // neither registration nor reconciliation creates attendance.
             }
             let response = TerminalResponse::Success {
                 resource_id: Some(event_id),

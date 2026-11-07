@@ -4,9 +4,10 @@
 //! from `VOICE_STATE_UPDATE` transitions, but only while a mapped event window
 //! is open for the guild. Outside event windows nothing is recorded — never an
 //! always-on voice log. A window is `[starts_at - 15 min, ends_at + 15 min]`
-//! per mapped event (persisted at `event.upsert` confirm next to the key
-//! mapping). Sessions overlapping two windows tag both, via the tag union
-//! widened at close time.
+//! per mapped event, resolved from shared accepted-instance lifecycle evidence.
+//! Historical capture records never grant permission to capture. Sessions
+//! overlapping two eligible windows tag both; close-time tags are revalidated
+//! transactionally with capture-time privacy gates.
 //!
 //! The read half projects the §4 shape for the keyless
 //! `event.attendance.read` verb from the stored rows: positive list only
@@ -317,9 +318,6 @@ pub async fn record_transition(store: &impl AttendanceStore, transition: VoiceTr
             return;
         }
     };
-    if windows.is_empty() {
-        return;
-    }
     let window_ms: Vec<AttendanceWindowMs> = windows
         .iter()
         .map(|window| AttendanceWindowMs {
@@ -595,7 +593,7 @@ pub fn project_attendance(
             *room = (row.joined_ms, row.channel_name.clone());
         }
         if from_ms < to_ms {
-            entry.0 += (to_ms - from_ms) / 60_000;
+            entry.0 += to_ms - from_ms;
             if !row.afk {
                 sweep.push((from_ms, 1));
                 sweep.push((to_ms, -1));
@@ -611,10 +609,10 @@ pub fn project_attendance(
     }
     let wire_members: Vec<Value> = members
         .into_iter()
-        .map(|(member_id, (minutes, sessions, first_joined_ms))| {
+        .map(|(member_id, (duration_ms, sessions, first_joined_ms))| {
             json!({
                 "discord_id": member_id.to_string(),
-                "minutes": minutes,
+                "minutes": duration_ms / 60_000,
                 "sessions": sessions,
                 "first_joined_at": two_bot_core::funnel::format_iso_millis(first_joined_ms),
             })
@@ -654,6 +652,19 @@ mod tests {
     use super::*;
 
     const MIN: i64 = 60_000;
+
+    #[test]
+    fn partial_minutes_accumulate_across_sessions_before_rounding() {
+        let rows = [
+            session(1, 7, "Lobby", false, false, 0, Some(30_000)),
+            session(1, 7, "Lobby", false, false, MIN, Some(MIN + 30_000)),
+        ];
+        let result =
+            project_attendance("event", &window("event", 0, 2 * MIN), &rows, 3 * MIN).unwrap();
+        assert_eq!(result["members"][0]["minutes"], 1);
+        assert_eq!(result["members"][0]["sessions"], 2);
+        assert_eq!(result["peak_concurrent"], 1);
+    }
 
     fn window(event_key: &str, starts_ms: i64, ends_ms: i64) -> AttendanceWindowMs {
         AttendanceWindowMs {
@@ -1093,5 +1104,490 @@ mod tests {
         .await;
         assert_eq!(*store.opens.lock().expect("opens lock"), 0);
         assert_eq!(*store.closes.lock().expect("closes lock"), 1);
+    }
+
+    /// How one `FaultStore` statement behaves.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fault {
+        Pass,
+        Fail,
+        /// Never resolves, so the statement bound must fire.
+        Hang,
+    }
+
+    /// What the logger wrote through a `FaultStore`.
+    #[derive(Default)]
+    struct Writes {
+        calls: Vec<&'static str>,
+        closes: Vec<(i64, OffsetDateTime, String, Vec<String>)>,
+        inserts: Vec<NewAttendanceSession>,
+    }
+
+    /// Fake store with a per-statement fault, configurable windows and open
+    /// rows, and a record of every call and write.
+    struct FaultStore {
+        windows: Vec<AttendanceWindow>,
+        open_rows: Vec<AttendanceSession>,
+        windows_fault: Fault,
+        open_fault: Fault,
+        voice_fault: Fault,
+        suppress_fault: Fault,
+        close_fault: Fault,
+        insert_fault: Fault,
+        writes: std::sync::Mutex<Writes>,
+    }
+
+    impl FaultStore {
+        /// One window spanning now, no open rows, every statement passing.
+        fn new() -> Self {
+            let now = OffsetDateTime::now_utc();
+            Self {
+                windows: vec![AttendanceWindow {
+                    event_key: "game-night".to_owned(),
+                    starts_at: now - time::Duration::hours(1),
+                    ends_at: now + time::Duration::hours(1),
+                }],
+                open_rows: Vec::new(),
+                windows_fault: Fault::Pass,
+                open_fault: Fault::Pass,
+                voice_fault: Fault::Pass,
+                suppress_fault: Fault::Pass,
+                close_fault: Fault::Pass,
+                insert_fault: Fault::Pass,
+                writes: std::sync::Mutex::new(Writes::default()),
+            }
+        }
+
+        fn with_open_row(mut self, channel_id: &str, name: &str) -> Self {
+            self.open_rows.push(AttendanceSession {
+                id: 5,
+                member_id: "11".to_owned(),
+                channel_id: channel_id.to_owned(),
+                channel_name: name.to_owned(),
+                is_bot: false,
+                afk: false,
+                joined_at: OffsetDateTime::now_utc() - time::Duration::minutes(5),
+                left_at: None,
+                event_keys: vec!["game-night".to_owned()],
+            });
+            self
+        }
+
+        fn note(&self, call: &'static str) {
+            self.writes.lock().expect("writes lock").calls.push(call);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.writes.lock().expect("writes lock").calls.clone()
+        }
+
+        async fn apply<T>(fault: Fault, value: T) -> Result<T, String> {
+            match fault {
+                Fault::Pass => Ok(value),
+                Fault::Fail => Err("store down".to_owned()),
+                Fault::Hang => std::future::pending().await,
+            }
+        }
+    }
+
+    impl AttendanceStore for FaultStore {
+        type Error = String;
+
+        async fn attendance_windows(
+            &self,
+            _guild: Snowflake,
+        ) -> Result<Vec<AttendanceWindow>, Self::Error> {
+            self.note("windows");
+            Self::apply(self.windows_fault, self.windows.clone()).await
+        }
+
+        async fn open_attendance_sessions(
+            &self,
+            _guild: Snowflake,
+            _member: Snowflake,
+        ) -> Result<Vec<AttendanceSession>, Self::Error> {
+            self.note("open_rows");
+            Self::apply(self.open_fault, self.open_rows.clone()).await
+        }
+
+        async fn insert_attendance_session(
+            &self,
+            new: NewAttendanceSession,
+        ) -> Result<i64, Self::Error> {
+            self.note("insert");
+            self.writes.lock().expect("writes lock").inserts.push(new);
+            Self::apply(self.insert_fault, 9).await
+        }
+
+        async fn close_attendance_session(
+            &self,
+            id: i64,
+            left_at: OffsetDateTime,
+            channel_name: String,
+            event_keys: &[String],
+        ) -> Result<u64, Self::Error> {
+            self.note("close");
+            self.writes.lock().expect("writes lock").closes.push((
+                id,
+                left_at,
+                channel_name,
+                event_keys.to_vec(),
+            ));
+            Self::apply(self.close_fault, 1).await
+        }
+
+        async fn attendance_sessions_for_event_key(
+            &self,
+            _guild: Snowflake,
+            _event_key: &str,
+        ) -> Result<Vec<AttendanceSession>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        async fn is_attendance_suppressed(
+            &self,
+            _guild: Snowflake,
+            _member: Snowflake,
+        ) -> Result<bool, Self::Error> {
+            self.note("suppressed");
+            Self::apply(self.suppress_fault, false).await
+        }
+
+        async fn is_attendance_voice_enabled(
+            &self,
+            _guild: Snowflake,
+        ) -> Result<bool, Self::Error> {
+            self.note("voice");
+            Self::apply(self.voice_fault, true).await
+        }
+    }
+
+    fn move_transition() -> VoiceTransition {
+        VoiceTransition {
+            previous: Some(7),
+            current: Some(9),
+            previous_name: Some("lobby-renamed".to_owned()),
+            current_name: Some("stage".to_owned()),
+            ..join_transition()
+        }
+    }
+
+    #[tokio::test]
+    async fn flag_off_touches_no_store() {
+        let store = FaultStore::new();
+        record_transition(
+            &store,
+            VoiceTransition {
+                enabled: false,
+                ..join_transition()
+            },
+        )
+        .await;
+        assert!(store.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_channel_frame_touches_no_store() {
+        let store = FaultStore::new();
+        record_transition(
+            &store,
+            VoiceTransition {
+                previous: Some(7),
+                current: Some(7),
+                ..join_transition()
+            },
+        )
+        .await;
+        assert!(store.calls().is_empty());
+        // A leave from nowhere to nowhere is the same noop.
+        record_transition(
+            &store,
+            VoiceTransition {
+                previous: None,
+                current: None,
+                ..join_transition()
+            },
+        )
+        .await;
+        assert!(store.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn windows_read_error_skips_transition() {
+        let mut store = FaultStore::new();
+        store.windows_fault = Fault::Fail;
+        record_transition(&store, join_transition()).await;
+        assert_eq!(store.calls(), vec!["windows"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn windows_read_timeout_skips_transition() {
+        let mut store = FaultStore::new();
+        store.windows_fault = Fault::Hang;
+        record_transition(&store, join_transition()).await;
+        assert_eq!(store.calls(), vec!["windows"]);
+    }
+
+    #[tokio::test]
+    async fn no_live_windows_still_checks_for_rows_to_finalize() {
+        let mut store = FaultStore::new();
+        store.windows.clear();
+        record_transition(&store, join_transition()).await;
+        assert_eq!(store.calls(), vec!["windows", "open_rows"]);
+        let writes = store.writes.lock().expect("writes lock");
+        assert!(writes.inserts.is_empty());
+        assert!(writes.closes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn revocation_leaves_no_live_window_but_still_finalizes() {
+        let mut store = FaultStore::new().with_open_row("7", "lobby");
+        store.windows.clear();
+        record_transition(
+            &store,
+            VoiceTransition {
+                previous: Some(7),
+                current: None,
+                ..join_transition()
+            },
+        )
+        .await;
+        assert_eq!(store.calls(), vec!["windows", "open_rows", "close"]);
+        let writes = store.writes.lock().expect("writes lock");
+        assert_eq!(writes.closes.len(), 1);
+        assert!(writes.inserts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_rows_read_error_skips_transition() {
+        let mut store = FaultStore::new().with_open_row("7", "lobby");
+        store.open_fault = Fault::Fail;
+        record_transition(&store, move_transition()).await;
+        assert_eq!(store.calls(), vec!["windows", "open_rows"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn open_rows_read_timeout_skips_transition() {
+        let mut store = FaultStore::new().with_open_row("7", "lobby");
+        store.open_fault = Fault::Hang;
+        record_transition(&store, move_transition()).await;
+        assert_eq!(store.calls(), vec!["windows", "open_rows"]);
+    }
+
+    #[tokio::test]
+    async fn outside_every_window_with_no_open_row_writes_nothing() {
+        let mut store = FaultStore::new();
+        let now = OffsetDateTime::now_utc();
+        store.windows = vec![AttendanceWindow {
+            event_key: "future-show".to_owned(),
+            starts_at: now + time::Duration::days(2),
+            ends_at: now + time::Duration::days(2) + time::Duration::hours(1),
+        }];
+        record_transition(&store, join_transition()).await;
+        // No open planned, so the gates are never consulted either.
+        assert_eq!(store.calls(), vec!["windows", "open_rows"]);
+    }
+
+    #[tokio::test]
+    async fn outside_window_leave_closes_open_row_without_gates() {
+        let mut store = FaultStore::new().with_open_row("7", "lobby");
+        let now = OffsetDateTime::now_utc();
+        store.windows = vec![AttendanceWindow {
+            event_key: "game-night".to_owned(),
+            starts_at: now - time::Duration::days(2),
+            ends_at: now - time::Duration::days(2) + time::Duration::hours(1),
+        }];
+        record_transition(
+            &store,
+            VoiceTransition {
+                previous: Some(7),
+                current: None,
+                previous_name: Some("lobby".to_owned()),
+                current_name: None,
+                ..join_transition()
+            },
+        )
+        .await;
+        assert_eq!(store.calls(), vec!["windows", "open_rows", "close"]);
+        let writes = store.writes.lock().expect("writes lock");
+        assert_eq!(writes.closes[0].0, 5);
+        assert_eq!(writes.closes[0].3, vec!["game-night".to_owned()]);
+        assert!(writes.inserts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn voice_gate_error_drops_open_and_skips_suppression_read() {
+        let mut store = FaultStore::new();
+        store.voice_fault = Fault::Fail;
+        record_transition(&store, join_transition()).await;
+        assert_eq!(store.calls(), vec!["windows", "open_rows", "voice"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn voice_gate_timeout_drops_open() {
+        let mut store = FaultStore::new();
+        store.voice_fault = Fault::Hang;
+        record_transition(&store, join_transition()).await;
+        assert_eq!(store.calls(), vec!["windows", "open_rows", "voice"]);
+    }
+
+    #[tokio::test]
+    async fn suppression_error_drops_open() {
+        let mut store = FaultStore::new();
+        store.suppress_fault = Fault::Fail;
+        record_transition(&store, join_transition()).await;
+        assert_eq!(
+            store.calls(),
+            vec!["windows", "open_rows", "voice", "suppressed"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suppression_timeout_drops_open() {
+        let mut store = FaultStore::new();
+        store.suppress_fault = Fault::Hang;
+        record_transition(&store, join_transition()).await;
+        assert_eq!(
+            store.calls(),
+            vec!["windows", "open_rows", "voice", "suppressed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_failure_on_move_still_closes_previous_row() {
+        let mut store = FaultStore::new().with_open_row("7", "lobby");
+        store.voice_fault = Fault::Fail;
+        record_transition(&store, move_transition()).await;
+        // The open is dropped fail-closed, but the old row is finalized.
+        assert_eq!(
+            store.calls(),
+            vec!["windows", "open_rows", "voice", "close"]
+        );
+    }
+
+    #[tokio::test]
+    async fn join_inserts_tagged_row_with_afk_and_bot_flags() {
+        let store = FaultStore::new();
+        record_transition(
+            &store,
+            VoiceTransition {
+                is_bot: true,
+                afk_channel: Some(7),
+                ..join_transition()
+            },
+        )
+        .await;
+        assert_eq!(
+            store.calls(),
+            vec!["windows", "open_rows", "voice", "suppressed", "insert"]
+        );
+        let writes = store.writes.lock().expect("writes lock");
+        let new = &writes.inserts[0];
+        assert_eq!(new.guild_id, "1");
+        assert_eq!(new.member_id, "11");
+        assert_eq!(new.channel_id, "7");
+        assert_eq!(new.channel_name, "lobby");
+        assert!(new.is_bot);
+        assert!(new.afk);
+        assert_eq!(new.event_keys, vec!["game-night".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn join_to_non_afk_channel_clears_afk_flag() {
+        let store = FaultStore::new();
+        record_transition(
+            &store,
+            VoiceTransition {
+                afk_channel: Some(99),
+                current_name: None,
+                ..join_transition()
+            },
+        )
+        .await;
+        let writes = store.writes.lock().expect("writes lock");
+        assert!(!writes.inserts[0].afk);
+        // A missing live name stores an empty one rather than failing.
+        assert_eq!(writes.inserts[0].channel_name, "");
+    }
+
+    #[tokio::test]
+    async fn move_closes_with_live_previous_name_then_inserts() {
+        let store = FaultStore::new().with_open_row("7", "lobby");
+        record_transition(&store, move_transition()).await;
+        assert_eq!(
+            store.calls(),
+            vec![
+                "windows",
+                "open_rows",
+                "voice",
+                "suppressed",
+                "close",
+                "insert"
+            ]
+        );
+        let writes = store.writes.lock().expect("writes lock");
+        // Row channel equals the previous channel: the renamed live name wins.
+        assert_eq!(writes.closes[0].2, "lobby-renamed");
+        assert_eq!(writes.inserts[0].channel_id, "9");
+        assert_eq!(writes.inserts[0].channel_name, "stage");
+    }
+
+    #[tokio::test]
+    async fn close_keeps_stored_name_when_row_channel_is_not_previous() {
+        // The row sits in channel 3 while the frame says the member left 7
+        // (a missed close earlier): the live name must not overwrite it.
+        let store = FaultStore::new().with_open_row("3", "old-room");
+        record_transition(&store, move_transition()).await;
+        let writes = store.writes.lock().expect("writes lock");
+        assert_eq!(writes.closes[0].2, "old-room");
+    }
+
+    #[tokio::test]
+    async fn close_keeps_stored_name_when_row_channel_id_is_corrupt() {
+        let store = FaultStore::new().with_open_row("not-a-snowflake", "old-room");
+        record_transition(&store, move_transition()).await;
+        let writes = store.writes.lock().expect("writes lock");
+        assert_eq!(writes.closes.len(), 1);
+        assert_eq!(writes.closes[0].2, "old-room");
+    }
+
+    #[tokio::test]
+    async fn close_error_does_not_block_the_new_open() {
+        let mut store = FaultStore::new().with_open_row("7", "lobby");
+        store.close_fault = Fault::Fail;
+        record_transition(&store, move_transition()).await;
+        let writes = store.writes.lock().expect("writes lock");
+        assert_eq!(writes.closes.len(), 1);
+        assert_eq!(writes.inserts.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_timeout_does_not_block_the_new_open() {
+        let mut store = FaultStore::new().with_open_row("7", "lobby");
+        store.close_fault = Fault::Hang;
+        record_transition(&store, move_transition()).await;
+        let writes = store.writes.lock().expect("writes lock");
+        assert_eq!(writes.closes.len(), 1);
+        assert_eq!(writes.inserts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn insert_error_returns_after_close_is_recorded() {
+        let mut store = FaultStore::new().with_open_row("7", "lobby");
+        store.insert_fault = Fault::Fail;
+        record_transition(&store, move_transition()).await;
+        let writes = store.writes.lock().expect("writes lock");
+        assert_eq!(writes.closes.len(), 1);
+        assert_eq!(writes.inserts.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insert_timeout_returns_after_close_is_recorded() {
+        let mut store = FaultStore::new().with_open_row("7", "lobby");
+        store.insert_fault = Fault::Hang;
+        record_transition(&store, move_transition()).await;
+        let writes = store.writes.lock().expect("writes lock");
+        assert_eq!(writes.closes.len(), 1);
+        assert_eq!(writes.inserts.len(), 1);
     }
 }

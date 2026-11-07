@@ -1,11 +1,10 @@
 -- 0471_event_attendance.sql: Event Echoes attendance log.
 --
--- Two tables. `event_attendance_windows` persists one row per mapped event
--- (guild, event_key) with the upsert-confirmed start/end instants; the logger
--- and the keyless `event.attendance.read` verb derive the recording window
--- `[starts_at - 15 min, ends_at + 15 min]` from it. Windows are control-plane
--- records (no member identity): per-member erasure and guild purges do not
--- cover them, mirroring `scheduled_events`.
+-- Two tables. `event_attendance_windows` retains the accepted instance and
+-- schedule at capture, for historical reads/finalization only. It never
+-- authorizes capture: the logger checks event_instance_windows and the current
+-- key mapping transactionally. No rows are backfilled on migration or upsert.
+-- Windows contain no member identity; member erasure does not cover them.
 --
 -- `event_voice_sessions` is the raw voice-session log: one row per
 -- (member, channel, joined_at, left_at). Rows open only while a window is
@@ -32,8 +31,11 @@
 CREATE TABLE IF NOT EXISTS event_attendance_windows (
   guild_id   TEXT NOT NULL,
   event_key  TEXT NOT NULL,
+  event_id   TEXT NOT NULL,
+  instance_starts_at TIMESTAMPTZ NOT NULL,
   starts_at  TIMESTAMPTZ NOT NULL,
   ends_at    TIMESTAMPTZ NOT NULL,
+  capture_stops TIMESTAMPTZ[] NOT NULL DEFAULT '{}',
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (guild_id, event_key)
 );

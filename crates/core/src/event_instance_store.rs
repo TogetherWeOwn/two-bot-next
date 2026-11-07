@@ -96,6 +96,34 @@ pub(crate) async fn observe_in(
     .bind(event.status.as_str())
     .bind(observed_at)
     .bind(advancing_snapshot)
+    .execute(&mut *connection)
+    .await?;
+    stop_attendance_in(connection, guild_id).await
+}
+
+// Retain finalization boundaries before a later positive observation can replace
+// missing evidence. This is historical credit metadata, never capture authority.
+// At most one stop after the last capture is needed; repeated omission polls
+// cannot grow a captured record indefinitely.
+async fn stop_attendance_in(
+    connection: &mut PgConnection,
+    guild_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE event_attendance_windows h
+         SET capture_stops = array_append(h.capture_stops, s.stopped_at)
+         FROM event_instance_windows w
+         CROSS JOIN LATERAL (
+           SELECT LEAST(w.revoked_at::timestamptz,
+                        CASE WHEN w.status = 'missing' THEN w.omitted_at::timestamptz END) AS stopped_at
+         ) s
+         WHERE h.guild_id = $1 AND w.guild_id = h.guild_id AND w.event_id = h.event_id
+           AND w.instance_starts_at = h.instance_starts_at AND s.stopped_at IS NOT NULL
+           AND NOT (s.stopped_at = ANY(h.capture_stops))
+           AND NOT EXISTS (SELECT 1 FROM unnest(h.capture_stops) stopped
+                           WHERE stopped >= h.updated_at)",
+    )
+    .bind(guild_id)
     .execute(connection)
     .await?;
     Ok(())
@@ -128,9 +156,9 @@ pub(crate) async fn omit_in(
     .bind(guild_id)
     .bind(observed_at)
     .bind(incoming_ids)
-    .execute(connection)
+    .execute(&mut *connection)
     .await?;
-    Ok(())
+    stop_attendance_in(connection, guild_id).await
 }
 
 /// Revoke a positively confirmed deletion, including retained completion grace.
@@ -175,6 +203,7 @@ pub async fn confirm_deleted(
     .bind(observed_at)
     .execute(&mut *tx)
     .await?;
+    stop_attendance_in(&mut tx, guild_id).await?;
     tx.commit().await
 }
 
@@ -196,6 +225,9 @@ pub(crate) async fn maintain_in(
              AND e.status NOT IN ('scheduled', 'active')
              AND (e.ends_at IS NULL OR e.ends_at < NOW() - INTERVAL '15 minutes')
              AND NOT EXISTS (SELECT 1 FROM event_voice_channels c WHERE c.event_id = e.event_id)
+             AND NOT EXISTS (SELECT 1 FROM event_attendance_windows h
+                             WHERE h.guild_id = e.guild_id AND h.event_id = e.event_id
+                               AND h.instance_starts_at = e.instance_starts_at)
              AND NOT EXISTS (SELECT 1 FROM internal_event_keys k
                              WHERE k.guild_id = e.guild_id AND k.event_id = e.event_id)
              AND NOT EXISTS (SELECT 1 FROM scheduled_events s

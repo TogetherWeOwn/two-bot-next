@@ -331,7 +331,7 @@ export const NOT_FORWARDED: Readonly<Record<string, string>> = {
   TWO_INTERNAL_ACTIONS: RECEIVER_CONFIG,
   TWO_EVENTSUB_BIND: RECEIVER_BIND,
   TWO_INTERNAL_ALLOW_ADD_MEMBER: CAPABILITY,
-  TWO_INTERNAL_ALLOW_ATTENDANCE_READ: CAPABILITY,
+  TWO_INTERNAL_ALLOW_ATTENDANCE_READ: "attendance capability; reaches the Container only as exactly 1 on its own explicit containerEnvVars line while TWO_INTERNAL_ACTIONS is exactly 1, never this general flag allowlist; default-off until separate rollout approval",
   TWO_INTERNAL_ALLOW_AUTOMATIONS: CAPABILITY,
   TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE: CAPABILITY,
   TWO_INTERNAL_ALLOW_EVENT_CANCEL: CAPABILITY,

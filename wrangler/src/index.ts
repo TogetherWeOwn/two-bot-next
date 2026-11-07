@@ -261,6 +261,8 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   TWO_INTERNAL_ACTIONS?: string;
   TWO_INTERNAL_CALLERS?: string;
   TWO_INTERNAL_CHANNEL_KEYS?: string;
+  /** Default-off attendance capability; forwarded explicitly only with the receiver. */
+  TWO_INTERNAL_ALLOW_ATTENDANCE_READ?: string;
   /** Signing keys: a secret, forwarded by its own explicit line and never logged. */
   TWO_INTERNAL_KEYS?: string;
 }
@@ -778,6 +780,9 @@ function containerEnvVars(env: Env, port: number): Record<string, string> {
     if (env.TWO_INTERNAL_CALLERS) vars["TWO_INTERNAL_CALLERS"] = env.TWO_INTERNAL_CALLERS;
     if (env.TWO_INTERNAL_CHANNEL_KEYS) vars["TWO_INTERNAL_CHANNEL_KEYS"] = env.TWO_INTERNAL_CHANNEL_KEYS;
     if (env.TWO_INTERNAL_KEYS) vars["TWO_INTERNAL_KEYS"] = env.TWO_INTERNAL_KEYS;
+    if (env.TWO_INTERNAL_ALLOW_ATTENDANCE_READ === "1") {
+      vars["TWO_INTERNAL_ALLOW_ATTENDANCE_READ"] = "1";
+    }
   }
   // Private EventSub receiver. Dark unless the Operator sets TWO_EVENTSUB to
   // exactly "1" with the signing secret present; any other state forwards
