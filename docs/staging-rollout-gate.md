@@ -107,10 +107,29 @@ stop a different attempt's singleton; it is **not** proof that this run never
 acquired a grant, or that staging is now stopped/idle. The parent's release and
 native expiry receipts supply the stop evidence.
 
+The staging Worker/container rollback now refuses a target unless its immutable
+Worker-version bindings prove `STAGING_RUNTIME_POLICY=bounded`,
+`TWO_DEPLOY_ENV=staging` and the receipt's exact `CONTAINER_RELEASE` SHA. Missing,
+duplicate, secret-type or mismatched bindings refuse before any fence, Worker
+restore or image rollout, even for `--dry-run`. A pre-stamp/always-on staging
+target has no legacy bypass. Binding evidence is necessary, not sufficient:
+reviewed target implementation and runtime/release acceptance remain mandatory.
+
+The deploy's auto-rollback passes the original `steps.use.outputs.expires_at`;
+it never chooses new minutes. Before mutation, `restore-check` asserts the
+current run/attempt/window without probing the intentionally failed build. After
+restore and ownership takeover, `rebind` authorizes and readies the restored
+receipt's deployment/SHA under that **same** expiry; the unchanged consecutive
+stable gate still runs afterwards. If the grant is missing, belongs to another
+attempt, ended, or expires during restore, recovery fails closed rather than
+minting extra time. Parent cleanup retains the original expiry and native
+expiry remains the cancellation backstop. The extra projected receipts are
+`auto-rollback-evidence.json.staging-use.jsonl` in the existing rollout artifact;
+production rollback never invokes this staging contract.
+
 The deploy and reusable voice/help workflows now declare the bounded contract,
-but the rollout is **incomplete and not activated**. Scheduled user-flow,
-rollback/drill runtime integration and the live-reader inventory still gate
-activation. The wrappers replace no existing qualification. The binding checker
+but the rollout is **incomplete and not activated**. Manual drill integration,
+remaining readers and the live inventory still gate activation. The wrappers replace no existing qualification. The binding checker
 permits only an absent policy or the exact `"bounded"` value in staging with
 `TWO_DEPLOY_ENV="staging"`; it rejects top-level, production and other named
 environment placement and plaintext ownership-control tokens. No checked-in

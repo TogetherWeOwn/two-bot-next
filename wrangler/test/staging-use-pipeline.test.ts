@@ -71,6 +71,29 @@ const binding = (over: Record<string, unknown> = {}) => ({
   ...base, sha: SHA, deploymentId: "dep-1", expiresAt: NOW + 10 * MINUTE, ...over,
 });
 
+test("rollback preflight asserts only the current retained grant without readiness or mutation", async () => {
+  const use = grant();
+  const f = fixture({ use });
+  const result = await pipelineUse({ ...base, action: "restore-check", expiresAt: use.expiresAt },
+    f.invoke, clock, f.emit);
+  assert.deepEqual(f.called(), ["status", "assert"]);
+  assert.deepEqual(f.calls[1], { ...binding(), action: "assert" });
+  assert.equal(result.action, "assert");
+  assert.deepEqual(f.state.use, use);
+  assert.equal(f.emitted.some((r) => r.action === "window"), false);
+  for (const invalid of [null, grant({ runId: "999" }), grant({ runAttempt: 2 }),
+    grant({ expiresAt: NOW + MINUTE }), grant({ phase: "released" }), grant({ phase: "preparing" })]) {
+    const bad = fixture({ use: invalid });
+    await assert.rejects(pipelineUse({ ...base, action: "restore-check", expiresAt: use.expiresAt },
+      bad.invoke, clock, bad.emit), code("staging_window_mismatch"));
+    assert.deepEqual(bad.called(), ["status"]);
+  }
+  const denied = fixture({ use }, "assert");
+  await assert.rejects(pipelineUse({ ...base, action: "restore-check", expiresAt: use.expiresAt },
+    denied.invoke, clock, denied.emit), code("injected_assert_failure"));
+  assert.deepEqual(denied.called(), ["status", "assert"]);
+});
+
 test("begin persists attempt and chosen expiry before acquire, then acquires and readies the same window", async () => {
   const f = fixture();
   const expiresAt = NOW + 30 * MINUTE;

@@ -15,7 +15,7 @@ const sameWindow = (use, args) => sameAttempt(use, args) && use.expiresAt === ar
  * The immutable expiry is an Actions output, never an untrusted HTTP field used
  * as a shell command. Native expiry remains authoritative if no cleanup runs. */
 export async function pipelineUse(args, invoke = stagingUse, now = Date.now, emit = () => {}) {
-  require(["begin", "consume", "rebind", "finish"].includes(args.action), "staging_pipeline_action_invalid");
+  require(["begin", "consume", "restore-check", "rebind", "finish"].includes(args.action), "staging_pipeline_action_invalid");
   require(typeof args.runId === "string" && /^[1-9][0-9]{0,19}$/.test(args.runId)
     && positive(args.runAttempt), "staging_run_invalid");
   if (args.action === "begin") {
@@ -46,6 +46,13 @@ export async function pipelineUse(args, invoke = stagingUse, now = Date.now, emi
     return call("ready", { sha: args.sha, deploymentId: args.deploymentId, expiresAt: args.expiresAt });
   }
   const state = await call("status");
+  if (args.action === "restore-check") {
+    // Rollback may restore a different build, but never invent recovery use.
+    // Assert the CURRENT grant before any fence/deployment/image mutation;
+    // readiness belongs to the restored build, not the intentionally failed one.
+    require(sameWindow(state.use, args) && state.use.phase === "active", "staging_window_mismatch");
+    return call("assert", { sha: state.sha, deploymentId: state.deploymentId, expiresAt: args.expiresAt });
+  }
   if (args.action === "finish") {
     // A begin can fail before publishing a grant. Cleanup records that fact but
     // must not infer authority to stop a different attempt's running singleton.

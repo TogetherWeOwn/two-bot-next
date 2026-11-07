@@ -1005,6 +1005,10 @@ def staging_full_window_errors(workflow, name="deploy-staging.yml"):
         if "concurrency" in job:
             errors.append(f"{name}:{job_id}: must not re-hold a lock inside the full-window group")
     deploy = jobs.get("deploy") or {}
+    rollback = [step for step in deploy.get("steps", []) if step.get("id") == "auto_rollback"]
+    if len(rollback) != 1 or (rollback[0].get("env") or {}).get("STAGING_USE_EXPIRES_AT") != \
+            "${{ steps.use.outputs.expires_at }}":
+        errors.append(f"{name}: rollback must retain the original finite-use expiry")
     declared = deploy.get("outputs") or {}
     bound = {}
     for job_id, workflow_file in (("voice-synthetic", "voice-synthetic.yml"),
@@ -6921,7 +6925,11 @@ class WorkflowTests(unittest.TestCase):
                 "dispatch carries the grant": lambda w: w["on"].__setitem__(
                     "workflow_dispatch", {"inputs": {"staging_use_expires_at": {"type": "string"}}}),
                 "extra secret": lambda w: w["on"]["workflow_call"]["secrets"].update(
-                    {"STAGING_OWNERSHIP_CONTROL_TOKEN": {"required": "false"}}),
+                    {"UNREVIEWED_CONTROL_TOKEN": {"required": "false"}}),
+                "control declaration missing": lambda w: w["on"]["workflow_call"]["secrets"].pop(
+                    "STAGING_OWNERSHIP_CONTROL_TOKEN"),
+                "control declaration required": lambda w: w["on"]["workflow_call"]["secrets"][
+                    "STAGING_OWNERSHIP_CONTROL_TOKEN"].update({"required": "true"}),
                 "window job dropped": lambda w: w["jobs"].pop("staging-window"),
                 "release job dropped": lambda w: w["jobs"].pop("staging-use-release"),
                 "extra job": lambda w: w["jobs"].__setitem__("extra", {}),
@@ -7003,6 +7011,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(staging_full_window_errors(staging), [])
         job = lambda w, name: w["jobs"][name]
         mutations = {
+            "rollback expiry missing": lambda w: next(s for s in job(w, "deploy")["steps"]
+                if s.get("id") == "auto_rollback")["env"].pop("STAGING_USE_EXPIRES_AT"),
+            "rollback expiry replaced": lambda w: next(s for s in job(w, "deploy")["steps"]
+                if s.get("id") == "auto_rollback")["env"].update({"STAGING_USE_EXPIRES_AT": "360"}),
             "legacy group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
             "cancelling": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
             "deploy re-holds": lambda w: job(w, "deploy").update(

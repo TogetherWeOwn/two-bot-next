@@ -594,6 +594,7 @@ jobs:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           ROLLBACK_ACTOR: github-actions:${{ github.run_id }}:${{ env.DEPLOY_SHA }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_EXPIRES_AT: ${{ steps.use.outputs.expires_at }}
         run: |
           set -euo pipefail
           # No --expected-sha flag: the snapshot's recorded serving SHA is
