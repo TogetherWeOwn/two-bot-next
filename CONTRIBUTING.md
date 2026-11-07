@@ -144,6 +144,57 @@ can cause component-install conflicts before fmt runs. The offline workflow
 policy suite pins all ten installers to the repository version; bump them and
 the toolchain and builder-image pins together.
 
+### Nightly test partitions
+
+`nightly.yml` retains its wiring-change PR selector and event timeout allow-list:
+45 minutes per heavy PR job (also the fallback for any other event), 180 minutes
+only for schedule/manual runs. Do not raise the PR cap to accommodate workload.
+The original serial all-feature workload is split into:
+
+- `sweep-plan`: generate the command reference, compile Cargo's default workspace
+  test selection (`--no-run`, including ordinary examples), and discover each
+  libtest target's original runnable inventory with the existing substring skips.
+- `sweep-partition`: six deterministic partitions, at most two in parallel. Each
+  re-discovers the same workspace/feature inventory and executes exact subsets
+  within binaries, including the bot binary, with one test thread per disposable
+  database. Duplicate names in different targets are separate identities. Unknown,
+  missing, duplicated or empty expected execution fails rather than passing.
+- `sweep-guarded`: the original guarded-URL routes and dedicated backup proofs,
+  including the CLI build and scratch prerequisites, still executed serially.
+- `sweep-docs`: workspace doctests with the plan's original include-ignored/skip
+  semantics, followed by `cargo doc --workspace --all-features --no-deps --locked`
+  under `RUSTDOCFLAGS=-D warnings`.
+
+The `nightly ignored tests and docs` aggregate requires the selector, plan, all six
+partitions, guarded suites/backups and docs. It compares exact-source-SHA receipts
+against the complete/disjoint plan; a failed, cancelled, missing or skipped
+selected job cannot pass. Matrix fail-fast is disabled. Plan and receipts are
+seven-day run artifacts, not executable build downloads. Artifact names are stable
+within one workflow run so failed-job reruns can reuse successful producers;
+rerun producers replace their own artifact, and SHA/plan-digest checks still apply.
+Native test processes
+retain their package working directory; the partition helper does not use
+nextest's per-test process isolation or llvm-cov's failure-tolerance flags.
+Each invocation uses a fresh libtest `--logfile` for exact status/name evidence,
+independent of inherited child stdout/stderr. Console diagnostic bytes still stream
+unchanged, including non-UTF-8 output. Only the closing harness summary supplies
+summary/count evidence; earlier summary-looking child lines are diagnostics.
+The successful closing summary/counts and process exit remain mandatory.
+Missing, empty, duplicate, failed, ignored or unknown result records fail closed.
+The pinned Rust 1.99.1 supports this deprecated flag; recheck its protocol when
+upgrading the toolchain rather than falling back to parsing mixed console output.
+
+Verify a change with an actual executing `pull_request` run on its exact head,
+record each heavy job's time and headroom, and aim for at most 35 minutes per
+leg. Test counts are not a runtime guarantee. Rebalance only from measured
+results; a skipped job or a 180-minute manual pass is not PR-cap evidence.
+Offline contracts run in the existing source-level CI suite:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_nightly_partition*.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
+```
+
 ### Pull-request size labels (advisory)
 
 `.github/workflows/pr-size.yml` labels every pull request `size/S` (up to 100
