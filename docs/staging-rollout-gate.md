@@ -75,6 +75,32 @@ build/deploy identity and rollout qualification gates, not their replacement.
 `release` confirms native stop, can repeat after expiry or partial acquisition,
 and refuses a different run/attempt/window. It cannot renew an expiry.
 
+`wrangler/scripts/staging-use-pipeline.mjs` composes that client for the pending
+workflow integration. `begin` uses authenticated control status to identify the
+currently owned build, persists and exports a finite expiry **before** acquisition,
+then requires readiness on that build. Repeating the same workflow attempt keeps
+its original expiry, including a partially prepared grant; a released/expired
+attempt cannot begin again. The caller supplies `STAGING_USE_MINUTES` only for
+`begin`, not as a renewal or an inherited consumer override.
+
+`rebind` requires the caller's original expiry plus the intended deployment/SHA
+from the independently validated deployment or rollback receipt. It refuses a
+missing/released/different-run grant rather than minting new authority. `consume`
+accepts the caller's exact deployment/SHA/expiry and only checks readiness: it
+never discovers a substitute build, acquires or releases. `finish` uses the
+current authenticated identity to release only that same run/attempt/window,
+including after a rollback or expiry. A `not-owned` result means cleanup did not
+stop a different attempt's singleton; it is **not** proof that this run never
+acquired a grant, or that staging is now stopped/idle. The parent's release and
+native expiry receipts supply the stop evidence.
+
+These wrappers are **not wired into workflows yet**. They do not supply an
+Actions lock, replace existing qualification, or activate the policy. The binding
+checker permits only an absent policy or the exact `"bounded"` value in staging
+with `TWO_DEPLOY_ENV="staging"`; it rejects top-level, production and other named
+environment placement and plaintext ownership-control tokens. No checked-in
+configuration enables the policy at this checkpoint.
+
 Every CLI invocation requires a pipeline-owned `STAGING_USE_RECEIPT` NDJSON path
 and writes an attempt receipt before network activity, followed by a projected
 success or fixed-code failure receipt. Upload these even on failed runs. Runtime
