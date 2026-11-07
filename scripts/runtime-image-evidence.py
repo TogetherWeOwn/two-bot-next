@@ -2,7 +2,8 @@
 
 The distroless runtime has no shell, package manager or coreutils, so nothing
 executes inside the image: one never-started container is exported and its
-filesystem is read here. Anything unparseable fails closed.
+filesystem is read here. Anything unparseable fails closed. --check-runtime
+also enforces the selected zlib-free package and dynamic-linking contract.
 """
 
 import argparse
@@ -26,10 +27,13 @@ TOOL_DIRS = ("usr/local/sbin", "usr/local/bin", "usr/sbin", "usr/bin", "sbin", "
 TOOLS = ("sh", "bash", "dash", "ash", "busybox", "apt", "apt-get", "dpkg", "perl",
          "python3", "openssl", "mount", "nsenter", "su", "sudo", "getcap", "setcap")
 CAPABILITY = "SCHILY.xattr.security.capability"
+RUNTIME_NEEDED = {"libc.so.6", "libm.so.6", "libgcc_s.so.1"}
+RUNTIME_PACKAGES = {"base-files", "ca-certificates", "media-types", "netbase", "tzdata",
+                    "tzdata-legacy", "libc6", "libgcc-s1", "gcc-14-base"}
 LIMITATIONS = [
     "Raw observations only: no vulnerability acceptance or suppression.",
     "Read from an exported, never-started container; nothing executed inside the image.",
-    "Package rows come from distroless status.d control files, which carry no dpkg Status field.",
+    "Package rows come from status.d control files; base records may omit dpkg Status, copied GCC records retain it.",
     "Only the security.capability extended attribute is recorded; other xattrs and runtime privileges are not.",
     "File presence and ELF linkage do not establish application input reachability.",
 ]
@@ -236,7 +240,33 @@ def elf_linkage(data):
     return interpreter, needed
 
 
-def inspect_filesystem(archive):
+def check_runtime_filesystem(members, filesystem):
+    """Enforce the selected zlib-free, dynamically linked runtime composition."""
+    binary = filesystem["binary"]
+    if not binary["interpreter"] or "libc.so.6" not in binary["needed"]:
+        raise ValueError("Runtime must retain dynamically linked, inventoried glibc")
+    unexpected = set(binary["needed"]) - RUNTIME_NEEDED
+    if unexpected:
+        raise ValueError(f"Runtime DT_NEEDED outside the allowed set: {sorted(unexpected)}")
+    libgcc = binary["needed"].get("libgcc_s.so.1")
+    if libgcc is not None and libgcc["packages"] != ["libgcc-s1"]:
+        raise ValueError("libgcc_s.so.1 lacks libgcc-s1 ownership")
+    if any(name.rsplit("/", 1)[-1].startswith("libz.so") for name in members):
+        raise ValueError("Runtime contains a libz.so file or link")
+    packages = {row["package"]: row for row in filesystem["installed_packages"]}
+    if set(packages) != RUNTIME_PACKAGES:
+        raise ValueError("Runtime package inventory differs from base-nossl plus official GCC runtime")
+    if packages["libgcc-s1"]["version"] != packages["gcc-14-base"]["version"]:
+        raise ValueError("GCC runtime package versions differ")
+    for package in ("libgcc-s1", "gcc-14-base"):
+        if packages[package]["status"] != INSTALLED:
+            raise ValueError("Copied GCC runtime package lacks installed dpkg status")
+        copyright_path = resolve(members, f"usr/share/doc/{package}/copyright")
+        if copyright_path is None or not members[copyright_path].isreg() or not members[copyright_path].size:
+            raise ValueError("Copied GCC runtime package lacks copyright data")
+
+
+def inspect_filesystem(archive, check_runtime=False):
     members, contents = {}, {}
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
         for member in tar:
@@ -272,7 +302,7 @@ def inspect_filesystem(archive):
         raise ValueError(f"ELF interpreter {interpreter} does not resolve inside the image")
     tools = sorted({"/" + path for path in (f"{directory}/{tool}" for directory in TOOL_DIRS for tool in TOOLS)
                     if resolve(members, path)})
-    return {
+    filesystem = {
         "installed_packages": installed_packages(members, contents),
         "setid_files": [{"path": "/" + name, "mode": oct(member.mode), "uid": member.uid, "gid": member.gid}
                         for name, member in sorted(members.items()) if member.isreg() and member.mode & 0o6000],
@@ -283,9 +313,12 @@ def inspect_filesystem(archive):
                    "sha256": hashlib.sha256(contents[BINARY]).hexdigest(),
                    "interpreter": interp, "needed": linkage},
     }
+    if check_runtime:
+        check_runtime_filesystem(members, filesystem)
+    return filesystem
 
 
-def collect(image, directory):
+def collect(image, directory, check_runtime=False):
     source_sha = (directory / "source-sha.txt").read_text().strip()
     image_id = (directory / "image-id.txt").read_text().strip()
     if not re.fullmatch(r"[0-9a-f]{40}", source_sha) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
@@ -350,7 +383,7 @@ def collect(image, directory):
     report["container"], archive, error = export_filesystem(image_id)
     if error is None:
         try:
-            report["filesystem"] = inspect_filesystem(archive)
+            report["filesystem"] = inspect_filesystem(archive, check_runtime=check_runtime)
         except (ValueError, tarfile.TarError, struct.error, UnicodeDecodeError) as failure:
             error = f"Image filesystem evidence is unparseable: {failure}"
     if error is not None:
@@ -364,8 +397,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image")
     parser.add_argument("directory", type=Path)
+    parser.add_argument("--check-runtime", action="store_true", help="enforce the zlib-free runtime contract")
     args = parser.parse_args()
-    report = collect(args.image, args.directory)
+    report = collect(args.image, args.directory, check_runtime=args.check_runtime)
     if not report["complete"]:
         raise SystemExit(report["collection_error"])
 

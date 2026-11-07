@@ -27,7 +27,7 @@ CONTAINER_WORKFLOWS = {
     "staging-migrate.yml": ("plan", "apply"),
     "deploy-production.yml": ("schema-gate", "roles-gate"),
     "production-migrate.yml": ("plan", "apply"),
-    "nightly.yml": ("sweep",),
+    "nightly.yml": ("sweep-plan", "sweep-partition", "sweep-guarded", "sweep-docs"),
 }
 DOCKERFILES = ("Dockerfile", "crates/voice-probe/Dockerfile")
 # libFuzzer needs nightly; pinned date, not floating stable.

@@ -21,7 +21,9 @@ pub mod automation_quota;
 pub mod automation_transfer;
 pub mod automod;
 pub mod automod_preview;
+pub mod automod_preview_input;
 pub mod automod_preview_limiter;
+pub mod automod_preview_report;
 pub mod automod_runtime;
 #[cfg(feature = "db")]
 pub mod automod_store;

@@ -615,7 +615,8 @@ class ImmutablePromotionWorkflowTests(unittest.TestCase):
                 if dependency not in ancestors:
                     ancestors.add(dependency)
                     pending.append(dependency)
-        for gate in ("voice-synthetic", "deploy", "pinned-history-guard"):
+        for gate in ("voice-synthetic", "help-embed-synthetic", "user-flow-synthetic",
+                     "deploy", "pinned-history-guard"):
             self.assertIn(gate, ancestors)
         self.assertNotIn("always()", job.get("if", ""))
         staged_deploy = next(step for step in jobs["deploy"]["steps"]
@@ -624,9 +625,21 @@ class ImmutablePromotionWorkflowTests(unittest.TestCase):
         commands = "\n".join(step.get("run", "") for step in job["steps"])
         self.assertIn("--fault-mode", commands)
         uploads = [step for step in job["steps"] if "actions/upload-artifact@" in step.get("uses", "")]
-        self.assertTrue(uploads, "no immutable certification artifact upload")
-        for step in uploads:
+        self.assertEqual(len(uploads), 2, "expected one diagnostic receipt and one certificate")
+        receipts = [step for step in uploads if step.get("with", {}).get("name")
+                    == "staging-use-certify-${{ github.run_id }}-${{ github.run_attempt }}"]
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0].get("if"), "always()")
+        self.assertEqual(receipts[0]["with"]["path"], "${{ runner.temp }}/staging-use-certify.jsonl")
+        self.assertEqual(receipts[0]["with"]["if-no-files-found"], "error")
+        certificates = [step for step in uploads if step is not receipts[0]]
+        self.assertEqual(len(certificates), 1, "no immutable certification artifact upload")
+        self.assertEqual(certificates[0].get("with", {}).get("name"),
+                         "bot-promotion-${{ github.run_id }}-${{ github.run_attempt }}")
+        self.assertEqual(certificates[0]["with"]["path"], "${{ runner.temp }}/promotion-upload")
+        for step in certificates:
             self.assertNotIn("always()", step.get("if", ""))
+        for step in uploads:
             self.assertNotEqual(step.get("with", {}).get("overwrite"), "true")
         diagnostics = [step for step in jobs["deploy"]["steps"]
                        if step.get("name") == "Upload the rollout evidence"]
