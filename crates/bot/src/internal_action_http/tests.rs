@@ -5217,3 +5217,410 @@ async fn listeners_fail_closed_and_drain_sibling_on_unexpected_exit() {
     assert!(result.is_err());
     assert!(*shutdown.borrow());
 }
+
+// ---------------------------------------------------------------------------
+// Keyless `event.attendance.read` (stored voice-session projection)
+// ---------------------------------------------------------------------------
+
+const OTHER_GUILD: &str = "999999999999999999";
+
+fn set_attendance_read_flag(on: bool) {
+    if on {
+        std::env::set_var("TWO_INTERNAL_ALLOW_ATTENDANCE_READ", "1");
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_ATTENDANCE_READ");
+    }
+}
+
+fn attendance_payload(key: &str) -> String {
+    serde_json::json!({"action": "event.attendance.read", "event_key": key}).to_string()
+}
+
+fn attendance_app(pool: sqlx::PgPool) -> (Router, Arc<MockEffect>, Arc<MockEventRead>) {
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let reads = Arc::new(MockEventRead::default());
+    let state = state_with_reads(pool, effect.clone(), reads.clone());
+    (router(state), effect, reads)
+}
+
+/// Historical window row. The read joins `event_instance_windows` with a LEFT
+/// JOIN, so a captured window alone is enough for the projection.
+async fn seed_attendance_window(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    event_key: &str,
+    starts_in: &str,
+    ends_in: &str,
+) {
+    sqlx::query(
+        "INSERT INTO event_attendance_windows \
+           (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at) \
+         VALUES ($1, $2, '100000000000000099', NOW() + $3::text::interval, \
+                 NOW() + $3::text::interval, NOW() + $4::text::interval)",
+    )
+    .bind(guild_id)
+    .bind(event_key)
+    .bind(starts_in)
+    .bind(ends_in)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// One raw voice-session row to seed, bundled to keep the helper narrow.
+struct AttendanceSessionSeed<'a> {
+    guild_id: &'a str,
+    member_id: &'a str,
+    channel_id: &'a str,
+    is_bot: bool,
+    joined_in: &'a str,
+    left_in: &'a str,
+    event_key: &'a str,
+}
+
+impl AttendanceSessionSeed<'_> {
+    async fn insert(&self, pool: &sqlx::PgPool) {
+        sqlx::query(
+            "INSERT INTO event_voice_sessions \
+               (guild_id, member_id, channel_id, channel_name, is_bot, joined_at, left_at, event_keys) \
+             VALUES ($1, $2, $3, 'Lobby', $4, NOW() + $5::text::interval, \
+                     NOW() + $6::text::interval, ARRAY[$7])",
+        )
+        .bind(self.guild_id)
+        .bind(self.member_id)
+        .bind(self.channel_id)
+        .bind(self.is_bot)
+        .bind(self.joined_in)
+        .bind(self.left_in)
+        .bind(self.event_key)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+async fn idempotency_rows(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM internal_idempotency")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn event_attendance_read_returns_final_positive_list_keyless_without_claim() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_attendance_read_flag(true);
+    let pool = db.pool();
+    // Window closed two hours ago, so the projection is final.
+    seed_attendance_window(pool, staging_guild(), "launch", "-3 hours", "-2 hours").await;
+    AttendanceSessionSeed {
+        guild_id: staging_guild(),
+        member_id: "41",
+        channel_id: "31",
+        is_bot: false,
+        joined_in: "-170 minutes",
+        left_in: "-130 minutes",
+        event_key: "launch",
+    }
+    .insert(pool)
+    .await;
+    // Below the threshold: still listed with its minutes.
+    AttendanceSessionSeed {
+        guild_id: staging_guild(),
+        member_id: "42",
+        channel_id: "31",
+        is_bot: false,
+        joined_in: "-150 minutes",
+        left_in: "-145 minutes",
+        event_key: "launch",
+    }
+    .insert(pool)
+    .await;
+    // Bots never appear in members or rooms.
+    AttendanceSessionSeed {
+        guild_id: staging_guild(),
+        member_id: "43",
+        channel_id: "32",
+        is_bot: true,
+        joined_in: "-170 minutes",
+        left_in: "-130 minutes",
+        event_key: "launch",
+    }
+    .insert(pool)
+    .await;
+    let (app, effect, reads) = attendance_app(pool.clone());
+    // No Idempotency-Key header: the read is keyless.
+    let (status, headers, body) =
+        answer(app, signed_read(&attendance_payload("launch"), "old")).await;
+    set_attendance_read_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert!(!headers.contains_key("idempotent-replay"));
+    let result = &body["result"];
+    assert_eq!(result["v"], 1);
+    assert_eq!(result["event_key"], "launch");
+    assert_eq!(result["final"], true);
+    assert_eq!(result["threshold_minutes"], 10);
+    assert_eq!(result["peak_concurrent"], 2);
+    assert!(result["window"]["starts_at"].is_string());
+    assert!(result["window"]["ends_at"].is_string());
+    let members = result["members"].as_array().unwrap();
+    assert_eq!(
+        members.len(),
+        2,
+        "bot excluded, below-threshold kept: {result}"
+    );
+    assert_eq!(members[0]["discord_id"], "41");
+    assert_eq!(members[0]["minutes"], 40);
+    assert_eq!(members[0]["sessions"], 1);
+    assert!(members[0]["first_joined_at"].is_string());
+    assert_eq!(members[1]["discord_id"], "42");
+    assert_eq!(members[1]["minutes"], 5);
+    let rooms = result["rooms"].as_array().unwrap();
+    assert_eq!(rooms.len(), 1, "bot-only rooms are omitted: {result}");
+    assert_eq!(rooms[0]["channel_id"], "31");
+    assert_eq!(rooms[0]["name_at_close"], "Lobby");
+    // Pure store read: no Discord effect, no durable idempotency claim.
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(reads.calls(), 0);
+    assert_eq!(idempotency_rows(pool).await, 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_attendance_read_open_window_is_not_final() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_attendance_read_flag(true);
+    let pool = db.pool();
+    seed_attendance_window(pool, staging_guild(), "live", "-1 hour", "+1 hour").await;
+    AttendanceSessionSeed {
+        guild_id: staging_guild(),
+        member_id: "41",
+        channel_id: "31",
+        is_bot: false,
+        joined_in: "-30 minutes",
+        left_in: "-10 minutes",
+        event_key: "live",
+    }
+    .insert(pool)
+    .await;
+    let (app, _, _) = attendance_app(pool.clone());
+    let (status, _, body) = answer(app, signed_read(&attendance_payload("live"), "old")).await;
+    set_attendance_read_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["final"], false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_attendance_read_unmapped_and_pre_enable_keys_are_refused_keyless() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_attendance_read_flag(true);
+    let pool = db.pool();
+    // Mapped key with an event id but no captured window: the pre-enable case.
+    InternalActionStore::new(pool.clone())
+        .put_event_key(staging_guild(), "launch", READ_EVENT_ID)
+        .await
+        .unwrap();
+    // Captured history with no remaining sessions, or only bots, is also refused.
+    seed_attendance_window(pool, staging_guild(), "empty", "-3 hours", "-2 hours").await;
+    seed_attendance_window(pool, staging_guild(), "botonly", "-3 hours", "-2 hours").await;
+    AttendanceSessionSeed {
+        guild_id: staging_guild(),
+        member_id: "43",
+        channel_id: "32",
+        is_bot: true,
+        joined_in: "-170 minutes",
+        left_in: "-130 minutes",
+        event_key: "botonly",
+    }
+    .insert(pool)
+    .await;
+    let (app, effect, reads) = attendance_app(pool.clone());
+    for key in ["ghost", "launch", "empty", "botonly"] {
+        let (status, _, body) =
+            answer(app.clone(), signed_read(&attendance_payload(key), "old")).await;
+        // Contract: unknown, pre-enable and bot-only keys all refuse `not_found`.
+        assert_eq!(status, StatusCode::NOT_FOUND, "{key}");
+        assert_eq!(body["error"]["code"], "not_found", "{key}");
+        assert_eq!(body["error"]["retryable"], false, "{key}");
+        assert!(body.get("result").is_none(), "{key}");
+    }
+    set_attendance_read_flag(false);
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(reads.calls(), 0);
+    assert_eq!(idempotency_rows(pool).await, 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_attendance_read_flag_off_is_refused_without_reading_or_claiming() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_attendance_read_flag(false);
+    let pool = db.pool();
+    seed_attendance_window(pool, staging_guild(), "launch", "-3 hours", "-2 hours").await;
+    AttendanceSessionSeed {
+        guild_id: staging_guild(),
+        member_id: "41",
+        channel_id: "31",
+        is_bot: false,
+        joined_in: "-170 minutes",
+        left_in: "-130 minutes",
+        event_key: "launch",
+    }
+    .insert(pool)
+    .await;
+    let (app, effect, reads) = attendance_app(pool.clone());
+    let (status, _, body) = answer(app, signed_read(&attendance_payload("launch"), "old")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert!(body.get("result").is_none());
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(reads.calls(), 0);
+    assert_eq!(idempotency_rows(pool).await, 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_attendance_read_malformed_key_is_refused_and_replay_is_conflict() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_attendance_read_flag(true);
+    let pool = db.pool();
+    seed_attendance_window(pool, staging_guild(), "launch", "-3 hours", "-2 hours").await;
+    AttendanceSessionSeed {
+        guild_id: staging_guild(),
+        member_id: "41",
+        channel_id: "31",
+        is_bot: false,
+        joined_in: "-170 minutes",
+        left_in: "-130 minutes",
+        event_key: "launch",
+    }
+    .insert(pool)
+    .await;
+    let (app, _, _) = attendance_app(pool.clone());
+    for raw in [
+        r#"{"action":"event.attendance.read"}"#,
+        r#"{"action":"event.attendance.read","event_key":""}"#,
+        r#"{"action":"event.attendance.read","event_key":"has space"}"#,
+    ] {
+        let (status, _, body) = answer(app.clone(), signed_read(raw, "old")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{raw}");
+        assert_eq!(body["error"]["code"], "malformed");
+    }
+    // The committed nonce is the only replay guard for a keyless read.
+    let raw = attendance_payload("launch");
+    let replay = nonce();
+    let (first, _, _) = answer(app.clone(), signed_read_with_nonce(&raw, "old", &replay)).await;
+    let (second, _, refused) = answer(app, signed_read_with_nonce(&raw, "old", &replay)).await;
+    set_attendance_read_flag(false);
+    assert_eq!(first, StatusCode::OK);
+    assert_eq!(second, StatusCode::CONFLICT);
+    assert_eq!(refused["error"]["code"], "replayed");
+    assert_eq!(idempotency_rows(pool).await, 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_attendance_read_malformed_stored_ids_fail_internal_without_leaking_them() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_attendance_read_flag(true);
+    let pool = db.pool();
+    for (key, member, channel) in [
+        ("badmember", "not-a-snowflake", "31"),
+        ("badchannel", "41", "chan-oops"),
+    ] {
+        seed_attendance_window(pool, staging_guild(), key, "-3 hours", "-2 hours").await;
+        AttendanceSessionSeed {
+            guild_id: staging_guild(),
+            member_id: "41",
+            channel_id: "31",
+            is_bot: false,
+            joined_in: "-170 minutes",
+            left_in: "-130 minutes",
+            event_key: key,
+        }
+        .insert(pool)
+        .await;
+        AttendanceSessionSeed {
+            guild_id: staging_guild(),
+            member_id: member,
+            channel_id: channel,
+            is_bot: false,
+            joined_in: "-160 minutes",
+            left_in: "-140 minutes",
+            event_key: key,
+        }
+        .insert(pool)
+        .await;
+    }
+    let (app, _, _) = attendance_app(pool.clone());
+    for key in ["badmember", "badchannel"] {
+        let (status, _, body) =
+            answer(app.clone(), signed_read(&attendance_payload(key), "old")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{key}");
+        assert_eq!(body["error"]["code"], "internal", "{key}");
+        assert_eq!(body["error"]["retryable"], true, "{key}");
+        assert!(body.get("result").is_none(), "{key}: no partial projection");
+        let text = body.to_string();
+        assert!(!text.contains("not-a-snowflake") && !text.contains("chan-oops"));
+    }
+    set_attendance_read_flag(false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_attendance_read_is_isolated_to_the_staging_guild() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_attendance_read_flag(true);
+    let pool = db.pool();
+    // Another guild owns the same key and a session; neither may be served.
+    seed_attendance_window(pool, OTHER_GUILD, "shared", "-3 hours", "-2 hours").await;
+    AttendanceSessionSeed {
+        guild_id: OTHER_GUILD,
+        member_id: "77",
+        channel_id: "31",
+        is_bot: false,
+        joined_in: "-170 minutes",
+        left_in: "-130 minutes",
+        event_key: "shared",
+    }
+    .insert(pool)
+    .await;
+    let (app, _, _) = attendance_app(pool.clone());
+    // No staging window for the key: refused even though another guild has one.
+    let (status, _, body) = answer(
+        app.clone(),
+        signed_read(&attendance_payload("shared"), "old"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "not_found");
+    // With a staging window the other guild's member stays out of the answer.
+    seed_attendance_window(pool, staging_guild(), "shared", "-3 hours", "-2 hours").await;
+    AttendanceSessionSeed {
+        guild_id: staging_guild(),
+        member_id: "41",
+        channel_id: "31",
+        is_bot: false,
+        joined_in: "-170 minutes",
+        left_in: "-130 minutes",
+        event_key: "shared",
+    }
+    .insert(pool)
+    .await;
+    let (status, _, body) = answer(app, signed_read(&attendance_payload("shared"), "old")).await;
+    set_attendance_read_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    let members = body["result"]["members"].as_array().unwrap();
+    assert_eq!(members.len(), 1, "{body}");
+    assert_eq!(members[0]["discord_id"], "41");
+    db.close().await.unwrap();
+}

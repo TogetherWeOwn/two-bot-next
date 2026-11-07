@@ -24,13 +24,18 @@ use two_bot_cutover::{
     CutoverDb,
 };
 
+// Exercise the public key writer with valid synthetic snowflakes, not the
+// short numeric IDs accepted only by the underlying TEXT columns.
+const EVENT_A: &str = "20000000000000001";
+const EVENT_B: &str = "20000000000000002";
+
 fn iso(at: OffsetDateTime) -> String {
     two_bot_core::funnel::format_iso_millis((at.unix_timestamp_nanos() / 1_000_000) as i64)
 }
 
 fn event(now: OffsetDateTime) -> ScheduledEvent {
     ScheduledEvent {
-        id: "2001".to_owned(),
+        id: EVENT_A.to_owned(),
         name: "Game night".to_owned(),
         starts_at: iso(now - Duration::minutes(20)),
         ends_at: Some(iso(now + Duration::minutes(20))),
@@ -64,7 +69,7 @@ async fn map(pool: &PgPool, guild: &str, key: &str, event_id: &str) {
 async fn mappings_and_historical_windows_never_authorize_capture() {
     with_database(|pool| async move {
         let now = OffsetDateTime::now_utc();
-        map(&pool, GUILD_A, "game-night", "2001").await;
+        map(&pool, GUILD_A, "game-night", EVENT_A).await;
         assert!(attendance_windows_for_guild(&pool, GUILD_A)
             .await
             .unwrap()
@@ -132,13 +137,13 @@ async fn capture_rechecks_privacy_and_commits_overlap_history_with_the_session()
         upsert_event(&pool, GUILD_A, &iso(now - Duration::minutes(2)), &observed)
             .await
             .unwrap();
-        map(&pool, GUILD_A, "game-night", "2001").await;
+        map(&pool, GUILD_A, "game-night", EVENT_A).await;
         let mut other = observed.clone();
-        other.id = "2002".to_owned();
+        other.id = EVENT_B.to_owned();
         upsert_event(&pool, GUILD_A, &iso(now - Duration::minutes(2)), &other)
             .await
             .unwrap();
-        map(&pool, GUILD_A, "overlap", "2002").await;
+        map(&pool, GUILD_A, "overlap", EVENT_B).await;
         assert_eq!(
             attendance_windows_for_guild(&pool, GUILD_A)
                 .await
@@ -250,7 +255,7 @@ async fn reschedules_omission_and_revocation_use_the_real_accepted_writers() {
         upsert_event(&pool, GUILD_A, &stamp(120), &observed)
             .await
             .unwrap();
-        map(&pool, GUILD_A, "game-night", "2001").await;
+        map(&pool, GUILD_A, "game-night", EVENT_A).await;
         let id = insert_attendance_session(&pool, &session(now, &["game-night"]))
             .await
             .unwrap();
@@ -371,16 +376,16 @@ async fn repointed_keys_do_not_mix_instances_and_deletion_revokes_capture() {
         upsert_event(&pool, GUILD_A, &iso(now - Duration::minutes(2)), &observed)
             .await
             .unwrap();
-        map(&pool, GUILD_A, "game-night", "2001").await;
+        map(&pool, GUILD_A, "game-night", EVENT_A).await;
         insert_attendance_session(&pool, &session(now, &["game-night"]))
             .await
             .unwrap();
         let mut other = observed.clone();
-        other.id = "2002".to_owned();
+        other.id = EVENT_B.to_owned();
         upsert_event(&pool, GUILD_A, &iso(now - Duration::minutes(1)), &other)
             .await
             .unwrap();
-        map(&pool, GUILD_A, "game-night", "2002").await;
+        map(&pool, GUILD_A, "game-night", EVENT_B).await;
         assert!(attendance_windows_for_guild(&pool, GUILD_A)
             .await
             .unwrap()
@@ -390,7 +395,7 @@ async fn repointed_keys_do_not_mix_instances_and_deletion_revokes_capture() {
                 .await
                 .is_err()
         );
-        map(&pool, GUILD_A, "new-key", "2002").await;
+        map(&pool, GUILD_A, "new-key", EVENT_B).await;
         assert_eq!(
             attendance_windows_for_guild(&pool, GUILD_A).await.unwrap()[0].event_key,
             "new-key"
@@ -398,7 +403,7 @@ async fn repointed_keys_do_not_mix_instances_and_deletion_revokes_capture() {
         let id = insert_attendance_session(&pool, &session(now, &["new-key"]))
             .await
             .unwrap();
-        two_bot_core::event_instance_store::confirm_deleted(&pool, GUILD_A, "2002", &iso(now))
+        two_bot_core::event_instance_store::confirm_deleted(&pool, GUILD_A, EVENT_B, &iso(now))
             .await
             .unwrap();
         assert!(attendance_windows_for_guild(&pool, GUILD_A)
@@ -438,7 +443,7 @@ async fn failed_session_write_rolls_back_history_and_new_close_tags_are_revalida
         let now = OffsetDateTime::now_utc();
         let observed = event(now);
         upsert_event(&pool, GUILD_A, &iso(now - Duration::minutes(2)), &observed).await.unwrap();
-        map(&pool, GUILD_A, "game-night", "2001").await;
+        map(&pool, GUILD_A, "game-night", EVENT_A).await;
         sqlx::query("ALTER TABLE event_voice_sessions ADD CONSTRAINT reject_test_capture CHECK (channel_id <> '4001')")
             .execute(&pool).await.unwrap();
         assert!(insert_attendance_session(&pool, &session(now, &["game-night"])).await.is_err());
@@ -446,9 +451,9 @@ async fn failed_session_write_rolls_back_history_and_new_close_tags_are_revalida
         sqlx::query("ALTER TABLE event_voice_sessions DROP CONSTRAINT reject_test_capture").execute(&pool).await.unwrap();
         let id = insert_attendance_session(&pool, &session(now, &["game-night"])).await.unwrap();
         let mut overlap = observed.clone();
-        overlap.id = "2002".to_owned();
+        overlap.id = EVENT_B.to_owned();
         upsert_event(&pool, GUILD_A, &iso(now - Duration::minutes(1)), &overlap).await.unwrap();
-        map(&pool, GUILD_A, "overlap", "2002").await;
+        map(&pool, GUILD_A, "overlap", EVENT_B).await;
         assert_eq!(close_attendance_session(&pool, id, now, "Lobby", &["game-night".to_owned(), "overlap".to_owned(), "unknown".to_owned()]).await.unwrap(), 1);
         assert!(attendance_window_for_key(&pool, GUILD_A, "overlap").await.unwrap().is_some());
         let rows = attendance_sessions_for_event_key(&pool, GUILD_A, "overlap").await.unwrap();
@@ -532,11 +537,11 @@ async fn two_windows(pool: &PgPool, now: OffsetDateTime) {
     upsert_event(pool, GUILD_A, &stamp, &observed)
         .await
         .unwrap();
-    map(pool, GUILD_A, "game-night", "2001").await;
+    map(pool, GUILD_A, "game-night", EVENT_A).await;
     let mut other = observed;
-    other.id = "2002".to_owned();
+    other.id = EVENT_B.to_owned();
     upsert_event(pool, GUILD_A, &stamp, &other).await.unwrap();
-    map(pool, GUILD_A, "overlap", "2002").await;
+    map(pool, GUILD_A, "overlap", EVENT_B).await;
 }
 
 #[tokio::test]
@@ -628,7 +633,7 @@ async fn queued_opt_out_or_voice_disable_blocks_new_close_time_tag() {
         upsert_event(&pool, GUILD_A, &iso(now - Duration::minutes(2)), &observed)
             .await
             .unwrap();
-        map(&pool, GUILD_A, "game-night", "2001").await;
+        map(&pool, GUILD_A, "game-night", EVENT_A).await;
         let id = insert_attendance_session(&pool, &session(now, &["game-night"]))
             .await
             .unwrap();
@@ -689,13 +694,13 @@ async fn first_close_time_tag_across_an_omission_gets_no_backcredit() {
         let mut a = event(now);
         a.starts_at = iso(now - Duration::minutes(60));
         let mut b = event(now);
-        b.id = "2002".to_owned();
+        b.id = EVENT_B.to_owned();
         b.starts_at = iso(now - Duration::minutes(10));
         b.ends_at = Some(iso(now + Duration::minutes(30)));
         upsert_event(&pool, GUILD_A, &stamp(45), &a).await.unwrap();
         upsert_event(&pool, GUILD_A, &stamp(45), &b).await.unwrap();
-        map(&pool, GUILD_A, "a", "2001").await;
-        map(&pool, GUILD_A, "b", "2002").await;
+        map(&pool, GUILD_A, "a", EVENT_A).await;
+        map(&pool, GUILD_A, "b", EVENT_B).await;
 
         let mut first = session(now, &["a"]);
         first.joined_at = now - Duration::minutes(40);
@@ -761,8 +766,8 @@ async fn first_close_time_tag_across_an_omission_gets_no_backcredit() {
         let mut fresh = session(now, &["b"]);
         fresh.joined_at = now - Duration::minutes(5);
         upsert_event(&pool, GUILD_A, &stamp(2), &b).await.unwrap();
-        let recovered: OffsetDateTime = sqlx::query_scalar("SELECT attendance_recovered_at FROM event_instance_windows WHERE guild_id = $1 AND event_id = '2002' AND is_current")
-            .bind(GUILD_A).fetch_one(&pool).await.unwrap();
+        let recovered: OffsetDateTime = sqlx::query_scalar("SELECT attendance_recovered_at FROM event_instance_windows WHERE guild_id = $1 AND event_id = $2 AND is_current")
+            .bind(GUILD_A).bind(EVENT_B).fetch_one(&pool).await.unwrap();
         assert_eq!(iso(recovered), stamp(10), "positive refresh must not move recovery");
         let fresh_id = insert_attendance_session(&pool, &fresh).await.unwrap();
         let b_rows = attendance_sessions_for_event_key(&pool, GUILD_A, "b")
@@ -783,12 +788,12 @@ async fn positive_refresh_preserves_post_recovery_close_time_overlap() {
         let mut a = event(now);
         a.starts_at = iso(now - Duration::minutes(60));
         let mut b = event(now);
-        b.id = "2002".to_owned();
+        b.id = EVENT_B.to_owned();
         b.starts_at = iso(now - Duration::minutes(5));
         upsert_event(&pool, GUILD_A, &stamp(60), &a).await.unwrap();
         upsert_event(&pool, GUILD_A, &stamp(60), &b).await.unwrap();
-        map(&pool, GUILD_A, "a", "2001").await;
-        map(&pool, GUILD_A, "b", "2002").await;
+        map(&pool, GUILD_A, "a", EVENT_A).await;
+        map(&pool, GUILD_A, "b", EVENT_B).await;
         replace_events(&pool, GUILD_A, &stamp(50), std::slice::from_ref(&a))
             .await
             .unwrap();

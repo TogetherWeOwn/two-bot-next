@@ -185,7 +185,8 @@ fn overlapping_keys(windows: &[AttendanceWindowMs], from_ms: i64, to_ms: i64) ->
 /// - same-channel frames plan nothing (the caller filters them already);
 /// - closes finalize every open row at now, except a stale row a missed
 ///   close left behind: when the member's next join/move opens a new row in
-///   a window the old row never overlapped, the stale row closes at its own
+///   a window the old row never overlapped and the observed previous channel
+///   does not match the row, the stale row closes at its own
 ///   `joined_at` (zero length, original tags only) so it can never inflate
 ///   the new event's minutes. Leaves always close at now — the member just
 ///   left — as do joins/moves when no window is open;
@@ -213,10 +214,12 @@ pub(crate) fn plan_transition(
         let same_event = open_now
             .iter()
             .any(|window| contains_ms(window.starts_ms, window.ends_ms, row.joined_ms));
-        // Only a join/move into a newly-open window with a foreign row is
-        // stale (missed close). Leaves and out-of-window transitions close
-        // at now so campers keep their overlap tags and minutes.
-        let stale = current.is_some() && !open_now.is_empty() && !same_event;
+        // A row in the observed previous channel is continuous, even when its
+        // join predates every currently-open window. Only a foreign row without
+        // that evidence can be treated as a missed close on a new join/move.
+        // Leaves and out-of-window transitions close at now.
+        let continuous = row.channel_id.is_some() && row.channel_id == previous;
+        let stale = current.is_some() && !open_now.is_empty() && !same_event && !continuous;
         let left_ms = if stale { row.joined_ms } else { now_ms };
         let mut tag_union = row.event_keys.clone();
         for key in overlapping_keys(windows, row.joined_ms, left_ms) {
@@ -550,6 +553,28 @@ pub enum AttendanceRefusal {
     OverBudget,
 }
 
+struct MemberSpans {
+    intervals: Vec<(i64, i64)>,
+    non_afk_intervals: Vec<(i64, i64)>,
+    sessions: u64,
+    first_joined_ms: i64,
+}
+
+// A failed close followed by a successful open can leave overlapping rows.
+// Union per member, not per row: one member cannot earn two minutes or occupy
+// two places in the peak for the same minute. Keep AFK eligibility separate.
+fn union_intervals(mut intervals: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    intervals.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (from, to) in intervals {
+        match merged.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => merged.push((from, to)),
+        }
+    }
+    merged
+}
+
 /// Project the §4 attendance shape over stored sessions. Pure over plain
 /// rows so the threshold/peak/final math pins without a database.
 ///
@@ -572,7 +597,7 @@ pub fn project_attendance(
         return Err(AttendanceRefusal::NoRecord);
     }
     // Per-member aggregation over window-clamped intervals.
-    let mut members: std::collections::BTreeMap<Snowflake, (i64, u64, i64)> =
+    let mut members: std::collections::BTreeMap<Snowflake, MemberSpans> =
         std::collections::BTreeMap::new();
     // Channel names from the latest-joined human session per channel.
     let mut rooms: std::collections::BTreeMap<Snowflake, (i64, String)> =
@@ -583,9 +608,14 @@ pub fn project_attendance(
         let end_ms = row.left_ms.unwrap_or(now_ms.min(close_ms));
         let from_ms = row.joined_ms.max(open_ms);
         let to_ms = end_ms.min(close_ms);
-        let entry = members.entry(row.member_id).or_insert((0, 0, i64::MAX));
-        entry.1 += 1;
-        entry.2 = entry.2.min(row.joined_ms);
+        let entry = members.entry(row.member_id).or_insert_with(|| MemberSpans {
+            intervals: Vec::new(),
+            non_afk_intervals: Vec::new(),
+            sessions: 0,
+            first_joined_ms: row.joined_ms,
+        });
+        entry.sessions += 1;
+        entry.first_joined_ms = entry.first_joined_ms.min(row.joined_ms);
         let room = rooms
             .entry(row.channel_id)
             .or_insert((i64::MIN, String::new()));
@@ -593,13 +623,31 @@ pub fn project_attendance(
             *room = (row.joined_ms, row.channel_name.clone());
         }
         if from_ms < to_ms {
-            entry.0 += to_ms - from_ms;
+            entry.intervals.push((from_ms, to_ms));
             if !row.afk {
-                sweep.push((from_ms, 1));
-                sweep.push((to_ms, -1));
+                entry.non_afk_intervals.push((from_ms, to_ms));
             }
         }
     }
+    let wire_members: Vec<Value> = members
+        .into_iter()
+        .map(|(member_id, spans)| {
+            let duration_ms: i64 = union_intervals(spans.intervals)
+                .into_iter()
+                .map(|(from, to)| to - from)
+                .sum();
+            for (from, to) in union_intervals(spans.non_afk_intervals) {
+                sweep.push((from, 1));
+                sweep.push((to, -1));
+            }
+            json!({
+                "discord_id": member_id.to_string(),
+                "minutes": duration_ms / 60_000,
+                "sessions": spans.sessions,
+                "first_joined_at": two_bot_core::funnel::format_iso_millis(spans.first_joined_ms),
+            })
+        })
+        .collect();
     sweep.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     let mut peak_concurrent = 0i64;
     let mut running = 0i64;
@@ -607,17 +655,6 @@ pub fn project_attendance(
         running += i64::from(delta);
         peak_concurrent = peak_concurrent.max(running);
     }
-    let wire_members: Vec<Value> = members
-        .into_iter()
-        .map(|(member_id, (duration_ms, sessions, first_joined_ms))| {
-            json!({
-                "discord_id": member_id.to_string(),
-                "minutes": duration_ms / 60_000,
-                "sessions": sessions,
-                "first_joined_at": two_bot_core::funnel::format_iso_millis(first_joined_ms),
-            })
-        })
-        .collect();
     let wire_rooms: Vec<Value> = rooms
         .into_iter()
         .map(|(channel_id, (_, name))| {
@@ -664,6 +701,40 @@ mod tests {
         assert_eq!(result["members"][0]["minutes"], 1);
         assert_eq!(result["members"][0]["sessions"], 2);
         assert_eq!(result["peak_concurrent"], 1);
+    }
+
+    #[test]
+    fn overlapping_sessions_for_one_member_deduplicate_duration_and_peak() {
+        // A failed move-close can leave both rows open until the eventual leave.
+        let rows = [
+            session(1, 7, "Lobby", false, false, 0, Some(20 * MIN)),
+            session(1, 9, "Stage", false, false, 10 * MIN, Some(20 * MIN)),
+        ];
+        let result = project_attendance("event", &window("event", 0, 30 * MIN), &rows, 60 * MIN)
+            .expect("fits the budget");
+        assert_eq!(result["members"][0]["minutes"], 20);
+        assert_eq!(result["members"][0]["sessions"], 2);
+        assert_eq!(result["peak_concurrent"], 1);
+        assert_eq!(result["rooms"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn non_afk_interval_union_does_not_bridge_afk_only_time() {
+        let rows = [
+            session(1, 7, "Lobby", false, false, 0, Some(5 * MIN)),
+            session(1, 9, "AFK", false, true, 3 * MIN, Some(18 * MIN)),
+            session(1, 7, "Lobby", false, false, 15 * MIN, Some(20 * MIN)),
+            session(2, 7, "Lobby", false, false, 10 * MIN, Some(15 * MIN)),
+        ];
+        let result = project_attendance("event", &window("event", 0, 30 * MIN), &rows, 60 * MIN)
+            .expect("fits the budget");
+        assert_eq!(result["members"][0]["minutes"], 20);
+        assert_eq!(result["members"][0]["sessions"], 3);
+        assert_eq!(result["members"][1]["minutes"], 5);
+        assert_eq!(
+            result["peak_concurrent"], 1,
+            "AFK time never fills a peak gap"
+        );
     }
 
     fn window(event_key: &str, starts_ms: i64, ends_ms: i64) -> AttendanceWindowMs {
@@ -787,7 +858,8 @@ mod tests {
         // the row closes at its own join (zero length, original tags only),
         // so it can never inflate the new show's minutes.
         let open = vec![row(1, 7, 10 * MIN, &["old-show"])];
-        let plan = plan_transition(&windows, &open, Some(7), Some(9), 1_010 * MIN);
+        // A fresh join has no previous channel to prove continuity with the row.
+        let plan = plan_transition(&windows, &open, None, Some(9), 1_010 * MIN);
         assert_eq!(
             plan.closes,
             vec![ClosePlan {
@@ -802,6 +874,34 @@ mod tests {
                 tags: vec!["new-show".to_owned()],
             })
         );
+    }
+
+    #[test]
+    fn continuous_move_into_a_later_window_preserves_earned_attendance() {
+        // A is closed, so the store now returns only B. The observed previous
+        // channel still proves that the member was continuously in the old room.
+        let windows = vec![window("b", 60 * MIN, 120 * MIN)];
+        let open = vec![row(1, 7, 0, &["a"])];
+        let plan = plan_transition(&windows, &open, Some(7), Some(9), 80 * MIN);
+        assert_eq!(
+            plan.closes,
+            vec![ClosePlan {
+                id: 1,
+                left_ms: 80 * MIN,
+                tag_union: vec!["a".to_owned(), "b".to_owned()],
+            }]
+        );
+        assert_eq!(
+            plan.open,
+            Some(OpenPlan {
+                tags: vec!["b".to_owned()]
+            })
+        );
+        // A stale row in a different room has no such continuity evidence.
+        let foreign = vec![row(1, 3, 0, &["a"])];
+        let stale = plan_transition(&windows, &foreign, Some(7), Some(9), 80 * MIN);
+        assert_eq!(stale.closes[0].left_ms, 0);
+        assert_eq!(stale.closes[0].tag_union, vec!["a".to_owned()]);
     }
 
     #[test]

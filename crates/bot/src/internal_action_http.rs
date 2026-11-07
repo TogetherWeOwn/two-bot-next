@@ -1893,8 +1893,9 @@ async fn read_event_attendance(
         .await
     {
         Ok(Some(window)) => window,
-        // No mapped window means no sessions by construction: nothing to read.
-        Ok(None) => return reject(Failure::from_action(unmapped_event_key(&event_key))),
+        // No captured window means no record, whether the key is unknown or
+        // its event closed before logging was enabled.
+        Ok(None) => return reject(Failure::code(ErrorCode::NotFound)),
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
     let sessions = match state
@@ -1940,7 +1941,7 @@ async fn read_event_attendance(
         // No tagged sessions (including every pre-enable window): the key
         // names nothing the logger saw.
         Err(two_bot::event_attendance::AttendanceRefusal::NoRecord) => {
-            reject(Failure::from_action(unmapped_event_key(&event_key)))
+            reject(Failure::code(ErrorCode::NotFound))
         }
         Err(two_bot::event_attendance::AttendanceRefusal::OverBudget) => {
             reject(Failure::code(ErrorCode::Internal))

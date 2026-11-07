@@ -1285,6 +1285,10 @@ async fn complete_request(
 const EVENT_INSTANCE_GUILD_PURGE_TABLES: &[&str] = &[
     "event_voice_channels",
     "internal_event_keys",
+    // Memberless captured-window history: it keeps a key bound to the old
+    // instance, so a rejoined guild could never reuse it. Purge it before the
+    // instance evidence it references; member erasure never touches it.
+    "event_attendance_windows",
     "event_instance_windows",
 ];
 
