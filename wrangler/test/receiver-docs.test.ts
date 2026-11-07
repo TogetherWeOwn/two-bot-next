@@ -45,6 +45,7 @@ function startupEnv(): Record<string, string> {
     };
     const env = {
       TWO_INTERNAL_ACTIONS: "1", TWO_INTERNAL_CALLERS: "fixture:website",
+      TWO_INTERNAL_ALLOW_ATTENDANCE_READ: "1",
       TWO_INTERNAL_CHANNEL_KEYS: "fixture:123456789012345678",
       TWO_INTERNAL_KEYS: `fixture:${randomBytes(32).toString("hex")}`,
       ...Object.fromEntries(blocked.map((key) => [key, key.endsWith("ROLE_KEYS") ? "member:123456789012345678" : "1"])),

@@ -759,6 +759,7 @@ async fn assert_default_inserts(
         ("internal_action_log", "audit_id", "INSERT INTO internal_action_log (intent_id, phase, caller_hash, action, resolved_role_id) VALUES (83, 'intent', repeat('b', 64), 'role.assign', '100000000000000010') RETURNING audit_id"),
         ("moderation_member_bans", "generation", "INSERT INTO moderation_member_bans (request_id, guild_id, user_id, state, created_at) VALUES ('post-restore:ban', '100000000000000001', '100000000000000012', 'prepared', now()) RETURNING generation"),
         ("privacy_opt_out_audit", "id", "INSERT INTO privacy_opt_out_audit (guild_id, member_id) VALUES ('100000000000000001', '100000000000000002') RETURNING id"),
+        ("event_voice_sessions", "id", "INSERT INTO event_voice_sessions (guild_id, member_id, channel_id, joined_at, left_at, event_keys) VALUES ('1001', '1002', '1003', now(), now(), ARRAY['post-restore']) RETURNING id"),
         ("event_store", "id", "INSERT INTO event_store (event_type, guild_id, user_id, event_time, dedup_key, presence_status, activity_type) VALUES ('PRESENCE_UPDATE', '100000000000000001', 'post-restore-member', now(), 'post-restore:event-store', 'online', 0) RETURNING id"),
     ];
     let cases: BTreeSet<(String, String)> = inserts
@@ -3142,6 +3143,22 @@ async fn v16_archive_restores_and_clears_newer_attendance_tables_without_backfil
             "event_attendance_windows" | "event_voice_sessions"
         )
     });
+    let instance_table = old
+        .manifest
+        .tables
+        .iter_mut()
+        .find(|table| table.name == "event_instance_windows")
+        .unwrap();
+    let recovery_at = instance_table
+        .columns
+        .iter()
+        .position(|column| column == "attendance_recovered_at")
+        .unwrap();
+    instance_table.columns.remove(recovery_at);
+    instance_table.column_types.remove(recovery_at);
+    for row in old.buffers.get_mut("event_instance_windows").unwrap() {
+        row.remove("attendance_recovered_at");
+    }
     old.manifest.version = 16;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-attendance-v16.ndjson.gz");
@@ -3157,10 +3174,31 @@ async fn v16_archive_restores_and_clears_newer_attendance_tables_without_backfil
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
+    let mut restored = snapshot(pool, &preserved).await;
+    let mut expected = archived;
+    // The v16 cells remain exact; only the new, unknown-history credit fence
+    // receives the destination's safe default instead of invented history.
+    for snapshot in [&mut restored, &mut expected] {
+        let instance = snapshot.get_mut("event_instance_windows").unwrap();
+        let at = instance
+            .columns
+            .iter()
+            .position(|(name, _)| name == "attendance_recovered_at")
+            .unwrap();
+        instance.columns.remove(at);
+        for row in &mut instance.rows {
+            row.remove(at);
+        }
+    }
     assert_eq!(
-        snapshot(pool, &preserved).await,
-        archived,
+        restored, expected,
         "v16 restores instance windows, mirror and voice claims"
+    );
+    let fenced: bool = sqlx::query_scalar("SELECT bool_and(attendance_recovered_at IS NOT NULL AND attendance_recovered_at > observed_at::timestamptz) FROM event_instance_windows")
+        .fetch_one(pool).await.unwrap();
+    assert!(
+        fenced,
+        "older archives must receive a restore-time credit fence"
     );
     for name in ["event_attendance_windows", "event_voice_sessions"] {
         let count: i64 = sqlx::query_scalar(audited(format!(

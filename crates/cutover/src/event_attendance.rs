@@ -74,6 +74,8 @@ const CAPTURE_WINDOWS_SQL: &str =
        AND w.ends_at IS NOT NULL AND w.ends_at >= w.starts_at
        AND w.starts_at <= clock_timestamp() + INTERVAL '15 minutes'
        AND w.ends_at >= clock_timestamp() - INTERVAL '15 minutes'
+       AND ($2::timestamptz IS NULL OR w.attendance_recovered_at IS NULL
+            OR w.attendance_recovered_at <= $2)
        AND NOT EXISTS (SELECT 1 FROM event_voice_channels c WHERE c.event_id = w.event_id
                        AND c.instance_starts_at <> w.instance_starts_at)
        AND NOT EXISTS (SELECT 1 FROM event_attendance_windows h
@@ -89,6 +91,7 @@ pub async fn attendance_windows_for_guild(
 ) -> Result<Vec<AttendanceWindow>, sqlx::Error> {
     sqlx::query_as::<_, (String, OffsetDateTime, OffsetDateTime)>(CAPTURE_WINDOWS_SQL)
         .bind(guild_id)
+        .bind(None::<OffsetDateTime>)
         .fetch_all(pool)
         .await
         .map(|rows| {
@@ -183,14 +186,31 @@ pub async fn open_attendance_sessions(
     })
 }
 
-// Called under the same guild lock as mirror/lifecycle writers. Revalidate
-// privacy at the write boundary too: a stale actor read cannot grant capture.
+// Serialize against settings writes and opt-out/opt-in even when their rows
+// do not exist. Always acquire these before lifecycle or session row locks.
+async fn lock_capture_in(
+    connection: &mut sqlx::PgConnection,
+    guild_id: &str,
+    member_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *connection)
+        .await?;
+    crate::privacy::lock_analytics_settings(connection, guild_id).await?;
+    crate::privacy::lock_member_change(connection, guild_id, member_id).await?;
+    two_bot_core::event_instance_store::lock_guild(connection, guild_id).await
+}
+
+// Called under privacy, settings and lifecycle locks. A stale actor read cannot
+// grant capture. For first close-time tags, reject spans crossing an omission:
+// before the first capture there is no complete history of earlier credit stops.
 async fn capture_tags_in(
     connection: &mut sqlx::PgConnection,
     guild_id: &str,
     member_id: &str,
     requested: &[String],
     at: OffsetDateTime,
+    since: OffsetDateTime,
 ) -> Result<Vec<String>, sqlx::Error> {
     let permitted: bool = sqlx::query_scalar(
         "SELECT NOT EXISTS (SELECT 1 FROM privacy_opt_outs WHERE guild_id = $1 AND member_id = $2)
@@ -206,6 +226,7 @@ async fn capture_tags_in(
     let windows: Vec<(String, OffsetDateTime, OffsetDateTime)> =
         sqlx::query_as(CAPTURE_WINDOWS_SQL)
             .bind(guild_id)
+            .bind(since)
             .fetch_all(&mut *connection)
             .await?;
     let grace = time::Duration::minutes(ATTENDANCE_WINDOW_GRACE_MINUTES);
@@ -242,12 +263,13 @@ pub async fn insert_attendance_session(
     new: &NewAttendanceSession,
 ) -> Result<i64, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    two_bot_core::event_instance_store::lock_guild(&mut tx, &new.guild_id).await?;
+    lock_capture_in(&mut tx, &new.guild_id, &new.member_id).await?;
     let tags = capture_tags_in(
         &mut tx,
         &new.guild_id,
         &new.member_id,
         &new.event_keys,
+        new.joined_at,
         new.joined_at,
     )
     .await?;
@@ -295,14 +317,14 @@ pub async fn close_attendance_session(
     let Some((guild_id, member_id)) = owner else {
         return Ok(0);
     };
-    two_bot_core::event_instance_store::lock_guild(&mut tx, &guild_id).await?;
-    let existing: Option<(Vec<String>,)> = sqlx::query_as(
-        "SELECT event_keys FROM event_voice_sessions WHERE id = $1 AND left_at IS NULL FOR UPDATE",
+    lock_capture_in(&mut tx, &guild_id, &member_id).await?;
+    let existing: Option<(Vec<String>, OffsetDateTime)> = sqlx::query_as(
+        "SELECT event_keys, joined_at FROM event_voice_sessions WHERE id = $1 AND left_at IS NULL FOR UPDATE",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((mut tags,)) = existing else {
+    let Some((mut tags, joined_at)) = existing else {
         return Ok(0);
     };
     let requested: Vec<String> = event_keys
@@ -311,7 +333,11 @@ pub async fn close_attendance_session(
         .cloned()
         .collect();
     if !requested.is_empty() {
-        for tag in capture_tags_in(&mut tx, &guild_id, &member_id, &requested, left_at).await? {
+        for tag in capture_tags_in(
+            &mut tx, &guild_id, &member_id, &requested, left_at, joined_at,
+        )
+        .await?
+        {
             if !tags.contains(&tag) {
                 tags.push(tag);
             }

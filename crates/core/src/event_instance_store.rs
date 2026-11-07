@@ -48,13 +48,13 @@ pub(crate) async fn observe_in(
     sqlx::query(
         "INSERT INTO event_instance_windows AS w
            (guild_id, event_id, instance_starts_at, starts_at, ends_at,
-            status, observed_at, revoked_at, identity_ambiguous)
+            status, observed_at, revoked_at, identity_ambiguous, attendance_recovered_at)
          SELECT $1, $2,
                 COALESCE((SELECT MIN(c.instance_starts_at) FROM event_voice_channels c
                           WHERE c.event_id = $2 HAVING COUNT(*) = 1), $3::text::timestamptz),
                 $3::text::timestamptz, $4::text::timestamptz, $5, $6,
                 CASE WHEN $5 = 'cancelled' THEN $6 ELSE NULL END,
-                (SELECT COUNT(*) > 1 FROM event_voice_channels c WHERE c.event_id = $2)
+                (SELECT COUNT(*) > 1 FROM event_voice_channels c WHERE c.event_id = $2), NULL
          WHERE $5 = 'cancelled' OR (
            $5 = 'completed' AND EXISTS (
              SELECT 1 FROM event_instance_windows confirmed
@@ -81,6 +81,10 @@ pub(crate) async fn observe_in(
          ON CONFLICT (guild_id, event_id) WHERE is_current DO UPDATE SET
            starts_at = EXCLUDED.starts_at, ends_at = EXCLUDED.ends_at,
            status = EXCLUDED.status, observed_at = EXCLUDED.observed_at,
+           attendance_recovered_at = CASE
+             WHEN w.status = 'missing' AND EXCLUDED.status IN ('scheduled', 'active', 'completed')
+             THEN GREATEST(w.omitted_at::timestamptz, EXCLUDED.observed_at::timestamptz)
+             ELSE w.attendance_recovered_at END,
            revoked_at = CASE WHEN EXCLUDED.status = 'cancelled'
                              THEN EXCLUDED.observed_at ELSE w.revoked_at END
          WHERE w.observed_at <= EXCLUDED.observed_at

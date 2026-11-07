@@ -168,7 +168,12 @@ is the serving version (same id as `wrangler deployments status --env staging`),
 and if they differ redeploy the intended SHA through the workflow first (full rule
 in `docs/production-deploy.md`).
 
-1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
+Before deploying the attendance build, apply `0471`, shipped `0472`, and additive
+`0475` through the normal migration/release gate, even with attendance off:
+shared lifecycle writers reference the attendance history and recovery column.
+No migration or flag enablement is authorized by this guide alone.
+
+1. Merge this change after its release gates. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values), only under the separately authorized enablement contract; no role keys or optional capability gates travel through this Worker.
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
 4. Operator applies migrations `0423` (settings CAS), `0424` (event outcome) and `0471` (event-attendance windows/sessions) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns, and `event.attendance.read` answers `internal` without its tables), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
@@ -472,8 +477,11 @@ stops capture guild-wide; closes still finalize so no open row leaks.
 
 Capture consumes the shared accepted `event_instance_windows` authority, not
 caller-requested upsert dates or a retained attendance window. New spans and new
-tags revalidate finite-window containment, lifecycle and privacy in a transaction
-under the guild ordering lock used by mirror writers. Cancellation, confirmed
+tags revalidate finite-window containment, lifecycle and privacy in a transaction.
+Capture takes the analytics-settings lock, the opt-out/opt-in pair lock, then the
+guild ordering lock used by mirror writers, before session row locks. The actual
+settings and privacy writers share those locks, including when rows are absent;
+committed suppression or voice-disable cannot race past the capture check. Cancellation, confirmed
 deletion, unconfirmed absence, ambiguous instances and unknown ends authorize no
 new capture. Positive completion keeps only its confirmed finite closing grace.
 The historical `(guild, event_key, event_id, instance_starts_at)` capture record
@@ -483,9 +491,15 @@ reads remain available after revocation, with session credit capped by the
 accepted revocation/absence instant. Lifecycle writers retain historical credit
 stops in their existing mirror transaction, so later re-observation cannot fill
 an unconfirmed gap in an older span; fresh spans may start after re-observation.
-The logger still finalizes existing rows
-when the shared lookup returns no live windows. The unshipped attendance
-migration is additive; the shipped shared-instance migration is unchanged.
+Migration `0475` adds a historical recovery boundary to shared instance evidence.
+After an absence, a new span or first close-time tag must begin no earlier than
+that first accepted recovery; ordinary positive refreshes never move the boundary.
+A span crossing an unrecorded gap gets no uncertain new tag. Existing evidence
+and older archives default to the migration/restore timestamp because their
+recovery history is unknown; no attendance is backfilled. Newly accepted instances
+start without a recovery fence until an actual absence/recovery. The logger still
+finalizes existing rows when the shared lookup returns no live windows. Both
+attendance migrations are additive; shipped migration `0472` is unchanged.
 
 | Code | Status | Retryable |
 | --- | --- | --- |

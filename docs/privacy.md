@@ -408,7 +408,7 @@ voice.
 | --- | --- | --- |
 | Presence | `presence_enabled` | `presence_update` |
 | Activity | `activity_enabled` | `first/second/third_message`, community `message_created` facts |
-| Voice | `voice_enabled` | `voice_session_start/end`, `first_voice_session`, community `voice_session_started/ended` facts, event-attendance session opens (`event_voice_sessions` inserts; closes still finalize) |
+| Voice | `voice_enabled` | `voice_session_start/end`, `first_voice_session`, community `voice_session_started/ended` facts, event-attendance session opens and new close-time tags (existing tags still finalize) |
 
 Every other event type still persists: joins, leaves, gate clears,
 onboarding prompts, invite clicks and routing rows serve
@@ -429,12 +429,15 @@ standalone capture's counter baseline and the backfill baseline alike, which
 share one writer), the onboarding writers (including the prompt guard, which
 re-gates before the insert for opt-outs that land while the welcome is in
 flight), `touch_activity` / `mark_bot`, the event-attendance session logger
-(open gate only: a suppressed member or a voice-disabled guild opens no span,
-while closes still finalize), and the inactivity sweep (suppression-only:
-a suppressed pair is skipped inside the per-member transaction, so the sweep
-never recreates the purged `member_inactive` row). Every gated writer serializes
-with concurrent opt-outs (a shared table lock, so a write that passes the
-gate can never land after the purge), and `member_join` rows strip a
+(a suppressed member or a voice-disabled guild opens no span and adds no new
+close-time tag, while existing tags still finalize), and the inactivity sweep
+(suppression-only: a suppressed pair is skipped inside the per-member
+transaction, so the sweep never recreates the purged `member_inactive` row).
+Every gated writer serializes with concurrent opt-outs so a write that passes
+the gate cannot land after the purge. Attendance uses the opt-out/opt-in pair
+advisory lock, preceded by a guild analytics-settings advisory lock shared with
+the toggle writer; other gated writers use a shared table lock. Attendance's
+lifecycle and session locks follow those privacy locks. `member_join` rows strip a
 suppressed inviter's `inviterId` from metadata while keeping the joiner's
 own row. Gateway activity timestamps carry their originating family
 (message/activity versus voice) through the timestamp buffer, and the
