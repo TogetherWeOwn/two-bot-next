@@ -285,6 +285,10 @@ before the baseline. Automatic promotion measures a **fresh full 30 minutes**
 after that baseline, rechecking exact-build readiness at most every minute
 and at the boundaries. Historical staging-green age, runner queues and idle
 time supply no credit; the guard's historical remainder is advisory only.
+The 30min interval is required continuous coverage on the same exact build and
+process incarnation, not an arbitrary wait; no shorter equivalent is supported.
+Earliest automatic exit requires that coverage, at least 10 judged requests,
+the final pinned user-flow/readiness/original-grant proof and confirmed release.
 Manual ordinary deploys retain their no-delay policy but use the same finite
 grant, baseline, final sample and release. Rollback and live-SHA cures skip
 the staging holder entirely. A superseded SHA refuses before acquisition;
@@ -302,6 +306,11 @@ cap. Startup readiness can consume up to five minutes before the fresh
 before expiry. A slow/unhealthy candidate that exhausts the grant fails closed;
 the extra job time never authorizes more sampling or extends the grant. Native
 expiry remains necessary if setup/provider calls exhaust the job budget.
+Startup≤5min, original non-renewing grant≤40min and job≤50min are maxima, not
+additional runtime authorization. Insufficient count, reset/restart, no bearer,
+changed build or unknown release is not rate PASS. At grant/budget exhaustion,
+fail closed, retain evidence and safely release or expire; hold and route the
+missing proof rather than renew or promote. This holder does not authorize B2.
 Lifecycle NDJSON and available
 measurement JSON are always retained as
 `staging-soak-<run_id>-<run_attempt>` for seven days. The soak runs outside the
@@ -848,7 +857,23 @@ Read the variable and the Environment's reviewers again before each dispatch.
 The cutover executor records each checkpoint with
 `scripts/cutover_watch_checkpoint.py` — one checkpoint per call — and pastes
 the emitted row onto the execution card at `T_0` (first `/readyz` 200 on the
-production revision) through the watch deadline `T_0 + 48 h`:
+production revision) until evidence-complete closure or the maximum initial
+watch deadline `T_0 + 48 h`. The 48h bound is not mandatory idle calendar or
+automatic acceptance. Apply [cutover.md §48-hour watch](cutover.md#48-hour-watch):
+all approved checklist/feature/voice/production receipts, prescribed actual timer/
+workload coverage, independent B2, no unexplained loss/resource/recovery gaps,
+singleton/data/job writer fences, migration/watermark/permission/rollback proof
+and a warm reverse-reconciliation manifest are required. B2 is **NOT VERIFIED**,
+`T` **unset**, B4 **NO-GO** until those independent gates pass. This documentation
+does not supply numeric B2 resource criteria, a live producer/fixture executor
+or a long-use grant. Normal monitoring and warm Coolify/recovery points remain
+after closure; no retirement authority is implied.
+
+At `T_0+48h`, missing evidence stays **INCOMPLETE**: cutover lead, Release Manager
+and data lead decide hold/incident/rollback, with accountable owner, deadline
+and next action. No silent extension or pass by timeout.
+
+Checkpoint example (a point readiness observation, not B4 acceptance):
 
 ```sh
 python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
@@ -858,13 +883,14 @@ python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
 ```
 
 `--checkpoint` is one of the five labels `+15m`, `+1h`, `+6h`, `+24h`,
-`+48h`, matching the five checkpoint rows below; `--expected-sha` is the
+`+48h`, matching the five checkpoint rows below while the watch remains open; `--expected-sha` is the
 deployed commit from the watch header and `--expected-build-id` is that
 deploy run's `<run id>-<attempt>` from the run summary. The script is
 read-only: one GET to `/readyz`, no writes, migrates, or DB connections. It
 emits GO only on a 200 with every component ready and an exact
 revision/build-ID match; anything short of a full match is EXTEND, never
-GO, and a ROLLBACK decision stays human. Checkpoints follow
+GO. A point GO is not B4 sign-off or proof of timer/workload coverage; a
+ROLLBACK decision retains its separate authority. Checkpoints follow
 [cutover.md](cutover.md) §48-hour watch. Poll read-only on a short cadence
 (suggested 60 s); record findings, not every healthy poll.
 
@@ -933,8 +959,11 @@ whole watch so the rollback dispatch never has to hunt for it.
 - `rollback-decision`: at each checkpoint record GO, EXTEND (with new
   deadline), or ROLLBACK. A ROLLBACK row must repeat the previous Worker
   version ID from the header — that is the `<version-id>` the rollback
-  dispatch needs. At +48 h record sign-off or extend the watch on the
-  execution card.
+  dispatch needs. Record evidence-complete closure as soon as every required
+  receipt is sufficient; later checkpoint labels impose no idle hold and must
+  not be fabricated. At +48 h incomplete remains INCOMPLETE; the cutover lead,
+  Release Manager and data lead decide hold/incident/rollback as above. EXTEND
+  is a recorded decision, never automatic additional runtime authority.
 
 ### Signal thresholds (budgets and rollback triggers)
 
@@ -970,7 +999,7 @@ acceptance.
 
 ### Scheduled-job manual checkpoints
 
-At +15 min, +1 h, +6 h, +24 h and +48 h, inspect the current checkpoint's
+At +15 min, +1 h, +6 h, +24 h and +48 h while the watch is open, inspect the current checkpoint's
 container logs with these exact JSON-field filters (not the `msg` envelope):
 
 ```text

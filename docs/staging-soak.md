@@ -29,26 +29,31 @@ source documentation or historical evidence is not a substitute.
 
 ## Unresolved acceptance terms and evidence gaps
 
-The approved policy specifies four ACTIVE hours, zero loss across all four event
-families, and 120 expected one-minute samples in hours 3–4, but it does not
-operationally define what makes an hour ACTIVE, the source or record shape of a
-one-minute sample, or a sampling requirement for hours 1–2. Do not infer an
-activity threshold, a `/readyz`-based definition, or an unapproved cadence. The
-four-family zero-loss requirement remains in force throughout; the first-two-hour
-sample rule is unspecified, not waived.
+Four ACTIVE hours is the **conservative retained envelope pending a justified
+replacement**, not clock acceptance or a supported shorter equivalence. ACTIVE
+means the exact qualified build/process/environment has actual representative
+expected-versus-processed joins, voice, messages and slash, affirmative coverage
+of every family and zero loss. Empty, idle or health-only denominators cannot
+pass. Keep one-minute cadence from entry through completion, including hours
+1–2. Hours 3–4 retain **120 distinct mature minute-spaced temporal samples**;
+rapid polling cannot substitute for temporal coverage.
 
-The existing documented evidence route is an offline seam, is not wired into the
-running bot, and does not cover slash. Its bounded 15-minute packet example does
-not identify a reviewed live source or schema for the required one-minute
-samples. The GET-only smoke invokes no slash command and supplies no such
-samples. No currently verified reviewed route establishes the four-family live
-evidence or the required 120 samples. These gaps keep the acceptance **NOT
-VERIFIED** and `T` unset; they do not authorize a new collector, receipt path,
-origin, overflow path or fault method. The approved policy names no owner for
-defining or authorizing a live sample method. The separate existing
-technical-policy question remains pending with the CTO; the CEO-held fixture
-authorization remains an execution hold. Neither is treated as the missing
-method's owner or as resolved or widened by this document.
+Each sample must identify build/process/environment, UTC bounds, expected,
+processed or no activity per family, readiness, gaps/outages, RSS/errors/reset
+semantics and reviewed provenance. No activity must be explicit; it is not
+all-family coverage. This describes required evidence, not a new collector.
+
+The existing evidence seam is offline, not wired into the running bot and omits
+slash. Its bounded 15-minute packet and GET-only smoke do not establish the
+required live source. Numeric memory/RSS growth/headroom/error-spike criteria,
+an approved all-family live sample producer/fixture executor and a long-use B2
+grant remain **unsupported**. B2 stays **NOT VERIFIED**, `T` **unset**, B4
+**NO-GO**. These are current gaps, not an unnamed historical CTO question.
+Engineering Lead owns technical disposition and Chief of Staff continuation;
+neither is falsely appointed the live qualification executor. Existing lifecycle,
+shared-database rehome, credential and incident holds retain their owners and
+release conditions; this source correction neither renews historical dates nor
+creates a duplicate activation/data/fixture tree.
 
 ### Bounded event-read evidence contract
 
@@ -71,16 +76,12 @@ per deploy** ([workflow comment](../.github/workflows/deploy-staging.yml#L10)); 
 separate historical staging note records a **92–139-second redeploy**
 ([boot window](discord-send-admission.md#boot-window)). Keep both labelled as
 documented historical interruption ranges, not as a verified
-outage-start-to-recovery measurement. They exceed the 60-second limit if the
-planned redeploy interruption is in scope. The approved policy does not say
-whether a planned redeploy is an “actual outage,” and names no owner for that
-classification. The separate existing technical-policy question remains
-pending with the CTO; the CEO-held fixture authorization is the execution hold,
-not an interpretation of the recovery rule. Do not infer a classification or
-assign a new owner here. Until the existing policy path resolves classification
-and a qualifying under-60-second recovery is independently measured, these
-redeploy exercises cannot establish a B2 PASS. Workflow finish-to-first-ready
-remains distinct from outage-start-to-verified-recovery.
+outage-start-to-recovery measurement. **Interrupting planned redeploys count as
+actual outages by default**. Those historical ranges exceed the under-60-second
+limit if observed in an attempt; they are warnings, not waivers. Independently
+measure every actual outage; deploy-finish-to-first-ready remains a separate
+workflow interval. These redeploy exercises cannot establish B2 PASS without
+qualifying evidence and separate exercise authority.
 
 ## Provisioning (operator, once)
 
@@ -127,12 +128,21 @@ a stopped bot alone is not zero idle cost. Policy activation is by merge through
 [roll-forward bootstrap](staging-rollout-gate.md#first-activation-roll-forward-bootstrap);
 this does not record activation or satisfy any unverified precondition above.
 
-Expiry or stop during required ACTIVE evidence is an interruption, not a passing
-sample or an implicit pause/reset. Preserve the original acceptance criteria and
-record the gap. Do not extend a window indefinitely, infer new soak semantics,
-remove health/security checks or disable production probes to achieve sleeping.
-Rollback to indefinite always-on staging needs a dated owner cost exception; it
-is not the default recovery route.
+**No long-use grant means no start.** The original 40-minute automatic-promotion
+holder does not authorize four-hour B2 use. Before any separately authorized
+attempt, predeclare UTC `T`, `T+4h` as the stop for an incomplete current attempt,
+and a startup/cleanup-inclusive finite long-use grant. `T+4h` grants no runtime
+by itself and must fit inside that separate authorization. Native expiry is the
+backstop, not permission to renew the attempt.
+
+Expiry, an evidence gap, restart or stop during required ACTIVE evidence is an
+interruption, not a passing sample or implicit pause/reset. At the boundary,
+incomplete evidence is **INSUFFICIENT/FAIL**, never PASS by timeout: safely
+release or expire, preserve the failed/UNKNOWN interval, hold qualification and
+route the exact missing proof to its existing technical/continuation owner. Do
+not silently restart the clock, extend a window indefinitely or disable normal
+health/security/production monitoring. Rollback to indefinite always-on staging
+needs a dated owner cost exception; it is not the default recovery route.
 
 ## Starting the soak
 
@@ -152,7 +162,8 @@ is not the default recovery route.
 - Keep the four event families in scope throughout: joins, voice, messages and
   slash. Compare expected and processed outcomes through the existing reviewed
   evidence route; visible guild activity alone does not prove bot processing.
-- Hours 3–4 require **120 expected one-minute samples**: one expected sample
+- Sample every minute from entry through completion. Hours 3–4 require
+  **120 distinct mature minute-spaced temporal samples**: one expected sample
   for each minute across those two hours. They are required evidence, not
   optional or best-effort. Do not invent or add a collector to produce them.
 - Preserve every observation and gap in the approved record, if verified and
@@ -162,6 +173,10 @@ is not the default recovery route.
   semantics or erase, reclassify or silently reset historical evidence.
 
 ## Acceptance
+
+Exit only on the complete evidence below, with the independent preconditions
+and resource criteria accepted. Idle elapsed time is never sufficient; the
+bounded stop/failure rule above remains mandatory for an incomplete attempt.
 
 - Four fully evidenced **ACTIVE hours** after qualifying `T`, with all four
   event families covered and **zero missed events**.
@@ -174,7 +189,7 @@ is not the default recovery route.
   unverified samples mean the evidence is incomplete.
 - Keep the **95–139-second documented per-deploy gateway-drop range** and the
   **92–139-second historical redeploy record** labelled historical/estimated.
-  Both exceed 60 seconds if a planned redeploy is in scope; neither provides an
+  Both warn of a breach for an interrupting planned redeploy; neither provides an
   exact outage-start-to-verified-recovery measurement — measure it offline with
   `scripts/gate5_outage.py` (Gate 5 in
   [soak-entry-gates.md](soak-entry-gates.md)), which reads a committed JSONL

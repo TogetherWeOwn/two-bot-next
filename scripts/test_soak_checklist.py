@@ -27,6 +27,50 @@ class SoakChecklistTests(unittest.TestCase):
         self.assertEqual(set(counts), set(range(1, 9)) | {12, 13})
         self.assertEqual((ROOT / "docs/soak-checklist.md").read_text(), render(self.checklist))
 
+    def test_timing_contract_survives_regeneration(self):
+        instructions = "\n".join(self.checklist["instructions"])
+        rendered = render(self.checklist)
+        for requirement in (
+            "B2 remains **NOT VERIFIED**, **T unset**, and B4 **NO-GO**",
+            "120 distinct mature minute-spaced temporal samples",
+            "Sample every minute from entry through completion",
+            "No grant means no start",
+            "40min automatic holder does not authorize B2",
+            "Gap, expiry or incomplete evidence at the boundary means INSUFFICIENT/FAIL",
+            "fresh continuous 30min baseline-to-final coverage",
+            "at least 10 judged requests",
+            ">max(1.5×production ratio,5%) with at least 3 staging 5xx",
+            "production below 10 requests retains the 5% fallback",
+            "Startup≤5min, original non-renewing grant≤40min and job≤50min",
+            "B4 48h is the maximum initial watch",
+            "At T0+48h incomplete stays INCOMPLETE",
+            "≥49/50 audible joins, no4017, both rekeys and actual sustained playback",
+            "2h is a maximum investigation, never endurance proof",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, instructions)
+                self.assertIn(requirement, rendered)
+        self.assertIn("[Evidence-bounded timing exits](#evidence-bounded-timing-exits)", rendered)
+
+    def test_timer_rows_require_receipts_not_idle_holds(self):
+        entries = {entry["id"]: entry for entry in self.checklist["entries"]}
+        for entry_id, retained_cadences in (
+            ("s1-04", ("60s expiry", "30s sweep")),
+            ("s4-10", ("60s expiry", "30s unban sweeps")),
+            ("s2-05", ("5min recovery", "60min purge")),
+            ("s4-11", ("5min recovery", "60min purge")),
+            ("s4-12", ("15s poll",)),
+        ):
+            with self.subTest(entry=entry_id):
+                action = entries[entry_id]["action"]
+                for cadence in retained_cadences:
+                    self.assertIn(cadence, action)
+                self.assertIn("receipts", action)
+                self.assertIn("attempt maximum", action)
+                self.assertNotIn("wait at least", action)
+        self.assertIn("unexpired item retained", entries["s4-10"]["expected"])
+        self.assertIn("only policy-expired", entries["s4-11"]["expected"])
+
     def test_unnumbered_section_ends_parity_table_scope(self):
         heading = "## 2. Non-command interactions"
         changed = self.parity.replace(heading,
