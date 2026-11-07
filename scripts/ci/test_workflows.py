@@ -1111,7 +1111,9 @@ def staging_qualification_assert_errors(job, job_id, entry, receipt, artifact):
     if job.get("environment") != "staging" or "env" in job or "continue-on-error" in job:
         errors.append(f"{label}: must use staging with no shared env or tolerated failure")
     steps = job.get("steps") or []
-    assertions = [step for step in steps if "staging-use" in str(step.get("run", ""))]
+    assertions = [step for step in steps if any(
+        script in str(step.get("run", ""))
+        for script in ("staging-use.mjs", "staging-use-pipeline.mjs"))]
     if len(assertions) != 1:
         return errors + [f"{label}: must have exactly one staging window assertion"]
     ready = assertions[0]
@@ -7580,6 +7582,8 @@ class WorkflowTests(unittest.TestCase):
                 "consumer credential": lambda changed: consume(changed).setdefault("env", {}).update({"TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
                 "consumer before assertion": lambda changed: changed["steps"].insert(0, changed["steps"].pop(changed["steps"].index(consume(changed)))),
                 "no assertion": lambda changed: changed["steps"].remove(ready(changed)),
+                "duplicate assertion": lambda changed: changed["steps"].append(deepcopy(ready(changed))),
+                "extra mutation": lambda changed: changed["steps"].append({"run": "node wrangler/scripts/staging-use-pipeline.mjs begin"}),
             }
             for label, mutate in mutations.items():
                 changed = deepcopy(job)
