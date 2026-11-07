@@ -10,7 +10,10 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
@@ -20,6 +23,9 @@ spec = importlib.util.spec_from_file_location(
 container_drill = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(container_drill)
 GateError = container_drill.GateError
+# The finite-use adapter module the drill imports; its subprocess is the only
+# thing the lifecycle fixtures replace, so the real adapter logic still runs.
+USE_MODULE = sys.modules[container_drill.StagingDrillUse.__module__]
 
 PRE = "11111111-1111-4111-8111-111111111111"
 BACKOUT_WORKER = "22222222-2222-4222-8222-222222222222"
@@ -39,6 +45,8 @@ BACKOUT_BUILD = "99-1"
 DEPLOYMENTS_PATH = "/workers/scripts/two-bot-next-staging/deployments"
 APPLICATIONS_PATH = "/containers/applications"
 ROLLOUTS_PATH = "/containers/applications/app1/rollouts?limit=100"
+RECEIPT = "staging-use-receipt.ndjson"
+OTHER_SHA = "d" * 40
 COVERING_ATTESTATION = json.dumps({
     "drill": {"distinct_sessions": 1, "window_start": "1970-01-01T00:00:00Z",
               "window_end": "2286-11-20T17:46:39Z"},
@@ -87,6 +95,17 @@ class World:
              "steps": [{"status": "completed"}]},
         ]
         self.namespaces = {PRE: "ns1", BACKOUT_WORKER: "ns1"}
+        # Immutable Worker version metadata: the `workers/message` annotation
+        # and the plain_text bindings the bounded-staging proof reads.
+        self.version_messages = {PRE: PRE_SHA, BACKOUT_WORKER: BACKOUT_SHA}
+        self.version_vars = {PRE: policy_vars(PRE_SHA),
+                             BACKOUT_WORKER: policy_vars(BACKOUT_SHA)}
+        self.deployed_versions = []  # new UUIDs minted by full deploys, in order
+        self.deploy_vars_override = {}
+        self.events = []  # ordered ("control"|"use"|"version"|"probe", ...)
+        self.use_calls = []
+        self.fail_use = {}  # (action, nth) -> return code or exception to raise
+        self.request_hook = None
         self.ready_polls = ready_polls
         self.polls_left = 0
         self.never_ready = set()
@@ -108,6 +127,11 @@ class World:
         if image == PRE_IMAGE:
             return PRE_SHA, PRE_BUILD
         return "unknown", "unknown"
+
+
+def policy_vars(sha):
+    return {"STAGING_RUNTIME_POLICY": "bounded", "TWO_DEPLOY_ENV": "staging",
+            "CONTAINER_RELEASE": sha}
 
 
 COMPLETED_COUNTS = {"active": 1, "healthy": 1, "failed": 0, "starting": 0,
@@ -162,17 +186,28 @@ class FakeClient:
             return row
         if path.startswith("/workers/scripts/two-bot-next-staging/versions/"):
             version = path.rsplit("/", 1)[1]
+            world.events.append(("version", version))
             namespace = world.namespaces.get(version)
-            if namespace is None:
-                return {"resources": {"bindings": []}}
-            return {"resources": {"bindings": [
-                {"type": "durable_object_namespace", "class_name": "TwoBotContainer",
-                 "name": "TWO_BOT", "namespace_id": namespace}]}}
+            bindings = []
+            if namespace is not None:
+                bindings.append({"type": "durable_object_namespace",
+                                 "class_name": "TwoBotContainer",
+                                 "name": "TWO_BOT", "namespace_id": namespace})
+            bindings.extend({"type": "plain_text", "name": name, "text": text}
+                            for name, text in world.version_vars.get(version, {}).items())
+            message = world.version_messages.get(version)
+            return {"id": version,
+                    "annotations": {"workers/message": message} if message else {},
+                    "resources": {"bindings": bindings}}
         raise AssertionError(path)
 
     def request(self, url):
         world = self.world
+        if world.request_hook:
+            world.request_hook(url)
         version = world.history[0]
+        if url.endswith("/readyz"):
+            world.events.append(("probe", version))
         if url.endswith("/health"):
             return (200 if world.phase == "active" else 503), {}, b""
         # Readiness follows the serving image (the Rust build reports its own
@@ -196,6 +231,7 @@ def make_control(world):
         world.tick(1)
         count = sum(1 for call in world.calls if call[0] == action) + 1
         world.calls.append((action, epoch, release_fence, expected_deployment))
+        world.events.append(("control", action))
         failure = world.fail_control.get((action, count))
         if failure:
             raise failure
@@ -237,7 +273,59 @@ max_instances = 1
 """
 
 
-def run_drill(world, raw_pin=None, attestation=COVERING_ATTESTATION, logs=None):
+def world_deploy(world):
+    """Full-container deploy fake: mints a NEW Worker version UUID stamped with
+    the message SHA and the generated config's staging vars, like wrangler."""
+    def deploy(config_path, message_sha):
+        config = json.loads(Path(config_path).read_text())
+        staging = config["env"]["staging"]
+        image = staging["containers"][0]["image"]
+        world.tick(2)
+        world.deploys.append(image)
+        world.messages.append(message_sha)
+        if world.refuse_deploy:
+            return 1
+        version = f"{len(world.deployed_versions) + 1:08x}-5555-4555-8555-555555555555"
+        world.deployed_versions.append(version)
+        world.version_messages[version] = message_sha
+        world.version_vars[version] = {**staging.get("vars", {}),
+                                       **world.deploy_vars_override}
+        world.namespaces[version] = "ns1"
+        world.history.insert(0, version)
+        world.serving_image = image
+        world.rollouts.append(rollout_row(world, f"r-{len(world.rollouts)}", image))
+        return 0
+    return deploy
+
+
+def fake_subprocess(world):
+    """Stands in for the adapter's subprocess module only: records each node
+    helper call (action, helper, exact child environment) and never spawns."""
+    def run(argv, env=None, **kwargs):
+        action = argv[2]
+        count = sum(1 for call in world.use_calls if call["action"] == action) + 1
+        world.use_calls.append({"argv0": argv[0], "action": action,
+                                "helper": Path(argv[1]).name, "env": dict(env),
+                                "t": world.t, "kwargs": kwargs})
+        world.events.append(("use", action, env.get("STAGING_USE_DEPLOYMENT")))
+        failure = world.fail_use.get((action, count))
+        if isinstance(failure, BaseException):
+            raise failure
+        return SimpleNamespace(returncode=failure or 0)
+    return SimpleNamespace(run=run, SubprocessError=subprocess.SubprocessError,
+                           DEVNULL=subprocess.DEVNULL)
+
+
+def lifecycle(world, **changes):
+    """The real StagingDrillUse on the world's clock (so expiry is testable)."""
+    env = {"GITHUB_RUN_ID": "123456", "GITHUB_RUN_ATTEMPT": "1",
+           "STAGING_USE_RECEIPT": RECEIPT, "PATH": "/usr/bin:/bin"}
+    env.update(changes)
+    return container_drill.StagingDrillUse(env, URL, SENTINEL, now=lambda: world.t)
+
+
+def run_drill(world, raw_pin=None, attestation=COVERING_ATTESTATION, logs=None,
+              staging_use=False):
     logs = [] if logs is None else logs
     directory = tempfile.mkdtemp()
     wrangler_dir = Path(directory) / "wrangler"
@@ -245,24 +333,14 @@ def run_drill(world, raw_pin=None, attestation=COVERING_ATTESTATION, logs=None):
     (wrangler_dir / "wrangler.toml").write_text(WRANGLER_TOML)
     deploy_path = str(Path(directory) / "staging-container-deploy.json")
 
-    def deploy(config_path, message_sha):
-        config = json.loads(Path(config_path).read_text())
-        image = config["env"]["staging"]["containers"][0]["image"]
-        world.tick(2)
-        world.deploys.append(image)
-        world.messages.append(message_sha)
-        if world.refuse_deploy:
-            return 1
-        world.serving_image = image
-        world.rollouts.append(rollout_row(world, f"r-{len(world.rollouts)}", image))
-        return 0
-
     instance = container_drill.Drill(
         FakeClient(world), make_control(world), URL, "123456",
-        (deploy_path, deploy, str(wrangler_dir)),
-        now=lambda: world.t, sleep=world.tick, log=logs.append)
+        (deploy_path, world_deploy(world), str(wrangler_dir)),
+        now=lambda: world.t, sleep=world.tick, log=logs.append,
+        staging_use=lifecycle(world) if staging_use else None)
     validated = container_drill.validate_pin(raw_pin or pin())
-    failures = instance.run(validated, container_drill.validate_attestation(attestation))
+    with patch.object(USE_MODULE, "subprocess", fake_subprocess(world)):
+        failures = instance.run(validated, container_drill.validate_attestation(attestation))
     return instance, failures, logs
 
 
@@ -358,9 +436,14 @@ class HappyPathTests(unittest.TestCase):
                           "status", "fence", "deployment-takeover"])
         self.assertTrue(all(call[2] for call in world.calls
                             if call[0] == "deployment-takeover"))
-        self.assertEqual([call[3] for call in world.calls
-                          if call[0] == "deployment-takeover"],
-                         [BACKOUT_WORKER, PRE])
+        # A full deploy mints a NEW Worker UUID; takeover expects that
+        # deployed identity, never the historical pin's Worker version.
+        takeovers = [call[3] for call in world.calls if call[0] == "deployment-takeover"]
+        self.assertEqual(len(world.deployed_versions), 2)
+        self.assertEqual(takeovers, world.deployed_versions)
+        self.assertFalse({PRE, BACKOUT_WORKER} & set(takeovers))
+        self.assertEqual(world.version_messages[takeovers[0]], BACKOUT_SHA)
+        self.assertEqual(world.version_messages[takeovers[1]], PRE_SHA)
 
     def test_deploy_config_overrides_only_the_image(self):
         world = World()
@@ -371,6 +454,8 @@ class HappyPathTests(unittest.TestCase):
         containers = config["env"]["staging"]["containers"]
         self.assertEqual(len(containers), 1)
         self.assertEqual(containers[0]["image"], PRE_IMAGE)  # last leg wrote restore
+        self.assertEqual(config["env"]["staging"]["vars"],
+                         policy_vars(PRE_SHA))  # restore leg binds the baseline SHA
         self.assertEqual(containers[0]["rollout_kind"], "full_auto")
         self.assertNotIn("image_vars", containers[0])
         self.assertEqual(config["name"], "two-bot-next")
@@ -474,6 +559,11 @@ class FailureRecoveryTests(unittest.TestCase):
         self.assertEqual(len(world.deploys), 1)
         self.assertEqual((world.phase, world.running), ("active", True))
         self.assertEqual(instance.evidence["restore"]["running_image"], PRE_IMAGE)
+        # No new version was minted, so the restore takeover expects the
+        # still-serving baseline Worker.
+        self.assertEqual(world.deployed_versions, [])
+        self.assertEqual([call[3] for call in world.calls
+                          if call[0] == "deployment-takeover"], [PRE])
 
     def test_deploy_failure_reports_exit_code(self):
         # A bare deploy_failed carries no cause (wrangler output is
@@ -723,7 +813,8 @@ class ConfigTests(unittest.TestCase):
             WRANGLER_TOML.replace('name = "two-bot-next"', 'name = "other"'))
         with self.assertRaises(GateError) as caught:
             container_drill.generate_deploy_config(str(Path(directory) / "out.json"),
-                                                   BACKOUT_IMAGE, str(wrangler_dir))
+                                                   BACKOUT_IMAGE, str(wrangler_dir),
+                                                   BACKOUT_SHA)
         self.assertEqual(str(caught.exception), "wrong_staging_config")
 
     def test_generated_config_has_no_dangling_relative_images(self):
@@ -739,7 +830,7 @@ class ConfigTests(unittest.TestCase):
         (Path(directory) / "Dockerfile").write_text("FROM scratch\n")
         out = Path(directory) / "deploy.json"
         container_drill.generate_deploy_config(str(out), BACKOUT_IMAGE,
-                                               str(wrangler_dir))
+                                               str(wrangler_dir), BACKOUT_SHA)
         config = json.loads(out.read_text())
         seen = [container["image"] for container in config.get("containers", [])]
         for env in config.get("env", {}).values():
@@ -751,6 +842,52 @@ class ConfigTests(unittest.TestCase):
                 continue
             self.assertTrue(os.path.isabs(ref), ref)
             self.assertTrue(Path(ref).exists(), ref)
+
+
+    def generate(self, toml, source_sha=BACKOUT_SHA):
+        directory = tempfile.mkdtemp()
+        wrangler_dir = Path(directory) / "wrangler"
+        wrangler_dir.mkdir()
+        (wrangler_dir / "wrangler.toml").write_text(toml)
+        out = Path(directory) / "deploy.json"
+        container_drill.generate_deploy_config(str(out), BACKOUT_IMAGE,
+                                               str(wrangler_dir), source_sha)
+        return json.loads(out.read_text()), wrangler_dir / "wrangler.toml"
+
+    def test_generated_config_binds_bounded_staging_policy_and_sha(self):
+        config, _ = self.generate(WRANGLER_TOML)
+        self.assertEqual(config["env"]["staging"]["vars"], policy_vars(BACKOUT_SHA))
+
+    def test_staged_vars_are_preserved_and_policy_overrides_stale_values(self):
+        toml = WRANGLER_TOML + (
+            '\n[env.staging.vars]\nFEATURE_FLAG = "kept"\n'
+            'STAGING_RUNTIME_POLICY = "unbounded"\nCONTAINER_RELEASE = "stale"\n'
+            '\n[env.production.vars]\nTWO_DEPLOY_ENV = "production"\n'
+            '\n[vars]\nTOP_LEVEL = "untouched"\n')
+        config, source = self.generate(toml)
+        self.assertEqual(config["env"]["staging"]["vars"],
+                         {**policy_vars(BACKOUT_SHA), "FEATURE_FLAG": "kept"})
+        self.assertEqual(config["env"]["production"]["vars"],
+                         {"TWO_DEPLOY_ENV": "production"})
+        self.assertEqual(config["vars"], {"TOP_LEVEL": "untouched"})
+        self.assertEqual(source.read_text(), toml)  # reviewed config never rewritten
+        self.assertEqual(config["env"]["staging"]["containers"][0]["image"], BACKOUT_IMAGE)
+        self.assertEqual(config["env"]["staging"]["version_metadata"],
+                         {"binding": "CF_VERSION_METADATA"})
+
+    def test_invalid_source_sha_refused_before_writing_a_config(self):
+        for bad in ("latest", "A" * 40, "b" * 39, None):
+            with self.subTest(source_sha=bad):
+                directory = tempfile.mkdtemp()
+                wrangler_dir = Path(directory) / "wrangler"
+                wrangler_dir.mkdir()
+                (wrangler_dir / "wrangler.toml").write_text(WRANGLER_TOML)
+                out = Path(directory) / "deploy.json"
+                with self.assertRaises(GateError) as caught:
+                    container_drill.generate_deploy_config(
+                        str(out), BACKOUT_IMAGE, str(wrangler_dir), bad)
+                self.assertEqual(str(caught.exception), "invalid_source_sha")
+                self.assertFalse(out.exists())
 
 
 class WranglerEnvTests(unittest.TestCase):
@@ -956,7 +1093,8 @@ class LagToleranceTests(unittest.TestCase):
 class MainTests(unittest.TestCase):
     def environ(self, **changes):
         env = {"STAGING_WORKER_URL": URL, "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
-               "GITHUB_RUN_ID": "123456", "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+               "GITHUB_RUN_ID": "123456", "GITHUB_RUN_ATTEMPT": "1",
+               "STAGING_USE_RECEIPT": RECEIPT, "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
                "CLOUDFLARE_API_TOKEN": "t" * 40}
         env.update(changes)
         return env
@@ -987,26 +1125,27 @@ class MainTests(unittest.TestCase):
             env = {**env, "GITHUB_STEP_SUMMARY": str(summary)}
 
             def deploy_factory(wrangler_bin, directory, environ):
-                def deploy(config_path, message_sha):
-                    config = json.loads(Path(config_path).read_text())
-                    world.deploys.append(
-                        config["env"]["staging"]["containers"][0]["image"])
-                    world.messages.append(message_sha)
-                    world.tick(2)
-                    world.serving_image = config["env"]["staging"]["containers"][0]["image"]
-                    world.rollouts.append(rollout_row(
-                        world, f"r-{len(world.rollouts)}", world.serving_image))
-                    return 0
-                return deploy
+                return world_deploy(world)
+
+            drill_class = container_drill.Drill
+
+            def make_drill(*args, **kwargs):
+                return drill_class(*args, **kwargs, now=lambda: world.t, sleep=world.tick)
 
             output = io.StringIO()
+            # Keep the real orchestration/adapter, but use one deterministic
+            # clock and replace the adapter's node transport; no real waits.
             with patch("builtins.print",
-                       lambda *a, **k: output.write(" ".join(map(str, a)) + "\n")):
+                       lambda *a, **k: output.write(" ".join(map(str, a)) + "\n")), \
+                    patch.object(USE_MODULE, "subprocess", fake_subprocess(world)), \
+                    patch.object(container_drill, "Drill", make_drill):
                 code = container_drill.main(
                     argv or self.args(directory), environ=env,
                     make_control=lambda token, url, actor: make_control(world),
                     client_factory=lambda account, token: FakeClient(world),
-                    deploy_factory=deploy_factory)
+                    deploy_factory=deploy_factory,
+                    make_staging_use=lambda env, url, token: container_drill.StagingDrillUse(
+                        env, url, token, now=lambda: world.t))
             return (code, output.getvalue(),
                     evidence.read_text() if evidence.exists() else None,
                     summary.read_text() if summary.exists() else None, world)
@@ -1020,12 +1159,45 @@ class MainTests(unittest.TestCase):
         for text in (output, evidence, summary):
             self.assertNotIn(SENTINEL, text)
 
+    def test_success_uses_the_run_attempt_receipt_and_confirms_release(self):
+        env = self.environ(GITHUB_RUN_ATTEMPT="3", STAGING_USE_RECEIPT="attempt-3.ndjson")
+        code, output, evidence, _, world = self.invoke(env)
+        self.assertEqual(code, 0)
+        data = json.loads(evidence)
+        self.assertEqual(data["staging_cleanup"], "release_confirmed")
+        self.assertIsInstance(data["staging_expires_at"], int)
+        for call in world.use_calls:
+            self.assertEqual(call["env"]["GITHUB_RUN_ID"], "123456")
+            self.assertEqual(call["env"]["GITHUB_RUN_ATTEMPT"], "3")
+            self.assertEqual(call["env"]["STAGING_USE_RECEIPT"], "attempt-3.ndjson")
+            self.assertEqual(call["env"]["STAGING_USE_EXPIRES_AT"],
+                             str(data["staging_expires_at"]))
+            self.assertNotIn("CLOUDFLARE_API_TOKEN", call["env"])
+        self.assertEqual(world.use_calls[-1]["action"], "release")
+        self.assertNotIn(SENTINEL, evidence)
+
+    def test_unconfirmed_release_is_nonzero_with_native_expiry_recorded(self):
+        world = World()
+        world.fail_use[("release", 1)] = 1
+        code, output, evidence, summary, _ = self.invoke(self.environ(), world)
+        self.assertEqual(code, 1)
+        data = json.loads(evidence)
+        self.assertEqual(data["failures"], ["cleanup:staging_drill_control_failed"])
+        self.assertEqual(data["staging_cleanup"], "native_expiry_release_unconfirmed")
+        self.assertIn("FAIL", summary)
+        for text in (output, evidence, summary):
+            self.assertNotIn(SENTINEL, text)
+
     def test_bad_environment_is_refused_before_any_change(self):
         cases = [
             self.environ(STAGING_WORKER_URL="https://two-bot-next.5150.workers.dev"),
             self.environ(STAGING_WORKER_URL="http://two-bot-next-staging.x.workers.dev"),
             self.environ(OWNERSHIP_CONTROL_TOKEN="short"),
             self.environ(GITHUB_RUN_ID="12 ; rm -rf"),
+            self.environ(GITHUB_RUN_ATTEMPT=""),
+            self.environ(GITHUB_RUN_ATTEMPT="0"),
+            self.environ(GITHUB_RUN_ATTEMPT="1 ; rm -rf"),
+            self.environ(STAGING_USE_RECEIPT=""),
         ]
         for env in cases:
             with self.subTest(env={k: v for k, v in env.items()
@@ -1037,6 +1209,7 @@ class MainTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertEqual(world.calls, [])
                 self.assertEqual(world.deploys, [])
+                self.assertEqual(world.use_calls, [])
                 self.assertIsNone(evidence)
                 self.assertNotIn(SENTINEL, output)
                 self.assertIn("refused before any change", output)
@@ -1047,7 +1220,8 @@ class DryRunPlanPinTests(unittest.TestCase):
 
     def environ(self):
         return {"STAGING_WORKER_URL": URL, "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
-                "GITHUB_RUN_ID": "123456", "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+                "GITHUB_RUN_ID": "123456", "GITHUB_RUN_ATTEMPT": "1",
+                "STAGING_USE_RECEIPT": RECEIPT, "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
                 "CLOUDFLARE_API_TOKEN": "t" * 40}
 
     def args(self, directory):
@@ -1081,12 +1255,14 @@ class DryRunPlanPinTests(unittest.TestCase):
 
             output = io.StringIO()
             with patch("builtins.print",
-                       lambda *a, **k: output.write(" ".join(map(str, a)) + "\n")):
+                       lambda *a, **k: output.write(" ".join(map(str, a)) + "\n")), \
+                    patch.object(USE_MODULE, "subprocess", fake_subprocess(world)):
                 code = container_drill.main(
                     self.args(directory), environ=self.environ(),
                     make_control=lambda token, url, actor: make_control(world),
                     client_factory=lambda account, token: FakeClient(world),
-                    deploy_factory=deploy_factory)
+                    deploy_factory=deploy_factory,
+                    make_staging_use=container_drill.StagingDrillUse)
         return code, output.getvalue(), world
 
     def test_plan_pins_baseline_and_numbered_leg_order(self):
@@ -1107,6 +1283,278 @@ class DryRunPlanPinTests(unittest.TestCase):
         mutating = [call for call in world.calls
                     if call[0] in ("fence", "deployment-takeover")]
         self.assertEqual(mutating, [])
+
+    def test_plan_states_the_finite_window_and_new_worker_takeover(self):
+        _, out, _ = self.dry_run()
+        self.assertIn("live use: one 25-minute run/attempt window", out)
+        self.assertIn("rebound to the original expiry", out)
+        self.assertIn(f"takeover to newly proved Worker (historical {BACKOUT_WORKER})", out)
+        self.assertIn(f"takeover to newly proved Worker (baseline {PRE})", out)
+
+    def test_dry_run_proves_policy_but_never_touches_lifecycle_or_ownership(self):
+        code, _, world = self.dry_run()
+        self.assertEqual(code, 0)
+        # Immutable policy/SHA proof is read-only; no acquire, ready, check or release.
+        self.assertEqual(world.use_calls, [])
+        self.assertEqual([event for event in world.events if event[0] == "use"], [])
+        self.assertIn(("version", BACKOUT_WORKER), world.events)
+        self.assertIn(("version", PRE), world.events)
+        self.assertEqual([call[0] for call in world.calls], ["status"])
+        self.assertEqual(world.deploys, [])
+
+    def test_dry_run_refuses_unproved_policy_without_lifecycle_mutation(self):
+        world = World()
+        world.version_vars[BACKOUT_WORKER]["STAGING_RUNTIME_POLICY"] = "unbounded"
+        instance = container_drill.Drill(
+            FakeClient(world), make_control(world), URL, "1", ("x", lambda p: 0, "y"),
+            now=lambda: world.t, sleep=world.tick, log=lambda message: None,
+            staging_use=lifecycle(world))
+        with patch.object(USE_MODULE, "subprocess", fake_subprocess(world)):
+            with self.assertRaises(GateError) as caught:
+                instance.preflight(container_drill.validate_pin(pin()), dry_run=True)
+        self.assertEqual(str(caught.exception), "staging_restore_policy_unproved")
+        self.assertEqual(world.use_calls, [])
+        self.assertEqual(world.calls, [])
+
+
+def kinds(world, *names):
+    """Control and lifecycle events in order, dropping reads and probes."""
+    return [event for event in world.events if event[0] in (names or ("control", "use"))]
+
+
+class LifecycleAdapterTests(unittest.TestCase):
+    """The real StagingDrillUse adapter driven by the real Drill; only the node
+    subprocess is recorded, so ordering and refusals are the shipped behavior."""
+
+    def test_acquire_ready_then_prefence_check_then_fence_in_order(self):
+        world = World()
+        instance, failures, _ = run_drill(world, staging_use=True)
+        self.assertEqual(failures, [])
+        first, second = world.deployed_versions
+        self.assertEqual(kinds(world), [
+            ("control", "status"),
+            ("use", "acquire", PRE), ("use", "ready", PRE),
+            ("control", "status"),
+            ("use", "restore-check", None),
+            ("control", "status"), ("control", "fence"),
+            ("control", "deployment-takeover"), ("use", "acquire", first),
+            ("control", "status"), ("control", "fence"),
+            ("control", "deployment-takeover"), ("use", "acquire", second),
+            ("use", "release", second)])
+        # Acquire and ready both precede the first baseline readiness probe.
+        probe = world.events.index(("probe", PRE))
+        self.assertLess(world.events.index(("use", "ready", PRE)), probe)
+        self.assertLess(probe, world.events.index(("use", "restore-check", None)))
+        self.assertEqual({call["helper"] for call in world.use_calls
+                          if call["action"] != "restore-check"}, {"staging-use.mjs"})
+        self.assertEqual([call["helper"] for call in world.use_calls
+                          if call["action"] == "restore-check"], ["staging-use-pipeline.mjs"])
+        self.assertEqual(instance.evidence["staging_cleanup"], "release_confirmed")
+
+    def test_new_version_is_proved_then_rebound_before_readiness_each_epoch(self):
+        world = World()
+        _, failures, _ = run_drill(world, staging_use=True)
+        self.assertEqual(failures, [])
+        for version in world.deployed_versions:
+            fence = max(index for index, event in enumerate(world.events)
+                        if event == ("control", "fence")
+                        and index < world.events.index(("probe", version)))
+            proof = world.events.index(("version", version))
+            takeover = next(index for index, event in enumerate(world.events)
+                            if event == ("control", "deployment-takeover") and index > proof)
+            rebind = world.events.index(("use", "acquire", version))
+            probe = world.events.index(("probe", version))
+            self.assertLess(fence, proof)
+            self.assertLess(proof, takeover)
+            self.assertLess(takeover, rebind)
+            self.assertLess(rebind, probe)
+        # The acquire env binds the NEW version and the SHA it was stamped with.
+        rebinds = [call["env"] for call in world.use_calls
+                   if call["action"] == "acquire"][1:]
+        self.assertEqual([(env["STAGING_USE_DEPLOYMENT"], env["STAGING_USE_SHA"])
+                          for env in rebinds],
+                         [(world.deployed_versions[0], BACKOUT_SHA),
+                          (world.deployed_versions[1], PRE_SHA)])
+
+    def test_every_call_keeps_the_original_expiry_and_a_minimal_environment(self):
+        world = World()
+        instance, failures, _ = run_drill(world, staging_use=True)
+        self.assertEqual(failures, [])
+        expiry = int(world.use_calls[0]["t"] * 1000) + 25 * 60 * 1000
+        self.assertEqual({call["env"]["STAGING_USE_EXPIRES_AT"] for call in world.use_calls},
+                         {str(expiry)})
+        self.assertEqual(instance.evidence["staging_expires_at"], expiry)
+        for call in world.use_calls:
+            self.assertEqual(call["argv0"], "node")
+            self.assertIs(call["kwargs"]["stdout"], subprocess.DEVNULL)
+            self.assertIs(call["kwargs"]["stderr"], subprocess.DEVNULL)
+            self.assertEqual(
+                set(call["env"]) - {"STAGING_USE_DEPLOYMENT", "STAGING_USE_SHA"},
+                {"GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "PATH", "STAGING_WORKER_URL",
+                 "OWNERSHIP_CONTROL_TOKEN", "STAGING_USE_RECEIPT", "STAGING_USE_EXPIRES_AT"})
+            self.assertEqual(call["env"]["STAGING_USE_RECEIPT"], RECEIPT)
+            self.assertEqual(call["env"]["GITHUB_RUN_ATTEMPT"], "1")
+        self.assertNotIn(SENTINEL, json.dumps(instance.evidence))
+
+    def test_refusals_before_acquire_never_touch_lifecycle_or_ownership(self):
+        def drop_policy(world):
+            del world.version_vars[BACKOUT_WORKER]["STAGING_RUNTIME_POLICY"]
+
+        def unbounded(world):
+            world.version_vars[PRE]["STAGING_RUNTIME_POLICY"] = "unbounded"
+
+        def unstamped(world):
+            world.version_messages[PRE] = None
+
+        def sha_mismatch(world):
+            world.version_messages[BACKOUT_WORKER] = OTHER_SHA
+            world.version_vars[BACKOUT_WORKER] = policy_vars(OTHER_SHA)
+
+        cases = [(drop_policy, "staging_restore_policy_unproved"),
+                 (unbounded, "staging_restore_policy_unproved"),
+                 (unstamped, "staging_restore_identity_invalid"),
+                 (sha_mismatch, "staging_drill_image_mismatch")]
+        for change, code in cases:
+            with self.subTest(code=code, change=change.__name__):
+                world = World()
+                change(world)
+                instance, failures, _ = run_drill(world, staging_use=True)
+                self.assertEqual(failures, [f"drill:{code}"])
+                self.assertEqual(world.use_calls, [])
+                self.assertEqual(world.deploys, [])
+                self.assertNotIn("fence", [call[0] for call in world.calls])
+                self.assertEqual(instance.evidence["staging_cleanup"], "not_acquired")
+
+    def test_baseline_revision_must_match_the_proved_baseline_sha(self):
+        world = World()
+        world.version_messages[PRE] = OTHER_SHA
+        world.version_vars[PRE] = policy_vars(OTHER_SHA)
+        instance, failures, _ = run_drill(world, staging_use=True)
+        self.assertEqual(failures, ["drill:staging_drill_image_mismatch"])
+        self.assertEqual(world.deploys, [])
+        self.assertNotIn("fence", [call[0] for call in world.calls])
+        # Startup acquired a grant; a later baseline mismatch must still stop it.
+        self.assertEqual(instance.evidence["staging_cleanup"], "release_confirmed")
+
+    def test_lifecycle_refusal_skips_restore_and_release(self):
+        cases = [("acquire", 1, "preflight"), ("ready", 1, "preflight"),
+                 ("restore-check", 1, "preflight_leg"), ("acquire", 2, "rebind")]
+        for action, nth, where in cases:
+            for failure in (1, OSError("node missing"), subprocess.TimeoutExpired("node", 1)):
+                with self.subTest(action=action, where=where, failure=repr(failure)):
+                    world = World()
+                    world.fail_use[(action, nth)] = failure
+                    instance, failures, logs = run_drill(world, staging_use=True)
+                    code = ("staging_drill_control_failed" if failure == 1
+                            else "staging_drill_control_unavailable")
+                    expected = [f"drill:{code}"]
+                    if where == "rebind":
+                        expected.append("restore_skipped_after_control_refusal")
+                    self.assertEqual(failures[:len(expected)], expected)
+                    if where == "rebind":
+                        self.assertEqual(failures, expected)
+                        self.assertEqual(len(world.deploys), 1)  # no restore deploy
+                    # No release, no further ownership mutation after the refusal.
+                    self.assertNotIn("release", [call["action"] for call in world.use_calls])
+                    self.assertEqual(world.use_calls[-1]["action"], action)
+                    self.assertEqual(instance.evidence["staging_cleanup"],
+                                     "native_expiry_after_control_refusal")
+                    self.assertNotIn(SENTINEL, "\n".join(logs) + json.dumps(instance.evidence))
+                    if where != "rebind":
+                        self.assertEqual(world.deploys, [])
+                        self.assertNotIn("fence", [call[0] for call in world.calls])
+
+    def test_auth_refusal_skips_restore_and_release(self):
+        world = World()
+        world.fail_control[("deployment-takeover", 1)] = GateError("ownership_auth_failed")
+        instance, failures, _ = run_drill(world, staging_use=True)
+        self.assertEqual(failures, ["drill:ownership_auth_failed",
+                                   "restore_skipped_after_auth_failure"])
+        self.assertEqual(len(world.deploys), 1)
+        self.assertNotIn("release", [call["action"] for call in world.use_calls])
+        self.assertEqual(instance.evidence["staging_cleanup"],
+                         "native_expiry_after_control_refusal")
+        # The takeover never succeeded, so nothing was rebound to the new Worker.
+        self.assertEqual([call["env"]["STAGING_USE_DEPLOYMENT"] for call in world.use_calls
+                          if call["action"] == "acquire"], [PRE])
+
+    def test_deployed_version_without_bounded_policy_is_refused_before_takeover(self):
+        world = World()
+        world.deploy_vars_override = {"STAGING_RUNTIME_POLICY": "unbounded"}
+        instance, failures, _ = run_drill(world, staging_use=True)
+        self.assertEqual(failures, ["drill:staging_restore_policy_unproved",
+                                   "restore_skipped_after_control_refusal"])
+        self.assertNotIn("deployment-takeover", [call[0] for call in world.calls])
+        self.assertEqual(len(world.deploys), 1)
+        self.assertEqual([call["action"] for call in world.use_calls],
+                         ["acquire", "ready", "restore-check"])
+        self.assertEqual(instance.evidence["staging_cleanup"],
+                         "native_expiry_after_control_refusal")
+
+    def test_deployed_version_stamped_with_another_sha_is_refused(self):
+        world = World()
+        base_deploy = world_deploy(world)
+
+        def stamped_wrong(config_path, message_sha):
+            return base_deploy(config_path, OTHER_SHA)
+
+        directory = tempfile.mkdtemp()
+        wrangler_dir = Path(directory) / "wrangler"
+        wrangler_dir.mkdir()
+        (wrangler_dir / "wrangler.toml").write_text(WRANGLER_TOML)
+        instance = container_drill.Drill(
+            FakeClient(world), make_control(world), URL, "1",
+            (str(Path(directory) / "deploy.json"), stamped_wrong, str(wrangler_dir)),
+            now=lambda: world.t, sleep=world.tick, log=lambda message: None,
+            staging_use=lifecycle(world))
+        with patch.object(USE_MODULE, "subprocess", fake_subprocess(world)):
+            failures = instance.run(container_drill.validate_pin(pin()),
+                                    container_drill.validate_attestation(COVERING_ATTESTATION))
+        # Annotation says OTHER_SHA but the generated CONTAINER_RELEASE var says the pin.
+        self.assertEqual(failures, ["drill:staging_restore_policy_unproved",
+                                   "restore_skipped_after_control_refusal"])
+        self.assertNotIn("deployment-takeover", [call[0] for call in world.calls])
+
+    def test_expiry_during_confirmation_refuses_success_and_later_mutations(self):
+        world = World()
+        ready_seen = [0]
+
+        def hook(url):
+            ready = (url.endswith("/readyz") and world.serving_image == BACKOUT_IMAGE
+                     and world.phase == "active" and world.running
+                     and world.polls_left == 0)
+            if ready:
+                ready_seen[0] += 1
+                if ready_seen[0] == 2:  # first confirmation probe: window runs out
+                    world.tick(25 * 60)
+
+        world.request_hook = hook
+        instance, failures, _ = run_drill(world, staging_use=True)
+        self.assertEqual(failures, ["drill:staging_drill_window_ended",
+                                   "restore:staging_drill_window_ended"])
+        self.assertNotIn("PASS", container_drill.summary(instance.evidence, failures))
+        # Only the drill leg's fence/deploy/takeover happened: the restore leg
+        # refused at its first window check, before any status, fence or deploy.
+        self.assertEqual([call[0] for call in world.calls],
+                         ["status", "status", "status", "fence", "deployment-takeover"])
+        self.assertEqual(world.deploys, [BACKOUT_IMAGE])
+        self.assertEqual(world.serving_image, BACKOUT_IMAGE)
+        self.assertNotIn("first_ready", instance.evidence.get("restore", {}))
+        self.assertEqual(instance.evidence["staging_cleanup"], "release_confirmed")
+
+    def test_dry_run_preflight_proves_versions_without_lifecycle_mutation(self):
+        world = World()
+        instance = container_drill.Drill(
+            FakeClient(world), make_control(world), URL, "1", ("x", lambda p: 0, "y"),
+            now=lambda: world.t, sleep=world.tick, log=lambda message: None,
+            staging_use=lifecycle(world))
+        with patch.object(USE_MODULE, "subprocess", fake_subprocess(world)):
+            baseline = instance.preflight(container_drill.validate_pin(pin()), dry_run=True)
+        self.assertEqual(baseline["source_sha"], PRE_SHA)
+        self.assertEqual(world.use_calls, [])
+        self.assertIsNone(instance.staging_use.expires_at)
+        self.assertEqual([call[0] for call in world.calls], ["status"])
+        self.assertFalse(instance.mutated)
 
 
 if __name__ == "__main__":
