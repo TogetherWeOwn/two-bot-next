@@ -145,8 +145,8 @@ remaining gateway/accepted-prefix work:
    slash-command registry is synchronized;
    `view:template` shows the saved template as stored; `view:preview` renders
    it with the invoking member/channel and explicit bounded sample arguments
-   (`arguments`, at most 500 UTF-16 units — the four-variable language ignores
-   them, so no `{args}`). Untrusted text is Markdown-escaped, views that cannot
+   (`arguments`, at most 500 UTF-16 units — the five-variable language renders
+   them as the `{args}` input). Untrusted text is Markdown-escaped, views that cannot
    fit carry an explicit truncation marker, and invalid saved templates refuse
    with a `/command name:<name> template:` correction. Inspection never sends
    to the channel, republishes the registry, touches cooldowns/claims, mutates
@@ -191,10 +191,34 @@ remaining gateway/accepted-prefix work:
    records the same resync marker as a define; a repeated state never
    claims the picker repaired, and no reply advises a restart, a delete
    or repeating the toggle.
+10. `/command-edit name:<name>` corrects one saved definition in place, unlike
+   `/command`, which still replaces the whole definition with its defaults
+   (description `Custom command`, no trigger). Optional `template`,
+   `description` and `text-trigger` replace only what is supplied; every
+   omitted field, the creator, the enabled flag and the command identity are
+   kept, so a disabled definition stays disabled. `clear-trigger:true` is the
+   only way to remove the text trigger; `clear-trigger:false` does nothing, an
+   empty `text-trigger` is invalid, and `text-trigger` with `clear-trigger:true`
+   is a contradiction. A forged type, a duplicate or an unknown option refuses
+   before any store read, and the Manage Server and automation checks run
+   before any parsing. The row is re-read under the guild lifecycle lock, so a
+   concurrent change to another field survives, and the complete merged
+   definition must pass the `/command` write rules: an invalid saved template
+   refuses even when the edit did not touch it. A newly supplied trigger may
+   not name a built-in and may not be held by any other command, including a
+   disabled one. The patch commits with one content-free `command.edit` audit
+   fact (no field names or text); a failed write or audit rolls both back.
+   A missing name, a value identical to the saved one and an empty patch are
+   zero-write: no audit fact, no timestamp touch, no republish. A real change
+   republishes the full registry once. A failed publication reports
+   saved-but-pending, records the same resync marker as a define and
+   resyncs automatically on the next successful full-set publication, with no
+   advice to restart or repeat the edit.
+   Confirmations are private and mention-safe and never echo saved text.
 
 ## Pending registry resync
 
-A define, remove or toggle commits its saved definition (and its one audit
+A define, clone, edit, remove or toggle commits its saved definition (and its one audit
 fact) before the full registry is republished. If that publication fails —
 for example Discord refuses the replace-all PUT during an outage — the
 picker would otherwise stay stale until a restart. Instead, the failed
@@ -205,7 +229,7 @@ idempotent, so repeated failures keep exactly one pending row.
 
 The private confirmation names both halves of the outcome truthfully — the
 definition is saved, synchronization is pending and will resync
-automatically on the next publication — and never advises restarting the
+automatically on the next successful full-set publication — and never advises restarting the
 bot, deleting the definition or repeating the mutation (a repeated toggle
 is a no-op that does not republish). The last confirmed discovery snapshot
 does not advance.
@@ -219,6 +243,38 @@ clears another guild's pending row. The marker is best-effort recovery
 state around the publication outcome (recording or clearing it never masks
 that outcome), holds no member data, and is excluded from backups: a
 recovered process republishes the full set on boot anyway.
+
+## Clone a saved response
+
+Use `/command-clone source:faq destination:faq-new` to start a related response
+without replacing anything. This management command requires Manage Server and
+the automations feature in the configured guild. Both names are required,
+lowercased, and validated against the existing 1–32 character name rules and
+all reserved names (including voice names while voice is off). Missing sources
+and existing destinations, including cloning a name onto itself, refuse without
+publishing or changing definitions.
+
+The destination copies the saved template, description and **enabled or disabled
+state**, with fresh creator/updater provenance for the invoking admin. It does
+**not** copy the unique text trigger. The private confirmation explains both
+choices. Disabled clones remain absent from the command picker and cannot run;
+cloning never enables them. Source fields, source run history and delivery/replay
+fences remain unchanged. Invalid saved templates/descriptions must be corrected
+before cloning. No overwrite, cross-guild, state or trigger override is supported.
+
+The existing guild transaction lock serializes source/destination checks,
+capacity (including disabled rows), create-only insertion and one content-free
+`command.create` audit. An insertion or audit failure leaves no destination or
+success fact. A competing writer cannot turn cloning into a replacement.
+Successful saves republish the complete enabled registry under the existing
+runtime serialization, not just the new command.
+
+If Discord publication fails after the save, the confirmation says **Saved** and
+that **the command picker is not yet synchronized**: synchronization is pending
+and will resync automatically on the next publication, so no further action is
+needed. Do not clone again: a repeated clone is a no-op that does not republish.
+Confirmed help discovery advances only after successful publication;
+resynchronization adds no clone or run audit fact.
 
 ## Slash-run audit replay
 

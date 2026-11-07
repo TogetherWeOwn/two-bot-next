@@ -198,9 +198,11 @@ async fn acceptance_audit_without_database_is_unavailable_and_empty() {
 
 #[tokio::test]
 async fn acceptance_audit_unreachable_database_degrades_not_500() {
-    // `connect_lazy` performs no I/O; the read fails and the route must
-    // report unavailable with 200, never an error text or a 500.
+    // A lazy pool can reach the migrated CI database after earlier suites.
+    // Close it before the request, as in ops_http's deterministic failure probe.
     let pool = lazy_pool();
+    pool.close().await;
+    assert!(matches!(pool.acquire().await, Err(sqlx::Error::PoolClosed)));
     let (status, json, text) = get_json(app(Some(pool.clone()))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["available"], false, "body: {text}");

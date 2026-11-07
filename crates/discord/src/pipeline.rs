@@ -442,7 +442,13 @@ pub struct Pipeline<
     C = NoClassification,
     P = PipelineSnapshots,
 > {
-    cache: InMemoryCache,
+    /// Shared with the internal-actions receiver's voice-snapshot read: the
+    /// gateway loop feeds events through this pipeline (`cache.update`), and
+    /// the receiver reads the same handle. Twilight's cache is internally
+    /// synchronized, so concurrent gateway writes and receiver reads are
+    /// safe; the receiver's projection fails closed on any gap instead of
+    /// inventing data.
+    cache: Arc<InMemoryCache>,
     handlers: FunnelHandlers<S, L, F>,
     invites: InviteTracker<P>,
     invite_source: I,
@@ -516,10 +522,37 @@ impl<
         classifier: C,
         snapshots: P,
     ) -> Self {
+        Self::with_shared_cache(
+            store,
+            leveling,
+            facts,
+            invite_source,
+            classifier,
+            snapshots,
+            Arc::new(
+                InMemoryCache::builder()
+                    .resource_types(cache_resource_types())
+                    .build(),
+            ),
+        )
+    }
+
+    /// Build over an explicit snapshot store with a caller-owned gateway
+    /// cache. The live gateway passes the handle it also hands to the
+    /// internal-actions receiver, so `voice.snapshot` reads the same cache
+    /// the shard runner feeds. Replay/test callers keep `with_snapshots`
+    /// and are unaffected.
+    pub fn with_shared_cache(
+        store: S,
+        leveling: Option<L>,
+        facts: Option<F>,
+        invite_source: I,
+        classifier: C,
+        snapshots: P,
+        cache: Arc<InMemoryCache>,
+    ) -> Self {
         Self {
-            cache: InMemoryCache::builder()
-                .resource_types(cache_resource_types())
-                .build(),
+            cache,
             handlers: FunnelHandlers::new(store, leveling, facts),
             invites: InviteTracker::new(snapshots),
             invite_source,

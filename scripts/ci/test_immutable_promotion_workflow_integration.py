@@ -7,8 +7,8 @@ outputs and logged arguments:
   staging:   prepare (promotion_clean) -> bundle -> snapshot -> deploy ->
              receipt -> takeover -> verify -> error-rate gate ->
              auto-rollback -> record -> evidence upload (always) ->
-             voice-synthetic -> pinned-history-guard ->
-             certify-promotion (only when clean)
+             voice-synthetic + help-embed-synthetic + user-flow-synthetic ->
+             pinned-history-guard -> certify-promotion (only when clean)
   production: guard run/attempt -> admit (before the production
              render/deploy) -> render (--artifact, no-bundle) ->
              deploy --no-bundle -> serving proof -> stable readyz gate
@@ -438,10 +438,12 @@ class WorkflowFilesTests(unittest.TestCase):
 class CertifyGraphTests(WorkflowFilesTests):
     def test_certify_runs_downstream_of_deploy_voice_and_pinned_history(self):
         job = self.staging["jobs"]["certify-promotion"]
-        self.assertEqual(job["needs"], ["deploy", "voice-synthetic", "user-flow-synthetic",
-                                        "pinned-history-guard"])
+        self.assertEqual(job["needs"], ["deploy", "voice-synthetic", "help-embed-synthetic",
+                                        "user-flow-synthetic", "pinned-history-guard"])
         voice = self.staging["jobs"]["voice-synthetic"]
         self.assertEqual(voice["needs"], "deploy")
+        help_embed = self.staging["jobs"]["help-embed-synthetic"]
+        self.assertEqual(help_embed["needs"], "deploy")
         synthetic = self.staging["jobs"]["user-flow-synthetic"]
         self.assertEqual(synthetic["needs"], "deploy")
         guard = self.staging["jobs"]["pinned-history-guard"]
@@ -561,11 +563,20 @@ class CertifyExecutionTests(unittest.TestCase):
         self.assertIn("always()", diagnostics[0].get("if", ""))
         self.assertEqual(diagnostics[0]["with"]["name"], "staging-rollout-evidence")
         certify_steps = steps_of(workflow["jobs"]["certify-promotion"])
-        promotions = [s for s in certify_steps if (s.get("uses") or "").startswith("actions/upload-artifact@")]
+        uploads = [s for s in certify_steps if (s.get("uses") or "").startswith("actions/upload-artifact@")]
+        promotions = [s for s in uploads if s.get("with", {}).get("path") == "${{ runner.temp }}/promotion-upload"]
+        lifecycle = [s for s in uploads if s.get("with", {}).get("path") == "${{ runner.temp }}/staging-use-certify.jsonl"]
+        self.assertEqual(len(uploads), 2)
         self.assertEqual(len(promotions), 1)
+        self.assertEqual(len(lifecycle), 1)
+        self.assertEqual(lifecycle[0]["if"], "always()")
+        self.assertEqual(lifecycle[0]["with"]["name"], "staging-use-certify-${{ github.run_id }}-${{ github.run_attempt }}")
+        self.assertEqual(promotions[0].get("if", "success()"), "success()")
+        self.assertEqual(promotions[0]["with"].get("overwrite", "false"), "false")
         self.assertIn("bot-promotion-", promotions[0]["with"]["name"])
         self.assertNotEqual(promotions[0]["with"]["name"], "staging-rollout-evidence")
-        _, certify = find_step(workflow["jobs"]["certify-promotion"], "run")
+        _, certify = find_step_by_name(workflow["jobs"]["certify-promotion"],
+                                       "Certify the served module bytes and verified rollout")
         # Diagnostics upload in deploy must not reference the promotion ZIP.
         self.assertNotIn("promotion.zip", diagnostics[0].get("with", {}).get("path", ""))
         self.assertIn("promotion.zip", run_of(certify))

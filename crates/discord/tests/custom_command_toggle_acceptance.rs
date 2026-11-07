@@ -26,13 +26,17 @@ use serde_json::{json, Value};
 use sqlx::{postgres::PgConnectOptions, postgres::PgPoolOptions, PgPool};
 use twilight_model::{application::interaction::Interaction, channel::Message};
 use two_bot_core::{
+    automation_transfer as transfer,
     command_permissions::{command_permission, CommandSurface},
+    commands::CustomCommand,
     custom_command_service as service, custom_command_store as store,
     custom_commands::{
-        builtin_command_names, reserved_command_names, AutomationMessageAcceptance,
-        PutCommandInput, StoredCommand,
+        builtin_command_names, max_custom_commands, publishable_builtin_names,
+        reserved_command_names, AutomationMessageAcceptance, CommandError, PutCommandInput,
+        StoredCommand,
     },
-    InteractionRouter, RouterGates, AUTOMATIONS_DISABLED_REPLY, MANAGE_SERVER_REQUIRED,
+    HandlerId, InteractionRouter, RouterGates, SlashContext, SlashOutcome,
+    AUTOMATIONS_DISABLED_REPLY, MANAGE_SERVER_REQUIRED,
 };
 use two_bot_discord::{
     custom_commands::{CustomCommandError, CustomCommandRuntime, TextCommandOutcome},
@@ -418,8 +422,12 @@ fn assert_full_set(set: &Value, enabled: bool) {
 }
 
 fn changed_reply(observed: &Observed, enabled: bool) {
+    changed_named_reply(observed, enabled, "faq");
+}
+
+fn changed_named_reply(observed: &Observed, enabled: bool, name: &str) {
     let text = private_reply(observed).to_ascii_lowercase();
-    assert!(text.contains("faq"));
+    assert!(text.contains(name), "saved command name: {text}");
     assert!(
         text.contains(if enabled { "enabled" } else { "disabled" }),
         "name saved state: {text}"
@@ -807,7 +815,7 @@ async fn toggle_refuses_reserved_or_invalid_saved_definition_without_reactivatio
         refusals.push(f.observe(&toggle(501 + index as u64, true, name)).await);
         checks.push((before, definitions(f.db.pool()).await));
     }
-    for (index, template, trigger) in [(0, "Unknown {args}", "!faq"), (1, TEMPLATE, "!rank")] {
+    for (index, template, trigger) in [(0, "Unknown {guild}", "!faq"), (1, TEMPLATE, "!rank")] {
         seed(f.db.pool(), "2222", "faq", trigger, template, false).await;
         let before = definitions(f.db.pool()).await;
         refusals.push(f.observe(&toggle(510 + index, true, "faq")).await);
@@ -891,9 +899,17 @@ async fn toggle_paused_trigger_remains_owned_and_existing_replacement_semantics_
 #[tokio::test]
 async fn toggle_at_capacity_can_resume_existing_definition_but_cannot_add_another() {
     let f = Fixture::new(false).await;
-    // The established contract is 100 total, reserving every builtin. Disabled
-    // saved definitions count toward storage capacity, not just picker entries.
-    let capacity = 100 - reserved_command_names().len();
+    // Independent pin: customs fill the guild ceiling around the live
+    // publishable set (70 published; 3 more squatted but unpublished). The
+    // fixture already stores `faq` and `other`; peers fill the rest of the
+    // budget. Disabled rows count toward storage, not just picker entries.
+    let reserved = reserved_command_names();
+    assert_eq!(
+        reserved.len(),
+        73,
+        "73 reserved names pin the oracle: 70 published +3 held"
+    );
+    let capacity = max_custom_commands(publishable_builtin_names().len());
     for index in 2..capacity {
         seed(
             f.db.pool(),
@@ -927,12 +943,15 @@ async fn toggle_at_capacity_can_resume_existing_definition_but_cannot_add_anothe
     changed_reply(&resumed, true);
     assert_eq!(row(&after)["enabled"], true);
     assert_eq!(immutable_fields(&before), immutable_fields(&after));
-    assert!(matches!(
-        overflow,
-        Err(service::ServiceError::Validation(
-            two_bot_core::custom_commands::CommandError::OverCapacity(_)
-        ))
-    ));
+    assert!(
+        matches!(
+            overflow,
+            Err(service::ServiceError::Validation(
+                CommandError::OverCapacity(budget)
+            )) if budget == capacity
+        ),
+        "one row past the live budget overflows"
+    );
     let sets = publications(&resumed.requests);
     assert_eq!(sets.len(), 1);
     let names = published_names(&sets[0]);
@@ -1433,4 +1452,726 @@ async fn toggle_control_existing_replace_and_remove_are_not_repurposed() {
         .any(|r| r["guild_id"] == "2222" && r["name"] == "faq"));
     assert_eq!(private_reply(&absent), "No command /faq found.");
     assert!(publications(&absent.requests).is_empty());
+}
+
+// Capacity pins: the parser envelope is the guild ceiling (100); the planner
+// and PUT path refuse only past it, with a no-growth exception for rows
+// saved under an older budget. Publication withholds excess customs instead
+// of failing. The live custom budget derives from the publishable set via
+// `max_custom_commands` (squatted-but-unpublished names hold no slots), so
+// a new builtin never silently strands a catalog; the fixed 33-row catalog
+// below exercises the stranded-over-budget path.
+const STRANDED_CATALOG_ROWS: usize = 33;
+const STRANDED_CATALOG_PLUS_ONE: usize = 34;
+const EXPECTED_BUILTINS_WITHOUT_VOICE: usize = 47;
+const EXPECTED_BUILTINS_WITH_VOICE: usize = 70;
+const EXPECTED_GUILD_LIMIT: usize = 100;
+
+fn bulk_name(index: usize) -> String {
+    format!("zzbulk{index:02}")
+}
+
+fn bulk_stored(index: usize) -> StoredCommand {
+    let name = bulk_name(index);
+    StoredCommand {
+        guild_id: "2222".to_owned(),
+        name: name.clone(),
+        description: format!("Bulk {index}"),
+        template: format!("Bulk reply {index} {{username}}"),
+        text_trigger: Some(format!("!{name}")),
+        enabled: true,
+    }
+}
+
+fn bulk_custom_commands(count: usize) -> Vec<CustomCommand> {
+    (0..count)
+        .map(|index| CustomCommand {
+            name: bulk_name(index),
+            description: format!("Bulk {index}"),
+            enabled: true,
+        })
+        .collect()
+}
+
+fn bulk_import_body(count: usize) -> Value {
+    let commands: Vec<Value> = (0..count)
+        .map(|index| {
+            let name = bulk_name(index);
+            json!({
+                "name": name,
+                "description": format!("Bulk {index}"),
+                "template": format!("Bulk reply {index} {{username}}"),
+                "text_trigger": format!("!{name}"),
+            })
+        })
+        .collect();
+    json!({"version": 1, "commands": commands})
+}
+
+fn bulk_update_body(count: usize) -> Value {
+    let commands: Vec<Value> = (0..count)
+        .map(|index| {
+            let name = bulk_name(index);
+            json!({
+                "name": name,
+                "description": format!("Bulk updated {index}"),
+                "template": format!("Updated {index} {{username}} in {{server}}"),
+                "text_trigger": format!("!{name}"),
+            })
+        })
+        .collect();
+    json!({
+        "version": 1,
+        "overwrite": true,
+        "commands": commands,
+    })
+}
+
+fn all_enabled_gates(voice: bool, assistant: bool) -> RouterGates {
+    RouterGates {
+        configured_guild: Some(2222),
+        scorecard: true,
+        automations: true,
+        announcements: true,
+        moderation: true,
+        voice,
+        voice_assistant: assistant,
+        tickets: false,
+        self_roles: false,
+        onboarding_picker: false,
+        session_picker: false,
+    }
+}
+
+fn automation_voice_gates(voice: bool) -> RouterGates {
+    RouterGates {
+        configured_guild: Some(2222),
+        automations: true,
+        moderation: false,
+        voice,
+        voice_assistant: false,
+        scorecard: false,
+        announcements: false,
+        tickets: false,
+        self_roles: false,
+        onboarding_picker: false,
+        session_picker: false,
+    }
+}
+
+fn runtime_with_gates(
+    pool: PgPool,
+    executor: ActionExecutor,
+    gates: RouterGates,
+) -> CustomCommandRuntime {
+    let mut router = InteractionRouter::new(gates);
+    CustomCommandRuntime::register(&mut router);
+    CustomCommandRuntime::new(pool, Arc::new(router), executor, 1111)
+}
+
+fn prefix_with(id: u64, actor: u64, content: &str) -> Message {
+    serde_json::from_value(json!({
+        "id": id.to_string(), "guild_id": "2222", "channel_id": "4444", "type": 0,
+        "author": {"id": actor.to_string(), "username": "tester", "discriminator": "0000", "avatar": null},
+        "content": content, "timestamp": "2026-10-24T00:00:00.000000+00:00",
+        "edited_timestamp": null, "tts": false, "mention_everyone": false,
+        "mentions": [], "mention_roles": [], "attachments": [], "embeds": [], "pinned": false
+    }))
+    .expect("human prefix fixture")
+}
+
+#[test]
+fn custom_catalog_33_row_export_parses_and_diffs_without_growth() {
+    let reserved = reserved_command_names();
+    for index in 0..STRANDED_CATALOG_PLUS_ONE {
+        let name = bulk_name(index);
+        assert!(
+            !reserved.contains(&name),
+            "bulk catalog must not collide: {name}"
+        );
+        assert!(!builtin_command_names().contains(&name));
+    }
+    let rows: Vec<StoredCommand> = (0..STRANDED_CATALOG_ROWS).map(bulk_stored).collect();
+    let document = transfer::export_document(&rows);
+    assert_eq!(document.version, 1);
+    assert_eq!(document.commands.len(), 33);
+    let names: Vec<&str> = document
+        .commands
+        .iter()
+        .map(|command| command.name.as_str())
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "export is stable sorted");
+    let body = serde_json::to_value(&document).expect("export serializes");
+    let parsed = transfer::parse_import_document(&body, 33).expect("33-row catalog parses");
+    assert_eq!(parsed.entries.len(), 33);
+    assert_eq!(parsed.invalid_entries, 0);
+    assert!(!parsed.overwrite);
+    // The planner budget follows the live publishable set; fresh growth
+    // past it is refused even though the envelope allows the parse.
+    let budget = max_custom_commands(publishable_builtin_names().len());
+    assert_eq!(
+        transfer::diff_import(&[], &parsed, &reserved, false),
+        Err(CommandError::OverCapacity(budget)),
+        "33 fresh customs exceed the live budget"
+    );
+    // The parser envelope is the guild ceiling; the per-guild custom budget
+    // is enforced in planning, where stored rows are known.
+    assert_eq!(
+        transfer::max_import_entries(),
+        100,
+        "parser envelope is the guild ceiling"
+    );
+    assert!(
+        transfer::max_import_entries() > budget,
+        "envelope stays above the planner budget"
+    );
+    let overflow_body = bulk_import_body(101);
+    let parser_overflow =
+        transfer::parse_import_document(&overflow_body, transfer::max_import_entries());
+    assert!(
+        matches!(
+            parser_overflow,
+            Err(transfer::ImportParseError::TooManyEntries {
+                count: 101,
+                max: 100
+            })
+        ),
+        "parser refuses past the ceiling: {parser_overflow:?}"
+    );
+    let parsed_loose =
+        transfer::parse_import_document(&overflow_body, 101).expect("loose parse reaches planner");
+    assert_eq!(
+        transfer::diff_import(&[], &parsed_loose, &reserved, true),
+        Err(CommandError::OverCapacity(budget)),
+        "101-row union overflows the planner budget"
+    );
+    // ...while a full-ceiling catalog still re-imports unchanged.
+    let stranded: Vec<StoredCommand> = (0..100).map(bulk_stored).collect();
+    let stranded_body =
+        serde_json::to_value(transfer::export_document(&stranded)).expect("export serializes");
+    let stranded_parsed =
+        transfer::parse_import_document(&stranded_body, transfer::max_import_entries())
+            .expect("full-ceiling catalog parses");
+    let stranded_diff =
+        transfer::diff_import(&stranded, &stranded_parsed, &reserved, false).expect("no growth");
+    assert_eq!(stranded_diff.unchanged.len(), 100);
+    let updates = transfer::parse_import_document(&bulk_update_body(STRANDED_CATALOG_ROWS), 33)
+        .expect("no-growth bulk updates parse");
+    let planned = transfer::diff_import(&rows, &updates, &reserved, true).expect("no-growth plans");
+    assert_eq!(planned.to_update.len(), 33);
+    assert!(planned.to_create.is_empty());
+    assert!(planned.rejected.is_empty());
+    let same = transfer::parse_import_document(&body, 33).expect("same content parses");
+    let converged =
+        transfer::diff_import(&rows, &same, &reserved, false).expect("same content converges");
+    assert_eq!(converged.unchanged.len(), 33);
+    assert_eq!(converged.accepted_entry_indices.len(), 33);
+}
+
+#[test]
+fn all_enabled_publication_withholds_custom_overflow_with_voice_off_and_on() {
+    for assistant in [false, true] {
+        let off = InteractionRouter::new(all_enabled_gates(false, assistant));
+        let off_builtins = off.publish_set(&[]).expect("off assembles");
+        assert_eq!(
+            off_builtins.len(),
+            EXPECTED_BUILTINS_WITHOUT_VOICE,
+            "assistant={assistant}"
+        );
+        let off_full = off
+            .publish_set(&bulk_custom_commands(33))
+            .expect("off 33 fits");
+        assert_eq!(off_full.len(), 80, "47+33=80 assistant={assistant}");
+        let on = InteractionRouter::new(all_enabled_gates(true, assistant));
+        let on_builtins = on.publish_set(&[]).expect("on assembles");
+        assert_eq!(
+            on_builtins.len(),
+            EXPECTED_BUILTINS_WITH_VOICE,
+            "assistant={assistant}"
+        );
+        assert!(
+            !on_builtins
+                .iter()
+                .any(|definition| definition.name == "templateassistant"),
+            "assistant stays unpublished assistant={assistant}"
+        );
+        // 70 builtins + 33 customs no longer fit: publication withholds the
+        // last custom in store order instead of failing the whole sync.
+        let on_full = on
+            .publish_set(&bulk_custom_commands(33))
+            .expect("on 33 still publishes");
+        assert_eq!(on_full.len(), EXPECTED_GUILD_LIMIT, "assistant={assistant}");
+        let on_names: Vec<_> = on_full.iter().map(|def| def.name.as_str()).collect();
+        assert!(
+            on_names.contains(&"zzbulk00"),
+            "first custom still publishes assistant={assistant}"
+        );
+        assert!(
+            !on_names.contains(&"zzbulk32"),
+            "70+33=103 withholds the last custom assistant={assistant}"
+        );
+        let overflow = on
+            .publish_set(&bulk_custom_commands(34))
+            .expect("custom overflow still publishes");
+        assert_eq!(
+            overflow.len(),
+            EXPECTED_GUILD_LIMIT,
+            "assistant={assistant}"
+        );
+        let overflow_names: Vec<_> = overflow.iter().map(|def| def.name.as_str()).collect();
+        assert!(
+            !overflow_names.contains(&"zzbulk32") && !overflow_names.contains(&"zzbulk33"),
+            "70+34=104 withholds two customs assistant={assistant}"
+        );
+    }
+}
+
+#[test]
+fn myroom_router_precedence_off_runs_custom_and_on_yields_to_voice_sink() {
+    for custom_row in [None, Some(true), Some(false)] {
+        let off = InteractionRouter::new(automation_voice_gates(false));
+        assert!(
+            !off.voice_owns_command("myroom"),
+            "off claims nothing for custom_row={custom_row:?}"
+        );
+        let context = SlashContext {
+            name: "myroom",
+            guild_id: Some(2222),
+            actor_permissions: Some(0),
+            custom_row,
+        };
+        match custom_row {
+            Some(true) => assert_eq!(
+                off.route_slash(&context),
+                SlashOutcome::Handled {
+                    handler: HandlerId::AutomationCustom
+                },
+                "off runs the grandfathered row"
+            ),
+            _ => assert_eq!(
+                off.route_slash(&context),
+                SlashOutcome::Unknown,
+                "off without an enabled row is unchanged"
+            ),
+        }
+        let on = InteractionRouter::new(automation_voice_gates(true));
+        assert!(on.voice_owns_command("myroom"));
+        for permissions in [None, Some(0), Some(u64::MAX)] {
+            let context = SlashContext {
+                name: "myroom",
+                guild_id: Some(2222),
+                actor_permissions: permissions,
+                custom_row,
+            };
+            assert_eq!(
+                on.route_slash(&context),
+                SlashOutcome::Ignore,
+                "on yields even with custom_row={custom_row:?} permissions={permissions:?}"
+            );
+        }
+        let on_publish = on
+            .publish_set(&[CustomCommand {
+                name: "myroom".to_owned(),
+                description: "Legacy rooms".to_owned(),
+                enabled: true,
+            }])
+            .expect("on assembles");
+        let myroom = on_publish
+            .iter()
+            .find(|definition| definition.name == "myroom")
+            .expect("voice myroom publishes");
+        assert_ne!(
+            myroom.description, "Legacy rooms",
+            "on withholds the custom definition"
+        );
+        let off_publish = off
+            .publish_set(&[CustomCommand {
+                name: "myroom".to_owned(),
+                description: "Legacy rooms".to_owned(),
+                enabled: true,
+            }])
+            .expect("off assembles");
+        let custom = off_publish
+            .iter()
+            .find(|definition| definition.name == "myroom")
+            .expect("off publishes the grandfathered row");
+        assert_eq!(custom.description, "Legacy rooms");
+    }
+}
+
+#[tokio::test]
+async fn custom_catalog_service_import_budget_succeeds_and_over_budget_overflows_with_bulk_updates()
+{
+    // The import budget follows the live publishable set, so the row counts
+    // derive from it instead of repeating a stale capacity literal.
+    let budget = max_custom_commands(publishable_builtin_names().len());
+    let url = std::env::var("TWO_TEST_DATABASE_URL")
+        .expect("explicit disposable test bootstrap required");
+    let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("isolated migrated fixture");
+    let parsed =
+        transfer::parse_import_document(&bulk_import_body(budget), budget).expect("budget parses");
+    let outcome = service::import(
+        db.pool(),
+        "2222",
+        "3333",
+        &parsed,
+        false,
+        "bulk-budget-import",
+        AT,
+    )
+    .await;
+    let stored = store::list_commands(db.pool(), "2222")
+        .await
+        .expect("list imported rows");
+    let updated =
+        transfer::parse_import_document(&bulk_update_body(budget), budget).expect("updates parse");
+    let applied = service::import(
+        db.pool(),
+        "2222",
+        "3333",
+        &updated,
+        true,
+        "bulk-budget-update",
+        AT,
+    )
+    .await;
+    let after_update = store::list_commands(db.pool(), "2222")
+        .await
+        .expect("list after updates");
+    let before_overflow = definitions(db.pool()).await;
+    let loose = transfer::parse_import_document(&bulk_import_body(budget + 1), 100)
+        .expect("loose over-budget parses");
+    let overflow = service::import(
+        db.pool(),
+        "2222",
+        "3333",
+        &loose,
+        true,
+        "bulk-over-budget-overflow",
+        AT,
+    )
+    .await;
+    let after_overflow = definitions(db.pool()).await;
+    db.close()
+        .await
+        .expect("drop owned test database before the expected RED assertion");
+    let outcome = outcome.expect("budget-sized import commits");
+    let applied = applied.expect("no-growth bulk updates commit");
+    assert_eq!(outcome.imported, budget);
+    assert_eq!(outcome.skipped, 0);
+    assert!(outcome.conflicts.is_empty());
+    assert_eq!(stored.len(), budget);
+    assert_eq!(applied.imported, budget);
+    assert_eq!(applied.skipped, 0);
+    assert_eq!(after_update.len(), budget);
+    assert!(
+        after_update
+            .iter()
+            .all(|row| row.template.starts_with("Updated ")),
+        "bulk updates rewrite templates without growth"
+    );
+    assert!(
+        matches!(overflow, Err(service::ImportServiceError::OverCapacity(max)) if max == budget),
+        "one row past budget overflows: {overflow:?}"
+    );
+    assert_eq!(
+        before_overflow, after_overflow,
+        "overflow writes nothing, including timestamps"
+    );
+    let live: Vec<CustomCommand> = after_update
+        .iter()
+        .map(StoredCommand::registry_entry)
+        .collect();
+    assert_eq!(live.len(), budget);
+    for (voice, expected) in [
+        (false, EXPECTED_BUILTINS_WITHOUT_VOICE + budget),
+        (true, EXPECTED_BUILTINS_WITH_VOICE + budget),
+    ] {
+        let router = InteractionRouter::new(all_enabled_gates(voice, false));
+        let set = router.publish_set(&live).expect("bulk publishes");
+        assert_eq!(set.len(), expected, "voice={voice}");
+    }
+}
+
+#[tokio::test]
+async fn grandfathered_myroom_publishes_dispatches_edits_and_toggles_with_voice_off() {
+    let url = std::env::var("TWO_TEST_DATABASE_URL")
+        .expect("explicit disposable test bootstrap required");
+    let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("isolated migrated fixture");
+    seed(
+        db.pool(),
+        "2222",
+        "myroom",
+        "!myroom",
+        "Legacy {username} in {server}",
+        true,
+    )
+    .await;
+    seed(
+        db.pool(),
+        "2222",
+        "freshsafe",
+        "!freshsafe",
+        "Fresh {username}",
+        true,
+    )
+    .await;
+    let mock =
+        MockRest::with_responder(|request| reply_to(request, &WireFailures::default())).await;
+    let executor = ActionExecutor::with_proxy("myroom-off-fixture".to_owned(), Some(mock.origin()))
+        .expect("loopback-only executor");
+    let runtime = runtime_with_gates(
+        db.pool().clone(),
+        executor.clone(),
+        automation_voice_gates(false),
+    );
+    let rows = store::list_commands(db.pool(), "2222")
+        .await
+        .expect("stored grandfathered rows");
+    let slash = observe(&runtime, &mock, &interaction(2001, "myroom", 0, vec![])).await;
+    let prefix = runtime
+        .handle_message(
+            &prefix_with(2002, 3333, "!myroom ordinary arguments"),
+            AutomationMessageAcceptance::Unmatched,
+            true,
+            Some("Test guild"),
+        )
+        .await;
+    let fresh_slash = observe(&runtime, &mock, &interaction(2003, "freshsafe", 0, vec![])).await;
+    // The same-name maintenance exception must not make the newly reserved
+    // name available for a fresh write, even while voice is off.
+    let fresh_collision = service::put(
+        db.pool(),
+        true,
+        "2233",
+        "3333",
+        &PutCommandInput {
+            name: "myroom".to_owned(),
+            description: "New collision".to_owned(),
+            template: "Not grandfathered".to_owned(),
+            text_trigger: None,
+        },
+        "myroom-fresh-off",
+        AT,
+    )
+    .await;
+    let fresh_collision_rows = store::list_commands(db.pool(), "2233").await;
+    let updated = service::put(
+        db.pool(),
+        true,
+        "2222",
+        "3333",
+        &PutCommandInput {
+            name: "myroom".to_owned(),
+            description: "Updated rooms".to_owned(),
+            template: "Updated {username}".to_owned(),
+            text_trigger: Some("!myroom".to_owned()),
+        },
+        "myroom-edit-off",
+        AT,
+    )
+    .await;
+    let fresh_edit = service::put(
+        db.pool(),
+        true,
+        "2222",
+        "3333",
+        &PutCommandInput {
+            name: "freshsafe".to_owned(),
+            description: "Fresh updated".to_owned(),
+            template: "Fresh updated {username}".to_owned(),
+            text_trigger: Some("!freshsafe".to_owned()),
+        },
+        "freshsafe-edit-off",
+        AT,
+    )
+    .await;
+    let disabled = observe(&runtime, &mock, &toggle(2004, false, "myroom")).await;
+    let enabled = observe(&runtime, &mock, &toggle(2005, true, "myroom")).await;
+    let fresh_disabled = observe(&runtime, &mock, &toggle(2006, false, "freshsafe")).await;
+    let fresh_enabled = observe(&runtime, &mock, &toggle(2007, true, "freshsafe")).await;
+    drop(runtime);
+    drop(executor);
+    mock.shutdown().await;
+    db.close().await.expect("drop only the owned test database");
+    // Assert captured voice-off observations only after explicit teardown.
+    assert_eq!(rows.len(), 2);
+    let customs: Vec<CustomCommand> = rows.iter().map(StoredCommand::registry_entry).collect();
+    let published = InteractionRouter::new(automation_voice_gates(false))
+        .publish_set(&customs)
+        .expect("off publishes");
+    let myroom = published
+        .iter()
+        .find(|definition| definition.name == "myroom")
+        .expect("off publishes the grandfathered row");
+    assert_eq!(myroom.description, "Saved description");
+    assert!(
+        published
+            .iter()
+            .any(|definition| definition.name == "freshsafe"),
+        "fresh names publish off"
+    );
+    assert!(
+        matches!(slash.result, Ok(true)),
+        "off runs myroom: {:?}",
+        slash.result
+    );
+    let completion = slash
+        .requests
+        .iter()
+        .find(|request| request.method == "PATCH")
+        .expect("myroom slash completes");
+    assert_eq!(body(completion)["content"], "Legacy tester in Test guild");
+    no_mentions(&body(completion));
+    assert!(matches!(prefix, Ok(TextCommandOutcome::Delivered)));
+    assert!(matches!(fresh_slash.result, Ok(true)));
+    assert!(
+        matches!(
+            fresh_collision,
+            Err(service::ServiceError::Validation(
+                CommandError::ReservedName(_)
+            ))
+        ),
+        "fresh myroom stays reserved: {fresh_collision:?}"
+    );
+    assert!(fresh_collision_rows
+        .expect("fresh-name collision rows")
+        .is_empty());
+    assert!(
+        updated.is_ok(),
+        "off allows same-name edits to the grandfathered row: {updated:?}"
+    );
+    assert!(fresh_edit.is_ok(), "fresh names edit off: {fresh_edit:?}");
+    changed_named_reply(&disabled, false, "myroom");
+    changed_named_reply(&enabled, true, "myroom");
+    changed_named_reply(&fresh_disabled, false, "freshsafe");
+    changed_named_reply(&fresh_enabled, true, "freshsafe");
+}
+
+#[tokio::test]
+async fn voice_on_retains_myroom_precedence_and_collision_safety() {
+    let url = std::env::var("TWO_TEST_DATABASE_URL")
+        .expect("explicit disposable test bootstrap required");
+    let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("isolated migrated fixture");
+    seed(
+        db.pool(),
+        "2222",
+        "myroom",
+        "!myroom",
+        "Legacy {username} in {server}",
+        true,
+    )
+    .await;
+    seed(
+        db.pool(),
+        "2222",
+        "freshsafe",
+        "!freshsafe",
+        "Fresh {username}",
+        true,
+    )
+    .await;
+    let mock =
+        MockRest::with_responder(|request| reply_to(request, &WireFailures::default())).await;
+    let executor = ActionExecutor::with_proxy("myroom-on-fixture".to_owned(), Some(mock.origin()))
+        .expect("loopback-only executor");
+    let runtime = runtime_with_gates(
+        db.pool().clone(),
+        executor.clone(),
+        automation_voice_gates(true),
+    );
+    let rows = store::list_commands(db.pool(), "2222")
+        .await
+        .expect("stored grandfathered rows");
+    let customs: Vec<CustomCommand> = rows.iter().map(StoredCommand::registry_entry).collect();
+    // Observe everything first; assert only after awaited teardown so a red
+    // path never leaves the owned database behind.
+    let published = InteractionRouter::new(automation_voice_gates(true)).publish_set(&customs);
+    let yielded = observe(&runtime, &mock, &interaction(2101, "myroom", 0, vec![])).await;
+    let fresh = observe(&runtime, &mock, &interaction(2102, "freshsafe", 0, vec![])).await;
+    let fresh_prefix = runtime
+        .handle_message(
+            &prefix_with(2103, 3333, "!freshsafe hello"),
+            AutomationMessageAcceptance::Unmatched,
+            true,
+            Some("Test guild"),
+        )
+        .await;
+    let myroom_prefix = runtime
+        .handle_message(
+            &prefix_with(2104, 3334, "!myroom hello"),
+            AutomationMessageAcceptance::Unmatched,
+            true,
+            Some("Test guild"),
+        )
+        .await;
+    let fresh_voice_name = service::put(
+        db.pool(),
+        true,
+        "2222",
+        "3333",
+        &PutCommandInput {
+            name: "setup".to_owned(),
+            description: "Fresh collision".to_owned(),
+            template: "No room".to_owned(),
+            text_trigger: None,
+        },
+        "fresh-setup-on",
+        AT,
+    )
+    .await;
+    let disabled = observe(&runtime, &mock, &toggle(2105, false, "myroom")).await;
+    drop(runtime);
+    drop(executor);
+    mock.shutdown().await;
+    db.close().await.expect("drop only the owned test database");
+
+    let published = published.expect("on publishes");
+    let myroom = published
+        .iter()
+        .find(|definition| definition.name == "myroom")
+        .expect("voice myroom publishes");
+    assert_ne!(
+        myroom.description, "Saved description",
+        "on withholds the custom definition"
+    );
+    assert!(
+        published
+            .iter()
+            .any(|definition| definition.name == "freshsafe"),
+        "fresh names still publish on"
+    );
+    assert!(
+        matches!(yielded.result, Ok(false)) && yielded.requests.is_empty(),
+        "on yields myroom to the voice sink: {:?}",
+        yielded.result
+    );
+    assert!(
+        matches!(fresh.result, Ok(true)),
+        "fresh still runs on: {:?}",
+        fresh.result
+    );
+    assert!(matches!(fresh_prefix, Ok(TextCommandOutcome::Delivered)));
+    assert!(
+        matches!(myroom_prefix, Ok(TextCommandOutcome::Delivered)),
+        "voice has no prefix counterpart, so !myroom still delivers on"
+    );
+    assert!(
+        matches!(
+            fresh_voice_name,
+            Err(service::ServiceError::Validation(
+                CommandError::ReservedName(_)
+            ))
+        ),
+        "fresh voice names stay refused on: {fresh_voice_name:?}"
+    );
+    changed_named_reply(&disabled, false, "myroom");
 }

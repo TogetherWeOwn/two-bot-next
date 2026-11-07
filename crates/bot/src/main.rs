@@ -147,6 +147,7 @@ mod self_role_runtime;
 mod shutdown;
 #[cfg(test)]
 mod smoke_error_contract_tests;
+mod staging_help_smoke_reconcile;
 #[cfg(test)]
 mod ticket_component_admission_acceptance_tests;
 mod ticket_runtime;
@@ -157,6 +158,7 @@ mod tracing_capture;
 // file is not loaded as two modules (clippy::duplicate_mod).
 #[cfg(test)]
 mod tuning_test_support;
+mod voice_snapshot;
 mod website_jobs;
 #[cfg(test)]
 mod website_roster_cap_acceptance_tests;
@@ -267,9 +269,18 @@ async fn run(cli_args: &[String]) {
             std::process::exit(1);
         }
         tracing::warn!(msg = "config_invalid", reason = %err, "config invalid; continuing with safe defaults");
+        // `Config::from_env` only fails on `GUILD_ID`; keep the token and
+        // database values from the environment so an invalid guild does not
+        // misreport as `receiver_token_missing`. The guild stays `None` and
+        // surfaces through the store refusal, whose catalog row names both
+        // `DATABASE_URL` and `GUILD_ID`.
         Config {
-            discord_token: None,
-            database_url: None,
+            discord_token: std::env::var("DISCORD_TOKEN")
+                .ok()
+                .map(two_bot_core::Secret::new),
+            database_url: std::env::var("DATABASE_URL")
+                .ok()
+                .map(two_bot_core::Secret::new),
             // Gateway config errors must not move the listener away from
             // the Worker probes and Docker healthcheck's configured address.
             listen_addr: std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_owned()),
@@ -332,6 +343,22 @@ async fn run(cli_args: &[String]) {
         }
     }
 
+    // Staging-only boot reconcile for the /help embed smoke channel: uses
+    // the token the process already holds, runs only when the staging
+    // deployment marker and staging guild both match, and never blocks or
+    // fails boot. Spawned detached so a slow Discord never delays gateway
+    // startup or database init. Needs the token alone, never the database.
+    // The handle is retained so a startup-failure exit below can drain an
+    // in-flight pass within a bounded budget instead of abandoning it; the
+    // happy path never waits on it, and every staging boot retries the pass.
+    let smoke_reconcile = staging_help_smoke_reconcile::maybe_reconcile_on_boot(
+        config
+            .discord_token
+            .as_ref()
+            .map(|secret| secret.expose().clone()),
+        config.guild_id,
+    );
+
     let store = match gateway_prerequisites(&config).ok().map(|(_, url, _)| url) {
         Some(url) => match tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -346,6 +373,11 @@ async fn run(cli_args: &[String]) {
                 Some(store)
             }
             _ => {
+                // Drain the in-flight smoke reconcile within a bounded
+                // budget so this failed boot never abandons a channel
+                // create or overwrite mid-flight; the supervisor restart
+                // retries the pass on the next healthy boot.
+                staging_help_smoke_reconcile::drain_reconcile_on_failure(smoke_reconcile).await;
                 tracing::error!(
                     startup_phase = "database_init",
                     error_class = "database_connect_failed",
@@ -406,6 +438,14 @@ async fn run(cli_args: &[String]) {
         }
     }
 
+    // Shared gateway voice-state cache: the receiver binds against it below
+    // and the gateway pipeline writes through it, so `voice.snapshot` reads
+    // live occupancy. Discord exposes no REST voice-state list; a receiver
+    // split from these writes answers `discord_unavailable`, never invented
+    // data. The receiver also binds the supervisor's gateway state below, so
+    // a warm cache while the gateway is disconnected (not `Connected`)
+    // refuses instead of serving stale occupancy with a fresh timestamp.
+    let voice_cache = voice_snapshot::new_shared_cache();
     // Capture the authoritative pool before the gateway's async move owns it.
     // Bind privately before starting tasks; enabled failures never fall back.
     let receiver = match receiver_config {
@@ -418,15 +458,21 @@ async fn run(cli_args: &[String]) {
                 .pool()
                 .clone();
             Some(
-                internal_action_http::bind(receiver_config, pool, token)
-                    .await
-                    .unwrap_or_else(|_| {
-                        tracing::error!(
-                            error_class = "receiver_bind_failed",
-                            "internal-action startup refused"
-                        );
-                        std::process::exit(1);
-                    }),
+                internal_action_http::bind(
+                    receiver_config,
+                    pool,
+                    token,
+                    Arc::clone(&voice_cache),
+                    Arc::clone(&gateway),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::error!(
+                        error_class = "receiver_bind_failed",
+                        "internal-action startup refused"
+                    );
+                    std::process::exit(1);
+                }),
             )
         }
         None => None,
@@ -449,18 +495,20 @@ async fn run(cli_args: &[String]) {
                     tracing::error!(error_class, "eventsub startup refused");
                     std::process::exit(1);
                 };
-                let Some(db) = store.as_ref() else {
-                    refuse("receiver_prerequisites_invalid")
-                };
-                let pool = db.pool().clone();
+                // A missing token also prevents pool construction; report
+                // that cause before checking the store it depends on.
                 let Some(token) = config
                     .discord_token
                     .as_ref()
                     .map(|secret| secret.expose().as_str())
                     .filter(|token| !token.is_empty())
                 else {
-                    refuse("receiver_prerequisites_invalid")
+                    refuse("receiver_token_missing")
                 };
+                let Some(db) = store.as_ref() else {
+                    refuse("receiver_store_missing")
+                };
+                let pool = db.pool().clone();
                 let proxy = std::env::var("DISCORD_API_BASE")
                     .ok()
                     .filter(|value| !value.is_empty());
@@ -517,9 +565,17 @@ async fn run(cli_args: &[String]) {
     // V1 voice rooms: per-guild lifecycle actors fed by the gateway sink.
     // Inert unless TWO_VOICE=1 with token + database present; any failure
     // degrades to voice-off with a warn, never a boot failure.
-    let voice = build_voice_runtime(&config, VoiceGates::from_env().enabled).await;
-
     let (shutdown, stopping) = tokio::sync::watch::channel(false);
+    // The game-activity flush runs its final pass on its own latch, sent only
+    // once the gateway task (its only producer) has joined, never on the
+    // service watch: frames the draining writer still applies, and the spans
+    // its voice guard closes on exit, must land before that pass.
+    let (activity_drained, activity_drain) = tokio::sync::watch::channel(false);
+    let (voice, flush_task) =
+        match build_voice_runtime(&config, VoiceGates::from_env().enabled, activity_drain).await {
+            Some((sink, flush)) => (Some(sink), Some(flush)),
+            None => (None, None),
+        };
 
     // M3.3 reconcile: once at startup plus a bounded interval while
     // `TWO_EVENTSUB` is exactly `1`. The loop shares the bound receiver's
@@ -558,6 +614,7 @@ async fn run(cli_args: &[String]) {
         let failure_slot = state.failure.clone();
         let state = Arc::clone(&gateway);
         let slot = Arc::clone(&automod_slot);
+        let voice_cache = Arc::clone(&voice_cache);
         let self_roles = self_roles.clone();
         let member = member.clone();
         let linger_stop = stopping.clone();
@@ -698,15 +755,21 @@ async fn run(cli_args: &[String]) {
                     };
                     let leveling = runtime.as_ref().map(|runtime| runtime.leveling());
                     let pipeline = Arc::new(
-                        build_persistent_pipeline(&store, guild_id, token.clone(), leveling)
-                            .await
-                            .map_err(|error| {
-                                step_failure(
-                                    FailureClass::MilestonesLoadFailed,
-                                    "milestones_load",
-                                    error,
-                                )
-                            })?,
+                        build_persistent_pipeline(
+                            &store,
+                            guild_id,
+                            token.clone(),
+                            leveling,
+                            voice_cache,
+                        )
+                        .await
+                        .map_err(|error| {
+                            step_failure(
+                                FailureClass::MilestonesLoadFailed,
+                                "milestones_load",
+                                error,
+                            )
+                        })?,
                     );
                     // Community voice + message capture: arm the Postgres
                     // facts sink only when the scorecard job is enabled, so a
@@ -947,6 +1010,13 @@ async fn run(cli_args: &[String]) {
         Some(task) => supervise_gateway(task, http, gateway, shutdown).await,
         None => http.await,
     };
+    // The gateway task has joined, so nothing feeds the game-activity
+    // collector anymore: release its final flush now so it runs concurrently
+    // with the joins below. After a drain-deadline cut, or a fatal queue
+    // worker return that drops the writer unjoined (`run_shard`), the writer
+    // may still be running; the pass is then best effort within the remaining
+    // budget, and the fatal path restarts the container anyway.
+    activity_drained.send_replace(true);
     // Both branches latch the shutdown watch before returning (the gateway
     // supervisor sends it before its drain; the HTTP/job serve path sends
     // it before joining its supervisor), so the reconcile task has been
@@ -974,6 +1044,8 @@ async fn run(cli_args: &[String]) {
         .drain(..)
         .collect::<Vec<_>>();
     join_worker_supervisors(supervisors, &latch_mark).await;
+    // Same remaining deadline for the game-activity flush released above.
+    join_worker_supervisors(flush_task.into_iter().collect(), &latch_mark).await;
     if result.is_err() {
         tracing::error!(
             msg = "shutdown_failed",

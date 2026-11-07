@@ -21,7 +21,10 @@ It needs no `db` feature, Discord types, clock, or I/O.
   stops creation for the guild, not for a member.
 - `VOICE_COMMANDS` lists every restrictable slash command (no leading slash),
   taken from the spec. `validate_access_controls` refuses unknown restriction
-  keys (exact lowercase match) and zero role IDs.
+  keys (exact lowercase match) and zero role IDs. `/myroom` is deliberately
+  absent: it carries no per-command role policy, so `/access restrict` and
+  `settings.command_roles` both refuse it without a write; the guild-wide
+  `required_role` gate still applies to it through `may_use_command`.
 
 A restriction entry with an **empty role list denies every non-admin**
 (fail closed). Delete the entry to lift the restriction; clearing

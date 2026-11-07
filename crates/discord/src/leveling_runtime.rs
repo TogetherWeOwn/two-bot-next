@@ -1124,6 +1124,42 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
         self.pipeline.handlers()
     }
 
+    /// Build over a caller-owned gateway cache. The live gateway passes the
+    /// handle it also hands to the internal-actions receiver, so
+    /// `voice.snapshot` reads the same cache the shard runner feeds.
+    /// Replay/test callers keep `with_snapshots` and are unaffected.
+    pub fn with_shared_cache(
+        store: S,
+        runtime: Option<LevelingRuntime>,
+        invite_source: I,
+        snapshots: P,
+        cache: Arc<twilight_cache_inmemory::InMemoryCache>,
+    ) -> Self {
+        let pending = DeferredLeveling::default();
+        let facts = DeferredCommunityFacts::default();
+        let classifier = SettingsChannelClassifier::new(ClassifierConfig::from_env());
+        let pipeline = Pipeline::with_shared_cache(
+            store,
+            Some(pending.clone()),
+            Some(facts.clone()),
+            invite_source,
+            classifier.clone(),
+            snapshots,
+            cache,
+        );
+        // Fail closed like `new`: the gateway runtime declares the real
+        // `MESSAGE_CONTENT` subscription before its shard runs.
+        pipeline.set_message_content_delivered(false);
+        Self {
+            pipeline,
+            classifier,
+            pending,
+            facts,
+            dispatch: tokio::sync::Mutex::new(()),
+            runtime,
+        }
+    }
+
     /// Declare whether the shard feeding this pipeline subscribed
     /// `MESSAGE_CONTENT`; message lengths are measured only when it did.
     pub fn set_message_content_delivered(&self, delivered: bool) {
