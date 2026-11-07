@@ -10,8 +10,9 @@ point and its deletion budget are unchanged) and the exclusion window grows:
 * deploy-staging holds one fixed repository-wide group at workflow level, so
   baseline, deploy, takeover, readiness, rollback, every in-run consumer,
   certify-promotion and the final staging-use release share one window;
-* standalone consumers (voice, help, user-flow staging probe) and the staging
-  drills hold that same group, so no split lock survives a rename;
+* standalone consumers (voice, help, user-flow staging probe), the staging
+  drills and the manual MCP prove-out hold that same group for their whole
+  start/proof/stop window, so no split lock survives a rename;
 * reusable voice/help invoked inside that window take a provably disjoint
   per-run nested group, never re-hold the caller's group (no deadlock), and
   bind the caller's exact SHA/deployment/expiry before live consumption
@@ -47,6 +48,7 @@ HELP = "help-embed-synthetic.yml"
 USER_FLOW = "synthetic-user-flow.yml"
 CONTAINER = "staging-container-drill.yml"
 ROLLBACK = "staging-rollback-drill.yml"
+MCP = "staging-mcp-proveout.yml"
 INVOCATIONS = ("schedule", "workflow_dispatch", "workflow_call")
 EXPRESSION = "${{"
 
@@ -76,7 +78,8 @@ STANDALONE_HOLDERS = {(VOICE, "synthetic"): False,
                       (HELP, "help-embed-smoke"): False,
                       (USER_FLOW, "staging"): True,
                       (CONTAINER, "container-drill"): False,
-                      (ROLLBACK, "drill"): True}
+                      (ROLLBACK, "drill"): True,
+                      (MCP, "proveout"): False}
 # Jobs that must hold nothing that can wait on the staging lifecycle.
 FREE_JOBS = {(USER_FLOW, "prod-passive"): "production passive probe",
              (ROLLBACK, "proof"): "rollback-proof orchestrator"}
@@ -89,7 +92,6 @@ EXEMPT = {
     ("deploy-production.yml", "production"): "production deploy; staging origin is evidence input only",
     ("gradual-promote-proof.yml", "proof"): "passive: target lock refuses before any Cloudflare call",
     ("slow-burn-tracker.yml", "tracker"): "read-only /ops/metrics scrape",
-    ("staging-mcp-proveout.yml", "proveout"): "read-only MCP prove-out",
     ("staging-ownership-status.yml", "status"): "read-only ownership GET; never starts a container",
     ("staging-events-read.yml", "read"): "database read only",
     ("staging-fixture-census.yml", "fixture-census"): "database read only",
@@ -538,6 +540,7 @@ def target_fixture(group=FIXTURE_GROUP):
     wfs[USER_FLOW]["jobs"]["staging"]["concurrency"] = dict(lock)
     wfs[CONTAINER]["concurrency"] = dict(lock)
     wfs[ROLLBACK]["jobs"]["drill"]["concurrency"] = dict(lock)
+    wfs[MCP]["concurrency"] = dict(lock)
     return wfs
 
 
@@ -613,12 +616,13 @@ class LockOracleControls(unittest.TestCase):
 
     def test_cancelling_or_implicit_cancel_policy_is_rejected(self):
         for value in ("true", "${{ github.event_name == 'push' }}", None):
-            for target in ("deploy", "voice", "help", "user-flow"):
+            for target in ("deploy", "voice", "help", "user-flow", "mcp"):
                 wfs = target_fixture()
                 lock = {"deploy": wfs[DEPLOY]["concurrency"],
                         "voice": wfs[VOICE]["concurrency"],
                         "help": wfs[HELP]["concurrency"],
-                        "user-flow": wfs[USER_FLOW]["jobs"]["staging"]["concurrency"]}[target]
+                        "user-flow": wfs[USER_FLOW]["jobs"]["staging"]["concurrency"],
+                        "mcp": wfs[MCP]["concurrency"]}[target]
                 if value is None:
                     lock.pop("cancel-in-progress")
                 else:
@@ -834,6 +838,47 @@ class LockOracleControls(unittest.TestCase):
                                                           "cancel-in-progress": "false"}
         self.assert_rejected(wfs, "exactly once (held 2 times)")
 
+    def test_mcp_proveout_holds_the_full_window_group(self):
+        # Formerly exempt as read-only; it now starts and stops staging, so it
+        # is a full-window holder, checked by this oracle independently of the
+        # builder's exact-shape pin.
+        self.assertNotIn((MCP, "proveout"), EXEMPT)
+        wfs = target_fixture()
+        wfs[MCP]["jobs"]["proveout"]["concurrency"] = wfs[MCP].pop("concurrency")
+        self.assertEqual(lifecycle_errors(wfs), [])
+        label = f"{MCP} proveout:"
+        wrong = ({"group": "staging-mcp-proveout", "cancel-in-progress": "false"},
+                 {"group": f"{FIXTURE_GROUP}-${{{{ github.event_name }}}}",
+                  "cancel-in-progress": "false"})
+        for lock in (None, *wrong):
+            wfs = target_fixture()
+            if lock is None:
+                del wfs[MCP]["concurrency"]
+            else:
+                wfs[MCP]["concurrency"] = lock
+            with self.subTest(lock=lock):
+                self.assert_rejected(wfs, f"{label} must hold the lifecycle group exactly once")
+        for change, claim in (({"cancel-in-progress": "true"}, "preserve the running job"),
+                              ({"cancel-in-progress": None}, "preserve the running job"),
+                              ({"group": "${{ vars.LIFECYCLE_GROUP }}"}, "fixed canonical group"),
+                              ({"group": "${{ github.run_id }}"}, "fixed canonical group")):
+            wfs = target_fixture()
+            lock = wfs[MCP]["concurrency"]
+            lock.update(change)
+            if lock["cancel-in-progress"] is None:
+                del lock["cancel-in-progress"]
+            with self.subTest(change=change):
+                self.assert_rejected(wfs, claim)
+        wfs = target_fixture()
+        wfs[MCP]["concurrency"] = FIXTURE_GROUP
+        self.assert_rejected(wfs, f"{label} lifecycle lock must be a mapping")
+        wfs = target_fixture()
+        wfs[MCP]["jobs"]["proveout"]["concurrency"] = dict(wfs[MCP]["concurrency"])
+        self.assert_rejected(wfs, f"{label} must hold the lifecycle group exactly once (held 2 times)")
+        wfs = target_fixture()
+        del wfs[MCP]["jobs"]["proveout"]
+        self.assert_rejected(wfs, f"{label} standalone consumer missing")
+
     def test_user_flow_hold_must_not_delay_production_probe(self):
         wfs = target_fixture()
         wfs[USER_FLOW]["concurrency"] = wfs[USER_FLOW]["jobs"]["staging"].pop("concurrency")
@@ -858,7 +903,7 @@ class LockOracleControls(unittest.TestCase):
 
     def test_split_legacy_lock_is_rejected(self):
         for legacy in LEGACY_GROUPS:
-            for file, node in ((CONTAINER, None), (ROLLBACK, "drill")):
+            for file, node in ((CONTAINER, None), (ROLLBACK, "drill"), (MCP, None)):
                 wfs = target_fixture(group=[g for g in LEGACY_GROUPS if g != legacy][0])
                 target = wfs[file] if node is None else wfs[file]["jobs"][node]
                 target["concurrency"]["group"] = legacy
@@ -890,8 +935,13 @@ class LockOracleControls(unittest.TestCase):
             with self.subTest(job=job):
                 self.assert_rejected(wfs, "unclassified staging consumer")
         wfs = target_fixture()
-        del wfs["staging-mcp-proveout.yml"]
+        del wfs["staging-ownership-status.yml"]
         self.assert_rejected(wfs, "stale exemption")
+        # A demoted holder cannot hide in the inventory either.
+        wfs = target_fixture()
+        with mock.patch.dict(STANDALONE_HOLDERS, clear=False):
+            del STANDALONE_HOLDERS[(MCP, "proveout")]
+            self.assert_rejected(wfs, f"unclassified staging consumer {MCP} proveout")
 
     def test_duplicate_yaml_keys_cannot_hide_a_lock_or_trigger(self):
         with self.assertRaisesRegex(ValueError, "duplicate workflow key"):
