@@ -107,7 +107,11 @@ capture every `internal_action_log` row and the `internal_audit_order` singleton
 **Ordinary restore and rollback-delta import refuse any archive/batch containing
 audit rows when the ordering trigger is installed, even if disabled.** The
 refusal happens before data/trigger changes, under a lock that excludes concurrent
-activation. Query failures remain database failures, not an absent-trigger pass.
+activation. The fence resolves `internal_action_log` through the same transaction
+and search path as the locked write target, then checks that relation's schema
+for allocator state and its attached ordering trigger. Non-public targets receive
+the same refusal; an unrelated schema's allocator is not a target installation.
+Query failures remain database failures, not an absent-trigger pass.
 Do not remove audit evidence from a real recovery point to evade the refusal.
 
 Audit-free restore remains supported. It never truncates, imports or resets the

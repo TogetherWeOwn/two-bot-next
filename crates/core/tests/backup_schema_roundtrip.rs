@@ -1479,6 +1479,172 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     db.close().await.unwrap();
 }
 
+/// Schema that owns the full migrated target in the non-public audit tests.
+const NON_PUBLIC_SCHEMA: &str = "audit_nonpublic";
+
+/// A fully migrated target whose only schema on the search path is
+/// [`NON_PUBLIC_SCHEMA`], with `public` removed afterwards. The real migration
+/// set runs while `public` still exists because 0361/0419/0420 name it for
+/// the send-admission table (which backups exclude); nothing a restore reads
+/// or writes lives there. Unqualified names, which restore resolves through
+/// the search path, therefore reach only this schema.
+async fn non_public_target() -> Option<(TestDatabase, PgPool)> {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").ok()?;
+    let fixture = TestDatabase::create(&url, &sqlx::migrate::Migrator::with_migrations(Vec::new()))
+        .await
+        .expect("create isolated test database");
+    sqlx::raw_sql(audited(format!("CREATE SCHEMA {NON_PUBLIC_SCHEMA}")))
+        .execute(fixture.pool())
+        .await
+        .unwrap();
+    let pool = fixture
+        .pool_with_search_path(NON_PUBLIC_SCHEMA)
+        .await
+        .expect("pool pinned to the non-public schema");
+    sqlx::migrate!("../cutover/migrations")
+        .run(&pool)
+        .await
+        .expect("real migrations apply inside the non-public schema");
+    sqlx::raw_sql("DROP SCHEMA public CASCADE")
+        .execute(fixture.pool())
+        .await
+        .unwrap();
+    let public_absent: bool = sqlx::query_scalar("SELECT to_regnamespace('public') IS NULL")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(public_absent, "the audit allocator must not be in public");
+    let activated: bool = sqlx::query_scalar(
+        "SELECT to_regclass('internal_audit_order') IS NOT NULL AND EXISTS (\
+         SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = current_schema() AND c.relname = 'internal_action_log' \
+           AND t.tgname = 'internal_audit_allocate_order' AND NOT t.tgisinternal)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(activated, "migration 0472 activated the non-public target");
+    Some((fixture, pool))
+}
+
+/// Audit-bearing restore into a target whose allocator lives outside `public`
+/// refuses in every trigger state and under catalog damage, before any write.
+#[tokio::test]
+async fn audit_bearing_restore_refuses_when_allocator_is_outside_public() {
+    let Some(db) = database().await else {
+        return;
+    };
+    seed(db.pool()).await;
+    forget_voice_authority_migration(db.pool()).await;
+    let directory = ArchiveDirectory::new();
+    let archive = directory.path("complete.ndjson.gz");
+    dump(db.pool(), &archive).await.unwrap();
+
+    let (target, pool) = non_public_target()
+        .await
+        .expect("test bootstrap already configured");
+    seed(&pool).await;
+    dirty_target(&pool).await;
+    // A non-initial allocator position, so a reset or overwrite is visible.
+    sqlx::raw_sql("UPDATE internal_audit_order SET last_audit_id = 41")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let tables = covered_tables(&pool).await;
+    let unchanged = snapshot(&pool, &tables).await;
+    assert_eq!(
+        unchanged["internal_audit_order"].rows.len(),
+        1,
+        "the allocator singleton is part of the compared state"
+    );
+    assert!(
+        unchanged["members"].rows.len() > 1,
+        "unrelated target rows are part of the compared state"
+    );
+    let helper = format!("{NON_PUBLIC_SCHEMA}.internal_audit_allocate_order");
+    for mode in ["ENABLE", "DISABLE"] {
+        sqlx::raw_sql(audited(format!(
+            "ALTER TABLE internal_action_log {mode} TRIGGER internal_audit_allocate_order"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let error = restore(&pool, &archive)
+            .await
+            .expect_err("audit identities must never be rewritten");
+        assert!(
+            matches!(error, DbDumpError::AuditOrderingInstalled { rows: 3 }),
+            "{mode}: {error}"
+        );
+        assert_eq!(snapshot(&pool, &tables).await, unchanged, "{mode}");
+    }
+    // Schema-qualified catalog damage: the trigger is gone and the helper is
+    // renamed, but the retained allocator state still proves activation.
+    sqlx::raw_sql(audited(format!(
+        "DROP TRIGGER internal_audit_allocate_order ON internal_action_log; \
+         ALTER FUNCTION {helper}() RENAME TO hidden_allocator"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let error = restore(&pool, &archive)
+        .await
+        .expect_err("damaged installation stays fenced");
+    assert!(
+        matches!(error, DbDumpError::AuditOrderingInstalled { rows: 3 }),
+        "damaged: {error}"
+    );
+    assert_eq!(snapshot(&pool, &tables).await, unchanged, "damaged");
+    target.close().await.unwrap();
+    db.close().await.unwrap();
+}
+
+/// Control: the same non-public target still accepts an audit-free archive,
+/// and the restore leaves the installed allocator position alone.
+#[tokio::test]
+async fn audit_free_restore_into_non_public_allocator_target_keeps_the_allocator() {
+    let Some(db) = database().await else {
+        return;
+    };
+    seed(db.pool()).await;
+    forget_voice_authority_migration(db.pool()).await;
+    let directory = ArchiveDirectory::new();
+    let archive = directory.path("audit-free.ndjson.gz");
+    dump_audit_free(db.pool(), &archive).await.unwrap();
+
+    let (target, pool) = non_public_target()
+        .await
+        .expect("test bootstrap already configured");
+    sqlx::raw_sql(
+        "CREATE TABLE schema_migrations (id TEXT PRIMARY KEY); \
+         ALTER TABLE members ADD COLUMN backup_identity BIGINT GENERATED ALWAYS AS IDENTITY \
+             (START WITH 17 INCREMENT BY 3) UNIQUE;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql("UPDATE internal_audit_order SET last_audit_id = 41")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let report = restore(&pool, &archive).await.unwrap();
+    assert!(report.ok);
+    let allocator: i64 =
+        sqlx::query_scalar("SELECT last_audit_id FROM internal_audit_order WHERE singleton")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(allocator, 41, "restore preserves the installed allocator");
+    let audit_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM internal_action_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(audit_rows, 0, "an audit-free archive writes no audit rows");
+    target.close().await.unwrap();
+    db.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn post_0469_archive_restores_voice_stores_verbatim() {
     let Some(db) = database().await else {

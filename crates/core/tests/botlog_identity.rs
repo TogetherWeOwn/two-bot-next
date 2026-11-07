@@ -115,6 +115,73 @@ async fn event_history_survives_replacement_repointing_and_duplicate_reverse_map
 }
 
 #[tokio::test]
+async fn drained_legacy_events_retry_without_enriching_audit_identity() {
+    let db = database().await;
+    let store = InternalActionStore::new(db.pool().clone());
+    for (action, outcome) in [
+        ("event.upsert", EventOutcome::Created),
+        ("event.cancel", EventOutcome::Cancelled),
+    ] {
+        // An old image omits the new key scalar, then proves no REST dispatch
+        // during drain. The payload hash still binds the exact event request.
+        let other_action = if action == "event.upsert" {
+            "event.cancel"
+        } else {
+            "event.upsert"
+        };
+        let key = format!("botlog:drained:{action}");
+        let id = RequestIdentity::new("website", &key, action, b"original-request").unwrap();
+        let first = claim(&store, &id, &subject(None, false)).await;
+        let intent_id = first.intent_id();
+        store.release_proven_not_sent(first).await.unwrap();
+        let retry_subject = subject(Some("launch"), false);
+        for changed in [
+            RequestIdentity::new("website", &key, action, b"changed-request").unwrap(),
+            RequestIdentity::new("website", &key, other_action, b"original-request").unwrap(),
+        ] {
+            assert!(matches!(
+                store.claim(&changed, &retry_subject).await.unwrap(),
+                InternalClaim::Mismatch
+            ));
+        }
+        let mut wrong_subject = retry_subject.clone();
+        wrong_subject.target_id = Some(DiscordId::new(REPLACEMENT).unwrap());
+        assert!(matches!(
+            store.claim(&id, &wrong_subject).await.unwrap(),
+            InternalClaim::Mismatch
+        ));
+        let retry = claim(&store, &id, &retry_subject).await;
+        assert_eq!(retry.intent_id(), intent_id);
+        // A second no-dispatch release must stay retryable too.
+        store.release_proven_not_sent(retry).await.unwrap();
+        let retry = claim(&store, &id, &retry_subject).await;
+        store.finish(&retry, &receipt(Some(outcome))).await.unwrap();
+        assert!(matches!(
+            store.claim(&id, &retry_subject).await.unwrap(),
+            InternalClaim::Replay(result) if result == receipt(Some(outcome))
+        ));
+        let unchanged: bool = sqlx::query_scalar(
+            "SELECT audit_event_key IS NULL AND NOT EXISTS (
+                SELECT 1 FROM internal_action_log WHERE intent_id = $1 AND audit_event_key IS NOT NULL
+             ) FROM internal_idempotency WHERE intent_id = $1",
+        )
+        .bind(intent_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            unchanged,
+            "legacy intent and every audit keep their NULL identity"
+        );
+    }
+    assert!(
+        page(&store).await.entries.is_empty(),
+        "unnamed history stays private"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn event_reclaim_and_reconciliation_never_relabel_pinned_or_legacy_identity() {
     let db = database().await;
     let store = InternalActionStore::new(db.pool().clone());

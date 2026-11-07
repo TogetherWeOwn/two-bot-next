@@ -41,6 +41,8 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 struct TestDb {
     admin: PgPool,
     pool: PgPool,
+    /// Pool whose search_path is only a non-public schema, if the test has one.
+    pinned: Option<PgPool>,
     name: String,
 }
 
@@ -98,12 +100,80 @@ impl TestDb {
         Ok(Self {
             admin: admin.clone(),
             pool,
+            pinned: None,
             name: name.to_owned(),
         })
     }
 
+    /// Like [`TestDb::new`], plus `schema` and a pool whose search_path names
+    /// only that schema (never a connection redirect: same database and
+    /// principal). `schema_migrations` run inside it, resolving unqualified
+    /// names there. `public_migrations` run in the default schema first.
+    async fn new_pinned(
+        role: &str,
+        schema: &str,
+        public_migrations: &[&str],
+        schema_migrations: &[&str],
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        assert!(schema.len() <= 40 && schema.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+        let mut db = Self::new(role, public_migrations).await?;
+        match db.pin(schema, schema_migrations).await {
+            Ok(pool) => {
+                db.pinned = Some(pool);
+                Ok(db)
+            }
+            Err(error) => {
+                let _ = db.cleanup().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn pin(
+        &self,
+        schema: &str,
+        migrations: &[&str],
+    ) -> Result<PgPool, Box<dyn std::error::Error + Send + Sync>> {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&self.pool)
+            .await?;
+        let path = schema.to_owned();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .after_connect(move |conn, _| {
+                let path = path.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path', $1, false)")
+                        .bind(path)
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(self.pool.connect_options().as_ref().clone())
+            .await?;
+        for migration in migrations.iter().copied() {
+            if let Err(error) = sqlx::raw_sql(sqlx::AssertSqlSafe(migration))
+                .execute(&pool)
+                .await
+            {
+                pool.close().await;
+                return Err(error.into());
+            }
+        }
+        Ok(pool)
+    }
+
+    /// The pinned pool; the test must have used [`TestDb::new_pinned`].
+    fn pinned(&self) -> &PgPool {
+        self.pinned.as_ref().expect("pinned schema pool")
+    }
+
     /// Best-effort teardown: every step runs, the first failure is reported.
     async fn cleanup(&self) -> TestResult {
+        if let Some(pinned) = &self.pinned {
+            pinned.close().await;
+        }
         self.pool.close().await;
         let dropped = sqlx::query(database_sql("DROP DATABASE", &self.name))
             .execute(&self.admin)
@@ -1021,6 +1091,151 @@ async fn apply_import_keeps_audit_identity_without_ordering_trigger() -> TestRes
             .fetch_one(&db.pool)
             .await?;
         assert_eq!(id, 7, "audit_id preserved");
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    let cleaned = db.cleanup().await;
+    result.and(cleaned)
+}
+
+const NON_PUBLIC: &str = "audit_nonpublic";
+
+/// The audit allocator lives in a non-public schema and `public` does not
+/// exist. The importer resolves the audit table through search_path, so the
+/// fence must follow it: audit rows refuse before any write in every trigger
+/// state and under schema-qualified catalog damage, and the allocator position
+/// and unrelated rows stay put.
+#[tokio::test]
+async fn apply_import_refuses_audit_rows_when_allocator_is_outside_public() -> TestResult {
+    if !db_opted_in() {
+        return Ok(());
+    }
+    let db = TestDb::new_pinned(
+        "anp",
+        NON_PUBLIC,
+        &[],
+        &[
+            include_str!("../migrations/0210_tickets.sql"),
+            include_str!("../migrations/0350_internal_actions.sql"),
+            AUDIT_TRIGGER_SQL,
+        ],
+    )
+    .await?;
+    let result = async {
+        let pool = db.pinned();
+        sqlx::raw_sql("DROP SCHEMA public CASCADE")
+            .execute(&db.pool)
+            .await?;
+        let public_absent: bool = sqlx::query_scalar("SELECT to_regnamespace('public') IS NULL")
+            .fetch_one(pool)
+            .await?;
+        assert!(public_absent, "public must not hold any allocator");
+        // An unrelated destination row and a non-initial allocator position.
+        let seeded = parse_import(&line("tickets", &ticket_row("t-pre"))).expect("valid");
+        assert_eq!(apply_import(pool, &seeded).await?.inserted, 1);
+        sqlx::raw_sql("UPDATE internal_audit_order SET last_audit_id = 41")
+            .execute(pool)
+            .await?;
+        let contents = format!(
+            "{}\n{}\n",
+            line("tickets", &ticket_row("t-a1")),
+            audit_line()
+        );
+        let rows = parse_import(&contents).expect("valid audit fixture");
+        for state in ["ENABLE", "DISABLE"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE internal_action_log {state} TRIGGER internal_audit_allocate_order"
+            )))
+            .execute(pool)
+            .await?;
+            let error = apply_import(pool, &rows).await.expect_err("must refuse");
+            assert!(
+                matches!(error, ImportApplyError::AuditOrderingInstalled { rows: 1 }),
+                "{state}: {error}"
+            );
+        }
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER internal_audit_allocate_order ON internal_action_log; \
+             ALTER FUNCTION {NON_PUBLIC}.internal_audit_allocate_order() RENAME TO hidden_allocator"
+        )))
+        .execute(pool)
+        .await?;
+        assert!(matches!(
+            apply_import(pool, &rows).await,
+            Err(ImportApplyError::AuditOrderingInstalled { rows: 1 })
+        ));
+        let tickets: Vec<String> = sqlx::query_scalar("SELECT id FROM tickets ORDER BY id")
+            .fetch_all(pool)
+            .await?;
+        assert_eq!(tickets, ["t-pre"], "no row of a refused file was written");
+        let audits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM internal_action_log")
+            .fetch_one(pool)
+            .await?;
+        assert_eq!(audits, 0, "no audit row was written");
+        let allocator: i64 =
+            sqlx::query_scalar("SELECT last_audit_id FROM internal_audit_order WHERE singleton")
+                .fetch_one(pool)
+                .await?;
+        assert_eq!(allocator, 41, "refused imports never move the allocator");
+        // An audit-free file is not blocked by the installed allocator.
+        let free = parse_import(&line("tickets", &ticket_row("t-a2"))).expect("valid");
+        assert_eq!(apply_import(pool, &free).await?.inserted, 1);
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    let cleaned = db.cleanup().await;
+    result.and(cleaned)
+}
+
+/// Control: an allocator in `public` that the target's resolved audit table
+/// does not use must not fence an unactivated non-public target, and the
+/// imported identity is preserved exactly. The unrelated allocator stays idle.
+#[tokio::test]
+async fn apply_import_ignores_unrelated_public_allocator_for_unactivated_target() -> TestResult {
+    if !db_opted_in() {
+        return Ok(());
+    }
+    let db = TestDb::new_pinned(
+        "aother",
+        NON_PUBLIC,
+        &[
+            include_str!("../migrations/0350_internal_actions.sql"),
+            AUDIT_TRIGGER_SQL,
+        ],
+        &[AUDIT_TABLE_SQL],
+    )
+    .await?;
+    let result = async {
+        let pool = db.pinned();
+        let resolved: String = sqlx::query_scalar(
+            "SELECT n.nspname::text FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.oid = to_regclass('internal_action_log')",
+        )
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(
+            resolved, NON_PUBLIC,
+            "the importer resolves the non-public table"
+        );
+        let rows = parse_import(&audit_line()).expect("valid audit fixture");
+        let outcome = apply_import(pool, &rows).await.expect("audit import");
+        assert_eq!(outcome.inserted, 1);
+        let preserved: bool = sqlx::query_scalar(
+            "SELECT audit_id = 7 AND created_at = TIMESTAMPTZ '2026-10-01 12:00:00+00' \
+             FROM internal_action_log",
+        )
+        .fetch_one(pool)
+        .await?;
+        assert!(preserved, "audit_id and created_at preserved");
+        let public_idle: bool = sqlx::query_scalar(
+            "SELECT last_audit_id = 0 AND last_created_at = TIMESTAMPTZ '1970-01-01 00:00:00+00' \
+                 AND NOT EXISTS (SELECT 1 FROM public.internal_action_log) \
+             FROM public.internal_audit_order WHERE singleton",
+        )
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(public_idle, "the unrelated public allocator was not used");
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     }
     .await;

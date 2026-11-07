@@ -328,17 +328,23 @@ pub const RESTORE_PRESERVED_TABLES: &[&str] = &["internal_audit_order"];
 /// Audit table whose identity (`audit_id`, `created_at`) an import preserves.
 pub const AUDIT_LOG_TABLE: &str = "internal_action_log";
 
-/// True when the target's audit table carries the ordering allocator trigger
-/// (`public.internal_audit_allocate_order()`, migration 0472), in any enabled
-/// state: a disabled trigger is still installed. The state table also fences
-/// a partially damaged installation (such as a renamed/missing helper).
+/// True when the search-path-resolved audit table carries the ordering allocator
+/// trigger (migration 0472), in any enabled state. Call under the import's table
+/// lock and search path. Its own schema's state table also fences a partially
+/// damaged installation; an allocator in an unrelated schema does not.
 /// A failed query is an error, never reported as an absent installation.
-pub const AUDIT_ORDER_TRIGGER_INSTALLED_SQL: &str = "SELECT \
-     to_regclass('public.internal_audit_order') IS NOT NULL OR EXISTS (\
-     SELECT 1 FROM pg_trigger \
-      WHERE tgrelid = to_regclass('public.internal_action_log') \
-        AND tgfoid = to_regprocedure('public.internal_audit_allocate_order()') \
-        AND NOT tgisinternal)";
+pub const AUDIT_ORDER_TRIGGER_INSTALLED_SQL: &str = "WITH target AS (\
+     SELECT oid, relnamespace FROM pg_catalog.pg_class \
+      WHERE oid = pg_catalog.to_regclass('internal_action_log')) \
+     SELECT EXISTS (\
+       SELECT 1 FROM target JOIN pg_catalog.pg_class state \
+         ON state.relnamespace = target.relnamespace \
+        WHERE state.relname = 'internal_audit_order') OR EXISTS (\
+       SELECT 1 FROM target JOIN pg_catalog.pg_trigger t ON t.tgrelid = target.oid \
+       JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid \
+        WHERE NOT t.tgisinternal AND (t.tgname = 'internal_audit_allocate_order' \
+          OR (p.proname = 'internal_audit_allocate_order' \
+              AND p.pronamespace = target.relnamespace)))";
 
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
@@ -3565,9 +3571,17 @@ mod tests {
         for table in RESTORE_PRESERVED_TABLES {
             assert!(DUMP_TABLES.contains(table), "{table} must be archived");
         }
-        // The guard keys on the real function and table, in any trigger state.
-        assert!(AUDIT_ORDER_TRIGGER_INSTALLED_SQL.contains("public.internal_audit_allocate_order"));
+        // The guard follows the locked write target, not a hardcoded schema.
+        assert!(AUDIT_ORDER_TRIGGER_INSTALLED_SQL
+            .contains("pg_catalog.to_regclass('internal_action_log')"));
+        assert!(
+            AUDIT_ORDER_TRIGGER_INSTALLED_SQL.contains("state.relnamespace = target.relnamespace")
+        );
+        assert!(AUDIT_ORDER_TRIGGER_INSTALLED_SQL.contains("t.tgrelid = target.oid"));
+        assert!(AUDIT_ORDER_TRIGGER_INSTALLED_SQL.contains("p.pronamespace = target.relnamespace"));
+        assert!(AUDIT_ORDER_TRIGGER_INSTALLED_SQL.contains("internal_audit_allocate_order"));
         assert!(AUDIT_ORDER_TRIGGER_INSTALLED_SQL.contains(AUDIT_LOG_TABLE));
+        assert!(!AUDIT_ORDER_TRIGGER_INSTALLED_SQL.contains("public."));
         assert!(!AUDIT_ORDER_TRIGGER_INSTALLED_SQL.contains("tgenabled"));
     }
 

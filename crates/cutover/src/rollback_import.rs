@@ -584,7 +584,7 @@ pub async fn apply_import(
         .count() as u64;
     if audit_rows > 0 {
         let audit_exists: bool =
-            sqlx::query_scalar("SELECT to_regclass('public.internal_action_log') IS NOT NULL")
+            sqlx::query_scalar("SELECT pg_catalog.to_regclass('internal_action_log') IS NOT NULL")
                 .fetch_one(&mut *tx)
                 .await?;
         if audit_exists {

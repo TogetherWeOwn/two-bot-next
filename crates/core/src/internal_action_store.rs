@@ -968,8 +968,12 @@ impl InternalActionStore {
                 == subject.target_id.as_ref().map(DiscordId::as_str)
             && row.try_get::<Option<&str>, _>("resolved_role_id")?
                 == subject.resolved_role_id.as_ref().map(DiscordId::as_str)
-            && row.try_get::<Option<&str>, _>("audit_event_key")?
-                == subject.audit_event_key.as_deref())
+            // Only called for proven-not-sent reclaim after action/payload
+            // equality. Old images omitted this scalar: allow that retry, but
+            // retain NULL so neither the intent nor consumed audit is relabelled.
+            && row
+                .try_get::<Option<&str>, _>("audit_event_key")?
+                .is_none_or(|pinned| Some(pinned) == subject.audit_event_key.as_deref()))
     }
 
     async fn audit(

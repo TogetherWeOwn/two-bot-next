@@ -95,7 +95,11 @@ to `internal_idempotency` and `internal_action_log`. The validated event
 request key is pinned at claim and copied into the terminal audit; reconcile
 must match a non-null pinned key when repairing the mapping. A legacy NULL
 intent may still have its operational mapping repaired, but its audit stays
-unnamed with no reverse-map fallback. The rank key is persisted
+unnamed with no reverse-map fallback. A pre-upgrade event released as `not_sent`
+may be reclaimed with the validated request key only after action, exact payload
+hash and all other subject scalars match. Its NULL event identity stays NULL
+through retry and completion; this does not enrich historical publication facts.
+Already-pinned non-null keys still require exact equality. The rank key is persisted
 atomically by `finish_role_assignment` from the retained `RoleAssignmentReport`
 (see `internal-member-execution.md`). Audit UPDATEs cannot change these
 identity or publication facts; the authorized erasure DELETE is retained.
