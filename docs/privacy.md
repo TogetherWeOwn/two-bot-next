@@ -298,7 +298,10 @@ queued purge). The live gateway invokes the queue/cancel paths on real
 `GUILD_DELETE`/`GUILD_CREATE` dispatches (outage payloads never queue; an
 available rejoin cancels before the next run), and the supervised retention
 job runs on a bounded schedule: a dry run that deletes nothing unless
-`TWO_RETENTION_MODE` is exactly `execute`. No other automatic age-based
+`TWO_RETENTION_MODE` is exactly `execute`. A completed guild purge removes both
+raw attendance sessions and memberless captured-window history before the
+shared instance evidence. Member erasure removes only the sessions; the
+memberless history must not pin an old event key after a guild purge. No other automatic age-based
 purger is installed: do not claim a live 30/90-day TTL beyond the windows
 this job enforces. Every run reports per-class metrics, with partial runs
 (deferred/overdue deletions, failed guild purges) surfaced as warnings that

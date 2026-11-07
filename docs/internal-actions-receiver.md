@@ -464,7 +464,12 @@ sessions, first_joined_at}], final}`. Positive list only: who was there, never a
 absence list. Members below the threshold stay listed with their minutes; the
 threshold travels in the payload. Bots never appear in `members` and never count
 toward `peak_concurrent`; AFK occupants keep their member rows but never count
-toward the peak. `rooms` carries the latest name the logger saw per channel with at
+toward the peak. Overlapping rows for one member are unioned before computing
+minutes; their non-AFK intervals are unioned separately for peak concurrency, so a
+failed move-close cannot count that member twice. `sessions` still counts the
+stored rows. A direct room move preserves the old span when its channel matches
+the observed previous channel, even after that span's original event window ends.
+`rooms` carries the latest name the logger saw per channel with at
 least one human session. Still-open rows clamp at `min(now, window close)`; `final`
 is true only once the window plus its 15-minute grace has passed, and the website
 only writes an Echo from `final: true` reads. `not_found` covers unmapped keys and
