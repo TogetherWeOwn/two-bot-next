@@ -1031,6 +1031,58 @@ mod tests {
         assert_eq!(rooms[1]["channel_id"], json!("9"));
     }
 
+    #[test]
+    fn result_budget_counts_serialized_utf8_and_reserves_the_envelope() {
+        let event = window("event", 0, MIN);
+        let mut rows = vec![session(1, 7, "", false, false, 0, Some(MIN))];
+        let empty = project_attendance("event", &event, &rows, 20 * MIN).unwrap();
+        let spare = MAX_ATTENDANCE_RESULT_BYTES - serde_json::to_vec(&empty).unwrap().len();
+        rows[0].channel_name = "x".repeat(spare);
+        let exact = project_attendance("event", &event, &rows, 20 * MIN).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&exact).unwrap().len(),
+            MAX_ATTENDANCE_RESULT_BYTES
+        );
+        rows[0].channel_name.push('x');
+        assert_eq!(
+            project_attendance("event", &event, &rows, 20 * MIN),
+            Err(AttendanceRefusal::OverBudget)
+        );
+        // A character count would accept this, but UTF-8 bytes exceed the cap.
+        rows[0].channel_name = "界".repeat(spare / 2);
+        assert!(rows[0].channel_name.chars().count() < spare);
+        assert_eq!(
+            project_attendance("event", &event, &rows, 20 * MIN),
+            Err(AttendanceRefusal::OverBudget)
+        );
+    }
+
+    #[test]
+    fn grace_close_is_the_exact_finality_boundary() {
+        let event = window("event", 0, MIN);
+        let rows = vec![session(1, 7, "Lobby", false, false, 0, None)];
+        let close = MIN + ATTENDANCE_GRACE_MS;
+        let before = project_attendance("event", &event, &rows, close - 1).unwrap();
+        let at = project_attendance("event", &event, &rows, close).unwrap();
+        assert_eq!(before["final"], false);
+        assert_eq!(at["final"], true);
+        assert_eq!(at["members"][0]["minutes"], 16);
+    }
+
+    #[test]
+    fn touching_sessions_do_not_double_the_peak_and_latest_room_name_wins() {
+        let event = window("event", 0, 10 * MIN);
+        let rows = [
+            session(2, 7, "Renamed", false, false, 5 * MIN, Some(10 * MIN)),
+            session(1, 7, "Original", false, false, 0, Some(5 * MIN)),
+        ];
+        let result = project_attendance("event", &event, &rows, 30 * MIN).unwrap();
+        assert_eq!(result["peak_concurrent"], 1);
+        assert_eq!(result["rooms"][0]["name_at_close"], "Renamed");
+        assert_eq!(result["members"][0]["minutes"], 5);
+        assert_eq!(result["members"][1]["minutes"], 5);
+    }
+
     /// Fake store for the capture-gate tests: one open window, an optional
     /// seeded open row, and counters for opens and closes.
     struct GateStore {
@@ -1155,6 +1207,120 @@ mod tests {
             current_name: Some("lobby".to_owned()),
             enabled: true,
         }
+    }
+
+    #[tokio::test]
+    async fn postgres_logger_roundtrip_uses_room_persistence_and_capture_privacy() {
+        use two_bot_core::{
+            internal_action_store::InternalActionStore,
+            scheduled_events::{EventStatus, ScheduledEvent},
+            website_store::upsert_event,
+        };
+        use two_bot_cutover::voice_rooms::PgRoomStore;
+        use two_bot_testsupport::TestDatabase;
+
+        let Ok(url) = std::env::var("TWO_TEST_DATABASE_URL") else {
+            assert!(
+                std::env::var("GITHUB_ACTIONS").is_err(),
+                "CI requires the test database"
+            );
+            eprintln!("SKIP attendance logger DB roundtrip: TWO_TEST_DATABASE_URL is unset");
+            return;
+        };
+        let db = TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+            .await
+            .unwrap();
+        let pool = db.pool();
+        let store = PgRoomStore::new(pool.clone());
+        let now = OffsetDateTime::now_utc();
+        let stamp = |at| two_bot_core::funnel::format_iso_millis(millis_of(at));
+        let observed = ScheduledEvent {
+            id: "20000000000000001".to_owned(),
+            name: "Game night".to_owned(),
+            starts_at: stamp(now - time::Duration::minutes(10)),
+            ends_at: Some(stamp(now + time::Duration::minutes(10))),
+            channel_id: None,
+            description: None,
+            status: EventStatus::Active,
+        };
+        upsert_event(
+            pool,
+            "1",
+            &stamp(now - time::Duration::minutes(1)),
+            &observed,
+        )
+        .await
+        .unwrap();
+        InternalActionStore::new(pool.clone())
+            .put_event_key("1", "game-night", &observed.id)
+            .await
+            .unwrap();
+        let mut transition = join_transition();
+        transition.guild = 1;
+        transition.member = 2;
+        transition.current = Some(7);
+        transition.current_name = Some("Lobby".to_owned());
+        record_transition(&store, transition.clone()).await;
+        let rows = AttendanceStore::open_attendance_sessions(&store, 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].channel_id, "7");
+        assert_eq!(rows[0].event_keys, ["game-night"]);
+
+        transition.previous = Some(7);
+        transition.previous_name = Some("Renamed lobby".to_owned());
+        transition.current = Some(8);
+        transition.current_name = Some("AFK".to_owned());
+        transition.afk_channel = Some(8);
+        record_transition(&store, transition.clone()).await;
+        let rows = AttendanceStore::attendance_sessions_for_event_key(&store, 1, "game-night")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let closed = rows.iter().find(|row| row.channel_id == "7").unwrap();
+        assert!(closed.left_at.is_some());
+        assert_eq!(closed.channel_name, "Renamed lobby");
+        assert!(rows.iter().find(|row| row.channel_id == "8").unwrap().afk);
+        let open = AttendanceStore::open_attendance_sessions(&store, 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].channel_id, "8");
+        assert!(open[0].left_at.is_none());
+        assert!(open[0].afk);
+
+        two_bot_cutover::privacy::opt_out_member(
+            &two_bot_cutover::CutoverDb::from_pool(pool.clone()),
+            "1",
+            "2",
+            "operator",
+        )
+        .await
+        .unwrap();
+        transition.previous = Some(8);
+        transition.current = Some(9);
+        record_transition(&store, transition).await;
+        assert!(AttendanceStore::open_attendance_sessions(&store, 1, 2)
+            .await
+            .unwrap()
+            .is_empty());
+        let rows = AttendanceStore::attendance_sessions_for_event_key(&store, 1, "game-night")
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "suppression closes existing rows but opens no new row"
+        );
+        assert!(rows.iter().all(|row| row.left_at.is_some()));
+        assert!(
+            AttendanceStore::attendance_sessions_for_event_key(&store, 3, "game-night")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        db.close().await.unwrap();
     }
 
     #[tokio::test]

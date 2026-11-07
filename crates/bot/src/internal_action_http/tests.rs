@@ -5527,6 +5527,103 @@ async fn event_attendance_read_malformed_key_is_refused_and_replay_is_conflict()
 }
 
 #[tokio::test]
+async fn event_attendance_read_busy_event_gate_refuses_without_claiming() {
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_attendance_read_flag(true);
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let reads = Arc::new(MockEventRead::default());
+    let mut receiver = state_with_reads(lazy_pool(), effect.clone(), reads.clone());
+    receiver.event_gate_wait = Duration::from_millis(10);
+    let state = Arc::new(receiver);
+    let held = state.event_gate.lock().await;
+    let (status, _, body) = answer(
+        router(state.clone()),
+        signed_read(&attendance_payload("launch"), "old"),
+    )
+    .await;
+    drop(held);
+    set_attendance_read_flag(false);
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "in_progress");
+    assert!(body.get("result").is_none());
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(reads.calls(), 0);
+}
+
+#[tokio::test]
+async fn event_attendance_read_oversized_projection_returns_only_bounded_error() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_attendance_read_flag(true);
+    let pool = db.pool();
+    seed_attendance_window(pool, staging_guild(), "launch", "-3 hours", "-2 hours").await;
+    // Many ordinary-length room names exceed the result budget collectively.
+    sqlx::query(
+        "INSERT INTO event_voice_sessions \
+           (guild_id, member_id, channel_id, channel_name, joined_at, left_at, event_keys) \
+         SELECT $1, n::text, n::text, repeat('界', 100), \
+                NOW() - interval '170 minutes', NOW() - interval '130 minutes', ARRAY['launch'] \
+         FROM generate_series(1, 200) n",
+    )
+    .bind(staging_guild())
+    .execute(pool)
+    .await
+    .unwrap();
+    let (app, effect, reads) = attendance_app(pool.clone());
+    let (status, _, body) = answer(app, signed_read(&attendance_payload("launch"), "old")).await;
+    set_attendance_read_flag(false);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["code"], "internal");
+    assert_eq!(body["error"]["retryable"], true);
+    assert!(body.get("result").is_none());
+    assert!(serde_json::to_vec(&body).unwrap().len() < 512);
+    assert!(!body.to_string().contains('界'));
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(reads.calls(), 0);
+    assert_eq!(idempotency_rows(pool).await, 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn event_attendance_read_store_failures_return_internal_not_partial_or_not_found() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_attendance_read_flag(true);
+    let pool = db.pool();
+    seed_attendance_window(pool, staging_guild(), "launch", "-3 hours", "-2 hours").await;
+    let (app, effect, reads) = attendance_app(pool.clone());
+    // Hide only relations in this isolated, migrated TestDatabase, one read at a time.
+    for (hide, restore) in [
+        (
+            "ALTER TABLE event_attendance_windows RENAME TO hidden_attendance_windows",
+            "ALTER TABLE hidden_attendance_windows RENAME TO event_attendance_windows",
+        ),
+        (
+            "ALTER TABLE event_voice_sessions RENAME TO hidden_voice_sessions",
+            "ALTER TABLE hidden_voice_sessions RENAME TO event_voice_sessions",
+        ),
+    ] {
+        sqlx::query(hide).execute(pool).await.unwrap();
+        let (status, _, body) = answer(
+            app.clone(),
+            signed_read(&attendance_payload("launch"), "old"),
+        )
+        .await;
+        sqlx::query(restore).execute(pool).await.unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "internal");
+        assert_eq!(body["error"]["retryable"], true);
+        assert!(body.get("result").is_none());
+        assert!(!body.to_string().contains("hidden_"));
+    }
+    set_attendance_read_flag(false);
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(reads.calls(), 0);
+    assert_eq!(idempotency_rows(pool).await, 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn event_attendance_read_malformed_stored_ids_fail_internal_without_leaking_them() {
     let Some(db) = database().await else { return };
     let _flag = INTERNAL_FLAG_LOCK.lock().await;

@@ -66,6 +66,74 @@ async fn map(pool: &PgPool, guild: &str, key: &str, event_id: &str) {
 }
 
 #[tokio::test]
+async fn raw_retention_store_count_and_delete_share_the_strict_cutoff() {
+    with_database(|pool| async move {
+        let store = two_bot_cutover::voice_rooms::PgRoomStore::new(pool.clone());
+        let cutoff = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::days(90);
+        // Raw retention applies to open and closed sessions in every guild.
+        for (guild, joined, left) in [
+            (GUILD_A, cutoff - Duration::seconds(1), None),
+            (GUILD_B, cutoff - Duration::seconds(1), Some(cutoff)),
+            (GUILD_A, cutoff, None),
+            (GUILD_B, cutoff + Duration::seconds(1), None),
+        ] {
+            sqlx::query(
+                "INSERT INTO event_voice_sessions \
+                   (guild_id, member_id, channel_id, joined_at, left_at, event_keys) \
+                 VALUES ($1, $2, '4001', $3, $4, ARRAY['game-night'])",
+            )
+            .bind(guild)
+            .bind(MEMBER)
+            .bind(joined)
+            .bind(left)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            store
+                .count_attendance_sessions_before(cutoff)
+                .await
+                .unwrap(),
+            2
+        );
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM event_voice_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 4, "count is read-only");
+        assert_eq!(
+            store
+                .delete_attendance_sessions_before(cutoff)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .count_attendance_sessions_before(cutoff)
+                .await
+                .unwrap(),
+            0
+        );
+        let survivors: Vec<OffsetDateTime> =
+            sqlx::query_scalar("SELECT joined_at FROM event_voice_sessions ORDER BY joined_at")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(survivors, [cutoff, cutoff + Duration::seconds(1)]);
+        assert_eq!(
+            store
+                .delete_attendance_sessions_before(cutoff)
+                .await
+                .unwrap(),
+            0
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn mappings_and_historical_windows_never_authorize_capture() {
     with_database(|pool| async move {
         let now = OffsetDateTime::now_utc();
