@@ -656,9 +656,10 @@ jobs:
       staging_use_expires_at: ${{ needs.deploy.outputs.staging_use_expires_at }}
       staging_use_sha: ${{ needs.deploy.outputs.staging_use_sha }}
       staging_use_deployment: ${{ needs.deploy.outputs.staging_use_deployment }}
-    # By name, not `inherit`: only the test bot token crosses the boundary.
+    # By name, not `inherit`: each callee job resolves its Environment's token.
     secrets:
       TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
+      STAGING_OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
 
   # Live /help embed smoke against staging (docs/staging-help-embed-smoke.md):
   # the dedicated test bot posts both help builders' embeds to a staging test
@@ -675,9 +676,10 @@ jobs:
       staging_use_expires_at: ${{ needs.deploy.outputs.staging_use_expires_at }}
       staging_use_sha: ${{ needs.deploy.outputs.staging_use_sha }}
       staging_use_deployment: ${{ needs.deploy.outputs.staging_use_deployment }}
-    # By name, not `inherit`: only the test bot token crosses the boundary.
+    # By name, not `inherit`: each callee job resolves its Environment's token.
     secrets:
       TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
+      STAGING_OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
 
   # Promotion prerequisite (docs/synthetic-user-flow.md): the same read-only
   # user-flow probe the five-minute synthetic runs, pinned to the exact SHA
