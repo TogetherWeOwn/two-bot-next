@@ -186,6 +186,20 @@ class StagingRestorePolicyTests(unittest.TestCase):
                 rollback.validate_staging_restore_policy(
                     FakeClient({("GET", path): version_route()}), WORKER, GOOD_VERSION, sha)
 
+    def test_missing_or_malformed_policy_resources_are_unproved(self):
+        path = f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}"
+        cases = [{"id": GOOD_VERSION}]
+        for resources in (None, [], "must-not-echo", {}, {"bindings": None},
+                          {"bindings": {}}, {"bindings": "must-not-echo"}):
+            cases.append({"id": GOOD_VERSION, "resources": resources})
+        for value in cases:
+            with self.subTest(value=value):
+                client = FakeClient({("GET", path): lambda: {"success": True, "result": value}})
+                with self.assertRaisesRegex(rollback.GateError,
+                                            "^staging_restore_policy_unproved$"):
+                    rollback.validate_staging_restore_policy(client, WORKER, GOOD_VERSION, SHA)
+                self.assertEqual(client.calls, [("GET", path)])
+
     def test_adapter_preserves_window_and_excludes_ambient_credentials_and_outputs(self):
         env = {"PATH": "/usr/bin", "GITHUB_RUN_ID": "700", "GITHUB_RUN_ATTEMPT": "2",
                "STAGING_USE_EXPIRES_AT": "1700001000000", "GITHUB_OUTPUT": "must-not-write",

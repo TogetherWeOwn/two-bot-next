@@ -474,7 +474,10 @@ def validate_staging_restore_policy(client, worker, version, sha):
     data = base.mapping(client.api(
         f"/workers/scripts/{worker}/versions/{base.identifier(version)}"))
     require(data.get("id") == version, "staging_restore_identity_invalid")
-    bindings = base.sequence(base.mapping(data.get("resources")).get("bindings"))
+    resources = data.get("resources")
+    require(isinstance(resources, dict), "staging_restore_policy_unproved")
+    bindings = resources.get("bindings")
+    require(isinstance(bindings, list), "staging_restore_policy_unproved")
     for name, value in (("STAGING_RUNTIME_POLICY", "bounded"),
                         ("TWO_DEPLOY_ENV", "staging"), ("CONTAINER_RELEASE", sha)):
         matches = [row for row in bindings if isinstance(row, dict) and row.get("name") == name]
