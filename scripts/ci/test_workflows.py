@@ -2372,19 +2372,12 @@ MCP_PROVEOUT_COMMAND = ('python3 scripts/staging_mcp_proveout.py '
 
 
 def staging_mcp_proveout_errors(workflow):
-    """Manual staging-only read-only authenticated MCP prove-out (TOG-23456).
+    """Manual MCP proof inside a finite, fully serialized staging window.
 
-    Dispatch-only with no inputs. The bearer arrives only as the `staging`
-    environment secret STAGING_MCP_TOKEN into one Run step (never echoed,
-    stored or uploaded; responses carry no credential). One job runs only
-    from main through the `staging` environment, on the routed runner for
-    job `proveout`, with its own non-cancelling concurrency group and a 10
-    minute timeout. Exactly three steps: pinned checkout without persisted
-    credentials, one Run step that calls the reviewed stdlib script with
-    the bearer via the environment only, and the 14 day artifact upload of
-    the sanitized prove-out file with `if: always()` so failures keep
-    their evidence. No wrangler, no production path, no staging Worker URL
-    variable, no `set -x`.
+    The unchanged read-only MCP command holds only its bearer. Separate pinned
+    control steps begin/ready and finish under the same workflow lock, with
+    fail-closed receipts even after acquisition/probe failure. Native expiry
+    remains the cancellation/runner-loss backstop, not an Actions cleanup promise.
     """
     name = "staging-mcp-proveout.yml"
     errors = []
@@ -2397,8 +2390,8 @@ def staging_mcp_proveout_errors(workflow):
         errors.append(f"{name}: workflow_dispatch must take no inputs")
     if workflow.get("permissions") != {}:
         errors.append(f"{name}: top-level permissions must stay empty")
-    if workflow.get("concurrency") != {"group": "staging-mcp-proveout", "cancel-in-progress": "false"}:
-        errors.append(f"{name}: must use its own staging-mcp-proveout group without cancelling")
+    if workflow.get("concurrency") != {"group": "staging-lifecycle", "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must hold the canonical staging-lifecycle group without cancelling")
     jobs = workflow.get("jobs") or {}
     if set(jobs) != {"proveout"}:
         errors.append(f"{name}: jobs must be exactly proveout")
@@ -2414,42 +2407,42 @@ def staging_mcp_proveout_errors(workflow):
         errors.append(f"{name}:proveout: timeout must stay 10 minutes")
     if not runner_allowed("proveout", job.get("runs-on")):
         errors.append(f"{name}:proveout: must use the routed runner expression for job 'proveout'")
-    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy", "concurrency"):
         if key in job:
-            errors.append(f"{name}:proveout: must not set {key} (bindings stay on the single Run step)")
-    text = str(job).lower().replace(" ", "")
-    for marker in ("wrangler", "production", "tojson(secrets", "secrets[", "set-x", "setx", "xtrace",
-                   "cloudflare_api_token", "ownership_control", "staging_worker_url",
-                   "production_worker_url", "/health", "/readyz", "vars.staging", "inputs."):
-        if marker in text:
-            errors.append(f"{name}:proveout: must not contain {marker!r}")
-    secrets = set(re.findall(r"secrets\.([a-z0-9_]+)", text))
-    if secrets != {"staging_mcp_token"}:
-        errors.append(f"{name}:proveout: must read exactly the STAGING_MCP_TOKEN secret")
+            errors.append(f"{name}:proveout: must not set {key} (credentials stay step-local; no nested lock)")
+    control_env = {"STAGING_WORKER_URL": "https://two-bot-next-staging.5150.workers.dev",
+                   "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}
+    start_path = "${{ runner.temp }}/staging-use-mcp-start.jsonl"
+    stop_path = "${{ runner.temp }}/staging-use-mcp-stop.jsonl"
+    cleanup_if = "always() && steps.use.outputs.expires_at != ''"
+    expected = [
+        {"uses": STAGING_CHECKOUT_USES,
+         "with": {"persist-credentials": "false", "fetch-depth": "1"}},
+        {"uses": STAGING_SETUP_NODE_USES,
+         "with": {"node-version": "22", "package-manager-cache": "false"}},
+        {"id": "use", "env": {**control_env, "STAGING_USE_MINUTES": "15",
+                                "STAGING_USE_RECEIPT": start_path},
+         "run": "node wrangler/scripts/staging-use-pipeline.mjs begin"},
+        staging_receipt_upload("mcp", "start", start_path),
+        {"env": MCP_PROVEOUT_ENV, "run": MCP_PROVEOUT_COMMAND},
+        {"if": cleanup_if, "env": {**control_env,
+            "STAGING_USE_EXPIRES_AT": "${{ steps.use.outputs.expires_at }}",
+            "STAGING_USE_RECEIPT": stop_path},
+         "run": "node wrangler/scripts/staging-use-pipeline.mjs finish"},
+        {**staging_receipt_upload("mcp", "stop", stop_path), "if": cleanup_if},
+        {"if": "always()", "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+         "with": {"name": "staging-mcp-proveout-${{ github.run_id }}",
+                  "path": "staging-mcp-proveout-${{ github.run_id }}.json",
+                  "if-no-files-found": "error", "retention-days": "14"}},
+    ]
     steps = job.get("steps") or []
-    if len(steps) != 3 or any("continue-on-error" in step for step in steps):
-        errors.append(f"{name}:proveout: must run exactly checkout, the prove-out and the upload, unconditionally")
-        return errors
-    checkout, run, upload = steps
-    if "if" in checkout or "if" in run:
-        errors.append(f"{name}:proveout: only the upload may carry a condition (always())")
-        return errors
-    if upload.get("if") != "always()":
-        errors.append(f"{name}:proveout: upload must run with if: always() so failures keep their artifact")
-        return errors
-    if not str(checkout.get("uses", "")).startswith("actions/checkout@") \
-            or (checkout.get("with") or {}).get("persist-credentials") != "false" \
-            or (checkout.get("with") or {}).get("fetch-depth") != "1":
-        errors.append(f"{name}:proveout: checkout must be pinned, shallow and must not persist credentials")
-    if run.get("env") != MCP_PROVEOUT_ENV:
-        errors.append(f"{name}:proveout: Run step must bind exactly the bearer, the staging URL and the run id")
-    if run.get("run") != MCP_PROVEOUT_COMMAND or "uses" in run or "shell" in run:
-        errors.append(f"{name}:proveout: Run step must call the reviewed script with the run id via the environment only")
-    if not str(upload.get("uses", "")).startswith("actions/upload-artifact@") or upload.get("with") != {
-            "name": "staging-mcp-proveout-${{ github.run_id }}",
-            "path": "staging-mcp-proveout-${{ github.run_id }}.json",
-            "if-no-files-found": "error", "retention-days": "14"}:
-        errors.append(f"{name}:proveout: must upload only the run's json for 14 days and fail if absent")
+    if len(steps) != len(expected):
+        errors.append(f"{name}:proveout: must run exactly checkout, setup-node, begin, start receipt, "
+                      "MCP probe, finish, stop receipt and proof upload")
+    for index, (step, wanted) in enumerate(zip(steps, expected)):
+        if {key: value for key, value in step.items() if key != "name"} != wanted:
+            errors.append(f"{name}:proveout: step {index + 1} must retain its exact bounded lifecycle, "
+                          "credential isolation and evidence contract")
     return errors
 
 

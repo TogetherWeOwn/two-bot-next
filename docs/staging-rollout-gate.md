@@ -67,7 +67,9 @@ sample; an unconfirmed stop or invalid authority fails. It never acquires,
 renews, starts, probes or releases staging. The slow-burn workflow uses this
 observer in a separate credential-isolated step and skips both issue writes and
 cache saves during idle. Its five-minute cadence and active-use burn checks are
-unchanged; scheduled user-flow and other readers still need integration.
+unchanged. Scheduled user-flow also observes instead of acquiring a window;
+remaining readers, including the production promotion's live staging-soak
+samples, still need integration without weakening their qualification gates.
 `acquire`, `assert`, `ready` and `release` pin the intended
 `STAGING_USE_SHA`, `STAGING_USE_DEPLOYMENT`, `GITHUB_RUN_ID`,
 `GITHUB_RUN_ATTEMPT` and absolute millisecond `STAGING_USE_EXPIRES_AT`. The
@@ -159,9 +161,10 @@ activation receipt.
 
 `deploy-staging` holds the fixed, non-cancelling `staging-lifecycle` group at
 workflow level, from baseline through all qualification jobs and
-`staging-use-release`. No job inside it re-holds the group. Both standalone drills
-and the scheduled staging user-flow job use the same canonical group. The
-rollback-proof orchestrator does **not** hold it while waiting for its child.
+`staging-use-release`. No job inside it re-holds the group. Both standalone drills,
+the manual MCP prove-out and the scheduled staging user-flow job use the same
+canonical group. The rollback-proof orchestrator does **not** hold it while
+waiting for its child.
 The user-flow group is job-level only: the passive production sibling never
 takes it or depends on the staging job. Production probe code is unchanged.
 
@@ -179,6 +182,13 @@ provably disjoint per-run nested groups and a separate main-only
 keeps only the test-bot credential. Standalone voice/help acquire at most 45
 minutes under the canonical workflow lock and release after their consumer,
 even if it fails. Called jobs never acquire or release the parent's grant.
+The manual [MCP prove-out](mcp.md#staging-prove-out) acquires and verifies at most
+15 minutes under the same canonical workflow lock, then releases its original
+expiry even after failed acquisition/readiness or proof. The existing MCP bearer
+and ownership-control token stay on separate steps; the MCP proof sequence is
+unchanged. `scripts/ci/test_staging_mcp_window.py` pins its lifecycle and credential
+isolation in addition to the independent full-window deployment oracle.
+
 Retain start/assert and stop/refusal artifacts for the run and attempt. Verify
 on exact-head Actions that the existing staging control secret resolves in each
 called staging job; a missing token fails closed, never warrants a new credential.
