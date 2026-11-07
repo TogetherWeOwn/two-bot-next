@@ -387,11 +387,12 @@ class ScannerTests(unittest.TestCase):
 class TrivyInstallerTests(unittest.TestCase):
     def installer(self):
         text = (ROOT / ".github/workflows/sbom.yml").read_text()
-        title = "      - name: Install verified Trivy from its GitHub release\n"
+        title = "      - name: Install verified pinned Trivy\n"
         self.assertIn(title, text)
         step = text.split(title, 1)[1].split("\n      - ", 1)[0]
-        return "\n".join(line[10:] for line in step.split("        run: |\n", 1)[1].splitlines()
-                         if line.startswith("          "))
+        self.assertIn("        id: trivy\n", step)
+        self.assertIn("        run: bash scripts/install-trivy.sh\n", step)
+        return (ROOT / "scripts/install-trivy.sh").read_text()
 
     def run_installer(self, download_status=0, checksum_status=0):
         script = self.installer()
@@ -402,7 +403,8 @@ class TrivyInstallerTests(unittest.TestCase):
             for command, body in {
                     "curl": 'printf "curl %s\\n" "$*" >> "$LOG"; exit "$DOWNLOAD_STATUS"',
                     "sha256sum": 'while IFS= read -r line; do printf "sha256sum %s\\n" "$line" >> "$LOG"; done; exit "$CHECKSUM_STATUS"',
-                    "tar": 'printf "tar %s\\n" "$*" >> "$LOG"'}.items():
+                    "tar": 'printf "tar %s\\n" "$*" >> "$LOG"; printf "#!/bin/sh\\nprintf \'Version: 0.69.3\\\\n\'\\n"',
+                    "uname": 'case "$1" in -s) printf "Linux\\n";; -m) printf "x86_64\\n";; esac'}.items():
                 path = tools / command
                 path.write_text("#!/bin/bash\n" + body + "\n")
                 path.chmod(0o755)
@@ -426,7 +428,8 @@ class TrivyInstallerTests(unittest.TestCase):
         self.assertIn("1816b632dfe529869c740c0913e36bd1629cb7688bd5634f4a858c1d57c88b75", calls)
         self.assertLess(calls.index("sha256sum"), calls.index("tar "))
         script = self.installer()
-        self.assertLess(script.index("tar -xzf"), script.index('>> "$GITHUB_PATH"'))
+        self.assertLess(script.index("tar -xOzf"), script.index('>> "$GITHUB_PATH"'))
+        self.assertLess(script.index('"$bin/trivy" --version'), script.index('>> "$GITHUB_PATH"'))
         self.assertNotIn("get.trivy.dev", script)
 
     def test_download_failure_is_not_extracted_or_published(self):
@@ -510,10 +513,11 @@ class StaticWiringTests(unittest.TestCase):
     def test_workflow_installs_trivy_before_untrusted_checkout_and_skips_redirect(self):
         image, _ = self.workflow_jobs()
         image = self.code(image)
-        self.assertLess(image.index("name: Install verified Trivy"), image.index("inputs.ref"))
+        self.assertLess(image.index("name: Install verified pinned Trivy"), image.index("inputs.ref"))
         self.assertEqual(image.count("skip-setup-trivy: true"), 4)
-        self.assertIn("name: Remove this job's Trivy binary\n        if: ${{ always() }}\n"
-                      '        run: rm -rf "$RUNNER_TEMP/trivy-bin"', image)
+        self.assertIn("id: trivy\n        run: bash scripts/install-trivy.sh", image)
+        self.assertIn("!cancelled() && steps.trivy.outcome == 'success'", image)
+        self.assertNotIn('rm -rf "$RUNNER_TEMP/trivy-bin"', image)
 
     def test_workflow_scan_and_validator_run_only_in_trusted_verify_job(self):
         image, verify = self.workflow_jobs()

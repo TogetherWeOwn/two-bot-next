@@ -23,14 +23,16 @@ use twilight_model::{
 use two_bot_core::{
     custom_command_service as service, custom_command_store as store,
     custom_commands::{
-        accepted_text_trigger, builtin_command_names, escape_inspect_text,
+        accepted_text_trigger, builtin_command_names, capture_prefix_args, escape_inspect_text,
         format_command_list_page, format_draft_preview, format_inspect_miss,
         format_inspect_preview, format_inspect_summary_with_gate, format_inspect_template,
         inspect_preview_context_unavailable, invalid_inspect_option_reply,
-        invalid_inspect_view_reply, render_template, validate_inspect_name, validate_template,
-        AuditRecord, AutomationMessageAcceptance, CloneCommandInput, CommandError, EditOutcome,
-        EditPatch, InspectView, PutCommandInput, StoredCommand, TemplateContext, ToggleOutcome,
-        TriggerPatch, INVALID_COMMAND_LIST_PAGE, MAX_INSPECT_ARGUMENT_UNITS,
+        invalid_inspect_view_reply, render_template, validate_args, validate_inspect_name,
+        validate_template, AuditRecord, AutomationMessageAcceptance, CloneCommandInput,
+        CommandError, EditOutcome, EditPatch, InspectView, PutCommandInput, StoredCommand,
+        TemplateContext, ToggleOutcome, TriggerPatch, ARGS_OPTION_NAME, ARGS_TOO_LONG_REASON,
+        ARGS_TOO_LONG_REPLY, INVALID_ARGS_REPLY, INVALID_COMMAND_LIST_PAGE,
+        MAX_INSPECT_ARGUMENT_UNITS,
     },
     router::{replies::InteractionReply, InteractionHandler},
     HandlerId, InteractionRouter, SlashOutcome,
@@ -367,6 +369,27 @@ impl CustomCommandRuntime {
             SlashOutcome::Handled {
                 handler: HandlerId::AutomationCustom,
             } => {
+                // Capture lands here: the lookup-before-defer above is the
+                // one scoped read that precedes validation, and unknown,
+                // deleted, disabled or other-guild rows never reach this arm
+                // (they stay silent), so arguments are only ever read for a
+                // known enabled row. Malformed or over-long input refuses with
+                // a direct ephemeral correction — never via the public defer —
+                // and audits nothing.
+                let args = match single_string_option(data, ARGS_OPTION_NAME) {
+                    SingleOption::Missing => String::new(),
+                    SingleOption::Value(value) => value.to_owned(),
+                    SingleOption::Malformed => {
+                        return self
+                            .answer_args_refusal(interaction, received, INVALID_ARGS_REPLY)
+                            .await;
+                    }
+                };
+                if validate_args(&args).is_err() {
+                    return self
+                        .answer_args_refusal(interaction, received, ARGS_TOO_LONG_REPLY)
+                        .await;
+                }
                 if let Err(defer_error) = self.defer(interaction, false, received).await {
                     // A refused defer proves no Discord-side effect, so audit
                     // the failed run: operators must distinguish "attempted
@@ -398,10 +421,9 @@ impl CustomCommandRuntime {
                             username: actor.name.clone(),
                             server: server.to_owned(),
                             channel: format!("<#{}>", channel.id),
-                            // Invocation capture lands with the run-path
-                            // slice; until then `{args}` renders empty, so
-                            // templates without it behave byte-identically.
-                            args: String::new(),
+                            // Validated above; substitutes literally in the
+                            // same single pass, never re-scanned.
+                            args,
                         });
                 // A stored row can predate or bypass definition-time
                 // validation (import, corruption): re-validate before
@@ -555,13 +577,22 @@ impl CustomCommandRuntime {
         // that ordering is pinned by the helper's unit tests.
         let user_mention = format!("<@{}>", message.author.id);
         let channel_mention = format!("<#{}>", message.channel_id);
-        // Remainder capture lands with the run-path slice; until then the
-        // prefix path substitutes empty, so `{args}`-free rows send
-        // byte-identically and new `{args}` rows echo nothing.
+        // Remainder after the trigger token is the `{args}` input verbatim.
+        // The attempt is already claimed, so over-long input refuses before
+        // any send with a definitive failed result — no channel correction,
+        // mirroring render failures.
+        let args = capture_prefix_args(&message.content);
+        if validate_args(args).is_err() {
+            let record =
+                AuditRecord::run(&guild, &actor, &row.name, false, Some(ARGS_TOO_LONG_REASON));
+            self.audit(&record, &format!("custom:text:result:{}", message.id))
+                .await?;
+            return Err(CustomCommandError::Render);
+        }
         let rendered = render_prefix_response(
             guild_name,
             &row.template,
-            "",
+            args,
             &user_mention,
             &message.author.name,
             &channel_mention,
@@ -645,6 +676,31 @@ impl CustomCommandRuntime {
             }
             _ => Ok(false),
         }
+    }
+
+    /// Answer a slash `{args}` validation refusal directly: one ephemeral
+    /// fixed-text correction, never via the public defer, with no audit row.
+    /// Same bounded pre-wire retry as routing refusals; any transport failure
+    /// maps to `Delivery` (nothing was deferred or executed, so there is no
+    /// double-record risk).
+    async fn answer_args_refusal(
+        &self,
+        interaction: &Interaction,
+        received: tokio::time::Instant,
+        body: &str,
+    ) -> Result<bool, CustomCommandError> {
+        tokio::time::timeout_at(
+            received + Duration::from_millis(crate::executor::RECEIPT_ADMISSION_BUDGET_MS),
+            self.executor.answer_interaction_with_blocked_retry(
+                interaction.id.get(),
+                &interaction.token,
+                &text_response(InteractionReply::new(body, true)),
+            ),
+        )
+        .await
+        .map_err(|_| CustomCommandError::Delivery)?
+        .map_err(|_| CustomCommandError::Delivery)?;
+        Ok(true)
     }
 
     async fn defer(
@@ -790,8 +846,11 @@ impl CustomCommandRuntime {
                 None => return invalid_inspect_view_reply(Some(raw)),
             },
         };
-        match single_string_option(data, "arguments") {
-            SingleOption::Missing => {}
+        // The validated sample is the preview `{args}` input (dry-run only:
+        // never sent, never audited). Slash and prefix runs substitute only
+        // captured invocation text.
+        let sample_args = match single_string_option(data, ARGS_OPTION_NAME) {
+            SingleOption::Missing => String::new(),
             SingleOption::Malformed => {
                 return invalid_inspect_option_reply(
                     "arguments",
@@ -805,9 +864,10 @@ impl CustomCommandRuntime {
                         "sample arguments must be at most 500 characters.",
                     );
                 }
+                sample.to_owned()
             }
-        }
-        // Both preview modes use invocation context, never sample arguments.
+        };
+        // Both preview modes use invocation context plus the sample arguments.
         let context = || {
             interaction
                 .author()
@@ -818,9 +878,7 @@ impl CustomCommandRuntime {
                     username: actor.name.clone(),
                     server: server.to_owned(),
                     channel: format!("<#{}>", channel.id),
-                    // The sample stays out of the render until the preview
-                    // slice makes it the preview input; see the run path.
-                    args: String::new(),
+                    args: sample_args.clone(),
                 })
         };
         if let Some(draft) = draft {
