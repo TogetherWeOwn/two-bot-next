@@ -24,7 +24,7 @@ async fn snapshot_bot_activity_and_checkpoint_commit_or_roll_back_together() {
     two_bot_store::apply_web_contract(&db.pool).await.unwrap();
     db.store
         .commit_dispatch(
-            &checkpoint("atomic", 1, "ws://mock"),
+            &checkpoint("atomic", 1, RESUME_URL),
             FunnelBatch {
                 snapshots: vec![SnapshotWrite::StoreAll(2222, vec![invite(1)])],
                 ..Default::default()
@@ -46,7 +46,7 @@ async fn snapshot_bot_activity_and_checkpoint_commit_or_roll_back_together() {
     };
     assert!(db
         .store
-        .commit_dispatch(&checkpoint("atomic", 2, "ws://mock"), bad)
+        .commit_dispatch(&checkpoint("atomic", 2, RESUME_URL), bad)
         .await
         .is_err());
     assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 1);
@@ -63,7 +63,7 @@ async fn snapshot_bot_activity_and_checkpoint_commit_or_roll_back_together() {
 
     db.store
         .commit_dispatch(
-            &checkpoint("atomic", 2, "ws://mock"),
+            &checkpoint("atomic", 2, RESUME_URL),
             FunnelBatch {
                 bots: vec![(2222, 77)],
                 snapshots: vec![SnapshotWrite::StoreAll(2222, vec![invite(2)])],
@@ -103,7 +103,7 @@ async fn snapshot_bot_activity_and_checkpoint_commit_or_roll_back_together() {
     assert_eq!(
         db.store
             .commit_dispatch(
-                &checkpoint("atomic", 2, "ws://mock"),
+                &checkpoint("atomic", 2, RESUME_URL),
                 FunnelBatch {
                     snapshots: vec![SnapshotWrite::StoreAll(2222, vec![invite(99)])],
                     ..Default::default()
@@ -123,7 +123,7 @@ async fn persistent_pipeline_hydrates_invites_and_stages_bot_departure_on_restar
     let db = TestDb::new().await;
     db.store
         .commit_dispatch(
-            &checkpoint("restart", 1, "ws://mock"),
+            &checkpoint("restart", 1, RESUME_URL),
             FunnelBatch {
                 snapshots: vec![SnapshotWrite::StoreAll(2222, vec![invite(7)])],
                 ..Default::default()
@@ -171,7 +171,7 @@ async fn persistent_pipeline_hydrates_invites_and_stages_bot_departure_on_restar
     assert_eq!(batch.bots, vec![(2222, 77)]);
     assert_eq!(batch.events[0].occurred_at, "2026-09-30T04:00:01.000Z");
     db.store
-        .commit_dispatch(&checkpoint("restart", 2, "ws://mock"), batch)
+        .commit_dispatch(&checkpoint("restart", 2, RESUME_URL), batch)
         .await
         .unwrap();
     let bot: bool = sqlx::query_scalar("SELECT is_bot FROM members WHERE member_id = '77'")

@@ -8,11 +8,11 @@ use super::*;
 
 mod opening_acceptance;
 
-async fn seed(case: &Case, url: &str, seq: u64) {
+async fn seed(case: &Case, seq: u64) {
     let (action, id) = case
         .store()
         .commit_dispatch_with_job(
-            &checkpoint(SESSION, seq, url),
+            &checkpoint(SESSION, seq, RESUME_URL),
             FunnelBatch::default(),
             Some(GatewayJob {
                 payload: queued_welcome().durable_payload().unwrap(),
@@ -87,13 +87,7 @@ async fn spawn_with_shutdown(
 ) -> Runner {
     let store = case.store();
     let saved = load_boot_session(&store).await.unwrap();
-    let config = crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), saved.as_ref());
-    let shard = Shard::with_config(
-        ShardId::ONE,
-        ConfigBuilder::from(config)
-            .proxy_url(url.to_owned())
-            .build(),
-    );
+    let shard = shard_with_transport(saved.as_ref(), Intents::empty(), url, url);
     let pipeline = Arc::new(build_pipeline(store.milestones().await.unwrap(), None));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
     let task = tokio::spawn(run_shard(
@@ -156,7 +150,7 @@ async fn recovered_terminal(evidence: Evidence) {
     let (mock, state) = recipient_discord(evidence).await;
     let result = bounded(async {
         let mut ws = gateway(true).await;
-        seed(&case, &ws.mock.url, 2).await;
+        seed(&case, 2).await;
         interrupted(&case).await;
         case.assert_unsent(&mock).await;
         let runner = spawn(&case, &mock, &ws.mock.url).await;
@@ -207,21 +201,12 @@ async fn wait_failure(case: &Case, runner: &Runner) {
     }).await.expect("recipient failure must stop the worker within a bounded evidence budget");
 }
 
-async fn repoint(case: &Case, url: &str) {
-    sqlx::query("UPDATE gateway_sessions SET resume_url = $1 WHERE guild_id = $2 AND shard_id = 0")
-        .bind(url)
-        .bind(GUILD)
-        .execute(case.pool())
-        .await
-        .expect("replace only the local mock port");
-}
-
 async fn recovered_retryable(evidence: Evidence) {
     let case = Case::new().await;
     let (mock, state) = recipient_discord(evidence).await;
     let result = bounded(async {
         let mut first = gateway(true).await;
-        seed(&case, &first.mock.url, 2).await;
+        seed(&case, 2).await;
         interrupted(&case).await;
         let runner = spawn(&case, &mock, &first.mock.url).await;
         assert_cold(&runner);
@@ -242,7 +227,6 @@ async fn recovered_retryable(evidence: Evidence) {
 
         state.lock().unwrap().evidence = Evidence::ChangedRoles;
         let mut second = gateway(true).await;
-        repoint(&case, &second.mock.url).await;
         let runner = spawn(&case, &mock, &second.mock.url).await;
         assert_cold(&runner);
         authenticate(&case, &mut second).await;
@@ -311,7 +295,7 @@ async fn onboarding_recipient_recovery_renders_current_not_captured_role_default
     let (mock, _) = recipient_discord(Evidence::ChangedRoles).await;
     let result = bounded(async {
         let mut ws = gateway(true).await;
-        seed(&case, &ws.mock.url, 2).await;
+        seed(&case, 2).await;
         interrupted(&case).await;
         let runner = spawn(&case, &mock, &ws.mock.url).await;
         assert_cold(&runner);
@@ -335,9 +319,9 @@ async fn onboarding_recipient_recovery_concurrent_valid_jobs_and_sequence_redeli
     let (mock, _) = recipient_discord(Evidence::Valid).await;
     let result = bounded(async {
         let mut ws = gateway(true).await;
-        seed(&case, &ws.mock.url, 2).await;
+        seed(&case, 2).await;
         interrupted(&case).await;
-        seed(&case, &ws.mock.url, 3).await;
+        seed(&case, 3).await;
         let runner = spawn(&case, &mock, &ws.mock.url).await;
         assert_cold(&runner);
         let auth = ws.mock.authentication().await;
@@ -378,7 +362,7 @@ async fn onboarding_recipient_recovery_persistent_failure_preserves_three_claim_
     let (mock, _) = recipient_discord(Evidence::Forbidden).await;
     let result = bounded(async {
         let mut first = gateway(true).await;
-        seed(&case, &first.mock.url, 2).await;
+        seed(&case, 2).await;
         interrupted(&case).await;
         let runner = spawn(&case, &mock, &first.mock.url).await;
         assert_eq!(first.mock.authentication().await["op"], 6);
@@ -389,7 +373,6 @@ async fn onboarding_recipient_recovery_persistent_failure_preserves_three_claim_
         case.assert_unsent(&mock).await;
         drop(first);
         let mut second = gateway(true).await;
-        repoint(&case, &second.mock.url).await;
         let runner = spawn(&case, &mock, &second.mock.url).await;
         assert_eq!(second.mock.authentication().await["op"], 6);
         second.send(resumed(2)).await;

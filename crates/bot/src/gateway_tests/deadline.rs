@@ -95,11 +95,6 @@ async fn checkpoint_lock_wait_fails_closed_before_heartbeat_and_restart_recovers
     assert_eq!(db.count().await, 0);
 
     let mut second = MockGateway::new(false, true).await;
-    sqlx::query("UPDATE gateway_sessions SET resume_url = $1")
-        .bind(&second.url)
-        .execute(&db.pool)
-        .await
-        .unwrap();
     let (runner, state) = spawn_runner(&db, &second.url).await;
     let auth = second.authentication().await;
     assert_eq!(auth["op"], 6);

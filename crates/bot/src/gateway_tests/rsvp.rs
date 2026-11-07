@@ -67,8 +67,7 @@ async fn spawn_with_shutdown(
 ) -> JoinHandle<Result<(), sqlx::Error>> {
     ensure_crypto_provider();
     let saved = load_boot_session(&db.store).await.unwrap();
-    let shard =
-        crate::gateway::build_shard(TOKEN.into(), Intents::empty(), saved.as_ref(), Some(url));
+    let shard = shard_with_transport(saved.as_ref(), Intents::empty(), url, url);
     tokio::spawn(run_shard(
         shard,
         Arc::new(build_pipeline(db.store.milestones().await.unwrap(), None)),
@@ -739,7 +738,7 @@ async fn resumed_startup_publishes_full_registry_without_ready() {
     let mut gateway = MockGateway::new(false, true).await;
     db.store
         .commit_dispatch(
-            &checkpoint("persisted-session", 2, &gateway.url),
+            &checkpoint("persisted-session", 2, RESUME_URL),
             FunnelBatch::default(),
         )
         .await

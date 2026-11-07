@@ -6,7 +6,7 @@ async fn rejected_close(code: u16) {
     let mut mock = MockGateway::with_close(false, false, Some(code)).await;
     db.store
         .commit_dispatch(
-            &checkpoint("rejected", 42, &mock.url),
+            &checkpoint("rejected", 42, RESUME_URL),
             FunnelBatch::default(),
         )
         .await
@@ -18,7 +18,7 @@ async fn rejected_close(code: u16) {
     wait_sequence(&db.store, 2).await;
     let saved = db.store.load().await.unwrap().unwrap();
     assert_eq!(saved.session_id, "fresh-session");
-    assert_eq!(saved.resume_url, mock.url);
+    assert_eq!(saved.resume_url, RESUME_URL);
     assert_eq!(db.count().await, 1);
     wait_connected(&state).await;
     assert!(!runner.is_finished());
@@ -45,22 +45,31 @@ async fn close_4009_identifies_and_replaces_checkpoint() {
 async fn failed_saved_endpoint_resumes_and_commits_with_saved_ready_url() {
     let db = TestDb::new().await;
     let mut mock = MockGateway::new(false, true).await;
-    let saved_url = "ws://127.0.0.1:1";
+    // The saved logical URL is trusted; its (dead) transport is the test seam.
+    let dead_transport = "ws://127.0.0.1:1";
     db.store
         .commit_dispatch(
-            &checkpoint("fresh-session", 2, saved_url),
+            &checkpoint("fresh-session", 2, RESUME_URL),
             FunnelBatch::default(),
         )
         .await
         .expect("seed");
-    let (runner, state) = spawn_runner(&db, &mock.url).await;
+    let (runner, state) = spawn_runner_on(
+        &db,
+        &mock.url,
+        dead_transport,
+        None,
+        None,
+        std::future::pending(),
+    )
+    .await;
     let auth = mock.authentication().await;
     assert_eq!(auth["op"], 6);
     assert_eq!(auth["d"]["session_id"], "fresh-session");
     assert_eq!(auth["d"]["seq"], 2);
     wait_sequence(&db.store, 3).await;
     let saved = db.store.load().await.unwrap().unwrap();
-    assert_eq!(saved.resume_url, saved_url);
+    assert_eq!(saved.resume_url, RESUME_URL);
     assert_eq!(db.count().await, 0, "replayed leave must be skipped");
     wait_connected(&state).await;
     assert!(!runner.is_finished());
@@ -129,11 +138,6 @@ async fn persistence_failure_stops_service_and_restart_recovers_committed_sequen
     // Simulate the Container restarting after DB recovery: no old pipeline
     // state or uncommitted sequence is reused.
     let mut second = MockGateway::new(false, true).await;
-    sqlx::query("UPDATE gateway_sessions SET resume_url = $1")
-        .bind(&second.url)
-        .execute(&db.pool)
-        .await
-        .expect("mock endpoint");
     let (runner, state) = spawn_runner(&db, &second.url).await;
     let auth = second.authentication().await;
     assert_eq!(auth["op"], 6);

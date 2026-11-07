@@ -62,7 +62,7 @@ async fn recovery_finishes_after_ready(resume: bool) {
     let locks = case.db.independent_pool().await.expect("owned lock pool");
     let result = bounded(async {
         let (mut ws, connected) = controlled_gateway().await;
-        seed_opening(&case, &ws.mock.url, resume).await;
+        seed_opening(&case, resume).await;
         interrupted(&case).await;
         let runner = spawn(&case, &mock, &ws.mock.url).await;
         connected.await.expect("connected local gateway");

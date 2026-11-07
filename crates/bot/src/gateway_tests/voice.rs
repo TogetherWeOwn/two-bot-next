@@ -439,7 +439,7 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
     let mut mock = cold_voice_gateway(release.clone()).await;
     db.store
         .commit_dispatch(
-            &checkpoint("saved-session", 2, &mock.url),
+            &checkpoint("saved-session", 2, RESUME_URL),
             FunnelBatch {
                 events: vec![event(EventType::MemberLeave, "2026-09-30T00:00:00.000Z")],
                 ..Default::default()
@@ -482,11 +482,11 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
     });
     ensure_crypto_provider();
     let saved = load_boot_session(&db.store).await.unwrap();
-    let shard = crate::gateway::build_shard(
-        TOKEN.into(),
-        two_bot_discord::gateway_intents(false),
+    let shard = shard_with_transport(
         saved.as_ref(),
-        Some(&mock.url),
+        two_bot_discord::gateway_intents(false),
+        &mock.url,
+        &mock.url,
     );
     let pipeline = Arc::new(build_pipeline(db.store.milestones().await.unwrap(), None));
     let state = Arc::new(RwLock::new(GatewayState::Armed));

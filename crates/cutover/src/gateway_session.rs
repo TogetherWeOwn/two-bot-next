@@ -9,12 +9,22 @@ use sqlx::{PgConnection, PgPool};
 use two_bot_core::analytics_family::{category_of_event, AnalyticsCategory};
 use two_bot_core::gateway_funnel::{FunnelBatch, SnapshotWrite};
 use two_bot_core::gateway_session::{
-    dispatch_action, BootDirective, DispatchAction, GatewaySession,
+    dispatch_action, is_valid_resume_url, BootDirective, DispatchAction, GatewaySession,
 };
 use two_bot_core::privacy::{inviter_in_metadata, scrubbed_member_join_metadata};
 use two_bot_core::{format_iso_millis, idempotency_key, EventType, FunnelEvent};
 
 use crate::db::{project_event, FunnelWrite};
+
+// Preserve the committed cursor and effects even when no resumable endpoint is
+// available. An empty URL makes boot policy discard the checkpoint and IDENTIFY.
+fn persisted_resume_url(value: &str) -> &str {
+    if is_valid_resume_url(value) {
+        value
+    } else {
+        ""
+    }
+}
 
 /// A captured feature job, not a second owner of membership funnel facts.
 /// Payloads must contain data only, never credentials or callback tokens.
@@ -84,7 +94,7 @@ impl GatewaySessionStore {
             Ok(GatewaySession {
                 session_id,
                 sequence: u64::try_from(sequence).map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
-                resume_url,
+                resume_url: persisted_resume_url(&resume_url).to_owned(),
                 updated_at_ms,
             })
         })
@@ -539,7 +549,7 @@ impl GatewaySessionStore {
              session_id = EXCLUDED.session_id, seq = EXCLUDED.seq,
              resume_url = EXCLUDED.resume_url, updated_at = EXCLUDED.updated_at",
         ).bind(&self.guild_id).bind(self.shard_id).bind(&session.session_id)
-            .bind(sequence).bind(&session.resume_url).bind(session.updated_at_ms)
+            .bind(sequence).bind(persisted_resume_url(&session.resume_url)).bind(session.updated_at_ms)
             .execute(&mut *tx).await?;
         tx.commit().await?;
         Ok((DispatchAction::Apply, job_id))
@@ -686,5 +696,27 @@ impl GatewaySessionStore {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::persisted_resume_url;
+
+    #[test]
+    fn persisted_endpoints_keep_valid_urls_and_empty_invalid_ones() {
+        for valid in ["wss://discord.gg", "wss://gateway.discord.gg:443/?v=10"] {
+            assert_eq!(persisted_resume_url(valid), valid);
+        }
+        for invalid in [
+            "",
+            "ws://gateway.discord.gg",
+            "wss://gateway.example.com",
+            "wss://discord.gg.example.com",
+            "wss://user@gateway.discord.gg",
+            "wss://gateway.discord.gg:8443",
+        ] {
+            assert_eq!(persisted_resume_url(invalid), "");
+        }
     }
 }

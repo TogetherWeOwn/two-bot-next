@@ -225,7 +225,7 @@ impl MockDiscord {
         let api = format!("http://{}", rest_listener.local_addr().unwrap());
         let (auth_tx, auth) = mpsc::channel(2);
         let (release, mut gates) = mpsc::channel(4);
-        let resume_url = url.clone();
+        let resume_url = "wss://gateway.discord.gg";
         let task = tokio::spawn(async move {
             for boot in 0..2 {
                 let (stream, _) = ws_listener.accept().await.unwrap();

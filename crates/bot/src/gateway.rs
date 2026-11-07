@@ -27,8 +27,8 @@ use twilight_gateway::{Event, EventTypeFlags, Intents, Message, Session, Shard, 
 use two_bot::voice_rooms::{build_production_runtime, VoiceEventSink};
 use two_bot_core::gateway_funnel::GatewayFunnelBuffer;
 use two_bot_core::gateway_session::{
-    boot_action_with, dispatch_action, invalidates_session, BootAction, DispatchAction,
-    GatewaySession,
+    boot_action_with, dispatch_action, invalidates_session, is_valid_resume_url, BootAction,
+    DispatchAction, GatewaySession,
 };
 use two_bot_core::{AutomodPolicy, ComponentStatus, Config, InviteState, Snowflake};
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
@@ -1683,7 +1683,9 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         if header.op != 0 { continue; }
                         let sequence = header.s.ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing sequence".into()))?;
                         let session = session_snapshot(&shard).ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing session".into()))?;
-                        let resume_url = shard.resume_url().or_else(|| received.as_ref().filter(|saved| saved.session_id == session.id()).map(|saved| saved.resume_url.as_str()))
+                        let resume_url = shard.resume_url().filter(|url| is_valid_resume_url(url))
+                            .or_else(|| received.as_ref().filter(|saved| saved.session_id == session.id()).map(|saved| saved.resume_url.as_str()))
+                            .or_else(|| shard.resume_url())
                             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
                         let checkpoint = GatewaySession { session_id: session.id().to_owned(), sequence, resume_url: resume_url.to_owned(), updated_at_ms: two_bot_core::funnel::now_millis_for_test() };
                         // A dispatch with a valid session proves Discord accepted
@@ -2286,9 +2288,18 @@ pub fn build_shard(
 ) -> Shard {
     let config = build_shard_config(token, intents, session);
     let config = match gateway_url {
-        Some(url) => twilight_gateway::ConfigBuilder::from(config)
-            .proxy_url(url.to_owned())
-            .build(),
+        Some(url) => {
+            let mut builder =
+                twilight_gateway::ConfigBuilder::from(config).proxy_url(url.to_owned());
+            // The explicit loopback acceptance transport also handles RESUME,
+            // but only after the persisted endpoint passed the normal policy.
+            if is_loopback_gateway(url)
+                && session.is_some_and(|saved| is_valid_resume_url(&saved.resume_url))
+            {
+                builder = builder.resume_url(url.to_owned());
+            }
+            builder.build()
+        }
         None => config,
     };
     Shard::with_config(ShardId::ONE, config)
@@ -2311,7 +2322,7 @@ pub fn build_shard_config(
     let mut builder = ConfigBuilder::new(token, intents);
     // Both fields are required to resume the saved session at its proper URL.
     // Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.ConfigBuilder.html#method.session
-    if let Some(session) = session {
+    if let Some(session) = session.filter(|saved| is_valid_resume_url(&saved.resume_url)) {
         builder = builder
             .session(Session::new(session.sequence, session.session_id.clone()))
             .resume_url(session.resume_url.clone());
@@ -3093,6 +3104,55 @@ mod tests {
         assert!(result.is_err());
         assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(*state.read().await, GatewayState::Armed);
+    }
+
+    #[tokio::test]
+    async fn shard_configuration_only_restores_valid_resume_endpoints() {
+        ensure_crypto_provider();
+        for (resume_url, accepted) in [
+            ("wss://gateway.discord.gg", true),
+            ("wss://discord.gg:443/", true),
+            ("ws://gateway.discord.gg", false),
+            ("wss://gateway.example.com", false),
+            ("wss://discord.gg.example.com", false),
+            ("wss://user@gateway.discord.gg", false),
+            ("wss://gateway.discord.gg:8443", false),
+            ("", false),
+        ] {
+            let saved = GatewaySession {
+                session_id: "fixture-session".into(),
+                sequence: 42,
+                resume_url: resume_url.into(),
+                updated_at_ms: 0,
+            };
+            let shard = build_shard("token".into(), Intents::empty(), Some(&saved), None);
+            assert_eq!(shard.session().is_some(), accepted, "{resume_url}");
+            assert_eq!(
+                shard.resume_url(),
+                accepted.then_some(resume_url),
+                "{resume_url}"
+            );
+            if let Some(session) = shard.session() {
+                assert_eq!(session.id(), saved.session_id);
+                assert_eq!(session.sequence(), saved.sequence);
+            }
+            let loopback = "ws://127.0.0.1:1";
+            let mock = build_shard(
+                "token".into(),
+                Intents::empty(),
+                Some(&saved),
+                Some(loopback),
+            );
+            assert_eq!(mock.session().is_some(), accepted);
+            assert_eq!(mock.resume_url(), accepted.then_some(loopback));
+            let remote = build_shard(
+                "token".into(),
+                Intents::empty(),
+                Some(&saved),
+                Some("wss://gateway.example.com"),
+            );
+            assert_eq!(remote.resume_url(), accepted.then_some(resume_url));
+        }
     }
 
     #[tokio::test]

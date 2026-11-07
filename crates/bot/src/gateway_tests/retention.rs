@@ -150,19 +150,8 @@ async fn start_runner(
 ) -> RunningGateway {
     ensure_crypto_provider();
     let store = GatewaySessionStore::new(pool.clone(), RETENTION_GUILD.to_owned(), 0);
-    // Rebinding the synthetic websocket endpoint is fixture setup only.
-    sqlx::query("UPDATE gateway_sessions SET resume_url = $1")
-        .bind(&peer.url)
-        .execute(pool)
-        .await
-        .unwrap();
     let saved = load_boot_session(&store).await.unwrap();
-    let shard = crate::gateway::build_shard(
-        TOKEN.into(),
-        Intents::empty(),
-        saved.as_ref(),
-        Some(&peer.url),
-    );
+    let shard = shard_with_transport(saved.as_ref(), Intents::empty(), &peer.url, &peer.url);
     let pipeline = Arc::new(build_pipeline(store.milestones().await.unwrap(), None));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
     let (stop, rx) = watch::channel(false);

@@ -595,12 +595,12 @@ async fn cold_resume_publishes_complete_registry_and_uses_bootstrap_guild_name()
     let mut gateway = CommandGateway::start(45000).await;
     db.store
         .commit_dispatch(
-            &checkpoint("cold-session", 42, &gateway.url),
+            &checkpoint("cold-session", 42, RESUME_URL),
             FunnelBatch::default(),
         )
         .await
         .unwrap();
-    let (runner, state) = spawn_runner_with_commands(&db, "ws://127.0.0.1:1", Some(commands)).await;
+    let (runner, state) = spawn_runner_with_commands(&db, &gateway.url, Some(commands)).await;
     let auth = gateway.authentication().await;
     assert_eq!(auth["op"], 6);
     assert_eq!(auth["d"]["seq"], 42);
@@ -745,12 +745,7 @@ async fn slow_prefix_rest_commits_checkpoint_and_reservation_fences_resume() {
     let restarted_rest = MockRest::start(script, ScriptedResponse::status(500)).await;
     let commands = bootstrap(&db, &restarted_rest, &vars(Some("0"))).await;
     let mut gateway = CommandGateway::start(45000).await;
-    sqlx::query("UPDATE gateway_sessions SET resume_url = $1")
-        .bind(&gateway.url)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    let (runner, state) = spawn_runner_with_commands(&db, "ws://127.0.0.1:1", Some(commands)).await;
+    let (runner, state) = spawn_runner_with_commands(&db, &gateway.url, Some(commands)).await;
     let auth = gateway.authentication().await;
     assert_eq!(auth["op"], 6);
     assert_eq!(auth["d"]["seq"], 2);

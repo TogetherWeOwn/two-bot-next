@@ -44,6 +44,10 @@ mod voice;
 
 const GUILD: &str = "2222";
 const TOKEN: &str = "mock-token";
+/// Trusted synthetic logical resume endpoint. Fixtures persist and advertise
+/// this value; the mock's loopback socket is injected only at the transport
+/// seam ([`shard_with_transport`]), after the production config validation.
+const RESUME_URL: &str = "wss://gateway.discord.gg";
 
 /// `GatewaySessionStore` serializes every checkpoint on
 /// `pg_advisory_xact_lock(hashtextextended('gateway:{guild}:{shard}', 0))`.
@@ -198,7 +202,7 @@ fn event(kind: EventType, at: &str) -> FunnelEvent {
 async fn gateway_transaction_rolls_back_effects_and_sequence_and_rejects_replay() {
     let db = TestDb::new().await;
     let first = event(EventType::FirstMessage, "2026-09-29T12:00:00.000Z");
-    let saved = checkpoint("mock-session", 42, "ws://mock");
+    let saved = checkpoint("mock-session", 42, RESUME_URL);
     db.store
         .commit_dispatch(
             &saved,
@@ -232,7 +236,7 @@ async fn gateway_transaction_rolls_back_effects_and_sequence_and_rejects_replay(
         Some(EventType::SecondMessage)
     );
     changed_timestamp.occurred_at = "not-a-timestamp".into();
-    let bad = checkpoint("mock-session", 43, "ws://mock");
+    let bad = checkpoint("mock-session", 43, RESUME_URL);
     let batch = FunnelBatch {
         events: vec![
             event(EventType::SecondMessage, "2026-09-29T12:00:02.000Z"),
@@ -255,7 +259,7 @@ async fn gateway_transaction_rolls_back_effects_and_sequence_and_rejects_replay(
     assert_eq!(
         db.store
             .commit_dispatch(
-                &checkpoint("mock-session", 41, "ws://mock"),
+                &checkpoint("mock-session", 41, RESUME_URL),
                 FunnelBatch::default()
             )
             .await
@@ -264,7 +268,7 @@ async fn gateway_transaction_rolls_back_effects_and_sequence_and_rejects_replay(
     );
     db.store
         .commit_dispatch(
-            &checkpoint("new-session", 1, "ws://mock"),
+            &checkpoint("new-session", 1, RESUME_URL),
             FunnelBatch::default(),
         )
         .await
@@ -285,7 +289,7 @@ async fn gateway_transaction_rolls_back_effects_and_sequence_and_rejects_replay(
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn gateway_stale_session_is_cleared_before_boot() {
     let db = TestDb::new().await;
-    let mut saved = checkpoint("expired", 42, "ws://mock");
+    let mut saved = checkpoint("expired", 42, RESUME_URL);
     saved.updated_at_ms -= SESSION_MAX_AGE_MS + 1;
     db.store
         .commit_dispatch(&saved, FunnelBatch::default())
@@ -296,10 +300,124 @@ async fn gateway_stale_session_is_cleared_before_boot() {
     db.close().await;
 }
 
-fn ready(url: &str, session: &str) -> Value {
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn gateway_invalid_persisted_resume_url_is_cleared_before_boot() {
+    let db = TestDb::new().await;
+    let mut effects = 0;
+    for (index, raw) in [
+        "",
+        "ws://127.0.0.1:9",
+        "wss://gateway.discord.gg.evil.example",
+        "wss://user:pw@gateway.discord.gg",
+        "wss://gateway.discord.gg:8443",
+        "https://gateway.discord.gg",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Write normalization: an invalid logical URL is stored as empty while
+        // the dispatch effects, session and cursor still commit.
+        let written = format!("written-{index}");
+        db.store
+            .commit_dispatch(
+                &checkpoint(&written, 42, raw),
+                FunnelBatch {
+                    events: vec![event(
+                        EventType::MemberLeave,
+                        &format!("2026-09-29T12:00:0{index}.000Z"),
+                    )],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("commit with invalid logical URL");
+        effects += 1;
+        assert_eq!(db.count().await, effects, "{raw:?} effects must commit");
+        let stored: String = sqlx::query_scalar("SELECT resume_url FROM gateway_sessions")
+            .fetch_one(&db.pool)
+            .await
+            .expect("raw stored URL");
+        assert_eq!(stored, "", "{raw:?} must be normalized on write");
+        let kept = db.store.load().await.expect("load").expect("session kept");
+        assert_eq!(
+            (kept.session_id.as_str(), kept.sequence),
+            (written.as_str(), 42)
+        );
+        assert_eq!(kept.resume_url, "");
+        assert!(
+            load_boot_session(&db.store).await.expect("boot").is_none(),
+            "{raw:?} written row must not be offered for RESUME"
+        );
+        assert!(db.store.load().await.expect("load").is_none());
+
+        // Restore normalization: a raw row written outside commit_dispatch.
+        let tampered = format!("tampered-{index}");
+        db.store
+            .commit_dispatch(
+                &checkpoint(&tampered, 43, RESUME_URL),
+                FunnelBatch::default(),
+            )
+            .await
+            .expect("seed valid checkpoint");
+        sqlx::query("UPDATE gateway_sessions SET resume_url = $1")
+            .bind(raw)
+            .execute(&db.pool)
+            .await
+            .expect("tamper persisted URL");
+        let restored = db.store.load().await.expect("load").expect("session kept");
+        assert_eq!(
+            (
+                restored.session_id.as_str(),
+                restored.sequence,
+                restored.resume_url.as_str()
+            ),
+            (tampered.as_str(), 43, ""),
+            "{raw:?} must restore with an empty endpoint and the cursor intact"
+        );
+        assert!(
+            load_boot_session(&db.store).await.expect("boot").is_none(),
+            "{raw:?} must not be offered for RESUME"
+        );
+        assert!(
+            db.store.load().await.expect("load").is_none(),
+            "{raw:?} row must be cleared"
+        );
+        assert_eq!(
+            db.count().await,
+            effects,
+            "clearing keeps committed effects"
+        );
+    }
+    // A valid logical URL still resumes with its session and sequence.
+    db.store
+        .commit_dispatch(
+            &checkpoint("trusted", 7, RESUME_URL),
+            FunnelBatch::default(),
+        )
+        .await
+        .expect("seed trusted checkpoint");
+    let resumed = load_boot_session(&db.store)
+        .await
+        .expect("boot")
+        .expect("valid session resumes");
+    assert_eq!(
+        (
+            resumed.session_id.as_str(),
+            resumed.sequence,
+            resumed.resume_url.as_str()
+        ),
+        ("trusted", 7, RESUME_URL)
+    );
+    db.close().await;
+}
+
+/// READY always advertises the trusted logical [`RESUME_URL`]; the mock
+/// listener URL is accepted only so call sites name the peer they script.
+fn ready(_mock_url: &str, session: &str) -> Value {
     json!({"op":0,"s":1,"t":"READY","d":{
         "v":10,"user":{"id":"999","username":"mock-bot","discriminator":"0","mfa_enabled":false},
-        "session_id":session,"resume_gateway_url":url,"guilds":[],"application":{"id":"1111","flags":0}
+        "session_id":session,"resume_gateway_url":RESUME_URL,"guilds":[],"application":{"id":"1111","flags":0}
     }})
 }
 
@@ -481,6 +599,25 @@ async fn readiness_wait_has_a_bounded_deadline() {
     wait_connected(&RwLock::new(GatewayState::Armed)).await;
 }
 
+/// Production config (validation included) with the mock transport injected
+/// afterwards. Twilight dials the resume URL for a resumed session and the
+/// proxy URL otherwise, so both are pointed at the loopback mock. This is the
+/// only place a test loopback URL reaches a shard's connection settings; it is
+/// test-only and never changes what production persists or accepts.
+fn shard_with_transport(
+    saved: Option<&GatewaySession>,
+    intents: Intents,
+    proxy_url: &str,
+    resume_transport: &str,
+) -> Shard {
+    let config = crate::gateway::build_shard_config(TOKEN.into(), intents, saved);
+    let mut builder = ConfigBuilder::from(config).proxy_url(proxy_url.to_owned());
+    if saved.is_some() {
+        builder = builder.resume_url(resume_transport.to_owned());
+    }
+    Shard::with_config(ShardId::ONE, builder.build())
+}
+
 async fn spawn_runner(
     db: &TestDb,
     url: &str,
@@ -524,15 +661,32 @@ async fn spawn_runner_with_automod_until_shutdown(
     JoinHandle<Result<(), sqlx::Error>>,
     Arc<RwLock<GatewayState>>,
 ) {
+    spawn_runner_on(db, url, url, commands, automod, shutdown).await
+}
+
+/// `proxy_url` serves a fresh IDENTIFY; `resume_transport` serves a RESUME.
+/// Both are loopback test transports layered over the production config.
+async fn spawn_runner_on(
+    db: &TestDb,
+    proxy_url: &str,
+    resume_transport: &str,
+    commands: Option<Arc<crate::command_runtime::CommandRuntime>>,
+    automod: Option<Arc<crate::automod_gateway::ProductionAutomod>>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> (
+    JoinHandle<Result<(), sqlx::Error>>,
+    Arc<RwLock<GatewayState>>,
+) {
     ensure_crypto_provider();
     let saved = load_boot_session(&db.store)
         .await
         .expect("load boot session");
-    // Shard::with_config consumes session/resume_url out of Config, so inject
-    // the mock bootstrap URL before construction, using the production factory.
-    let config = crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), saved.as_ref());
-    let builder = ConfigBuilder::from(config).proxy_url(url.to_owned());
-    let shard = Shard::with_config(ShardId::ONE, builder.build());
+    let shard = shard_with_transport(
+        saved.as_ref(),
+        Intents::empty(),
+        proxy_url,
+        resume_transport,
+    );
     let pipeline = Arc::new(build_pipeline(
         db.store.milestones().await.expect("milestones"),
         None,
@@ -632,18 +786,13 @@ async fn gateway_resume_after_restart_has_no_duplicate_funnel_rows_and_is_ready(
     runner.abort();
     let _ = runner.await;
     first.task.abort();
-    // New pipeline and shard represent a new Container process. Repoint the
-    // mock-only URL because each local listener receives a new ephemeral port.
+    // New pipeline and shard represent a new Container process. The persisted
+    // logical URL is untouched; only the transport seam targets the new mock
+    // because each local listener receives a new ephemeral port.
     let mut second = MockGateway::new(false, true).await;
-    let mut saved = db.store.load().await.expect("load").expect("session");
-    // Preserve seq but update only the mock endpoint, not through commit_dispatch.
-    saved.resume_url = second.url.clone();
-    sqlx::query("UPDATE gateway_sessions SET resume_url = $1")
-        .bind(&saved.resume_url)
-        .execute(&db.pool)
-        .await
-        .expect("mock URL");
-    let (runner, state) = spawn_runner(&db, "ws://127.0.0.1:1").await;
+    let saved = db.store.load().await.expect("load").expect("session");
+    assert_eq!(saved.resume_url, RESUME_URL);
+    let (runner, state) = spawn_runner(&db, &second.url).await;
     let auth = second.authentication().await;
     assert_eq!(auth["op"], 6);
     assert_eq!(auth["d"]["seq"], 2);
@@ -664,7 +813,7 @@ async fn gateway_invalid_session_falls_back_to_identify_and_replaces_checkpoint(
     let mut mock = MockGateway::new(true, false).await;
     db.store
         .commit_dispatch(
-            &checkpoint("invalid-session", 42, &mock.url),
+            &checkpoint("invalid-session", 42, RESUME_URL),
             FunnelBatch::default(),
         )
         .await

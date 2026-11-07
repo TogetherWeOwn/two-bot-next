@@ -64,8 +64,8 @@ async fn controlled_gateway() -> (GatewayFixture, tokio::sync::oneshot::Receiver
     )
 }
 
-async fn seed_opening(case: &Case, url: &str, resume: bool) {
-    seed(case, url, 2).await;
+async fn seed_opening(case: &Case, resume: bool) {
+    seed(case, 2).await;
     if !resume {
         // Losing only the session must not remove accepted durable work.
         case.store().clear().await.unwrap();
@@ -125,7 +125,7 @@ async fn opening_requires_dispatch(authentication: Authentication) {
     let result = bounded(async {
         let (mut ws, connected) = controlled_gateway().await;
         let resume = !matches!(authentication, Authentication::IdentifyReady);
-        seed_opening(&case, &ws.mock.url, resume).await;
+        seed_opening(&case, resume).await;
         let runner = spawn(&case, &mock, &ws.mock.url).await;
         connected.await.expect("real mock WebSocket connected");
         assert_cold(&runner);
@@ -202,7 +202,7 @@ async fn onboarding_gateway_cooperative_shutdown_before_hello_preserves_unclaime
         let (mock, _) = recipient_discord(Evidence::Forbidden).await;
         let result = bounded(async {
             let (ws, connected) = controlled_gateway().await;
-            seed_opening(&case, &ws.mock.url, resume).await;
+            seed_opening(&case, resume).await;
             let original = row(&case, 2).await;
             let (shutdown, receiver) = tokio::sync::watch::channel(false);
             let mut runner = spawn_with_shutdown(&case, &mock, &ws.mock.url, Some(receiver)).await;
@@ -245,7 +245,7 @@ async fn omitted_flags_recovery(evidence: Evidence) {
     let (mock, _) = recipient_discord(evidence).await;
     let result = bounded(async {
         let mut ws = gateway(true).await;
-        seed(&case, &ws.mock.url, 2).await;
+        seed(&case, 2).await;
         interrupted(&case).await;
         let runner = spawn(&case, &mock, &ws.mock.url).await;
         assert_cold(&runner);
