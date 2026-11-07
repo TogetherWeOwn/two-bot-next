@@ -371,11 +371,116 @@ class EvidenceTests(unittest.TestCase):
         self.assertLess(diagnostic, workflow.index("name: Retain SBOMs"))
         step = workflow[diagnostic:workflow.index("name: Retain SBOMs")]
         self.assertIn("!cancelled() && steps.inventory.outcome == 'success'", step)
-        self.assertIn('python3 scripts/runtime-image-evidence.py "$IMAGE" sbom || status=$?', step)
+        self.assertIn('python3 scripts/runtime-image-evidence.py "$IMAGE" sbom --check-runtime || status=$?', step)
         self.assertIn("sha256sum runtime-image-evidence.json", step)
         self.assertLess(step.index("sha256sum runtime-image-evidence.json"), step.index('exit "$status"'))
         self.assertEqual(workflow.count("ignore-unfixed: false"), 2)
         self.assertEqual(workflow.count("exit-code: '1'"), 2)
+
+
+class RuntimeContractTests(unittest.TestCase):
+    def setUp(self):
+        self.image = ImageFixture()
+        self.image.entries.pop(evidence.STATUS_DIR + "zlib1g")
+        for package in evidence.RUNTIME_PACKAGES:
+            if package in ("libgcc-s1", "gcc-14-base"):
+                self.image.entries[evidence.STATUS_DIR + package] = (
+                    "file", control(package, "14.2.0-19", extra="Status: install ok installed\n").encode())
+                self.image.entries[f"usr/share/doc/{package}/copyright"] = ("file", b"GCC copyright fixture\n")
+            elif evidence.STATUS_DIR + package not in self.image.entries:
+                self.image.entries[evidence.STATUS_DIR + package] = ("file", control(package, "1.0").encode())
+        self.image.entries[f"{LIBS}/libm.so.6"] = ("file", b"libm")
+        self.image.entries[evidence.BINARY] = ("file", elf(("libc.so.6", "libm.so.6", "libgcc_s.so.1")))
+
+    def inspect(self):
+        return evidence.inspect_filesystem(self.image.archive(), check_runtime=True)
+
+    def test_allowed_needed_set_resolves_inside_zlib_free_image(self):
+        filesystem = self.inspect()
+        needed = filesystem["binary"]["needed"]
+        self.assertEqual(set(needed), {"libc.so.6", "libm.so.6", "libgcc_s.so.1"})
+        self.assertEqual({row["package"] for row in filesystem["installed_packages"]}, evidence.RUNTIME_PACKAGES)
+        for soname in needed:
+            self.assertEqual(needed[soname]["resolved"], f"/{LIBS}/{soname}")
+        self.image.entries[evidence.BINARY] = ("file", elf(("libc.so.6",)))
+        self.assertEqual(set(self.inspect()["binary"]["needed"]), {"libc.so.6"})
+
+    def test_libgcc_ownership_is_required(self):
+        name = evidence.STATUS_DIR + "libgcc-s1.md5sums"
+        manifest = self.image.entries.pop(name)
+        with self.assertRaisesRegex(ValueError, "libgcc_s.so.1 lacks libgcc-s1 ownership"):
+            self.inspect()
+        self.image.entries[name] = ("file", ("2" * 32 + "  usr/lib/other/libgcc_s.so.1\n").encode())
+        with self.assertRaisesRegex(ValueError, "libgcc_s.so.1 lacks libgcc-s1 ownership"):
+            self.inspect()
+        self.image.entries[name] = manifest
+        needed = self.inspect()["binary"]["needed"]
+        self.assertEqual(needed["libgcc_s.so.1"]["packages"], ["libgcc-s1"])
+
+    def test_unexpected_needed_fails_even_when_it_resolves(self):
+        self.image.entries[f"{LIBS}/libssl.so.3"] = ("file", b"libssl")
+        self.image.entries[evidence.BINARY] = ("file", elf(("libc.so.6", "libssl.so.3")))
+        with self.assertRaisesRegex(ValueError, "DT_NEEDED outside the allowed set"):
+            self.inspect()
+
+    def test_allowed_needed_must_resolve(self):
+        self.image.entries.pop(f"{LIBS}/libm.so.6")
+        with self.assertRaisesRegex(ValueError, "DT_NEEDED libm.so.6 does not resolve inside"):
+            self.inspect()
+
+    def test_unlinked_libz_files_and_links_are_rejected(self):
+        for path, entry in (("opt/libz.so.1", ("file", b"unused zlib")),
+                            (f"{LIBS}/libz.so", ("link", "missing"))):
+            with self.subTest(path=path):
+                self.image.entries[path] = entry
+                with self.assertRaisesRegex(ValueError, "libz.so file or link"):
+                    self.inspect()
+                self.image.entries.pop(path)
+
+    def test_missing_or_additional_packages_fail(self):
+        for package in ("libc6", "libgcc-s1", "gcc-14-base"):
+            with self.subTest(missing=package):
+                entry = self.image.entries.pop(evidence.STATUS_DIR + package)
+                with self.assertRaisesRegex(ValueError, "package inventory differs"):
+                    self.inspect()
+                self.image.entries[evidence.STATUS_DIR + package] = entry
+        self.image.entries[evidence.STATUS_DIR + "zlib1g"] = ("file", control("zlib1g", "1.3").encode())
+        with self.assertRaisesRegex(ValueError, "package inventory differs"):
+            self.inspect()
+
+    def test_copied_packages_keep_installed_status_version_and_copyright(self):
+        name = evidence.STATUS_DIR + "gcc-14-base"
+        self.image.entries[name] = ("file", control("gcc-14-base", "14.3.0-1").encode())
+        with self.assertRaisesRegex(ValueError, "versions differ"):
+            self.inspect()
+        self.image.entries[name] = ("file", control("gcc-14-base", "14.2.0-19").encode())
+        with self.assertRaisesRegex(ValueError, "installed dpkg status"):
+            self.inspect()
+        self.image.entries[name] = ("file", control("gcc-14-base", "14.2.0-19", extra="Status: install ok installed\n").encode())
+        self.image.entries.pop("usr/share/doc/gcc-14-base/copyright")
+        with self.assertRaisesRegex(ValueError, "copyright data"):
+            self.inspect()
+
+    def test_static_substitution_is_not_implicitly_accepted(self):
+        self.image.entries[evidence.BINARY] = ("file", elf(()))
+        with self.assertRaisesRegex(ValueError, "dynamically linked, inventoried glibc"):
+            self.inspect()
+
+    def test_cli_enforces_contract_and_retains_incomplete_evidence(self):
+        self.image.entries[f"{LIBS}/libm.so.6"] = ("link", "missing")
+        docker = FakeDocker(self.image)
+        with scratch() as temporary:
+            directory = Path(temporary)
+            (directory / "image-id.txt").write_text(IMAGE_ID + "\n")
+            (directory / "source-sha.txt").write_text(SOURCE_SHA + "\n")
+            with patch.object(evidence, "docker", docker), patch.object(sys, "argv", [
+                    "runtime-image-evidence.py", "two-bot:fixture", str(directory), "--check-runtime"]), \
+                    self.assertRaisesRegex(SystemExit, "does not resolve inside"):
+                evidence.main()
+            report = json.loads((directory / "runtime-image-evidence.json").read_text())
+        self.assertIs(report["complete"], False)
+        self.assertEqual(report["container"]["cleanup"]["status"], "removed")
+        self.assertEqual(docker.calls[-1][:2], ("rm", "--force"))
 
 
 class InspectShapeRegressionTests(unittest.TestCase):

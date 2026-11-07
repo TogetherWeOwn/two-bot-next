@@ -192,14 +192,14 @@ jobs:
       - name: Validate SBOM inventories and record checksums
         id: inventory
         run: |
-          python3 scripts/validate-sbom.py sbom/Cargo.lock sbom
+          python3 scripts/validate-sbom.py sbom/Cargo.lock sbom --check-runtime
           rm sbom/Cargo.lock
           (cd sbom && sha256sum *.cdx.json source-sha.txt image-id.txt > SHA256SUMS)
       - name: Collect exact-image applicability evidence
         if: ${{ !cancelled() && steps.inventory.outcome == 'success' }}
         run: |
           status=0
-          python3 scripts/runtime-image-evidence.py "$IMAGE" sbom || status=$?
+          python3 scripts/runtime-image-evidence.py "$IMAGE" sbom --check-runtime || status=$?
           (cd sbom && sha256sum runtime-image-evidence.json > runtime-image-evidence.sha256)
           exit "$status"
       - name: Bind findings to exact installed tuples (no acceptance, no suppression)
