@@ -526,14 +526,9 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
     // Registry-sync requests consumed by the per-boot assertion below.
     let mut consumed = 0usize;
     for boot in 0..2 {
-        // Restart with an unreachable bootstrap URL: RESUME must select the
-        // unchanged persisted endpoint rather than quietly IDENTIFY again.
-        let gateway = if boot == 0 {
-            &discord.url
-        } else {
-            "ws://127.0.0.1:1"
-        };
-        bots.push(Bot::spawn(db, addr, gateway, &discord.api, logs));
+        // Both boots use the explicit loopback transport; the persisted
+        // logical endpoint stays unchanged, and the second auth must RESUME.
+        bots.push(Bot::spawn(db, addr, &discord.url, &discord.api, logs));
         let bot = bots.last_mut().unwrap();
         let health = wait_http(bot, addr, "/healthz", 200).await;
         assert!(health.contains("\"status\":\"ok\""));
@@ -643,6 +638,11 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         );
         discord.release.send(()).await.unwrap();
         checkpoint(db, if boot == 0 { 2 } else { 3 }).await;
+        assert_eq!(
+            db.store().load().await.unwrap().unwrap().resume_url,
+            "wss://gateway.discord.gg",
+            "checkpoint keeps the logical endpoint on both boots"
+        );
         let ready = wait_http(bot, addr, "/readyz", 200).await;
         assert!(ready.contains("\"gateway\",\"ready\""));
         if boot == 0 {

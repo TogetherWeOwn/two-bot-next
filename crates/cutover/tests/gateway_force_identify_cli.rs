@@ -201,7 +201,7 @@ fn database_sql(operation: &str, name: &str) -> sqlx::AssertSqlSafe<String> {
 async fn dry_run_then_apply_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
     sqlx::query(
         "INSERT INTO gateway_sessions (guild_id, shard_id, session_id, seq, resume_url, updated_at)
-         VALUES ($1, 0, 'current-session', 42, 'ws://mock', now())",
+         VALUES ($1, 0, 'current-session', 42, 'wss://gateway.discord.gg', now())",
     )
     .bind(GUILD)
     .execute(&db.pool)
@@ -274,6 +274,26 @@ async fn dry_run_then_apply_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
     let report = db.run(GUILD, &["--guild", GUILD]);
     assert!(stdout(&report).contains("ARMED at"), "{}", stdout(&report));
     assert_eq!(db.snapshot().await?, after, "dry run wrote");
+
+    // A fresh row with a rejected endpoint must report IDENTIFY without
+    // rewriting either the checkpoint or its already-armed directive.
+    sqlx::query("UPDATE gateway_sessions SET resume_url = 'ws://mock'")
+        .execute(&db.pool)
+        .await?;
+    let invalid = db.snapshot().await?;
+    let report = db.run(GUILD, &["--guild", GUILD]);
+    assert_eq!(report.status.code(), Some(0), "{}", stderr(&report));
+    let body = stdout(&report);
+    assert!(
+        body.contains("would IDENTIFY"),
+        "rejected endpoint:\n{body}"
+    );
+    assert!(!body.contains("would RESUME"), "rejected endpoint:\n{body}");
+    assert_eq!(
+        db.snapshot().await?,
+        invalid,
+        "invalid endpoint dry run wrote"
+    );
     Ok(())
 }
 
