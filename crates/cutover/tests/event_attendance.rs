@@ -132,10 +132,25 @@ async fn lifecycle_stop_is_exported_without_advancing_last_capture() {
                 .count,
             Some(1)
         );
-        let mut lines = Vec::new();
-        two_bot_cutover::rollback_delta::export_delta(&pool, &baseline, &mut |line: String| {
-            lines.push(line);
-            Ok::<(), std::io::Error>(())
+        // The export's erased writer is not Send. Keep it on one blocking
+        // thread while the async fixture remains Send for panic-safe teardown.
+        let export_pool = pool.clone();
+        let export_baseline = baseline.clone();
+        let lines = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut lines = Vec::new();
+                two_bot_cutover::rollback_delta::export_delta(
+                    &export_pool,
+                    &export_baseline,
+                    &mut |line: String| {
+                        lines.push(line);
+                        Ok::<(), std::io::Error>(())
+                    },
+                )
+                .await
+                .unwrap();
+                lines
+            })
         })
         .await
         .unwrap();

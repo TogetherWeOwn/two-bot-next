@@ -1778,7 +1778,7 @@ async fn attendance_gateway_recovery_does_not_bridge_a_snapshot_occupant() {
         vec![VoiceMember {
             member_id: MEMBER,
             channel_id: CREATOR,
-            bot: false,
+            bot: Some(false),
         }],
     ));
     assert!(!recovery.capture_allowed(&worker.live));

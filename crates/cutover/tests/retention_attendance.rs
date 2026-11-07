@@ -451,7 +451,7 @@ async fn lifecycle_race(writer: Writer, first: First) {
                 run_retention(&pool, RetentionMode::Execute)
                     .await
                     .map(|_| ())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| format!("{error:?}"))
             })
         };
         let (writer_task, retention_task, first_parked, second_waiting);
