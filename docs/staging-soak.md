@@ -195,7 +195,8 @@ bounded stop/failure rule above remains mandatory for an incomplete attempt.
   [soak-entry-gates.md](soak-entry-gates.md)), which reads a committed JSONL
   tick log; there is no live producer. An offline pass verifies offline
   reconciliation only; it does not prove a deployed build, live event coverage
-  or staging acceptance. Classification remains unresolved as above.
+  or staging acceptance. Interrupting planned redeploys count as actual outages by default; the live
+  measurement/source gap remains unresolved, not their classification.
 
 The approved exercise set—three redeploys, two drops, Neon idle-hit and actual
 429 categories—still requires exact reviewed budgets, an independent stop and

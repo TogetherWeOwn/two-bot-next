@@ -71,6 +71,13 @@ class SoakChecklistTests(unittest.TestCase):
         self.assertIn("unexpired item retained", entries["s4-10"]["expected"])
         self.assertIn("only policy-expired", entries["s4-11"]["expected"])
 
+    def test_b2_planned_outages_keep_default_classification(self):
+        staging = " ".join((ROOT / "docs/staging-soak.md").read_text().split())
+        self.assertNotIn("Classification remains unresolved", staging)
+        acceptance = staging.split("## Acceptance", 1)[1]
+        self.assertIn("Interrupting planned redeploys count as actual outages by default", acceptance)
+        self.assertIn("measurement/source gap remains unresolved", acceptance)
+
     def test_unnumbered_section_ends_parity_table_scope(self):
         heading = "## 2. Non-command interactions"
         changed = self.parity.replace(heading,
