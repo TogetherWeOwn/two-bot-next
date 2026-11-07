@@ -18,7 +18,16 @@ point and its deletion budget are unchanged) and the exclusion window grows:
   bind the caller's exact SHA/deployment/expiry before live consumption
   without acquiring or releasing the caller's grant;
 * the scheduled rollback-proof orchestrator and production passive probes
-  hold nothing that waits on staging.
+  hold nothing that waits on staging;
+* deploy-production's ``soak`` is a job-level whole-window holder: only
+  ordinary guarded deploys enter it (never rollback or the live-SHA cure),
+  one original grant bound to the guarded SHA covers every live read from
+  baseline through the fresh interval, final probe and post-sample recheck,
+  an always-run release closes it, only lifecycle-only steps see the control
+  credential and the run/attempt evidence is always retained. No other
+  deploy-production node (workflow, guard, gates, recheck, production lane)
+  can wait on the staging group, and ``staging-soak-evidence`` is a pure
+  no-secret/no-environment/no-live-read publisher of a successful soak.
 
 Run with check.yml's scripts/ci unittest discovery. Only YAML and Python
 source are read; no workflow is dispatched and no Discord, database or deploy
@@ -49,6 +58,9 @@ USER_FLOW = "synthetic-user-flow.yml"
 CONTAINER = "staging-container-drill.yml"
 ROLLBACK = "staging-rollback-drill.yml"
 MCP = "staging-mcp-proveout.yml"
+PRODUCTION = "deploy-production.yml"
+SOAK = "soak"
+PUBLISHER = "staging-soak-evidence"
 INVOCATIONS = ("schedule", "workflow_dispatch", "workflow_call")
 EXPRESSION = "${{"
 
@@ -79,16 +91,18 @@ STANDALONE_HOLDERS = {(VOICE, "synthetic"): False,
                       (USER_FLOW, "staging"): True,
                       (CONTAINER, "container-drill"): False,
                       (ROLLBACK, "drill"): True,
-                      (MCP, "proveout"): False}
+                      (MCP, "proveout"): False,
+                      (PRODUCTION, SOAK): True}
 # Jobs that must hold nothing that can wait on the staging lifecycle.
 FREE_JOBS = {(USER_FLOW, "prod-passive"): "production passive probe",
-             (ROLLBACK, "proof"): "rollback-proof orchestrator"}
+             (ROLLBACK, "proof"): "rollback-proof orchestrator",
+             (PRODUCTION, "production"): "production deploy/rollback lane"}
 # Staging-touching jobs outside the lifecycle lock, each with a reason. A new
 # staging-touching job fails the inventory until it is classified here or
 # made a holder. Reclassify (do not silently extend) when one goes live.
+# The promotion soak was reclassified to a holder and its publisher must not
+# touch staging at all (promotion_soak_errors), so neither is exempt.
 EXEMPT = {
-    ("deploy-production.yml", "soak"): "production guard reads staging evidence",
-    ("deploy-production.yml", "staging-soak-evidence"): "production guard reads staging evidence",
     ("deploy-production.yml", "production"): "production deploy; staging origin is evidence input only",
     ("gradual-promote-proof.yml", "proof"): "passive: target lock refuses before any Cloudflare call",
     ("slow-burn-tracker.yml", "tracker"): "read-only /ops/metrics scrape",
@@ -455,12 +469,188 @@ def repository_errors(wfs, canonical):
     return errors
 
 
+def need_set(node):
+    needs = node.get("needs")
+    return {needs} if isinstance(needs, str) else set(needs or ())
+
+
+def squash(value):
+    return re.sub(r"\s+", "", str(value or ""))
+
+
+def expr(text):
+    return f"${{{{ {text} }}}}"
+
+
+GUARD_SHA = expr("needs.guard.outputs.sha")
+# Ordinary guarded deploy only: rollback and the live-SHA cure never queue on
+# staging. Every clause is required and the condition is a pure conjunction.
+SOAK_CLAUSES = ("needs.guard.outputs.skip == ''", "needs.guard.outputs.mode == 'deploy'",
+                "needs.guard.outputs.allow_unstaged != 'true'")
+# Any of these can re-admit a failed/cancelled/rollback path into a condition.
+WIDENING = ("||", "always()", "cancelled()", "failure()")
+MAX_SOAK_MINUTES = 40
+# A credential-bearing step may run exactly one lifecycle client command.
+LIFECYCLE_ONLY = re.compile(r"node wrangler/scripts/(?:staging-use(?:-pipeline)?\.mjs [a-z]+|"
+                            r"staging-soak-window\.mjs)")
+LIVE_READ = re.compile(r"STAGING_WORKER_URL|METRICS_SCRAPE_TOKEN|OWNERSHIP_CONTROL")
+SOAK_WINDOW = "staging-soak-window.mjs"
+BASELINE = "rest-5xx-counters.mjs"
+FINAL_PROBE = "promotion_regression_gate.py staging"
+STEP_OUTPUT = re.compile(r"\$\{\{\s*steps\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.[A-Za-z_][A-Za-z0-9_-]*\s*\}\}")
+SOAK_OUTPUT = re.compile(r"\$\{\{\s*needs\.soak\.outputs\.[A-Za-z_][A-Za-z0-9_-]*\s*\}\}")
+PUBLISHED = f"needs.{PUBLISHER}.result == 'success'"
+
+
+def soak_step_errors(job):
+    """Whole-window shape of the promotion soak's steps (spelling-agnostic)."""
+    errors = []
+    steps = list(job.get("steps") or [])
+    runs = [str(step.get("run", "")) for step in steps]
+    acquires = [i for i, step in enumerate(steps)
+                if "acquire" in staging_use_actions(runs[i])]
+    if len(acquires) != 1:
+        return [f"soak: must acquire exactly one original grant (found {len(acquires)})"]
+    start = acquires[0]
+    grant = steps[start]
+    gid = grant.get("id")
+    env = grant.get("env") or {}
+    if not gid or "if" in grant:
+        errors.append("soak: acquire must be an unconditional step with an id")
+    if squash(env.get("STAGING_USE_EXPECTED_SHA")) != squash(GUARD_SHA):
+        errors.append("soak: acquire must refuse any build but the guarded SHA")
+    if str(env.get("OWNERSHIP_CONTROL_TOKEN", "")) != OWNERSHIP_TOKEN:
+        errors.append("soak: acquire must use the staging control credential")
+    minutes, timeout = str(env.get("STAGING_USE_MINUTES", "")), str(job.get("timeout-minutes", ""))
+    if not (minutes.isdigit() and timeout.isdigit()
+            and 0 < int(minutes) <= int(timeout) <= MAX_SOAK_MINUTES):
+        errors.append("soak: grant and job must hold one literal bounded expiry "
+                      f"(0 < minutes <= timeout <= {MAX_SOAK_MINUTES})")
+    binding = {"STAGING_USE_EXPIRES_AT": expr(f"steps.{gid}.outputs.expires_at"),
+               "STAGING_USE_DEPLOYMENT": expr(f"steps.{gid}.outputs.deployment_id"),
+               "STAGING_USE_SHA": GUARD_SHA}
+    receipt = env.get("STAGING_USE_RECEIPT")
+
+    def find(predicate):
+        return [i for i, run in enumerate(runs) if predicate(run)]
+
+    windows = find(lambda run: SOAK_WINDOW in run)
+    baselines = find(lambda run: BASELINE in run)
+    outputs = job.get("outputs") or {}
+    judge_ids = {m.group(1) for v in outputs.values() for m in [STEP_OUTPUT.fullmatch(str(v).strip())] if m}
+    judges = [i for i, step in enumerate(steps) if step.get("id") in judge_ids and FINAL_PROBE in runs[i]]
+    readies = [i for i in find(lambda run: "ready" in staging_use_actions(run)) if i != start]
+    releases = find(lambda run: "release" in staging_use_actions(run))
+    if len(windows) != 1:
+        errors.append("soak: exactly one fresh live interval must be measured")
+    if not baselines:
+        errors.append("soak: baseline metrics missing")
+    if (len(judges) != 1 or set(outputs) != {"skip", "evidence"} or len(judge_ids) != 1
+            or not all(STEP_OUTPUT.fullmatch(str(v).strip()) for v in outputs.values())):
+        errors.append("soak: verdict outputs must come from the one final candidate probe")
+    if len(releases) != 1:
+        errors.append(f"soak: must release the original grant exactly once (found {len(releases)})")
+    if errors:
+        return errors
+    window, judge, release = windows[0], judges[0], releases[0]
+    after = [i for i in readies if judge < i < release]
+    if not (any(start < i < window for i in baselines) and start < window < judge):
+        errors.append("soak: grant, baseline, live interval and final probe out of order")
+    if not after:
+        errors.append("soak: original grant must be rechecked after final sampling, before release")
+    if "--baseline-counters" not in runs[judge]:
+        errors.append("soak: final probe must be judged against this window's baseline")
+    if squash(steps[window].get("env", {}).get("AUTO")) != squash(expr("needs.guard.outputs.auto")):
+        errors.append("soak: interval length must follow the guarded run's automatic flag")
+    for i in [window, *after, release]:
+        step = steps[i]
+        senv = step.get("env") or {}
+        names = ("STAGING_USE_EXPIRES_AT",) if i == release else tuple(binding)
+        if any(squash(senv.get(name)) != squash(binding[name]) for name in names):
+            errors.append(f"soak: step {i} is not bound to the original grant")
+        if senv.get("STAGING_USE_RECEIPT") != receipt:
+            errors.append(f"soak: step {i} writes a different lifecycle receipt")
+        if i != release and "if" in step:
+            errors.append(f"soak: step {i} can skip a lifecycle assertion")
+    guard = bare(steps[release].get("if"))
+    if not guard.startswith("always()") or f"steps.{gid}.outputs.expires_at" not in guard:
+        errors.append("soak: release must always run once the original expiry exists")
+    # Every live read (control, Worker or metrics) sits inside the grant.
+    for i, step in enumerate(steps):
+        if LIVE_READ.search(str(step)) and not start <= i <= release:
+            errors.append(f"soak: step {i} reads staging outside the held grant")
+    # Credential isolation: metrics/probe/artifact steps never see the token.
+    if "ownership_control" in str(job.get("env") or {}).lower():
+        errors.append("soak: job-level env leaks the staging control credential")
+    for i, step in enumerate(steps):
+        if "ownership_control" in str(step).lower() and not LIFECYCLE_ONLY.fullmatch(runs[i].strip()):
+            errors.append(f"soak: step {i} mixes the staging control credential with other work")
+    retained = [step for step in steps[release + 1:]
+                if "actions/upload-artifact@" in str(step.get("uses", ""))]
+    if not any(bare(step.get("if")) == "always()"
+               and {"github.run_id", "github.run_attempt"} <= set(
+                   re.findall(r"github\.run_(?:id|attempt)", str((step.get("with") or {}).get("name"))))
+               and str(receipt) in str((step.get("with") or {}).get("path"))
+               for step in retained):
+        errors.append("soak: lifecycle evidence must always be retained per run attempt")
+    return errors
+
+
+def promotion_soak_errors(wfs, canonical):
+    """deploy-production: soak is the only staging holder; publisher is pure."""
+    errors = []
+    workflow = wfs.get(PRODUCTION, {})
+    jobs = workflow.get("jobs") or {}
+    triggers = tuple(t for t in events(workflow) if t != "workflow_call")
+    # Production and its rollback must never queue behind staging.
+    for name, node in [("workflow", workflow)] + list(jobs.items()):
+        if name != SOAK and may_hold(node, "standalone", triggers, canonical):
+            errors.append(f"production coupling: {PRODUCTION} {name} can wait on staging")
+    soak = jobs.get(SOAK)
+    if soak is not None:
+        if need_set(soak) != {"guard"}:
+            errors.append("soak: must wait only on the guard, never a production-lane job")
+        condition = bare(soak.get("if"))
+        if (any(token in condition for token in WIDENING)
+                or not all(clause in condition for clause in SOAK_CLAUSES)):
+            errors.append("soak: only an ordinary guarded deploy may enter the staging window")
+        if "continue-on-error" in soak or any("continue-on-error" in s for s in soak.get("steps") or []):
+            errors.append("soak: a failed lifecycle or sample step must fail the soak")
+        errors += soak_step_errors(soak)
+    publisher = jobs.get(PUBLISHER)
+    if publisher is None:
+        errors.append("publisher: staging-soak-evidence missing")
+        return errors
+    condition = bare(publisher.get("if"))
+    if (SOAK not in need_set(publisher) or "needs.soak.result == 'success'" not in condition
+            # `!cancelled()` is harmless here: it is AND-ed with soak success.
+            or any(token in condition for token in ("||", "always()", "failure()"))
+            or "skipped" in condition):
+        errors.append("publisher: only a successful soak may qualify")
+    text = str(publisher)
+    if ("environment" in publisher or "secrets." in text or STAGING_TOUCH.search(text)
+            or re.search(r"vars\.STAGING", text) or "continue-on-error" in text):
+        errors.append("publisher: must hold no environment, secret or live staging input")
+    if (publisher.get("permissions") or {}) not in ({}, {"contents": "read"}):
+        errors.append("publisher: must hold no read/write scope beyond contents")
+    steps = publisher.get("steps") or []
+    if (len(steps) != 1 or "uses" in steps[0] or "if" in steps[0]
+            or not all(SOAK_OUTPUT.fullmatch(str(v).strip())
+                       for v in (steps[0].get("env") or {}).values())):
+        errors.append("publisher: must be one step republishing only soak outputs")
+    for name in ("production", "recheck"):
+        if PUBLISHED not in bare((jobs.get(name) or {}).get("if")):
+            errors.append(f"publisher: {name} must require the published soak verdict")
+    return errors
+
+
 def lifecycle_errors(wfs):
     errors = []
     canonical = canonical_group(wfs.get(DEPLOY, {}), errors)
     if canonical is None:
         return errors
-    for check in (window_errors, child_errors, standalone_errors, repository_errors):
+    for check in (window_errors, child_errors, standalone_errors, repository_errors,
+                  promotion_soak_errors):
         errors += check(wfs, canonical)
     return errors
 
@@ -541,7 +731,59 @@ def target_fixture(group=FIXTURE_GROUP):
     wfs[CONTAINER]["concurrency"] = dict(lock)
     wfs[ROLLBACK]["jobs"]["drill"]["concurrency"] = dict(lock)
     wfs[MCP]["concurrency"] = dict(lock)
+    jobs = wfs[PRODUCTION]["jobs"]
+    jobs[SOAK] = soak_fixture(dict(lock))
+    jobs[PUBLISHER] = publisher_fixture()
     return wfs
+
+
+FIXTURE_RECEIPT = "${{ runner.temp }}/fixture-use.ndjson"
+
+
+def soak_fixture(lock):
+    """Conceptual whole-window soak, deliberately spelled unlike #2004."""
+    url = {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"}
+    grant = {**url, "OWNERSHIP_CONTROL_TOKEN": OWNERSHIP_TOKEN,
+             "STAGING_USE_SHA": GUARD_SHA,
+             "STAGING_USE_DEPLOYMENT": expr("steps.grant.outputs.deployment_id"),
+             "STAGING_USE_EXPIRES_AT": expr("steps.grant.outputs.expires_at"),
+             "STAGING_USE_RECEIPT": FIXTURE_RECEIPT}
+    metrics = {**url, "METRICS_SCRAPE_TOKEN": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"}
+    return {
+        "needs": "guard", "if": " && ".join(SOAK_CLAUSES), "concurrency": lock,
+        "environment": {"name": "staging", "deployment": "false"}, "timeout-minutes": "40",
+        "outputs": {"skip": expr("steps.verdict.outputs.skip"),
+                    "evidence": expr("steps.verdict.outputs.evidence")},
+        "steps": [
+            {"uses": "actions/checkout@fixture"},
+            {"id": "grant", "env": {**url, "OWNERSHIP_CONTROL_TOKEN": OWNERSHIP_TOKEN,
+                                    "STAGING_USE_EXPECTED_SHA": GUARD_SHA, "STAGING_USE_MINUTES": "35",
+                                    "STAGING_USE_RECEIPT": FIXTURE_RECEIPT},
+             "run": "node wrangler/scripts/staging-use-pipeline.mjs begin"},
+            {"env": metrics, "run": "node wrangler/scripts/rest-5xx-counters.mjs --out b.json"},
+            {"env": {**grant, "AUTO": expr("needs.guard.outputs.auto")},
+             "run": "node wrangler/scripts/staging-soak-window.mjs"},
+            {"id": "verdict", "env": metrics,
+             "run": "python3 scripts/promotion_regression_gate.py staging --baseline-counters b.json"},
+            {"env": dict(grant), "run": "node wrangler/scripts/staging-use-pipeline.mjs consume"},
+            {"if": "always() && steps.grant.outputs.expires_at != ''",
+             "env": {key: grant[key] for key in ("STAGING_WORKER_URL", "OWNERSHIP_CONTROL_TOKEN",
+                                                 "STAGING_USE_EXPIRES_AT", "STAGING_USE_RECEIPT")},
+             "run": "node wrangler/scripts/staging-use-pipeline.mjs finish"},
+            {"if": "always()", "uses": "actions/upload-artifact@fixture",
+             "with": {"name": "fixture-${{ github.run_attempt }}-${{ github.run_id }}",
+                      "path": f"{FIXTURE_RECEIPT}\nb.json"}}]}
+
+
+def publisher_fixture():
+    return {"needs": ["guard", SOAK],
+            "if": "!cancelled() && needs.guard.result == 'success' && needs.soak.result == 'success'",
+            "permissions": {"contents": "read"},
+            "outputs": {"skip": expr("steps.publish.outputs.skip"),
+                        "evidence": expr("steps.publish.outputs.evidence")},
+            "steps": [{"id": "publish", "shell": "python3 {0}", "run": "print('republish')",
+                       "env": {"SKIP": expr("needs.soak.outputs.skip"),
+                               "EVIDENCE": expr("needs.soak.outputs.evidence")}}]}
 
 
 class RepositoryContractTests(unittest.TestCase):
@@ -946,6 +1188,213 @@ class LockOracleControls(unittest.TestCase):
     def test_duplicate_yaml_keys_cannot_hide_a_lock_or_trigger(self):
         with self.assertRaisesRegex(ValueError, "duplicate workflow key"):
             yaml.load("concurrency:\n  group: one\n  group: two\n", Loader=UniqueKeyLoader)
+
+
+def step_index(job, needle):
+    return next(i for i, step in enumerate(job["steps"]) if needle in str(step))
+
+
+class PromotionSoakControls(unittest.TestCase):
+    """Each mutation must be rejected on the fixture AND the checked-in YAML."""
+
+    def variants(self):
+        return (("fixture", target_fixture()), ("repository", load_all()))
+
+    def assert_mutation_rejected(self, mutate, claim):
+        for label, wfs in self.variants():
+            jobs = wfs[PRODUCTION]["jobs"]
+            mutate(wfs, jobs, jobs[SOAK], jobs[PUBLISHER])
+            with self.subTest(source=label, claim=claim):
+                errors = lifecycle_errors(wfs)
+                self.assertTrue(any(claim in e for e in errors), (claim, errors))
+
+    def test_soak_and_publisher_are_not_exempt(self):
+        self.assertNotIn((PRODUCTION, SOAK), EXEMPT)
+        self.assertNotIn((PRODUCTION, PUBLISHER), EXEMPT)
+        self.assertIs(STANDALONE_HOLDERS[(PRODUCTION, SOAK)], True)
+        for _, wfs in self.variants():
+            self.assertEqual(lifecycle_errors(wfs), [])
+
+    def test_missing_split_or_cancelling_soak_lock_is_rejected(self):
+        label = f"{PRODUCTION} {SOAK}:"
+        self.assert_mutation_rejected(lambda w, j, s, p: s.pop("concurrency"),
+                                      f"{label} must hold the lifecycle group exactly once")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: s.update(concurrency={"group": "staging-soak", "cancel-in-progress": "false"}),
+            f"{label} must hold the lifecycle group exactly once")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: s["concurrency"].update(group="${{ github.workflow }}-soak"),
+            f"{label} lifecycle group must resolve")
+        for cancel in ("true", None):
+            def cancelling(w, j, s, p, cancel=cancel):
+                if cancel is None:
+                    del s["concurrency"]["cancel-in-progress"]
+                else:
+                    s["concurrency"]["cancel-in-progress"] = cancel
+            self.assert_mutation_rejected(cancelling, "preserve the running job")
+        self.assert_mutation_rejected(lambda w, j, s, p: s.update(concurrency=s["concurrency"]["group"]),
+                                      f"{label} lifecycle lock must be a mapping")
+        # Split: the soak keeps the other historical spelling.
+        for _, wfs in self.variants():
+            canonical = wfs[DEPLOY]["concurrency"]["group"].casefold()
+            soak = wfs[PRODUCTION]["jobs"][SOAK]
+            soak["concurrency"]["group"] = next(g for g in LEGACY_GROUPS if g != canonical)
+            self.assertTrue(any("split lifecycle lock" in e for e in lifecycle_errors(wfs)))
+
+    def test_workflow_level_or_production_lane_coupling_is_rejected(self):
+        def workflow_level(w, j, s, p):
+            w[PRODUCTION]["concurrency"] = s.pop("concurrency")
+        self.assert_mutation_rejected(workflow_level, "must hold the lifecycle group at job level")
+        self.assert_mutation_rejected(workflow_level, "production coupling: deploy-production.yml workflow")
+        for name in ("guard", "recheck", "production", PUBLISHER):
+            def holder(w, j, s, p, name=name):
+                j[name]["concurrency"] = dict(s["concurrency"])
+            self.assert_mutation_rejected(holder, f"production coupling: {PRODUCTION} {name}")
+        # Unprovable expression group on the lane is treated as holding.
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: j["production"].update(concurrency={"group": "${{ vars.LANE }}"}),
+            "production coupling")
+        self.assert_mutation_rejected(lambda w, j, s, p: s.update(needs=["guard", "recheck"]),
+                                      "soak: must wait only on the guard")
+
+    def test_rollback_and_live_sha_cure_never_enter_staging(self):
+        for clause in SOAK_CLAUSES:
+            self.assert_mutation_rejected(
+                lambda w, j, s, p, c=clause: s.update({"if": s["if"].replace(c, "true")}),
+                "only an ordinary guarded deploy")
+        for widen in (" || needs.guard.outputs.mode == 'rollback'", " && always()", " && !cancelled()"):
+            self.assert_mutation_rejected(lambda w, j, s, p, x=widen: s.update({"if": s["if"] + x}),
+                                          "only an ordinary guarded deploy")
+
+    def test_original_grant_and_expiry_binding(self):
+        def acquire(s):
+            return s["steps"][step_index(s, "mjs begin")]
+        self.assert_mutation_rejected(lambda w, j, s, p: s["steps"].pop(step_index(s, "mjs begin")),
+                                      "exactly one original grant (found 0)")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: s["steps"].insert(step_index(s, SOAK_WINDOW), {
+                "env": acquire(s)["env"], "run": "node wrangler/scripts/staging-use-pipeline.mjs rebind"}),
+            "exactly one original grant (found 2)")
+        for value in ("", "${{ github.sha }}", "${{ inputs.sha }}"):
+            self.assert_mutation_rejected(
+                lambda w, j, s, p, v=value: acquire(s)["env"].update(STAGING_USE_EXPECTED_SHA=v),
+                "refuse any build but the guarded SHA")
+        self.assert_mutation_rejected(lambda w, j, s, p: acquire(s).update({"if": "success()"}),
+                                      "acquire must be an unconditional step")
+        for minutes, timeout in (("0", "40"), ("41", "41"), ("${{ inputs.minutes }}", "40"),
+                                 ("40", "39"), ("360", "360"), ("40", "")):
+            def bound(w, j, s, p, m=minutes, t=timeout):
+                acquire(s)["env"]["STAGING_USE_MINUTES"] = m
+                s["timeout-minutes"] = t
+            self.assert_mutation_rejected(bound, "one literal bounded expiry")
+        for needle in (SOAK_WINDOW, "mjs consume", "mjs finish"):
+            for var, value in (("STAGING_USE_EXPIRES_AT", "${{ github.run_id }}"),
+                               ("STAGING_USE_RECEIPT", "/tmp/other.ndjson")):
+                def rebound(w, j, s, p, n=needle, k=var, v=value):
+                    s["steps"][step_index(s, n)]["env"][k] = v
+                self.assert_mutation_rejected(rebound, "soak: step")
+        for needle in (SOAK_WINDOW, "mjs consume"):
+            self.assert_mutation_rejected(
+                lambda w, j, s, p, n=needle: s["steps"][step_index(s, n)]["env"].update(
+                    STAGING_USE_DEPLOYMENT="${{ steps.other.outputs.deployment_id }}"),
+                "not bound to the original grant")
+
+    def test_window_sample_and_recheck_order(self):
+        self.assert_mutation_rejected(lambda w, j, s, p: s["steps"].pop(step_index(s, SOAK_WINDOW)),
+                                      "exactly one fresh live interval")
+        def baseline_first(w, j, s, p):
+            s["steps"].insert(1, s["steps"].pop(step_index(s, BASELINE)))
+        self.assert_mutation_rejected(baseline_first, "out of order")
+        self.assert_mutation_rejected(baseline_first, "reads staging outside the held grant")
+        self.assert_mutation_rejected(lambda w, j, s, p: s["steps"].pop(step_index(s, "mjs consume")),
+                                      "rechecked after final sampling")
+        def recheck_early(w, j, s, p):
+            s["steps"].insert(step_index(s, SOAK_WINDOW) + 1, s["steps"].pop(step_index(s, "mjs consume")))
+        self.assert_mutation_rejected(recheck_early, "rechecked after final sampling")
+        for needle in (SOAK_WINDOW, "mjs consume"):
+            self.assert_mutation_rejected(
+                lambda w, j, s, p, n=needle: s["steps"][step_index(s, n)].update({"if": "false"}),
+                "can skip a lifecycle assertion")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: s["steps"][step_index(s, SOAK_WINDOW)]["env"].update(AUTO="true"),
+            "automatic flag")
+        def unjudged(w, j, s, p):
+            step = s["steps"][step_index(s, FINAL_PROBE)]
+            step["run"] = step["run"].replace("--baseline-counters", "--counters")
+        self.assert_mutation_rejected(unjudged, "against this window's baseline")
+        self.assert_mutation_rejected(lambda w, j, s, p: s["outputs"].update(evidence="{}"),
+                                      "verdict outputs must come from")
+
+    def test_failed_or_skipped_cleanup_is_rejected(self):
+        def release(s):
+            return s["steps"][step_index(s, "mjs finish")]
+        self.assert_mutation_rejected(lambda w, j, s, p: s["steps"].remove(release(s)),
+                                      "release the original grant exactly once (found 0)")
+        for guard in ("success()", "steps.grant.outputs.expires_at != ''", "always()"):
+            self.assert_mutation_rejected(lambda w, j, s, p, g=guard: release(s).update({"if": g}),
+                                          "release must always run")
+        self.assert_mutation_rejected(lambda w, j, s, p: release(s).update({"continue-on-error": "true"}),
+                                      "must fail the soak")
+        self.assert_mutation_rejected(lambda w, j, s, p: s.update({"continue-on-error": "true"}),
+                                      "must fail the soak")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: s["steps"].append({"env": {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"},
+                                                  "run": "curl \"$STAGING_WORKER_URL/readyz\""}),
+            "reads staging outside the held grant")
+
+    def test_control_credential_stays_in_lifecycle_only_steps(self):
+        for needle in (BASELINE, FINAL_PROBE, "upload-artifact"):
+            def leak(w, j, s, p, n=needle):
+                s["steps"][step_index(s, n)].setdefault("env", {})["OWNERSHIP_CONTROL_TOKEN"] = OWNERSHIP_TOKEN
+            self.assert_mutation_rejected(leak, "mixes the staging control credential")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: s.update(env={"OWNERSHIP_CONTROL_TOKEN": OWNERSHIP_TOKEN}),
+            "job-level env leaks")
+        def chained(w, j, s, p):
+            step = s["steps"][step_index(s, "mjs consume")]
+            step["run"] += "\nnode wrangler/scripts/rest-5xx-counters.mjs --out c.json"
+        self.assert_mutation_rejected(chained, "mixes the staging control credential")
+
+    def test_lifecycle_evidence_is_retained_per_attempt(self):
+        def artifact(s):
+            return s["steps"][step_index(s, "upload-artifact")]
+        self.assert_mutation_rejected(lambda w, j, s, p: s["steps"].remove(artifact(s)),
+                                      "always be retained per run attempt")
+        self.assert_mutation_rejected(lambda w, j, s, p: artifact(s).pop("if"),
+                                      "always be retained per run attempt")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: artifact(s)["with"].update(name="staging-soak-${{ github.run_id }}"),
+            "always be retained per run attempt")
+        self.assert_mutation_rejected(lambda w, j, s, p: artifact(s)["with"].update(path="b.json"),
+                                      "always be retained per run attempt")
+
+    def test_publisher_is_a_pure_successful_soak_republisher(self):
+        for condition in ("!cancelled() && (needs.soak.result == 'success' || needs.soak.result == 'skipped')",
+                          "always() && needs.soak.result == 'success'",
+                          "!cancelled() && needs.guard.result == 'success'"):
+            self.assert_mutation_rejected(lambda w, j, s, p, c=condition: p.update({"if": c}),
+                                          "only a successful soak may qualify")
+        self.assert_mutation_rejected(lambda w, j, s, p: p.update(needs="guard"),
+                                      "only a successful soak may qualify")
+        for change in ({"environment": {"name": "staging", "deployment": "false"}},
+                       {"env": {"T": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"}},
+                       {"env": {"U": "${{ vars.STAGING_WORKER_URL }}"}},
+                       {"continue-on-error": "true"}):
+            self.assert_mutation_rejected(lambda w, j, s, p, c=change: p.update(c),
+                                          "no environment, secret or live staging input")
+        self.assert_mutation_rejected(lambda w, j, s, p: p.update(permissions={"contents": "read", "actions": "read"}),
+                                      "no read/write scope beyond contents")
+        self.assert_mutation_rejected(lambda w, j, s, p: p["steps"].insert(0, {"uses": "actions/checkout@x"}),
+                                      "one step republishing only soak outputs")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: p["steps"][0]["env"].update(EVIDENCE="${{ needs.guard.outputs.sha }}"),
+            "one step republishing only soak outputs")
+        # Removing the publisher, or production/recheck no longer needing it.
+        self.assert_mutation_rejected(lambda w, j, s, p: j.pop(PUBLISHER), "staging-soak-evidence missing")
+        for name in ("production", "recheck"):
+            self.assert_mutation_rejected(
+                lambda w, j, s, p, n=name: j[n].update({"if": j[n]["if"].replace(PUBLISHED, "true")}),
+                f"{name} must require the published soak verdict")
 
 
 class ExistingSafetyControls(unittest.TestCase):
