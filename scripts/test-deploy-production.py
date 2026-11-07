@@ -701,7 +701,9 @@ class StaticGuardTests(unittest.TestCase):
         self.assertEqual("\n".join(job["environment"]),
                          "    environment:\n      name: staging\n      deployment: false")
         self.assertEqual(set(children(job["permissions"][1:], 6)), {"contents", "actions"})
-        self.assertEqual(int(value(job["timeout-minutes"])), 40)
+        # Keep ten minutes of cleanup headroom beyond the unchanged 40-minute
+        # grant pinned below; the job ceiling is not runtime authority.
+        self.assertEqual(int(value(job["timeout-minutes"])), 50)
         outputs = "\n".join(job["outputs"])
         self.assertIn("skip: ${{ steps.judge.outputs.skip }}", outputs)
         self.assertIn("evidence: ${{ steps.judge.outputs.evidence }}", outputs)
