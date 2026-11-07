@@ -44,13 +44,15 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: synthetic-user-flow
-  cancel-in-progress: false
-
+# No workflow-wide queue: a staging job waiting on a deployment must not
+# hold back a later production sample. Each environment serializes itself.
 jobs:
   staging:
     name: staging user-flow synthetic
+    # Job-level only: production passive alerting never takes this group.
+    concurrency:
+      group: staging-lifecycle
+      cancel-in-progress: false
     permissions:
       actions: read
       contents: read
@@ -109,6 +111,9 @@ jobs:
           python3 scripts/synthetic_alert.py --env staging --evidence "synthetic-staging-$RUN_ID.json" --post-only
   prod-passive:
     name: prod passive user-flow synthetic
+    concurrency:
+      group: synthetic-user-flow-production
+      cancel-in-progress: false
     permissions:
       actions: read
       contents: read

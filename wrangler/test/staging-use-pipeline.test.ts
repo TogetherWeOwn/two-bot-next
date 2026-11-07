@@ -97,6 +97,38 @@ test("begin persists attempt and chosen expiry before acquire, then acquires and
   assert.equal(result.use.phase, "active");
 });
 
+test("deploy begin pins the independent receipt before any mutation", async () => {
+  for (const over of [{ sha: SHA2 }, { deploymentId: "dep-2" }]) {
+    const f = fixture();
+    await assert.rejects(pipelineUse({ ...base, action: "begin", minutes: 30,
+      sha: SHA, deploymentId: "dep-1", ...over }, f.invoke, clock, f.emit), code("staging_identity_mismatch"));
+    assert.deepEqual(f.called(), ["status"]);
+    assert.equal(f.emitted.some((value) => value.action === "window"), false);
+    assert.equal(f.state.use, null);
+  }
+  for (const over of [{ sha: SHA }, { deploymentId: "dep-1" }, { sha: "bad", deploymentId: "dep-1" }]) {
+    const f = fixture();
+    await assert.rejects(pipelineUse({ ...base, action: "begin", minutes: 30, ...over }, f.invoke, clock, f.emit),
+      code("staging_identity_invalid"));
+    assert.deepEqual(f.calls, []);
+  }
+});
+
+test("deploy acquire-only preserves the existing rollout gate and fault-injection verdict", async () => {
+  const f = fixture({}, "ready");
+  const result = await pipelineUse({ ...base, action: "begin", minutes: 30,
+    sha: SHA, deploymentId: "dep-1", acquireOnly: true }, f.invoke, clock, f.emit);
+  assert.deepEqual(f.called(), ["status", "acquire"]);
+  assert.equal(result.action, "acquire");
+  assert.equal(result.use.phase, "active");
+  assert.equal(result.use.expiresAt, NOW + 30 * MINUTE);
+  assert.ok(f.log.indexOf("emit:window") < f.log.indexOf("call:acquire"));
+  const failing = fixture({}, "acquire");
+  await assert.rejects(pipelineUse({ ...base, action: "begin", minutes: 30, acquireOnly: true },
+    failing.invoke, clock, failing.emit), code("injected_acquire_failure"));
+  assert.deepEqual(failing.called(), ["status", "acquire"]);
+});
+
 test("begin accepts the 360 minute maximum", async () => {
   const f = fixture();
   await pipelineUse({ ...base, action: "begin", minutes: 360 }, f.invoke, clock, f.emit);
@@ -210,6 +242,7 @@ test("invalid arguments refuse before any invoke or receipt", async () => {
     [{ action: "begin", minutes: 30, runAttempt: Number.NaN }, "staging_run_invalid"],
     [{ action: "begin", minutes: 0 }, "staging_window_invalid"],
     [{ action: "begin", minutes: 361 }, "staging_window_invalid"],
+    [{ action: "begin", minutes: 30, acquireOnly: "true" }, "staging_pipeline_mode_invalid"],
     [{ action: "begin", minutes: 1.5 }, "staging_window_invalid"],
     [{ action: "begin", minutes: Number.NaN }, "staging_window_invalid"],
     [{ action: "begin", minutes: undefined }, "staging_window_invalid"],

@@ -52,7 +52,8 @@ JOB_INVENTORY = {
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
                               "promotion-skipped", "production"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "help-embed-synthetic",
-                           "user-flow-synthetic", "pinned-history-guard", "certify-promotion"},
+                           "user-flow-synthetic", "pinned-history-guard", "certify-promotion",
+                           "staging-use-release"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
     "release.yml": {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"},
@@ -90,10 +91,10 @@ JOB_INVENTORY = {
     # checking out inputs.ref (CodeQL cache-poisoning gate).
     "sbom.yml": {"image", "verify"},
     # Live staging voice synthetic (docs/voice-synthetic.md); pinned shape below.
-    "voice-synthetic.yml": {"synthetic"},
+    "voice-synthetic.yml": {"staging-window", "synthetic", "staging-use-release"},
     # Live staging /help embed smoke (docs/staging-help-embed-smoke.md);
     # pinned shape below.
-    "help-embed-synthetic.yml": {"help-embed-smoke"},
+    "help-embed-synthetic.yml": {"staging-window", "help-embed-smoke", "staging-use-release"},
     # Five-minute user-flow synthetic (docs/synthetic-user-flow.md): staging
     # health-contract plus passive production probes; pinned shape below.
     "synthetic-user-flow.yml": {"staging", "prod-passive"},
@@ -159,6 +160,33 @@ ROUTED_RUNNER = (
     "contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && "
     "vars.CI_OVERFLOW_RUNNER) || '[\"self-hosted\",\"two-selfhosted\"]') }}}}"
 )
+# One canonical staging lifecycle lock. deploy-staging holds it for the whole
+# workflow window; every standalone staging consumer and drill holds it exactly
+# once; reusable callees run on a provably disjoint group when called.
+STAGING_LIFECYCLE_GROUP = "staging-lifecycle"
+STAGING_USE_INPUTS = ("staging_use_expires_at", "staging_use_sha", "staging_use_deployment")
+STAGING_CHECKOUT_USES = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+STAGING_SETUP_NODE_USES = "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
+STAGING_USE_RECEIPT = "${{ runner.temp }}/staging-use.jsonl"
+STAGING_USE_RELEASE_RECEIPT = "${{ runner.temp }}/staging-use-release.jsonl"
+STAGING_UPLOAD_USES = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+
+
+def staging_receipt_upload(kind, phase, receipt):
+    """The always() receipt artifact: retained 14 days, a missing receipt is an error."""
+    return {"if": "always()", "uses": STAGING_UPLOAD_USES,
+            "with": {"name": f"staging-use-{kind}-{phase}-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}",
+                     "path": receipt, "if-no-files-found": "error", "retention-days": "14"}}
+STAGING_CONTROL_ENV = {
+    "STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}",
+    "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
+}
+STAGING_CALLEE_GROUPS = {
+    "voice-synthetic.yml": "${{ inputs.staging_use_expires_at != '' && "
+                           "format('staging-voice-consumer-{0}', github.run_id) || 'staging-lifecycle' }}",
+    "help-embed-synthetic.yml": "${{ inputs.staging_use_expires_at != '' && "
+                                "format('staging-help-consumer-{0}', github.run_id) || 'staging-lifecycle' }}",
+}
 DEPLOY_MARKERS = (
     "cloudflare/wrangler-action", "wrangler deploy", "wrangler publish",
     "cloudflare_api_token", "staging_worker_url", "production_worker_url", "/health", "/readyz",
@@ -959,6 +987,65 @@ def staging_pinned_sha_errors(workflows):
     return errors
 
 
+def staging_full_window_errors(workflow, name="deploy-staging.yml"):
+    """deploy-staging holds the canonical lifecycle lock for the whole workflow.
+
+    The group lives at workflow level only (no job re-holds it, which would
+    deadlock), the two reusable callers pass the grant only from declared deploy
+    outputs, and a separate `staging-use-release` job stops the window after
+    every consumer (always, never continue-on-error). Native expiry still bounds
+    runner loss; this job is the courtesy stop.
+    """
+    errors = []
+    if workflow.get("concurrency") != {"group": STAGING_LIFECYCLE_GROUP, "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must hold the canonical staging-lifecycle group for the whole workflow, "
+                      "never cancelling")
+    jobs = workflow.get("jobs") or {}
+    for job_id, job in jobs.items():
+        if "concurrency" in job:
+            errors.append(f"{name}:{job_id}: must not re-hold a lock inside the full-window group")
+    deploy = jobs.get("deploy") or {}
+    declared = deploy.get("outputs") or {}
+    bound = {}
+    for job_id, workflow_file in (("voice-synthetic", "voice-synthetic.yml"),
+                                  ("help-embed-synthetic", "help-embed-synthetic.yml")):
+        job = jobs.get(job_id) or {}
+        grant = job.get("with") or {}
+        if set(grant) != set(STAGING_USE_INPUTS):
+            errors.append(f"{name}:{job_id}: must pass exactly the three staging_use inputs")
+            continue
+        for key, value in grant.items():
+            match = re.fullmatch(r"\$\{\{ needs\.deploy\.outputs\.([A-Za-z0-9_]+) \}\}", str(value))
+            if not match or match.group(1) not in declared:
+                errors.append(f"{name}:{job_id}: {key} must come only from a declared needs.deploy.outputs value")
+            else:
+                bound.setdefault(key, set()).add(match.group(1))
+        if "concurrency" in job or job.get("uses") != f"./.github/workflows/{workflow_file}":
+            errors.append(f"{name}:{job_id}: must call its reusable workflow without its own lock")
+    if any(len(names) != 1 for names in bound.values()):
+        errors.append(f"{name}: both reusable callers must pass the same deploy outputs")
+    release = jobs.get("staging-use-release") or {}
+    wanted = {"deploy", "voice-synthetic", "help-embed-synthetic", "user-flow-synthetic",
+              "pinned-history-guard", "certify-promotion"}
+    needs = release.get("needs")
+    if not isinstance(needs, list) or len(needs) != len(wanted) or set(needs) != wanted:
+        errors.append(f"{name}:staging-use-release: must need every window job")
+    if "always()" not in str(release.get("if") or "").split(" && ") or "||" in str(release.get("if") or ""):
+        errors.append(f"{name}:staging-use-release: must run with always() as a conjunct")
+    if release.get("environment") != "staging" or release.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:staging-use-release: must read only the staging Environment with contents:read")
+    if "continue-on-error" in release or any("continue-on-error" in step for step in release.get("steps") or []):
+        errors.append(f"{name}:staging-use-release: a failed stop must fail the run")
+    if not runner_allowed("staging-use-release", release.get("runs-on")):
+        errors.append(f"{name}:staging-use-release: must use the routed runner expression for job "
+                      "'staging-use-release'")
+    commands = [str(step.get("run") or "") for step in release.get("steps") or []]
+    if not any(command in ("node wrangler/scripts/staging-use-pipeline.mjs finish",
+                           "node wrangler/scripts/staging-use.mjs release") for command in commands):
+        errors.append(f"{name}:staging-use-release: must stop the window through the reviewed client")
+    return errors
+
+
 def soak_hold_errors(workflow, name="deploy-staging.yml"):
     """The soak hold defers push deploys loudly, never as a quiet green.
 
@@ -1017,10 +1104,49 @@ def soak_hold_errors(workflow, name="deploy-staging.yml"):
     return errors
 
 
+def staging_qualification_assert_errors(job, job_id, entry, receipt, artifact):
+    """Only the separate ready step may hold the staging control credential."""
+    label = f"deploy-staging.yml:{job_id}"
+    errors = []
+    if job.get("environment") != "staging" or "env" in job or "continue-on-error" in job:
+        errors.append(f"{label}: must use staging with no shared env or tolerated failure")
+    steps = job.get("steps") or []
+    assertions = [step for step in steps if "staging-use" in str(step.get("run", ""))]
+    if len(assertions) != 1:
+        return errors + [f"{label}: must have exactly one staging window assertion"]
+    ready = assertions[0]
+    expected_env = {**STAGING_CONTROL_ENV,
+                    "STAGING_USE_SHA": "${{ needs.deploy.outputs.staging_use_sha }}",
+                    "STAGING_USE_DEPLOYMENT": "${{ needs.deploy.outputs.staging_use_deployment }}",
+                    "STAGING_USE_EXPIRES_AT": "${{ needs.deploy.outputs.staging_use_expires_at }}",
+                    "STAGING_USE_RECEIPT": f"${{{{ runner.temp }}}}/{receipt}"}
+    if (set(ready) - {"name"} != {"run", "env"}
+            or ready.get("run") != "node wrangler/scripts/staging-use.mjs ready"
+            or ready.get("env") != expected_env):
+        errors.append(f"{label}: readiness must unconditionally assert the exact deploy grant")
+    consumers = [step for step in steps if entry in str(step.get("run", ""))]
+    if len(consumers) != 1 or steps.index(ready) >= steps.index(consumers[0]):
+        errors.append(f"{label}: readiness must precede the consumer")
+    uploads = [step for step in steps if (step.get("with") or {}).get("path") == expected_env["STAGING_USE_RECEIPT"]]
+    if len(uploads) != 1 or {k: v for k, v in uploads[0].items() if k != "name"} != {
+            "if": "always()", "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+            "with": {"name": f"{artifact}-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}",
+                     "path": expected_env["STAGING_USE_RECEIPT"], "if-no-files-found": "error", "retention-days": "14"}}:
+        errors.append(f"{label}: must always retain the assertion receipt for 14 days")
+    for step in steps:
+        if step is not ready and ("secrets." in str(step) or "ownership_control" in str(step).lower()):
+            errors.append(f"{label}: control credential must stay in the readiness step only")
+        if job_id == "certify-promotion" and step is not ready and any(marker in str(step).lower() for marker in DEPLOY_MARKERS):
+            errors.append(f"{label}: only the exact readiness step may probe staging")
+    if any(marker in str(job).lower() for marker in DEPLOY_MARKERS[:4]):
+        errors.append(f"{label}: must never deploy")
+    return errors
+
+
 def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
     """The exact-SHA user-flow synthetic gates promotion, read-only.
 
-    One job runs after the deploy with no Environment, no secret and no
+    One job runs after the deploy with a step-scoped readiness credential and no
     write grant: it checks out the reviewed probe from the workflow head and
     runs the read-only staging health-contract probe pinned to the deployed
     dispatch-or-head SHA, refusing when the staging origin is unset.
@@ -1040,13 +1166,12 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
     if not runner_allowed("user-flow-synthetic", job.get("runs-on")):
         errors.append(f"{name}:user-flow-synthetic: must use the routed runner expression "
                       "for job 'user-flow-synthetic'")
-    for key in ("if", "uses", "environment", "services", "container",
+    for key in ("if", "uses", "services", "container",
                 "continue-on-error", "strategy", "concurrency"):
         if key in job:
             errors.append(f"{name}:user-flow-synthetic: must not set {key}")
-    text = str(job).lower()
-    if "secrets." in text or any(marker in text for marker in DEPLOY_MARKERS[:4]):
-        errors.append(f"{name}:user-flow-synthetic: must never read a secret or deploy")
+    errors.extend(staging_qualification_assert_errors(job, "user-flow-synthetic",
+                  "staging_health_contract_probe.py", "staging-use-user-flow.jsonl", "staging-use-user-flow"))
     steps = job.get("steps") or []
     probes = [step for step in steps
               if "staging_health_contract_probe.py" in str(step.get("run", ""))]
@@ -1680,7 +1805,7 @@ def rollback_proof_job_errors(job, mode):
 def staging_rollback_drill_errors(workflow):
     """Daily staging-only auto-rollback proof and optional manual Worker drill.
 
-    The orchestrator must not hold deploy-staging while waiting for its child;
+    The orchestrator must not hold staging-lifecycle while waiting for its child;
     only the manual Worker drill shares that lane. No production bindings.
     """
     name = "staging-rollback-drill.yml"
@@ -1698,7 +1823,7 @@ def staging_rollback_drill_errors(workflow):
                 or field.get("default") != ""):
             errors.append(f"{name}: target_version must be optional/empty for the daily automatic proof")
     if workflow.get("concurrency") != {"group": "staging-rollback-proof-${{ github.event_name }}", "cancel-in-progress": "false"}:
-        errors.append(f"{name}: scheduled/manual wrappers must have separate groups outside deploy-staging")
+        errors.append(f"{name}: scheduled/manual wrappers must have separate groups outside staging-lifecycle")
     jobs = workflow.get("jobs") or {}
     if set(jobs) != {"drill", "proof", "alert"}:
         errors.append(f"{name}: jobs must be exactly drill, proof and alert")
@@ -1710,8 +1835,8 @@ def staging_rollback_drill_errors(workflow):
     if jobs["alert"].get("needs") != "proof" or jobs["alert"].get("if") != "${{ !cancelled() && needs.proof.result == 'failure' }}":
         errors.append(f"{name}: alert must run on a failed proof only")
     job = jobs["drill"]
-    if job.get("concurrency") != {"group": "deploy-staging", "cancel-in-progress": "false"}:
-        errors.append(f"{name}:drill: must share deploy-staging without cancelling")
+    if job.get("concurrency") != {"group": STAGING_LIFECYCLE_GROUP, "cancel-in-progress": "false"}:
+        errors.append(f"{name}:drill: must hold the canonical staging-lifecycle group without cancelling")
     if job.get("environment") != "staging":
         errors.append(f"{name}:drill: must stay scoped to the staging environment")
     if job.get("if") != ("github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' "
@@ -1776,7 +1901,7 @@ def staging_container_drill_errors(workflow):
 
     Dispatch-only with seven required backout pins, one required compatibility
     note and one optional session attestation. One job runs from main through the `staging`
-    environment and shares the deploy-staging concurrency group (never
+    environment and holds the staging-lifecycle concurrency group (never
     cancelling), so a push deploy cannot interleave. Exactly four steps:
     pinned checkout, pinned setup-node, `npm ci` in wrangler/ (the repo-pinned
     wrangler binary the reviewed script drives for the full-container
@@ -1805,8 +1930,8 @@ def staging_container_drill_errors(workflow):
             elif (field.get("type") != "string" or str(field.get("required")).lower() != "true"
                     or "default" in field):
                 errors.append(f"{name}: {key} must be a required string with no default (never latest)")
-    if workflow.get("concurrency") != {"group": "deploy-staging", "cancel-in-progress": "false"}:
-        errors.append(f"{name}: must share the deploy-staging group without cancelling")
+    if workflow.get("concurrency") != {"group": STAGING_LIFECYCLE_GROUP, "cancel-in-progress": "false"}:
+        errors.append(f"{name}: must hold the canonical staging-lifecycle group without cancelling")
     jobs = workflow.get("jobs") or {}
     if set(jobs) != {"container-drill"}:
         errors.append(f"{name}: jobs must be exactly container-drill")
@@ -3412,14 +3537,169 @@ python3 tooling/scripts/ci/roles_gate.py \\
     return errors
 
 
+def staging_callee_window_errors(name, workflow, consumer):
+    """Pin the independent full-window shape of a reusable staging consumer.
+
+    The callee takes exactly three required string inputs (the caller's grant),
+    one explicit token secret and a group that is disjoint when called and the
+    canonical lifecycle group when standalone. Three jobs only: `staging-window`
+    (the only holder of the staging control credential before consumption;
+    asserts the inherited grant, or begins a bounded standalone one), the
+    original `consumer` (needs it, holds no control credential) and
+    `staging-use-release` (standalone finish; never touches a caller's grant).
+    """
+    errors = []
+    on = workflow.get("on") or {}
+    call = on.get("workflow_call") or {}
+    if on.get("workflow_dispatch") or set(call) != {"secrets", "inputs"}:
+        errors.append(f"{name}: workflow_call takes exactly the token secret and the three grant inputs; "
+                      "workflow_dispatch takes no inputs")
+    if call.get("secrets") != {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": {"required": "false"}}:
+        errors.append(f"{name}: workflow_call secrets must be exactly the optional TWO_VOICE_SYNTHETIC_BOT_TOKEN")
+    inputs = call.get("inputs")
+    if not isinstance(inputs, dict) or list(inputs) != list(STAGING_USE_INPUTS) or any(
+            field != {"type": "string", "required": "true"} for field in inputs.values()):
+        errors.append(f"{name}: workflow_call inputs must be exactly the three required string "
+                      "staging_use_expires_at, staging_use_sha and staging_use_deployment")
+    if workflow.get("concurrency") != {"group": STAGING_CALLEE_GROUPS[name], "cancel-in-progress": "false"}:
+        errors.append(f"{name}: group must be disjoint when called and staging-lifecycle standalone, "
+                      "never cancelling")
+    jobs = workflow.get("jobs") or {}
+    if set(jobs) != {"staging-window", consumer, "staging-use-release"}:
+        errors.append(f"{name}: jobs must be exactly staging-window, {consumer} and staging-use-release")
+        return errors
+    for job_id, job in jobs.items():
+        for key in ("concurrency", "continue-on-error", "uses", "services", "container", "strategy", "env"):
+            if key in job:
+                errors.append(f"{name}:{job_id}: must not set {key}")
+    window = jobs["staging-window"]
+    if set(window) - {"name"} != {"if", "permissions", "environment", "runs-on", "timeout-minutes",
+                                  "outputs", "steps"}:
+        errors.append(f"{name}:staging-window: unexpected job keys")
+    if window.get("if") != "github.ref == 'refs/heads/main'":
+        errors.append(f"{name}:staging-window: must run only from main")
+    if window.get("environment") != "staging":
+        errors.append(f"{name}:staging-window: must read the staging Environment")
+    if window.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:staging-window: must keep contents:read only")
+    if window.get("timeout-minutes") != "8":
+        errors.append(f"{name}:staging-window: timeout must stay 8 minutes")
+    if not runner_allowed("staging-window", window.get("runs-on")):
+        errors.append(f"{name}:staging-window: must use the routed runner expression for job 'staging-window'")
+    steps = window.get("steps") or []
+    output_name = None
+    kind = "voice" if consumer == "synthetic" else "help"
+    if len(steps) != 5:
+        errors.append(f"{name}:staging-window: must be checkout, setup-node, standalone begin, "
+                      "inherited ready, always receipt upload")
+    else:
+        checkout, node, first, second, upload = steps
+        # The begin/ready guards are disjoint, so either order is equivalent.
+        ready, begin = (first, second) if str(first.get("run", "")).endswith(" ready") else (second, first)
+        if {key: value for key, value in upload.items() if key != "name"} != staging_receipt_upload(
+                kind, "start", STAGING_USE_RECEIPT):
+            errors.append(f"{name}:staging-window: must always upload the start receipt for 14 days, "
+                          "failing on a missing file")
+        if checkout != {"uses": STAGING_CHECKOUT_USES,
+                        "with": {"persist-credentials": "false", "fetch-depth": "1"}}:
+            errors.append(f"{name}:staging-window: checkout must be the pinned action without persisted credentials")
+        if node != {"uses": STAGING_SETUP_NODE_USES,
+                    "with": {"node-version": "22", "package-manager-cache": "false"}}:
+            errors.append(f"{name}:staging-window: second step must be the pinned setup-node on Node 22")
+        if set(ready) - {"name"} != {"if", "env", "run"} or ready.get("if") != "inputs.staging_use_expires_at != ''" \
+                or ready.get("run") != "node wrangler/scripts/staging-use.mjs ready" or ready.get("env") != {
+                    **STAGING_CONTROL_ENV,
+                    "STAGING_USE_SHA": "${{ inputs.staging_use_sha }}",
+                    "STAGING_USE_DEPLOYMENT": "${{ inputs.staging_use_deployment }}",
+                    "STAGING_USE_EXPIRES_AT": "${{ inputs.staging_use_expires_at }}",
+                    "STAGING_USE_RECEIPT": STAGING_USE_RECEIPT}:
+            errors.append(f"{name}:staging-window: inherited ready must run only for a non-empty "
+                          "input with the exact input bindings")
+        step_id = begin.get("id")
+        if set(begin) - {"name"} != {"id", "if", "env", "run"} or not step_id \
+                or begin.get("if") != "inputs.staging_use_expires_at == ''" \
+                or begin.get("run") != "node wrangler/scripts/staging-use-pipeline.mjs begin" or begin.get("env") != {
+                    **STAGING_CONTROL_ENV, "STAGING_USE_MINUTES": "45",
+                    "STAGING_USE_RECEIPT": STAGING_USE_RECEIPT}:
+            errors.append(f"{name}:staging-window: standalone begin must run only for an empty input, "
+                          "with a 45 minute window")
+        outputs = window.get("outputs")
+        if not isinstance(outputs, dict) or len(outputs) != 1 or not step_id or list(outputs.values()) != [
+                f"${{{{ steps.{step_id}.outputs.expires_at }}}}"]:
+            errors.append(f"{name}:staging-window: must export exactly the begin step's expires_at")
+        else:
+            output_name = next(iter(outputs))
+    # The consumer waits for the assert, keeps its credential rules, and never holds a lock.
+    if jobs[consumer].get("needs") != "staging-window":
+        errors.append(f"{name}:{consumer}: must need exactly staging-window")
+    release = jobs["staging-use-release"]
+    if set(release) - {"name"} != {"if", "needs", "permissions", "environment", "runs-on",
+                                   "timeout-minutes", "steps"}:
+        errors.append(f"{name}:staging-use-release: unexpected job keys")
+    needs = release.get("needs")
+    if not isinstance(needs, list) or set(needs) != {"staging-window", consumer} or len(needs) != 2:
+        errors.append(f"{name}:staging-use-release: must need exactly staging-window and {consumer}")
+    conjuncts = str(release.get("if") or "").split(" && ")
+    expected = {"always()", "github.ref == 'refs/heads/main'", "inputs.staging_use_expires_at == ''",
+                f"needs.staging-window.outputs.{output_name} != ''"}
+    if output_name is None or len(conjuncts) != 4 or set(conjuncts) != expected:
+        errors.append(f"{name}:staging-use-release: must be always(), main-only, standalone-only and "
+                      "gated on the begin output")
+    if release.get("environment") != "staging":
+        errors.append(f"{name}:staging-use-release: must read the staging Environment")
+    if release.get("permissions") != {"contents": "read"}:
+        errors.append(f"{name}:staging-use-release: must keep contents:read only")
+    if str(release.get("timeout-minutes")) not in {str(n) for n in range(1, 11)}:
+        errors.append(f"{name}:staging-use-release: needs a timeout of at most 10 minutes")
+    if not runner_allowed("staging-use-release", release.get("runs-on")):
+        errors.append(f"{name}:staging-use-release: must use the routed runner expression for job "
+                      "'staging-use-release'")
+    rsteps = release.get("steps") or []
+    if len(rsteps) != 4:
+        errors.append(f"{name}:staging-use-release: must be checkout, setup-node, finish, "
+                      "always receipt upload")
+    else:
+        checkout, node, finish, upload = rsteps
+        if {key: value for key, value in upload.items() if key != "name"} != staging_receipt_upload(
+                kind, "stop", STAGING_USE_RELEASE_RECEIPT):
+            errors.append(f"{name}:staging-use-release: must always upload the cleanup receipt for 14 days, "
+                          "failing on a missing file")
+        if checkout != {"uses": STAGING_CHECKOUT_USES,
+                        "with": {"persist-credentials": "false", "fetch-depth": "1"}}:
+            errors.append(f"{name}:staging-use-release: checkout must be pinned without persisted credentials")
+        if node != {"uses": STAGING_SETUP_NODE_USES,
+                    "with": {"node-version": "22", "package-manager-cache": "false"}}:
+            errors.append(f"{name}:staging-use-release: second step must be the pinned setup-node on Node 22")
+        if set(finish) - {"name"} != {"if", "env", "run"} \
+                or finish.get("if") != "inputs.staging_use_expires_at == ''" \
+                or finish.get("run") != "node wrangler/scripts/staging-use-pipeline.mjs finish" or finish.get("env") != {
+                    **STAGING_CONTROL_ENV,
+                    "STAGING_USE_EXPIRES_AT": f"${{{{ needs.staging-window.outputs.{output_name} }}}}",
+                    "STAGING_USE_RECEIPT": STAGING_USE_RELEASE_RECEIPT}:
+            errors.append(f"{name}:staging-use-release: finish must run only standalone on the begin output")
+    # Release never reads the caller's grant inputs outside its own standalone guard.
+    body = str({**{key: value for key, value in release.items() if key not in {"if", "steps"}},
+                "steps": [{key: value for key, value in step.items() if key != "if"} for step in rsteps]})
+    if "inputs." in body:
+        errors.append(f"{name}:staging-use-release: must never touch the caller's grant inputs")
+    # Control credentials and lifecycle commands stay out of the consumer.
+    consumer_text = str(jobs[consumer]).lower().replace(" ", "")
+    for marker in ("staging_use", "staging-use", "ownership_control", "staging_ownership"):
+        if marker in consumer_text:
+            errors.append(f"{name}:{consumer}: must not contain {marker!r} (no control credential)")
+    return errors
+
+
 def voice_synthetic_errors(workflow):
     """Live staging voice synthetic (docs/voice-synthetic.md).
 
     Runs on workflow_call (deploy-staging), a 6-hourly schedule and dispatch,
     only from main, through the `voice-synthetic` environment whose single
     secret is the dedicated test bot token, on the routed runner for job
-    `synthetic`, with its own non-cancelling concurrency group and a 10 minute
-    timeout. Exactly three steps: pinned checkout without persisted
+    `synthetic`, behind the pinned `staging-window` assert job (needs it) and
+    the standalone `staging-use-release` job (staging_callee_window_errors),
+    with the called-disjoint / standalone-canonical non-cancelling group and a
+    10 minute timeout. Exactly three steps: pinned checkout without persisted
     credentials, one Run step (the only holder of the token) that runs the
     reviewed script, and the evidence upload. No wrangler, no production path,
     no staging Worker URL, no `set -x`.
@@ -3431,22 +3711,11 @@ def voice_synthetic_errors(workflow):
     on = workflow.get("on") or {}
     if set(on) != {"workflow_call", "schedule", "workflow_dispatch"}:
         errors.append(f"{name}: triggers must be exactly workflow_call, schedule and workflow_dispatch")
-    call = on.get("workflow_call") or {}
-    if on.get("workflow_dispatch") or set(call) - {"secrets"} or (
-        call.get("secrets") is not None
-        and call["secrets"] != {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": {"required": "false"}}
-    ):
-        errors.append(
-            f"{name}: workflow_call takes only the optional TWO_VOICE_SYNTHETIC_BOT_TOKEN secret; "
-            "workflow_dispatch takes no inputs"
-        )
     if workflow.get("permissions") != {}:
         errors.append(f"{name}: top-level permissions must stay empty")
-    if workflow.get("concurrency") != {"group": "voice-synthetic", "cancel-in-progress": "false"}:
-        errors.append(f"{name}: must use its own voice-synthetic group without cancelling")
+    errors.extend(staging_callee_window_errors(name, workflow, "synthetic"))
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"synthetic"}:
-        errors.append(f"{name}: jobs must be exactly synthetic")
+    if set(jobs) != {"staging-window", "synthetic", "staging-use-release"}:
         return errors
     job = jobs["synthetic"]
     if job.get("environment") != "voice-synthetic":
@@ -3459,7 +3728,7 @@ def voice_synthetic_errors(workflow):
         errors.append(f"{name}:synthetic: timeout must stay 10 minutes")
     if not runner_allowed("synthetic", job.get("runs-on")):
         errors.append(f"{name}:synthetic: must use the routed runner expression for job 'synthetic'")
-    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+    for key in ("env", "uses", "services", "container", "continue-on-error", "strategy", "concurrency"):
         if key in job:
             errors.append(f"{name}:synthetic: must not set {key}")
     steps = job.get("steps") or []
@@ -3484,7 +3753,8 @@ def help_embed_synthetic_errors(workflow):
     through the existing `voice-synthetic` environment whose single secret
     is the dedicated test bot token (the staging product bot token never
     enters GitHub), on the routed runner for job `help-embed-smoke`, with
-    its own non-cancelling concurrency group and a 25 minute timeout (it
+    the called-disjoint / standalone-canonical non-cancelling group, the pinned
+    `staging-window` / `staging-use-release` jobs and a 25 minute timeout (it
     builds the payload example). Exactly six steps: pinned checkout
     without persisted credentials, a binding gate (sees only whether the
     token secret is set, never its value) so an unconfigured optional run
@@ -3502,22 +3772,11 @@ def help_embed_synthetic_errors(workflow):
     on = workflow.get("on") or {}
     if set(on) != {"workflow_call", "workflow_dispatch"}:
         errors.append(f"{name}: triggers must be exactly workflow_call and workflow_dispatch")
-    call = on.get("workflow_call") or {}
-    if on.get("workflow_dispatch") or set(call) - {"secrets"} or (
-        call.get("secrets") is not None
-        and call["secrets"] != {"TWO_VOICE_SYNTHETIC_BOT_TOKEN": {"required": "false"}}
-    ):
-        errors.append(
-            f"{name}: workflow_call takes only the optional TWO_VOICE_SYNTHETIC_BOT_TOKEN secret; "
-            "workflow_dispatch takes no inputs"
-        )
     if workflow.get("permissions") != {}:
         errors.append(f"{name}: top-level permissions must stay empty")
-    if workflow.get("concurrency") != {"group": "help-embed-synthetic", "cancel-in-progress": "false"}:
-        errors.append(f"{name}: must use its own help-embed-synthetic group without cancelling")
+    errors.extend(staging_callee_window_errors(name, workflow, "help-embed-smoke"))
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"help-embed-smoke"}:
-        errors.append(f"{name}: jobs must be exactly help-embed-smoke")
+    if set(jobs) != {"staging-window", "help-embed-smoke", "staging-use-release"}:
         return errors
     job = jobs["help-embed-smoke"]
     if job.get("environment") != "voice-synthetic":
@@ -3530,7 +3789,7 @@ def help_embed_synthetic_errors(workflow):
         errors.append(f"{name}:help-embed-smoke: timeout must stay 25 minutes")
     if not runner_allowed("help-embed-smoke", job.get("runs-on")):
         errors.append(f"{name}:help-embed-smoke: must use the routed runner expression for job 'help-embed-smoke'")
-    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+    for key in ("env", "uses", "services", "container", "continue-on-error", "strategy", "concurrency"):
         if key in job:
             errors.append(f"{name}:help-embed-smoke: must not set {key}")
     steps = job.get("steps") or []
@@ -3623,8 +3882,8 @@ def synthetic_user_flow_errors(workflow):
                 errors.append(f"{name}: force_fail must be an opt-in boolean defaulting to false")
     if workflow.get("permissions") != {}:
         errors.append(f"{name}: top-level permissions must stay empty")
-    if workflow.get("concurrency") != {"group": "synthetic-user-flow", "cancel-in-progress": "false"}:
-        errors.append(f"{name}: must use its own synthetic-user-flow group without cancelling")
+    if "concurrency" in workflow:
+        errors.append(f"{name}: workflow queue must not couple production samples to staging waits")
     jobs = workflow.get("jobs") or {}
     if set(jobs) != {"staging", "prod-passive"}:
         errors.append(f"{name}: jobs must be exactly staging and prod-passive")
@@ -3639,6 +3898,9 @@ def synthetic_user_flow_errors(workflow):
             errors.append(f"{name}:{job_id}: must run only from main")
         if job.get("permissions") != {"actions": "read", "contents": "read", "issues": "write"}:
             errors.append(f"{name}:{job_id}: must keep actions:read, contents:read and issues:write only")
+        expected_group = STAGING_LIFECYCLE_GROUP if job_id == "staging" else "synthetic-user-flow-production"
+        if job.get("concurrency") != {"group": expected_group, "cancel-in-progress": "false"}:
+            errors.append(f"{name}:{job_id}: must use its non-cancelling per-environment job lock")
         if job.get("timeout-minutes") != "10":
             errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
         if not runner_allowed(job_id, job.get("runs-on")):
@@ -4100,6 +4362,7 @@ def workflow_policy_errors(workflows):
             errors.extend(soak_hold_errors(workflow))
             errors.extend(pinned_history_guard_errors(workflow))
             errors.extend(user_flow_synthetic_errors(workflow))
+            errors.extend(staging_full_window_errors(workflow))
             errors.extend(schema_gate_errors(workflow))
             errors.extend(roles_gate_errors(workflow))
         if name == "release.yml":
@@ -4208,6 +4471,17 @@ def workflow_policy_errors(workflows):
                 continue  # pinned-drill verdict: pinned by pinned_history_guard_errors above
             if name == "deploy-staging.yml" and job_id == "user-flow-synthetic":
                 continue  # read-only exact-SHA probe: pinned by user_flow_synthetic_errors above
+            if name == "deploy-staging.yml" and job_id == "staging-use-release":
+                continue  # window stop: pinned by staging_full_window_errors above
+            if name == "deploy-staging.yml" and job_id == "certify-promotion":
+                errors.extend(staging_qualification_assert_errors(job, job_id, "scripts/bot_promotion.py certify",
+                              "staging-use-certify.jsonl", "staging-use-certify"))
+                if (job.get("permissions") != {"contents": "read", "actions": "read"}
+                        or set(job.get("needs") or []) != {"deploy", "voice-synthetic", "help-embed-synthetic",
+                                                          "user-flow-synthetic", "pinned-history-guard"}
+                        or job.get("if") != "success() && needs.deploy.outputs.promotion_clean == 'true' && vars.VOICE_SYNTHETIC_REQUIRED != 'false'"):
+                    errors.append(f"{name}:{job_id}: must retain the success-only, complete qualification gate")
+                continue  # offline certificate with a narrowly scoped readiness assertion
             else:
                 # Retargeting a known CI job must not create an unapproved
                 # deploy/probe route outside the deploy workflows.
@@ -6528,6 +6802,147 @@ class WorkflowTests(unittest.TestCase):
             mutate(changed)
             self.assertNotEqual(voice_synthetic_errors(changed), [])
 
+    def test_reusable_staging_consumers_pin_the_independent_full_window(self):
+        import copy
+        for file_name, consumer, check in (
+                ("voice-synthetic.yml", "synthetic", voice_synthetic_errors),
+                ("help-embed-synthetic.yml", "help-embed-smoke", help_embed_synthetic_errors)):
+            workflow = self.workflows[file_name]
+            self.assertEqual(check(workflow), [], file_name)
+            window = lambda w: w["jobs"]["staging-window"]
+            release = lambda w: w["jobs"]["staging-use-release"]
+            mutations = {
+                "group is canonical when called": lambda w: w["concurrency"].update({"group": "staging-lifecycle"}),
+                "group is a bare consumer name": lambda w: w["concurrency"].update({"group": file_name}),
+                "group cancels": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
+                "group uses run attempt": lambda w: w["concurrency"].update(
+                    {"group": w["concurrency"]["group"].replace("github.run_id", "github.run_attempt")}),
+                "input optional": lambda w: w["on"]["workflow_call"]["inputs"]["staging_use_sha"].update(
+                    {"required": "false"}),
+                "input dropped": lambda w: w["on"]["workflow_call"]["inputs"].pop("staging_use_deployment"),
+                "dispatch carries the grant": lambda w: w["on"].__setitem__(
+                    "workflow_dispatch", {"inputs": {"staging_use_expires_at": {"type": "string"}}}),
+                "extra secret": lambda w: w["on"]["workflow_call"]["secrets"].update(
+                    {"STAGING_OWNERSHIP_CONTROL_TOKEN": {"required": "false"}}),
+                "window job dropped": lambda w: w["jobs"].pop("staging-window"),
+                "release job dropped": lambda w: w["jobs"].pop("staging-use-release"),
+                "extra job": lambda w: w["jobs"].__setitem__("extra", {}),
+                "window not main-only": lambda w: window(w).pop("if"),
+                "window wrong environment": lambda w: window(w).update({"environment": "voice-synthetic"}),
+                "window writes": lambda w: window(w).update({"permissions": {"contents": "write"}}),
+                "window timeout": lambda w: window(w).update({"timeout-minutes": "30"}),
+                "window runner": lambda w: window(w).update({"runs-on": "ubuntu-latest"}),
+                "window tolerated": lambda w: window(w).update({"continue-on-error": "true"}),
+                "window unpinned checkout": lambda w: window(w)["steps"][0].update({"uses": "actions/checkout@v4"}),
+                "window persists credentials": lambda w: window(w)["steps"][0]["with"].update(
+                    {"persist-credentials": "true"}),
+                "window node version": lambda w: window(w)["steps"][1]["with"].update({"node-version": "24"}),
+                "ready always": lambda w: window(w)["steps"][3].pop("if"),
+                "ready on standalone": lambda w: window(w)["steps"][3].update(
+                    {"if": "inputs.staging_use_expires_at == ''"}),
+                "ready unbound sha": lambda w: window(w)["steps"][3]["env"].update({"STAGING_USE_SHA": "${{ github.sha }}"}),
+                "ready wrong token": lambda w: window(w)["steps"][3]["env"].update(
+                    {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}),
+                "ready tolerated": lambda w: window(w)["steps"][3].update({"continue-on-error": "true"}),
+                "ready acquires": lambda w: window(w)["steps"][3].update(
+                    {"run": "node wrangler/scripts/staging-use.mjs acquire"}),
+                "begin always": lambda w: window(w)["steps"][2].pop("if"),
+                "begin on inherited": lambda w: window(w)["steps"][2].update(
+                    {"if": "inputs.staging_use_expires_at != ''"}),
+                "begin long window": lambda w: window(w)["steps"][2]["env"].update({"STAGING_USE_MINUTES": "360"}),
+                "begin tolerated": lambda w: window(w)["steps"][2].update({"continue-on-error": "true"}),
+                "start receipt not always uploaded": lambda w: window(w)["steps"][4].pop("if"),
+                "start receipt short retention": lambda w: window(w)["steps"][4]["with"].update(
+                    {"retention-days": "1"}),
+                "start receipt may be missing": lambda w: window(w)["steps"][4]["with"].update(
+                    {"if-no-files-found": "ignore"}),
+                "stop receipt not always uploaded": lambda w: release(w)["steps"][3].pop("if"),
+                "stop receipt wrong path": lambda w: release(w)["steps"][3]["with"].update(
+                    {"path": "${{ runner.temp }}/staging-use.jsonl"}),
+                "finish unguarded": lambda w: release(w)["steps"][2].pop("if"),
+                "finish shares the start receipt": lambda w: release(w)["steps"][2]["env"].update(
+                    {"STAGING_USE_RECEIPT": "${{ runner.temp }}/staging-use.jsonl"}),
+                "window output dropped": lambda w: window(w).pop("outputs"),
+                "window output from inputs": lambda w: window(w)["outputs"].update(
+                    {next(iter(window(w)["outputs"])): "${{ inputs.staging_use_expires_at }}"}),
+                "consumer not waiting for window": lambda w: w["jobs"][consumer].pop("needs"),
+                "consumer waits for release": lambda w: w["jobs"][consumer].update({"needs": "staging-use-release"}),
+                "consumer re-holds the lock": lambda w: w["jobs"][consumer].update(
+                    {"concurrency": {"group": "staging-lifecycle", "cancel-in-progress": "false"}}),
+                "consumer holds the control credential": lambda w: w["jobs"][consumer]["steps"][1]["env"].update(
+                    {"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
+                "release not main-only": lambda w: release(w).update(
+                    {"if": release(w)["if"].replace("github.ref == 'refs/heads/main' && ", "")}),
+                "release not always": lambda w: release(w).update(
+                    {"if": release(w)["if"].replace("always() && ", "")}),
+                "release runs inherited": lambda w: release(w).update(
+                    {"if": release(w)["if"].replace("inputs.staging_use_expires_at == ''",
+                                                    "inputs.staging_use_expires_at != ''")}),
+                "release ignores output": lambda w: release(w).update(
+                    {"if": " && ".join(release(w)["if"].split(" && ")[:3])}),
+                "release not waiting for consumer": lambda w: release(w).update({"needs": ["staging-window"]}),
+                "release wrong environment": lambda w: release(w).update({"environment": "voice-synthetic"}),
+                "release tolerated": lambda w: release(w).update({"continue-on-error": "true"}),
+                "release step tolerated": lambda w: release(w)["steps"][2].update({"continue-on-error": "true"}),
+                "release touches caller grant": lambda w: release(w)["steps"][2]["env"].update(
+                    {"STAGING_USE_EXPIRES_AT": "${{ inputs.staging_use_expires_at }}"}),
+                "release releases instead of finishing": lambda w: release(w)["steps"][2].update(
+                    {"run": "node wrangler/scripts/staging-use.mjs release"}),
+                "release runner": lambda w: release(w).update({"runs-on": "ubuntu-latest"}),
+            }
+            for label, mutate in mutations.items():
+                changed = copy.deepcopy(workflow)
+                try:
+                    mutate(changed)
+                except (KeyError, IndexError, TypeError, StopIteration):
+                    self.fail(f"{file_name}: mutation {label!r} did not apply")
+                with self.subTest(file=file_name, mutation=label):
+                    self.assertNotEqual(check(changed), [])
+
+    def test_staging_deploy_holds_the_full_window_and_releases_after_every_consumer(self):
+        import copy
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(staging_full_window_errors(staging), [])
+        job = lambda w, name: w["jobs"][name]
+        mutations = {
+            "legacy group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "cancelling": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
+            "deploy re-holds": lambda w: job(w, "deploy").update(
+                {"concurrency": {"group": "staging-lifecycle", "cancel-in-progress": "false"}}),
+            "caller re-holds": lambda w: job(w, "voice-synthetic").update(
+                {"concurrency": {"group": "staging-lifecycle", "cancel-in-progress": "false"}}),
+            "voice grant from literal": lambda w: job(w, "voice-synthetic")["with"].update(
+                {"staging_use_expires_at": "1"}),
+            "help grant from sha": lambda w: job(w, "help-embed-synthetic")["with"].update(
+                {"staging_use_sha": "${{ github.sha }}"}),
+            "help grant undeclared output": lambda w: job(w, "help-embed-synthetic")["with"].update(
+                {"staging_use_deployment": "${{ needs.deploy.outputs.undeclared }}"}),
+            "voice grant dropped": lambda w: job(w, "voice-synthetic")["with"].pop("staging_use_deployment"),
+            "release dropped": lambda w: w["jobs"].pop("staging-use-release"),
+            "release not always": lambda w: job(w, "staging-use-release").update({"if": "success()"}),
+            "release or-always": lambda w: job(w, "staging-use-release").update({"if": "always() || true"}),
+            "release skips certify": lambda w: job(w, "staging-use-release").update(
+                {"needs": [n for n in job(w, "staging-use-release")["needs"] if n != "certify-promotion"]}),
+            "release skips a consumer": lambda w: job(w, "staging-use-release").update(
+                {"needs": [n for n in job(w, "staging-use-release")["needs"] if n != "help-embed-synthetic"]}),
+            "release skips user flow": lambda w: job(w, "staging-use-release").update(
+                {"needs": [n for n in job(w, "staging-use-release")["needs"] if n != "user-flow-synthetic"]}),
+            "release skips history guard": lambda w: job(w, "staging-use-release").update(
+                {"needs": [n for n in job(w, "staging-use-release")["needs"] if n != "pinned-history-guard"]}),
+            "release wrong environment": lambda w: job(w, "staging-use-release").update({"environment": "production"}),
+            "release tolerated": lambda w: job(w, "staging-use-release").update({"continue-on-error": "true"}),
+            "release no client": lambda w: next(step for step in job(w, "staging-use-release")["steps"]
+                                                if step.get("run") == "node wrangler/scripts/staging-use-pipeline.mjs finish").update({"run": "true"}),
+        }
+        for label, mutate in mutations.items():
+            changed = copy.deepcopy(staging)
+            try:
+                mutate(changed)
+            except (KeyError, IndexError, TypeError, StopIteration):
+                self.fail(f"mutation {label!r} did not apply")
+            with self.subTest(mutation=label):
+                self.assertTrue(staging_full_window_errors(changed))
+
     def test_staging_deploy_gates_on_the_voice_synthetic(self):
         job = self.workflows["deploy-staging.yml"]["jobs"]["voice-synthetic"]
         self.assertEqual(job.get("needs"), "deploy")
@@ -7145,6 +7560,43 @@ class WorkflowTests(unittest.TestCase):
                 mutate(changed["deploy-staging.yml"])
                 self.assertTrue(user_flow_synthetic_errors(changed["deploy-staging.yml"]), label)
                 self.assertTrue(workflow_policy_errors(changed), label)
+
+    def test_qualification_assertions_are_exact_and_keep_secrets_out_of_consumers(self):
+        for job_id, entry, receipt, artifact in (
+                ("user-flow-synthetic", "staging_health_contract_probe.py", "staging-use-user-flow.jsonl", "staging-use-user-flow"),
+                ("certify-promotion", "scripts/bot_promotion.py certify", "staging-use-certify.jsonl", "staging-use-certify")):
+            job = self.workflows["deploy-staging.yml"]["jobs"][job_id]
+            check = lambda changed: staging_qualification_assert_errors(changed, job_id, entry, receipt, artifact)
+            self.assertEqual(check(job), [])
+            ready = lambda changed: next(step for step in changed["steps"]
+                                         if step.get("run") == "node wrangler/scripts/staging-use.mjs ready")
+            consume = lambda changed: next(step for step in changed["steps"] if entry in str(step.get("run", "")))
+            mutations = {
+                "wrong environment": lambda changed: changed.update({"environment": "production"}),
+                "skipped assertion": lambda changed: ready(changed).update({"if": "false"}),
+                "tolerated assertion": lambda changed: ready(changed).update({"continue-on-error": "true"}),
+                "wrong attempt input": lambda changed: ready(changed)["env"].update({"STAGING_USE_EXPIRES_AT": "1"}),
+                "wrong credential": lambda changed: ready(changed)["env"].update({"OWNERSHIP_CONTROL_TOKEN": "${{ secrets.OTHER }}"}),
+                "consumer credential": lambda changed: consume(changed).setdefault("env", {}).update({"TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}),
+                "consumer before assertion": lambda changed: changed["steps"].insert(0, changed["steps"].pop(changed["steps"].index(consume(changed)))),
+                "no assertion": lambda changed: changed["steps"].remove(ready(changed)),
+            }
+            for label, mutate in mutations.items():
+                changed = deepcopy(job)
+                mutate(changed)
+                with self.subTest(job=job_id, mutation=label):
+                    self.assertTrue(check(changed))
+
+    def test_production_synthetic_has_no_shared_staging_queue(self):
+        workflow = self.workflows["synthetic-user-flow.yml"]
+        self.assertEqual(synthetic_user_flow_errors(workflow), [])
+        for group in ("synthetic-user-flow", "staging-lifecycle"):
+            changed = deepcopy(workflow)
+            changed["concurrency"] = {"group": group, "cancel-in-progress": "false"}
+            self.assertTrue(synthetic_user_flow_errors(changed))
+        changed = deepcopy(workflow)
+        changed["jobs"]["prod-passive"]["concurrency"]["group"] = "staging-lifecycle"
+        self.assertTrue(synthetic_user_flow_errors(changed))
 
     def test_soak_hold_shell_behaves(self):
         # Execute the actual hold-check shell across its six cases: dispatch
@@ -8067,7 +8519,7 @@ class WorkflowTests(unittest.TestCase):
             "manual replaces pending schedule": lambda w: w["concurrency"].update({"group": "staging-rollback-proof"}),
             "weekly only": lambda w: w["on"].update({"schedule": [{"cron": "17 3 * * 1"}]}),
             "dispatcher deadlocks staging lane": lambda w: w["jobs"]["proof"].update(
-                {"concurrency": {"group": "deploy-staging", "cancel-in-progress": False}}),
+                {"concurrency": {"group": "staging-lifecycle", "cancel-in-progress": False}}),
             "dispatcher reads production secrets": lambda w: w["jobs"]["proof"].update({"environment": "production"}),
             "dispatcher extra bindings": lambda w: w["jobs"]["proof"]["steps"][1]["env"].update({"URL": "production"}),
             "missing evidence": lambda w: w["jobs"]["proof"]["steps"].pop(),
@@ -8187,7 +8639,7 @@ class WorkflowTests(unittest.TestCase):
             "workflow-level secret": lambda w: w.update(
                 {"env": {"T": "${{ secrets.TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL }}"}}),
             "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
-            "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "staging-lifecycle"}),
             "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
             "wrong environment": lambda w: job(w).update({"environment": "staging"}),
             "production environment": lambda w: job(w).update({"environment": "production"}),
@@ -8299,7 +8751,7 @@ class WorkflowTests(unittest.TestCase):
             "workflow-level secret": lambda w: w.update(
                 {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PRIVACY_RO_DATABASE_URL }}"}}),
             "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
-            "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "staging-lifecycle"}),
             "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
             "wrong environment": lambda w: job(w).update({"environment": "staging"}),
             "production environment": lambda w: job(w).update({"environment": "production"}),
@@ -8377,7 +8829,7 @@ class WorkflowTests(unittest.TestCase):
             "workflow-level secret": lambda w: w.update(
                 {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"}}),
             "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
-            "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "staging-lifecycle"}),
             "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
             "wrong environment": lambda w: job(w).update({"environment": "staging"}),
             "production environment": lambda w: job(w).update({"environment": "production"}),
@@ -8449,7 +8901,7 @@ class WorkflowTests(unittest.TestCase):
             "workflow-level secret": lambda w: w.update(
                 {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"}}),
             "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
-            "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "staging-lifecycle"}),
             "sibling concurrency group": lambda w: w["concurrency"].update({"group": "staging-retention-census"}),
             "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
             "wrong environment": lambda w: job(w).update({"environment": "staging"}),
@@ -8525,7 +8977,7 @@ class WorkflowTests(unittest.TestCase):
             "workflow-level secret": lambda w: w.update(
                 {"env": {"T": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}}),
             "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
-            "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "staging-lifecycle"}),
             "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
             "wrong environment": lambda w: job(w).update({"environment": "staging-events-read"}),
             "production environment": lambda w: job(w).update({"environment": "production"}),
@@ -8857,7 +9309,7 @@ class WorkflowTests(unittest.TestCase):
                 {"default": "two-bot-next-gradual-proof"}),
             "top-level permissions": lambda w: w.update({"permissions": {"contents": "read"}}),
             "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
-            "shared concurrency group": lambda w: w["concurrency"].update({"group": "deploy-staging"}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "staging-lifecycle"}),
             "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
             "production environment": lambda w: job(w).update({"environment": "production"}),
             "no environment": lambda w: job(w).pop("environment"),

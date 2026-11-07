@@ -21,8 +21,10 @@ export async function pipelineUse(args, invoke = stagingUse, now = Date.now, emi
   if (args.action === "begin") {
     require(positive(args.minutes) && args.minutes <= MAX_WINDOW_MINUTES, "staging_window_invalid");
     require(args.expiresAt === undefined, "staging_pipeline_begin_inherited");
+    require(args.acquireOnly === undefined || typeof args.acquireOnly === "boolean", "staging_pipeline_mode_invalid");
   } else require(positive(args.expiresAt), "staging_window_invalid");
-  if (args.action === "consume" || args.action === "rebind") {
+  if (args.action === "consume" || args.action === "rebind"
+    || (args.action === "begin" && (args.sha !== undefined || args.deploymentId !== undefined))) {
     require(typeof args.sha === "string" && /^[0-9a-f]{40}$/.test(args.sha)
       && typeof args.deploymentId === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(args.deploymentId),
     "staging_identity_invalid");
@@ -58,6 +60,10 @@ export async function pipelineUse(args, invoke = stagingUse, now = Date.now, emi
   }
   let expiresAt;
   if (args.action === "begin") {
+    // Deployment callers independently pin the receipt-validated new build;
+    // standalone consumers may discover the currently serving build instead.
+    if (args.sha !== undefined) require(state.sha === args.sha && state.deploymentId === args.deploymentId,
+      "staging_identity_mismatch");
     // A retry cannot mint a longer window, even when its first acquire/ready
     // response was lost. A released or expired attempt can never begin again.
     if (sameAttempt(state.use, args)) {
@@ -80,7 +86,10 @@ export async function pipelineUse(args, invoke = stagingUse, now = Date.now, emi
   // can still be released by the parent; the native alarm is the last resort.
   emit({ schema: "two-bot-staging-pipeline.v1", action: "window", environment: "staging",
     ...binding, runId: args.runId, runAttempt: args.runAttempt, observedAt: new Date(now()).toISOString() });
-  await call("acquire", binding);
+  const acquired = await call("acquire", binding);
+  // Deploy uses its existing rollout/readiness gate (including intentional
+  // failure drills). Do not hide that verdict behind a second readiness loop.
+  if (args.action === "begin" && args.acquireOnly) return acquired;
   return call("ready", binding);
 }
 
@@ -99,17 +108,20 @@ if (isDirectInvocation(process.argv[1], import.meta.url)) {
     // Status must never export an unrelated run's grant.
     if (output && result.action === "window") appendFileSync(output,
       `expires_at=${result.expiresAt}\n`, { mode: 0o600 });
-    if (output && result.action === "ready") appendFileSync(output,
+    if (output && (result.action === "acquire" || result.action === "ready")) appendFileSync(output,
       `expires_at=${result.use.expiresAt}\ndeployment_id=${result.deploymentId}\nsha=${result.sha}\n`, { mode: 0o600 });
     process.stdout.write(line);
   };
   try {
     require(path, "staging_receipt_required");
+    require(process.env.STAGING_USE_ACQUIRE_ONLY === undefined || process.env.STAGING_USE_ACQUIRE_ONLY === "1",
+      "staging_pipeline_mode_invalid");
     await pipelineUse({ action: process.argv[2], url: process.env.STAGING_WORKER_URL,
       token: process.env.OWNERSHIP_CONTROL_TOKEN, runId: process.env.GITHUB_RUN_ID,
       runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT), minutes: Number(process.env.STAGING_USE_MINUTES),
       expiresAt: process.env.STAGING_USE_EXPIRES_AT === undefined ? undefined : Number(process.env.STAGING_USE_EXPIRES_AT),
-      sha: process.env.STAGING_USE_SHA, deploymentId: process.env.STAGING_USE_DEPLOYMENT }, stagingUse, Date.now, emit);
+      sha: process.env.STAGING_USE_SHA, deploymentId: process.env.STAGING_USE_DEPLOYMENT,
+      acquireOnly: process.env.STAGING_USE_ACQUIRE_ONLY === "1" }, stagingUse, Date.now, emit);
   } catch (error) {
     const code = error instanceof StagingUseError ? error.code : "staging_pipeline_failed";
     console.error(code);

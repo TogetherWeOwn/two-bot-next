@@ -108,7 +108,14 @@ CALLED_FORM = re.compile(
     r"'([A-Za-z0-9_.-]+)'\s*\}\}")
 EVENT_FORM = re.compile(r"([A-Za-z0-9_.-]*)\$\{\{\s*github\.event_name\s*\}\}")
 GRANT_OUTPUT = re.compile(r"\$\{\{\s*needs\.deploy\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
-STAGING_USE = re.compile(r"staging-use\.mjs\s+([a-z]+)")
+# Same semantic actions through the redacting composition client. Keep the
+# direct-client fixture controls and classify begin/finish just as strictly.
+STAGING_USE = re.compile(r"staging-use(?:-pipeline)?\.mjs\s+([a-z]+)")
+ACTION_NAMES = {"begin": "acquire", "rebind": "acquire", "finish": "release", "consume": "ready"}
+
+
+def staging_use_actions(command):
+    return [ACTION_NAMES.get(action, action) for action in STAGING_USE.findall(command)]
 
 
 class UniqueKeyLoader(yaml.BaseLoader):
@@ -232,7 +239,7 @@ def step_runs(job):
 
 def staging_use_steps(job, action):
     return [step for step in step_runs(job)
-            if action in STAGING_USE.findall(step["run"])]
+            if action in staging_use_actions(step["run"])]
 
 
 def bare(condition):
@@ -351,7 +358,7 @@ def consumer_errors(callee_name, callee):
     asserted = False
     for owner_name, owner in jobs.items():
         for step in owner.get("steps") or []:
-            actions = STAGING_USE.findall(str(step.get("run", "")))
+            actions = staging_use_actions(str(step.get("run", "")))
             if not {"assert", "ready"} & set(actions):
                 continue
             before = owner_name in needs and owner_name != consumer_name
@@ -403,6 +410,10 @@ def standalone_errors(wfs, canonical):
         triggers = events(workflow)
         if any(may_hold(node, "standalone", triggers, canonical) for node in (workflow, job)):
             errors.append(f"{file} {job_name}: {role} holds the lifecycle group")
+    # Even an unrelated workflow-level group is unsafe here: a previous run
+    # retains it while staging waits, indirectly queueing later prod samples.
+    if "concurrency" in wfs.get(USER_FLOW, {}):
+        errors.append("prod-passive: shared workflow queue couples production to staging waits")
     passive = (wfs.get(USER_FLOW, {}).get("jobs") or {}).get("prod-passive") or {}
     needs = passive.get("needs")
     if needs == "staging" or (isinstance(needs, list) and "staging" in needs):
@@ -538,6 +549,28 @@ class RepositoryContractTests(unittest.TestCase):
 
 
 class LockOracleControls(unittest.TestCase):
+    def test_composition_actions_keep_the_same_mutation_and_readiness_guards(self):
+        self.assertEqual(staging_use_actions("node staging-use-pipeline.mjs begin"), ["acquire"])
+        self.assertEqual(staging_use_actions("node staging-use-pipeline.mjs finish"), ["release"])
+        self.assertEqual(staging_use_actions("node staging-use-pipeline.mjs consume"), ["ready"])
+        self.assertEqual(staging_use_actions("node staging-use-pipeline.mjs rebind"), ["acquire"])
+        wfs = target_fixture()
+        for workflow in wfs.values():
+            for job in workflow.get("jobs", {}).values():
+                for step in step_runs(job):
+                    step["run"] = (step["run"].replace("staging-use.mjs acquire", "staging-use-pipeline.mjs begin")
+                                   .replace("staging-use.mjs release", "staging-use-pipeline.mjs finish"))
+        self.assertEqual(lifecycle_errors(wfs), [])
+        # The composed client cannot bypass either the final-release dependency
+        # closure or the inherited path's prohibition on acquire/release.
+        release = next(job for job in wfs[DEPLOY]["jobs"].values() if staging_use_steps(job, "release"))
+        release["needs"] = ["deploy"]
+        self.assert_rejected(wfs, "must wait for every window consumer")
+        wfs = target_fixture()
+        wfs[VOICE]["jobs"]["staging-window"]["steps"].append({
+            "run": "node staging-use-pipeline.mjs finish", "if": INHERITED_GUARD})
+        self.assert_rejected(wfs, "release can touch the caller's grant")
+
     def assert_rejected(self, wfs, claim):
         errors = lifecycle_errors(wfs)
         self.assertTrue(any(claim in e for e in errors), (claim, errors))
@@ -546,6 +579,14 @@ class LockOracleControls(unittest.TestCase):
         for group in (FIXTURE_GROUP, "another-valid-lifecycle-key", *LEGACY_GROUPS):
             with self.subTest(group=group):
                 self.assertEqual(lifecycle_errors(target_fixture(group)), [])
+
+    def test_production_probe_cannot_wait_on_an_unrelated_shared_workflow_queue(self):
+        wfs = target_fixture()
+        wfs[USER_FLOW]["jobs"]["prod-passive"]["concurrency"] = {
+            "group": "production-samples", "cancel-in-progress": "false"}
+        self.assertEqual(lifecycle_errors(wfs), [])
+        wfs[USER_FLOW]["concurrency"] = {"group": "synthetic-user-flow", "cancel-in-progress": "false"}
+        self.assert_rejected(wfs, "shared workflow queue couples production")
 
     def test_group_comparison_is_case_insensitive(self):
         wfs = target_fixture()

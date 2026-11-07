@@ -57,7 +57,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: deploy-staging
+  group: staging-lifecycle
   cancel-in-progress: false
 
 jobs:

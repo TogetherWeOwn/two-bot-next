@@ -56,7 +56,7 @@ ceiling accommodates a separately authorized four-ACTIVE-hour soak, not a
 permanent staging session. A provider stop failure is unconfirmed cleanup, never
 idle/zero-cost proof, and must be repaired through the existing incident path.
 
-### Trusted client and receipt contract (not wired yet)
+### Trusted client and receipt contract (partial wiring, not activated)
 
 `wrangler/scripts/staging-use.mjs` is the pipeline client for the protocol.
 `status` reads only the authenticated control path and neither acquires nor
@@ -75,13 +75,18 @@ build/deploy identity and rollout qualification gates, not their replacement.
 `release` confirms native stop, can repeat after expiry or partial acquisition,
 and refuses a different run/attempt/window. It cannot renew an expiry.
 
-`wrangler/scripts/staging-use-pipeline.mjs` composes that client for the pending
-workflow integration. `begin` uses authenticated control status to identify the
-currently owned build, persists and exports a finite expiry **before** acquisition,
-then requires readiness on that build. Repeating the same workflow attempt keeps
-its original expiry, including a partially prepared grant; a released/expired
-attempt cannot begin again. The caller supplies `STAGING_USE_MINUTES` only for
-`begin`, not as a renewal or an inherited consumer override.
+`wrangler/scripts/staging-use-pipeline.mjs` composes that client. `begin` uses
+authenticated control status to identify the currently owned build, persists and
+exports a finite expiry **before** acquisition, then requires readiness on that
+build. A deployment caller also supplies independently validated
+`STAGING_USE_SHA` and `STAGING_USE_DEPLOYMENT`; a mismatch refuses before mutation.
+The deploy job sets `STAGING_USE_ACQUIRE_ONLY=1` to authorize without a duplicate
+readiness loop: its existing exact-rollout `verify` step still owns the readiness
+verdict, including intentionally failing gateway drills. Acquisition alone never
+certifies startup or qualification. Repeating the same workflow attempt keeps its
+original expiry, including a partially prepared grant; a released/expired attempt
+cannot begin again. The caller supplies `STAGING_USE_MINUTES` only for `begin`,
+not as a renewal or an inherited consumer override.
 
 `rebind` requires the caller's original expiry plus the intended deployment/SHA
 from the independently validated deployment or rollback receipt. It refuses a
@@ -94,10 +99,12 @@ stop a different attempt's singleton; it is **not** proof that this run never
 acquired a grant, or that staging is now stopped/idle. The parent's release and
 native expiry receipts supply the stop evidence.
 
-These wrappers are **not wired into workflows yet**. They do not supply an
-Actions lock, replace existing qualification, or activate the policy. The binding
-checker permits only an absent policy or the exact `"bounded"` value in staging
-with `TWO_DEPLOY_ENV="staging"`; it rejects top-level, production and other named
+The deploy and reusable voice/help workflows now declare the bounded contract,
+but the rollout is **incomplete and not activated**. Scheduled user-flow,
+rollback/drill runtime integration and the live-reader inventory still gate
+activation. The wrappers replace no existing qualification. The binding checker
+permits only an absent policy or the exact `"bounded"` value in staging with
+`TWO_DEPLOY_ENV="staging"`; it rejects top-level, production and other named
 environment placement and plaintext ownership-control tokens. No checked-in
 configuration enables the policy at this checkpoint.
 
@@ -119,6 +126,52 @@ Standalone consumers and rollback use the same finite-use contract. Until that
 integration and the inventory/rollback gates below are complete, these client
 and runtime receipts are source-level support only, not a qualified workflow or
 activation receipt.
+
+### Full-window workflow and recovery semantics
+
+`deploy-staging` holds the fixed, non-cancelling `staging-lifecycle` group at
+workflow level, from baseline through all qualification jobs and
+`staging-use-release`. No job inside it re-holds the group. Both standalone drills
+and the scheduled staging user-flow job use the same canonical group. The
+rollback-proof orchestrator does **not** hold it while waiting for its child.
+The user-flow group is job-level only: the passive production sibling never
+takes it or depends on the staging job. Production probe code is unchanged.
+
+The deploy job authorizes a 120-minute maximum window after receipt-validated
+ownership transfer and before its unchanged rollout/readiness gate. It exports
+the exact deployment/SHA and immutable expiry. All five qualifying jobs remain
+in that same push run; user-flow and certification reassert the window before
+consumption. Release needs every consumer and runs after failures too. A cleanup
+failure stays red; native expiry remains mandatory for cancelled or lost runners.
+
+Called voice/help receive three required `workflow_call`-only string inputs from
+`needs.deploy.outputs`; dispatch cannot inject an inherited grant. They use
+provably disjoint per-run nested groups and a separate main-only
+`environment: staging` job for authenticated readiness. Their live consumer job
+keeps only the test-bot credential. Standalone voice/help acquire at most 45
+minutes under the canonical workflow lock and release after their consumer,
+even if it fails. Called jobs never acquire or release the parent's grant.
+Retain start/assert and stop/refusal artifacts for the run and attempt. Verify
+on exact-head Actions that the existing staging control secret resolves in each
+called staging job; a missing token fails closed, never warrants a new credential.
+
+**Pending-slot replacement (accepted recovery, 2026-11-07):** GitHub preserves a
+running holder with `cancel-in-progress: false`, but keeps only one pending item
+per group. A newer five-minute probe or drill can replace a pending deployment;
+there is no FIFO/fairness guarantee. A cancelled deploy is not qualification or
+staging history. Re-dispatch `deploy-staging` from `main` with `sha` set to that
+exact merged 40-hex SHA, wait for all five qualifying jobs plus release, and
+retain the new attempt's receipts before considering promotion. The pin/history
+guard stays unchanged; an older pin still makes that run intentionally red and
+cannot certify a different workflow head. No scheduler or automatic redispatch
+is added. The five-minute consumer's idle/finite-use behavior remains an
+activation prerequisite, not permission for near-continuous staging windows.
+
+**Reruns:** use **Re-run all jobs**, never only failed jobs. A partial rerun has a
+new `run_attempt` but old grant outputs, so the inherited assert refuses with
+`staging_window_mismatch`. Do not copy another attempt's expiry, reset the grant
+or renew it to make the rerun pass. Missing inherited expiry fails closed via
+the nested-lock refusal/cancellation, not by bypassing the consumer.
 
 Before activation, retain authorized live inventory for the staging and
 production Worker versions, namespaces, Container applications/instances,

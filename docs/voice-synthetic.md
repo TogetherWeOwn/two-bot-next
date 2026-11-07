@@ -97,10 +97,17 @@ A workflow's retry loop must fit inside the original window, not renew it.
 Keep every existing active-use check and cleanup obligation; a stopped gateway
 is not a passing room-lifecycle test.
 
-The runtime protocol checkpoint is not activation. The existing scheduled and
-reusable consumers still need lifecycle wiring and full-window serialization
-before rollout acceptance. Production is unchanged; no permanent staging
-keepalive, host timer or new always-on cost is authorized.
+The workflow wiring is not activation. A separate `staging-window` job in the
+`staging` environment asserts a called deploy's exact grant; the live `synthetic`
+job needs it and never holds the ownership credential. A standalone run holds
+the canonical workflow lock, begins at most 45 minutes, and releases after the
+consumer. Called runs use a disjoint per-run group and never release the parent.
+Start/assert and cleanup receipts are retained for 14 days. Use **Re-run all
+jobs** after a failure: re-running only failed jobs changes the attempt and the
+inherited assert refuses. See the linked contract for pending-slot replacement
+and exact-SHA re-dispatch recovery. Full rollout still requires the remaining
+consumer/rollback wiring, live inventory and acceptance. Production is unchanged;
+no permanent staging keepalive, host timer or new always-on cost is authorized.
 
 ## When it runs
 
