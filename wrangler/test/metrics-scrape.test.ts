@@ -21,12 +21,35 @@ test("alert input dimensions match the Rust always-emitted scrape contract", () 
 });
 
 const isOptionalLine = (line: string) => Object.hasOwn(ALERT_OPTIONAL_INPUT_LABELS, line.split(/[{ ]/)[0]!);
+// The `voice` internal-actions family validates when present but is never
+// required: a rolled-back pre-`voice` container must still scrape.
+const isVoiceFamilyLine = (line: string) =>
+  line.startsWith("two_bot_internal_actions_total{") && line.includes('family="voice"');
 
 test("every current required label combination is required, not merely one row per family", () => {
-  const lines = metricsLines().filter((line) => !isOptionalLine(line));
+  const lines = metricsLines().filter((line) => !isOptionalLine(line) && !isVoiceFamilyLine(line));
   for (let i = 0; i < lines.length; i++) {
     assert.equal(parseAlertScrape(lines.filter((_, j) => j !== i).join("\n")), null, lines[i]);
   }
+});
+
+test("older exposition without the voice family still parses", () => {
+  const withoutVoice = metricsLines().filter((line) => !isVoiceFamilyLine(line)).join("\n");
+  const samples = parseAlertScrape(withoutVoice);
+  assert.ok(samples);
+  assert.equal(samples.filter((s) => s.name === "two_bot_internal_actions_total").length, 6 * 12);
+  assert.ok(parseAlertScrape(metricsBody()));
+});
+
+test("a partially present voice family fails the scrape", () => {
+  // All-or-nothing: a missing outcome row would undercount refusals and
+  // clear a rising-refusal streak, so eleven of twelve voice rows is a
+  // failed scrape while zero of twelve is a rolled-back container.
+  const lines = metricsLines();
+  const voiceIndex = lines.findIndex(isVoiceFamilyLine);
+  assert.ok(voiceIndex >= 0);
+  assert.equal(parseAlertScrape(lines.filter((_, j) => j !== voiceIndex).join("\n")), null);
+  assert.ok(parseAlertScrape(lines.filter((line) => !isVoiceFamilyLine(line)).join("\n")));
 });
 
 test("older exposition without the optional gauges still parses", () => {

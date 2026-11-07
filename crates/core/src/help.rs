@@ -85,8 +85,10 @@ const HELP_GROUPS: &[HelpGroup] = &[
             "command-remove",
             "command-list",
             "command-inspect",
+            "command-clone",
             "command-disable",
             "command-enable",
+            "command-edit",
             "schedule",
             "schedule-remove",
             "schedule-list",
@@ -166,8 +168,18 @@ const HELP_GROUPS: &[HelpGroup] = &[
         title: "Voice rooms",
         requires: None,
         commands: &[
-            "setup", "ping", "invite", "reclaim", "transfer", "name", "private", "public", "limit",
+            "setup",
+            "ping",
+            "invite",
+            "reclaim",
+            "transfer",
+            "name",
+            "private",
+            "public",
+            "limit",
             "unlimit",
+            "myroom",
+            "room-access-inspect",
         ],
         anchor: Some("textchannels"),
     },
@@ -207,7 +219,6 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
     let live: HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     let mut out = String::new();
     let _ = writeln!(out, "**Server commands** ({} live)", live.len(),);
-    out.push_str("Gated commands need the listed permission.\n");
     let mut rendered: HashSet<&str> = HashSet::new();
     for group in HELP_GROUPS {
         if group.anchor.is_some_and(|anchor| !live.contains(anchor)) {
@@ -235,7 +246,7 @@ pub fn help_text(defs: &[CommandDefinition]) -> String {
         out.push_str(&names.join(" · "));
         out.push('\n');
         if group.commands.contains(&"rsvp-attendance") && live.contains("rsvp-attendance") {
-            out.push_str("Paste the event id or its link, e.g. https://discord.com/events/<server-id>/<event-id>.\n");
+            out.push_str("Paste the event id or link, e.g. https://discord.com/events/<server-id>/<event-id>.\n");
             out.push_str("Totals include your saved response and saved time; live event availability is not checked.\n");
         }
     }
@@ -907,17 +918,24 @@ mod tests {
                 "{token} appears exactly once"
             );
         }
-        // 45 non-voice commands (7 core + 25 feature + 9 moderation + 4 reads),
-        // including inspection, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
-        // tempban-list, purge-preview, channel-inspect and moderation-recent, plus 21 additional voice commands (voice
+        // 47 non-voice commands (7 core + 27 feature + 9 moderation + 4 reads),
+        // including inspection, clone, edit, reopen, welcome-preview, pause/resume, giveaway, lfg-edit, lfg-list, feed-inspect,
+        // tempban-list, purge-preview, channel-inspect and moderation-recent, plus 23 additional voice commands (voice
         // `kick` loses first-wins to moderation `/kick`). `/templateassistant` stays
         // unpublished until its slice lands: matches the regenerated `docs/commands.md` total.
-        assert!(text.contains("**Server commands** (66 live)"));
+        assert!(text.contains("**Server commands** (70 live)"));
         assert!(
             !text.contains("**Custom**"),
             "every published name is grouped"
         );
-        assert!(text.len() < 2000, "fits Discord's content ceiling");
+        // Bytes overstate the wire length: every `·` separator costs two
+        // UTF-8 bytes but one UTF-16 unit. Assert the ceiling with the same
+        // unit count the adapter routes on, so the full builtin set keeps its
+        // plain-content reply instead of tipping into the embed fallback.
+        assert!(
+            crate::message_safety::text_len(&text) <= crate::message_safety::CONTENT_LIMIT,
+            "fits Discord's content ceiling"
+        );
     }
 
     #[test]
@@ -945,7 +963,7 @@ mod tests {
             "**Giveaways** — needs Manage Server\n/giveaway\n",
             "**Message cleanup** — needs Manage Messages\n/purge · /purge-preview\n",
             "**Channel slowmode and locks** — needs Manage Channels\n/slowmode · /lockdown · /unlock · /channel-inspect\n",
-            "**Voice rooms**\n/setup · /ping · /invite · /reclaim · /transfer · /name · /private · /public · /limit · /unlimit\n",
+            "**Voice rooms**\n/setup · /ping · /invite · /reclaim · /transfer · /name · /private · /public · /limit · /unlimit · /myroom · /room-access-inspect\n",
             "**Voice room admin** — needs Manage Channels\n/create · /textchannels · /access · /logging · /position · /group · /inheritpermissions · /defaultlimit · /alwaysprivate\n",
             "**Voice room settings** — needs Manage Server\n/export · /import\n",
         ] {
@@ -1039,12 +1057,12 @@ mod tests {
             .iter()
             .flat_map(|g| g.commands.iter().copied())
             .collect();
-        // 45 non-voice names, including inspection, reopen, welcome-preview, pause/resume,
+        // 47 non-voice names, including inspection, clone, edit, reopen, welcome-preview, pause/resume,
         // giveaway, lfg-edit, lfg-list, feed-inspect, tempban-list, purge-preview, channel-inspect
         // and moderation-recent, plus
-        // 21 additional voice names (voice `kick` shares the Kick group).
+        // 23 additional voice names (voice `kick` shares the Kick group).
         // `/templateassistant` stays out until its slice lands.
-        assert_eq!(grouped.len(), 66);
+        assert_eq!(grouped.len(), 70);
         for name in [
             "rank",
             "leaderboard",
@@ -1057,7 +1075,9 @@ mod tests {
             "command",
             "command-disable",
             "command-enable",
+            "command-edit",
             "command-inspect",
+            "command-clone",
             "schedule-list",
             "sticky-remove",
             "rsvp",

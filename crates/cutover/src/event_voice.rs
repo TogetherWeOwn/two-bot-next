@@ -4,8 +4,8 @@
 //! `UNIQUE (event_id, instance_starts_at)`: the create path claims with
 //! `INSERT ... ON CONFLICT DO NOTHING` holding `owner_tick_lease` before any
 //! Discord call, so two workers or a double tick yield one channel. A losing
-//! claim still refreshes `starts_at`/`ends_at` (a `starts_at` shift updates
-//! the row in place, channel kept) and re-leases a row whose lease is `NULL`
+//! claim refreshes binding dates from accepted instance evidence when present,
+//! never from stale caller dates, and re-leases a row whose lease is `NULL`
 //! and which still needs a create (unbound, or orphaned awaiting a
 //! replacement); a new occurrence starts a new row. Per-member join/leave
 //! spans persist in `event_voice_presence` on the voice packets themselves;
@@ -31,8 +31,12 @@ use time::OffsetDateTime;
 /// (or orphaned) row whose lease is `NULL`. A false loser must not call
 /// Discord.
 ///
-/// The conflict path always refreshes `starts_at`/`ends_at` (a rescheduled
-/// instance keeps its row, channel kept) but only takes a `NULL` lease on a
+/// With accepted evidence, only its current unambiguous live instance may
+/// claim, using confirmed window dates rather than unfenced caller dates.
+/// The supplied immutable identity must match; this bool API cannot substitute
+/// an identity that the caller would subsequently bind under another value.
+/// Legacy claims without evidence retain their old behavior but prove no
+/// lifecycle/window. The conflict path only takes a `NULL` lease on a
 /// row that still needs a create: unbound, or orphaned awaiting a
 /// replacement channel. A live binding is never re-leased (a revived row's
 /// lease stays `NULL` and the claim loses, so no tick double-creates), and
@@ -47,6 +51,26 @@ pub async fn claim_event_voice_channel(
     ends_at: Option<OffsetDateTime>,
     lease: &str,
 ) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    two_bot_core::event_instance_store::lock_event(&mut tx, event_id).await?;
+    let windows: Vec<(OffsetDateTime, OffsetDateTime, Option<OffsetDateTime>, bool)> =
+        sqlx::query_as(
+            "SELECT instance_starts_at, starts_at, ends_at,
+                    NOT identity_ambiguous AND revoked_at IS NULL
+                    AND status IN ('scheduled', 'active')
+             FROM event_instance_windows WHERE event_id = $1 AND is_current",
+        )
+        .bind(event_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    // The bool API cannot silently substitute an identity: the caller later
+    // binds with the same immutable instance. A stale/wrong instance loses.
+    // Legacy claims remain possible, but cannot create lifecycle evidence.
+    let (starts_at, ends_at) = match windows.as_slice() {
+        [] => (starts_at, ends_at),
+        [(instance, start, end, true)] if *instance == instance_starts_at => (*start, *end),
+        _ => return Ok(false),
+    };
     let won = sqlx::query(
         "INSERT INTO event_voice_channels
          (event_id, instance_starts_at, starts_at, ends_at, status,
@@ -60,10 +84,11 @@ pub async fn claim_event_voice_channel(
     .bind(starts_at)
     .bind(ends_at)
     .bind(lease)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?
     .is_some();
     if won {
+        tx.commit().await?;
         return Ok(true);
     }
     // Conflict: refresh the schedule and conditionally take a `NULL` lease.
@@ -89,9 +114,10 @@ pub async fn claim_event_voice_channel(
     .bind(starts_at)
     .bind(ends_at)
     .bind(lease)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?
     .flatten();
+    tx.commit().await?;
     Ok(held.as_deref() == Some(lease))
 }
 
@@ -130,6 +156,21 @@ pub async fn bind_event_voice_channel(
     instance_starts_at: OffsetDateTime,
     channel_id: &str,
 ) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    two_bot_core::event_instance_store::lock_event(&mut tx, event_id).await?;
+    let eligible: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (
+           SELECT 1 FROM event_instance_windows WHERE event_id = $1 AND is_current
+             AND (instance_starts_at <> $2 OR identity_ambiguous OR revoked_at IS NOT NULL
+                  OR status NOT IN ('scheduled', 'active')))",
+    )
+    .bind(event_id)
+    .bind(instance_starts_at)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !eligible {
+        return Ok(false);
+    }
     let bound = sqlx::query(
         "UPDATE event_voice_channels
          SET voice_channel_id = $3, status = 'creating', updated_at = NOW()
@@ -140,10 +181,11 @@ pub async fn bind_event_voice_channel(
     .bind(event_id)
     .bind(instance_starts_at)
     .bind(channel_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected()
         != 0;
+    tx.commit().await?;
     Ok(bound)
 }
 

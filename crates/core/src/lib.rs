@@ -20,6 +20,10 @@ pub mod audit_store;
 pub mod automation_quota;
 pub mod automation_transfer;
 pub mod automod;
+pub mod automod_preview;
+pub mod automod_preview_input;
+pub mod automod_preview_limiter;
+pub mod automod_preview_report;
 pub mod automod_runtime;
 #[cfg(feature = "db")]
 pub mod automod_store;
@@ -142,6 +146,8 @@ pub mod scheduled_store;
 pub mod secret;
 pub mod tempban_inventory;
 pub use secret::Secret;
+#[cfg(feature = "db")]
+pub mod event_instance_store;
 pub mod self_roles;
 pub mod send_admission;
 pub mod settings;
@@ -258,9 +264,9 @@ pub use custom_command_store::{
 pub use custom_commands::{
     accepted_text_trigger, adjudicate_delete, adjudicate_put, adjudicate_run,
     builtin_command_names, check_capacity, deregister_set, error_code, format_command_list,
-    is_builtin_trigger, max_custom_commands, placeholders_in, registry_with_custom,
-    render_template, require_automations_enabled, reserved_command_names, trigger_word,
-    validate_put_input, validate_template, AuditRecord, CommandError, DeleteDecision,
+    is_builtin_trigger, max_custom_commands, placeholders_in, publishable_builtin_names,
+    registry_with_custom, render_template, require_automations_enabled, reserved_command_names,
+    trigger_word, validate_put_input, validate_template, AuditRecord, CommandError, DeleteDecision,
     PutCommandInput, PutDecision, RunOutcome, StoredCommand, TemplateContext, TemplateError,
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS,
     MAX_TEXT_TRIGGER_CHARS, TEMPLATE_PLACEHOLDERS,

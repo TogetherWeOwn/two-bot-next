@@ -37,15 +37,45 @@ build/smoke, staging handshake, and the current CISO disposition for any
 accepted tuples to pass before calling the rollback complete. SBOMs regenerate
 per head through the supply-chain lane.
 
+## Selected change: `base-nossl-debian13`
+
+The runtime is changing from `cc-debian13` to
+`gcr.io/distroless/base-nossl-debian13:nonroot@sha256:e6b0f82595aa1edde72c8054de7a9dca30f0f8f54820c37a167c0ddfc21c5c67`
+(registry index body and header reverified). The builder stays
+`rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137`.
+The sections below that name `cc-debian13` are historical measurements of the
+prior image, not of this candidate.
+
+- Base packages: base-files, ca-certificates, media-types, netbase, tzdata,
+  tzdata-legacy and libc6. The Dockerfile adds only `libgcc-s1` and
+  `gcc-14-base` from the official Debian 13 repository: the `libgcc_s.so.1`
+  library, both copyright files and truthful `dpkg-query -s` records under
+  `/var/lib/dpkg/status.d/<package>`. No apt installation; no zlib, sid or
+  forky packages. The image has no `zlib1g`, `libz.so*`, `libssl`, `libzstd`,
+  `libstdc++` or `libgomp`.
+- uid/gid 65532, the Trivy HIGH/CRITICAL and unfixed gates and the empty
+  `.trivyignore.yaml` are unchanged.
+- The trusted `verify` job is to require that the binary's `DT_NEEDED` set is a
+  subset of `libc.so.6`, `libm.so.6` and `libgcc_s.so.1`, resolved inside the
+  image, with no `libz` and the required package records and SBOM entries.
+- Unmeasured: image size, CVE counts, container smoke, cold start and the
+  staging TLS handshake have not been run on this candidate. Nothing here claims
+  a passing gate or production acceptance. Security review and the staging
+  drill / Release Manager gates remain.
+
 ## Verdict
 
-The default runtime is `gcr.io/distroless/cc-debian13:nonroot` (digest-pinned,
-trixie builder). Do not use the `static` variant or deploy a `debug-nonroot`
-variant. Per-precondition status: TLS handshake met per the cutover note above
-(deploy-staging run `38773972225`); backup/guild-config upload-hook path still
-open (needs sidecar/static upload binaries or host-side upload per
-`docs/backup.md`; not proven on the distroless image); CISO acknowledgement of
-the 14-package inventory and pin-refresh runbook still open (no receipt linked).
+At the time of the original evaluation the default runtime was
+`gcr.io/distroless/cc-debian13:nonroot` (digest-pinned, trixie builder); it is
+being replaced as described above. Do not use the `static` variant or deploy a
+`debug-nonroot` variant. Per-precondition status (measured on the `cc` image):
+TLS handshake met per the cutover note above (deploy-staging run
+`38773972225`); backup/guild-config upload-hook path still open (needs
+sidecar/static upload binaries or host-side upload per `docs/backup.md`; not
+proven on the distroless image); CISO acknowledgement of the 14-package
+inventory and pin-refresh runbook still open (no receipt linked), and the
+nine-package `base-nossl` inventory has no acknowledgement yet. The TLS receipt
+does not carry over to the candidate until it is re-run.
 
 ## Compatibility
 
@@ -99,12 +129,14 @@ Counts are point-in-time (CI re-measures every head), not a standing PASS.
 The distroless `nonroot` tag is unversioned: refresh the digest pin by hand
 after a Debian point release if no Dependabot bump arrives.
 
-## Why `cc`, not `static`
+## Why `cc`, not `static` (historical; superseded by `base-nossl`)
 
 The release binary dynamically links glibc/`libgcc_s`/`libstdc++` (ring crypto,
 hyper/tokio). The `static` variant ships no libc — it would require retargeting
-to musl, out of scope. `cc` provides exactly the needed userspace and nothing
-else (14 packages, no shell or package manager).
+to musl, out of scope. `cc` provided the needed userspace and more
+(14 packages, no shell or package manager). The selected `base-nossl` change
+narrows this to glibc plus `libgcc_s.so.1` (9 packages), enforced by the
+`DT_NEEDED` subset check above; it is unmeasured.
 
 ## Cutover preconditions — status at closeout
 
@@ -121,9 +153,10 @@ else (14 packages, no shell or package manager).
 ## Runtime profile: cold start, RSS and readiness timings
 
 Historical trial-image profiling for the cutover guard. The default
-`Dockerfile` builds the pinned `cc-debian13:nonroot` base digest; current
-build-provenance arguments and labels do not alter the runtime. This profile
-remains historical evidence. No guard logic changes here; thresholds stay
+`Dockerfile` built the pinned `cc-debian13:nonroot` base digest when this was
+measured; the selected `base-nossl-debian13` runtime has no profile yet.
+Build-provenance arguments and labels do not alter the runtime. This profile
+remains historical evidence for the `cc` image only. No guard logic changes here; thresholds stay
 where the cutover guard reads them in the
 [production signal thresholds](production-deploy.md#signal-thresholds-budgets-and-rollback-triggers).
 

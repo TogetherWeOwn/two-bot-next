@@ -45,7 +45,9 @@ boundaries (auth.rs, gateway_backoff.rs, member-erasure.ts, SessionController.ph
 The words also match directory names/descendants. Prose filenames ending .md/.rst/.txt
 are not modules, but still inherit any critical directory floor. Substrings such as
 names in authors.py, voices/, and roleplay.ts do not match those critical words.
-Also T0: .github/workflows/deploy*, crates/cutover/**, and wrangler .toml/.json/.jsonc
+Also T0: .github/workflows/deploy*, .github/workflows/supply-chain.yml,
+.github/scripts/pr_standards.py (the pr-lint gate itself, judged from the base
+branch), crates/cutover/**, and wrangler .toml/.json/.jsonc
 configs at any depth (including wrangler.production.toml); prose like docs/wrangler.md
 is not a config. Deploy scripts outside these paths still require a declared T0 when critical.
 Renames inspect both old and new paths; deleting a T0 file is still T0.

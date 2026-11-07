@@ -13,6 +13,36 @@ they do not state. This bot moderates real members from one always-on
 container: a wrong automated action against a member is a production defect,
 not a cosmetic one.
 
+## Production merge evidence
+
+Apply [the contribution policy](CONTRIBUTING.md#production-merge-evidence) when
+reviewing production merge readiness; this advisory guide grants no merge or
+deploy permission. Exact-head staging is the default. It is not required only
+when **all** artifact-identical conditions are verified:
+
+- The actual diff is only tests (`test/`, `e2e/`, `*.test.*`, fixtures), docs
+  (`docs/`, `*.md`), or CI unrelated to build/deploy/release/promotion. Inspect
+  content, not labels. Exclude deploy/release workflows, Wrangler/Worker config,
+  Dockerfiles, migrations, package manifests and lockfiles; any runtime,
+  dependency or deployment change disqualifies the PR.
+- Complete production artifacts for the exact PR head and current `main` are
+  byte-identical. The confirmation card records both full head SHAs and both
+  bundle/image hashes for every deployed component, covering the container image,
+  Worker bundle, deployed assets and image metadata. Source-tree equality, a file
+  label, PR title or a partial output is not proof.
+- Required CI and Devin Review pass on that exact PR head, with findings fixed
+  or answered with evidence.
+
+The Release Manager must record the verified classification and paired hashes in
+a new exact-head, per-PR confirmation. Missing proof, a mismatch or a non-qualifying
+diff keeps the full exact-head staging requirement. Preserve every required
+check, review gate, incident/freeze/hold safeguard, identity/capability hold,
+SHA-pinned squash merge and release-log requirement; no red deterministic gate
+is waived. A new head needs a fresh confirmation; a changed comparison `main`
+needs revalidated artifact evidence. Historical rejections are not retroactive
+approvals: submit qualifying candidates afresh with hashes. No pipeline skip,
+no-op implementation or production action is authorized by this rule.
+
 ## What merits a finding
 
 Report blocking defects only: concrete correctness, security, data-integrity,
@@ -23,18 +53,80 @@ at the reviewed commit.
 
 Severity is impact times confidence, after the disproof pass below:
 
-- **Severe (red):** production-reachable wrong or duplicated moderation of a
-  member, token/secret disclosure, authorization bypass on a privileged
-  command or signed internal action, shared-database corruption, or a
-  gateway crash/poison loop — with the mechanism verified.
+- **Severe (red):** only an outcome listed under "What counts as Severe"
+  below, with the mechanism verified.
 - **Non-severe:** a real defect with limited blast radius or a narrow trigger.
 - **Investigate/flag, not a bug:** the mechanism depends on an assumption you
   could not verify against this code or the pinned Twilight/Discord contract.
-- **Security exception:** never drop or downgrade a plausible security issue
-  for lack of full verification; reserve Critical for a traced, verified path.
+- **Security exception:** for candidates meeting the concrete-path requirement
+  below, never drop or downgrade a plausible security issue for lack of full
+  verification; reserve Critical for a traced, verified path.
   Do not describe a suspected vulnerability, exposed secret, or sensitive
   data publicly: post only a non-sensitive notice that a private report under
   `SECURITY.md` is required.
+
+## What counts as Severe
+
+Severe only when merging the change would cause one of these:
+
+- **Data loss or corruption:** a write in `crates/store` that drops the
+  predicate it read, so a replayed event applies a funnel effect twice, or an
+  edit to an applied migration.
+- **Security or auth/authz weakness:** a privileged command that skips its
+  row in `crates/core/src/command_permissions.rs`, or a token reaching logs
+  or `Debug` output.
+- **Production breakage or a broken deploy/rollback gate:** a poison event
+  that crash-loops the gateway runner, a `sql/web_v1.sql` change that breaks
+  the website's reads, or a `deploy-production.yml` rollback that cannot
+  restore the previous image.
+- **Wrong user-visible behavior with no workaround:** automod acting on a
+  trusted or protected executor that `docs/containment.md` excludes.
+- **A test or gate that can no longer fail:** `scripts/check-secret-debug.py`
+  or `scripts/check-migrations.py` gaining an early exit that passes every
+  input.
+
+Not Severe (use Non-severe): missing edge-case tests (no empty-argument
+case for a custom command), naming (a function name in `crates/core`), docs
+drift (`docs/commands.md` lagging a command change), refactor suggestions
+(splitting `crates/bot/src/dispatch.rs`), performance without a measured
+regression ("this lookup may be slow" with no event-rate path), and
+defensive checks for states the callers already prevent (re-checking a
+permission the router already enforced).
+
+These labels only grade a finding that already qualifies under "What
+merits a finding", "Test rigor" and "Skip"; they never make an item
+reportable. Most of the Not Severe items are skipped outright, and any
+that is still reported is Non-severe.
+
+## Before you flag a security issue
+
+- Require a concrete exploit path at the exact reviewed commit: name the
+  attacker, the input they control, what they gain, and the file/lines where
+  protection is missing. Follow `SECURITY.md` for private reporting; never post
+  a runnable exploit or sensitive values.
+- First check the documented design (ADRs, README, module docs and PR body).
+  Behavior explicitly intended by that design is not itself a security finding;
+  raise design disagreement as a non-blocking question instead.
+- Trace protection earlier in the call path: middleware, size caps, signature
+  checks, server-only creation and allowlists can disprove the candidate.
+- Hypothetical hardening without an exploit path ("could log", "might leak",
+  defence in depth) is **Non-severe at most**, categorized as **analysis**, not
+  security; the existing Skip rules still apply.
+
+Examples grounded in this repository:
+
+- **Would qualify (hypothetical regression, not a present defect):** removing
+  the MAC rejection in `AuthenticatedRequest::verify`
+  (`crates/core/src/internal_actions.rs`) would let a caller who can reach the
+  internal receiver, but has no signing secret, supply an action body and gain
+  an enabled moderation effect if the remaining gates pass. Trace those gates
+  in `crates/bot/src/internal_action_http.rs` before reporting; the current
+  receiver verifies the MAC before nonce burn, authorization or effects.
+- **False alarm:** "unknown key IDs use a fallback signing key" is not an auth
+  bypass. `KeyRing::verify` in `crates/core/src/internal_actions.rs` deliberately
+  performs the comparison with a random decoy, then requires a known key as
+  well as a matching signature. The module docs describe this equal-work
+  protection; even a matching decoy signature cannot authenticate a caller.
 
 ## Disproof pass (before posting any finding)
 
@@ -148,5 +240,6 @@ Judge each PR against the PR template that applies to this repo
 
 - PR title is not a Conventional Commits header, or the body is missing/empty a section that template requires (org default: Thinking Path, Linked Issues or Issue Description, Verification, Attestation, Model Used).
 - Where the template has an Attestation block: the tier is understated for the touched paths, claims lack a test mapping to a file changed in this PR (T2 may use `none`), or D-items are checked without evidence in the diff.
+- T0 path → attestation present: a diff touching a T0 path (migrations/sql/db, auth words, `.github/workflows/deploy*`, `crates/cutover/**`, wrangler config) must declare `risk_tier: T0` with claims↔tests and checked D1–D8; `pr-lint` enforces this floor, so a missing attestation is a blocking finding even when CI is otherwise green.
 - Title, body, branch name, or review replies contain internal ticket ids, instance links, internal hostnames, private addresses, private emails, or credential material. Links to public GitHub issues and PRs are allowed.
 - Verification claims tests or results that the diff or CI output contradicts, or reports a local run without its exact command and result.

@@ -94,18 +94,19 @@ jobs:
           command: check advisories
           arguments: --workspace --all-features
 
-  sweep:
-    name: nightly ignored tests and docs
+  sweep-plan:
+    name: nightly inventory plan
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     permissions:
       contents: read
-    # Runner routing: see the note on `check` in check.yml.
+    # Keep the existing sweep overflow allow-list and runner protections.
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sweep') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
-    timeout-minutes: 45
+    # Preserve the event allow-list: unknown events retain the 45-minute cap.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}
     # Match required CI isolation on the shared Docker host.
     container:
-      image: rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546
+      image: rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: '0'
@@ -146,7 +147,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -155,7 +156,7 @@ jobs:
             ~/.cargo/git
             target
           # Keep lean nightly artifacts separate from the required check job.
-          key: ${{ runner.os }}-nightly-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-nightly-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-nightly-cargo-
       - name: Prepare isolated test databases
@@ -213,7 +214,7 @@ jobs:
           TEST_DATABASE_URL: postgresql://agent_test@agent-testdb:5432/postgres
           PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/nightly-workspace
         run: >-
-          cargo test --workspace --all-features --locked --no-fail-fast -- --include-ignored --test-threads=1
+          python3 .github/scripts/nightly_partition.py plan -- --include-ignored --test-threads=1
           --skip regenerate_reference_docs
           --skip channel_moderation_store::
           --skip channel_moderation_store::tests::lockdown_round_trip_stores_and_restores_exact_masks
@@ -378,6 +379,239 @@ jobs:
           --skip event_store_s7_scheduled_event_user_add_remove_persist_user_id_deltas_only
           --skip event_store_s7_duplicate_delivery_inserts_once
           --skip event_store_s7_privacy_tripwire_rejects_descriptions_and_locations
+      - name: Upload original runnable inventory and six-partition plan
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          # Run-scoped names permit re-run failed jobs without losing the plan.
+          name: nightly-plan
+          overwrite: true
+          path: nightly-plan.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Report cache size
+        if: always()
+        shell: bash
+        run: |
+          for path in "$HOME/.cargo/registry" "$HOME/.cargo/git" "$GITHUB_WORKSPACE/target"; do
+            if [ -d "$path" ]; then
+              du -sh "$path"
+            else
+              printf '%s: absent\n' "$path"
+            fi
+          done
+          df -h "$GITHUB_WORKSPACE"
+
+  sweep-partition:
+    name: nightly partition ${{ matrix.partition }}
+    needs: [changes, sweep-plan]
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        partition: [0, 1, 2, 3, 4, 5]
+    permissions:
+      contents: read
+    # Keep the existing sweep overflow allow-list and runner protections.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sweep') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Preserve the event allow-list: unknown events retain the 45-minute cap.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}
+    # Match required CI isolation on the shared Docker host.
+    container:
+      image: rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      TWO_LFG_TESTDB_CI: '1'
+      TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
+      # CI service hosts only; deployed processes default to `required`
+      # (docs/database-tls.md). Without it the in-process `connect` refuses
+      # the loopback test database and voice startup degrades to voice-off.
+      TWO_DATABASE_TLS: local-only
+    services:
+      agent-testdb:
+        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          # Disposable CI service only, matching the test-database guards.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download exact-run inventory plan
+        id: plan
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: nightly-plan
+      - name: Job-container prerequisites (job-private loopback forward)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
+          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
+          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
+          exit 1
+      - name: Guarded fixture routing and doc references (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
+        with:
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Keep lean nightly artifacts separate from the required check job.
+          key: ${{ runner.os }}-nightly-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-nightly-cargo-
+      - name: Prepare isolated test databases
+        id: databases
+        run: |
+          # Match the existing guards; never relax them or use a repository secret.
+          createdb -h agent-testdb -U agent_test two_bot_test_tog10090_nightly
+          createdb -h agent-testdb -U agent_test two_next_backup_nightly
+          createdb -h agent-testdb -U agent_test two_next_backup_publication_nightly
+          mkdir -p "$RUNNER_TEMP/nightly-workspace" "$RUNNER_TEMP/backup-roundtrip" "$RUNNER_TEMP/backup-publication"
+      # Serial execution prevents the ignored stores' shared tables/locks from
+      # racing. Sticky/onboarding tests are disposable-DB tests, not Discord calls.
+      # Channel moderation, the discord channel-moderation executor, feeds_store,
+      # legacy_verify_db, raid_list_db, reengagement_list_db, game_activity_report_db, staging_migrate_db
+      # and internal_events require agent_test, not the two_bot_test_* bootstrap
+      # used by TestDatabase suites. Skip only those tests here, then run ALL of
+      # those suites below with their accepted URL.
+      # The store suite reads its own TEST_DATABASE_URL and isolates per schema.
+      - name: Generate command reference before workspace compilation
+        run: python3 scripts/generate_command_reference.py
+
+      - name: Execute exact serial partition and prove its inventory
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly
+          MEMBER_TESTDB: agent-testdb
+          TEST_DATABASE_URL: postgresql://agent_test@agent-testdb:5432/postgres
+          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/nightly-workspace
+          NIGHTLY_PARTITION: ${{ matrix.partition }}
+        run: >-
+          python3 .github/scripts/nightly_partition.py run
+          --partition "$NIGHTLY_PARTITION"
+          --receipt "nightly-receipts/partition-$NIGHTLY_PARTITION.json"
+      - name: Upload exact partition execution receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: nightly-partition-${{ matrix.partition }}
+          overwrite: true
+          path: nightly-receipts/partition-${{ matrix.partition }}.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Report cache size
+        if: always()
+        shell: bash
+        run: |
+          for path in "$HOME/.cargo/registry" "$HOME/.cargo/git" "$GITHUB_WORKSPACE/target"; do
+            if [ -d "$path" ]; then
+              du -sh "$path"
+            else
+              printf '%s: absent\n' "$path"
+            fi
+          done
+          df -h "$GITHUB_WORKSPACE"
+
+  sweep-guarded:
+    name: nightly guarded suites and backups
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    permissions:
+      contents: read
+    # Keep the existing sweep overflow allow-list and runner protections.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sweep') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Preserve the event allow-list: unknown events retain the 45-minute cap.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}
+    # Match required CI isolation on the shared Docker host.
+    container:
+      image: rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      TWO_LFG_TESTDB_CI: '1'
+      TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
+      # CI service hosts only; deployed processes default to `required`
+      # (docs/database-tls.md). Without it the in-process `connect` refuses
+      # the loopback test database and voice startup degrades to voice-off.
+      TWO_DATABASE_TLS: local-only
+    services:
+      agent-testdb:
+        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          # Disposable CI service only, matching the test-database guards.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Job-container prerequisites (job-private loopback forward)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
+          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
+          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
+          exit 1
+      - name: Guarded fixture routing and doc references (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
+        with:
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Keep lean nightly artifacts separate from the required check job.
+          key: ${{ runner.os }}-nightly-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-nightly-cargo-
+      - name: Prepare isolated test databases
+        id: databases
+        run: |
+          # Match the existing guards; never relax them or use a repository secret.
+          createdb -h agent-testdb -U agent_test two_bot_test_tog10090_nightly
+          createdb -h agent-testdb -U agent_test two_next_backup_nightly
+          createdb -h agent-testdb -U agent_test two_next_backup_publication_nightly
+          mkdir -p "$RUNNER_TEMP/nightly-workspace" "$RUNNER_TEMP/backup-roundtrip" "$RUNNER_TEMP/backup-publication"
+      # Serial execution prevents the ignored stores' shared tables/locks from
+      # racing. Sticky/onboarding tests are disposable-DB tests, not Discord calls.
+      # Channel moderation, the discord channel-moderation executor, feeds_store,
+      # legacy_verify_db, raid_list_db, reengagement_list_db, game_activity_report_db, staging_migrate_db
+      # and internal_events require agent_test, not the two_bot_test_* bootstrap
+      # used by TestDatabase suites. Skip only those tests here, then run ALL of
+      # those suites below with their accepted URL.
+      # The store suite reads its own TEST_DATABASE_URL and isolates per schema.
+      - name: Generate command reference before workspace compilation
+        run: python3 scripts/generate_command_reference.py
+
       - name: Channel moderation ignored tests with their guarded URL
         if: ${{ !cancelled() && steps.databases.outcome == 'success' }}
         env:
@@ -487,8 +721,117 @@ jobs:
         run: >-
           cargo test -p two-bot-core --all-features --test backup_dump_publication --locked
           -- --include-ignored --test-threads=1
+      - name: Report cache size
+        if: always()
+        shell: bash
+        run: |
+          for path in "$HOME/.cargo/registry" "$HOME/.cargo/git" "$GITHUB_WORKSPACE/target"; do
+            if [ -d "$path" ]; then
+              du -sh "$path"
+            else
+              printf '%s: absent\n' "$path"
+            fi
+          done
+          df -h "$GITHUB_WORKSPACE"
+
+  sweep-docs:
+    name: nightly doctests and strict docs
+    needs: [changes, sweep-plan]
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    permissions:
+      contents: read
+    # Keep the existing sweep overflow allow-list and runner protections.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sweep') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Preserve the event allow-list: unknown events retain the 45-minute cap.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}
+    # Match required CI isolation on the shared Docker host.
+    container:
+      image: rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      TWO_LFG_TESTDB_CI: '1'
+      TWO_GATEWAY_TEST_DATABASE_URL: postgresql://agent_test@localhost:5432/agent_test
+      # CI service hosts only; deployed processes default to `required`
+      # (docs/database-tls.md). Without it the in-process `connect` refuses
+      # the loopback test database and voice startup degrades to voice-off.
+      TWO_DATABASE_TLS: local-only
+    services:
+      agent-testdb:
+        image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+        env:
+          POSTGRES_USER: agent_test
+          POSTGRES_DB: agent_test
+          # Disposable CI service only, matching the test-database guards.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U agent_test -d agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download exact-run inventory plan
+        id: plan
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: nightly-plan
+      - name: Job-container prerequisites (job-private loopback forward)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 postgresql-client socat >/dev/null
+          nohup setsid socat TCP-LISTEN:5432,bind=127.0.0.1,reuseaddr,fork TCP:agent-testdb:5432 >/dev/null 2>&1 &
+          for i in $(seq 1 30); do pg_isready -q -h 127.0.0.1 -U agent_test -d agent_test && exit 0; sleep 1; done
+          exit 1
+      - name: Guarded fixture routing and doc references (offline)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
+        with:
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Keep lean nightly artifacts separate from the required check job.
+          key: ${{ runner.os }}-nightly-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-nightly-cargo-
+      - name: Prepare isolated test databases
+        id: databases
+        run: |
+          # Match the existing guards; never relax them or use a repository secret.
+          createdb -h agent-testdb -U agent_test two_bot_test_tog10090_nightly
+          createdb -h agent-testdb -U agent_test two_next_backup_nightly
+          createdb -h agent-testdb -U agent_test two_next_backup_publication_nightly
+          mkdir -p "$RUNNER_TEMP/nightly-workspace" "$RUNNER_TEMP/backup-roundtrip" "$RUNNER_TEMP/backup-publication"
+      # Serial execution prevents the ignored stores' shared tables/locks from
+      # racing. Sticky/onboarding tests are disposable-DB tests, not Discord calls.
+      # Channel moderation, the discord channel-moderation executor, feeds_store,
+      # legacy_verify_db, raid_list_db, reengagement_list_db, game_activity_report_db, staging_migrate_db
+      # and internal_events require agent_test, not the two_bot_test_* bootstrap
+      # used by TestDatabase suites. Skip only those tests here, then run ALL of
+      # those suites below with their accepted URL.
+      # The store suite reads its own TEST_DATABASE_URL and isolates per schema.
+      - name: Generate command reference before workspace compilation
+        run: python3 scripts/generate_command_reference.py
+
+      - name: Workspace doctests with original ignored-test and skip semantics
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_tog10090_nightly
+          MEMBER_TESTDB: agent-testdb
+          TEST_DATABASE_URL: postgresql://agent_test@agent-testdb:5432/postgres
+          PAPERCLIP_RUN_SCRATCH_DIR: ${{ runner.temp }}/nightly-workspace
+        run: python3 .github/scripts/nightly_partition.py docs
       - name: cargo doc -D warnings
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.plan.outcome == 'success' }}
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps --locked
@@ -504,3 +847,37 @@ jobs:
             fi
           done
           df -h "$GITHUB_WORKSPACE"
+
+  sweep:
+    name: nightly ignored tests and docs
+    needs: [changes, sweep-plan, sweep-partition, sweep-guarded, sweep-docs]
+    if: ${{ always() }}
+    permissions:
+      contents: read
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sweep') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download original inventory plan
+        if: ${{ needs.changes.outputs.rust != 'false' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: nightly-plan
+      - name: Download all six partition receipts
+        if: ${{ needs.changes.outputs.rust != 'false' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: nightly-partition-*
+          path: nightly-receipts
+          merge-multiple: true
+      - name: Require selector, every selected leg, and complete execution evidence
+        if: always()
+        env:
+          NIGHTLY_NEEDS: ${{ toJSON(needs) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$NIGHTLY_NEEDS" > nightly-needs.json
+          python3 .github/scripts/nightly_partition.py aggregate --needs nightly-needs.json

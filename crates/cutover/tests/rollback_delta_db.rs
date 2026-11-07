@@ -98,6 +98,7 @@ impl TestDb {
             include_str!("../migrations/0414_voice_rooms_custom_name.sql"),
             include_str!("../migrations/0416_voice_room_privacy.sql"),
             include_str!("../migrations/0422_voice_create_reservations.sql"),
+            include_str!("../migrations/0472_event_instance_windows.sql"),
         ] {
             sqlx::raw_sql(migration).execute(&pool).await?;
         }
@@ -144,6 +145,17 @@ impl TestDb {
              ('claim-before', '100', '300', '2026-09-29T12:00:00Z', NULL, '2026-09-29T12:00:00Z'),
              ('claim-bound', '100', '301', '2026-09-29T12:00:00Z', '500', '2026-10-01T12:00:00Z'),
              ('claim-rollback', '100', '302', '2026-09-29T12:00:00Z', NULL, '2026-10-01T12:00:00Z');",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::raw_sql(
+            "INSERT INTO event_instance_windows
+             (guild_id, event_id, instance_starts_at, starts_at, status, observed_at, omitted_at, revoked_at) VALUES
+             ('g', 'observed-after', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z', 'active', '2026-10-01T12:00:00.000Z', NULL, NULL),
+             ('g', 'omitted-after', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z', 'missing', '2026-09-29T12:00:00.000Z', '2026-10-01T12:00:00.000Z', NULL),
+             ('g', 'revoked-after', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z', 'deleted', '2026-09-29T12:00:00.000Z', NULL, '2026-10-01T12:00:00.000Z'),
+             ('g', 'exact-baseline', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z', 'cancelled', '2026-09-30T12:00:00.000Z', '2026-09-30T12:00:00.000Z', '2026-09-30T12:00:00.000Z'),
+             ('g', 'before', '2026-09-29T12:00:00Z', '2026-09-29T12:00:00Z', 'active', '2026-09-29T12:00:00.000Z', NULL, NULL)",
         )
         .execute(pool)
         .await?;
@@ -219,6 +231,11 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
             count_of(&summary, "voice_create_reservations"),
             Some(("measured".to_owned(), Some(2)))
         );
+        // All three ordering fences contribute; exactly T_f is not after it.
+        assert_eq!(
+            count_of(&summary, "event_instance_windows"),
+            Some(("measured".to_owned(), Some(3)))
+        );
         // Unmeasurable tables carry a reason, never a silent skip.
         for table in [
             "community_scorecard_attempts",
@@ -293,15 +310,24 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
         tx.rollback().await?;
 
         // Export emits one NDJSON line per post-T_f row:
-        // 1 + 1 + 2 + 1 + 1 + 3 (voice_rooms handoff, rename and privacy) + 2 (claim settlements).
+        // 1 + 1 + 2 + 1 + 1 + 3 (voice_rooms handoff, rename and privacy)
+        // + 2 (claim settlements) + 2 (event observation/revocation fences).
         let mut lines = Vec::new();
         let exported = export_delta(&db.pool, SINCE, &mut |line: String| {
             lines.push(line);
             Ok::<(), std::io::Error>(())
         })
         .await?;
-        assert_eq!(exported, 11);
-        assert_eq!(lines.len(), 11);
+        assert_eq!(exported, 14);
+        assert_eq!(lines.len(), 14);
+        let mut window_ids: Vec<String> = lines
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|value| value["table"] == "event_instance_windows")
+            .map(|value| value["row"]["event_id"].as_str().unwrap().to_owned())
+            .collect();
+        window_ids.sort_unstable();
+        assert_eq!(window_ids, ["observed-after", "omitted-after", "revoked-after"]);
         let settlements: Vec<serde_json::Value> = lines
             .iter()
             .map(|line| serde_json::from_str(line).unwrap())

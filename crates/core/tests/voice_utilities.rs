@@ -2,8 +2,9 @@
 
 use proptest::prelude::*;
 use two_bot_core::voice_utilities::{
-    invite_render, is_valid_invite_code, ping_render, INVALID_INVITE_CODE, MAX_INVITE_CODE_CHARS,
-    MAX_PING_DISPLAY_MS, MIN_INVITE_CODE_CHARS, NO_INVITE_CONFIGURED,
+    invite_render, is_valid_invite_code, myroom_render, ping_render, INVALID_INVITE_CODE,
+    MAX_INVITE_CODE_CHARS, MAX_PING_DISPLAY_MS, MIN_INVITE_CODE_CHARS, MYROOM_CREATION_GUIDANCE,
+    MYROOM_EMPTY, NO_INVITE_CONFIGURED,
 };
 
 #[test]
@@ -111,4 +112,38 @@ proptest! {
             prop_assert_eq!(out, INVALID_INVITE_CODE);
         }
     }
+}
+
+#[test]
+fn myroom_empty_names_no_room_and_the_next_action() {
+    let out = myroom_render(&[], false);
+    assert_eq!(out, MYROOM_EMPTY);
+    let lower = out.to_ascii_lowercase();
+    assert!(lower.contains("no") && lower.contains("own"));
+    assert!(lower.contains("room"));
+    assert!(!lower.contains("<#"), "no channel may be invented: {out}");
+    // Creation guidance is conditional: no lobby promise when creation is
+    // not actually open.
+    assert!(
+        !lower.contains("join"),
+        "no join guidance without an open creator path: {out}"
+    );
+    let guided = myroom_render(&[], true);
+    assert_eq!(guided, format!("{MYROOM_EMPTY}{MYROOM_CREATION_GUIDANCE}"));
+    let guided = guided.to_ascii_lowercase();
+    assert!(guided.contains("creator") && guided.contains("join"));
+}
+
+#[test]
+fn myroom_lists_each_room_as_a_channel_reference_only() {
+    // Channel references only: no privacy label or ACL classification.
+    let out = myroom_render(&[500, 501], false);
+    assert_eq!(out, "You own 2 live voice rooms:\n<#500>\n<#501>");
+    assert!(!out.contains("private") && !out.contains("public"));
+}
+
+#[test]
+fn myroom_singular_counts_one_room() {
+    let out = myroom_render(&[502], true);
+    assert_eq!(out, "You own 1 live voice room:\n<#502>");
 }

@@ -6,7 +6,7 @@
 push or PR. A completed-but-unsuccessful staging run promotes nothing; a green
 one promotes the commit of the latest successful staging deploy — never its
 own run SHA, so a re-run of an older staging run cannot downgrade production —
-after a 30-minute soak past the staging-green time
+after a fresh 30-minute live staging measurement window
 (see [Automatic promotion](#automatic-promotion)). The B4 cutover executor
 (TOG-9699) dispatches it from `main`. Agents never do. The cutover gates in
 [cutover.md](cutover.md) still apply.
@@ -32,9 +32,10 @@ since Environment settings can drift.
    Environment, so an Environment-scoped value alone is invisible to the guard
    and every `allow_unstaged` dispatch refuses before probing. The deploy job
    refuses when it is unset, not an `https://` URL, or equal to staging.
-3. Optionally add production-scoped `CLOUDFLARE_API_TOKEN` /
-   `CLOUDFLARE_ACCOUNT_ID` secrets. Environment secrets override the
-   repository secrets that staging uses.
+3. Add the `production` Environment secrets `CLOUDFLARE_API_TOKEN` /
+   `CLOUDFLARE_ACCOUNT_ID`. The pair is Environment-scoped (`staging` and
+   `production`) with no repository-scope copies; the production job reads
+   only the `production` copies.
 
 The `sha guard` job refuses every dispatch until the Environment has
 reviewers and a main-only branch policy. `PRODUCTION_AUTO_APPROVE=true`
@@ -257,12 +258,55 @@ These skips keep it green while deploying nothing:
   staging run cannot downgrade production (intentional downgrades stay an
   explicit operator rollback, which also serves the older container image).
 
-Otherwise the `soak` job sleeps the remainder of 30 minutes past the
-staging-green time, recomputed there from the staging-green timestamp the
-guard reports (an unreadable timestamp soaks the full window). The soak runs
-outside the `deploy-production` lane — only the `production` and `release`
-jobs hold it — so a sleeping promotion never queues an operator rollback
-behind it. The lane keeps the default single pending slot, so a `recheck`
+A guard skip or a pre-deploy recheck skip also runs the
+**`production promotion skipped (<reason>)`**
+job, emits a warning, and uploads the JSON artifact
+`production-promotion-skipped-<run_id>-<run_attempt>`. Its receipt contains
+`outcome: "skipped"`, `reason`, the target `sha`, `run_id` and `run_attempt`;
+the job exposes `outcome` and `reason` outputs too. Watchers must inspect this
+named job/check (or its receipt), not count successful workflow runs as
+successful deploys. For example, the jobs API for a run shows a completed
+`production promotion skipped (staging-pending)` check when CI finished first;
+that is a deferral, not a rollout. Alert on repeated deferrals without a newer
+verified production revision; `live` and `older-than-live` are intentional
+no-ops. These markers do not waive gates or turn a failed gate green. An actual
+rollout still needs the successful `production` job, immutable promotion
+evidence and a matching live `/readyz` revision.
+
+Both completion triggers are necessary: removing `check` loses the wake when
+staging finishes first; removing `deploy-staging` loses it when CI finishes
+first. A `ci-pending` or `staging-pending` run alone does not establish a
+promotion deadlock. Inspect the later completion's run and its gates before
+changing trigger routing. No staging-poll retry loop is needed.
+
+Otherwise the `soak` job takes the canonical `staging-lifecycle` lock,
+acquires a 40-minute run/attempt grant for the guarded SHA and proves readiness
+before the baseline. Automatic promotion measures a **fresh full 30 minutes**
+after that baseline, rechecking exact-build readiness at most every minute
+and at the boundaries. Historical staging-green age, runner queues and idle
+time supply no credit; the guard's historical remainder is advisory only.
+Manual ordinary deploys retain their no-delay policy but use the same finite
+grant, baseline, final sample and release. Rollback and live-SHA cures skip
+the staging holder entirely. A superseded SHA refuses before acquisition;
+select the current verified candidate on the next promotion rather than
+starting a different build under the old candidate's authorization.
+
+The staging lock spans startup, baseline, measurement, final evidence and
+release in one job, including failed/cancelled cleanup. Native persisted expiry
+is still required if the runner disappears; `always()` alone is not cleanup
+proof. The original absolute expiry never moves. The grant remains capped at
+40 minutes; the job has a 50-minute timeout, leaving ten minutes for
+checkout/setup, stop and evidence rather than cancelling cleanup at the grant
+cap. Startup readiness can consume up to five minutes before the fresh
+30-minute interval; final sampling and original-grant readiness must still finish
+before expiry. A slow/unhealthy candidate that exhausts the grant fails closed;
+the extra job time never authorizes more sampling or extends the grant. Native
+expiry remains necessary if setup/provider calls exhaust the job budget.
+Lifecycle NDJSON and available
+measurement JSON are always retained as
+`staging-soak-<run_id>-<run_attempt>` for seven days. The soak runs outside the
+`deploy-production` lane — only the `production` job holds it —
+so a staging wait never queues an operator production rollback behind it. The lane keeps the default single pending slot, so a `recheck`
 job waits for the soak and both gates, then re-reads the hold, the live
 revision and the active dispatches immediately before the deploy: a hold set,
 a target gone live or stale, or an operator dispatch queued, waiting or in
@@ -316,13 +360,13 @@ itself on staging.
 Before any production mutation, every ordinary promotion compares the
 soaked candidate on staging with production as it serves now:
 
-- The `soak` job first records a soak-baseline `/ops/metrics` scrape
+- The `soak` job acquires and readies the guarded SHA in its finite window,
+  then records a soak-baseline `/ops/metrics` scrape
   (`wrangler/scripts/rest-5xx-counters.mjs`, same `staging` Environment
-  bearer), so the judged soak window starts at that sample, then sleeps out
-  the remainder of the 30 minutes past the staging-green time.
-- The `staging-soak-evidence` job runs after the soak (outside the lane,
-  `staging` Environment with `deployment: false` for the scrape bearer). It
-  runs the staging user-flow probe pinned to the guarded SHA and bound to
+  bearer). Automatic runs measure the full fresh interval with
+  `wrangler/scripts/staging-soak-window.mjs`; manual runs do not add a delay.
+- Under that same job's staging lock, it runs the final staging user-flow
+  probe pinned to the guarded SHA and bound to
   the guarded run-attempt build (a same-SHA redeploy no longer proves the
   candidate soaked), one `/ops/metrics` scrape, and a read-only listing of
   the main-branch `deploy-staging` runs. If staging now serves another
@@ -334,9 +378,13 @@ soaked candidate on staging with production as it serves now:
   (`two_bot_process_incarnation`): when the identity changed between the
   baseline and the post-soak sample, the process restarted mid-soak and the
   cumulative counters after the restart no longer cover the soak, so the
-  ratio records `insufficient_data` instead of a pass. No baseline is
-  expected when the soak skipped (it was already over before the run
-  started).
+  ratio records `insufficient_data` instead of a pass. The baseline is always
+  supplied from the same bounded job, never optional historical evidence.
+  A post-sample original-grant readiness check and confirmed release must
+  succeed before the job can pass; unknown cleanup is not a green verdict.
+- `staging-soak-evidence` only forwards that successful job's recorded
+  verdict. It has no staging secret, live probe or lifecycle authority and
+  cannot turn a failed/cancelled soak or release into qualification.
 - The `production` job then runs the passive production probe and the same
   scrape against production as the baseline (production's counters since its
   process started, normally a day or more of traffic), and
@@ -386,6 +434,29 @@ record is written before the watch; a watch rollback shows in the run
 summary and its evidence artifact. As after a manual rollback, set
 `PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL` after a watch rollback, or the next
 automatic run re-promotes the same build.
+## Deploy notifications
+
+The final step of the `production` job reports every production change to
+the release-verification webhook, which opens a verification card for the
+release manager and feeds the release log. One HMAC-SHA256-signed JSON
+record per run (`scripts/deploy_notify.py`):
+
+| Field | Value |
+| --- | --- |
+| `event` | `deploy`, or `rollback` for an operator rollback dispatch |
+| `outcome` | `success`, `rolled_back` (a gate failed, or the post-deploy watch breached, and the snapshot was restored) or `failed` |
+| `sha`, `versionId`, `imageDigest`, `previousVersionId` | the guarded SHA, the new (or restored) Worker version, the promoted image digest, the snapshot's previous version |
+| `runUrl`, `startedAt`, `finishedAt` | this run |
+| `reason` | for a rollback, failure, or live-SHA recovery: which gate failed, whether a failed restore was also rolled back, or the recovery mode |
+
+Bindings: repository variable `PAPERCLIP_DEPLOY_WEBHOOK_URL` (https) and
+secret `PAPERCLIP_DEPLOY_WEBHOOK_SECRET`. Headers `X-Paperclip-Timestamp` and
+`X-Paperclip-Signature: sha256=<HMAC(secret, "<timestamp>." + body)>`; the
+receiver allows 300 s of clock skew. The step is never a gate: it runs with
+`continue-on-error`, a 2-minute timeout, and only a notice when the bindings
+are unset. The daily release audit cross-checks GitHub runs, so a lost
+delivery is still caught. Values outside their allowlisted shapes are sent as
+`null`; the step never prints the secret, the signature or the response.
 
 ## Production error-rate gate
 
@@ -454,8 +525,12 @@ requires image convergence and live exact-version `/health` plus original-stamp
 0/1 or 1/0) need two consecutive fully passing observations, finished rollout steps
 and all instances updated; any miss resets confirmations. Empty rollout listings
 or the exact older rollout identified by the pre-deploy snapshot may poll; a newer
-foreign-image rollout refuses. A different same-SHA build still refuses. The
-production event ID is not restamped into the image.
+foreign-image rollout refuses. If the 600-second window expires without any
+accepted observation, the refusal names the last wait class in fixed vocabulary —
+`awaiting_rollout_listing`, `awaiting_application_config` or
+`awaiting_runtime_convergence` — so the next run can tell a stalled control-plane
+rollout from an application-config lag. A different same-SHA build still refuses.
+The production event ID is not restamped into the image.
 
 Rollback and explicitly authorized live-SHA recovery remain independent of
 artifact retention. Only live-SHA recovery builds a fresh image. Its rendered
@@ -480,7 +555,7 @@ verifies the saved module inventory and renders immutable inputs as described
 above. The legacy recovery invocation makes source/build paths absolute and
 sets `image_vars` on the single production container; existing protected tests
 still pin that legacy diff. The lockfile's Wrangler
-(4.152.0) runs the deploy: `wrangler-action` uses the installed version when
+(4.156.0) runs the deploy: `wrangler-action` uses the installed version when
 `wranglerVersion` is omitted, and the job runs `npm ci` first.
 
 The gate polls `/readyz` every 10 seconds for up to 30 attempts. In ordinary
