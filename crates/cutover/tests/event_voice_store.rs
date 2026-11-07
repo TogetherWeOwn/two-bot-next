@@ -64,6 +64,239 @@ async fn span_counts(pool: &sqlx::PgPool, user_id: &str) -> (i64, i64) {
 }
 
 #[tokio::test]
+async fn claims_use_confirmed_window_and_preserve_stable_identity_and_lease_age() {
+    use two_bot_core::{
+        scheduled_events::{EventStatus, ScheduledEvent},
+        website_store::upsert_event,
+    };
+
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test database required");
+    let db = TestDatabase::create(&url, &sqlx::migrate!("./migrations"))
+        .await
+        .unwrap();
+    let pool = db.pool();
+    let at = OffsetDateTime::from_unix_timestamp(1_793_707_200).unwrap();
+    let mut event = ScheduledEvent {
+        id: "200000000000000001".to_owned(),
+        name: "fixture".to_owned(),
+        starts_at: two_bot_core::funnel::format_iso_millis(at.unix_timestamp() * 1000),
+        ends_at: None,
+        channel_id: None,
+        description: None,
+        status: EventStatus::Scheduled,
+    };
+    // Claim first: fresh observation adopts the legacy instance, not its
+    // unfenced mutable schedule. Losing claims never refresh the lease age.
+    assert!(claim(pool, &event.id, at, "tick-a").await);
+    upsert_event(
+        pool,
+        "100000000000000001",
+        "2026-11-03T10:00:00.000Z",
+        &event,
+    )
+    .await
+    .unwrap();
+    backdate_updated(pool, &event.id, 10).await;
+    let before: OffsetDateTime =
+        sqlx::query_scalar("SELECT updated_at FROM event_voice_channels WHERE event_id = $1")
+            .bind(&event.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let moved = at + Duration::hours(2);
+    event.starts_at = two_bot_core::funnel::format_iso_millis(moved.unix_timestamp() * 1000);
+    upsert_event(
+        pool,
+        "100000000000000001",
+        "2026-11-03T10:01:00.000Z",
+        &event,
+    )
+    .await
+    .unwrap();
+    assert!(!claim_event_voice_channel(
+        pool,
+        &event.id,
+        at,
+        at - Duration::days(1),
+        Some(at),
+        "tick-b"
+    )
+    .await
+    .unwrap());
+    let (identity, start, end, updated): (OffsetDateTime, OffsetDateTime, Option<OffsetDateTime>, OffsetDateTime) =
+        sqlx::query_as("SELECT instance_starts_at, starts_at, ends_at, updated_at FROM event_voice_channels WHERE event_id = $1")
+            .bind(&event.id).fetch_one(pool).await.unwrap();
+    assert_eq!((identity, start, end, updated), (at, moved, None, before));
+    assert!(
+        !claim(pool, &event.id, moved, "tick-c").await,
+        "reschedule cannot establish another instance"
+    );
+    assert!(
+        bind_event_voice_channel(pool, &event.id, at, "300000000000000001")
+            .await
+            .unwrap()
+    );
+    event.status = EventStatus::Cancelled;
+    upsert_event(
+        pool,
+        "100000000000000001",
+        "2026-11-03T10:02:00.000Z",
+        &event,
+    )
+    .await
+    .unwrap();
+    assert!(!claim(pool, &event.id, at, "tick-d").await);
+    assert!(
+        !bind_event_voice_channel(pool, &event.id, at, "300000000000000002")
+            .await
+            .unwrap()
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn mirror_first_claim_consumes_the_initial_identity_after_reschedule() {
+    use two_bot_core::{
+        scheduled_events::{EventStatus, ScheduledEvent},
+        website_store::upsert_event,
+    };
+
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test database required");
+    let db = TestDatabase::create(&url, &sqlx::migrate!("./migrations"))
+        .await
+        .unwrap();
+    let at = OffsetDateTime::from_unix_timestamp(1_793_707_200).unwrap();
+    let mut event = ScheduledEvent {
+        id: "200000000000000001".to_owned(),
+        name: "fixture".to_owned(),
+        starts_at: two_bot_core::funnel::format_iso_millis(at.unix_timestamp() * 1000),
+        ends_at: None,
+        channel_id: None,
+        description: None,
+        status: EventStatus::Scheduled,
+    };
+    upsert_event(
+        db.pool(),
+        "100000000000000001",
+        "2026-11-03T10:00:00.000Z",
+        &event,
+    )
+    .await
+    .unwrap();
+    event.starts_at =
+        two_bot_core::funnel::format_iso_millis((at + Duration::hours(2)).unix_timestamp() * 1000);
+    upsert_event(
+        db.pool(),
+        "100000000000000001",
+        "2026-11-03T10:01:00.000Z",
+        &event,
+    )
+    .await
+    .unwrap();
+    assert!(claim(db.pool(), &event.id, at, "tick-a").await);
+    let identity: OffsetDateTime = sqlx::query_scalar(
+        "SELECT instance_starts_at FROM event_voice_channels WHERE event_id = $1",
+    )
+    .bind(&event.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(identity, at);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn real_snapshot_omission_holds_the_claim_fence_until_commit() {
+    use two_bot_core::{
+        scheduled_events::{EventStatus, ScheduledEvent},
+        website_store::{replace_events, upsert_event},
+    };
+
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test database required");
+    let db = TestDatabase::create(&url, &sqlx::migrate!("./migrations"))
+        .await
+        .unwrap();
+    let at = OffsetDateTime::from_unix_timestamp(1_793_707_200).unwrap();
+    let event = ScheduledEvent {
+        id: "200000000000000001".to_owned(),
+        name: "fixture".to_owned(),
+        starts_at: two_bot_core::funnel::format_iso_millis(at.unix_timestamp() * 1000),
+        ends_at: None,
+        channel_id: None,
+        description: None,
+        status: EventStatus::Active,
+    };
+    upsert_event(
+        db.pool(),
+        "100000000000000001",
+        "2026-11-03T10:00:00.000Z",
+        &event,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION pause_window_omission() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN PERFORM pg_advisory_xact_lock(2053001); RETURN NEW; END $$",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER pause_window_omission BEFORE UPDATE ON event_instance_windows
+         FOR EACH ROW EXECUTE FUNCTION pause_window_omission()",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let mut barrier = db.pool().begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(2053001)")
+        .execute(&mut *barrier)
+        .await
+        .unwrap();
+    let pool = db.pool().clone();
+    let writer = tokio::spawn(async move {
+        replace_events(&pool, "100000000000000001", "2026-11-03T10:01:00.000Z", &[]).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                 WHERE datname = current_database() AND state = 'active'
+                   AND wait_event = 'advisory' AND query LIKE 'UPDATE event_instance_windows%')",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("real writer reaches the omission barrier");
+    let mut contender = db.pool().begin().await.unwrap();
+    let acquired: bool = sqlx::query_scalar(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended('event_instance:' || $1, 0))",
+    )
+    .bind(&event.id)
+    .fetch_one(&mut *contender)
+    .await
+    .unwrap();
+    assert!(!acquired, "omission fences the same lock as claims/binds");
+    contender.rollback().await.unwrap();
+    barrier.commit().await.unwrap();
+    assert_eq!(writer.await.unwrap().unwrap(), None);
+    assert!(!claim(db.pool(), &event.id, at, "after-omission").await);
+    assert!(
+        !bind_event_voice_channel(db.pool(), &event.id, at, "300000000000000001")
+            .await
+            .unwrap()
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn claim_first_wins_and_loser_keeps_the_winner_lease() {
     let Some(db) = database().await else { return };
     let pool = db.pool();
