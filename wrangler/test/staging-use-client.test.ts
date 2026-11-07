@@ -45,6 +45,23 @@ test("staging client: acquire binds version, build, epoch, run/attempt and immut
   }
 });
 
+test("staging client: a deployment resource UUID cannot replace the Worker version UUID", async () => {
+  const versionId = "11111111-1111-4111-8111-111111111111";
+  const deploymentResourceId = "22222222-2222-4222-8222-222222222222";
+  const current = { ...state, deploymentId: versionId,
+    owner: { ...state.owner, deploymentId: versionId }, use: { ...use, deploymentId: versionId } };
+  const wrong = responses([Response.json(current)]);
+  await assert.rejects(stagingUse({ ...args, deploymentId: deploymentResourceId }, wrong.send,
+    async () => {}, clock), /staging_identity_mismatch/);
+  assert.equal(wrong.calls.length, 1);
+  assert.equal(wrong.calls[0].init.method, "GET", "wrong resource must never acquire");
+  const h = responses([Response.json({ ...current, use: null }), Response.json(current)]);
+  const receipt = await stagingUse({ ...args, deploymentId: versionId }, h.send, async () => {}, clock);
+  assert.equal(receipt.deploymentId, versionId);
+  assert.equal(receipt.use?.deploymentId, versionId);
+  assert.equal(JSON.parse(String(h.calls[1].init.body)).deploymentId, versionId);
+});
+
 test("staging client: invalid origin, identities and windows refuse before any network", async () => {
   const leak = TOKEN;
   for (const patch of [

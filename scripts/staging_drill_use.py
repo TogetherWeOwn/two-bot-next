@@ -37,13 +37,13 @@ class StagingDrillUse:
             self.shas[version] = sha
 
     def call(self, action, version=None, *, pipeline=False):
-        require(self.expires_at is not None, "staging_drill_window_missing")
-        env = dict(self.env, STAGING_USE_EXPIRES_AT=str(self.expires_at))
-        if version is not None:
-            require(version in self.shas, "staging_drill_identity_unproved")
-            env.update(STAGING_USE_DEPLOYMENT=version, STAGING_USE_SHA=self.shas[version])
-        helper = "staging-use-pipeline.mjs" if pipeline else "staging-use.mjs"
         try:
+            require(self.expires_at is not None, "staging_drill_window_missing")
+            env = dict(self.env, STAGING_USE_EXPIRES_AT=str(self.expires_at))
+            if version is not None:
+                require(version in self.shas, "staging_drill_identity_unproved")
+                env.update(STAGING_USE_DEPLOYMENT=version, STAGING_USE_SHA=self.shas[version])
+            helper = "staging-use-pipeline.mjs" if pipeline else "staging-use.mjs"
             result = subprocess.run(
                 ["node", str(self.root / "wrangler/scripts" / helper), action],
                 env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

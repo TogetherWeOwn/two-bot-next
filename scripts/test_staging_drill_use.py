@@ -370,6 +370,19 @@ class WindowTests(UseHarness):
 
 
 class FailureTests(UseHarness):
+    def test_local_identity_refusal_stops_cleanup_after_a_valid_acquisition(self):
+        use = self.started()
+        with self.assertRaises(GateError) as caught:
+            use.rebind(OTHER)
+        self.assertEqual(str(caught.exception), "staging_drill_identity_unproved")
+        self.assertTrue(use.failed)
+        use.finish()
+        self.assertEqual(self.runtime.actions, ["acquire", "ready"])
+        for recovery in (False, True):
+            with self.assertRaises(GateError) as caught:
+                use.check(recovery=recovery)
+            self.assertEqual(str(caught.exception), "staging_drill_window_ended")
+
     def test_refusal_marks_failed_and_stops_every_later_call(self):
         use = self.started()
         self.runtime.fail[("restore-check", 1)] = 1

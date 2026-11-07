@@ -315,6 +315,32 @@ test("bounded staging: control authentication, version stamping and bounded body
   assert.equal(h.starts.length, 0);
 });
 
+test("bounded staging: deployment identity is CF_VERSION_METADATA's Worker version UUID", async (t) => {
+  const versionId = "11111111-1111-4111-8111-111111111111";
+  const deploymentResourceId = "22222222-2222-4222-8222-222222222222";
+  const env = { ...BOUNDED_STAGING_ENV, CF_VERSION_METADATA: { id: versionId } };
+  const h = await harness(t, env, { owner: { ...ACTIVE_OWNER, deploymentId: versionId } });
+  const ingress = { ...env, TWO_BOT: { getByName: () => h.bot } } as unknown as Env;
+  const window = stagingWindow();
+  const acquire = (deploymentId: string) => new Request(`https://worker.invalid${STAGING_USE_PATH}`, {
+    method: "POST", headers: { authorization: `Bearer ${CONTROL_TOKEN}`, [DEPLOYMENT_HEADER]: deploymentResourceId },
+    body: JSON.stringify({ ...window, action: "acquire", expectedEpoch: 1,
+      deploymentId, sha: env.CONTAINER_RELEASE }),
+  });
+  const refused = await worker.fetch(acquire(deploymentResourceId), ingress, {} as ExecutionContext);
+  assert.equal(refused.status, 503);
+  assert.equal(h.values.has(STAGING_USE_KEY), false);
+  assert.equal(h.starts.length, 0);
+  const accepted = await worker.fetch(acquire(versionId), ingress, {} as ExecutionContext);
+  assert.equal(accepted.status, 200, "Worker overwrites the caller header with its own version UUID");
+  const state = await accepted.json();
+  assert.equal(state.deploymentId, versionId);
+  assert.equal(state.owner.deploymentId, versionId);
+  assert.equal(state.use.deploymentId, versionId);
+  assert.equal((h.values.get(STAGING_USE_KEY) as { deploymentId: string }).deploymentId, versionId);
+  assert.equal(h.starts.length, 0, "acquisition is not startup");
+});
+
 test("bounded staging: native expiry stops a lost runner's container, consumes schedules, and never resurrects", async (t) => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
   const h = await harness(t, BOUNDED_STAGING_ENV);
