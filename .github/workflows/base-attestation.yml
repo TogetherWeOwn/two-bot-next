@@ -1,0 +1,36 @@
+name: base-attestation
+
+# Metadata only. Never check out or execute a PR head in this workflow.
+# Enforcement requires native required-workflow binding, not a status name:
+# another Actions workflow can publish a same-name context. Keep all existing
+# required checks until the additive binding has been accepted and verified.
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: base-attestation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  metadata:
+    name: base-attestation-metadata
+    permissions:
+      contents: read
+      pull-requests: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out only the trusted base gate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+      - name: Validate fenced metadata with the base policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/base_attestation_gate.py --event "$GITHUB_EVENT_PATH"
