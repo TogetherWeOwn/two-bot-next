@@ -271,6 +271,7 @@ async fn seeded_mirror() -> (MemoryMirror, MirrorRows) {
                 id: EVENT.to_owned(),
                 name: "Seeded".to_owned(),
                 starts_at: "2026-09-01T18:00:00.000Z".to_owned(),
+                ends_at: None,
                 channel_id: Some(CHANNEL.to_owned()),
                 description: None,
                 status: EventStatus::Scheduled,
@@ -489,12 +490,17 @@ fn local_guard_refusals_are_unsent_and_never_discord_rejections() {
 
 #[tokio::test]
 async fn create_update_cancel_and_read_refresh_before_acknowledging() {
+    let confirmed_end = |status, voice| {
+        let mut body = response(status, voice);
+        body["scheduled_end_time"] = json!("2026-09-01T22:30:00+01:00");
+        body
+    };
     let rest = MockRest::start(
         vec![
             ScriptedResponse::json(201, response(1, false)),
-            ScriptedResponse::json(200, response(1, true)),
-            ScriptedResponse::json(200, response(4, true)),
-            ScriptedResponse::json(200, response(4, true)),
+            ScriptedResponse::json(200, confirmed_end(1, true)),
+            ScriptedResponse::json(200, confirmed_end(4, true)),
+            ScriptedResponse::json(200, confirmed_end(4, true)),
         ],
         ScriptedResponse::status(500),
     )
@@ -516,6 +522,10 @@ async fn create_update_cancel_and_read_refresh_before_acknowledging() {
     assert_eq!(created, json!({"outcome": "created", "event_id": EVENT}));
     let (row, observed) = mirror.row().unwrap();
     assert_eq!(row.starts_at, "2026-09-01T19:00:00.000Z");
+    assert_eq!(
+        row.ends_at, None,
+        "unknown response end is not the requested end"
+    );
     assert_eq!(row.channel_id, None);
     assert_eq!(row.description, None);
     assert_eq!(row.status, EventStatus::Scheduled);
@@ -534,6 +544,11 @@ async fn create_update_cancel_and_read_refresh_before_acknowledging() {
         .unwrap();
     assert_eq!(updated, json!({"outcome": "updated", "event_id": EVENT}));
     assert_eq!(mirror.row().unwrap().0.channel_id.as_deref(), Some(CHANNEL));
+    assert_eq!(
+        mirror.row().unwrap().0.ends_at.as_deref(),
+        Some("2026-09-01T21:30:00.000Z"),
+        "the confirmed response end wins over the requested end"
+    );
     assert_eq!(
         mirror.row().unwrap().0.description.as_deref(),
         Some("Meet in voice")
@@ -666,6 +681,7 @@ async fn already_cancelled_404_and_other_failures_do_not_retry_or_refresh() {
             id: EVENT.to_owned(),
             name: "old".to_owned(),
             starts_at: "2026-09-01T19:00:00.000Z".to_owned(),
+            ends_at: None,
             channel_id: None,
             description: None,
             status: EventStatus::Cancelled,
@@ -737,7 +753,16 @@ async fn malformed_or_mismatched_success_never_becomes_retry_safe() {
     bad_time["scheduled_start_time"] = json!("not-a-date");
     let mut missing_name = response(1, false);
     missing_name["name"] = Value::Null;
+    let mut bad_end = response(1, false);
+    bad_end["scheduled_end_time"] = json!("not-a-date");
+    let mut end_before_start = response(1, false);
+    end_before_start["scheduled_end_time"] = json!("2026-09-01T18:00:00Z");
+    let mut non_string_end = response(1, false);
+    non_string_end["scheduled_end_time"] = json!(5);
     for body in [
+        bad_end,
+        end_before_start,
+        non_string_end,
         json!({"id": EVENT}),
         wrong_id,
         wrong_guild,
@@ -1017,12 +1042,15 @@ mod database {
                 .connect_with(options)
                 .await
                 .unwrap();
-            sqlx::raw_sql(include_str!(
-                "../../cutover/migrations/0300_website_contract.sql"
-            ))
-            .execute(&pool)
-            .await
-            .unwrap();
+            for migration in [
+                include_str!("../../cutover/migrations/0300_website_contract.sql"),
+                include_str!("../../cutover/migrations/0450_scheduled_events_claim.sql"),
+                include_str!("../../cutover/migrations/0452_scheduled_events_tombstone.sql"),
+                include_str!("../../cutover/migrations/0455_event_voice_channels.sql"),
+                include_str!("../../cutover/migrations/0472_event_instance_windows.sql"),
+            ] {
+                sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+            }
             Self {
                 admin,
                 pool,

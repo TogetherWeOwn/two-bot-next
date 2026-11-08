@@ -76,7 +76,7 @@ before creating a browser build in that project's own card. The separate
   literal fallback is not permission to bypass validation. `{args}` echoes the
   invocation text literally under the [conditional M2
   contract](custom-command-args-spec.md): core render plus the 500-unit
-  argument bound are built, and run-path capture follows in the next slice.
+  argument bound are built, and run-path capture is built in the capture slice.
   Arguments do not authorize new
   evaluation. No HTML, script, SQL, include, network, or nested substitution.
 

@@ -159,6 +159,27 @@ registered until that lands.
    `get_config` must still succeed Worker-side. The backfill tool remains
    explicitly unimplemented; its readiness jobs excerpt is not backfill progress.
 
+The manual workflow holds the canonical non-cancelling `staging-lifecycle`
+lock across startup, proof and cleanup. A separate control-only step acquires
+at most **15 minutes** for the current run/attempt and verifies the exact
+Worker deployment/container SHA before the MCP command can run. The MCP
+step keeps only `STAGING_MCP_TOKEN`; the existing staging ownership token
+stays on the separate lifecycle steps. Both clients use the same fixed
+staging origin. The read-only MCP request sequence and refusal checks are
+unchanged; no fence override is supplied by the workflow.
+
+Cleanup runs after proof or startup failure whenever begin exported an expiry,
+including partial acquisition/readiness failure. It releases only that same
+run/attempt/window, never renews it, and retains a stop or refusal receipt.
+Start/readiness and stop NDJSON artifacts include the run and attempt and are
+retained for 14 days with missing files treated as errors. The sanitized MCP
+proof artifact is still required even on failure. Native persisted expiry is
+the cancellation/runner-loss backstop: an Actions cleanup step alone is not
+proof of stop, and `not-owned` is not proof of idle. A failed or skipped proof
+is never qualification.
+
+This wiring is not activation evidence. The bounded-policy rollout remains
+held by the [staging lifecycle inventory, rollback and acceptance gates](staging-rollout-gate.md#no-always-on-staging-rule-and-activation-hold).
 No dashboard or admin UI duplication: MCP reuses the same container read
 APIs and never adds UI.
 

@@ -2,7 +2,7 @@
 
 `deploy-staging.yml` runs `scripts/staging_rollout.py` before and after a
 successful Wrangler deployment (the `deploy` job was re-enabled by
-[TOG-12856](/TOG/issues/TOG-12856)). Order: ownership-control `preflight`,
+the earlier deploy re-enable). Order: ownership-control `preflight`,
 `prepare`, Wrangler deploy, `receipt`, ownership-control `deployment-takeover`,
 `verify`. `preflight` and `deployment-takeover` live outside
 `staging_rollout.py`. Readiness cannot be proven before the takeover, because a
@@ -19,12 +19,307 @@ are restored (with takeover, which releases an intentional fence onto the
 restored version after a fenced takeover refusal), and the run still stays red — the restore
 recovers service, it never certifies the failed build. Without a successful
 deploy and snapshot there is nothing to restore, so no rollback is attempted.
+The helper additionally requires a proven finite-policy target and the original
+run's grant. Receipt/takeover failures precede grant acquisition, so their
+conditional rollback invocation refuses before mutation with
+`staging_restore_window_missing`. They do not restore the predecessor; reconcile
+serving version, rollout and ownership, then repair through roll-forward. A
+failed step alone proves neither that the new build is serving nor that the
+predecessor is unchanged.
 The gate does not
 accept a health response from an old singleton. This is a **staging-only** gate,
 not production authorization or a migration tool. Operators can preview the
 ordered restore plan for a receipt without any mutation via
 `scripts/worker_container_rollback.py rollback ... --dry-run`, which validates
 the receipt identically to the live path and exits 0.
+
+## No-always-on staging rule and activation hold
+
+Idle staging/preview must carry **no recurring always-on runtime cost**. Start
+staging only through a trusted pipeline-owned, finite-use window, verify the
+exact tested SHA/environment before qualification, and stop through native
+Container/DO lifecycle controls on completion or expiry. A runner's `always()`
+cleanup is useful but cannot be the cancellation/runner-loss backstop. Production
+behavior, probes and release gates are unchanged. Never add a host timer, idle
+keepalive or scheduled probe that resurrects staging outside an authorized window.
+
+**Rollout status: activation by merge, not yet verified.** The staging-use
+protocol in `wrangler/src/staging-lifecycle.ts` is gated by the staging-only
+`STAGING_RUNTIME_POLICY=bounded` configuration. The policy ships in the staging
+vars of the activating change, so merging it activates the policy through the
+ordinary `deploy-staging` push run. Nothing here records that activation as done.
+Source, a merge or a sleeping container is not evidence of the bounded lifecycle:
+only the live qualification, rollback proof and measurement gates below establish
+it. Claim no savings until they pass. See
+[First activation roll-forward bootstrap](#first-activation-roll-forward-bootstrap).
+
+The protocol binds a finite window to staging, an exact Worker deployment and
+container SHA, the current ownership epoch, and a workflow run/attempt. It
+persists denial before teardown and before publishing a new grant. Rebinding
+through a deployment or rollback keeps the original expiry; a retry cannot
+extend it or steal a different consumer's window. Released attempts cannot be
+reacquired. Native persisted expiry re-reads the current grant after DO
+reconstruction; expired probes, ingress and SDK startup paths cannot revive the
+container. Routine callers must request only their needed window; the runtime
+ceiling accommodates a separately authorized four-ACTIVE-hour soak, not a
+permanent staging session. A provider stop failure is unconfirmed cleanup, never
+idle/zero-cost proof, and must be repaired through the existing incident path.
+Unconfirmed acquire/release teardown persists a native stop-only retry after
+15 seconds instead of waiting for the original grant expiry; repeated failures
+retain successors and never authorize startup.
+
+Replay end markers currently retain one small DO storage key per workflow
+run/attempt without pruning. This storage-growth limitation is retained for this
+rollout: deleting a marker without an independent replay horizon would let a
+late retry mint another window. It is not ongoing Container/DO runtime-use
+proof or a claim that storage is free.
+
+### Trusted client and receipt contract (partial wiring, not activated)
+
+`wrangler/scripts/staging-use.mjs` is the pipeline client for the protocol.
+`status` reads only the authenticated control path and neither acquires nor
+starts staging. `observe` is also control-only: periodic readers sample only
+an active window bound to the current deployment/SHA/epoch. A confirmed stopped,
+unauthorized/released/expired runtime emits `intentional_idle`, never a healthy
+sample; an unconfirmed stop or invalid authority fails. It never acquires,
+renews, starts, probes or releases staging. The slow-burn workflow uses this
+observer in a separate credential-isolated step and skips both issue writes and
+cache saves during idle. Its five-minute cadence and active-use burn checks are
+unchanged. Scheduled user-flow also observes instead of acquiring a window.
+The production promotion's live staging-soak samples use one bounded grant
+through baseline, measurement, final sampling and release; their exact-head live
+qualification remains required.
+`acquire`, `assert`, `ready` and `release` pin the intended
+`STAGING_USE_SHA`, `STAGING_USE_DEPLOYMENT`, `GITHUB_RUN_ID`,
+`GITHUB_RUN_ATTEMPT` and absolute millisecond `STAGING_USE_EXPIRES_AT`. The
+origin must be the approved staging workers.dev origin, with no path, query or
+credentials. The dedicated `OWNERSHIP_CONTROL_TOKEN` stays on control requests,
+never on the public readiness probe. HTTP redirects, oversized/malformed replies
+and unknown provider errors refuse without printing remote bodies or secrets.
+
+`ready` requires the matching active window, probes `/readyz` for the exact
+Worker version and build SHA with all components ready, then rechecks the
+ownership epoch and window. This is **additional** to the existing image/digest,
+build/deploy identity and rollout qualification gates, not their replacement.
+`release` confirms native stop, can repeat after expiry or partial acquisition,
+and refuses a different run/attempt/window. It cannot renew an expiry.
+
+`wrangler/scripts/staging-use-pipeline.mjs` composes that client. `begin` uses
+authenticated control status to identify the currently owned build, persists and
+exports a finite expiry **before** acquisition, then requires readiness on that
+build. A deployment caller also supplies independently validated
+`STAGING_USE_SHA` and `STAGING_USE_DEPLOYMENT`; a mismatch refuses before mutation.
+The deploy job sets `STAGING_USE_ACQUIRE_ONLY=1` to authorize without a duplicate
+readiness loop: its existing exact-rollout `verify` step still owns the readiness
+verdict, including intentionally failing gateway drills. Acquisition alone never
+certifies startup or qualification. Repeating the same workflow attempt keeps its
+original expiry, including a partially prepared grant; a released/expired attempt
+cannot begin again. The caller supplies `STAGING_USE_MINUTES` only for `begin`,
+not as a renewal or an inherited consumer override.
+
+`rebind` requires the caller's original expiry plus the intended deployment/SHA
+from the independently validated deployment or rollback receipt. It refuses a
+missing/released/different-run grant rather than minting new authority. `consume`
+accepts the caller's exact deployment/SHA/expiry and only checks readiness: it
+never discovers a substitute build, acquires or releases. `finish` uses the
+current authenticated identity to release only that same run/attempt/window,
+including after a rollback or expiry. A `not-owned` result means cleanup did not
+stop a different attempt's singleton; it is **not** proof that this run never
+acquired a grant, or that staging is now stopped/idle. The parent's release and
+native expiry receipts supply the stop evidence.
+
+The staging Worker/container rollback now refuses a target unless its immutable
+Worker-version bindings prove `STAGING_RUNTIME_POLICY=bounded`,
+`TWO_DEPLOY_ENV=staging` and the receipt's exact `CONTAINER_RELEASE` SHA. Missing,
+duplicate, secret-type or mismatched bindings refuse before any fence, Worker
+restore or image rollout, even for `--dry-run`. A pre-stamp/always-on staging
+target has no legacy bypass. Binding evidence is necessary, not sufficient:
+reviewed target implementation and runtime/release acceptance remain mandatory.
+
+The deploy's auto-rollback runs the helper and its nested client from the
+workflow-head `tooling` checkout, never a historical deployed SHA's helper.
+It passes the original `steps.use.outputs.expires_at`; it never chooses new minutes. Before mutation, `restore-check` asserts the
+current run/attempt/window without probing the intentionally failed build. After
+restore and ownership takeover, `rebind` authorizes and readies the restored
+receipt's deployment/SHA under that **same** expiry; the unchanged consecutive
+stable gate still runs afterwards. If the grant is missing, belongs to another
+attempt, ended, or expires during restore, recovery fails closed rather than
+minting extra time. Parent cleanup retains the original expiry and native
+expiry remains the cancellation backstop. The extra projected receipts are
+`auto-rollback-evidence.json.staging-use.jsonl` in the existing rollout artifact;
+production rollback never invokes this staging contract.
+
+The deploy, reusable voice/help, manual Worker/container drills, MCP proof and
+production staging-soak workflows now declare the bounded contract. Scheduled
+user-flow and slow-burn readers observe authority without starting or extending
+it; confirmed idle skips live sampling and incident decisions, not active-use
+checks. This is source integration whose merge is the activation trigger, not a recorded
+activation or live qualification. Exact-head Actions, live inventory, the
+first-activation bootstrap and rollback proof, and independent review still gate
+rollout. The wrappers replace no existing qualification. The binding checker
+permits only an absent policy or the exact `"bounded"` value in staging with
+`TWO_DEPLOY_ENV="staging"`; it rejects top-level, production and other named
+environment placement and plaintext ownership-control tokens. The staging vars
+carry `bounded`; no top-level, production or other environment sets it.
+
+Every CLI invocation requires a pipeline-owned `STAGING_USE_RECEIPT` NDJSON path
+and writes an attempt receipt before network activity, followed by a projected
+success or fixed-code failure receipt. Upload these even on failed runs. Runtime
+`staging_use` events separately record acquisition, explicit release and native
+expiry/stop with UTC observation, run/attempt, immutable expiry, deployment/SHA,
+epoch and confirmed/unconfirmed stop outcome. Native expiry receipts are the
+runner-loss/cancellation evidence path when an artifact upload cannot execute;
+an `authorized` receipt is not startup/readiness or zero-cost proof.
+
+The required pipeline integration must hold one window and full-window exclusion
+through **all** `deploy`, `user-flow-synthetic`, `voice-synthetic`,
+`help-embed-synthetic` and `certify-promotion` jobs in the same `deploy-staging`
+run, including a push run reused by a post-merge drill. Reusable consumers must
+assert the caller's window without taking the caller's lock or releasing it.
+Standalone consumers and rollback use the same finite-use contract. That wiring
+is present, but its exact-head live acceptance and the inventory/rollback gates
+below remain required. Client and runtime source support alone is not a qualified
+workflow or activation receipt.
+
+### Full-window workflow and recovery semantics
+
+`deploy-staging` holds the fixed, non-cancelling `staging-lifecycle` group at
+workflow level, from baseline through all qualification jobs and
+`staging-use-release`. No job inside it re-holds the group. Both standalone drills,
+standalone voice/help, the manual MCP prove-out and the production promotion soak
+use the same canonical group. The rollback-proof orchestrator does **not** hold
+it while waiting for its child.
+The read-only scheduled user-flow observer uses its independent job-level
+`synthetic-user-flow-staging` queue: it cannot replace pending lifecycle holders.
+The passive production sibling uses its own queue and never depends on staging.
+Production probe code is unchanged.
+
+The deploy job authorizes a 120-minute maximum window after receipt-validated
+ownership transfer and before its unchanged rollout/readiness gate. It exports
+the exact deployment/SHA and immutable expiry. All five qualifying jobs remain
+in that same push run; user-flow and certification reassert the window before
+consumption. Release needs every consumer and runs after failures too. A cleanup
+failure stays red; native expiry remains mandatory for cancelled or lost runners.
+
+Called voice/help receive three required `workflow_call`-only string inputs from
+`needs.deploy.outputs`; dispatch cannot inject an inherited grant. They use
+provably disjoint per-run nested groups and a separate main-only
+`environment: staging` job for authenticated readiness. The caller must pass both
+`TWO_VOICE_SYNTHETIC_BOT_TOKEN` and `STAGING_OWNERSHIP_CONTROL_TOKEN` by name,
+never `secrets: inherit`; declaring the control name in the callee alone does not
+make the environment secret available on the called path. The control declaration
+is required. Their live consumer job stays in `voice-synthetic`, references only
+the test-bot credential, and never receives a control-token environment variable.
+Standalone voice/help acquire at most 45 minutes under the canonical workflow lock
+and release after their consumer,
+even if it fails. Called jobs never acquire or release the parent's grant.
+The manual [MCP prove-out](mcp.md#staging-prove-out) acquires and verifies at most
+15 minutes under the same canonical workflow lock, then releases its original
+expiry even after failed acquisition/readiness or proof. The existing MCP bearer
+and ownership-control token stay on separate steps; the MCP proof sequence is
+unchanged. `scripts/ci/test_staging_mcp_window.py` pins its lifecycle and credential
+isolation in addition to the independent full-window deployment oracle.
+
+Retain start/assert and stop/refusal artifacts for the run and attempt. Verify
+on exact-head Actions that the existing staging control secret resolves in each
+called staging job; a missing token fails closed, never warrants a new credential.
+
+**Pending-slot replacement (residual recovery, 2026-11-07):** GitHub preserves a
+running holder with `cancel-in-progress: false`, but keeps only one pending item
+per group. The five-minute user-flow observer is outside that group and cannot
+replace a pending deploy or promotion soak. Actual holders (another deploy,
+drill or soak) can still replace one pending holder; there is no FIFO/fairness
+guarantee. A cancelled run is not qualification or staging history. Re-dispatch
+`deploy-staging` from `main` with `sha` set to that exact merged 40-hex SHA, wait
+for all five qualifying jobs plus release, and retain the new attempt's receipts
+before considering promotion. A cancelled production soak needs a new promotion
+run through its unchanged guard and fresh full-window measurement, never
+historical soak credit. The pin/history guard stays unchanged; an older pin
+still makes that deploy run intentionally red and cannot certify a different
+workflow head. No scheduler or automatic redispatch is added. The five-minute
+observer never grants a window; its cadence is not permission for
+near-continuous staging use.
+
+**Reruns:** use **Re-run all jobs**, never only failed jobs. A partial rerun has a
+new `run_attempt` but old grant outputs, so the inherited assert refuses with
+`staging_window_mismatch`. Do not copy another attempt's expiry, reset the grant
+or renew it to make the rerun pass. Missing inherited expiry fails closed via
+the nested-lock refusal/cancellation, not by bypassing the consumer.
+
+Before activation, retain authorized live inventory for the staging and
+production Worker versions, namespaces, Container applications/instances,
+alarms/schedules, and active pipeline consumers. Inventory Neon suspend policy
+and every shared database consumer too. A sleeping bot cannot establish that a
+shared database or another consumer stopped billing. Unsupported controls are
+real prerequisites, not permission to weaken active-use security, health or
+qualification checks. A zero cron count does not prove there are no per-object
+DO alarms; retain source inspection and runtime stop/expiry evidence for those.
+A database endpoint's idle state or default-autosuspend setting does not identify
+the Worker's secret-backed database or prove the effective suspend delay. Obtain
+a non-secret provider/resource label and resolved policy, inventory its shared
+consumers, and do not suspend shared compute on the bot's authority alone.
+
+Retain a rollback receipt with the exact staging Worker version, immutable
+image, SHA, ownership epoch, configuration and migration ledger. A rollback
+target must preserve finite-use expiry; reverting to indefinite always-on staging
+requires an explicit dated owner cost exception naming scope, recurring cost and
+expiry/review date. No such exception is supplied here. Bootstrap/rollback
+compatibility is resolved by the roll-forward rule below, before the merge.
+
+### First activation roll-forward bootstrap
+
+Activation is the ordinary `deploy-staging` push run for the change that ships
+`STAGING_RUNTIME_POLICY=bounded` in the staging vars. There is no wrapper or
+separate activation step and no baseline taken beforehand.
+
+- **Predecessors are not restore targets.** The currently deployed staging
+  versions (v875, v876 and v877) predate the policy and are unbounded. They are
+  never valid restore targets, because restoring one reverts to indefinite
+  always-on staging. Only a dated owner cost exception could change this, and none
+  exists.
+- **The first bounded deploy has no restore target.** Automatic rollback refuses
+  with `staging_restore_policy_unproved` before any mutation (fence, Worker
+  restore or image rollout).
+- **If a step fails after a successful deploy**, the bounded code is already
+  serving and stops through release, native expiry and the constructor refusing
+  ungranted legacy ticks. Expiry and stop receipts are the evidence; the red run
+  never certifies the build.
+- **If `wrangler deploy` itself fails**, remote state is unconfirmed. A lost
+  response can follow an accepted publication; a failed command proves neither
+  that the predecessor remained serving nor that bounded code was installed.
+  Automatic rollback runs only when the deploy step reports success. Reconcile
+  the actual serving Worker version/policy and Container rollout/image through
+  authorized read-only inventory before recovery. Claim no stop or qualification
+  from this branch; bounded roll-forward-only recovery still applies.
+- **Recovery is roll-forward only.** Fix forward with a new bounded build. Never
+  revert the policy or restore an unbounded version to recover.
+- **Baseline B1.** The first run that passes all five qualifying jobs
+  (`deploy`, `user-flow-synthetic`, `voice-synthetic`, `help-embed-synthetic`,
+  `certify-promotion`) plus `staging-use-release` becomes baseline B1 and supplies
+  the first rollback receipt.
+- **Rollback proof before any savings claim.** A fault-injection deploy must show
+  a finite rollback to B1 that keeps the original expiry and ends with confirmed
+  stopped status. Until it passes, make no savings claim.
+- **Later red builds.** An existing snapshot may select a prior bounded build that
+  was red, since the policy bindings are what matter. The unchanged 18-pass stable
+  restore gate still applies to it.
+
+Every gate in this document stays in force: exact-head Actions, Security then QA,
+separate per-PR exact-head Release Manager acceptance before merge, fresh inventory
+of the actual database, shared policy and applied migration ledger, exact-head
+qualification, and the `t0`, pre-7-day and post-7-day evidence below. The bootstrap
+sequence is a technical recovery decision, not approval to merge, deploy production
+or waive missing qualification. The merge-push qualification and rollback drill
+remain required live activation evidence.
+
+At verified activation record UTC `t0`, actual resource/version/SHA identities,
+finite expiry, exact-head startup/qualification evidence, stop/idle convergence
+and rollback receipt. Immediately retain the separated staging pre-window
+`[t0-7d,t0)` DO GB-s and Container hours; schedule the measurement follow-up at
+`t0+7d` for `[t0,t0+7d)`. Keep production as a separate control. Report gross
+usage, modeled monthly savings and invoice-confirmed savings separately, with
+query schema/filters/units and incomplete or delayed data disclosed. Assignment,
+merge or an unverified deployment is not `t0`.
 
 ## Step order and why
 
@@ -36,7 +331,7 @@ the receipt identically to the live path and exits 0.
 3. `receipt` (steps 3-4 below) needs only Wrangler's output file, local Docker and
    the Worker versions API, so it runs **before** ownership moves. A malformed,
    stale or wrong-environment receipt therefore never hands ownership to an
-   unverified version ([TOG-12939](/TOG/issues/TOG-12939): the first real run
+   unverified version (the first real run
    failed here, after takeover, because the receipt gate had never seen real
    Wrangler output).
 4. `verify` (steps 5-7) needs an owning singleton: a parked singleton answers
@@ -47,8 +342,14 @@ the receipt identically to the live path and exits 0.
    `verify`, or the error-rate gate), the workflow attempts an automatic rollback to the pre-deploy
    snapshot (Worker version **and** container image, with takeover) via
    `scripts/worker_container_rollback.py`; `scripts/staging_rollout.py` only reports
-   the failure. After a fenced takeover refusal the rollback's own takeover
-   releases the fence onto the restored version. A restored deployment still leaves the job red on `main`: the rollback
+   the failure. The helper refuses before mutation unless a finite-policy target
+   and the original run/attempt grant are proved. Receipt validation and initial
+   ownership takeover run **before** grant acquisition: their failures leave no
+   expiry, so automatic rollback refuses with `staging_restore_window_missing`
+   and recovery is roll-forward after reconciling remote state. This is not a
+   successful restore or proof that the predecessor is still serving. When the
+   grant exists, the rollback's own takeover can release a fence onto the restored
+   version. A restored deployment still leaves the job red on `main`: the rollback
    restores service, it never certifies the failed build. There is deliberately **no
    automatic permanent fence**: a successful restore ends with takeover (`active`), so
    the next push can hand off again without a manual `release_fence` dispatch. When
@@ -91,8 +392,11 @@ the receipt identically to the live path and exits 0.
 3. Read the **fresh** `WRANGLER_OUTPUT_FILE_PATH` NDJSON only after Wrangler exits
    successfully. Every Wrangler invocation appends its own `wrangler-session`
    record, and `wrangler-action` runs `wrangler --version` before deploying, so
-   the file holds several sessions. Require at least one session, all pinned to
-   4.152.0 with record version 1, exactly one `deploy` invocation and every other
+   the file holds several sessions. The action selects its exact CLI version
+   from the deployed checkout's lockfile after `npm ci`, so an older pinned drill
+   uses that commit's CLI and receipt guard, not the workflow head's newer pin.
+   Require at least one session, all pinned to that checkout's version (currently
+   4.156.0) with record version 1, exactly one `deploy` invocation and every other
    session exactly `--version` or `-v`, and exactly one staging deploy record
    with the expected Worker name, fresh timestamp and concrete Worker version.
    The `receipt` step runs this check **before** `deployment-takeover`, so
@@ -277,7 +581,9 @@ pinned client documents a `last` input but does not establish a trustworthy
 next-cursor/ordering contract, so a saturated page fails with
 `rollout_snapshot_truncated` rather than pretending the baseline is complete.
 First-deploy/bootstrap and no-new-rollout cases also fail; they are not evidence
-that a new revision was rolled out. No automatic rollback or secret mutation is
+that a new revision was rolled out. The first bounded activation is handled by the
+[roll-forward bootstrap](#first-activation-roll-forward-bootstrap), not by this
+gate's rollback. No automatic rollback or secret mutation is
 performed by `scripts/staging_rollout.py` itself; rollback is a workflow step that
 invokes `scripts/worker_container_rollback.py`. The local baseline receipt is
 type- and shape-validated before `select_rollout`, `receipt` or `verify` acts

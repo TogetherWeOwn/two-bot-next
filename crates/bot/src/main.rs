@@ -457,7 +457,11 @@ async fn run(cli_args: &[String]) {
     // data. The receiver also binds the supervisor's gateway state below, so
     // a warm cache while the gateway is disconnected (not `Connected`)
     // refuses instead of serving stale occupancy with a fresh timestamp.
+    // Beside it, the join clock the pipeline observes through: witnessed
+    // voice joins stamp `rooms[].occupied_since`, and anything the gateway
+    // never saw reads `null`, never a fabricated start.
     let voice_cache = voice_snapshot::new_shared_cache();
+    let voice_clock = voice_snapshot::VoiceOccupancyClock::new();
     // Capture the authoritative pool before the gateway's async move owns it.
     // Bind privately before starting tasks; enabled failures never fall back.
     let receiver = match receiver_config {
@@ -475,6 +479,7 @@ async fn run(cli_args: &[String]) {
                     pool,
                     token,
                     Arc::clone(&voice_cache),
+                    Arc::clone(&voice_clock),
                     Arc::clone(&gateway),
                 )
                 .await
@@ -783,6 +788,12 @@ async fn run(cli_args: &[String]) {
                             )
                         })?,
                     );
+                    // Voice-session clock: register the pipeline's transition
+                    // observer so witnessed joins stamp `voice.snapshot`
+                    // `rooms[].occupied_since`. Always on and ungated like the
+                    // cache writes themselves — tracking is memory-only, and
+                    // unwitnessed occupancy still reads `null`.
+                    pipeline.set_voice_transition_observer(voice_clock.clone());
                     // Community voice + message capture: arm the Postgres
                     // facts sink only when the scorecard job is enabled, so a
                     // staging-gated rollout captures exactly while it scores.

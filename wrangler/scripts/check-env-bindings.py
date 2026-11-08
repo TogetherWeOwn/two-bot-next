@@ -53,6 +53,7 @@ OPTIONAL_SECRET_BINDINGS = {
     # TOG-29201: the MCP shared bearer (docs/mcp.md). Optional Worker
     # secret only; a committed var would publish the bearer.
     "MCP_TOKEN",
+    "OWNERSHIP_CONTROL_TOKEN",
 }
 # TOG-22861 workers.dev break-glass: staging and production serve the public
 # suffix until a custom domain and Access app exist. Every named environment
@@ -261,6 +262,13 @@ def _collect_errors(cfg: dict) -> list[str]:
             )
         if variables.get(DEPLOY_ENV_VAR, "staging") != "staging":
             errors.append(f'{prefix}: {DEPLOY_ENV_VAR} must be exactly "staging" or absent')
+        if "STAGING_RUNTIME_POLICY" in variables:
+            if env_name != "staging":
+                errors.append(f"{prefix}: STAGING_RUNTIME_POLICY is staging-only")
+            if variables["STAGING_RUNTIME_POLICY"] != "bounded":
+                errors.append(f'{prefix}: STAGING_RUNTIME_POLICY must be exactly "bounded" or absent')
+            if variables.get(DEPLOY_ENV_VAR) != "staging":
+                errors.append(f'{prefix}: STAGING_RUNTIME_POLICY requires TWO_DEPLOY_ENV exactly "staging"')
         if GATEWAY_FAIL_INJECTION_VAR in variables:
             errors.append(
                 f"{prefix}: {GATEWAY_FAIL_INJECTION_VAR} must never be a committed var "

@@ -572,11 +572,20 @@ class CertifyExecutionTests(unittest.TestCase):
         self.assertIn("always()", diagnostics[0].get("if", ""))
         self.assertEqual(diagnostics[0]["with"]["name"], "staging-rollout-evidence")
         certify_steps = steps_of(workflow["jobs"]["certify-promotion"])
-        promotions = [s for s in certify_steps if (s.get("uses") or "").startswith("actions/upload-artifact@")]
+        uploads = [s for s in certify_steps if (s.get("uses") or "").startswith("actions/upload-artifact@")]
+        promotions = [s for s in uploads if s.get("with", {}).get("path") == "${{ runner.temp }}/promotion-upload"]
+        lifecycle = [s for s in uploads if s.get("with", {}).get("path") == "${{ runner.temp }}/staging-use-certify.jsonl"]
+        self.assertEqual(len(uploads), 2)
         self.assertEqual(len(promotions), 1)
+        self.assertEqual(len(lifecycle), 1)
+        self.assertEqual(lifecycle[0]["if"], "always()")
+        self.assertEqual(lifecycle[0]["with"]["name"], "staging-use-certify-${{ github.run_id }}-${{ github.run_attempt }}")
+        self.assertEqual(promotions[0].get("if", "success()"), "success()")
+        self.assertEqual(promotions[0]["with"].get("overwrite", "false"), "false")
         self.assertIn("bot-promotion-", promotions[0]["with"]["name"])
         self.assertNotEqual(promotions[0]["with"]["name"], "staging-rollout-evidence")
-        _, certify = find_step(workflow["jobs"]["certify-promotion"], "run")
+        _, certify = find_step_by_name(workflow["jobs"]["certify-promotion"],
+                                       "Certify the served module bytes and verified rollout")
         # Diagnostics upload in deploy must not reference the promotion ZIP.
         self.assertNotIn("promotion.zip", diagnostics[0].get("with", {}).get("path", ""))
         self.assertIn("promotion.zip", run_of(certify))

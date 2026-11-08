@@ -2138,10 +2138,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     for name in [
         "game_activity_guild_aggregates",
         "assistant_monthly_builds",
@@ -2156,6 +2156,7 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -2182,7 +2183,8 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -2203,6 +2205,7 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2229,10 +2232,10 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     for name in [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
@@ -2245,6 +2248,7 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -2269,7 +2273,8 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -2288,6 +2293,7 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2314,10 +2320,10 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
     // epoch-claim guard but predates the delete tombstones, token registry
     // event voice pair and starboard tables.
@@ -2332,6 +2338,7 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -2355,7 +2362,8 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -2373,6 +2381,7 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2407,10 +2416,10 @@ async fn v11_archive_restores_and_clears_newer_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     // Frozen tombstone-only v11 shape: the merged v11 writer carried the
     // delete tombstones but predates the token registry event voice pair and starboard tables.
     for name in [
@@ -2423,6 +2432,7 @@ async fn v11_archive_restores_and_clears_newer_registry() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -2445,7 +2455,8 @@ async fn v11_archive_restores_and_clears_newer_registry() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -2462,6 +2473,7 @@ async fn v11_archive_restores_and_clears_newer_registry() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2496,10 +2508,10 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     for table in [
         "event_voice_channels",
         "event_voice_presence",
@@ -2509,6 +2521,7 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let rows = old.buffers.remove(table).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {table}");
@@ -2530,7 +2543,8 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -2546,6 +2560,7 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2580,10 +2595,10 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     // Frozen registry-present v12 shape: the released writer carried the
     // token registry but predates the event voice pair and starboard tables.
     for name in [
@@ -2595,6 +2610,7 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -2622,7 +2638,8 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     assert_eq!(
@@ -2658,6 +2675,7 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2704,10 +2722,10 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     for name in [
         "starboard_config",
         "starboard_starrers",
@@ -2715,6 +2733,7 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         assert!(
             !old.buffers.remove(name).unwrap().is_empty(),
@@ -2748,7 +2767,8 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     for name in &restored_tables {
@@ -2797,6 +2817,7 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2833,11 +2854,16 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
-    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+    assert_eq!(old.manifest.version, 16);
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "event_instance_windows",
+    ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         old.manifest.tables.retain(|table| table.name != name);
@@ -2856,7 +2882,12 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
     assert_eq!(inspected.manifest.version, 14);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["giveaways", "giveaway_entries", "giveaway_draws"]
+        [
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
+            "event_instance_windows"
+        ]
     );
     sqlx::query("DELETE FROM starboard_starrers")
         .execute(pool)
@@ -2898,7 +2929,12 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         archived,
         "v14 restores starboard, voice and registry data"
     );
-    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "event_instance_windows",
+    ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(name)
@@ -2931,6 +2967,72 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         .await
         .unwrap();
     assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v15_archive_restores_and_clears_newer_event_instance_windows_without_backfill() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let preserved = vec![
+        "giveaways".to_owned(),
+        "giveaway_entries".to_owned(),
+        "giveaway_draws".to_owned(),
+        "scheduled_events".to_owned(),
+        "event_voice_channels".to_owned(),
+    ];
+    let archived = snapshot(pool, &preserved).await;
+    for name in &preserved {
+        assert!(
+            !archived[name].rows.is_empty(),
+            "v15 fixture must populate {name}"
+        );
+    }
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v16-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 16);
+    let windows = old.buffers.remove("event_instance_windows").unwrap();
+    assert_eq!(
+        windows.len(),
+        2,
+        "fixture must populate the instance windows"
+    );
+    old.manifest
+        .tables
+        .retain(|table| table.name != "event_instance_windows");
+    old.manifest.version = 15;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-instance-windows-v15.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("released v15 archive remains readable");
+    assert_eq!(inspected.manifest.version, 15);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        ["event_instance_windows"]
+    );
+    // The v15 archive carries no windows. A destination window must not
+    // survive, and no window may be invented from the restored bindings.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    assert_eq!(
+        snapshot(pool, &preserved).await,
+        archived,
+        "v15 restores giveaways, mirror and voice claims"
+    );
+    let windows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_instance_windows")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        windows, 0,
+        "a pre-v16 restore clears the windows and never backfills liveness"
+    );
     db.close().await.unwrap();
 }
 

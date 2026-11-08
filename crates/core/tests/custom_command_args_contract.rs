@@ -1,15 +1,19 @@
 //! Slice-1 contract for the bounded `{args}` substitution
-//! (`docs/custom-command-args-spec.md` §8, render-level cases).
+//! (`docs/custom-command-args-spec.md` §8, render-level cases) plus the
+//! slice-2 run-path vocabulary: capture, publish and corrections.
 //!
 //! Offline deterministic fixtures only: synthetic context values, no member
-//! data, no Discord send, no database. Slash/prefix capture, corrections and
-//! audit land with the run-path slice; what this target pins is the core
-//! promise — `{args}` renders member text literally in one pass, bounded,
-//! through the same mention treatment as every other template input.
+//! data, no Discord send, no database. Live slash/prefix/preview behavior is
+//! pinned by the discord acceptance suites; what this target pins is the
+//! core promise — `{args}` renders member text literally in one pass,
+//! bounded, through the same mention treatment as every other template
+//! input — and the closed vocabulary every path shares.
 
+use two_bot_core::commands::{merge_commands, CustomCommand};
 use two_bot_core::custom_commands::{
-    render_template, validate_args, validate_template, ArgsError, TemplateContext, TemplateError,
-    MAX_ARGS_UNITS, MAX_RENDERED_CHARS,
+    capture_prefix_args, render_template, validate_args, validate_template, ArgsError,
+    TemplateContext, TemplateError, ARGS_MALFORMED_REASON, ARGS_OPTION_NAME, ARGS_TOO_LONG_REASON,
+    ARGS_TOO_LONG_REPLY, INVALID_ARGS_REPLY, MAX_ARGS_UNITS, MAX_RENDERED_CHARS,
 };
 use two_bot_core::message_safety::neutralize_mentions;
 
@@ -122,6 +126,71 @@ fn args_get_byte_identical_mention_treatment() {
             "raw mass mention must not survive neutralization: {via_args:?}"
         );
     }
+}
+
+#[test]
+fn prefix_remainder_is_the_args_input_before_the_bound() {
+    // ARG-11: the remainder after the trigger token is the invocation text
+    // verbatim; no remainder (or only whitespace) captures empty. The 500
+    // UTF-16-unit bound still applies past capture, never truncating.
+    assert_eq!(capture_prefix_args("!quote"), "");
+    assert_eq!(capture_prefix_args("!quote   "), "");
+    assert_eq!(capture_prefix_args("!quote be kind"), "be kind");
+    assert_eq!(
+        capture_prefix_args("!quote  keep  spacing\nand lines "),
+        "keep  spacing\nand lines "
+    );
+    let boundary_input = format!("!quote {}", "x".repeat(500));
+    let remainder = capture_prefix_args(&boundary_input);
+    validate_args(remainder).expect("500-unit remainder renders");
+    let overflow_input = format!("!quote {}", "x".repeat(501));
+    let overflow = capture_prefix_args(&overflow_input);
+    assert_eq!(validate_args(overflow), Err(ArgsError::TooLong));
+}
+
+#[test]
+fn published_custom_commands_carry_the_bounded_arguments_option() {
+    // Publish half of ARG-01/02/04: every merged custom definition carries
+    // exactly one optional `arguments` string whose advertised `max_length`
+    // matches the authoritative server-side unit bound. Absent input
+    // substitutes empty, so there is no required-args concept.
+    let custom = ["faq", "quote"]
+        .into_iter()
+        .map(|name| CustomCommand {
+            name: name.to_owned(),
+            description: "Saved".to_owned(),
+            enabled: true,
+        })
+        .collect::<Vec<_>>();
+    let merged = merge_commands(&[], &custom).expect("merges");
+    for name in ["faq", "quote"] {
+        let definition = merged
+            .iter()
+            .find(|definition| definition.name == name)
+            .expect("custom row publishes");
+        assert_eq!(definition.options.len(), 1, "only the arguments option");
+        let option = &definition.options[0];
+        assert_eq!(option.name, ARGS_OPTION_NAME);
+        assert_eq!(option.kind, 3, "application-command string option");
+        assert!(option.required.is_none(), "absent args substitute empty");
+        assert_eq!(option.max_length, Some(MAX_ARGS_UNITS as u32));
+    }
+}
+
+#[test]
+fn correction_vocabulary_is_closed_and_content_free() {
+    // Contract half of ARG-03/05/12/17/19: two reason codes, two member
+    // replies, no member text or content-derived measurement anywhere.
+    assert_eq!(ARGS_MALFORMED_REASON, "args_malformed");
+    assert_eq!(ARGS_TOO_LONG_REASON, "args_too_long");
+    assert_eq!(
+        INVALID_ARGS_REPLY,
+        "Invalid arguments: expected a single text value. Example: /quote arguments:hello"
+    );
+    assert_eq!(
+        ARGS_TOO_LONG_REPLY,
+        "Arguments must be at most 500 UTF-16 units. Shorten them and retry."
+    );
 }
 
 #[test]
