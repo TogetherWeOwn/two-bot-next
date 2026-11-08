@@ -567,7 +567,7 @@ fn private_command_diagnostics_exclude_options_tokens_names_and_dm() {
         Some(CHANNEL.to_string().as_str())
     );
     let mut channel_object_only: serde_json::Value = serde_json::to_value(&interaction).unwrap();
-    channel_object_only["channel"] = json!({"id": "1234", "type": 0});
+    channel_object_only["channel"] = serde_json::json!({"id": "1234", "type": 0});
     channel_object_only
         .as_object_mut()
         .unwrap()
@@ -580,7 +580,7 @@ fn private_command_diagnostics_exclude_options_tokens_names_and_dm() {
             .as_deref(),
         Some("1234")
     );
-    channel_object_only["channel_id"] = json!(CHANNEL.to_string());
+    channel_object_only["channel_id"] = serde_json::json!(CHANNEL.to_string());
     let both: Interaction = serde_json::from_value(channel_object_only).unwrap();
     assert_eq!(
         crate::audit_changes::command_event(&both, "received", "gateway", at)
