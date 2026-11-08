@@ -47,6 +47,51 @@ pub struct AttendanceSession {
     pub event_keys: Vec<String>,
 }
 
+type AttendanceSessionRow = (
+    i64,
+    String,
+    String,
+    String,
+    bool,
+    bool,
+    OffsetDateTime,
+    Option<OffsetDateTime>,
+    Vec<String>,
+    OffsetDateTime,
+);
+
+// Share row materialization outside the open/read async state machines.
+#[inline(never)]
+fn sessions_from_rows(rows: Vec<AttendanceSessionRow>) -> Vec<AttendanceSession> {
+    rows.into_iter()
+        .map(
+            |(
+                id,
+                member_id,
+                channel_id,
+                channel_name,
+                is_bot,
+                afk,
+                joined_at,
+                left_at,
+                event_keys,
+                name_observed_at,
+            )| AttendanceSession {
+                id,
+                member_id,
+                channel_id,
+                channel_name,
+                name_observed_at,
+                is_bot,
+                afk,
+                joined_at,
+                left_at,
+                event_keys,
+            },
+        )
+        .collect()
+}
+
 /// Maximum open rows examined or conservatively finalized per recovery turn.
 pub const ATTENDANCE_RECOVERY_PAGE_SIZE: usize = 32;
 /// Maximum candidate windows and tags examined by a transition page.
@@ -173,25 +218,6 @@ const CAPTURE_WINDOWS_SQL: &str =
                          AND (h.event_id <> w.event_id OR h.instance_starts_at <> w.instance_starts_at))
      ORDER BY w.starts_at, k.event_key LIMIT 129";
 
-// Share one query/decoder future between planning and transactional capture,
-// rather than compiling separate pool- and connection-executor variants.
-#[inline(never)]
-async fn capture_windows_in(
-    connection: &mut sqlx::PgConnection,
-    guild_id: &str,
-    since: Option<OffsetDateTime>,
-    closing: bool,
-    requested: Option<&[String]>,
-) -> Result<Vec<(String, OffsetDateTime, OffsetDateTime)>, sqlx::Error> {
-    sqlx::query_as(CAPTURE_WINDOWS_SQL)
-        .bind(guild_id)
-        .bind(since)
-        .bind(closing)
-        .bind(requested)
-        .fetch_all(connection)
-        .await
-}
-
 /// Accepted candidate windows within raw retention for transition planning.
 /// Expired candidates can tag an existing overlapping span, never open one.
 /// Historical attendance records cannot authorize a new span or tag.
@@ -199,8 +225,12 @@ pub async fn attendance_windows_for_guild(
     pool: &sqlx::PgPool,
     guild_id: &str,
 ) -> Result<Vec<AttendanceWindow>, sqlx::Error> {
-    let mut connection = pool.acquire().await?;
-    capture_windows_in(&mut connection, guild_id, None, true, None)
+    sqlx::query_as::<_, (String, OffsetDateTime, OffsetDateTime)>(CAPTURE_WINDOWS_SQL)
+        .bind(guild_id)
+        .bind(None::<OffsetDateTime>)
+        .bind(true)
+        .bind(None::<Vec<String>>)
+        .fetch_all(pool)
         .await
         .map(|rows| {
             rows.into_iter()
@@ -242,21 +272,7 @@ pub async fn open_attendance_sessions(
     guild_id: &str,
     member_id: &str,
 ) -> Result<Vec<AttendanceSession>, sqlx::Error> {
-    sqlx::query_as::<
-        _,
-        (
-            i64,
-            String,
-            String,
-            String,
-            bool,
-            bool,
-            OffsetDateTime,
-            Option<OffsetDateTime>,
-            Vec<String>,
-            OffsetDateTime,
-        ),
-    >(
+    sqlx::query_as::<_, AttendanceSessionRow>(
         "SELECT id,
                 CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE repeat('x', 21) END,
                 CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE repeat('x', 21) END,
@@ -275,35 +291,7 @@ pub async fn open_attendance_sessions(
     .bind(member_id)
     .fetch_all(pool)
     .await
-    .map(|rows| {
-        rows.into_iter()
-            .map(
-                |(
-                    id,
-                    member_id,
-                    channel_id,
-                    channel_name,
-                    is_bot,
-                    afk,
-                    joined_at,
-                    left_at,
-                    event_keys,
-                    name_observed_at,
-                )| AttendanceSession {
-                    id,
-                    member_id,
-                    channel_id,
-                    channel_name,
-                    name_observed_at,
-                    is_bot,
-                    afk,
-                    joined_at,
-                    left_at,
-                    event_keys,
-                },
-            )
-            .collect()
-    })
+    .map(sessions_from_rows)
 }
 
 // Serialize against settings writes and opt-out/opt-in even when their rows
@@ -344,8 +332,14 @@ async fn capture_tags_in(
     if !permitted {
         return Ok(Vec::new());
     }
-    let windows =
-        capture_windows_in(connection, guild_id, Some(since), closing, Some(requested)).await?;
+    let windows: Vec<(String, OffsetDateTime, OffsetDateTime)> =
+        sqlx::query_as(CAPTURE_WINDOWS_SQL)
+            .bind(guild_id)
+            .bind(since)
+            .bind(closing)
+            .bind(requested)
+            .fetch_all(&mut *connection)
+            .await?;
     if windows.len() > ATTENDANCE_MAX_WINDOWS || windows.iter().any(|(key, _, _)| key.len() > 128) {
         return Err(sqlx::Error::Protocol(
             "attendance candidates exceed budget".into(),
@@ -533,21 +527,7 @@ pub async fn attendance_sessions_for_event_key(
     let Some((bound, stops)) = bound else {
         return Ok(Vec::new());
     };
-    sqlx::query_as::<
-        _,
-        (
-            i64,
-            String,
-            String,
-            String,
-            bool,
-            bool,
-            OffsetDateTime,
-            Option<OffsetDateTime>,
-            Vec<String>,
-            OffsetDateTime,
-        ),
-    >(
+    sqlx::query_as::<_, AttendanceSessionRow>(
         "SELECT id, member_id, channel_id, channel_name, is_bot, afk, \
                 joined_at, left_at, event_keys, COALESCE(name_observed_at, joined_at) \
          FROM event_voice_sessions \
@@ -559,35 +539,16 @@ pub async fn attendance_sessions_for_event_key(
     .fetch_all(pool)
     .await
     .map(|rows| {
-        rows.into_iter()
-            .map(
-                |(
-                    id,
-                    member_id,
-                    channel_id,
-                    channel_name,
-                    is_bot,
-                    afk,
-                    joined_at,
-                    left_at,
-                    event_keys,
-                    name_observed_at,
-                )| AttendanceSession {
-                    id,
-                    member_id,
-                    channel_id,
-                    channel_name,
-                    name_observed_at,
-                    is_bot,
-                    afk,
-                    joined_at,
-                    left_at: Some(two_bot_core::internal_action_store::cap_attendance_session(
-                        joined_at, left_at, bound, &stops,
-                    )),
-                    event_keys,
-                },
-            )
-            .collect()
+        let mut sessions = sessions_from_rows(rows);
+        for session in &mut sessions {
+            session.left_at = Some(two_bot_core::internal_action_store::cap_attendance_session(
+                session.joined_at,
+                session.left_at,
+                bound,
+                &stops,
+            ));
+        }
+        sessions
     })
 }
 
