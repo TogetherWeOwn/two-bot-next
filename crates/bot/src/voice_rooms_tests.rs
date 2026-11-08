@@ -2665,6 +2665,38 @@ async fn attendance_member_loss_during_pending_close_recovers_only_that_member()
     assert!(recovery.capture_allowed(&worker.live));
 }
 
+#[test]
+fn attendance_recovery_ids_preserve_scope_limits_and_page_exhaustion() {
+    for count in [0, 1, 8, 9, 31, 32] {
+        let rows = || {
+            (1..=count)
+                .map(|id| recovery_row(id, MEMBER, CREATOR))
+                .collect()
+        };
+        let (ids, exhausted) = AttendanceRecovery::recovery_ids(rows(), Some(MEMBER)).unwrap();
+        assert_eq!(ids, (1..=count.min(8)).collect::<Vec<_>>());
+        assert_eq!(exhausted, count <= 8);
+        let (ids, exhausted) = AttendanceRecovery::recovery_ids(rows(), None).unwrap();
+        assert_eq!(ids, (1..=count).collect::<Vec<_>>());
+        assert_eq!(exhausted, count < 32);
+    }
+    for scope in [Some(MEMBER), None] {
+        let rows = (1..=33)
+            .map(|id| recovery_row(id, MEMBER, CREATOR))
+            .collect();
+        assert!(AttendanceRecovery::recovery_ids(rows, scope).is_none());
+    }
+    let mixed = vec![
+        recovery_row(1, MEMBER, CREATOR),
+        recovery_row(2, MEMBER + 1, CREATOR),
+    ];
+    assert!(AttendanceRecovery::recovery_ids(mixed.clone(), Some(MEMBER)).is_none());
+    assert_eq!(
+        AttendanceRecovery::recovery_ids(mixed, None),
+        Some((vec![1, 2], true))
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn attendance_member_recovery_pages_through_a_timeout_without_losing_the_cursor() {
     let (live, store, http, _) = fixture();

@@ -10622,6 +10622,32 @@ impl AttendanceRecovery {
         }
     }
 
+    // Release identity strings before the finalization await and keep page
+    // validation out of the generic recovery future's cancellation paths.
+    #[inline(never)]
+    fn recovery_ids(
+        rows: Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>,
+        member: Option<Snowflake>,
+    ) -> Option<(Vec<i64>, bool)> {
+        let page_size = two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE;
+        if rows.len() > page_size
+            || member.is_some_and(|member| {
+                let member = member.to_string();
+                rows.iter().any(|row| row.member_id != member)
+            })
+        {
+            return None;
+        }
+        let close_limit = if member.is_some() { 8 } else { page_size };
+        let exhausted = if member.is_some() {
+            rows.len() <= close_limit
+        } else {
+            rows.len() < page_size
+        };
+        let ids = rows.iter().take(close_limit).map(|row| row.id).collect();
+        Some((ids, exhausted))
+    }
+
     // Share the fetch/finalize state machine, but retain distinct store reads
     // and close limits for member loss versus a genuine full discontinuity.
     async fn recover_page<S: RoomPersistence, H: RoomWrites>(
@@ -10631,7 +10657,6 @@ impl AttendanceRecovery {
         after_id: i64,
     ) -> Result<Option<(i64, bool)>, StoreError> {
         let guild = worker.live.guild_id;
-        let page_size = two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE;
         let rows = match member {
             Some(member) => {
                 worker
@@ -10646,31 +10671,19 @@ impl AttendanceRecovery {
                     .await?
             }
         };
-        if rows.len() > page_size
-            || member.is_some_and(|member| {
-                let member = member.to_string();
-                rows.iter().any(|row| row.member_id != member)
-            })
-        {
+        let Some((ids, exhausted)) = Self::recovery_ids(rows, member) else {
             return Ok(None);
-        }
+        };
         {
             let live = worker.live.read_state();
             if !live.ready || live.generation != generation {
                 return Ok(None);
             }
         }
-        let close_limit = if member.is_some() { 8 } else { page_size };
-        let ids: Vec<_> = rows.iter().take(close_limit).map(|row| row.id).collect();
         worker
             .store
             .recover_attendance_sessions(guild, &ids)
             .await?;
-        let exhausted = if member.is_some() {
-            rows.len() <= close_limit
-        } else {
-            rows.len() < page_size
-        };
         Ok(Some((ids.last().copied().unwrap_or(after_id), exhausted)))
     }
 
