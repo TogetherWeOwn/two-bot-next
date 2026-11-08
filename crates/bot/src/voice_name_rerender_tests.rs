@@ -55,6 +55,62 @@ fn override_saves_of(trace: &Trace) -> Vec<String> {
         .collect()
 }
 
+#[tokio::test]
+async fn delayed_move_echo_does_not_rename_a_personal_room_as_empty() {
+    for outcome in [None, Some(RoomHttpError::UnknownOutcome)] {
+        let (live, store, http, trace) = fixture();
+        store.creators.lock().unwrap()[0].name_template =
+            "{{@@num@@ = 0 ?? Idle room $# // @@owner@@}}".to_owned();
+        if let Some(error) = outcome {
+            http.move_errors.lock().unwrap().push_back(error);
+        }
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        let ticket = worker
+            .live
+            .voice_update(MEMBER, Some(CREATOR), Some(false))
+            .unwrap();
+        assert!(worker.accept_join(ticket, "Alex", 7, NOW.to_owned()));
+        dispatch(&mut worker, 0).await;
+        assert_eq!(*worker.http.created_names.lock().unwrap(), ["Alex"]);
+        dispatch(&mut worker, 1).await;
+        assert!(worker.uncertain_moves.contains_key(&500));
+        assert_eq!(worker.live.read_state().humans(500), 0);
+
+        // The HTTP double deliberately does not echo a voice-state event.
+        // Discord may already have moved the person, so zero cached humans
+        // cannot justify an empty-room name any more than deletion.
+        worker.reconcile();
+        worker.refresh_template_names(2);
+        for _ in 0..8 {
+            if !worker.dispatch_one(2).await {
+                break;
+            }
+        }
+        assert!(renames_of(&trace).is_empty(), "{trace:?}");
+        assert_eq!(
+            worker.live.read_state().channels[&500].name.as_deref(),
+            Some("Alex")
+        );
+
+        // The delayed gateway echo makes occupancy authoritative. Repeated
+        // same-channel frames and naming ticks must not spend a rename.
+        worker.live.voice_update(MEMBER, Some(500), Some(false));
+        worker.live.voice_update(MEMBER, Some(500), Some(false));
+        worker.reconcile();
+        worker.refresh_template_names(3);
+        for _ in 0..8 {
+            if !worker.dispatch_one(600_000).await {
+                break;
+            }
+        }
+        assert!(renames_of(&trace).is_empty(), "{trace:?}");
+        assert_eq!(
+            worker.desired_names.get(&500).map(String::as_str),
+            Some("Alex")
+        );
+    }
+}
+
 // --- re-render on fact changes (failing until V5 recalculation is wired) ----
 
 #[tokio::test]
