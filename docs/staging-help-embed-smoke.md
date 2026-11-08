@@ -42,6 +42,35 @@ detail, matching the Rust builder tests. Short `/help` and short
 carry an embed footer; this smoke exercises the embed path of both builders,
 rather than simulating staging's current registry size.
 
+## Icon delivery and rollback contract
+
+`crates/discord/src/brand.rs` owns `BRAND_ICON_URL`:
+`https://imagedelivery.net/cNVnKlHCCMxI9vqDkwBbUQ/two-icon1-dark512-4469ca165f03/public`.
+This is the approved Icon 1 dark 512×512 PNG, already imported as image
+`two-icon1-dark512-4469ca165f03`, served with the existing `public` variant.
+No upload, new variant or credential is needed by the bot.
+
+The real consumers are the footer icons on the embed branches of
+`help_response` and `help_detail_response` in `crates/discord/src/interactions.rs`,
+via `brand_embed` → `brand_footer`. Neither builder adds an author icon.
+Colour, footer text, body and layout are unchanged. Plain-content help replies
+still have no footer. Changing this constant does not synchronize the bot avatar.
+
+Keep `assets/brand/two-icon-1-dark-512.png` unchanged (29,035 bytes; SHA-256
+`ff0cd5863ed02b1f405bd3f1bf22b192ea7b9e6dc657792cb6df621f8fce438a`).
+The rollback URL is
+`https://raw.githubusercontent.com/TogetherWeOwn/two-bot-next/main/assets/brand/two-icon-1-dark-512.png`.
+To roll delivery back, restore that URL in the constant and its exact-URL Rust
+assertion and Python fixture, through the normal review and release gates.
+Do not delete or re-import the Images copy as part of a code rollback.
+
+Use the existing payload builder and smoke above for evidence on the changed
+SHA: `expected.icon_url` and both read-back footers must contain the Images URL.
+An offline fixture pass or a historical run using the GitHub URL does not prove
+runtime Images adoption. Record the exact deployed SHA and smoke run; if that
+proof is pending at merge, hand the gap to rollout coordination explicitly.
+The read-back proves the URL field, not a visual render or image fetch by Discord.
+
 ## CI gate and provisioning
 
 `.github/workflows/help-embed-synthetic.yml` runs only from `main`, by manual

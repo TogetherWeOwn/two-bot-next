@@ -1,23 +1,22 @@
 //! Owner brand constants for user-visible Discord surfaces.
 //!
 //! Icon 1 (gradient "T" in a broken octagon) is the owner's chosen mark.
-//! The raster asset lives at `assets/brand/two-icon-1-dark-512.png` and is
-//! served from this repository's stable public URL, so every embed footer
-//! icon and the bot avatar resolve to that one file through
-//! [`BRAND_ICON_URL`]. Embed colour is the brand pink-red 500, the gradient
-//! mid-stop (`--two-pink-500` in the brand tokens).
+//! The raster asset lives at `assets/brand/two-icon-1-dark-512.png`; its
+//! approved Cloudflare Images copy is served through [`BRAND_ICON_URL`]
+//! for embed footer icons. Avatar synchronization is a separate operation.
+//! Embed colour is the brand pink-red 500, the gradient mid-stop
+//! (`--two-pink-500` in the brand tokens).
 
 use twilight_model::channel::message::embed::{Embed, EmbedFooter};
 
 /// Brand pink-red 500, the gradient mid-stop. Embed colour everywhere.
 pub const BRAND_EMBED_COLOR: u32 = 0xFF0E52;
 
-/// Stable public URL of the Icon 1 dark-background PNG (512x512).
+/// Public Cloudflare Images delivery URL of the approved Icon 1 dark PNG (512x512).
 ///
-/// Points at this repository so the icon stays reachable without depending
-/// on the web-site card landing first; move it to the site asset URL once
-/// that exists and update this one constant.
-pub const BRAND_ICON_URL: &str = "https://raw.githubusercontent.com/TogetherWeOwn/two-bot-next/main/assets/brand/two-icon-1-dark-512.png";
+/// The committed original remains the rollback asset; see
+/// `docs/staging-help-embed-smoke.md` for the delivery and rollback contract.
+pub const BRAND_ICON_URL: &str = "https://imagedelivery.net/cNVnKlHCCMxI9vqDkwBbUQ/two-icon1-dark512-4469ca165f03/public";
 
 /// Footer text shown on bot-authored embeds.
 pub const BRAND_FOOTER_TEXT: &str = "Together We Own";
@@ -50,14 +49,11 @@ mod brand_tests {
     }
 
     #[test]
-    fn icon_url_is_a_stable_same_repo_public_url() {
-        assert!(
-            BRAND_ICON_URL.starts_with("https://raw.githubusercontent.com/TogetherWeOwn/"),
-            "icon must resolve without depending on another card's deploy"
-        );
-        assert!(
-            BRAND_ICON_URL.ends_with("assets/brand/two-icon-1-dark-512.png"),
-            "icon must be the committed dark-background PNG"
+    fn icon_url_is_the_approved_cloudflare_images_delivery() {
+        assert_eq!(
+            BRAND_ICON_URL,
+            "https://imagedelivery.net/cNVnKlHCCMxI9vqDkwBbUQ/two-icon1-dark512-4469ca165f03/public",
+            "icon must use the approved Icon 1 image and public variant"
         );
     }
 

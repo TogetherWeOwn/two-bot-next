@@ -24,8 +24,8 @@ OTHER_APP = "1111111111111111111"
 CHANNEL = "1546211377000000001"
 TOKEN = "RAW_SECRET_SENTINEL_never_disclose_bot_token"
 EXPECTED = {"color": 16715346, "footer_text": "Together We Own",
-            "icon_url": "https://raw.githubusercontent.com/TogetherWeOwn/"
-                        "two-bot-next/main/assets/brand/two-icon-1-dark-512.png"}
+            "icon_url": "https://imagedelivery.net/cNVnKlHCCMxI9vqDkwBbUQ/"
+                        "two-icon1-dark512-4469ca165f03/public"}
 
 
 def embed(description):
