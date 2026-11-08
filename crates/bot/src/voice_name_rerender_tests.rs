@@ -129,6 +129,79 @@ async fn delayed_move_echo_does_not_rename_a_personal_room_as_empty() {
 }
 
 #[tokio::test]
+async fn unresolved_creator_move_keeps_known_guest_playtime() {
+    for outcome in [None, Some(RoomHttpError::UnknownOutcome)] {
+        TEST_WALL_MS.set(0);
+        let (live, store, http, trace) = fixture();
+        store.creators.lock().unwrap()[0].name_template =
+            "{{@@num@@ = 0 ?? Idle room $# // @@owner@@}}".to_owned();
+        if let Some(error) = outcome {
+            http.move_errors.lock().unwrap().push_back(error);
+        }
+        let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        worker.wall_clock = test_wall_clock;
+        let ticket = worker
+            .live
+            .voice_update(MEMBER, Some(CREATOR), Some(false))
+            .unwrap();
+        assert!(worker.accept_join(ticket, "Alex", 7, NOW.to_owned()));
+        dispatch(&mut worker, 0).await;
+        worker.refresh_template_names(0);
+        dispatch(&mut worker, 1).await;
+        assert!(worker.uncertain_moves.contains_key(&500));
+
+        // Another member's authoritative presence does not resolve the
+        // creator's move. Observe their game without publishing room names.
+        let guest = MEMBER + 1;
+        worker.live.voice_update(guest, Some(500), Some(false));
+        worker.live.set_presence(
+            guest,
+            MemberPresence {
+                game: Some("Apex".to_owned()),
+                ..Default::default()
+            },
+        );
+        worker.refresh_template_names(2);
+        TEST_WALL_MS.set(60_000);
+        worker.refresh_template_names(3);
+        TEST_WALL_MS.set(120_000);
+        worker.live.voice_update(guest, None, Some(false));
+        worker.refresh_template_names(4);
+        assert_eq!(worker.live.read_state().humans(500), 0);
+        assert!(worker.uncertain_moves.contains_key(&500));
+        assert_eq!(
+            worker
+                .playtime
+                .get(&500)
+                .map_or(0, |playtime| playtime.minutes("Apex", test_wall_clock())),
+            2
+        );
+        assert!(!worker.name_signatures.contains_key(&500));
+        assert!(worker.name_inputs.is_none());
+        assert!(!worker.desired_names.contains_key(&500));
+        for _ in 0..8 {
+            if !worker.dispatch_one(600_000).await {
+                break;
+            }
+        }
+        assert!(renames_of(&trace).is_empty(), "{trace:?}");
+        assert_eq!(
+            worker.live.read_state().channels[&500].name.as_deref(),
+            Some("Alex")
+        );
+
+        // The guest's completed interval survives the later creator echo;
+        // no game time accrues while the guest is absent.
+        TEST_WALL_MS.set(600_000);
+        worker.live.voice_update(MEMBER, Some(500), Some(false));
+        worker.refresh_template_names(5);
+        assert_eq!(worker.playtime[&500].minutes("Apex", test_wall_clock()), 2);
+        assert_eq!(worker.desired_names[&500], "Alex");
+        assert!(renames_of(&trace).is_empty(), "{trace:?}");
+    }
+}
+
+#[tokio::test]
 async fn rate_limited_move_defers_custom_rerender_until_occupancy_resolves() {
     let (live, store, http, trace) = fixture();
     store.creators.lock().unwrap()[0].name_template = "@@owner@@".to_owned();
