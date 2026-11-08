@@ -136,19 +136,22 @@ pub struct AttendanceRecoveryRow {
     pub channel_id: String,
 }
 
-// Decode directly into the retained page, without an intermediate tuple vector.
-// Keep decoding and its error cleanup out of the generic query stream.
-impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for AttendanceRecoveryRow {
-    #[inline(never)]
-    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
-        use sqlx::Row;
+// Reuse the raw query stream; decode its bounded page before the commit await.
+#[inline(never)]
+fn recovery_rows(
+    rows: Vec<sqlx::postgres::PgRow>,
+) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
+    use sqlx::Row;
 
-        Ok(Self {
-            id: row.try_get(0)?,
-            member_id: row.try_get(1)?,
-            channel_id: row.try_get(2)?,
+    rows.iter()
+        .map(|row| {
+            Ok(AttendanceRecoveryRow {
+                id: row.try_get(0)?,
+                member_id: row.try_get(1)?,
+                channel_id: row.try_get(2)?,
+            })
         })
-    }
+        .collect()
 }
 
 /// Read the next bounded recovery page. The cursor advances only after the
@@ -200,14 +203,14 @@ async fn recovery_page(
          FROM event_voice_sessions
          WHERE guild_id = $1 AND left_at IS NULL AND id > $2 ORDER BY id LIMIT $3"
     };
-    let mut query = sqlx::query_as::<_, AttendanceRecoveryRow>(sql)
+    let mut query = sqlx::query(sql)
         .bind(guild_id)
         .bind(after_id)
         .bind(ATTENDANCE_RECOVERY_PAGE_SIZE as i64);
     if let Some(member_id) = member_id {
         query = query.bind(member_id);
     }
-    let rows = query.fetch_all(&mut *tx).await?;
+    let rows = recovery_rows(query.fetch_all(&mut *tx).await?)?;
     tx.commit().await?;
     Ok(rows)
 }
