@@ -61,16 +61,17 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [REST guard](rest-guard.md)
 - [Audit domain](audit-core.md)
 - [Audit mirror](audit-service.md)
+- [Diagnostics](audit-diagnostics.md)
 - [Audit persistence](audit-store.md)
 - [Action signing v2](internal-action-signing-v2.md)
-- [Action persistence](internal-action-store.md)
+- [Action store](internal-action-store.md)
 - [Action ingress](internal-actions-receiver.md)
 - [Announcements](internal-action-executor.md)
 - [Settings actions](internal-action-settings.md)
-- [Channel executor](internal-channel-moderation.md)
-- [Event executors](internal-event-executors.md)
-- [Member executors](internal-member-execution.md)
-- [Moderation executor](internal-member-moderation.md)
+- [Channels](internal-channel-moderation.md)
+- [Events](internal-event-executors.md)
+- [Members](internal-member-execution.md)
+- [Moderation](internal-member-moderation.md)
 
 ## Commands, moderation and community
 

@@ -502,6 +502,40 @@ fn lfg_select(values: Vec<String>) -> Interaction {
     interaction
 }
 
+#[test]
+fn private_command_diagnostics_exclude_options_tokens_names_and_dm() {
+    let mut interaction = slash(
+        "COMMAND NAME SENTINEL",
+        Some(CHANNEL),
+        vec![CommandDataOption {
+            name: "input".to_owned(),
+            value: CommandOptionValue::String("PRIVATE ARGUMENT SENTINEL".to_owned()),
+        }],
+    );
+    interaction.token = "PRIVATE TOKEN SENTINEL".to_owned();
+    let at = "2026-11-08T00:00:00.000Z";
+    let received =
+        crate::audit_changes::command_event(&interaction, "received", "gateway", at).unwrap();
+    assert_eq!(received.actor_id.as_deref(), Some("88"));
+    let body = serde_json::to_string(&received).unwrap();
+    assert!(!body.contains("SENTINEL"));
+    let reply = crate::audit_changes::command_event(&interaction, "timeout", "finish", at).unwrap();
+    assert_ne!(received.entry_id, reply.entry_id);
+    assert!(reply.metadata_json.contains("timeout"));
+    assert!(reply.metadata_json.contains("not_business_success"));
+    assert_eq!(
+        crate::audit_changes::command_event(&interaction, "received", "gateway", at)
+            .unwrap()
+            .entry_id,
+        received.entry_id
+    );
+    interaction.guild_id = None;
+    assert!(crate::audit_changes::command_event(&interaction, "received", "gateway", at).is_none());
+    interaction.guild_id = Some(Id::new(GUILD));
+    interaction.data = None;
+    assert!(crate::audit_changes::command_event(&interaction, "received", "gateway", at).is_none());
+}
+
 /// The same interaction as `member` with `permissions`, with its own id/token.
 fn from_member(mut interaction: Interaction, member: u64, permissions: Permissions) -> Interaction {
     interaction.id = Id::new(member);

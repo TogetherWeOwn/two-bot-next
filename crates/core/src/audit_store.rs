@@ -786,6 +786,13 @@ const KINDS: &[&str] = &[
     "voice_leave",
     "voice_move",
     "moderation_action",
+    "channel_change",
+    "role_change",
+    "guild_change",
+    "member_join",
+    "member_leave",
+    "command_action",
+    "automation_action",
 ];
 
 fn stored(row: &PgRow) -> Result<StoredAudit, AuditStoreError> {
@@ -797,6 +804,13 @@ fn stored(row: &PgRow) -> Result<StoredAudit, AuditStoreError> {
         "voice_leave" => AuditKind::VoiceLeave,
         "voice_move" => AuditKind::VoiceMove,
         "moderation_action" => AuditKind::ModerationAction,
+        "channel_change" => AuditKind::ChannelChange,
+        "role_change" => AuditKind::RoleChange,
+        "guild_change" => AuditKind::GuildChange,
+        "member_join" => AuditKind::MemberJoin,
+        "member_leave" => AuditKind::MemberLeave,
+        "command_action" => AuditKind::CommandAction,
+        "automation_action" => AuditKind::AutomationAction,
         _ => return Err(AuditStoreError::Invalid("operational kind")),
     };
     Ok(StoredAudit {

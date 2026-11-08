@@ -330,6 +330,19 @@ pub(crate) enum RegistrySyncError {
     Publish,
 }
 
+fn audit_command_reply(
+    interaction: &Interaction,
+    phase: &str,
+    result: &Result<(), two_bot_discord::executor::DiscordError>,
+) {
+    let outcome = result.as_ref().err().map_or("accepted", discord_class);
+    if let Some(event) =
+        crate::audit_changes::command_event(interaction, outcome, phase, &two_bot_core::now_iso())
+    {
+        crate::audit_capture::submit(event);
+    }
+}
+
 impl CommandRuntime {
     /// Compose all feature slices over the same router, executor and pool.
     #[allow(clippy::too_many_arguments)]
@@ -2680,7 +2693,7 @@ impl CommandRuntime {
     /// Answer an interaction through the shared executor. The token never
     /// appears in logs — only the interaction id and error.
     async fn defer(&self, interaction: &Interaction, command: &str) -> bool {
-        match self
+        let result = self
             .executor
             .answer_interaction_with_blocked_retry(
                 interaction.id.get(),
@@ -2693,8 +2706,9 @@ impl CommandRuntime {
                     }),
                 },
             )
-            .await
-        {
+            .await;
+        audit_command_reply(interaction, "defer", &result);
+        match result {
             Ok(()) => true,
             Err(err) => {
                 warn!(interaction_id = %interaction.id.get(), command, reason = discord_class(&err), "command defer failed");
@@ -2704,30 +2718,32 @@ impl CommandRuntime {
     }
 
     async fn answer(&self, interaction: &Interaction, response: InteractionResponse) {
-        if let Err(err) = self
+        let result = self
             .executor
             .answer_interaction_with_blocked_retry(
                 interaction.id.get(),
                 &interaction.token,
                 &response,
             )
-            .await
-        {
+            .await;
+        audit_command_reply(interaction, "answer", &result);
+        if let Err(err) = result {
             warn!(interaction_id = %interaction.id.get(), reason = discord_class(&err), "sticky reply failed");
         }
     }
 
     /// Complete the original ephemeral defer, never issue a second callback.
     async fn finish(&self, interaction: &Interaction, content: impl AsRef<str>) {
-        if let Err(err) = self
+        let result = self
             .executor
             .edit_interaction_response_with_blocked_retry(
                 interaction.application_id.get(),
                 &interaction.token,
                 content.as_ref(),
             )
-            .await
-        {
+            .await;
+        audit_command_reply(interaction, "finish", &result);
+        if let Err(err) = result {
             warn!(interaction_id = %interaction.id.get(), reason = discord_class(&err), "sticky reply edit failed");
         }
     }

@@ -445,6 +445,75 @@ fn delivered(entry: &str, message_id: &str) -> (String, DeliverOutcome) {
 
 // --------------------------------------------------------------- sweeping --
 
+#[tokio::test]
+async fn capture_admission_never_connects_and_connect_failure_keeps_rows() {
+    let runtime = unconnected_runtime(all_vars());
+    runtime.submit(event("queued-without-io"));
+    assert_eq!(runtime.capture.counts(), (1, 0));
+    assert_eq!(
+        runtime.capture.front().unwrap().entry_id,
+        "queued-without-io"
+    );
+    assert!(runtime.sweep().await.is_err());
+    assert_eq!(runtime.capture.counts(), (1, 0));
+}
+
+#[tokio::test]
+async fn capture_flush_bounds_batch_replays_ack_loss_and_roundtrips_new_kinds() {
+    let Some(db) =
+        database("capture_flush_bounds_batch_replays_ack_loss_and_roundtrips_new_kinds").await
+    else {
+        return;
+    };
+    let mirror = ScriptMirror::default();
+    let runtime = runtime(db.pool(), &mirror);
+    let wired = runtime.wired().await.unwrap();
+    let kinds = [
+        AuditKind::ChannelChange,
+        AuditKind::RoleChange,
+        AuditKind::GuildChange,
+        AuditKind::MemberJoin,
+        AuditKind::MemberLeave,
+        AuditKind::CommandAction,
+        AuditKind::AutomationAction,
+    ];
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let mut row = event(&format!("new-kind-{index}"));
+        row.kind = kind;
+        // Simulate insert success followed by lost acknowledgement: capture
+        // must replay the same identity, not emit another durable row.
+        wired.service.record(&row).await.unwrap();
+        runtime.submit(row.clone());
+        assert_eq!(
+            AuditStore::new(db.pool())
+                .get(&row.entry_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .event
+                .kind,
+            kind
+        );
+    }
+    for id in 0..crate::audit_capture::BATCH {
+        runtime.submit(event(&format!("batch-{id}")));
+    }
+    runtime.flush_capture(&wired).await.unwrap();
+    assert_eq!(runtime.capture.counts(), (kinds.len(), 0));
+    assert!(
+        mirror.posts().is_empty(),
+        "capture only stores; delivery owns Discord"
+    );
+    runtime.flush_capture(&wired).await.unwrap();
+    assert_eq!(runtime.capture.counts(), (0, 0));
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM operational_audit_log")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, (kinds.len() + crate::audit_capture::BATCH) as i64);
+    db.close().await.unwrap();
+}
+
 #[test]
 fn halt_transitions_cover_engage_disengage_and_clear() {
     // M4.48: the same booleans the sweep feeds to `two_bot_audit_delivery_halt`

@@ -33,6 +33,13 @@ pub enum AuditKind {
     VoiceLeave,
     VoiceMove,
     ModerationAction,
+    ChannelChange,
+    RoleChange,
+    GuildChange,
+    MemberJoin,
+    MemberLeave,
+    CommandAction,
+    AutomationAction,
 }
 
 impl AuditKind {
@@ -47,6 +54,13 @@ impl AuditKind {
             Self::VoiceLeave => "voice_leave",
             Self::VoiceMove => "voice_move",
             Self::ModerationAction => "moderation_action",
+            Self::ChannelChange => "channel_change",
+            Self::RoleChange => "role_change",
+            Self::GuildChange => "guild_change",
+            Self::MemberJoin => "member_join",
+            Self::MemberLeave => "member_leave",
+            Self::CommandAction => "command_action",
+            Self::AutomationAction => "automation_action",
         }
     }
 }
@@ -438,7 +452,7 @@ mod tests {
 
     #[test]
     fn kind_names_match_two_bot() {
-        // All seven legacy OperationalAuditKind values, no more.
+        // Legacy values remain stable; the private diagnostics extend them.
         for kind in [
             AuditKind::MessageEdit,
             AuditKind::MessageDelete,
@@ -447,6 +461,13 @@ mod tests {
             AuditKind::VoiceLeave,
             AuditKind::VoiceMove,
             AuditKind::ModerationAction,
+            AuditKind::ChannelChange,
+            AuditKind::RoleChange,
+            AuditKind::GuildChange,
+            AuditKind::MemberJoin,
+            AuditKind::MemberLeave,
+            AuditKind::CommandAction,
+            AuditKind::AutomationAction,
         ] {
             let name = kind.as_str();
             let back: AuditKind =

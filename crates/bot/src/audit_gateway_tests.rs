@@ -237,6 +237,30 @@ fn event_type_for(action: ModerationAuditAction) -> AuditLogEventType {
 // ----------------------------------------------------------------- translate --
 
 #[test]
+fn production_identity_is_replay_stable_and_session_scoped() {
+    let cache = build_cache();
+    let packet = voice_event(Some(CH_VOICE_A));
+    let first = translate(&packet, &cache, AT, 12, "fixture-session-one");
+    let replay = translate(
+        &packet,
+        &cache,
+        "2026-11-08T12:00:00.000Z",
+        12,
+        "fixture-session-one",
+    );
+    let later = translate(&packet, &cache, AT, 13, "fixture-session-one");
+    let new_session = translate(&packet, &cache, AT, 12, "fixture-session-two");
+    assert_eq!(first[0].entry_id, replay[0].entry_id);
+    assert_ne!(first[0].entry_id, later[0].entry_id);
+    assert_ne!(first[0].entry_id, new_session[0].entry_id);
+    assert!(!first[0].entry_id.contains("fixture-session-one"));
+    let metadata: serde_json::Value = serde_json::from_str(&first[0].metadata_json).unwrap();
+    assert_eq!(metadata["actorConfidence"], "unknown");
+    assert_eq!(metadata["clock"], "gateway_receipt_utc");
+    assert!(first[0].actor_id.is_none());
+}
+
+#[test]
 fn member_role_and_nick_change_matches_core_contract() {
     let cache = build_cache();
     seed_member(&cache, MEMBER, &[11, 12], None);
@@ -396,6 +420,79 @@ fn all_fourteen_audit_log_actions_produce_uncorrelated_rows() {
             two_bot_core::format_iso_millis(((log_id >> 22) + 1_420_070_400_000) as i64)
         );
     }
+}
+
+#[test]
+fn expanded_audit_events_verify_only_the_recorded_executor_and_channel_names() {
+    use twilight_model::guild::audit_log::AuditLogChange;
+    let cache = build_cache();
+    for action in [1u16, 10, 12, 28, 30, 31, 32] {
+        let packet = audit_entry(
+            AuditLogEventType::from(action),
+            800_000_000_000_000_100 + u64::from(action),
+        );
+        let rows = translate(&packet, &cache, AT, u64::from(action), "fixture-session");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].entry_id.starts_with("discord-audit:"));
+        let meta: serde_json::Value = serde_json::from_str(&rows[0].metadata_json).unwrap();
+        assert_eq!(meta["actorConfidence"], "verified");
+        assert_eq!(meta["source"], "discord_audit_log");
+        assert_eq!(rows[0].actor_id.as_deref(), Some(BOT.to_string().as_str()));
+    }
+    let mut packet = audit_entry(AuditLogEventType::ChannelUpdate, 800_000_000_000_000_200);
+    if let Event::GuildAuditLogEntryCreate(entry) = &mut packet {
+        entry.changes.push(AuditLogChange::Name {
+            old: Some("Room A".to_owned()),
+            new: Some("Room B".to_owned()),
+        });
+        entry.reason = Some("PRIVATE FREE-FORM REASON SENTINEL".to_owned());
+        entry.user_id = None;
+    }
+    let rows = translate(&packet, &cache, AT, 50, "fixture-session");
+    let meta: serde_json::Value = serde_json::from_str(&rows[0].metadata_json).unwrap();
+    assert_eq!(meta["oldName"], "Room A");
+    assert_eq!(meta["newName"], "Room B");
+    assert_eq!(meta["actorConfidence"], "unknown");
+    assert!(!rows[0].metadata_json.contains("SENTINEL"));
+    assert_eq!(rows[0].source_channel_id, Some(MEMBER.to_string()));
+    let missing = translate(
+        &member_update(&[12], None),
+        &cache,
+        AT,
+        51,
+        "fixture-session",
+    );
+    assert_eq!(missing[0].action.as_deref(), Some("baseline_missing"));
+    assert!(!missing[0].metadata_json.contains("addedRoleIds"));
+    let join = Event::MemberAdd(Box::new(MemberAdd {
+        guild_id: Id::new(GUILD),
+        member: cached_member(MEMBER, &[], None),
+    }));
+    assert_eq!(
+        translate(&join, &cache, AT, 52, "fixture-session")[0].kind,
+        AuditKind::MemberJoin
+    );
+    let leave = Event::MemberRemove(twilight_model::gateway::payload::incoming::MemberRemove {
+        guild_id: Id::new(GUILD),
+        user: user(MEMBER, false),
+    });
+    assert_eq!(
+        translate(&leave, &cache, AT, 53, "fixture-session")[0].kind,
+        AuditKind::MemberLeave
+    );
+    let bulk = Event::MessageDeleteBulk(
+        twilight_model::gateway::payload::incoming::MessageDeleteBulk {
+            channel_id: Id::new(CH_TEXT),
+            guild_id: Some(Id::new(GUILD)),
+            ids: vec![Id::new(10), Id::new(11)],
+        },
+    );
+    assert_eq!(
+        translate(&bulk, &cache, AT, 54, "fixture-session")[0]
+            .action
+            .as_deref(),
+        Some("message_bulk_delete")
+    );
 }
 
 /// Marker MAC key from the public, non-production vectors shared with the
@@ -686,6 +783,5 @@ async fn record_without_a_handle_continues_silently() {
         AuditKind::VoiceJoin,
         guild_str(),
         AT.to_owned(),
-    )])
-    .await;
+    )]);
 }
