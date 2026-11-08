@@ -492,99 +492,117 @@ impl AttendanceTransition {
         }
     }
 
+    // Keep synchronous planning and its temporary collections outside the
+    // generic async state machine, including its cancellation/drop paths.
+    #[inline(never)]
+    fn retain_windows(&mut self, windows: Vec<AttendanceWindow>) {
+        use two_bot_cutover::event_attendance::ATTENDANCE_MAX_WINDOWS;
+        // Alternate stores must obey the same bounds as the SQL adapter.
+        // An oversized candidate set grants no new tags or opens; existing
+        // tags and the observed close boundary are still finalized.
+        let bounded = windows.len() <= ATTENDANCE_MAX_WINDOWS
+            && windows.iter().all(|w| w.event_key.len() <= 128);
+        self.allow_open &= bounded;
+        self.windows = Some(if bounded {
+            windows
+                .into_iter()
+                .map(|w| AttendanceWindowMs {
+                    event_key: w.event_key,
+                    starts_ms: millis_of(w.starts_at),
+                    ends_ms: millis_of(w.ends_at),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        });
+    }
+
+    #[inline(never)]
+    fn retain_close_page(&mut self, rows: Vec<AttendanceSession>) -> Result<(), ()> {
+        use two_bot_cutover::event_attendance::{
+            ATTENDANCE_MAX_TAG_BYTES, ATTENDANCE_MAX_WINDOWS, ATTENDANCE_RECOVERY_PAGE_SIZE,
+        };
+        let t = &self.transition;
+        if rows.len() > ATTENDANCE_RECOVERY_PAGE_SIZE {
+            return Err(());
+        }
+        let bounded: Vec<bool> = rows
+            .iter()
+            .map(|r| {
+                r.event_keys.len() <= ATTENDANCE_MAX_WINDOWS
+                    && r.event_keys.iter().map(String::len).sum::<usize>()
+                        <= ATTENDANCE_MAX_TAG_BYTES
+                    && r.channel_name.len() <= 4096
+                    && r.channel_id.len() <= 20
+                    && r.member_id.len() <= 20
+            })
+            .collect();
+        self.allow_open &= bounded.iter().all(|bounded| *bounded);
+        self.rows_exhausted = rows.len() < ATTENDANCE_RECOVERY_PAGE_SIZE;
+        let open_rows: Vec<_> = rows
+            .iter()
+            .zip(&bounded)
+            .map(|(r, bounded)| OpenRow {
+                id: r.id,
+                channel_id: (r.channel_id.len() <= 20)
+                    .then(|| r.channel_id.parse().ok())
+                    .flatten(),
+                joined_ms: millis_of(r.joined_at),
+                event_keys: if *bounded {
+                    r.event_keys.clone()
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect();
+        let plan = plan_transition(
+            self.windows.as_deref().unwrap_or_default(),
+            &open_rows,
+            t.previous,
+            t.current,
+            millis_of(t.observed_at),
+        );
+        self.closes = plan
+            .closes
+            .into_iter()
+            .zip(open_rows)
+            .zip(bounded)
+            .map(|((mut close, row), bounded)| {
+                if !bounded {
+                    // Empty expansion means finalize by id, preserving the
+                    // original metadata server-side instead of sentinel text.
+                    close.tag_union.clear();
+                    return (close, None);
+                }
+                let name = (row.channel_id.is_some() && row.channel_id == t.previous)
+                    .then(|| t.previous_name.clone())
+                    .flatten();
+                (close, name)
+            })
+            .collect();
+        Ok(())
+    }
+
     async fn advance(
         &mut self,
         store: &impl AttendanceStore,
         may_open: impl Fn() -> bool,
     ) -> Result<(), ()> {
-        use two_bot_cutover::event_attendance::{
-            ATTENDANCE_MAX_TAG_BYTES, ATTENDANCE_MAX_WINDOWS, ATTENDANCE_RECOVERY_PAGE_SIZE,
-        };
-        let t = &self.transition;
         if self.windows.is_none() {
-            let windows = store.attendance_windows(t.guild).await.map_err(|_| ())?;
-            // Alternate stores must obey the same bounds as the SQL adapter.
-            // An oversized candidate set grants no new tags or opens; existing
-            // tags and the observed close boundary are still finalized.
-            let bounded = windows.len() <= ATTENDANCE_MAX_WINDOWS
-                && windows.iter().all(|w| w.event_key.len() <= 128);
-            self.allow_open &= bounded;
-            self.windows = Some(if bounded {
-                windows
-                    .into_iter()
-                    .map(|w| AttendanceWindowMs {
-                        event_key: w.event_key,
-                        starts_ms: millis_of(w.starts_at),
-                        ends_ms: millis_of(w.ends_at),
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            });
+            let windows = store
+                .attendance_windows(self.transition.guild)
+                .await
+                .map_err(|_| ())?;
+            self.retain_windows(windows);
         }
         if self.closes.is_empty() && !self.rows_exhausted {
             let rows = store
-                .open_attendance_sessions(t.guild, t.member)
+                .open_attendance_sessions(self.transition.guild, self.transition.member)
                 .await
                 .map_err(|_| ())?;
-            if rows.len() > ATTENDANCE_RECOVERY_PAGE_SIZE {
-                return Err(());
-            }
-            let bounded: Vec<bool> = rows
-                .iter()
-                .map(|r| {
-                    r.event_keys.len() <= ATTENDANCE_MAX_WINDOWS
-                        && r.event_keys.iter().map(String::len).sum::<usize>()
-                            <= ATTENDANCE_MAX_TAG_BYTES
-                        && r.channel_name.len() <= 4096
-                        && r.channel_id.len() <= 20
-                        && r.member_id.len() <= 20
-                })
-                .collect();
-            self.allow_open &= bounded.iter().all(|bounded| *bounded);
-            self.rows_exhausted = rows.len() < ATTENDANCE_RECOVERY_PAGE_SIZE;
-            let open_rows: Vec<_> = rows
-                .iter()
-                .zip(&bounded)
-                .map(|(r, bounded)| OpenRow {
-                    id: r.id,
-                    channel_id: (r.channel_id.len() <= 20)
-                        .then(|| r.channel_id.parse().ok())
-                        .flatten(),
-                    joined_ms: millis_of(r.joined_at),
-                    event_keys: if *bounded {
-                        r.event_keys.clone()
-                    } else {
-                        Vec::new()
-                    },
-                })
-                .collect();
-            let plan = plan_transition(
-                self.windows.as_deref().unwrap_or_default(),
-                &open_rows,
-                t.previous,
-                t.current,
-                millis_of(t.observed_at),
-            );
-            self.closes = plan
-                .closes
-                .into_iter()
-                .zip(open_rows)
-                .zip(bounded)
-                .map(|((mut close, row), bounded)| {
-                    if !bounded {
-                        // Empty expansion means finalize by id, preserving the
-                        // original metadata server-side instead of sentinel text.
-                        close.tag_union.clear();
-                        return (close, None);
-                    }
-                    let name = (row.channel_id.is_some() && row.channel_id == t.previous)
-                        .then(|| t.previous_name.clone())
-                        .flatten();
-                    (close, name)
-                })
-                .collect();
+            self.retain_close_page(rows)?;
         }
+        let t = &self.transition;
         for _ in 0..CLOSES_PER_TURN {
             let Some((close, name)) = self.closes.front() else {
                 break;
