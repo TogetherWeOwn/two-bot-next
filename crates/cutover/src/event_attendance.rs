@@ -173,6 +173,25 @@ const CAPTURE_WINDOWS_SQL: &str =
                          AND (h.event_id <> w.event_id OR h.instance_starts_at <> w.instance_starts_at))
      ORDER BY w.starts_at, k.event_key LIMIT 129";
 
+// Share one query/decoder future between planning and transactional capture,
+// rather than compiling separate pool- and connection-executor variants.
+#[inline(never)]
+async fn capture_windows_in(
+    connection: &mut sqlx::PgConnection,
+    guild_id: &str,
+    since: Option<OffsetDateTime>,
+    closing: bool,
+    requested: Option<&[String]>,
+) -> Result<Vec<(String, OffsetDateTime, OffsetDateTime)>, sqlx::Error> {
+    sqlx::query_as(CAPTURE_WINDOWS_SQL)
+        .bind(guild_id)
+        .bind(since)
+        .bind(closing)
+        .bind(requested)
+        .fetch_all(connection)
+        .await
+}
+
 /// Accepted candidate windows within raw retention for transition planning.
 /// Expired candidates can tag an existing overlapping span, never open one.
 /// Historical attendance records cannot authorize a new span or tag.
@@ -180,12 +199,8 @@ pub async fn attendance_windows_for_guild(
     pool: &sqlx::PgPool,
     guild_id: &str,
 ) -> Result<Vec<AttendanceWindow>, sqlx::Error> {
-    sqlx::query_as::<_, (String, OffsetDateTime, OffsetDateTime)>(CAPTURE_WINDOWS_SQL)
-        .bind(guild_id)
-        .bind(None::<OffsetDateTime>)
-        .bind(true)
-        .bind(None::<Vec<String>>)
-        .fetch_all(pool)
+    let mut connection = pool.acquire().await?;
+    capture_windows_in(&mut connection, guild_id, None, true, None)
         .await
         .map(|rows| {
             rows.into_iter()
@@ -329,14 +344,8 @@ async fn capture_tags_in(
     if !permitted {
         return Ok(Vec::new());
     }
-    let windows: Vec<(String, OffsetDateTime, OffsetDateTime)> =
-        sqlx::query_as(CAPTURE_WINDOWS_SQL)
-            .bind(guild_id)
-            .bind(since)
-            .bind(closing)
-            .bind(requested)
-            .fetch_all(&mut *connection)
-            .await?;
+    let windows =
+        capture_windows_in(connection, guild_id, Some(since), closing, Some(requested)).await?;
     if windows.len() > ATTENDANCE_MAX_WINDOWS || windows.iter().any(|(key, _, _)| key.len() > 128) {
         return Err(sqlx::Error::Protocol(
             "attendance candidates exceed budget".into(),
