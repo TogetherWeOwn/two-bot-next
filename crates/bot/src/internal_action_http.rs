@@ -412,6 +412,10 @@ impl VoiceMoveExecutor {
         }
         let member_num: Snowflake = member_id.parse().unwrap_or(0);
         let (current, occupants) = {
+            let readiness = self.gateway_state.read().await;
+            if *readiness != crate::gateway::GatewayState::Connected {
+                return Err(fail("voice_move_gateway_not_ready"));
+            }
             let mut admissions = self
                 .voice_clock
                 .move_admissions
@@ -648,18 +652,62 @@ impl VoiceMoveEffect for VoiceMoveExecutor {
                         "voice_move_admission_busy",
                     )
                 })?;
+            if *self.gateway_state.read().await != crate::gateway::GatewayState::Connected {
+                return Err(Self::unavailable(
+                    "gateway not ready; retryable",
+                    "voice_move_gateway_not_ready",
+                ));
+            }
             let gathered = self
                 .gather_facts(guild_id, guild_num, bot_id, member_id, target_id)
                 .await?;
             if let Some((outcome, from)) = gathered.early {
                 return Ok(receipt_for(outcome, from, None));
             }
-            let Some(facts) = gathered.facts else {
+            let Some(mut facts) = gathered.facts else {
                 return Err(VoiceMoveExecutor::unavailable(
                     "voice move gather inconsistent",
                     "voice_move_gather_inconsistent",
                 ));
             };
+            // REST gathering may have spanned a gateway gap or voice change.
+            // Reproject occupancy under the readiness guard immediately before
+            // admission; a changed source invalidates the gathered room grants.
+            {
+                let readiness = self.gateway_state.read().await;
+                if *readiness != crate::gateway::GatewayState::Connected {
+                    return Err(Self::unavailable(
+                        "gateway not ready; retryable",
+                        "voice_move_gateway_not_ready",
+                    ));
+                }
+                let mut admissions = self.voice_clock.move_admissions.lock().map_err(|_| {
+                    Self::unavailable(
+                        "voice move admissions unavailable; retryable",
+                        "voice_move_admissions_unavailable",
+                    )
+                })?;
+                let (current, occupants) = occupancy(
+                    &self.voice_cache,
+                    guild_num,
+                    facts.member_id,
+                    facts.target.id,
+                    &mut admissions,
+                )
+                .map_err(|_| {
+                    Self::unavailable(
+                        "voice move cache changed; retryable",
+                        "voice_move_cache_race",
+                    )
+                })?;
+                if current != facts.member_channel_id {
+                    return Err(Self::unavailable(
+                        "voice move source changed; retryable",
+                        "voice_move_source_changed",
+                    ));
+                }
+                facts.target_occupants = occupants;
+            }
             let from = |facts: &VoiceMoveFacts| facts.member_channel_id.map(|id| id.to_string());
             match decide(&facts) {
                 VoiceMoveDecision::Proceed { .. } => {}

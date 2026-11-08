@@ -3200,6 +3200,8 @@ struct MockVoiceApiConfig {
     member_timeout: Value,
     target_status_after_patch: Option<u16>,
     target_overwrites_after_patch: Vec<Value>,
+    identity_seen: Option<Arc<tokio::sync::Notify>>,
+    disconnect_on_member: Option<Arc<RwLock<crate::gateway::GatewayState>>>,
 }
 
 impl Default for MockVoiceApiConfig {
@@ -3214,6 +3216,8 @@ impl Default for MockVoiceApiConfig {
             member_timeout: Value::Null,
             target_status_after_patch: None,
             target_overwrites_after_patch: Vec::new(),
+            identity_seen: None,
+            disconnect_on_member: None,
         }
     }
 }
@@ -3246,6 +3250,9 @@ impl MockVoiceApi {
                     }));
                     let guild_path = format!("/api/v10/guilds/{guild_id}");
                     if path == "/api/v10/users/@me" {
+                        if let Some(seen) = &config.identity_seen {
+                            seen.notify_one();
+                        }
                         return (
                             StatusCode::OK,
                             HeaderMap::new(),
@@ -3300,6 +3307,11 @@ impl MockVoiceApi {
                             })
                         };
                         if user_id == VOICE_MOVE_BOT_ID || voice_move_known_member(user_id) {
+                            if user_id != VOICE_MOVE_BOT_ID {
+                                if let Some(state) = &config.disconnect_on_member {
+                                    *state.write().await = crate::gateway::GatewayState::Armed;
+                                }
+                            }
                             return (StatusCode::OK, HeaderMap::new(), Json(member(user_id)));
                         }
                         return (StatusCode::NOT_FOUND, HeaderMap::new(), Json(Value::Null));
@@ -3434,6 +3446,67 @@ async fn voice_move_executor_gateway_not_ready_is_unavailable() {
     assert_eq!(error.code, ErrorCode::DiscordUnavailable);
     assert_eq!(mock.patch_calls(), 0);
     assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn voice_move_executor_queued_request_rechecks_gateway() {
+    let identity_seen = Arc::new(tokio::sync::Notify::new());
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        identity_seen: Some(identity_seen.clone()),
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let executor = voice_move_executor(&mock, seeded_voice_move_cache());
+    let gate = executor.admission_gate.lock().await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).unwrap();
+    let mut future = executor.execute_move(&request);
+    tokio::select! {
+        result = &mut future => panic!("admission gate did not hold request: {result:?}"),
+        _ = identity_seen.notified() => {
+            *executor.gateway_state.write().await = crate::gateway::GatewayState::Armed;
+            drop(gate);
+        }
+        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("identity handshake timed out"),
+    }
+    let error = tokio::time::timeout(Duration::from_secs(5), future)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(mock.patch_calls(), 0);
+    assert!(!mock
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request["path"] == format!("/api/v10/guilds/{}", staging_guild())));
+}
+
+#[tokio::test]
+async fn voice_move_executor_gateway_gap_during_gather_prevents_patch() {
+    let state = connected_gateway();
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        disconnect_on_member: Some(state.clone()),
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(mock.origin.clone()))
+            .unwrap();
+    let executor = VoiceMoveExecutor::new(
+        discord,
+        seeded_voice_move_cache(),
+        state,
+        VoiceOccupancyClock::new(),
+    );
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).unwrap();
+    assert_eq!(
+        executor.execute_move(&request).await.unwrap_err().code,
+        ErrorCode::DiscordUnavailable
+    );
+    assert_eq!(mock.patch_calls(), 0);
 }
 
 #[tokio::test]

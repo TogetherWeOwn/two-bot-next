@@ -154,10 +154,13 @@ impl VoiceOccupancyClock {
 
 impl two_bot_discord::VoiceTransitionObserver for VoiceOccupancyClock {
     fn observe_voice_transition(&self, transition: two_bot_discord::VoiceTransitionObservation) {
-        self.move_admissions
-            .lock()
-            .expect("voice move admissions")
-            .observe(transition.member_id, transition.current_channel_id);
+        {
+            let mut admissions = self.move_admissions.lock().expect("voice move admissions");
+            admissions.observe(transition.member_id, transition.current_channel_id);
+            // A reseed may prove an arrival without emitting a transition.
+            // A later witnessed departure from that target also settles it.
+            admissions.observe(transition.member_id, transition.previous_channel_id);
+        }
         if transition.is_bot {
             return;
         }
@@ -826,6 +829,36 @@ mod tests {
         Event::GuildCreate(Box::new(GuildCreate::Available(
             serde_json::from_value(guild).expect("guild fixture"),
         )))
+    }
+
+    #[test]
+    fn pipeline_reseed_then_departure_reconciles_move_without_http_read() {
+        for destination in [None, Some(201)] {
+            let pipeline = two_bot_discord::MemPipeline::for_replay();
+            let clock = VoiceOccupancyClock::new();
+            pipeline.set_voice_transition_observer(clock.clone());
+            clock
+                .move_admissions
+                .lock()
+                .unwrap()
+                .reserve(7, 200)
+                .unwrap();
+            pipeline.handle_at(&pipeline_guild(&[7]), "2026-11-03T10:00:00Z");
+            assert!(clock
+                .move_admissions
+                .lock()
+                .unwrap()
+                .reserve(7, 200)
+                .is_err());
+            // GuildCreate reseeds occupancy without an arrival transition.
+            pipeline.handle_at(&pipeline_voice(7, destination), "2026-11-03T10:01:00Z");
+            assert!(clock
+                .move_admissions
+                .lock()
+                .unwrap()
+                .reserve(7, 200)
+                .is_ok());
+        }
     }
 
     #[test]
