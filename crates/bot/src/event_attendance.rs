@@ -986,16 +986,19 @@ pub fn project_attendance(
     observations.sort_unstable();
     let wire_rooms: Vec<AttendanceRoom<'_>> = observations
         .chunk_by(|a, b| a.0 == b.0)
-        .filter_map(|rows| {
-            // max_by_key returns the last maximum, hence the last input row
-            // wins an equal observation stamp, independent of join/leave time.
-            rows.iter()
-                .map(|(_, index)| &sessions[*index])
-                .max_by_key(|row| row.name_observed_ns)
-                .map(|row| AttendanceRoom {
-                    channel_id: row.channel_id.to_string(),
-                    name_at_close: &row.channel_name,
-                })
+        .map(|rows| {
+            let mut latest = &sessions[rows[0].1];
+            for (_, index) in &rows[1..] {
+                let row = &sessions[*index];
+                // Equal stamps keep the last input observation.
+                if row.name_observed_ns >= latest.name_observed_ns {
+                    latest = row;
+                }
+            }
+            AttendanceRoom {
+                channel_id: latest.channel_id.to_string(),
+                name_at_close: &latest.channel_name,
+            }
         })
         .collect();
     let value = serde_json::to_value(AttendanceResult {
