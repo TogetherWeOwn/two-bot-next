@@ -860,14 +860,15 @@ struct MemberSpans {
 // two places in the peak for the same minute. Keep AFK eligibility separate.
 fn union_intervals(mut intervals: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
     intervals.sort_unstable();
-    let mut merged: Vec<(i64, i64)> = Vec::new();
-    for (from, to) in intervals {
-        match merged.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => merged.push((from, to)),
+    intervals.dedup_by(|next, previous| {
+        if next.0 <= previous.1 {
+            previous.1 = previous.1.max(next.1);
+            true
+        } else {
+            false
         }
-    }
-    merged
+    });
+    intervals
 }
 
 /// Project the §4 attendance shape over stored sessions. Pure over plain
@@ -992,6 +993,20 @@ pub fn project_attendance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interval_union_compacts_nested_touching_and_disjoint_spans() {
+        assert!(union_intervals(Vec::new()).is_empty());
+        assert_eq!(union_intervals(vec![(10, 20)]), vec![(10, 20)]);
+        assert_eq!(
+            union_intervals(vec![(50, 60), (20, 30), (10, 20), (12, 15), (10, 20)]),
+            vec![(10, 30), (50, 60)]
+        );
+        assert_eq!(
+            union_intervals(vec![(5, 10), (1, 100), (10, 50), (100, 101)]),
+            vec![(1, 101)]
+        );
+    }
 
     const MIN: i64 = 60_000;
 

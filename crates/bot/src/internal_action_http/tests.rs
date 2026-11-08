@@ -5976,10 +5976,16 @@ async fn pause_attendance_read_on(
     tokio::task::JoinHandle<(StatusCode, HeaderMap, Value)>,
 ) {
     let mut lock_tx = pool.begin().await.unwrap();
-    sqlx::query(&format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))
-        .execute(&mut *lock_tx)
-        .await
-        .unwrap();
+    let lock = match table {
+        "event_attendance_windows" => {
+            sqlx::query("LOCK TABLE event_attendance_windows IN ACCESS EXCLUSIVE MODE")
+        }
+        "event_voice_sessions" => {
+            sqlx::query("LOCK TABLE event_voice_sessions IN ACCESS EXCLUSIVE MODE")
+        }
+        other => panic!("unsupported barrier table {other}"),
+    };
+    lock.execute(&mut *lock_tx).await.unwrap();
     let request = signed_read(&attendance_payload(key), "old");
     let in_flight = tokio::spawn(async move { answer(app, request).await });
     let waiting = tokio::time::timeout(Duration::from_secs(3), async {
