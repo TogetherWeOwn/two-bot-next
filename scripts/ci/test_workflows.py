@@ -7016,7 +7016,7 @@ class WorkflowTests(unittest.TestCase):
                 "window wrong environment": lambda w: window(w).update({"environment": "voice-synthetic"}),
                 "window writes": lambda w: window(w).update({"permissions": {"contents": "write"}}),
                 "window timeout": lambda w: window(w).update({"timeout-minutes": "30"}),
-                "window runner": lambda w: window(w).update({"runs-on": "ubuntu-latest"}),
+                "window runner": lambda w: window(w).update({"runs-on": "ubuntu-latest-16-cores"}),
                 "window tolerated": lambda w: window(w).update({"continue-on-error": "true"}),
                 "window unpinned checkout": lambda w: window(w)["steps"][0].update({"uses": "actions/checkout@v4"}),
                 "window persists credentials": lambda w: window(w)["steps"][0]["with"].update(
@@ -7073,7 +7073,7 @@ class WorkflowTests(unittest.TestCase):
                     {"STAGING_USE_EXPIRES_AT": "${{ inputs.staging_use_expires_at }}"}),
                 "release releases instead of finishing": lambda w: release(w)["steps"][2].update(
                     {"run": "node wrangler/scripts/staging-use.mjs release"}),
-                "release runner": lambda w: release(w).update({"runs-on": "ubuntu-latest"}),
+                "release runner": lambda w: release(w).update({"runs-on": "ubuntu-latest-16-cores"}),
             }
             for label, mutate in mutations.items():
                 changed = copy.deepcopy(workflow)

@@ -25,7 +25,12 @@ class ChannelCiTests(unittest.TestCase):
     def assert_isolated(self, workflow):
         # Host selection is explicit; database isolation still comes from
         # the job container and service network, not private runner labels.
-        self.assertEqual(len(re.findall(r"(?m)^    runs-on: ubuntu-latest$", workflow)), 3)
+        hosted_jobs = ("changes", "advisories", *SWEEP_COMPILING_JOBS, "sweep")
+        self.assertEqual(len(re.findall(r"(?m)^    runs-on: ubuntu-latest$", workflow)),
+                         len(hosted_jobs))
+        for job in hosted_jobs:
+            body = re.split(r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1)[0]
+            self.assertRegex(body, r"(?m)^    runs-on: ubuntu-latest$", job)
         self.assertNotIn("CI_OVERFLOW_", workflow)
         self.assertNotIn("!github.event.repository.private", workflow)
         self.assertNotIn("        ports:", workflow)
