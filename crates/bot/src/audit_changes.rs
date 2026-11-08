@@ -45,6 +45,31 @@ fn channel_row(
     let guild = channel.guild_id?;
     let old = cache.channel(channel.id);
     let occupancy = cache.stats().channel_voice_states(channel.id);
+    let mut metadata = json!({
+        "baseline": if old.is_some() { "cached" } else { "missing" },
+        "oldName": old.as_ref().and_then(|c| c.name.as_deref()).map(channel_name),
+        "newName": if action == "channel_delete" { None } else { channel.name.as_deref().map(channel_name) },
+        "nameChanged": old.as_ref().map(|c| c.name != channel.name),
+        "parentId": channel.parent_id.map(|id| id.to_string()),
+        "position": channel.position,
+        "bitrate": channel.bitrate,
+        "userLimit": channel.user_limit,
+        "slowmode": channel.rate_limit_per_user,
+        "permissionOverwritesChanged": old.as_ref().map(|c| c.permission_overwrites != channel.permission_overwrites),
+        "topicChanged": old.as_ref().map(|c| c.topic != channel.topic),
+        "occupancyObserved": occupancy,
+        "occupancyEvidence": "cached_voice_states_not_authoritative",
+        "botReason": "unknown_gateway_observation"
+    });
+    if action == "channel_delete" {
+        // The delete payload is an observation, not a cached historical baseline.
+        metadata["deletedName"] = json!(channel.name.as_deref().map(channel_name));
+        metadata["deletedNameSource"] = json!(if channel.name.is_some() {
+            "gateway_payload"
+        } else {
+            "missing"
+        });
+    }
     let mut event = row(
         AuditKind::ChannelChange,
         guild.get(),
@@ -52,22 +77,7 @@ fn channel_row(
         action,
         at,
         sequence,
-        json!({
-            "baseline": if old.is_some() { "cached" } else { "missing" },
-            "oldName": old.as_ref().and_then(|c| c.name.as_deref()).map(channel_name),
-            "newName": if action == "channel_delete" { None } else { channel.name.as_deref().map(channel_name) },
-            "nameChanged": old.as_ref().map(|c| c.name != channel.name),
-            "parentId": channel.parent_id.map(|id| id.to_string()),
-            "position": channel.position,
-            "bitrate": channel.bitrate,
-            "userLimit": channel.user_limit,
-            "slowmode": channel.rate_limit_per_user,
-            "permissionOverwritesChanged": old.as_ref().map(|c| c.permission_overwrites != channel.permission_overwrites),
-            "topicChanged": old.as_ref().map(|c| c.topic != channel.topic),
-            "occupancyObserved": occupancy,
-            "occupancyEvidence": "cached_voice_states_not_authoritative",
-            "botReason": "unknown_gateway_observation"
-        }),
+        metadata,
     );
     // Existing sink self-channel guard also covers create/update/delete.
     event.source_channel_id = Some(channel.id.to_string());
@@ -358,6 +368,8 @@ mod tests {
         let meta: Value = serde_json::from_str(&events[0].metadata_json).expect("metadata");
         assert_eq!(meta["oldName"], "Before");
         assert_eq!(meta["newName"], "After");
+        assert!(meta.get("deletedName").is_none());
+        assert!(meta.get("deletedNameSource").is_none());
         assert_eq!(meta["actorConfidence"], "unknown");
         assert!(events[0].actor_id.is_none());
         assert!(!events[0].metadata_json.contains("PRIVATE TOPIC SENTINEL"));
@@ -381,6 +393,78 @@ mod tests {
         dm.guild_id = None;
         assert!(translate(
             &Event::ChannelCreate(Box::new(ChannelCreate(dm))),
+            &cache,
+            AT,
+            9
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn channel_deletion_preserves_payload_name_without_inventing_a_baseline() {
+        use twilight_model::gateway::payload::incoming::ChannelDelete;
+
+        for cached in [false, true] {
+            for payload_name in [Some("Deleted"), None] {
+                let cache = build_cache();
+                if cached {
+                    cache.update(&Event::ChannelCreate(Box::new(ChannelCreate(channel(
+                        "Cached",
+                    )))));
+                }
+                let mut deleted = channel("Deleted");
+                deleted.name = payload_name.map(str::to_owned);
+                let packet = Event::ChannelDelete(Box::new(ChannelDelete(deleted)));
+                let mut events = translate(&packet, &cache, AT, 9);
+                assert_eq!(events.len(), 1);
+                let event = &mut events[0];
+                decorate(event, &packet, 9, None, AT);
+                let meta: Value = serde_json::from_str(&event.metadata_json).expect("metadata");
+                assert_eq!(event.action.as_deref(), Some("channel_delete"));
+                assert_eq!(event.source_channel_id.as_deref(), Some("2"));
+                assert_eq!(meta["baseline"], if cached { "cached" } else { "missing" });
+                assert_eq!(meta["oldName"], json!(cached.then_some("Cached")));
+                assert_eq!(meta["newName"], Value::Null);
+                assert_eq!(meta["deletedName"], json!(payload_name));
+                assert_eq!(
+                    meta["deletedNameSource"],
+                    if payload_name.is_some() {
+                        "gateway_payload"
+                    } else {
+                        "missing"
+                    }
+                );
+                if !cached {
+                    assert_eq!(meta["nameChanged"], Value::Null);
+                }
+                assert_eq!(meta["actorConfidence"], "unknown");
+                assert!(event.actor_id.is_none());
+                assert!(!event.metadata_json.contains("PRIVATE TOPIC SENTINEL"));
+            }
+        }
+    }
+
+    #[test]
+    fn channel_deletion_sanitizes_payload_name_and_excludes_dms() {
+        use twilight_model::gateway::payload::incoming::ChannelDelete;
+
+        let cache = build_cache();
+        let raw = format!("`\n@everyone <@123>{}", "😀".repeat(150));
+        let mut deleted = channel(&raw);
+        let packet = Event::ChannelDelete(Box::new(ChannelDelete(deleted.clone())));
+        let event = &translate(&packet, &cache, AT, 9)[0];
+        let meta: Value = serde_json::from_str(&event.metadata_json).expect("metadata");
+        let name = meta["deletedName"].as_str().expect("payload name retained");
+        assert_eq!(name, channel_name(&raw));
+        assert!(name.encode_utf16().count() <= 100);
+        assert!(!name.contains('`'));
+        assert!(!name.contains('\n'));
+        assert!(!name.contains("@everyone"));
+        assert!(!name.contains("<@123>"));
+        assert!(!event.metadata_json.contains("PRIVATE TOPIC SENTINEL"));
+        deleted.guild_id = None;
+        assert!(translate(
+            &Event::ChannelDelete(Box::new(ChannelDelete(deleted))),
             &cache,
             AT,
             9

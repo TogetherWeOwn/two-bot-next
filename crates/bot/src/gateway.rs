@@ -1126,9 +1126,9 @@ fn apply_dispatch<I: InviteSource>(
     let mut dispatch_error: Option<sqlx::Error> = None;
     // Staff audit rows: translated pre-update (member deltas and
     // voice boundaries need the rows the funnel is about to
-    // mutate), then admitted without I/O to the bounded capture queue.
-    // The retry job owns durable writes; admission is not a durable receipt
-    // and process loss before insertion is an explicitly documented gap.
+    // mutate). Legacy rows retain their awaited pre-checkpoint storage path.
+    // Added diagnostics enter the bounded capture queue without I/O; the retry
+    // job owns their insert, and loss before insertion is a documented gap.
     let mut audit_events = Vec::new();
     if let Some(dispatch) = dispatch {
         // A cold voice RESUME is followed by IDENTIFY; READY connects.
