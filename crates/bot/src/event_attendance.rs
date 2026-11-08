@@ -848,13 +848,6 @@ pub enum AttendanceRefusal {
     OverBudget,
 }
 
-struct MemberSpans {
-    intervals: Vec<(i64, i64)>,
-    non_afk_intervals: Vec<(i64, i64)>,
-    sessions: u64,
-    first_joined_ms: i64,
-}
-
 // A failed close followed by a successful open can leave overlapping rows.
 // Union per member, not per row: one member cannot earn two minutes or occupy
 // two places in the peak for the same minute. Keep AFK eligibility separate.
@@ -931,53 +924,52 @@ pub fn project_attendance(
         return Err(AttendanceRefusal::OverBudget);
     }
     let (open_ms, close_ms) = window_open_ms(window.starts_ms, window.ends_ms);
-    // Per-member aggregation over window-clamped intervals.
-    let mut members: std::collections::BTreeMap<Snowflake, MemberSpans> =
-        std::collections::BTreeMap::new();
-    // Sort room observations by channel and input position below. This keeps
-    // latest-name ties deterministic without a separate tree specialization.
-    let mut rooms: Vec<(Snowflake, usize)> = Vec::new();
-    // Sweep events for the peak: (instant, delta), ends before starts.
-    let mut sweep: Vec<(i64, i64)> = Vec::new();
-    for (index, row) in sessions.iter().enumerate().filter(|(_, row)| !row.is_bot) {
-        let end_ms = row.left_ms.unwrap_or(now_ms.min(close_ms));
-        let from_ms = row.joined_ms.max(open_ms);
-        let to_ms = end_ms.min(close_ms);
-        let entry = members.entry(row.member_id).or_insert_with(|| MemberSpans {
-            intervals: Vec::new(),
-            non_afk_intervals: Vec::new(),
-            sessions: 0,
-            first_joined_ms: row.joined_ms,
-        });
-        entry.sessions += 1;
-        entry.first_joined_ms = entry.first_joined_ms.min(row.joined_ms);
-        rooms.push((row.channel_id, index));
-        if from_ms < to_ms {
-            entry.intervals.push((from_ms, to_ms));
-            if !row.afk {
-                entry.non_afk_intervals.push((from_ms, to_ms));
-            }
-        }
-    }
-    if members.is_empty() {
+    // Group bounded human observations by unsigned member id and input position.
+    // Reuse the same tuple ordering and storage for room observations below.
+    let mut observations: Vec<(Snowflake, usize)> = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| !row.is_bot)
+        .map(|(index, row)| (row.member_id, index))
+        .collect();
+    if observations.is_empty() {
         return Err(AttendanceRefusal::NoRecord);
     }
-    let wire_members: Vec<AttendanceMember> = members
-        .into_iter()
-        .map(|(member_id, spans)| {
-            let duration_ms: i64 = union_intervals(spans.intervals)
+    observations.sort_unstable();
+    // Sweep events for the peak: (instant, delta), ends before starts.
+    let mut sweep: Vec<(i64, i64)> = Vec::new();
+    let wire_members: Vec<AttendanceMember> = observations
+        .chunk_by(|a, b| a.0 == b.0)
+        .map(|rows| {
+            let mut intervals = Vec::new();
+            let mut non_afk_intervals = Vec::new();
+            let mut first_joined_ms = i64::MAX;
+            for (_, index) in rows {
+                let row = &sessions[*index];
+                first_joined_ms = first_joined_ms.min(row.joined_ms);
+                let end_ms = row.left_ms.unwrap_or(now_ms.min(close_ms));
+                let from_ms = row.joined_ms.max(open_ms);
+                let to_ms = end_ms.min(close_ms);
+                if from_ms < to_ms {
+                    intervals.push((from_ms, to_ms));
+                    if !row.afk {
+                        non_afk_intervals.push((from_ms, to_ms));
+                    }
+                }
+            }
+            let duration_ms: i64 = union_intervals(intervals)
                 .into_iter()
                 .map(|(from, to)| to - from)
                 .sum();
-            for (from, to) in union_intervals(spans.non_afk_intervals) {
+            for (from, to) in union_intervals(non_afk_intervals) {
                 sweep.push((from, 1));
                 sweep.push((to, -1));
             }
             AttendanceMember {
-                discord_id: member_id.to_string(),
+                discord_id: rows[0].0.to_string(),
                 minutes: duration_ms / 60_000,
-                sessions: spans.sessions,
-                first_joined_at: two_bot_core::funnel::format_iso_millis(spans.first_joined_ms),
+                sessions: rows.len() as u64,
+                first_joined_at: two_bot_core::funnel::format_iso_millis(first_joined_ms),
             }
         })
         .collect();
@@ -988,14 +980,16 @@ pub fn project_attendance(
         running += delta;
         peak_concurrent = peak_concurrent.max(running);
     }
-    rooms.sort_unstable();
-    let wire_rooms: Vec<AttendanceRoom<'_>> = rooms
+    for (id, index) in &mut observations {
+        *id = sessions[*index].channel_id;
+    }
+    observations.sort_unstable();
+    let wire_rooms: Vec<AttendanceRoom<'_>> = observations
         .chunk_by(|a, b| a.0 == b.0)
-        .filter_map(|observations| {
+        .filter_map(|rows| {
             // max_by_key returns the last maximum, hence the last input row
             // wins an equal observation stamp, independent of join/leave time.
-            observations
-                .iter()
+            rows.iter()
                 .map(|(_, index)| &sessions[*index])
                 .max_by_key(|row| row.name_observed_ns)
                 .map(|row| AttendanceRoom {
@@ -1119,6 +1113,37 @@ mod tests {
                 {"channel_id": u64::MAX.to_string(), "name_at_close": "Latest"},
             ])
         );
+    }
+
+    #[test]
+    fn interleaved_members_keep_unsigned_order_counts_and_independent_interval_unions() {
+        let event = window("event", 0, 60 * MIN);
+        let rows = [
+            session(u64::MAX, 7, "Lobby", false, false, 5 * MIN, Some(15 * MIN)),
+            session(2, 7, "Lobby", false, false, 30 * MIN, Some(30 * MIN)),
+            session(u64::MAX, 7, "Lobby", false, true, 0, Some(10 * MIN)),
+            session(10, 7, "Lobby", false, false, 0, Some(20 * MIN)),
+            session(u64::MAX, 7, "Lobby", false, false, 10 * MIN, Some(20 * MIN)),
+            session(1, 7, "Lobby", true, false, 0, Some(20 * MIN)),
+        ];
+        let result = project_attendance("event", &event, &rows, 80 * MIN).unwrap();
+        assert_eq!(
+            result["members"],
+            json!([
+                {"discord_id": "2", "minutes": 0, "sessions": 1,
+                 "first_joined_at": two_bot_core::funnel::format_iso_millis(30 * MIN)},
+                {"discord_id": "10", "minutes": 20, "sessions": 1,
+                 "first_joined_at": two_bot_core::funnel::format_iso_millis(0)},
+                {"discord_id": u64::MAX.to_string(), "minutes": 20, "sessions": 3,
+                 "first_joined_at": two_bot_core::funnel::format_iso_millis(0)},
+            ])
+        );
+        assert_eq!(result["peak_concurrent"], 2);
+        let mut reversed = rows.to_vec();
+        reversed.reverse();
+        let reversed = project_attendance("event", &event, &reversed, 80 * MIN).unwrap();
+        assert_eq!(result["members"], reversed["members"]);
+        assert_eq!(result["peak_concurrent"], reversed["peak_concurrent"]);
     }
 
     #[test]
