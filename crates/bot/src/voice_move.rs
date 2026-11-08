@@ -321,17 +321,9 @@ pub(crate) fn occupancy(
     };
     let mut current = None;
     let mut occupants = 0u32;
-    let mut observed = Vec::new();
     for user in &users {
         let state = cache.voice_state(*user, guild).ok_or(())?;
         let channel = state.channel_id().get();
-        if admissions
-            .targets
-            .get(&user.get())
-            .is_some_and(|(target, _)| *target == channel)
-        {
-            observed.push(user.get());
-        }
         if channel == target_id {
             occupants = occupants.saturating_add(1);
         }
@@ -339,9 +331,11 @@ pub(crate) fn occupancy(
             current = Some(channel);
         }
     }
-    for member in observed {
-        admissions.release(member);
-    }
+    // Cache equality never settles a hold: the cache may already reflect a
+    // publication older than the reservation, so only a generation-fenced
+    // observer callback (see `VoiceMoveAdmissions::observe`) may release it.
+    // Until then the seat is counted conservatively, even if the member is
+    // also cached in the target, and the member's own moves fail closed.
     if admissions.targets.contains_key(&member_id) {
         return Err(());
     }

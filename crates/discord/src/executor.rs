@@ -217,6 +217,15 @@ impl DiscordError {
             if detail == &two_bot_core::send_admission::AdmissionError::Blocked.to_string())
     }
 
+    /// The canonical durable admission storage refusal is pre-wire, not a
+    /// transport failure. Keep this provenance narrow: other unavailable
+    /// details, including storage-looking text, do not prove an unsent request.
+    #[must_use]
+    pub fn is_admission_storage(&self) -> bool {
+        matches!(self, Self::Unavailable(detail)
+            if detail == &two_bot_core::send_admission::AdmissionError::Storage.to_string())
+    }
+
     /// True when the failure proves the request had no effect: everything
     /// [`Self::is_safe_pre_mutation`] covers, plus a 429. Discord documents a
     /// rate-limited request as not processed, and the send-admission layer
@@ -846,10 +855,11 @@ impl PendingHeaders<'_> {
         .await;
         let body = match collected {
             Ok(Ok(body)) => body.to_bytes().to_vec(),
-            // 429 is definitive no-effect even with a broken, oversized or
-            // timed-out body. Missing timing installs an indefinite hold
-            // instead of a default.
-            Err(_) | Ok(Err(_)) if status == 429 => Vec::new(),
+            // These received rejections prove no effect even with a broken,
+            // oversized or timed-out body. Preserve their status and use the
+            // normal receipt settlement below exactly once. 429 still needs
+            // its body timing first; missing timing installs an indefinite hold.
+            Err(_) | Ok(Err(_)) if matches!(status, 400 | 403 | 404 | 429) => Vec::new(),
             Err(_) => {
                 // Headers arrived but the body stalled: a GET cannot mutate,
                 // so release the lane where the permit is in scope. Without
@@ -4697,6 +4707,26 @@ mod tests {
             DiscordError::Rejected("discord refused the request".to_owned()),
         ] {
             assert!(!error.is_admission_blocked(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn only_canonical_admission_storage_proves_pre_wire_storage_refusal() {
+        assert!(
+            DiscordError::Unavailable(AdmissionError::Storage.to_string()).is_admission_storage()
+        );
+        for error in [
+            DiscordError::Unavailable(AdmissionError::Blocked.to_string()),
+            DiscordError::Unavailable(format!("{} ", AdmissionError::Storage)),
+            DiscordError::Unavailable("transport: database unavailable".to_owned()),
+            DiscordError::Unavailable("Discord response body unavailable".to_owned()),
+            DiscordError::Unavailable(HEADER_TIMEOUT_MESSAGE.to_owned()),
+            DiscordError::Unavailable(BODY_TIMEOUT_MESSAGE.to_owned()),
+            DiscordError::Timeout,
+            DiscordError::RateLimited,
+            DiscordError::Rejected(AdmissionError::Storage.to_string()),
+        ] {
+            assert!(!error.is_admission_storage(), "{error:?}");
         }
     }
 

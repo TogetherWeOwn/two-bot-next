@@ -942,6 +942,151 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_immediate_newer_arrival_settles_only_its_hold_without_double_counting() {
+        let pipeline = two_bot_discord::MemPipeline::for_replay();
+        let clock = VoiceOccupancyClock::new();
+        pipeline.set_voice_transition_observer(clock.clone());
+        pipeline.handle_at(&pipeline_guild(&[]), "2026-11-03T10:00:00Z");
+        pipeline.handle_at(&pipeline_voice(7, Some(201)), "2026-11-03T10:00:01Z");
+        pipeline.handle_at(&pipeline_voice(8, Some(201)), "2026-11-03T10:00:02Z");
+        {
+            let mut admissions = clock.move_admissions.lock().unwrap();
+            admissions.reserve(7, 200).unwrap();
+            admissions.reserve(8, 200).unwrap();
+        }
+        pipeline.handle_at(&pipeline_voice(7, Some(200)), "2026-11-03T10:00:03Z");
+        let mut admissions = clock.move_admissions.lock().unwrap();
+        assert_eq!(
+            crate::voice_move::occupancy(pipeline.cache(), 100, 7, 200, &mut admissions),
+            Ok((Some(200), 2)),
+            "one cached arrival plus only the other member's reserved seat"
+        );
+        assert!(
+            admissions.reserve(8, 200).is_err(),
+            "unrelated hold survives"
+        );
+        assert!(
+            admissions.reserve(7, 201).is_ok(),
+            "arrival settled its own hold"
+        );
+    }
+
+    fn paused_pipeline() -> (
+        two_bot_discord::MemPipeline,
+        Arc<VoiceOccupancyClock>,
+        Arc<PausedMoveObserver>,
+    ) {
+        let pipeline = two_bot_discord::MemPipeline::for_replay();
+        let clock = VoiceOccupancyClock::new();
+        let observer = Arc::new(PausedMoveObserver {
+            clock: clock.clone(),
+            pending: Mutex::new(Vec::new()),
+        });
+        pipeline.set_voice_transition_observer(observer.clone());
+        (pipeline, clock, observer)
+    }
+
+    fn read_occupancy(
+        pipeline: &two_bot_discord::MemPipeline,
+        clock: &VoiceOccupancyClock,
+        member: u64,
+    ) -> Result<(Option<u64>, u32), ()> {
+        let mut admissions = clock.move_admissions.lock().unwrap();
+        crate::voice_move::occupancy(pipeline.cache(), 100, member, 200, &mut admissions)
+    }
+
+    #[test]
+    fn pipeline_publication_between_final_read_and_reserve_keeps_hold_until_fenced_departure() {
+        // Rooms: A = 201 (source), B = 200 (target), C = 202.
+        let (pipeline, clock, observer) = paused_pipeline();
+        pipeline.handle_at(&pipeline_guild(&[7, 8]), "2026-11-03T10:00:00Z");
+        pipeline.handle_at(&pipeline_voice(7, Some(201)), "2026-11-03T10:00:01Z");
+        observer.deliver();
+        // The executor's final read still sees M in A with one occupant in B.
+        assert_eq!(read_occupancy(&pipeline, &clock, 7), Ok((Some(201), 1)));
+        // M's A -> B publication lands before the reserve; its callback is delayed.
+        pipeline.handle_at(&pipeline_voice(7, Some(200)), "2026-11-03T10:00:02Z");
+        clock
+            .move_admissions
+            .lock()
+            .unwrap()
+            .reserve(7, 200)
+            .unwrap();
+        // The PATCH outcome is uncertain, so nothing releases the hold. The
+        // cache already shows M in B, but equality must not settle it.
+        assert_eq!(read_occupancy(&pipeline, &clock, 7), Err(()));
+        assert_eq!(
+            read_occupancy(&pipeline, &clock, 8),
+            Ok((Some(200), 3)),
+            "two cached occupants plus the conservative unobserved seat"
+        );
+        // The delayed A -> B callback was fenced before the reservation.
+        observer.deliver();
+        assert_eq!(read_occupancy(&pipeline, &clock, 8), Ok((Some(200), 3)));
+        assert!(clock
+            .move_admissions
+            .lock()
+            .unwrap()
+            .reserve(7, 200)
+            .is_err());
+        // A newer global event for another member cannot settle M's hold.
+        pipeline.handle_at(&pipeline_voice(8, Some(201)), "2026-11-03T10:00:03Z");
+        observer.deliver();
+        assert_eq!(read_occupancy(&pipeline, &clock, 8), Ok((Some(201), 2)));
+        assert_eq!(read_occupancy(&pipeline, &clock, 7), Err(()));
+        // M -> C is published but its callback has not run: still held.
+        pipeline.handle_at(&pipeline_voice(7, Some(202)), "2026-11-03T10:00:04Z");
+        assert_eq!(read_occupancy(&pipeline, &clock, 8), Ok((Some(201), 1)));
+        assert!(clock
+            .move_admissions
+            .lock()
+            .unwrap()
+            .reserve(7, 200)
+            .is_err());
+        // The fenced later departure from B settles it; B is exactly empty.
+        observer.deliver();
+        assert_eq!(read_occupancy(&pipeline, &clock, 8), Ok((Some(201), 0)));
+        assert!(clock
+            .move_admissions
+            .lock()
+            .unwrap()
+            .reserve(7, 200)
+            .is_ok());
+    }
+
+    #[test]
+    fn pipeline_pure_reseed_arrival_stays_conservative_until_a_later_departure() {
+        let (pipeline, clock, observer) = paused_pipeline();
+        clock
+            .move_admissions
+            .lock()
+            .unwrap()
+            .reserve(7, 200)
+            .unwrap();
+        // GuildCreate caches M in the target without an arrival transition,
+        // so nothing proves the cached seat is the reserved one.
+        pipeline.handle_at(&pipeline_guild(&[7, 8]), "2026-11-03T10:00:00Z");
+        observer.deliver();
+        assert_eq!(read_occupancy(&pipeline, &clock, 7), Err(()));
+        assert_eq!(read_occupancy(&pipeline, &clock, 8), Ok((Some(200), 3)));
+        assert!(clock
+            .move_admissions
+            .lock()
+            .unwrap()
+            .reserve(7, 200)
+            .is_err());
+        pipeline.handle_at(&pipeline_voice(7, None), "2026-11-03T10:01:00Z");
+        observer.deliver();
+        assert_eq!(read_occupancy(&pipeline, &clock, 8), Ok((Some(200), 1)));
+        assert!(clock
+            .move_admissions
+            .lock()
+            .unwrap()
+            .reserve(7, 200)
+            .is_ok());
+    }
+
+    #[test]
     fn pipeline_reseed_then_departure_reconciles_move_without_http_read() {
         for destination in [None, Some(201)] {
             let pipeline = two_bot_discord::MemPipeline::for_replay();

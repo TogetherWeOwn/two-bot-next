@@ -315,6 +315,11 @@ struct VoiceMoveExecutor {
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
     admission_gate: tokio::sync::Mutex<()>,
     voice_clock: Arc<VoiceOccupancyClock>,
+    /// Test-only barrier: runs once, after the final occupancy read and the
+    /// decision but before the seat is reserved, so a test can publish a
+    /// gateway change into exactly that window.
+    #[cfg(test)]
+    before_reserve: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl VoiceMoveExecutor {
@@ -330,7 +335,14 @@ impl VoiceMoveExecutor {
             gateway_state,
             admission_gate: tokio::sync::Mutex::new(()),
             voice_clock,
+            #[cfg(test)]
+            before_reserve: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    fn set_before_reserve(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.before_reserve.lock().expect("before-reserve hook") = Some(Box::new(hook));
     }
 
     fn unavailable(message: &'static str, reason: &'static str) -> ActionError {
@@ -726,6 +738,13 @@ impl VoiceMoveEffect for VoiceMoveExecutor {
                 }
             }
             let from_string = from(&facts);
+            #[cfg(test)]
+            {
+                let hook = self.before_reserve.lock().ok().and_then(|mut h| h.take());
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
             self.voice_clock
                 .move_admissions
                 .lock()

@@ -176,8 +176,8 @@ pub enum VoiceMovePatch {
     Limited { retry_after_secs: u64 },
     /// Anything else (5xx, redirect, transport): outcome unknown, retryable.
     Unavailable,
-    /// Proven pre-wire refusal (durable send admission blocked, or the bot
-    /// credential guard refused): no request reached Discord. Retryable, and
+    /// Proven pre-wire refusal (durable send admission blocked/unavailable,
+    /// or the bot credential guard refused): no request reached Discord. Retryable, and
     /// the caller may release any unobserved-seat reservation.
     NotSent,
 }
@@ -457,7 +457,9 @@ impl ActionExecutor {
             Err(super::DiscordError::Guard(GuardError::TokenInvalid)) => {
                 return Ok(VoiceMovePatch::NotSent);
             }
-            Err(error) if error.is_admission_blocked() => return Ok(VoiceMovePatch::NotSent),
+            Err(error) if error.is_admission_blocked() || error.is_admission_storage() => {
+                return Ok(VoiceMovePatch::NotSent);
+            }
             Err(error) => {
                 return Err(send_error(error, VOICE_MOVE_TIMEOUT_MS).into_action_error());
             }

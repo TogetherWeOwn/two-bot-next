@@ -450,12 +450,23 @@ gateway in addition to cached occupants (bots included). The always-on voice
 transition observer reconciles witnessed arrivals or post-reseed departures even
 without an HTTP read. A generation fence captured before each gateway cache
 mutation prevents an older delayed observation from clearing a newer reservation.
-Known no-effect replies and typed pre-wire admission refusals release their
-reservation; transport/5xx uncertainty does not. There is no timer-based seat release. An unresolved member cannot start another move, and a full ledger fails
-closed with retryable `discord_unavailable`. This fences this receiver's admissions,
-not independent Discord joins or moves outside it. An unexplained 400/404 after
-one fresh fact read also answers/audits retryable `discord_unavailable`, not a
-bot-grant diagnosis; proven fresh refusals retain their domain outcome.
+Cache equality alone never settles a hold: a pure guild reseed that places the
+member in the target conservatively retains the member fence and counts the
+reserved seat in addition to that cached occupant until a later fenced arrival
+or departure reconciles it. Another member's newer event is not evidence for
+this member. Reseeding never clears the ledger.
+Known no-effect replies and canonical pre-wire admission refusals (including
+admission-store unavailability) release their reservation; transport/5xx
+uncertainty does not. Received 400/403/404 rejections retain their status even
+when their body fails or exhausts the shared attempt budget; 2xx success still
+requires the existing complete-body policy, and 429 still collects body timing
+before falling back to headers or a missing-timing hold. There is no timer-based
+seat release. An unresolved member cannot start another move, and a full ledger
+fails closed with retryable `discord_unavailable`. This fences this receiver's
+admissions, not independent Discord joins or moves outside it. An unexplained
+400/404 after one fresh fact read also answers/audits retryable
+`discord_unavailable`, not a bot-grant diagnosis; proven fresh refusals retain
+their domain outcome. No rejected PATCH is retried inside the move.
 
 The voice response remains synchronous, but receiver-tracked work holds admission
 capacity through terminal audit persistence even if the HTTP handler is cancelled.
