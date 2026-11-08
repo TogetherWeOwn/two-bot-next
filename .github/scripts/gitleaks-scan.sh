@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Full-history gitleaks scan with a base-branch policy on pull requests and
-# merge-queue commits.
+# merge-queue commits and PR-validation dispatches.
 #
 # On `pull_request` the checkout is the PR merge ref, and on `merge_group` it
 # is the unmerged queue commit, so the root `.gitleaks.toml`, the root
@@ -17,8 +17,8 @@
 #     not hide anything from the scan;
 #   * `--ignore-gitleaks-allow` drops inline `gitleaks:allow` suppressions.
 # A PR that legitimately needs a new allowlist merges that change first, as
-# its own small reviewed PR. Push-to-main and dispatch runs scan with the
-# repo's own policy, which is already merged.
+# its own small reviewed PR. PR-validation dispatches use only fetched main
+# policy. Push-to-main runs keep the repo's own policy, which is already merged.
 #
 # Not covered: the workflow and this script come from the PR as well. Closing
 # that needs a platform control (protected workflow paths / required review).
@@ -26,14 +26,14 @@
 # Inputs (environment):
 #   GITLEAKS_BIN  path to the verified gitleaks binary (required)
 #   EVENT_NAME    github.event_name; the base-branch policy applies to
-#                 `pull_request` and `merge_group`
+#                 `pull_request`, `merge_group` and `workflow_dispatch`
 #   BASE_REF      github.base_ref, or on `merge_group`
 #                 github.event.merge_group.base_ref (a full ref such as
-#                 `refs/heads/main`; the prefix is stripped here). Required
-#                 when EVENT_NAME is `pull_request` or `merge_group`.
+#                 `refs/heads/main`; the prefix is stripped here). Dispatch
+#                 requires `main` or `refs/heads/main`. Required on all three.
 #   RUNNER_TEMP   scratch directory (falls back to TMPDIR, then /tmp)
-# Run from the repository root. In a PR or queue run it overwrites the
-# working-tree `.gitleaksignore`; run it only in a disposable checkout.
+# Run from the repository root. PR, queue and dispatch runs overwrite the
+# working-tree `.gitleaksignore`; run them only in a disposable checkout.
 set -euo pipefail
 
 : "${GITLEAKS_BIN:?GITLEAKS_BIN must point at the verified gitleaks binary}"
@@ -41,12 +41,17 @@ set -euo pipefail
 # --log-opts=HEAD: scan only history reachable from HEAD, not every fetched branch.
 args=(git . --redact --verbose --exit-code 1 --log-opts=HEAD --ignore-gitleaks-allow)
 
-if [[ "${EVENT_NAME:-}" == "pull_request" || "${EVENT_NAME:-}" == "merge_group" ]]; then
-  : "${BASE_REF:?BASE_REF is required for pull_request and merge_group runs}"
+if [[ "${EVENT_NAME:-}" == "pull_request" || "${EVENT_NAME:-}" == "merge_group" || "${EVENT_NAME:-}" == "workflow_dispatch" ]]; then
+  : "${BASE_REF:?BASE_REF is required for PR, queue and dispatch runs}"
   # merge_group.base_ref arrives as a full ref (refs/heads/main); strip it.
   base_ref="${BASE_REF#refs/heads/}"
-  base="refs/remotes/origin/${base_ref}"
-  if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+  if ! git check-ref-format "refs/heads/${base_ref}" >/dev/null 2>&1 \
+      || [[ "${EVENT_NAME}" == "workflow_dispatch" && "${base_ref}" != "main" ]]; then
+    echo "::error::invalid trusted base ref for the ${EVENT_NAME} scan" >&2
+    exit 2
+  fi
+  # Resolve once so config and ignore policy always share a merged snapshot.
+  if ! base="$(git rev-parse --verify --quiet "refs/remotes/origin/${base_ref}^{commit}")"; then
     echo "::error::base branch ${base_ref} is not fetched; the ${EVENT_NAME} scan cannot load its policy" >&2
     exit 2
   fi
