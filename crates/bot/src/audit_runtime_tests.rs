@@ -459,6 +459,45 @@ async fn capture_admission_never_connects_and_connect_failure_keeps_rows() {
 }
 
 #[tokio::test]
+async fn bulk_delete_diagnostics_queue_without_connecting_and_survive_connect_failure() {
+    use twilight_gateway::Event;
+    use twilight_model::{gateway::payload::incoming::MessageDeleteBulk, id::Id};
+    let connects = Arc::new(AtomicUsize::new(0));
+    let attempts = connects.clone();
+    let runtime: AuditRuntime<ScriptMirror> = AuditRuntime::new(
+        all_vars(),
+        GUILD.to_owned(),
+        Box::new(move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(ErrorClass::Database) })
+        }),
+    )
+    .unwrap();
+    let packet = Event::MessageDeleteBulk(MessageDeleteBulk {
+        guild_id: Some(Id::new(GUILD.parse().unwrap())),
+        channel_id: Id::new(4444),
+        ids: vec![Id::new(5555), Id::new(5556)],
+    });
+    let rows = crate::audit_gateway::translate(
+        &packet,
+        &two_bot_discord::build_cache(),
+        "2026-11-08T00:00:00.000Z",
+        42,
+        "synthetic-session",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, AuditKind::MessageDelete);
+    assert_eq!(rows[0].action.as_deref(), Some("message_bulk_delete"));
+    crate::audit_gateway::record_into(&runtime, &rows).await;
+    assert_eq!(connects.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.capture.counts(), (1, 0));
+    assert_eq!(runtime.capture.front().as_ref(), Some(&rows[0]));
+    assert!(matches!(runtime.sweep().await, Err(ErrorClass::Database)));
+    assert_eq!(connects.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.capture.front().as_ref(), Some(&rows[0]));
+}
+
+#[tokio::test]
 async fn capture_flush_bounds_batch_replays_ack_loss_and_roundtrips_new_kinds() {
     let Some(db) =
         database("capture_flush_bounds_batch_replays_ack_loss_and_roundtrips_new_kinds").await

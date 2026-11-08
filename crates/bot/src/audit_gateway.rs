@@ -274,7 +274,10 @@ pub(crate) async fn record_into<M: AuditMirror + Clone>(
                 | AuditKind::MessageDelete
                 | AuditKind::MemberUpdate
                 | AuditKind::ModerationAction
-        ) && event.action.as_deref() != Some("baseline_missing");
+        ) && !matches!(
+            event.action.as_deref(),
+            Some("baseline_missing" | "message_bulk_delete")
+        );
         if legacy {
             if runtime.record(event).await.is_err() {
                 tracing::warn!(entry_id = %event.entry_id, "audit_gateway_store_failed");

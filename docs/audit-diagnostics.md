@@ -79,6 +79,8 @@ checkpoint; they never compete for diagnostic queue capacity. That legacy path
 can still await connection/storage, and its existing log-and-continue behavior
 on storage failure is not a lossless guarantee. A `baseline_missing` member
 observation is new diagnostic evidence, not a legacy delta, and remains queued.
+Bulk-delete observations also remain queued despite sharing the `MessageDelete`
+kind with legacy single-message deletes.
 This change does not claim that all Gateway recording is nonblocking.
 
 The diagnostic process-local queue holds at most **256 rows**, each at most **16 KiB** serialized
