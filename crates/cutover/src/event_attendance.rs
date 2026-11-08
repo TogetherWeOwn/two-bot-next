@@ -137,7 +137,9 @@ pub struct AttendanceRecoveryRow {
 }
 
 // Decode directly into the retained page, without an intermediate tuple vector.
+// Keep decoding and its error cleanup out of the generic query stream.
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for AttendanceRecoveryRow {
+    #[inline(never)]
     fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row;
 
