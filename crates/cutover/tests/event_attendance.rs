@@ -10,16 +10,18 @@ use sqlx::PgPool;
 use support::{with_database, GUILD_A, GUILD_B, MEMBER};
 use time::{Duration, OffsetDateTime};
 use two_bot_core::{
-    internal_action_store::InternalActionStore,
+    internal_action_store::{
+        InternalActionStore, InternalStoreError, MAX_ATTENDANCE_CAPTURE_STOPS,
+    },
     scheduled_events::{EventStatus, ScheduledEvent},
     website_store::{replace_events, upsert_event},
 };
 use two_bot_cutover::event_attendance::{
     attendance_recovery_page, attendance_sessions_for_event_key, attendance_window_for_key,
-    attendance_windows_for_guild, close_attendance_session, insert_attendance_session,
-    is_attendance_suppressed, is_attendance_voice_enabled, open_attendance_sessions,
-    recover_attendance_sessions, NewAttendanceSession, ATTENDANCE_MAX_TAG_BYTES,
-    ATTENDANCE_MAX_WINDOWS, ATTENDANCE_RECOVERY_PAGE_SIZE,
+    attendance_windows_for_guild, attendance_windows_for_transition, close_attendance_session,
+    insert_attendance_session, is_attendance_suppressed, is_attendance_voice_enabled,
+    open_attendance_sessions, recover_attendance_sessions, NewAttendanceSession,
+    ATTENDANCE_MAX_TAG_BYTES, ATTENDANCE_MAX_WINDOWS, ATTENDANCE_RECOVERY_PAGE_SIZE,
 };
 use two_bot_cutover::{
     privacy::{opt_out_member, set_analytics_settings},
@@ -1656,6 +1658,375 @@ async fn oversize_insert_and_close_inputs_are_rejected_without_mutation() {
         assert_eq!(before.0 .5, None);
         assert_eq!(count(&pool, "event_attendance_windows").await, windows);
         assert_eq!(row_count(&pool).await, 1);
+    })
+    .await;
+}
+
+/// An accepted, mapped, completed occurrence: live evidence first, then the
+/// positive completion, exactly as the lifecycle writers observe it.
+async fn completed_mapped(
+    pool: &PgPool,
+    now: OffsetDateTime,
+    id: &str,
+    key: &str,
+    starts_at: OffsetDateTime,
+    ends_at: OffsetDateTime,
+) {
+    let mut occurrence = event(now);
+    occurrence.id = id.to_owned();
+    occurrence.starts_at = iso(starts_at);
+    occurrence.ends_at = Some(iso(ends_at));
+    occurrence.status = EventStatus::Active;
+    upsert_event(pool, GUILD_A, &iso(now - Duration::seconds(1)), &occurrence)
+        .await
+        .unwrap();
+    occurrence.status = EventStatus::Completed;
+    upsert_event(pool, GUILD_A, &iso(now), &occurrence)
+        .await
+        .unwrap();
+    map(pool, GUILD_A, key, id).await;
+}
+
+fn keys(windows: &[two_bot_cutover::event_attendance::AttendanceWindow]) -> Vec<&str> {
+    windows.iter().map(|w| w.event_key.as_str()).collect()
+}
+
+#[tokio::test]
+async fn transition_planning_filters_unrelated_history_before_the_overlap_limit() {
+    with_database(|pool| async move {
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+        // Exactly the planner budget of unrelated retained occurrences, all
+        // accepted, mapped and completed days ago. They sort before the live one.
+        for n in 0..ATTENDANCE_MAX_WINDOWS {
+            let id = format!("{}", 30_000_000_000_000_000_u64 + n as u64);
+            let start = now - Duration::days(10) + Duration::minutes(n as i64 * 2);
+            completed_mapped(
+                &pool,
+                now,
+                &id,
+                &format!("old-{n}"),
+                start,
+                start + Duration::hours(1),
+            )
+            .await;
+        }
+        upsert_event(
+            &pool,
+            GUILD_A,
+            &iso(now - Duration::seconds(1)),
+            &event(now),
+        )
+        .await
+        .unwrap();
+        map(&pool, GUILD_A, "current", EVENT_A).await;
+
+        // The broad compatibility reader still sees every candidate and hits
+        // the 129-row overlap limit, so a caller using it must refuse.
+        let broad = attendance_windows_for_guild(&pool, GUILD_A).await.unwrap();
+        assert_eq!(broad.len(), ATTENDANCE_MAX_WINDOWS + 1);
+        assert!(keys(&broad).contains(&"current"));
+
+        // The scoped planner reads exactly the live occurrence, via both entry points.
+        let scoped = attendance_windows_for_transition(&pool, GUILD_A, MEMBER, None, now)
+            .await
+            .unwrap();
+        assert_eq!(keys(&scoped), ["current"]);
+        let store = two_bot_cutover::voice_rooms::PgRoomStore::new(pool.clone());
+        let via_store = store
+            .attendance_windows_for_transition(GUILD_A, MEMBER, Some("4001"), now)
+            .await
+            .unwrap();
+        assert_eq!(keys(&via_store), ["current"]);
+
+        // The real insert is unaffected by the retained history and tags only the live key.
+        let mut join = session(now, &["current"]);
+        join.joined_at = now - Duration::minutes(5);
+        let id = insert_attendance_session(&pool, &join).await.unwrap();
+        let tags: Vec<String> =
+            sqlx::query_scalar("SELECT event_keys FROM event_voice_sessions WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tags, ["current"]);
+        // An open continuous span in the previous channel adds no unrelated history.
+        let continuing =
+            attendance_windows_for_transition(&pool, GUILD_A, MEMBER, Some("4001"), now)
+                .await
+                .unwrap();
+        assert_eq!(keys(&continuing), ["current"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn transition_planning_keeps_expired_windows_overlapping_the_open_span_only() {
+    with_database(|pool| async move {
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+        let mut a = event(now);
+        a.starts_at = iso(now - Duration::hours(3));
+        a.ends_at = Some(iso(now + Duration::hours(1)));
+        upsert_event(&pool, GUILD_A, &iso(now - Duration::seconds(1)), &a)
+            .await
+            .unwrap();
+        map(&pool, GUILD_A, "a", EVENT_A).await;
+        let mut span = session(now, &["a"]);
+        span.joined_at = now - Duration::minutes(150);
+        let id = insert_attendance_session(&pool, &span).await.unwrap();
+        // Expired an hour ago but inside the continuous span.
+        completed_mapped(
+            &pool,
+            now,
+            EVENT_B,
+            "b",
+            now - Duration::hours(2),
+            now - Duration::hours(1),
+        )
+        .await;
+        // Expired days ago: overlaps neither the observation nor the span.
+        completed_mapped(
+            &pool,
+            now,
+            "20000000000000003",
+            "c",
+            now - Duration::days(10),
+            now - Duration::days(10) + Duration::hours(1),
+        )
+        .await;
+
+        let plan = |member: &'static str, previous: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                attendance_windows_for_transition(&pool, GUILD_A, member, previous, now)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|w| w.event_key)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(plan(MEMBER, Some("4001")).await, ["a", "b"]);
+        // Wrong previous channel, no previous channel, or another member's span
+        // never reach back to the expired window.
+        assert_eq!(plan(MEMBER, Some("9999")).await, ["a"]);
+        assert_eq!(plan(MEMBER, None).await, ["a"]);
+        assert_eq!(plan("30000000000000009", Some("4001")).await, ["a"]);
+
+        // The expired candidate tags the existing span at close, never opens one.
+        assert!(insert_attendance_session(&pool, &session(now, &["b"]))
+            .await
+            .is_err());
+        close_attendance_session(&pool, id, now, None, &["b".to_owned()])
+            .await
+            .unwrap();
+        let tags: Vec<String> =
+            sqlx::query_scalar("SELECT event_keys FROM event_voice_sessions WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tags, ["a", "b"]);
+        // A closed span no longer extends the lookback.
+        assert_eq!(plan(MEMBER, Some("4001")).await, ["a"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn null_tag_elements_read_as_oversize_and_drain_by_id_preserving_metadata() {
+    with_database(|pool| async move {
+        let joined = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::hours(1);
+        let poisoned = seed_member_row(&pool, GUILD_A, MEMBER, 1, joined, None).await;
+        let healthy = seed_member_row(
+            &pool,
+            GUILD_A,
+            MEMBER,
+            2,
+            joined + Duration::seconds(1),
+            None,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE event_voice_sessions SET event_keys = ARRAY['20000000000000001', NULL]::text[]
+             WHERE id = $1",
+        )
+        .bind(poisoned)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rows_before = row_count(&pool).await;
+        let healthy_before = raw_state(&pool, healthy).await;
+
+        // The poisoned array is replaced by the oversize sentinel; the neighbour is exact.
+        let rows = open_attendance_sessions(&pool, GUILD_A, MEMBER)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [poisoned, healthy]
+        );
+        assert!(
+            rows[0].event_keys.iter().map(String::len).sum::<usize>() > ATTENDANCE_MAX_TAG_BYTES
+        );
+        assert_eq!(rows[1].event_keys, ["20000000000000002"]);
+
+        // Expansion decodes the stored tags, so it refuses and leaves the row untouched.
+        assert!(close_attendance_session(
+            &pool,
+            poisoned,
+            joined + Duration::minutes(30),
+            Some("Lobby"),
+            &["new-tag".to_owned()],
+        )
+        .await
+        .is_err());
+        let intact = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT left_at IS NULL AND event_keys IS NOT DISTINCT FROM
+                            ARRAY['20000000000000001', NULL]::text[]
+                     FROM event_voice_sessions WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert!(intact(poisoned).await, "failed expansion must not mutate");
+
+        // Draining by id (no expansion) closes both rows and keeps server metadata.
+        let left = joined + Duration::minutes(30);
+        for id in [poisoned, healthy] {
+            assert_eq!(
+                close_attendance_session(&pool, id, left, None, &[])
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+        let drained: bool = sqlx::query_scalar(
+            "SELECT left_at = $2 AND event_keys IS NOT DISTINCT FROM
+                    ARRAY['20000000000000001', NULL]::text[]
+             FROM event_voice_sessions WHERE id = $1",
+        )
+        .bind(poisoned)
+        .bind(left)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            drained,
+            "exact metadata tags, including NULL, survive the drain"
+        );
+        let (after, _) = raw_state(&pool, healthy).await;
+        assert_eq!(after.5, Some(left));
+        assert_eq!(
+            (&after.0, &after.1, after.2, after.3, after.4, after.6, &after.7),
+            (
+                &healthy_before.0 .0,
+                &healthy_before.0 .1,
+                healthy_before.0 .2,
+                healthy_before.0 .3,
+                healthy_before.0 .4,
+                healthy_before.0 .6,
+                &healthy_before.0 .7
+            )
+        );
+        // Nothing replaced either row and no window was opened or recorded.
+        assert!(open_attendance_sessions(&pool, GUILD_A, MEMBER)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(row_count(&pool).await, rows_before);
+        assert_eq!(count(&pool, "event_attendance_windows").await, 0);
+    })
+    .await;
+}
+
+/// Replace the window's stops with `total` timestamps: all but two precede
+/// the join, a later one follows it, and the first after the join is 2 minutes in.
+async fn set_capture_stops(pool: &PgPool, key: &str, total: i32) {
+    let updated = sqlx::query(
+        "UPDATE event_attendance_windows h
+         SET capture_stops = ARRAY(
+                 SELECT j.joined_at - INTERVAL '1 hour' - n * INTERVAL '1 second'
+                 FROM generate_series(1, $3::int - 2) n)
+             || ARRAY[j.joined_at + INTERVAL '5 minutes', j.joined_at + INTERVAL '2 minutes']
+         FROM (SELECT joined_at FROM event_voice_sessions
+               WHERE guild_id = $1 AND event_keys @> ARRAY[$2::text] LIMIT 1) j
+         WHERE h.guild_id = $1 AND h.event_key = $2",
+    )
+    .bind(GUILD_A)
+    .bind(key)
+    .bind(total)
+    .execute(pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(updated, 1);
+}
+
+#[tokio::test]
+async fn capture_stops_over_the_bound_refuse_in_both_readers_and_the_bound_is_accepted() {
+    with_database(|pool| async move {
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+        upsert_event(
+            &pool,
+            GUILD_A,
+            &iso(now - Duration::seconds(1)),
+            &event(now),
+        )
+        .await
+        .unwrap();
+        map(&pool, GUILD_A, "game-night", EVENT_A).await;
+        let joined = session(now, &["game-night"]).joined_at;
+        insert_attendance_session(&pool, &session(now, &["game-night"]))
+            .await
+            .unwrap();
+        let store = InternalActionStore::new(pool.clone());
+        let bound = MAX_ATTENDANCE_CAPTURE_STOPS as i32;
+
+        // Exactly at the bound the read succeeds; the first stop after the join caps credit.
+        set_capture_stops(&pool, "game-night", bound).await;
+        let stored: i32 =
+            sqlx::query_scalar("SELECT cardinality(capture_stops) FROM event_attendance_windows")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, bound);
+        let rows = attendance_sessions_for_event_key(&pool, GUILD_A, "game-night")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].left_at, Some(joined + Duration::minutes(2)));
+        let rows = store
+            .attendance_sessions_for_event_key(GUILD_A, "game-night")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].left_at, Some(joined + Duration::minutes(2)));
+
+        // One over, and far over, are refused by both readers without a partial result.
+        for total in [bound + 1, 100_000] {
+            set_capture_stops(&pool, "game-night", total).await;
+            assert!(
+                matches!(
+                    attendance_sessions_for_event_key(&pool, GUILD_A, "game-night").await,
+                    Err(sqlx::Error::Protocol(_))
+                ),
+                "{total}"
+            );
+            assert_eq!(
+                store
+                    .attendance_sessions_for_event_key(GUILD_A, "game-night")
+                    .await
+                    .unwrap_err(),
+                InternalStoreError::Unavailable,
+                "{total}"
+            );
+        }
     })
     .await;
 }

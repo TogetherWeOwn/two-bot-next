@@ -22,8 +22,9 @@
 //! with the guild only — no member or channel ids on this warm path, per
 //! docs/log-volume-guard.md — and never fail the actor loop. A missed open
 //! stays missed (the documented join-before-window gap); unfinished closes
-//! retain their original evidence across bounded maintenance turns. Later
-//! frames wait in the bounded actor inbox; no open passes unfinished closes.
+//! retain their original evidence across bounded maintenance turns. Room input
+//! keeps flowing; skipped attendance frames require conservative recovery.
+//! No open passes unfinished closes.
 //!
 //! Contract v2 §9 opt-out at capture: before opening a span the logger
 //! consults `privacy_opt_outs` (`suppressed_in`) and
@@ -81,7 +82,10 @@ impl AttendanceReadAuthority {
 #[derive(Debug, Default)]
 struct AttendanceFenceState {
     epoch: u64,
+    recovery: u64,
     ready: bool,
+    observations: usize,
+    loss_generation: u64,
 }
 
 /// One guild's read/capture recovery epoch. Gateway interruption invalidates
@@ -96,6 +100,7 @@ impl AttendanceReadFence {
     pub fn invalidate(&self) {
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         state.epoch += 1;
+        state.recovery += 1;
         state.ready = false;
     }
 
@@ -104,26 +109,77 @@ impl AttendanceReadFence {
     pub fn begin_recovery(&self) -> AttendanceRecoveryGuard {
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         state.epoch += 1;
+        state.recovery += 1;
         state.ready = false;
         AttendanceRecoveryGuard {
             fence: self.clone(),
-            epoch: state.epoch,
+            recovery: state.recovery,
         }
+    }
+
+    /// Fence a gateway observation before enqueueing or changing live membership.
+    /// Dropping it without acknowledgement records lost continuity, including
+    /// capacity refusal and actor termination, without allocating another queue.
+    pub(crate) fn observe(&self) -> AttendanceObservation {
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        state.epoch += 1;
+        state.observations += 1;
+        AttendanceObservation {
+            fence: self.clone(),
+            acknowledged: false,
+        }
+    }
+
+    pub(crate) fn loss_generation(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .loss_generation
     }
 
     fn ticket(&self) -> Option<AttendanceReadTicket> {
         let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        state.ready.then(|| AttendanceReadTicket {
+        (state.ready && state.observations == 0).then(|| AttendanceReadTicket {
             fence: self.clone(),
             epoch: state.epoch,
         })
     }
 }
 
+/// An unresolved ingress observation. Ownership follows the queued command,
+/// then its retained close continuation; room dispatch never waits on this guard.
+pub(crate) struct AttendanceObservation {
+    fence: AttendanceReadFence,
+    acknowledged: bool,
+}
+
+impl AttendanceObservation {
+    pub(crate) fn acknowledge(mut self) {
+        self.acknowledged = true;
+    }
+}
+
+impl Drop for AttendanceObservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .fence
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.observations -= 1;
+        if !self.acknowledged {
+            state.loss_generation += 1;
+            state.epoch += 1;
+            state.recovery += 1;
+            state.ready = false;
+        }
+    }
+}
+
 /// Actor-owned completion authority for exactly one recovery incarnation.
 pub struct AttendanceRecoveryGuard {
     fence: AttendanceReadFence,
-    epoch: u64,
+    recovery: u64,
 }
 
 impl AttendanceRecoveryGuard {
@@ -135,7 +191,7 @@ impl AttendanceRecoveryGuard {
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if state.epoch != self.epoch {
+        if state.recovery != self.recovery {
             return false;
         }
         state.ready = true;
@@ -150,8 +206,9 @@ impl Drop for AttendanceRecoveryGuard {
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if state.epoch == self.epoch {
+        if state.recovery == self.recovery {
             state.epoch += 1;
+            state.recovery += 1;
             state.ready = false;
         }
     }
@@ -172,7 +229,49 @@ impl AttendanceReadTicket {
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        state.ready && state.epoch == self.epoch
+        state.ready && state.observations == 0 && state.epoch == self.epoch
+    }
+}
+
+#[cfg(test)]
+mod ingress_fence_tests {
+    use super::*;
+
+    #[test]
+    fn all_queued_observations_must_finish_without_reviving_old_tickets() {
+        let authority = AttendanceReadAuthority::default();
+        let fence = AttendanceReadFence::default();
+        authority.register(7, fence.clone());
+        let actor = fence.begin_recovery();
+        assert!(actor.complete());
+        let old = authority.ticket(7).unwrap();
+        let join = fence.observe();
+        let movement = fence.observe();
+        assert!(!old.is_current());
+        assert!(authority.ticket(7).is_none());
+        assert!(
+            actor.complete(),
+            "observations do not cancel recovery ownership"
+        );
+        join.acknowledge();
+        assert!(
+            authority.ticket(7).is_none(),
+            "second observation remains queued"
+        );
+        movement.acknowledge();
+        assert!(authority.ticket(7).unwrap().is_current());
+        assert!(!old.is_current());
+        drop(fence.observe());
+        assert!(!actor.complete(), "lost input cancels completion ownership");
+        assert!(authority.ticket(7).is_none());
+        let recovered = fence.begin_recovery();
+        assert!(recovered.complete());
+        assert!(authority.ticket(7).unwrap().is_current());
+        drop(actor);
+        assert!(
+            authority.ticket(7).is_some(),
+            "old guard cannot revoke replacement"
+        );
     }
 }
 
@@ -187,6 +286,9 @@ pub trait AttendanceStore: Send + Sync {
     fn attendance_windows(
         &self,
         guild: Snowflake,
+        member: Snowflake,
+        previous: Option<Snowflake>,
+        observed_at: OffsetDateTime,
     ) -> impl Future<Output = Result<Vec<AttendanceWindow>, Self::Error>> + Send;
     fn open_attendance_sessions(
         &self,
@@ -407,8 +509,8 @@ const CLOSES_PER_TURN: usize = 8;
 /// Bounded finalization continuation owned by the guild actor. It retains the
 /// original observation, names, candidate windows and any uncertain close plan.
 /// No new open is attempted until every old row is finalized. The actor keeps
-/// later frames in its existing bounded inbox while maintenance drains pages;
-/// room dispatch and timers continue between turns.
+/// consuming room input while maintenance drains pages; skipped attendance
+/// observations require conservative recovery instead of another unbounded queue.
 pub struct AttendanceTransition {
     transition: VoiceTransition,
     windows: Option<Vec<AttendanceWindowMs>>,
@@ -587,7 +689,12 @@ impl AttendanceTransition {
     ) -> Result<(), ()> {
         if self.windows.is_none() {
             let windows = store
-                .attendance_windows(self.transition.guild)
+                .attendance_windows(
+                    self.transition.guild,
+                    self.transition.member,
+                    self.transition.previous,
+                    self.transition.observed_at,
+                )
                 .await
                 .map_err(|_| ())?;
             self.retain_windows(windows);
@@ -1393,6 +1500,9 @@ mod tests {
         async fn attendance_windows(
             &self,
             _guild: Snowflake,
+            _member: Snowflake,
+            _previous: Option<Snowflake>,
+            _observed_at: OffsetDateTime,
         ) -> Result<Vec<AttendanceWindow>, Self::Error> {
             let now = OffsetDateTime::now_utc();
             Ok(vec![AttendanceWindow {
@@ -1814,6 +1924,9 @@ mod tests {
         async fn attendance_windows(
             &self,
             _guild: Snowflake,
+            _member: Snowflake,
+            _previous: Option<Snowflake>,
+            _observed_at: OffsetDateTime,
         ) -> Result<Vec<AttendanceWindow>, Self::Error> {
             self.note("windows");
             Self::apply(self.windows_fault, self.windows.clone()).await

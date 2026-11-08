@@ -5908,3 +5908,227 @@ async fn event_attendance_read_in_flight_across_recovery_epoch_is_refused_not_st
     drop(first);
     db.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn event_attendance_read_overlength_stored_ids_are_refused_not_truncated_into_valid_ids() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_attendance_read_flag(true);
+    let pool = db.pool();
+    // A 21-character prefix of each malformed value parses as the valid id 1.
+    let padded = "000000000000000000001garbage";
+    let multibyte = format!("1{}", "界".repeat(30));
+    let cases = [
+        ("longmember", padded.to_owned(), "31".to_owned()),
+        ("longchannel", "41".to_owned(), padded.to_owned()),
+        ("widemember", multibyte.clone(), "31".to_owned()),
+        ("widechannel", "41".to_owned(), multibyte),
+    ];
+    for (key, member, channel) in &cases {
+        seed_attendance_window(pool, staging_guild(), key, "-3 hours", "-2 hours").await;
+        // A valid sibling row proves the whole read is refused, never partial.
+        AttendanceSessionSeed {
+            guild_id: staging_guild(),
+            member_id: "40",
+            channel_id: "31",
+            is_bot: false,
+            joined_in: "-170 minutes",
+            left_in: "-130 minutes",
+            event_key: key,
+        }
+        .insert(pool)
+        .await;
+        AttendanceSessionSeed {
+            guild_id: staging_guild(),
+            member_id: member,
+            channel_id: channel,
+            is_bot: false,
+            joined_in: "-160 minutes",
+            left_in: "-140 minutes",
+            event_key: key,
+        }
+        .insert(pool)
+        .await;
+    }
+    let (app, _, _, _recovery) = attendance_app(pool.clone());
+    for (key, _, _) in &cases {
+        let (status, _, body) =
+            answer(app.clone(), signed_read(&attendance_payload(key), "old")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{key}");
+        assert_eq!(body["error"]["code"], "internal", "{key}");
+        assert!(body.get("result").is_none(), "{key}: no partial projection");
+        let text = body.to_string();
+        assert!(!text.contains("garbage") && !text.contains('界'), "{key}");
+    }
+    set_attendance_read_flag(false);
+    db.close().await.unwrap();
+}
+
+/// Hold `table` under an exclusive lock, start a signed read, and wait until
+/// it is blocked on that lock. The caller releases the returned transaction.
+async fn pause_attendance_read_on(
+    pool: &sqlx::PgPool,
+    app: Router,
+    table: &str,
+    key: &str,
+) -> (
+    sqlx::Transaction<'static, sqlx::Postgres>,
+    tokio::task::JoinHandle<(StatusCode, HeaderMap, Value)>,
+) {
+    let mut lock_tx = pool.begin().await.unwrap();
+    sqlx::query(&format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))
+        .execute(&mut *lock_tx)
+        .await
+        .unwrap();
+    let request = signed_read(&attendance_payload(key), "old");
+    let in_flight = tokio::spawn(async move { answer(app, request).await });
+    let waiting = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+                 WHERE NOT l.granted AND c.relname = $1",
+            )
+            .bind(table)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if waiting.is_err() {
+        lock_tx.rollback().await.unwrap();
+        panic!("the attendance read never waited on {table}");
+    }
+    (lock_tx, in_flight)
+}
+
+#[tokio::test]
+async fn event_attendance_negative_reads_straddling_recovery_epoch_are_refused_not_not_found() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_attendance_read_flag(true);
+    let pool = db.pool();
+    // `missing` has no captured window; `empty` has a window but no sessions.
+    seed_attendance_window(pool, staging_guild(), "empty", "-3 hours", "-2 hours").await;
+    for (table, key) in [
+        ("event_attendance_windows", "missing"),
+        ("event_voice_sessions", "empty"),
+    ] {
+        let authority = two_bot::event_attendance::AttendanceReadAuthority::default();
+        let fence = two_bot::event_attendance::AttendanceReadFence::default();
+        authority.register(staging_snowflake(), fence.clone());
+        let first = fence.begin_recovery();
+        assert!(first.complete());
+        let (app, effect, reads) = attendance_app_with(pool.clone(), authority);
+
+        // Unchanged epoch: the barrier alone must not change the 404.
+        let (lock_tx, in_flight) = pause_attendance_read_on(pool, app.clone(), table, key).await;
+        lock_tx.rollback().await.unwrap();
+        let (status, _, body) = tokio::time::timeout(Duration::from_secs(10), in_flight)
+            .await
+            .expect("the released read finishes")
+            .unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND, "{key}: unchanged epoch");
+        assert_eq!(body["error"]["code"], "not_found", "{key}");
+
+        // New epoch completes while the read waits: it cannot revive the old ticket.
+        let (lock_tx, in_flight) = pause_attendance_read_on(pool, app, table, key).await;
+        fence.invalidate();
+        let second = fence.begin_recovery();
+        assert!(second.complete());
+        lock_tx.rollback().await.unwrap();
+        let (status, _, body) = tokio::time::timeout(Duration::from_secs(10), in_flight)
+            .await
+            .expect("the released read finishes")
+            .unwrap();
+        assert_attendance_unavailable(status, &body, key);
+        assert_eq!(effect.calls(), 0);
+        assert_eq!(reads.calls(), 0);
+        drop(second);
+        drop(first);
+    }
+    set_attendance_read_flag(false);
+    assert_eq!(idempotency_rows(pool).await, 0);
+    db.close().await.unwrap();
+}
+
+/// Replace the window's stops with `total` timestamps. All but two precede the
+/// join; one later stop follows it and the first stop after the join is 20
+/// minutes in, so the capped credit is exactly 20 minutes.
+async fn seed_capture_stops(pool: &sqlx::PgPool, key: &str, total: i32) {
+    let updated = sqlx::query(
+        "UPDATE event_attendance_windows h \
+         SET capture_stops = ARRAY( \
+                 SELECT j.joined_at - INTERVAL '1 hour' - n * INTERVAL '1 second' \
+                 FROM generate_series(1, $3::int - 2) n) \
+             || ARRAY[j.joined_at + INTERVAL '30 minutes', j.joined_at + INTERVAL '20 minutes'] \
+         FROM (SELECT joined_at FROM event_voice_sessions \
+               WHERE guild_id = $1 AND event_keys @> ARRAY[$2::text] LIMIT 1) j \
+         WHERE h.guild_id = $1 AND h.event_key = $2",
+    )
+    .bind(staging_guild())
+    .bind(key)
+    .bind(total)
+    .execute(pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(updated, 1, "{key}");
+}
+
+#[tokio::test]
+async fn event_attendance_read_capture_stops_over_the_bound_are_refused_and_the_bound_is_served() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_attendance_read_flag(true);
+    let pool = db.pool();
+    let bound = two_bot_core::internal_action_store::MAX_ATTENDANCE_CAPTURE_STOPS as i32;
+    for key in ["exactstops", "overstops"] {
+        seed_attendance_window(pool, staging_guild(), key, "-3 hours", "-2 hours").await;
+        AttendanceSessionSeed {
+            guild_id: staging_guild(),
+            member_id: "41",
+            channel_id: "31",
+            is_bot: false,
+            joined_in: "-170 minutes",
+            left_in: "-130 minutes",
+            event_key: key,
+        }
+        .insert(pool)
+        .await;
+    }
+    seed_capture_stops(pool, "exactstops", bound).await;
+    seed_capture_stops(pool, "overstops", bound + 1).await;
+    let (app, effect, reads, _recovery) = attendance_app(pool.clone());
+
+    // Exactly at the bound the signed read succeeds; the first stop after the
+    // join caps the member at 20 of the 40 stored minutes.
+    let (status, _, body) = answer(
+        app.clone(),
+        signed_read(&attendance_payload("exactstops"), "old"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let members = body["result"]["members"].as_array().unwrap();
+    assert_eq!(members.len(), 1, "{body}");
+    assert_eq!(members[0]["discord_id"], "41");
+    assert_eq!(members[0]["minutes"], 20);
+    assert_eq!(members[0]["sessions"], 1);
+
+    // One stop over the bound refuses the whole read, never a truncated credit.
+    let (status, _, body) = answer(app, signed_read(&attendance_payload("overstops"), "old")).await;
+    set_attendance_read_flag(false);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["code"], "internal");
+    assert_eq!(body["error"]["retryable"], true);
+    assert!(body.get("result").is_none(), "no partial projection");
+    assert!(serde_json::to_vec(&body).unwrap().len() < 512);
+    assert_eq!(effect.calls(), 0);
+    assert_eq!(reads.calls(), 0);
+    assert_eq!(idempotency_rows(pool).await, 0);
+    db.close().await.unwrap();
+}

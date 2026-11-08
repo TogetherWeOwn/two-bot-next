@@ -491,21 +491,23 @@ unknown offline time earns no credit, even if the occupant is present again.
 Recovery processes 32 rows per one-second turn, retries failed pages, and blocks
 capture until drained. Signed reads share that recovery fence: an unwired actor,
 cold start, disconnected gateway, or unfinished drain refuses `discord_unavailable`,
-not a partial list. Reads revalidate their original epoch after projection, so even
-a completed newer recovery cannot validate an in-flight old result. Actor exit
-revokes readiness. Buffered pre-recovery joins stay missed. Maintenance detects
-recovery without new frames; an unchanged-generation snapshot cannot override
-queued transitions. Snapshots never open spans.
+not a partial list. Gateway observations fence reads before queue admission; readiness
+requires every observation to finish. Reads revalidate their original epoch for
+positive and absent results; a newer recovery cannot revive an old ticket. Actor
+exit revokes readiness. Refused or skipped attendance frames require conservative
+recovery, even in the same gateway generation. Buffered pre-recovery joins stay
+missed. Maintenance detects recovery without new frames; snapshots never open spans.
 
 Normal transitions also share one total one-second deadline across reads, gates
 and writes, with at most eight close attempts per turn. Open rows page 32 at a time;
-candidates cap at 128, names at 4 KiB and stored tag text at 16 KiB per row. An
-oversized candidate set grants no new capture; existing tags still finalize.
-Malformed oversized stored rows finalize by id without new tags or replacement
-metadata; oversized values remain intact server-side and disable this transition's
-new open. They cannot indefinitely park the guild inbox. The actor retains original observation, names, windows and uncertain close plans,
-resuming on maintenance before consuming later frames from its bounded inbox.
-Room dispatch/timers continue between turns. No new open passes unfinished closes;
+relevant candidates cap at 128, names at 4 KiB and stored tag text at 16 KiB per row.
+Planning filters for the observation/continuous span before the candidate limit.
+Oversized candidates grant no new capture; existing tags still finalize. Malformed
+rows, including NULL tags, finalize by id without replacing stored metadata and
+disable replacement opens. The actor retains original close evidence for maintenance
+retries, but keeps consuming room commands. Later attendance frames cannot overwrite
+pending closes: they require conservative recovery. Room dispatch/timers continue.
+No new open passes unfinished closes;
 uncertain closes retry the same id/boundary/tags, while uncertain opens never retry.
 A gateway change during continuation permits retained closes but no new open,
 and requires recovery before reads/capture resume. Reads refuse while pending.
@@ -538,10 +540,11 @@ start without a recovery fence until an actual absence/recovery. The logger stil
 finalizes existing rows when the shared lookup returns no live windows. Both
 attendance migrations are additive; shipped migration `0472` is unchanged.
 
-Signed attendance reads admit at most 4,096 raw spans and 1 MiB of aggregate
-room-name bytes before projection. SQL bounds individual text cells and streams
-rows; an extra span, overlong name or exhausted byte budget refuses the entire
-read as `internal`, never a silently truncated positive list. The independent
+Signed attendance reads admit at most 4,096 raw spans, 4,096 fixed-width capture
+stops and 1 MiB of room-name bytes. SQL checks stop cardinality before decoding,
+bounds text cells and streams rows; overflow refuses the whole read as `internal`,
+never truncated totals. Overlong identities become invalid sentinels, not prefixes.
+The independent
 serialized-result budget still reserves the relay envelope below 64 KiB.
 
 | Code | Status | Retryable |

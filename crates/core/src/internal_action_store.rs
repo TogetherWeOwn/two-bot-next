@@ -1060,23 +1060,38 @@ impl InternalActionStore {
         event_key: &str,
     ) -> Result<Vec<AttendanceSession>, InternalStoreError> {
         Self::check_event_key_shape(guild_id, event_key)?;
-        let bound: Option<(OffsetDateTime, Vec<OffsetDateTime>)> =
+        let bound: Option<(OffsetDateTime, Option<Vec<OffsetDateTime>>)> =
             sqlx::query_as(ATTENDANCE_SESSION_BOUND_SQL)
                 .bind(guild_id)
                 .bind(event_key)
+                .bind(MAX_ATTENDANCE_CAPTURE_STOPS as i64)
                 .fetch_optional(&self.pool)
                 .await?;
         let Some((bound, stops)) = bound else {
             return Ok(Vec::new());
         };
+        let stops = stops.ok_or(InternalStoreError::Unavailable)?;
         // Stream a bounded prefix and refuse an overflow, never truncate totals.
-        // Bound each text cell in SQL before the driver materializes it; an
-        // overlong prefix remains invalid and cannot masquerade as a valid ID.
+        // Bound each text cell in SQL before the driver materializes it. An ID
+        // longer than 20 bytes (a u64 has at most 20 digits) becomes the empty
+        // sentinel, which never parses; a truncated prefix could parse as a
+        // different valid ID, so IDs are never cut.
         let mut raw = sqlx::query_as::<
             _,
-            (String, String, String, bool, bool, OffsetDateTime, Option<OffsetDateTime>, OffsetDateTime),
+            (
+                String,
+                String,
+                String,
+                bool,
+                bool,
+                OffsetDateTime,
+                Option<OffsetDateTime>,
+                OffsetDateTime,
+            ),
         >(
-            "SELECT LEFT(member_id, 21), LEFT(channel_id, 21), LEFT(channel_name, 65537), is_bot, afk,
+            "SELECT CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE '' END,
+                    CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE '' END,
+                    LEFT(channel_name, 65537), is_bot, afk,
                     joined_at, left_at, COALESCE(name_observed_at, joined_at)
              FROM event_voice_sessions
              WHERE guild_id = $1 AND event_keys @> ARRAY[$2]
@@ -1126,6 +1141,10 @@ impl InternalActionStore {
 pub const MAX_ATTENDANCE_INPUT_SESSIONS: usize = 4096;
 /// Aggregate room-name bytes admitted before projection/copying.
 pub const MAX_ATTENDANCE_INPUT_NAME_BYTES: usize = 1024 * 1024;
+/// Maximum fixed-width loss-of-authority timestamps admitted before decoding.
+/// Together with the raw-span bound this caps both allocation and cap scans;
+/// overflow refuses the whole read, never truncates credit history.
+pub const MAX_ATTENDANCE_CAPTURE_STOPS: usize = 4096;
 
 /// Shared historical-window projection used by both attendance stores.
 /// Identity is fixed at capture; key repointing cannot redirect a past record.
@@ -1143,7 +1162,7 @@ pub const ATTENDANCE_SESSION_BOUND_SQL: &str =
     "SELECT LEAST(clock_timestamp(), COALESCE(w.ends_at, h.ends_at) + INTERVAL '15 minutes',
                   w.revoked_at::timestamptz,
                   CASE WHEN w.status = 'missing' THEN w.omitted_at::timestamptz END) AS capture_end,
-            h.capture_stops
+            CASE WHEN cardinality(h.capture_stops) <= $3 THEN h.capture_stops ELSE NULL END
      FROM event_attendance_windows h LEFT JOIN event_instance_windows w
        ON w.guild_id = h.guild_id AND w.event_id = h.event_id
       AND w.instance_starts_at = h.instance_starts_at

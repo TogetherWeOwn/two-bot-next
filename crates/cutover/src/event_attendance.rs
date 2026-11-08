@@ -211,6 +211,13 @@ const CAPTURE_WINDOWS_SQL: &str =
        AND ($3::boolean OR w.ends_at >= clock_timestamp() - INTERVAL '15 minutes')
        AND ($2::timestamptz IS NULL OR w.attendance_recovered_at IS NULL
             OR w.attendance_recovered_at <= $2)
+       AND ($5::text IS NULL OR (
+            w.starts_at <= $6::timestamptz + INTERVAL '15 minutes'
+            AND w.ends_at >= LEAST($6::timestamptz,
+                (SELECT min(s.joined_at) FROM event_voice_sessions s
+                 WHERE s.guild_id = $1 AND s.member_id = $5 AND s.channel_id = $7
+                   AND s.left_at IS NULL))
+                - INTERVAL '15 minutes'))
        AND NOT EXISTS (SELECT 1 FROM event_voice_channels c WHERE c.event_id = w.event_id
                        AND c.instance_starts_at <> w.instance_starts_at)
        AND NOT EXISTS (SELECT 1 FROM event_attendance_windows h
@@ -225,11 +232,37 @@ pub async fn attendance_windows_for_guild(
     pool: &sqlx::PgPool,
     guild_id: &str,
 ) -> Result<Vec<AttendanceWindow>, sqlx::Error> {
+    planning_windows(pool, guild_id, None, None, None).await
+}
+
+/// Candidates relevant to the observed join or the member's continuous open
+/// span. Filter before the overlap limit, so unrelated retained occurrences
+/// cannot disable current capture. Historical candidates still grant no open.
+pub async fn attendance_windows_for_transition(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    member_id: &str,
+    previous: Option<&str>,
+    observed_at: OffsetDateTime,
+) -> Result<Vec<AttendanceWindow>, sqlx::Error> {
+    planning_windows(pool, guild_id, Some(member_id), previous, Some(observed_at)).await
+}
+
+async fn planning_windows(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    member_id: Option<&str>,
+    previous: Option<&str>,
+    observed_at: Option<OffsetDateTime>,
+) -> Result<Vec<AttendanceWindow>, sqlx::Error> {
     sqlx::query_as::<_, (String, OffsetDateTime, OffsetDateTime)>(CAPTURE_WINDOWS_SQL)
         .bind(guild_id)
         .bind(None::<OffsetDateTime>)
         .bind(true)
         .bind(None::<Vec<String>>)
+        .bind(member_id)
+        .bind(observed_at)
+        .bind(previous)
         .fetch_all(pool)
         .await
         .map(|rows| {
@@ -279,8 +312,10 @@ pub async fn open_attendance_sessions(
                 CASE WHEN octet_length(channel_name) <= 4096 THEN channel_name ELSE repeat('x', 4097) END,
                 is_bot, afk, joined_at, left_at,
                 CASE WHEN cardinality(event_keys) <= 128 THEN
+                     CASE WHEN EXISTS (SELECT 1 FROM unnest(event_keys) k WHERE k IS NULL)
+                          THEN ARRAY[repeat('x', 16385)] ELSE
                      CASE WHEN (SELECT COALESCE(sum(octet_length(k)), 0) FROM unnest(event_keys) k) <= 16384
-                          THEN event_keys ELSE ARRAY[repeat('x', 16385)] END
+                          THEN event_keys ELSE ARRAY[repeat('x', 16385)] END END
                      ELSE ARRAY[repeat('x', 16385)] END,
                 COALESCE(name_observed_at, joined_at)
          FROM event_voice_sessions
@@ -338,6 +373,9 @@ async fn capture_tags_in(
             .bind(since)
             .bind(closing)
             .bind(requested)
+            .bind(None::<&str>)
+            .bind(None::<OffsetDateTime>)
+            .bind(None::<&str>)
             .fetch_all(&mut *connection)
             .await?;
     if windows.len() > ATTENDANCE_MAX_WINDOWS || windows.iter().any(|(key, _, _)| key.len() > 128) {
@@ -458,8 +496,10 @@ pub async fn close_attendance_session(
     } else {
         let existing: Option<(Vec<String>, OffsetDateTime)> = sqlx::query_as(
             "SELECT CASE WHEN cardinality(event_keys) <= 128 THEN
+                     CASE WHEN EXISTS (SELECT 1 FROM unnest(event_keys) k WHERE k IS NULL)
+                          THEN ARRAY[repeat('x', 16385)] ELSE
                          CASE WHEN (SELECT COALESCE(sum(octet_length(k)), 0) FROM unnest(event_keys) k) <= 16384
-                              THEN event_keys ELSE ARRAY[repeat('x', 16385)] END
+                              THEN event_keys ELSE ARRAY[repeat('x', 16385)] END END
                          ELSE ARRAY[repeat('x', 16385)] END,
                     joined_at FROM event_voice_sessions WHERE id = $1 AND left_at IS NULL FOR UPDATE",
         )
@@ -518,15 +558,18 @@ pub async fn attendance_sessions_for_event_key(
     guild_id: &str,
     event_key: &str,
 ) -> Result<Vec<AttendanceSession>, sqlx::Error> {
-    let bound: Option<(OffsetDateTime, Vec<OffsetDateTime>)> =
+    let bound: Option<(OffsetDateTime, Option<Vec<OffsetDateTime>>)> =
         sqlx::query_as(two_bot_core::internal_action_store::ATTENDANCE_SESSION_BOUND_SQL)
             .bind(guild_id)
             .bind(event_key)
+            .bind(two_bot_core::internal_action_store::MAX_ATTENDANCE_CAPTURE_STOPS as i64)
             .fetch_optional(pool)
             .await?;
     let Some((bound, stops)) = bound else {
         return Ok(Vec::new());
     };
+    let stops = stops
+        .ok_or_else(|| sqlx::Error::Protocol("attendance capture stops exceed budget".into()))?;
     sqlx::query_as::<_, AttendanceSessionRow>(
         "SELECT id, member_id, channel_id, channel_name, is_bot, afk, \
                 joined_at, left_at, event_keys, COALESCE(name_observed_at, joined_at) \
@@ -637,6 +680,18 @@ impl PgRoomStore {
         guild_id: &str,
     ) -> Result<Vec<AttendanceWindow>, sqlx::Error> {
         attendance_windows_for_guild(self.pool(), guild_id).await
+    }
+
+    /// [`attendance_windows_for_transition`] over this store's pool.
+    pub async fn attendance_windows_for_transition(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+        previous: Option<&str>,
+        observed_at: OffsetDateTime,
+    ) -> Result<Vec<AttendanceWindow>, sqlx::Error> {
+        attendance_windows_for_transition(self.pool(), guild_id, member_id, previous, observed_at)
+            .await
     }
 
     /// [`open_attendance_sessions`] over this store's pool.

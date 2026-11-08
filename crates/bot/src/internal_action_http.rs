@@ -1869,6 +1869,14 @@ async fn read_voice_snapshot(
     }
 }
 
+fn not_found_code(ticket: &two_bot::event_attendance::AttendanceReadTicket) -> ErrorCode {
+    if ticket.is_current() {
+        ErrorCode::NotFound
+    } else {
+        ErrorCode::DiscordUnavailable
+    }
+}
+
 /// Keyless `event.attendance.read`: project the §4 attendance shape from the
 /// stored voice-session rows for the caller's `event_key` in the staging
 /// guild. An unmapped key refuses `not_found` before touching sessions; a
@@ -1914,7 +1922,9 @@ async fn read_event_attendance(
         Ok(Some(window)) => window,
         // No captured window means no record, whether the key is unknown or
         // its event closed before logging was enabled.
-        Ok(None) => return reject(Failure::code(ErrorCode::NotFound)),
+        // The negative answer is also an output of the original epoch: a
+        // recovery that finished during the await cannot revive an old ticket.
+        Ok(None) => return reject(Failure::code(not_found_code(&ticket))),
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
     let sessions = match state
@@ -1967,7 +1977,7 @@ async fn read_event_attendance(
         // No tagged sessions (including every pre-enable window): the key
         // names nothing the logger saw.
         Err(two_bot::event_attendance::AttendanceRefusal::NoRecord) => {
-            reject(Failure::code(ErrorCode::NotFound))
+            reject(Failure::code(not_found_code(&ticket)))
         }
         Err(two_bot::event_attendance::AttendanceRefusal::OverBudget) => {
             reject(Failure::code(ErrorCode::Internal))

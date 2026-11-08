@@ -2818,6 +2818,7 @@ mod tests {
             (ErrorCode::Unauthorized, 401, false),
             (ErrorCode::StaleRequest, 401, false),
             (ErrorCode::ActionNotAllowed, 403, false),
+            (ErrorCode::NotFound, 404, false),
             (ErrorCode::Replayed, 409, false),
             (ErrorCode::VersionConflict, 409, false),
             (ErrorCode::InProgress, 409, true),
@@ -2831,6 +2832,7 @@ mod tests {
             assert_eq!(code.status(), status, "{:?}", code);
             assert_eq!(code.retryable(), retryable, "{:?}", code);
         }
+        assert_eq!(ErrorCode::NotFound.as_str(), "not_found");
         assert_eq!(auth_failure("x").message, AUTH_FAILURE_MESSAGE);
         assert_eq!(auth_failure("x").code, ErrorCode::Unauthorized);
     }
