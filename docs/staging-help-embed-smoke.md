@@ -64,12 +64,19 @@ To roll delivery back, restore that URL in the constant and its exact-URL Rust
 assertion and Python fixture, through the normal review and release gates.
 Do not delete or re-import the Images copy as part of a code rollback.
 
-Use the existing payload builder and smoke above for evidence on the changed
-SHA: `expected.icon_url` and both read-back footers must contain the Images URL.
-An offline fixture pass or a historical run using the GitHub URL does not prove
-runtime Images adoption. Record the exact deployed SHA and smoke run; if that
-proof is pending at merge, hand the gap to rollout coordination explicitly.
-The read-back proves the URL field, not a visual render or image fetch by Discord.
+Use the existing payload builder and smoke above to check the synthetic
+round-trip on the changed SHA: `expected.icon_url` and both read-back footers
+must contain the Images URL. Record that SHA and smoke run as synthetic evidence
+only: the separate test bot posts these payloads, so a pass does not prove
+that the deployed product bot adopted the Images URL.
+
+For runtime Images adoption, record the exact deployed SHA and a separate
+observation of the product bot using the Images URL in a branded help footer.
+Until that observation exists, runtime adoption remains unproven; if it is
+pending at merge, hand the evidence gap to rollout coordination explicitly.
+Neither an offline fixture pass nor a historical run using the GitHub URL
+proves Images adoption. The synthetic read-back proves the URL field, not a
+visual render or image fetch by Discord.
 
 ## CI gate and provisioning
 
