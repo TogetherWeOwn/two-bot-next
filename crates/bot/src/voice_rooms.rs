@@ -10529,6 +10529,11 @@ struct AttendanceRecovery {
     pending: Option<crate::event_attendance::AttendanceTransition>,
 }
 
+struct AttendanceRecoveryScope {
+    generation: u64,
+    loss: Option<(Snowflake, u64)>,
+}
+
 impl AttendanceRecovery {
     fn observe_generation(&mut self, live: &LiveGuild) {
         let state = live.read_state();
@@ -10687,30 +10692,19 @@ impl AttendanceRecovery {
         Ok(Some((ids.last().copied().unwrap_or(after_id), exhausted)))
     }
 
-    async fn turn<S: RoomPersistence, H: RoomWrites>(
-        &mut self,
-        worker: &GuildRoomWorker<S, H>,
-        enabled: bool,
-    ) {
-        if !enabled {
-            return;
-        }
-        if self.pending.is_some() {
-            // Finish the original observed close before interruption cleanup
-            // can zero any of its rows. Never spend two attendance budgets in
-            // the same maintenance turn, even when the last close completes.
-            self.resume_pending(worker).await;
-            return;
-        }
-        self.observe_generation(&worker.live);
+    // Keep synchronous scope/cursor bookkeeping outside the generic actor
+    // future, including its cancellation and error-formatting paths.
+    #[inline(never)]
+    fn prepare_page(&mut self, live: &LiveGuild) -> Option<AttendanceRecoveryScope> {
+        self.observe_generation(live);
         let (generation, ready) = {
-            let live = worker.live.read_state();
+            let live = live.read_state();
             (live.generation, live.ready)
         };
         if !ready {
-            return;
+            return None;
         }
-        let fence = &worker.live.attendance_reads;
+        let fence = &live.attendance_reads;
         let loss = if self.resetting {
             None
         } else {
@@ -10725,26 +10719,32 @@ impl AttendanceRecovery {
                 self.member_loss = fence.next_loss();
                 self.after_id = 0;
             }
-            let Some(loss) = self.member_loss else { return };
-            Some(loss)
+            Some(self.member_loss?)
         };
-        // Share one timeout/await state for both scopes. Cancellation drops the
-        // entire page future without advancing either retained cursor.
-        let recover =
-            Self::recover_page(worker, generation, loss.map(|loss| loss.0), self.after_id);
-        let result = tokio::time::timeout(Duration::from_millis(1_000), recover).await;
-        let Ok(Ok(Some((after_id, exhausted)))) = result else {
+        Some(AttendanceRecoveryScope { generation, loss })
+    }
+
+    #[inline(never)]
+    fn finish_page(
+        &mut self,
+        live: &LiveGuild,
+        scope: AttendanceRecoveryScope,
+        result: Option<(i64, bool)>,
+    ) {
+        let AttendanceRecoveryScope { generation, loss } = scope;
+        let Some((after_id, exhausted)) = result else {
             // No cursor advance on failure/cancellation, including an
             // uncertain commit. Never retry within the same turn.
             if loss.is_none() {
                 debug!(
-                    guild = worker.live.guild_id.to_string(),
+                    guild = live.guild_id.to_string(),
                     "attendance recovery deferred"
                 );
             }
             return;
         };
-        let live = worker.live.read_state();
+        let fence = &live.attendance_reads;
+        let live = live.read_state();
         if live.generation != generation || self.generation != Some(generation) || !live.ready {
             return;
         }
@@ -10772,6 +10772,39 @@ impl AttendanceRecovery {
                 self.resetting = false;
             }
         }
+    }
+
+    async fn turn<S: RoomPersistence, H: RoomWrites>(
+        &mut self,
+        worker: &GuildRoomWorker<S, H>,
+        enabled: bool,
+    ) {
+        if !enabled {
+            return;
+        }
+        if self.pending.is_some() {
+            // Finish the original observed close before interruption cleanup
+            // can zero any of its rows. Never spend two attendance budgets in
+            // the same maintenance turn, even when the last close completes.
+            self.resume_pending(worker).await;
+            return;
+        }
+        let Some(scope) = self.prepare_page(&worker.live) else {
+            return;
+        };
+        // Share one timeout/await state for both scopes. Cancellation drops the
+        // entire page future without advancing either retained cursor.
+        let recover = Self::recover_page(
+            worker,
+            scope.generation,
+            scope.loss.map(|loss| loss.0),
+            self.after_id,
+        );
+        let result = match tokio::time::timeout(Duration::from_millis(1_000), recover).await {
+            Ok(Ok(result)) => result,
+            _ => None,
+        };
+        self.finish_page(&worker.live, scope, result);
     }
 }
 
