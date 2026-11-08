@@ -4,7 +4,7 @@ use super::*;
 use axum::body::Body;
 use std::{
     collections::{HashMap, HashSet},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tower::ServiceExt;
 use twilight_cache_inmemory::DefaultInMemoryCache;
@@ -3126,6 +3126,7 @@ const VOICE_MOVE_OWNER_ID: &str = "123456789012345678";
 const VOICE_MOVE_DENIED_ID: &str = "100000000000000043";
 const VOICE_MOVE_LIMITED_ID: &str = "100000000000000044";
 const VOICE_MOVE_STALE_ID: &str = "100000000000000045";
+const VOICE_MOVE_NOT_SENT_ID: &str = "100000000000000046";
 
 /// Mover ids the loopback double snapshots: the seeded member plus one per
 /// PATCH-issuing executor test.
@@ -3137,6 +3138,7 @@ fn voice_move_known_member(user_id: &str) -> bool {
             | VOICE_MOVE_DENIED_ID
             | VOICE_MOVE_LIMITED_ID
             | VOICE_MOVE_STALE_ID
+            | VOICE_MOVE_NOT_SENT_ID
     )
 }
 
@@ -3202,6 +3204,9 @@ struct MockVoiceApiConfig {
     target_overwrites_after_patch: Vec<Value>,
     identity_seen: Option<Arc<tokio::sync::Notify>>,
     disconnect_on_member: Option<Arc<RwLock<crate::gateway::GatewayState>>>,
+    /// Set once every prerequisite read of a move has been served, so a test
+    /// admission can refuse exactly the PATCH that follows.
+    prerequisites_done: Option<Arc<AtomicBool>>,
 }
 
 impl Default for MockVoiceApiConfig {
@@ -3218,6 +3223,7 @@ impl Default for MockVoiceApiConfig {
             target_overwrites_after_patch: Vec::new(),
             identity_seen: None,
             disconnect_on_member: None,
+            prerequisites_done: None,
         }
     }
 }
@@ -3244,10 +3250,31 @@ impl MockVoiceApi {
                     let (parts, _) = request.into_parts();
                     let path = parts.uri.path().to_owned();
                     let method = parts.method.clone();
-                    seen.lock().unwrap().push(json!({
-                        "method": method.as_str(),
-                        "path": path,
-                    }));
+                    {
+                        let mut calls = seen.lock().unwrap();
+                        calls.push(json!({
+                            "method": method.as_str(),
+                            "path": path,
+                        }));
+                        if let Some(done) = &config.prerequisites_done {
+                            let guild_path = format!("/api/v10/guilds/{guild_id}");
+                            let served = |wanted: String| {
+                                calls.iter().any(|call| {
+                                    call["method"] == "GET" && call["path"] == wanted.as_str()
+                                })
+                            };
+                            if served(guild_path.clone())
+                                && served(format!("/api/v10/channels/{VOICE_MOVE_SOURCE_ID}"))
+                                && served(format!("/api/v10/channels/{VOICE_MOVE_TARGET_ID}"))
+                                && served(format!("{guild_path}/members/{VOICE_MOVE_BOT_ID}"))
+                                && served(format!(
+                                    "{guild_path}/members/{VOICE_MOVE_NOT_SENT_ID}"
+                                ))
+                            {
+                                done.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
                     let guild_path = format!("/api/v10/guilds/{guild_id}");
                     if path == "/api/v10/users/@me" {
                         if let Some(seen) = &config.identity_seen {
@@ -3670,6 +3697,111 @@ async fn voice_move_executor_limited_patch_carries_discord_wait() {
         .expect("limited PATCH answers");
     assert_eq!(receipt.outcome, VoiceMoveOutcome::RateLimited);
     assert_eq!(receipt.retry_after_secs, Some(5));
+    assert_eq!(mock.patch_calls(), 1);
+}
+
+/// Durable-admission double: grants every read, refuses with the typed
+/// `Blocked` error once the mock has served the move's prerequisites, until
+/// the test opens the lane.
+#[derive(Debug)]
+struct PatchLaneAdmission {
+    key: two_bot_core::send_admission::TokenKey,
+    armed: Arc<AtomicBool>,
+    open: AtomicBool,
+    refusals: AtomicUsize,
+}
+
+struct GrantedCompletion;
+
+impl two_bot_core::send_admission::SendCompletion for GrantedCompletion {
+    fn complete(
+        self: Box<Self>,
+        _: Option<two_bot_core::send_admission::SendCooldown>,
+    ) -> two_bot_core::send_admission::AdmissionFuture<
+        'static,
+        Result<(), two_bot_core::send_admission::AdmissionError>,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl two_bot_core::send_admission::SendAdmission for PatchLaneAdmission {
+    fn token_key(&self) -> &two_bot_core::send_admission::TokenKey {
+        &self.key
+    }
+    fn admit(
+        &self,
+    ) -> two_bot_core::send_admission::AdmissionFuture<
+        '_,
+        Result<
+            two_bot_core::send_admission::AdmissionPermit,
+            two_bot_core::send_admission::AdmissionError,
+        >,
+    > {
+        let refused = self.armed.load(Ordering::SeqCst) && !self.open.load(Ordering::SeqCst);
+        if refused {
+            self.refusals.fetch_add(1, Ordering::SeqCst);
+        }
+        Box::pin(async move {
+            if refused {
+                Err(two_bot_core::send_admission::AdmissionError::Blocked)
+            } else {
+                Ok(two_bot_core::send_admission::AdmissionPermit::new(
+                    Box::new(GrantedCompletion),
+                ))
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn voice_move_executor_admission_blocked_patch_releases_reservation() {
+    // The durable lane refuses the PATCH after every read succeeded: nothing
+    // reached the wire, so neither the seat nor the member stays fenced. Once
+    // the lane opens, the same member is admitted and moved.
+    const TOKEN: &str = "not-a-credential";
+    let armed = Arc::new(AtomicBool::new(false));
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        prerequisites_done: Some(armed.clone()),
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let admission = Arc::new(PatchLaneAdmission {
+        key: two_bot_core::send_admission::TokenKey::for_bot_token(TOKEN).unwrap(),
+        armed,
+        open: AtomicBool::new(false),
+        refusals: AtomicUsize::new(0),
+    });
+    let discord = ActionExecutor::with_admission(
+        TOKEN.to_owned(),
+        Some(mock.origin.clone()),
+        admission.clone(),
+    )
+    .unwrap();
+    let executor = VoiceMoveExecutor::new(
+        discord,
+        seeded_voice_move_cache_for(VOICE_MOVE_NOT_SENT_ID),
+        connected_gateway(),
+        VoiceOccupancyClock::new(),
+    );
+    let body = voice_move_body(VOICE_MOVE_NOT_SENT_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+
+    let error = executor
+        .execute_move(&request)
+        .await
+        .expect_err("blocked admission is a retryable refusal");
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(error.log_reason, "voice_move_not_sent");
+    assert_eq!(mock.patch_calls(), 0, "a refused admission sends no PATCH");
+    assert!(admission.refusals.load(Ordering::SeqCst) >= 1);
+
+    admission.open.store(true, Ordering::SeqCst);
+    let receipt = executor
+        .execute_move(&request)
+        .await
+        .expect("a leaked reservation would refuse the same member here");
+    assert_eq!(receipt.outcome, VoiceMoveOutcome::Moved);
     assert_eq!(mock.patch_calls(), 1);
 }
 

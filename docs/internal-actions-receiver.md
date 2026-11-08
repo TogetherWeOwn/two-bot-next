@@ -447,9 +447,11 @@ owner/Administrator exemptions follow Discord's permission rules.
 One guild admission gate covers fact gathering through PATCH completion. A bounded
 1024-entry ledger counts successful or uncertain moves not yet witnessed by the
 gateway in addition to cached occupants (bots included). The always-on voice
-transition observer reconciles witnessed arrivals even without an HTTP read;
-known no-effect replies release their reservation. There is no timer-based seat
-release. An unresolved member cannot start another move, and a full ledger fails
+transition observer reconciles witnessed arrivals or post-reseed departures even
+without an HTTP read. A generation fence captured before each gateway cache
+mutation prevents an older delayed observation from clearing a newer reservation.
+Known no-effect replies and typed pre-wire admission refusals release their
+reservation; transport/5xx uncertainty does not. There is no timer-based seat release. An unresolved member cannot start another move, and a full ledger fails
 closed with retryable `discord_unavailable`. This fences this receiver's admissions,
 not independent Discord joins or moves outside it. An unexplained 400/404 after
 one fresh fact read also answers/audits retryable `discord_unavailable`, not a

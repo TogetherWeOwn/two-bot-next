@@ -21,7 +21,7 @@
 //! The guild owner and `ADMINISTRATOR` holders pass every check, exactly like
 //! the moderation resolver.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use twilight_cache_inmemory::DefaultInMemoryCache;
 use two_bot_core::voice_permissions::{
@@ -233,17 +233,21 @@ pub(crate) fn parse_override(value: &serde_json::Value) -> Option<ChannelOverrid
 /// new effects until gateway observations reconcile it (or the runtime restarts).
 #[derive(Debug, Default)]
 pub(crate) struct VoiceMoveAdmissions {
-    targets: HashMap<Snowflake, Snowflake>,
+    targets: HashMap<Snowflake, (Snowflake, u64)>,
+    generation: u64,
 }
 
 impl VoiceMoveAdmissions {
     const LIMIT: usize = 1024;
 
     pub(crate) fn reserve(&mut self, member: Snowflake, target: Snowflake) -> Result<(), ()> {
-        if self.targets.len() >= Self::LIMIT || self.targets.contains_key(&member) {
+        if self.targets.len() >= Self::LIMIT
+            || self.targets.contains_key(&member)
+            || self.generation == u64::MAX
+        {
             return Err(());
         }
-        self.targets.insert(member, target);
+        self.targets.insert(member, (target, self.generation));
         Ok(())
     }
 
@@ -251,8 +255,24 @@ impl VoiceMoveAdmissions {
         self.targets.remove(&member);
     }
 
-    pub(crate) fn observe(&mut self, member: Snowflake, channel: Option<Snowflake>) {
-        if channel.is_some_and(|channel| self.targets.get(&member) == Some(&channel)) {
+    /// Captured before the pipeline publishes a cache change. Reservations
+    /// created after this fence must not be settled by its delayed observer.
+    pub(crate) fn begin_transition(&mut self) -> u64 {
+        self.generation = self.generation.saturating_add(1);
+        self.generation
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        member: Snowflake,
+        channel: Option<Snowflake>,
+        generation: u64,
+    ) {
+        if self
+            .targets
+            .get(&member)
+            .is_some_and(|(target, reserved)| channel == Some(*target) && *reserved < generation)
+        {
             self.release(member);
         }
     }
@@ -266,7 +286,7 @@ impl VoiceMoveAdmissions {
 /// set as empty. Cold/unavailable guilds, disabled caching and mid-mutation
 /// gaps fail closed into `discord_unavailable`.
 pub(crate) fn occupancy(
-    cache: &Arc<DefaultInMemoryCache>,
+    cache: &DefaultInMemoryCache,
     guild_id: Snowflake,
     member_id: Snowflake,
     target_id: Snowflake,
@@ -305,7 +325,11 @@ pub(crate) fn occupancy(
     for user in &users {
         let state = cache.voice_state(*user, guild).ok_or(())?;
         let channel = state.channel_id().get();
-        if admissions.targets.get(&user.get()) == Some(&channel) {
+        if admissions
+            .targets
+            .get(&user.get())
+            .is_some_and(|(target, _)| *target == channel)
+        {
             observed.push(user.get());
         }
         if channel == target_id {
@@ -321,7 +345,7 @@ pub(crate) fn occupancy(
     if admissions.targets.contains_key(&member_id) {
         return Err(());
     }
-    for target in admissions.targets.values() {
+    for (target, _) in admissions.targets.values() {
         if *target == target_id {
             occupants = occupants.saturating_add(1);
         }
@@ -388,14 +412,46 @@ mod tests {
             admissions.reserve(member, TARGET).unwrap();
         }
         assert!(admissions.reserve(2000, TARGET).is_err());
-        admissions.observe(1, Some(SOURCE));
-        admissions.observe(1, None);
+        let generation = admissions.begin_transition();
+        admissions.observe(1, Some(SOURCE), generation);
+        admissions.observe(1, None, generation);
         assert!(admissions.reserve(2000, TARGET).is_err());
-        admissions.observe(1, Some(TARGET));
+        admissions.observe(1, Some(TARGET), generation);
         assert!(admissions.reserve(2000, TARGET).is_ok());
         admissions.release(2000);
         assert!(admissions.reserve(2000, TARGET).is_ok());
         assert!(admissions.reserve(2000, SOURCE).is_err());
+    }
+
+    #[test]
+    fn admission_observations_only_settle_older_reservations() {
+        let mut admissions = VoiceMoveAdmissions::default();
+        let older = admissions.begin_transition();
+        admissions.reserve(MEMBER, TARGET).unwrap();
+        admissions.observe(MEMBER, Some(TARGET), older);
+        assert!(admissions.reserve(MEMBER, TARGET).is_err());
+        let newer = admissions.begin_transition();
+        admissions.observe(MEMBER, Some(TARGET), newer);
+        assert!(admissions.reserve(MEMBER, TARGET).is_ok());
+        // A duplicate of the same callback cannot settle the next move either.
+        admissions.observe(MEMBER, Some(TARGET), newer);
+        assert!(admissions.reserve(MEMBER, TARGET).is_err());
+    }
+
+    #[test]
+    fn admission_generation_exhaustion_fails_closed_without_wrapping() {
+        let mut admissions = VoiceMoveAdmissions {
+            generation: u64::MAX - 1,
+            ..VoiceMoveAdmissions::default()
+        };
+        admissions.reserve(MEMBER, TARGET).unwrap();
+        let generation = admissions.begin_transition();
+        assert_eq!(generation, u64::MAX);
+        admissions.observe(MEMBER, Some(TARGET), generation);
+        assert!(admissions.targets.is_empty());
+        assert!(admissions.reserve(MEMBER, TARGET).is_err());
+        assert_eq!(admissions.begin_transition(), u64::MAX);
+        assert!(admissions.reserve(MEMBER, TARGET).is_err());
     }
 
     #[test]

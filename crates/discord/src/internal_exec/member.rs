@@ -176,6 +176,10 @@ pub enum VoiceMovePatch {
     Limited { retry_after_secs: u64 },
     /// Anything else (5xx, redirect, transport): outcome unknown, retryable.
     Unavailable,
+    /// Proven pre-wire refusal (durable send admission blocked, or the bot
+    /// credential guard refused): no request reached Discord. Retryable, and
+    /// the caller may release any unobserved-seat reservation.
+    NotSent,
 }
 
 fn move_patch_outcome(response: &RawResponse) -> VoiceMovePatch {
@@ -187,6 +191,23 @@ fn move_patch_outcome(response: &RawResponse) -> VoiceMovePatch {
             retry_after_secs: discord_retry_after_secs(response),
         },
         _ => VoiceMovePatch::Unavailable,
+    }
+}
+
+/// Shared mapping of a failed bounded exchange to the scalar-only envelope.
+fn send_error(error: super::DiscordError, timeout_ms: u64) -> MemberError {
+    match error {
+        super::DiscordError::Guard(error) => MemberError::Guard(error),
+        super::DiscordError::Timeout => MemberError::Action(ActionError::new(
+            ErrorCode::UpstreamTimeout,
+            format!("Discord did not answer in {timeout_ms}ms"),
+            "discord_timeout",
+        )),
+        _ => MemberError::Action(ActionError::new(
+            ErrorCode::DiscordUnavailable,
+            "Discord was unreachable",
+            "discord_unreachable",
+        )),
     }
 }
 
@@ -203,19 +224,7 @@ impl ActionExecutor {
         let (response, _) = self
             .send_with_timeout_for(&request, None, Duration::from_millis(timeout_ms))
             .await
-            .map_err(|error| match error {
-                super::DiscordError::Guard(error) => MemberError::Guard(error),
-                super::DiscordError::Timeout => MemberError::Action(ActionError::new(
-                    ErrorCode::UpstreamTimeout,
-                    format!("Discord did not answer in {timeout_ms}ms"),
-                    "discord_timeout",
-                )),
-                _ => MemberError::Action(ActionError::new(
-                    ErrorCode::DiscordUnavailable,
-                    "Discord was unreachable",
-                    "discord_unreachable",
-                )),
-            })?;
+            .map_err(|error| send_error(error, timeout_ms))?;
         Ok(response)
     }
 
@@ -425,27 +434,34 @@ impl ActionExecutor {
         member_id: &str,
         channel_id: &str,
     ) -> Result<VoiceMovePatch, ActionError> {
-        let mut response = self
-            .discord_send(
-                self.inner
-                    .factory
-                    .update_guild_member(
-                        numeric_id(guild_id)?.cast(),
-                        numeric_id(member_id)?.cast(),
-                    )
-                    .channel_id(Some(numeric_id(channel_id)?.cast()))
-                    .try_into_request()
-                    .map_err(|_| {
-                        ActionError::new(
-                            ErrorCode::Malformed,
-                            "Invalid Discord request",
-                            "discord_request_invalid",
-                        )
-                    })?,
-                VOICE_MOVE_TIMEOUT_MS,
-            )
+        let request = self
+            .inner
+            .factory
+            .update_guild_member(numeric_id(guild_id)?.cast(), numeric_id(member_id)?.cast())
+            .channel_id(Some(numeric_id(channel_id)?.cast()))
+            .try_into_request()
+            .map_err(|_| {
+                ActionError::new(
+                    ErrorCode::Malformed,
+                    "Invalid Discord request",
+                    "discord_request_invalid",
+                )
+            })?;
+        // Keep the typed error until classified: a durable admission refusal
+        // or an invalid-credential guard refusal proves nothing was sent.
+        let mut response = match self
+            .send_with_timeout_for(&request, None, Duration::from_millis(VOICE_MOVE_TIMEOUT_MS))
             .await
-            .map_err(MemberError::into_action_error)?;
+        {
+            Ok((response, _)) => response,
+            Err(super::DiscordError::Guard(GuardError::TokenInvalid)) => {
+                return Ok(VoiceMovePatch::NotSent);
+            }
+            Err(error) if error.is_admission_blocked() => return Ok(VoiceMovePatch::NotSent),
+            Err(error) => {
+                return Err(send_error(error, VOICE_MOVE_TIMEOUT_MS).into_action_error());
+            }
+        };
         let outcome = move_patch_outcome(&response);
         if outcome == VoiceMovePatch::Moved {
             response.complete().await;

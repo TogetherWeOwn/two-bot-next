@@ -750,7 +750,10 @@ impl VoiceMoveEffect for VoiceMoveExecutor {
             // Transport/5xx uncertainty must not admit another member into it.
             if matches!(
                 &patch,
-                Ok(VoiceMovePatch::Denied | VoiceMovePatch::Limited { .. } | VoiceMovePatch::Stale)
+                Ok(VoiceMovePatch::Denied
+                    | VoiceMovePatch::Limited { .. }
+                    | VoiceMovePatch::Stale
+                    | VoiceMovePatch::NotSent)
             ) || matches!(&patch, Err(error) if error.code == ErrorCode::RateLimited)
             {
                 self.voice_clock
@@ -781,6 +784,10 @@ impl VoiceMoveEffect for VoiceMoveExecutor {
                 Ok(VoiceMovePatch::Unavailable) => Err(VoiceMoveExecutor::unavailable(
                     "Discord move uncertain; retryable",
                     "voice_move_discord_uncertain",
+                )),
+                Ok(VoiceMovePatch::NotSent) => Err(VoiceMoveExecutor::unavailable(
+                    "Discord move not sent; retryable",
+                    "voice_move_not_sent",
                 )),
                 Ok(VoiceMovePatch::Stale) => {
                     // Re-evaluate once, without retrying the PATCH. A fresh

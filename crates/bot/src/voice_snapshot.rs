@@ -153,13 +153,28 @@ impl VoiceOccupancyClock {
 }
 
 impl two_bot_discord::VoiceTransitionObserver for VoiceOccupancyClock {
+    fn begin_voice_transition(&self) -> u64 {
+        self.move_admissions
+            .lock()
+            .expect("voice move admissions")
+            .begin_transition()
+    }
+
     fn observe_voice_transition(&self, transition: two_bot_discord::VoiceTransitionObservation) {
         {
             let mut admissions = self.move_admissions.lock().expect("voice move admissions");
-            admissions.observe(transition.member_id, transition.current_channel_id);
+            admissions.observe(
+                transition.member_id,
+                transition.current_channel_id,
+                transition.generation,
+            );
             // A reseed may prove an arrival without emitting a transition.
-            // A later witnessed departure from that target also settles it.
-            admissions.observe(transition.member_id, transition.previous_channel_id);
+            // Only a departure begun after the reservation can settle it.
+            admissions.observe(
+                transition.member_id,
+                transition.previous_channel_id,
+                transition.generation,
+            );
         }
         if transition.is_bot {
             return;
@@ -559,6 +574,7 @@ mod tests {
         occurred_at_ms: Option<u64>,
     ) -> two_bot_discord::VoiceTransitionObservation {
         two_bot_discord::VoiceTransitionObservation {
+            generation: 0,
             guild_id: 9,
             member_id,
             previous_channel_id: previous.map(|(channel, _)| channel),
@@ -619,20 +635,24 @@ mod tests {
             .unwrap()
             .reserve(7, 11)
             .unwrap();
+        let observe = |mut transition: two_bot_discord::VoiceTransitionObservation| {
+            transition.generation = clock.begin_voice_transition();
+            clock.observe_voice_transition(transition);
+        };
         // A stale source observation cannot release an unobserved move.
-        clock.observe_voice_transition(transition(7, None, Some((10, &[7])), None));
+        observe(transition(7, None, Some((10, &[7])), None));
         assert!(clock
             .move_admissions
             .lock()
             .unwrap()
             .reserve(7, 11)
             .is_err());
-        clock.observe_voice_transition(transition(7, Some((10, &[])), Some((11, &[7])), None));
-        clock.observe_voice_transition(transition(7, Some((11, &[])), None, None));
+        observe(transition(7, Some((10, &[])), Some((11, &[7])), None));
+        observe(transition(7, Some((11, &[])), None, None));
         assert!(clock.move_admissions.lock().unwrap().reserve(7, 11).is_ok());
         let mut bot = transition(7, None, Some((11, &[])), None);
         bot.is_bot = true;
-        clock.observe_voice_transition(bot);
+        observe(bot);
         assert!(clock.move_admissions.lock().unwrap().reserve(7, 11).is_ok());
     }
 
@@ -829,6 +849,96 @@ mod tests {
         Event::GuildCreate(Box::new(GuildCreate::Available(
             serde_json::from_value(guild).expect("guild fixture"),
         )))
+    }
+
+    struct PausedMoveObserver {
+        clock: Arc<VoiceOccupancyClock>,
+        pending: Mutex<Vec<two_bot_discord::VoiceTransitionObservation>>,
+    }
+
+    impl two_bot_discord::VoiceTransitionObserver for PausedMoveObserver {
+        fn begin_voice_transition(&self) -> u64 {
+            self.clock.begin_voice_transition()
+        }
+
+        fn observe_voice_transition(
+            &self,
+            transition: two_bot_discord::VoiceTransitionObservation,
+        ) {
+            self.pending.lock().unwrap().push(transition);
+        }
+
+        fn reset_voice_occupancy(&self, guild_id: Option<u64>, channel_id: Option<u64>) {
+            self.clock.reset_voice_occupancy(guild_id, channel_id);
+        }
+    }
+
+    impl PausedMoveObserver {
+        fn deliver(&self) {
+            use two_bot_discord::VoiceTransitionObserver;
+            for transition in self.pending.lock().unwrap().drain(..) {
+                self.clock.observe_voice_transition(transition);
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_older_departure_cannot_clear_a_newer_last_seat_reservation() {
+        use crate::voice_move::occupancy;
+        let pipeline = two_bot_discord::MemPipeline::for_replay();
+        let cache = pipeline.cache();
+        let clock = VoiceOccupancyClock::new();
+        let observer = Arc::new(PausedMoveObserver {
+            clock: clock.clone(),
+            pending: Mutex::new(Vec::new()),
+        });
+        pipeline.set_voice_transition_observer(observer.clone());
+        pipeline.handle_at(&pipeline_guild(&[7, 8]), "2026-11-03T10:00:00Z");
+        pipeline.handle_at(&pipeline_voice(8, Some(201)), "2026-11-03T10:00:01Z");
+        observer.deliver();
+        // Publish the older target->source transition but pause its observer.
+        pipeline.handle_at(&pipeline_voice(7, Some(201)), "2026-11-03T10:00:02Z");
+        {
+            let mut admissions = clock.move_admissions.lock().unwrap();
+            assert_eq!(
+                occupancy(cache, 100, 7, 200, &mut admissions),
+                Ok((Some(201), 0))
+            );
+            admissions.reserve(7, 200).unwrap();
+        }
+        // HTTP admitted a newer source->target move from the published cache.
+        // Delivery of the older departure must not make its last seat reusable.
+        observer.deliver();
+        {
+            let mut admissions = clock.move_admissions.lock().unwrap();
+            assert_eq!(
+                occupancy(cache, 100, 8, 200, &mut admissions),
+                Ok((Some(201), 1))
+            );
+            assert!(
+                admissions.reserve(7, 200).is_err(),
+                "member fence survives too"
+            );
+        }
+        // A genuine later arrival settles the hold, leaving exactly one cached
+        // occupant rather than a cached occupant plus an unobserved seat.
+        pipeline.handle_at(&pipeline_voice(7, Some(200)), "2026-11-03T10:00:03Z");
+        observer.deliver();
+        {
+            let mut admissions = clock.move_admissions.lock().unwrap();
+            assert_eq!(
+                occupancy(cache, 100, 7, 200, &mut admissions),
+                Ok((Some(200), 1))
+            );
+        }
+        pipeline.handle_at(&pipeline_voice(7, Some(201)), "2026-11-03T10:00:04Z");
+        observer.deliver();
+        let mut admissions = clock.move_admissions.lock().unwrap();
+        assert_eq!(
+            occupancy(cache, 100, 8, 200, &mut admissions),
+            Ok((Some(201), 0))
+        );
+        assert!(admissions.reserve(7, 200).is_ok());
     }
 
     #[test]

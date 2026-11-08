@@ -116,11 +116,18 @@ pub struct VoiceTransitionObservation {
     /// since epoch (`None` when the receipt stamp did not parse: the clock
     /// drops the provable session instead of stamping a guess).
     pub occurred_at_ms: Option<u64>,
+    /// Observer fence captured before the cache mutation, not at delivery.
+    pub generation: u64,
 }
 
 /// Receives voice session boundaries from the serial gateway writer.
 /// Implementations must not block or await: record the stamp and return.
 pub trait VoiceTransitionObserver: Send + Sync {
+    /// Fence external admissions before publishing the new cached voice state.
+    fn begin_voice_transition(&self) -> u64 {
+        0
+    }
+
     fn observe_voice_transition(&self, transition: VoiceTransitionObservation);
 
     /// Forget evidence for all guilds (`None`), one guild, or one channel
@@ -1102,6 +1109,8 @@ impl<
                 // treats a missing member as non-bot, so the fallback is a
                 // plain `false` with no cache read.
                 let is_bot = update.member.as_ref().is_some_and(|m| m.user.bot);
+                let observer = self.voice_transition_observer.get();
+                let generation = observer.map_or(0, |observer| observer.begin_voice_transition());
                 self.cache.update(event);
                 // Per-member serial chain (TOG-5981): hold the member's
                 // mutex across end(A)→start(B) so the pair stays atomic for
@@ -1136,8 +1145,9 @@ impl<
                 // early above, so only witnessed session boundaries arrive.
                 // An unreadable receipt stamp travels as `None` so the clock
                 // drops the provable session instead of stamping a guess.
-                if let Some(observer) = self.voice_transition_observer.get() {
+                if let Some(observer) = observer {
                     observer.observe_voice_transition(VoiceTransitionObservation {
+                        generation,
                         guild_id,
                         member_id,
                         previous_channel_id: old_channel,
@@ -1491,6 +1501,7 @@ mod tests {
             *transitions,
             vec![
                 VoiceTransitionObservation {
+                    generation: 0,
                     guild_id: GUILD,
                     member_id: 1,
                     previous_channel_id: None,
@@ -1501,6 +1512,7 @@ mod tests {
                     occurred_at_ms: stamp_ms("2026-10-19T12:00:00.000Z"),
                 },
                 VoiceTransitionObservation {
+                    generation: 0,
                     guild_id: GUILD,
                     member_id: 1,
                     previous_channel_id: Some(10),
@@ -1511,6 +1523,7 @@ mod tests {
                     occurred_at_ms: stamp_ms("2026-10-19T12:00:10.000Z"),
                 },
                 VoiceTransitionObservation {
+                    generation: 0,
                     guild_id: GUILD,
                     member_id: 1,
                     previous_channel_id: Some(11),
