@@ -425,7 +425,7 @@ class PRLintTests(unittest.TestCase):
 class ChangedFileInventoryTests(unittest.TestCase):
     def inventory(self, entries, count=None, success=True, event="pull_request",
                   metadata_overrides=None, after_overrides=None, git_changes=None,
-                  **env_overrides):
+                  gitlink=None, **env_overrides):
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             root = Path(tmp)
             metadata = {
@@ -443,7 +443,7 @@ class ChangedFileInventoryTests(unittest.TestCase):
                 git("init", "--quiet")
                 git("config", "user.name", "Fixture")
                 git("config", "user.email", "fixture@example.invalid")
-                for changes in git_changes:
+                for index, changes in enumerate(git_changes):
                     for name, content in changes.items():
                         path = repo / name
                         if content is None:
@@ -452,11 +452,15 @@ class ChangedFileInventoryTests(unittest.TestCase):
                             path.parent.mkdir(parents=True, exist_ok=True)
                             path.write_text(content)
                     git("add", "--all")
+                    if index == 1 and gitlink:
+                        git("update-index", "--add", "--cacheinfo",
+                            f"160000,{git('rev-parse', 'HEAD')},{gitlink}")
                     git("commit", "--quiet", "--allow-empty", "-m", "fixture")
                 metadata["base"]["sha"] = git("rev-parse", "HEAD~1")
                 metadata["head"]["sha"] = git("rev-parse", "HEAD")
             metadata.update(metadata_overrides or {})
             after = {**metadata, **(after_overrides or {})}
+            entries = [{"status": "modified", **entry} for entry in entries]
             fixture = root / "fixture.json"
             fixture.write_text(json.dumps({"before": metadata, "after": after,
                                            "pages": [entries[i:i + 100] for i in range(0, len(entries), 100)] or [[]]}))
@@ -521,7 +525,7 @@ class ChangedFileInventoryTests(unittest.TestCase):
                 self.assertIn("--slurp", calls[1])
 
     def test_entry_count_precedes_rename_expansion(self):
-        entries = [{"filename": "docs/new.md", "previous_filename": "auth/old.rs"},
+        entries = [{"filename": "docs/new.md", "previous_filename": "auth/old.rs", "status": "renamed"},
                    {"filename": "docs/other.md", "status": "removed"}]
         paths, _, _ = self.inventory(entries)
         self.assertEqual(paths, ["docs/new.md", "auth/old.rs", "docs/other.md"])
@@ -542,6 +546,21 @@ class ChangedFileInventoryTests(unittest.TestCase):
             with self.subTest(entries=entries):
                 self.inventory(entries, success=False)
 
+    def test_renamed_entries_require_their_source_path(self):
+        for extra in ({}, {"previous_filename": None}, {"previous_filename": ""}):
+            with self.subTest(extra=extra):
+                self.inventory([{"filename": "docs/new.md", "status": "renamed", **extra}],
+                               success=False)
+        self.inventory([{"filename": "docs/new.md", "status": "unknown"}], success=False)
+
+    def test_dispatch_includes_gitlinks_despite_submodule_ignore_policy(self):
+        paths, _, _ = self.inventory(
+            [], count=3, event="workflow_dispatch", gitlink="auth",
+            git_changes=[{}, {"docs/page.md": "ordinary change", ".gitmodules":
+                             '[submodule "fixture"]\n\tpath = auth\n'
+                             '\turl = https://example.invalid/fixture\n\tignore = all\n'}])
+        self.assertEqual(set(paths), {".gitmodules", "auth", "docs/page.md"})
+
     def test_stale_or_changing_inventory_fails_closed(self):
         entries = [{"filename": "a.rs"}]
         for overrides in ({"EVENT_HEAD_SHA": "c" * 40}, {"EVENT_BASE_SHA": "c" * 40}):
@@ -561,7 +580,8 @@ class ChangedFileInventoryTests(unittest.TestCase):
         self.assertRegex(emitted["base_sha"], r"^[0-9a-f]{40}$")
         self.assertFalse(any("/files?" in call[1] for call in calls))
         # The complete diff still feeds the same base-branch T0 floor.
-        metadata = PRLintTests().resolve()
+        metadata = PRLintTests().resolve(EVENT_NAME="pull_request", EVENT_HEAD_REF="fix/inventory",
+                                         EVENT_AUTHOR="contributor")
         output = PRLintTests().validate({**metadata, "changed_files": "\n".join(paths)}, success=False)
         self.assertIn("::error title=Attestation::", output)
 
