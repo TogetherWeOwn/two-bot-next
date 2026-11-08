@@ -934,13 +934,12 @@ pub fn project_attendance(
     // Per-member aggregation over window-clamped intervals.
     let mut members: std::collections::BTreeMap<Snowflake, MemberSpans> =
         std::collections::BTreeMap::new();
-    // Borrow the latest observation; clone its name only into the wire value.
-    // Name order is independent of join and credit-capped leave times.
-    let mut rooms: std::collections::BTreeMap<Snowflake, &SessionMs> =
-        std::collections::BTreeMap::new();
+    // Sort room observations by channel and input position below. This keeps
+    // latest-name ties deterministic without a separate tree specialization.
+    let mut rooms: Vec<(Snowflake, usize)> = Vec::new();
     // Sweep events for the peak: (instant, delta), ends before starts.
     let mut sweep: Vec<(i64, i64)> = Vec::new();
-    for row in sessions.iter().filter(|row| !row.is_bot) {
+    for (index, row) in sessions.iter().enumerate().filter(|(_, row)| !row.is_bot) {
         let end_ms = row.left_ms.unwrap_or(now_ms.min(close_ms));
         let from_ms = row.joined_ms.max(open_ms);
         let to_ms = end_ms.min(close_ms);
@@ -952,10 +951,7 @@ pub fn project_attendance(
         });
         entry.sessions += 1;
         entry.first_joined_ms = entry.first_joined_ms.min(row.joined_ms);
-        let room = rooms.entry(row.channel_id).or_insert(row);
-        if row.name_observed_ns >= room.name_observed_ns {
-            *room = row;
-        }
+        rooms.push((row.channel_id, index));
         if from_ms < to_ms {
             entry.intervals.push((from_ms, to_ms));
             if !row.afk {
@@ -992,14 +988,23 @@ pub fn project_attendance(
         running += delta;
         peak_concurrent = peak_concurrent.max(running);
     }
+    rooms.sort_unstable();
     let wire_rooms: Vec<AttendanceRoom<'_>> = rooms
-        .into_iter()
-        .map(|(channel_id, row)| AttendanceRoom {
-            channel_id: channel_id.to_string(),
-            name_at_close: &row.channel_name,
+        .chunk_by(|a, b| a.0 == b.0)
+        .filter_map(|observations| {
+            // max_by_key returns the last maximum, hence the last input row
+            // wins an equal observation stamp, independent of join/leave time.
+            observations
+                .iter()
+                .map(|(_, index)| &sessions[*index])
+                .max_by_key(|row| row.name_observed_ns)
+                .map(|row| AttendanceRoom {
+                    channel_id: row.channel_id.to_string(),
+                    name_at_close: &row.channel_name,
+                })
         })
         .collect();
-    let bytes = serde_json::to_vec(&AttendanceResult {
+    let value = serde_json::to_value(AttendanceResult {
         v: 1,
         event_key,
         window: AttendanceResultWindow {
@@ -1013,11 +1018,11 @@ pub fn project_attendance(
         r#final: now_ms >= close_ms,
     })
     .map_err(|_| AttendanceRefusal::OverBudget)?;
+    let bytes = serde_json::to_vec(&value).map_err(|_| AttendanceRefusal::OverBudget)?;
     if bytes.len() > MAX_ATTENDANCE_RESULT_BYTES {
         return Err(AttendanceRefusal::OverBudget);
     }
-    // Materialize the receiver's Value only after checking the serialized budget.
-    serde_json::from_slice(&bytes).map_err(|_| AttendanceRefusal::OverBudget)
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -1091,6 +1096,29 @@ mod tests {
         );
         let reversed = project_attendance("event", &event, &[last, low, first], 80 * MIN).unwrap();
         assert_eq!(reversed["rooms"][1]["name_at_close"], "First");
+    }
+
+    #[test]
+    fn rooms_keep_unsigned_channel_order_and_latest_names_across_interleaved_rows() {
+        let event = window("event", 0, 60 * MIN);
+        let mut latest = session(1, u64::MAX, "Latest", false, false, 0, Some(MIN));
+        latest.name_observed_ns = i128::MAX;
+        let rows = [
+            session(2, 10, "Ten", false, false, 0, Some(MIN)),
+            latest,
+            session(3, 2, "Two", false, true, 0, Some(MIN)),
+            session(4, u64::MAX, "Older", false, false, 0, Some(MIN)),
+            session(5, 10, "Bot rename", true, false, 2 * MIN, Some(3 * MIN)),
+        ];
+        let result = project_attendance("event", &event, &rows, 80 * MIN).unwrap();
+        assert_eq!(
+            result["rooms"],
+            json!([
+                {"channel_id": "2", "name_at_close": "Two"},
+                {"channel_id": "10", "name_at_close": "Ten"},
+                {"channel_id": u64::MAX.to_string(), "name_at_close": "Latest"},
+            ])
+        );
     }
 
     #[test]
