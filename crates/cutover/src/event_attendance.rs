@@ -139,7 +139,7 @@ pub struct AttendanceRecoveryRow {
 // Reuse the raw query stream; decode its bounded page before the commit await.
 #[inline(never)]
 fn recovery_rows(
-    rows: Vec<sqlx::postgres::PgRow>,
+    rows: &[sqlx::postgres::PgRow],
 ) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
     use sqlx::Row;
 
@@ -210,7 +210,7 @@ async fn recovery_page(
     if let Some(member_id) = member_id {
         query = query.bind(member_id);
     }
-    let rows = recovery_rows(query.fetch_all(&mut *tx).await?)?;
+    let rows = recovery_rows(&query.fetch_all(&mut *tx).await?)?;
     tx.commit().await?;
     Ok(rows)
 }
