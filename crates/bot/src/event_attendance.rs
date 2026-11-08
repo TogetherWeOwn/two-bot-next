@@ -37,7 +37,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use time::OffsetDateTime;
 use two_bot_core::Snowflake;
 use two_bot_cutover::event_attendance::{
@@ -860,15 +860,46 @@ struct MemberSpans {
 // two places in the peak for the same minute. Keep AFK eligibility separate.
 fn union_intervals(mut intervals: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
     intervals.sort_unstable();
-    intervals.dedup_by(|next, previous| {
-        if next.0 <= previous.1 {
-            previous.1 = previous.1.max(next.1);
-            true
-        } else {
-            false
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (from, to) in intervals {
+        match merged.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => merged.push((from, to)),
         }
-    });
-    intervals
+    }
+    merged
+}
+
+#[derive(serde::Serialize)]
+struct AttendanceMember {
+    discord_id: String,
+    minutes: i64,
+    sessions: u64,
+    first_joined_at: String,
+}
+
+#[derive(serde::Serialize)]
+struct AttendanceRoom<'a> {
+    channel_id: String,
+    name_at_close: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct AttendanceResultWindow {
+    starts_at: String,
+    ends_at: String,
+}
+
+#[derive(serde::Serialize)]
+struct AttendanceResult<'a> {
+    v: u8,
+    event_key: &'a str,
+    window: AttendanceResultWindow,
+    threshold_minutes: i64,
+    peak_concurrent: i64,
+    rooms: Vec<AttendanceRoom<'a>>,
+    members: Vec<AttendanceMember>,
+    r#final: bool,
 }
 
 /// Project the §4 attendance shape over stored sessions. Pure over plain
@@ -935,7 +966,7 @@ pub fn project_attendance(
     if members.is_empty() {
         return Err(AttendanceRefusal::NoRecord);
     }
-    let wire_members: Vec<Value> = members
+    let wire_members: Vec<AttendanceMember> = members
         .into_iter()
         .map(|(member_id, spans)| {
             let duration_ms: i64 = union_intervals(spans.intervals)
@@ -946,12 +977,12 @@ pub fn project_attendance(
                 sweep.push((from, 1));
                 sweep.push((to, -1));
             }
-            json!({
-                "discord_id": member_id.to_string(),
-                "minutes": duration_ms / 60_000,
-                "sessions": spans.sessions,
-                "first_joined_at": two_bot_core::funnel::format_iso_millis(spans.first_joined_ms),
-            })
+            AttendanceMember {
+                discord_id: member_id.to_string(),
+                minutes: duration_ms / 60_000,
+                sessions: spans.sessions,
+                first_joined_at: two_bot_core::funnel::format_iso_millis(spans.first_joined_ms),
+            }
         })
         .collect();
     sweep.sort_unstable();
@@ -961,28 +992,27 @@ pub fn project_attendance(
         running += delta;
         peak_concurrent = peak_concurrent.max(running);
     }
-    let wire_rooms: Vec<Value> = rooms
+    let wire_rooms: Vec<AttendanceRoom<'_>> = rooms
         .into_iter()
-        .map(|(channel_id, row)| {
-            json!({
-                "channel_id": channel_id.to_string(),
-                "name_at_close": row.channel_name,
-            })
+        .map(|(channel_id, row)| AttendanceRoom {
+            channel_id: channel_id.to_string(),
+            name_at_close: &row.channel_name,
         })
         .collect();
-    let value = json!({
-        "v": 1,
-        "event_key": event_key,
-        "window": {
-            "starts_at": two_bot_core::funnel::format_iso_millis(window.starts_ms),
-            "ends_at": two_bot_core::funnel::format_iso_millis(window.ends_ms),
+    let value = serde_json::to_value(AttendanceResult {
+        v: 1,
+        event_key,
+        window: AttendanceResultWindow {
+            starts_at: two_bot_core::funnel::format_iso_millis(window.starts_ms),
+            ends_at: two_bot_core::funnel::format_iso_millis(window.ends_ms),
         },
-        "threshold_minutes": ATTENDANCE_THRESHOLD_MINUTES,
-        "peak_concurrent": peak_concurrent,
-        "rooms": wire_rooms,
-        "members": wire_members,
-        "final": now_ms >= close_ms,
-    });
+        threshold_minutes: ATTENDANCE_THRESHOLD_MINUTES,
+        peak_concurrent,
+        rooms: wire_rooms,
+        members: wire_members,
+        r#final: now_ms >= close_ms,
+    })
+    .map_err(|_| AttendanceRefusal::OverBudget)?;
     let bytes = serde_json::to_vec(&value).map_err(|_| AttendanceRefusal::OverBudget)?;
     if bytes.len() > MAX_ATTENDANCE_RESULT_BYTES {
         return Err(AttendanceRefusal::OverBudget);
@@ -993,6 +1023,7 @@ pub fn project_attendance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn interval_union_compacts_nested_touching_and_disjoint_spans() {
@@ -1375,6 +1406,32 @@ mod tests {
         assert_eq!(
             value["window"]["ends_at"],
             json!("1970-01-01T02:00:00.000Z")
+        );
+        assert_eq!(
+            value,
+            json!({
+                "v": 1,
+                "event_key": "game-night",
+                "window": {
+                    "starts_at": "1970-01-01T01:00:00.000Z",
+                    "ends_at": "1970-01-01T02:00:00.000Z",
+                },
+                "threshold_minutes": 10,
+                "peak_concurrent": 2,
+                "rooms": [
+                    {"channel_id": "7", "name_at_close": "lobby"},
+                    {"channel_id": "9", "name_at_close": "afk-room"},
+                ],
+                "members": [
+                    {"discord_id": "11", "minutes": 75, "sessions": 2,
+                     "first_joined_at": "1970-01-01T00:50:00.000Z"},
+                    {"discord_id": "12", "minutes": 5, "sessions": 1,
+                     "first_joined_at": "1970-01-01T01:40:00.000Z"},
+                    {"discord_id": "13", "minutes": 80, "sessions": 1,
+                     "first_joined_at": "1970-01-01T00:50:00.000Z"},
+                ],
+                "final": false,
+            })
         );
     }
 

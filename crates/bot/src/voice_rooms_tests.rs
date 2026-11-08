@@ -1906,7 +1906,11 @@ async fn attendance_dark_recovery_never_touches_the_store() {
 /// now, mirroring each row into the recovery page so a premature conservative
 /// recovery would be visible. Returns the observation instant to use.
 fn seed_open_attendance(store: &Store, count: i64) -> OffsetDateTime {
-    let now = OffsetDateTime::now_utc();
+    // Attendance persists epoch milliseconds, so the observation instant is
+    // already at stored precision and equality survives the round trip.
+    let now = crate::event_attendance::datetime_of(crate::event_attendance::millis_of(
+        OffsetDateTime::now_utc(),
+    ));
     store
         .attendance_window_rows
         .lock()
@@ -2316,13 +2320,14 @@ async fn attendance_pending_frame_loss_preserves_closes_but_revokes_replacement_
     assert_eq!(worker.store.attendance_close_log.lock().unwrap().len(), 8);
     recovery.turn(&worker, true).await;
     assert!(recovery.pending.is_none());
-    let log = worker.store.attendance_close_log.lock().unwrap();
-    assert_eq!(log.len(), 9);
-    assert!(
-        log.iter().all(|close| close.1 == observed_at),
-        "original evidence survives"
-    );
-    drop(log);
+    {
+        let log = worker.store.attendance_close_log.lock().unwrap();
+        assert_eq!(log.len(), 9);
+        assert!(
+            log.iter().all(|close| close.1 == observed_at),
+            "original evidence survives"
+        );
+    }
     assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
     assert!(authority.ticket(GUILD).is_none());
     recovery.turn(&worker, true).await;
