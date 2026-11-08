@@ -107,9 +107,15 @@ pub struct AttendanceReadFence {
 }
 
 impl AttendanceReadFence {
+    // Keep mutex acquisition/poison recovery shared across hot-path fence checks.
+    #[inline(never)]
+    fn state(&self) -> std::sync::MutexGuard<'_, AttendanceFenceState> {
+        self.inner.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
     /// Revoke readiness and every outstanding read ticket, without a DB await.
     pub fn invalidate(&self) {
-        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state();
         state.epoch += 1;
         state.recovery += 1;
         state.ready = false;
@@ -118,7 +124,7 @@ impl AttendanceReadFence {
     /// Start a new recovery incarnation. Keep its guard alive for the actor's
     /// lifetime; dropping it revokes readiness on normal exit or panic unwind.
     pub fn begin_recovery(&self) -> AttendanceRecoveryGuard {
-        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state();
         state.epoch += 1;
         state.recovery += 1;
         state.ready = false;
@@ -132,7 +138,7 @@ impl AttendanceReadFence {
     /// Dropping it without acknowledgement records lost continuity, including
     /// capacity refusal and actor termination, without allocating another queue.
     pub(crate) fn observe(&self, member: Snowflake) -> AttendanceObservation {
-        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state();
         state.epoch += 1;
         state.observations += 1;
         AttendanceObservation {
@@ -144,7 +150,7 @@ impl AttendanceReadFence {
 
     /// Only an actual actor/gateway discontinuity may clear unknown loss.
     pub(crate) fn begin_full_recovery(&self) -> AttendanceRecoveryGuard {
-        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state();
         state.epoch += 1;
         state.recovery += 1;
         state.ready = false;
@@ -157,24 +163,16 @@ impl AttendanceReadFence {
     }
 
     pub(crate) fn capture_allowed(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .capture_allowed()
+        self.state().capture_allowed()
     }
 
     pub(crate) fn next_loss(&self) -> Option<(Snowflake, u64)> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .lost_members
-            .first()
-            .copied()
+        self.state().lost_members.first().copied()
     }
 
     /// Compare incarnations after commit; an older page cannot erase newer loss.
     pub(crate) fn finish_loss(&self, loss: (Snowflake, u64)) -> bool {
-        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state();
         if let Some(index) = state.lost_members.iter().position(|entry| *entry == loss) {
             state.lost_members.swap_remove(index);
             return true;
@@ -183,31 +181,24 @@ impl AttendanceReadFence {
     }
 
     pub(crate) fn loss_is_current(&self, loss: (Snowflake, u64)) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .lost_members
-            .contains(&loss)
+        self.state().lost_members.contains(&loss)
     }
 
     /// The transition itself holds readiness false; check only continuity at
     /// its final open boundary, including loss before its baseline was sampled.
     pub(crate) fn may_open(&self, loss_generation: u64) -> bool {
-        let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self.state();
         state.loss_generation == loss_generation
             && state.lost_members.is_empty()
             && !state.saturated
     }
 
     pub(crate) fn loss_generation(&self) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .loss_generation
+        self.state().loss_generation
     }
 
     fn ticket(&self) -> Option<AttendanceReadTicket> {
-        let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let state = self.state();
         (state.capture_allowed() && state.observations == 0).then(|| AttendanceReadTicket {
             fence: self.clone(),
             epoch: state.epoch,
@@ -231,11 +222,7 @@ impl AttendanceObservation {
 
 impl Drop for AttendanceObservation {
     fn drop(&mut self) {
-        let mut state = self
-            .fence
-            .inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.fence.state();
         state.observations -= 1;
         if !self.acknowledged {
             state.loss_generation += 1;
@@ -267,11 +254,7 @@ impl AttendanceRecoveryGuard {
     /// Called only after the final bounded page commits and gateway evidence
     /// is revalidated. A disconnect or replacement meanwhile refuses completion.
     pub fn complete(&self) -> bool {
-        let mut state = self
-            .fence
-            .inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.fence.state();
         if state.recovery != self.recovery {
             return false;
         }
@@ -282,11 +265,7 @@ impl AttendanceRecoveryGuard {
 
 impl Drop for AttendanceRecoveryGuard {
     fn drop(&mut self) {
-        let mut state = self
-            .fence
-            .inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.fence.state();
         if state.recovery == self.recovery {
             state.epoch += 1;
             state.recovery += 1;
@@ -305,11 +284,7 @@ pub struct AttendanceReadTicket {
 impl AttendanceReadTicket {
     /// Whether the read still belongs to the recovered incarnation it began in.
     pub fn is_current(&self) -> bool {
-        let state = self
-            .fence
-            .inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.fence.state();
         state.capture_allowed() && state.observations == 0 && state.epoch == self.epoch
     }
 }
