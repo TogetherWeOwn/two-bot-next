@@ -452,27 +452,24 @@ pub trait RoomPersistence: Send + Sync {
         async { Ok::<u64, StoreError>(0) }
     }
     /// Minimal bounded recovery page, never an unbounded guild session read.
+    /// A known member limits the read to that member; unsupported stores refuse
+    /// that scope rather than broadening it to unrelated guild members.
     fn attendance_recovery_page(
         &self,
         guild: Snowflake,
+        member: Option<Snowflake>,
         after_id: i64,
     ) -> impl Future<
         Output = Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError>,
     > + Send {
         let _ = (guild, after_id);
-        async { Ok(Vec::new()) }
-    }
-    /// Known observation loss cannot broaden to unrelated guild members.
-    fn attendance_member_recovery_page(
-        &self,
-        guild: Snowflake,
-        member: Snowflake,
-        after_id: i64,
-    ) -> impl Future<
-        Output = Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError>,
-    > + Send {
-        let _ = (guild, member, after_id);
-        async { Err(StoreError::Unavailable) }
+        async move {
+            if member.is_some() {
+                Err(StoreError::Unavailable)
+            } else {
+                Ok(Vec::new())
+            }
+        }
     }
     /// Conservative recovery only: no new rows, tags or inferred leave times.
     fn recover_attendance_sessions(
@@ -951,20 +948,11 @@ impl RoomPersistence for PgRoomStore {
     async fn attendance_recovery_page(
         &self,
         guild: Snowflake,
+        member: Option<Snowflake>,
         after_id: i64,
     ) -> Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError> {
-        self.attendance_recovery_page(&guild.to_string(), after_id)
-            .await
-            .map_err(store_error)
-    }
-
-    async fn attendance_member_recovery_page(
-        &self,
-        guild: Snowflake,
-        member: Snowflake,
-        after_id: i64,
-    ) -> Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError> {
-        self.attendance_member_recovery_page(&guild.to_string(), &member.to_string(), after_id)
+        let member = member.map(|member| member.to_string());
+        self.attendance_recovery_page(&guild.to_string(), member.as_deref(), after_id)
             .await
             .map_err(store_error)
     }
@@ -10529,11 +10517,6 @@ struct AttendanceRecovery {
     pending: Option<crate::event_attendance::AttendanceTransition>,
 }
 
-struct AttendanceRecoveryScope {
-    generation: u64,
-    loss: Option<(Snowflake, u64)>,
-}
-
 impl AttendanceRecovery {
     fn observe_generation(&mut self, live: &LiveGuild) {
         let state = live.read_state();
@@ -10662,20 +10645,10 @@ impl AttendanceRecovery {
         after_id: i64,
     ) -> Result<Option<(i64, bool)>, StoreError> {
         let guild = worker.live.guild_id;
-        let rows = match member {
-            Some(member) => {
-                worker
-                    .store
-                    .attendance_member_recovery_page(guild, member, after_id)
-                    .await?
-            }
-            None => {
-                worker
-                    .store
-                    .attendance_recovery_page(guild, after_id)
-                    .await?
-            }
-        };
+        let rows = worker
+            .store
+            .attendance_recovery_page(guild, member, after_id)
+            .await?;
         let Some((ids, exhausted)) = Self::recovery_ids(rows, member) else {
             return Ok(None);
         };
@@ -10692,19 +10665,30 @@ impl AttendanceRecovery {
         Ok(Some((ids.last().copied().unwrap_or(after_id), exhausted)))
     }
 
-    // Keep synchronous scope/cursor bookkeeping outside the generic actor
-    // future, including its cancellation and error-formatting paths.
-    #[inline(never)]
-    fn prepare_page(&mut self, live: &LiveGuild) -> Option<AttendanceRecoveryScope> {
-        self.observe_generation(live);
+    async fn turn<S: RoomPersistence, H: RoomWrites>(
+        &mut self,
+        worker: &GuildRoomWorker<S, H>,
+        enabled: bool,
+    ) {
+        if !enabled {
+            return;
+        }
+        if self.pending.is_some() {
+            // Finish the original observed close before interruption cleanup
+            // can zero any of its rows. Never spend two attendance budgets in
+            // the same maintenance turn, even when the last close completes.
+            self.resume_pending(worker).await;
+            return;
+        }
+        self.observe_generation(&worker.live);
         let (generation, ready) = {
-            let live = live.read_state();
+            let live = worker.live.read_state();
             (live.generation, live.ready)
         };
         if !ready {
-            return None;
+            return;
         }
-        let fence = &live.attendance_reads;
+        let fence = &worker.live.attendance_reads;
         let loss = if self.resetting {
             None
         } else {
@@ -10719,32 +10703,26 @@ impl AttendanceRecovery {
                 self.member_loss = fence.next_loss();
                 self.after_id = 0;
             }
-            Some(self.member_loss?)
+            let Some(loss) = self.member_loss else { return };
+            Some(loss)
         };
-        Some(AttendanceRecoveryScope { generation, loss })
-    }
-
-    #[inline(never)]
-    fn finish_page(
-        &mut self,
-        live: &LiveGuild,
-        scope: AttendanceRecoveryScope,
-        result: Option<(i64, bool)>,
-    ) {
-        let AttendanceRecoveryScope { generation, loss } = scope;
-        let Some((after_id, exhausted)) = result else {
+        // Share one timeout/await state for both scopes. Cancellation drops the
+        // entire page future without advancing either retained cursor.
+        let recover =
+            Self::recover_page(worker, generation, loss.map(|loss| loss.0), self.after_id);
+        let result = tokio::time::timeout(Duration::from_millis(1_000), recover).await;
+        let Ok(Ok(Some((after_id, exhausted)))) = result else {
             // No cursor advance on failure/cancellation, including an
             // uncertain commit. Never retry within the same turn.
             if loss.is_none() {
                 debug!(
-                    guild = live.guild_id.to_string(),
+                    guild = worker.live.guild_id.to_string(),
                     "attendance recovery deferred"
                 );
             }
             return;
         };
-        let fence = &live.attendance_reads;
-        let live = live.read_state();
+        let live = worker.live.read_state();
         if live.generation != generation || self.generation != Some(generation) || !live.ready {
             return;
         }
@@ -10772,39 +10750,6 @@ impl AttendanceRecovery {
                 self.resetting = false;
             }
         }
-    }
-
-    async fn turn<S: RoomPersistence, H: RoomWrites>(
-        &mut self,
-        worker: &GuildRoomWorker<S, H>,
-        enabled: bool,
-    ) {
-        if !enabled {
-            return;
-        }
-        if self.pending.is_some() {
-            // Finish the original observed close before interruption cleanup
-            // can zero any of its rows. Never spend two attendance budgets in
-            // the same maintenance turn, even when the last close completes.
-            self.resume_pending(worker).await;
-            return;
-        }
-        let Some(scope) = self.prepare_page(&worker.live) else {
-            return;
-        };
-        // Share one timeout/await state for both scopes. Cancellation drops the
-        // entire page future without advancing either retained cursor.
-        let recover = Self::recover_page(
-            worker,
-            scope.generation,
-            scope.loss.map(|loss| loss.0),
-            self.after_id,
-        );
-        let result = match tokio::time::timeout(Duration::from_millis(1_000), recover).await {
-            Ok(Ok(result)) => result,
-            _ => None,
-        };
-        self.finish_page(&worker.live, scope, result);
     }
 }
 

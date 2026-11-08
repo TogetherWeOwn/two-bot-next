@@ -441,6 +441,7 @@ impl RoomPersistence for Store {
     async fn attendance_recovery_page(
         &self,
         _: Snowflake,
+        member: Option<Snowflake>,
         after_id: i64,
     ) -> Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError> {
         Ok(self
@@ -448,24 +449,9 @@ impl RoomPersistence for Store {
             .lock()
             .unwrap()
             .iter()
-            .filter(|row| row.id > after_id)
-            .take(two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE)
-            .cloned()
-            .collect())
-    }
-
-    async fn attendance_member_recovery_page(
-        &self,
-        _: Snowflake,
-        member: Snowflake,
-        after_id: i64,
-    ) -> Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError> {
-        Ok(self
-            .attendance_recovery_rows
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|row| row.member_id == member.to_string() && row.id > after_id)
+            .filter(|row| {
+                row.id > after_id && member.is_none_or(|member| row.member_id == member.to_string())
+            })
             .take(two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE)
             .cloned()
             .collect())

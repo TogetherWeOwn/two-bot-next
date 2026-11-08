@@ -1996,12 +1996,36 @@ mod tests {
             },
         )
         .await;
-        let page = crate::voice_rooms::RoomPersistence::attendance_recovery_page(&store, guild, 0)
-            .await
-            .unwrap();
+        let page =
+            crate::voice_rooms::RoomPersistence::attendance_recovery_page(&store, guild, None, 0)
+                .await
+                .unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].member_id, recovery_member.to_string());
         assert_eq!(page[0].channel_id, "7");
+        assert_eq!(
+            crate::voice_rooms::RoomPersistence::attendance_recovery_page(
+                &store,
+                guild,
+                Some(recovery_member),
+                0,
+            )
+            .await
+            .unwrap(),
+            page,
+        );
+        assert!(
+            crate::voice_rooms::RoomPersistence::attendance_recovery_page(
+                &store,
+                guild,
+                Some(member),
+                0,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "a scoped adapter must not return the neighboring member's row",
+        );
         let ids = [page[0].id];
         assert_eq!(
             crate::voice_rooms::RoomPersistence::recover_attendance_sessions(
@@ -2020,7 +2044,7 @@ mod tests {
             1
         );
         assert!(
-            crate::voice_rooms::RoomPersistence::attendance_recovery_page(&store, guild, 0)
+            crate::voice_rooms::RoomPersistence::attendance_recovery_page(&store, guild, None, 0)
                 .await
                 .unwrap()
                 .is_empty()

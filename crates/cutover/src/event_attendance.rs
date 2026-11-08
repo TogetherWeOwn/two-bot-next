@@ -711,25 +711,16 @@ pub async fn is_attendance_voice_enabled(
 }
 
 impl PgRoomStore {
-    /// [`attendance_recovery_page`] over this store's pool.
+    /// Bounded recovery over this store's pool, restricted to the supplied
+    /// member for known observation loss or the guild for a full discontinuity.
     pub fn attendance_recovery_page<'a>(
         &'a self,
         guild_id: &'a str,
+        member_id: Option<&'a str>,
         after_id: i64,
     ) -> impl std::future::Future<Output = Result<Vec<AttendanceRecoveryRow>, sqlx::Error>> + Send + 'a
     {
-        attendance_recovery_page(self.pool(), guild_id, after_id)
-    }
-
-    /// [`attendance_member_recovery_page`] over this store's pool.
-    pub fn attendance_member_recovery_page<'a>(
-        &'a self,
-        guild_id: &'a str,
-        member_id: &'a str,
-        after_id: i64,
-    ) -> impl std::future::Future<Output = Result<Vec<AttendanceRecoveryRow>, sqlx::Error>> + Send + 'a
-    {
-        attendance_member_recovery_page(self.pool(), guild_id, member_id, after_id)
+        recovery_page(self.pool(), guild_id, member_id, after_id)
     }
 
     /// [`recover_attendance_sessions`] over this store's pool.
