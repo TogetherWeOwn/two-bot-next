@@ -526,10 +526,13 @@ fn private_command_routing_diagnostics_do_not_promote_dispatch_to_business_succe
             name: "PRIVATE NAME SENTINEL".to_owned(),
             outcome,
         };
-        assert_eq!(super::command_route_outcome(&routed), expected);
+        assert_eq!(
+            crate::command_runtime::command_route_outcome(&routed),
+            expected
+        );
         let row = crate::audit_changes::command_event(
             &slash("help", Some(CHANNEL), vec![]),
-            super::command_route_outcome(&routed),
+            crate::command_runtime::command_route_outcome(&routed),
             "router",
             "2026-11-08T00:00:00.000Z",
         )
@@ -539,7 +542,7 @@ fn private_command_routing_diagnostics_do_not_promote_dispatch_to_business_succe
         assert!(!row.metadata_json.contains("SENTINEL"));
     }
     assert_eq!(
-        super::command_route_outcome(&RoutedInteraction::Ignore),
+        crate::command_runtime::command_route_outcome(&RoutedInteraction::Ignore),
         "not_a_slash_route"
     );
 }

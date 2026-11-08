@@ -347,7 +347,7 @@ fn audit_command_state(interaction: &Interaction, phase: &str, outcome: &str) {
     }
 }
 
-fn command_route_outcome(routed: &RoutedInteraction) -> &'static str {
+pub(crate) fn command_route_outcome(routed: &RoutedInteraction) -> &'static str {
     match routed {
         RoutedInteraction::Slash { outcome, .. } => match outcome {
             SlashOutcome::Handled { .. } => "handler_selected",

@@ -71,7 +71,7 @@ pub(crate) fn event(
     row.target_id = row.source_channel_id.clone();
     row.metadata_json = json!({
         "family": family.token(), "outcome": outcome_token(outcome),
-        "entityFingerprint": format!("{:x}", Sha256::digest(entity_key.as_bytes())),
+        "entityFingerprint": hex::encode(Sha256::digest(entity_key.as_bytes())),
         "correlationId": row.entry_id,
         "actorType": "bot", "actorConfidence": "unknown",
         "source": "feature_audit_boundary",
@@ -130,6 +130,16 @@ mod tests {
                 assert!(!row.metadata_json.contains("opaque-entity"));
             }
         }
+    }
+
+    #[test]
+    fn entity_fingerprint_is_the_lowercase_sha256_hex_digest() {
+        let row = event(Family::Feed, "1", None, "", "ok").unwrap();
+        let metadata: Value = serde_json::from_str(&row.metadata_json).unwrap();
+        assert_eq!(
+            metadata["entityFingerprint"],
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]
