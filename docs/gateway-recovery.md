@@ -54,7 +54,12 @@ in-flight join overlapping deletion. Deployment/acceptance evidence is separate.
 Attendance remains gated by `TWO_INTERNAL_ALLOW_ATTENDANCE_READ` (OFF unless
 explicitly enabled). An actual gateway, actor or process discontinuity drains
 old open attendance rows in bounded identity-only pages before capture resumes;
-snapshots do not reconstruct joins, tags or outage credit.
+snapshots do not reconstruct joins, tags or outage credit. Observations made
+before or during that full sweep remain read barriers until consumed or dropped,
+but do not create redundant member-loss scopes: no new rows are captured during
+the sweep. This coverage follows the observation even if it stays queued past
+completion. A genuinely newer observation after completion still records loss;
+ordinary close completion never clears member loss or saturation.
 
 A dropped, refused or skipped known-member observation revokes guild read tickets
 immediately, but **does not** establish a guild-wide interruption. The actor

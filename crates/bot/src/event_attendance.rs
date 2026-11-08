@@ -86,6 +86,8 @@ pub(crate) const ATTENDANCE_LOSS_MEMBERS: usize = 32;
 struct AttendanceFenceState {
     epoch: u64,
     recovery: u64,
+    /// Most recent full-sweep incarnation, including after it completes.
+    full_recovery: u64,
     ready: bool,
     observations: usize,
     loss_generation: u64,
@@ -144,6 +146,10 @@ impl AttendanceReadFence {
         AttendanceObservation {
             fence: self.clone(),
             member,
+            // No capture occurs during a full sweep. Its observations remain
+            // read barriers, but their dropped frames cannot lose newer rows.
+            loss_recovery: (state.ready || state.recovery != state.full_recovery)
+                .then_some(state.recovery),
             acknowledged: false,
         }
     }
@@ -154,6 +160,7 @@ impl AttendanceReadFence {
         state.epoch += 1;
         state.recovery += 1;
         state.ready = false;
+        state.full_recovery = state.recovery;
         state.lost_members.clear();
         state.saturated = false;
         AttendanceRecoveryGuard {
@@ -211,6 +218,8 @@ impl AttendanceReadFence {
 pub(crate) struct AttendanceObservation {
     fence: AttendanceReadFence,
     member: Snowflake,
+    /// None for a frame already covered by the pending full sweep.
+    loss_recovery: Option<u64>,
     acknowledged: bool,
 }
 
@@ -224,7 +233,14 @@ impl Drop for AttendanceObservation {
     fn drop(&mut self) {
         let mut state = self.fence.state();
         state.observations -= 1;
-        if !self.acknowledged {
+        // A newer full sweep also covers observations queued before it began.
+        // Never clear losses here: a post-sweep observation is still genuine,
+        // even if an older covered guard is dropped after that newer loss.
+        if !self.acknowledged
+            && self
+                .loss_recovery
+                .is_some_and(|recovery| recovery >= state.full_recovery)
+        {
             state.loss_generation += 1;
             state.epoch += 1;
             let incarnation = state.loss_generation;
@@ -337,6 +353,46 @@ mod ingress_fence_tests {
         assert!(replacement.complete());
         assert!(fence.capture_allowed());
         assert!(!ticket.is_current());
+    }
+
+    #[test]
+    fn full_recovery_covers_old_and_queued_loss_but_preserves_new_loss() {
+        let fence = AttendanceReadFence::default();
+        let actor = fence.begin_full_recovery();
+        assert!(actor.complete());
+        let old_ticket = fence.ticket().unwrap();
+        let before_reset = fence.observe(1);
+        fence.invalidate();
+        let reset = fence.begin_full_recovery();
+        let queued = fence.observe(2);
+        drop(before_reset);
+        for member in 3..=40 {
+            drop(fence.observe(member));
+        }
+        assert!(fence.next_loss().is_none(), "full sweep covers these rows");
+        assert!(!fence.capture_allowed());
+        assert!(fence.ticket().is_none());
+        assert!(reset.complete());
+        assert!(fence.capture_allowed());
+        assert!(
+            fence.ticket().is_none(),
+            "queued observation still fences reads"
+        );
+        drop(queued);
+        assert!(fence.ticket().is_some());
+        assert!(!old_ticket.is_current());
+
+        let next_reset = fence.begin_full_recovery();
+        let delayed = fence.observe(9);
+        assert!(next_reset.complete());
+        drop(fence.observe(9));
+        let new_loss = fence.next_loss().unwrap();
+        drop(delayed);
+        assert_eq!(fence.next_loss(), Some(new_loss));
+        assert!(next_reset.complete(), "completion cannot clear newer loss");
+        assert!(!fence.capture_allowed());
+        assert!(fence.finish_loss(new_loss));
+        assert!(fence.ticket().is_some());
     }
 
     #[test]

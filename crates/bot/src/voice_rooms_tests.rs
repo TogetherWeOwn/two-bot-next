@@ -2901,6 +2901,236 @@ async fn attendance_loss_table_overflow_keeps_capture_off_without_a_guild_sweep(
     );
 }
 
+/// A genuine gateway discontinuity with `rows` stale open rows. Returns after
+/// the first 32-row page, so the full recovery is mid-flight (`resetting`),
+/// together with a read ticket issued before the discontinuity.
+async fn full_recovery_mid_flight(
+    rows: i64,
+) -> (
+    GuildRoomWorker<Store, Http>,
+    AttendanceRecovery,
+    crate::event_attendance::AttendanceReadAuthority,
+    crate::event_attendance::AttendanceReadTicket,
+    u64,
+) {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    let old_read = authority.ticket(GUILD).expect("initial recovery complete");
+    worker.live.disconnect();
+    worker.live.publish(snapshot(&[], vec![]));
+    worker
+        .store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .extend((1..=rows).map(|id| recovery_row(id, MEMBER, CREATOR)));
+    recovery.turn(&worker, true).await;
+    let generation = worker.live.read_state().generation;
+    assert!(recovery.resetting, "full recovery is still pending");
+    assert_eq!(recovery.generation, Some(generation));
+    assert_eq!(
+        worker
+            .store
+            .attendance_recovery_closed
+            .lock()
+            .unwrap()
+            .len(),
+        32
+    );
+    assert!(!old_read.is_current());
+    assert!(authority.ticket(GUILD).is_none());
+    assert!(!recovery.capture_allowed(&worker.live));
+    (worker, recovery, authority, old_read, generation)
+}
+
+/// Drain the remaining pages of a 65-row full recovery, asserting the page
+/// bound and that nothing is captured or readable until the last page.
+async fn finish_full_recovery(
+    worker: &GuildRoomWorker<Store, Http>,
+    recovery: &mut AttendanceRecovery,
+    authority: &crate::event_attendance::AttendanceReadAuthority,
+    generation: u64,
+) {
+    for closed in [64usize, 65] {
+        assert!(recovery.resetting);
+        assert!(authority.ticket(GUILD).is_none());
+        assert!(!recovery.capture_allowed(&worker.live));
+        recovery.turn(worker, true).await;
+        assert_eq!(
+            worker
+                .store
+                .attendance_recovery_closed
+                .lock()
+                .unwrap()
+                .len(),
+            closed,
+            "at most one 32-row page per turn"
+        );
+        assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+        assert_eq!(
+            worker.live.read_state().generation,
+            generation,
+            "no manufactured gateway change"
+        );
+    }
+    assert!(!recovery.resetting);
+    assert_eq!(
+        *worker.store.attendance_recovery_closed.lock().unwrap(),
+        (1..=65).collect::<Vec<i64>>()
+    );
+}
+
+/// Observations dropped while a genuine multi-page full recovery is pending are
+/// covered by that recovery. Thirty-three of them must not become a lasting
+/// saturated loss that keeps capture and reads off after the full completes.
+#[tokio::test(start_paused = true)]
+async fn attendance_full_recovery_covers_observations_dropped_while_reset_pending() {
+    let (worker, mut recovery, authority, old_read, generation) =
+        full_recovery_mid_flight(65).await;
+    for offset in 0..33u64 {
+        let observed_at = OffsetDateTime::now_utc();
+        let mut movement = attendance_move_for(MEMBER + 2_000 + offset, observed_at);
+        movement.enabled = recovery.transition_allowed(&worker.live, observed_at);
+        assert!(!movement.enabled, "reset pending refuses the transition");
+        let member = movement.member;
+        recovery
+            .record(
+                &worker,
+                movement,
+                Some(worker.live.attendance_reads.observe(member)),
+            )
+            .await;
+        assert!(recovery.pending.is_none());
+        assert!(authority.ticket(GUILD).is_none());
+        assert!(!recovery.capture_allowed(&worker.live));
+    }
+    assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+    finish_full_recovery(&worker, &mut recovery, &authority, generation).await;
+
+    assert!(
+        recovery.capture_allowed(&worker.live),
+        "covered drops left no loss behind"
+    );
+    assert!(worker.live.attendance_reads.next_loss().is_none());
+    let new_read = authority
+        .ticket(GUILD)
+        .expect("readiness after full recovery");
+    assert!(new_read.is_current());
+    assert!(!old_read.is_current(), "the old read stays invalid");
+    let since = recovery.capture_since.unwrap();
+    assert!(recovery.transition_allowed(&worker.live, since));
+}
+
+/// Observations obtained during the reset but resolved after the full recovery
+/// completes keep reads fenced until acknowledged or dropped, then neither leave
+/// a loss nor allow the stale transition to open.
+#[tokio::test(start_paused = true)]
+async fn attendance_queued_reset_observations_fence_reads_until_resolved_without_stale_opens() {
+    for acknowledge in [false, true] {
+        let (worker, mut recovery, authority, old_read, generation) =
+            full_recovery_mid_flight(65).await;
+        let stale_at = OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let mut queued = Vec::new();
+        for offset in 0..33u64 {
+            let member = MEMBER + 2_000 + offset;
+            let mut movement = attendance_move_for(member, stale_at);
+            movement.enabled = recovery.transition_allowed(&worker.live, stale_at);
+            assert!(!movement.enabled);
+            queued.push((movement, worker.live.attendance_reads.observe(member)));
+        }
+        finish_full_recovery(&worker, &mut recovery, &authority, generation).await;
+
+        assert!(
+            authority.ticket(GUILD).is_none(),
+            "unresolved queued observations keep reads fenced"
+        );
+        assert!(
+            !recovery.transition_allowed(&worker.live, stale_at),
+            "a pre-recovery observation can never open"
+        );
+        let mut resolved = 0;
+        for (mut movement, observation) in queued {
+            assert!(authority.ticket(GUILD).is_none());
+            if acknowledge {
+                movement.current = movement.previous;
+            }
+            recovery.record(&worker, movement, Some(observation)).await;
+            resolved += 1;
+            assert!(recovery.pending.is_none());
+            assert_eq!(authority.ticket(GUILD).is_some(), resolved == 33);
+        }
+        assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+        assert!(worker.store.attendance_close_log.lock().unwrap().is_empty());
+        assert!(worker.live.attendance_reads.next_loss().is_none());
+        assert!(recovery.capture_allowed(&worker.live));
+        let new_read = authority.ticket(GUILD).expect("readiness after resolution");
+        assert!(new_read.is_current());
+        assert!(!old_read.is_current());
+        assert_eq!(worker.live.read_state().generation, generation);
+    }
+}
+
+/// A fresh loss after the full recovery completed is a real loss: it is not
+/// erased by an older queued reset observation resolving, and is recovered
+/// only by its own member recovery.
+#[tokio::test(start_paused = true)]
+async fn attendance_fresh_loss_after_full_recovery_survives_old_queued_reset_guard() {
+    let (worker, mut recovery, authority, _old_read, generation) =
+        full_recovery_mid_flight(65).await;
+    let stale_at = OffsetDateTime::now_utc() - time::Duration::seconds(1);
+    let mut movement = attendance_move_for(MEMBER + 2_000, stale_at);
+    movement.enabled = recovery.transition_allowed(&worker.live, stale_at);
+    assert!(!movement.enabled);
+    let old_guard = worker.live.attendance_reads.observe(MEMBER + 2_000);
+    finish_full_recovery(&worker, &mut recovery, &authority, generation).await;
+
+    // The same member is genuinely lost after completion.
+    drop(worker.live.attendance_reads.observe(MEMBER + 2_000));
+    let fresh = worker
+        .live
+        .attendance_reads
+        .next_loss()
+        .expect("fresh loss");
+    assert!(!recovery.capture_allowed(&worker.live));
+    recovery.record(&worker, movement, Some(old_guard)).await;
+    assert_eq!(
+        worker.live.attendance_reads.next_loss(),
+        Some(fresh),
+        "old reset guard did not erase or rewrite the fresh loss"
+    );
+    assert!(!recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_none());
+
+    // Only its own member recovery clears it.
+    recovery.turn(&worker, true).await;
+    assert!(worker.live.attendance_reads.next_loss().is_none());
+    assert!(recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_some());
+    assert_eq!(worker.live.read_state().generation, generation);
+}
+
+/// Intentional saturation after the full recovery stays off: coverage by a
+/// completed full recovery must not hide thirty-three fresh losses.
+#[tokio::test(start_paused = true)]
+async fn attendance_fresh_saturation_after_full_recovery_keeps_capture_off() {
+    let (worker, mut recovery, authority, _old_read, generation) =
+        full_recovery_mid_flight(65).await;
+    finish_full_recovery(&worker, &mut recovery, &authority, generation).await;
+    assert!(recovery.capture_allowed(&worker.live));
+    lose_members(&worker, 33);
+    for _ in 0..crate::event_attendance::ATTENDANCE_LOSS_MEMBERS {
+        recovery.turn(&worker, true).await;
+    }
+    assert!(worker.live.attendance_reads.next_loss().is_none());
+    assert!(!recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_none());
+    assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+}
+
 /// `snapshot` re-keyed to `guild`: channel guild ids and the @everyone
 /// role id follow the guild, so `LiveGuild::publish` accepts it.
 fn snapshot_for_guild(guild: u64, extra: &[u64], members: Vec<VoiceMember>) -> GuildSnapshot {
