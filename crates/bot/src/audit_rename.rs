@@ -24,10 +24,9 @@ pub fn channel_name(value: &str) -> String {
         .filter(|c| !c.is_control())
         .map(|c| if c == '`' { ' ' } else { c })
         .collect();
-    two_bot_core::message_safety::truncate(
-        &two_bot_core::message_safety::neutralize_mentions(&value),
-        100,
-    )
+    // Unlike ordinary message text, diagnostic names also neutralize user/role
+    // mentions before storage; keep the REST allowed_mentions guard as well.
+    two_bot_core::message_safety::truncate(&value.replace('@', "@\u{200b}"), 100)
 }
 
 pub struct RenameSnapshot<'a> {
@@ -111,6 +110,20 @@ pub fn outcome(base: &AuditEvent, result: &Result<(), RoomHttpError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_names_neutralize_all_mentions_before_utf16_truncation() {
+        for input in ["@everyone", "@here", "<@123>", "<@!123>", "<@&123>"] {
+            assert_eq!(channel_name(input), input.replace('@', "@\u{200b}"));
+        }
+        let at_boundary = format!("{}<@123>", "😀".repeat(48));
+        let bounded = channel_name(&at_boundary);
+        assert_eq!(bounded.encode_utf16().count(), 100);
+        assert_eq!(bounded, format!("{}<@\u{200b}1", "😀".repeat(48)));
+        assert_eq!(channel_name(""), "");
+        assert_eq!(channel_name("Quiet 🦀 room"), "Quiet 🦀 room");
+        assert_eq!(channel_name("`room`\r\n\t\0"), " room ");
+    }
 
     #[test]
     fn library_recorder_bridge_delivers_correlated_attempt_and_result() {
