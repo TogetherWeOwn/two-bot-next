@@ -17,11 +17,12 @@ use two_bot_core::{
     website_store::{replace_events, upsert_event},
 };
 use two_bot_cutover::event_attendance::{
-    attendance_recovery_page, attendance_sessions_for_event_key, attendance_window_for_key,
-    attendance_windows_for_guild, attendance_windows_for_transition, close_attendance_session,
-    insert_attendance_session, is_attendance_suppressed, is_attendance_voice_enabled,
-    open_attendance_sessions, recover_attendance_sessions, NewAttendanceSession,
-    ATTENDANCE_MAX_TAG_BYTES, ATTENDANCE_MAX_WINDOWS, ATTENDANCE_RECOVERY_PAGE_SIZE,
+    attendance_member_recovery_page, attendance_recovery_page, attendance_sessions_for_event_key,
+    attendance_window_for_key, attendance_windows_for_guild, attendance_windows_for_transition,
+    close_attendance_session, insert_attendance_session, is_attendance_suppressed,
+    is_attendance_voice_enabled, is_unsupported_stored_tags, open_attendance_sessions,
+    recover_attendance_sessions, NewAttendanceSession, ATTENDANCE_MAX_TAG_BYTES,
+    ATTENDANCE_MAX_WINDOWS, ATTENDANCE_RECOVERY_PAGE_SIZE,
 };
 use two_bot_cutover::{
     privacy::{opt_out_member, set_analytics_settings},
@@ -2027,6 +2028,463 @@ async fn capture_stops_over_the_bound_refuse_in_both_readers_and_the_bound_is_ac
                 "{total}"
             );
         }
+    })
+    .await;
+}
+
+/// Stored tag arrays SQLx cannot decode as a plain `text[]`, plus controls.
+/// Each expression is a literal, so the read and close paths see the exact shape.
+const UNSUPPORTED_TAG_SHAPES: [(&str, &str); 6] = [
+    ("two_dimensional", "'{{a,b},{c,d}}'::text[]"),
+    ("lower_bound_zero", "'[0:1]={a,b}'::text[]"),
+    ("lower_bound_two", "'[2:3]={a,b}'::text[]"),
+    ("null_element", "ARRAY['a', NULL]::text[]"),
+    (
+        "too_many_elements",
+        "(SELECT array_agg('k' || g) FROM generate_series(1, 129) g)",
+    ),
+    ("too_many_bytes", "ARRAY[repeat('w', 16385)]"),
+];
+
+type RawShapeRow = (
+    String,
+    String,
+    bool,
+    bool,
+    OffsetDateTime,
+    Option<OffsetDateTime>,
+    Option<OffsetDateTime>,
+    Option<String>,
+);
+
+// Compare server-rendered arrays without asking SQLx to decode malformed shapes.
+async fn raw_shape_state(pool: &PgPool, id: i64) -> (RawShapeRow, OffsetDateTime) {
+    let row = sqlx::query_as(
+        "SELECT channel_id, channel_name, is_bot, afk, joined_at, left_at, name_observed_at,
+                event_keys::text FROM event_voice_sessions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let changed = sqlx::query_scalar("SELECT changed_at FROM event_voice_sessions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (row, changed)
+}
+
+/// Exact stored shape: text form (carries bounds) plus dimensions and lower bound.
+async fn tag_shape(pool: &PgPool, id: i64) -> (String, Option<i32>, Option<i32>) {
+    sqlx::query_as(
+        "SELECT event_keys::text, array_ndims(event_keys), array_lower(event_keys, 1)
+         FROM event_voice_sessions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn set_tags(pool: &PgPool, id: i64, expr: &str) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE event_voice_sessions SET event_keys = {expr} WHERE id = $1"
+    )))
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn unsupported_tag_array_shapes_read_as_sentinels_and_drain_by_id_preserving_tags() {
+    use self::raw_shape_state as raw_state;
+
+    with_database(|pool| async move {
+        let joined = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::hours(2);
+        let left = joined + Duration::hours(1);
+        let mut bad = Vec::new();
+        for (n, (name, expr)) in UNSUPPORTED_TAG_SHAPES.iter().enumerate() {
+            let id = seed_member_row(
+                &pool,
+                GUILD_A,
+                MEMBER,
+                n + 1,
+                joined + Duration::seconds(n as i64),
+                None,
+            )
+            .await;
+            set_tags(&pool, id, expr).await;
+            bad.push((*name, id));
+        }
+        let controls = UNSUPPORTED_TAG_SHAPES.len() + 1;
+        let empty = seed_member_row(
+            &pool,
+            GUILD_A,
+            MEMBER,
+            controls,
+            joined + Duration::seconds(20),
+            None,
+        )
+        .await;
+        set_tags(&pool, empty, "'{}'::text[]").await;
+        let healthy = seed_member_row(
+            &pool,
+            GUILD_A,
+            MEMBER,
+            controls + 1,
+            joined + Duration::seconds(21),
+            None,
+        )
+        .await;
+        // Bounds-1 one-dimensional arrays at the element cap stay healthy.
+        let cap = seed_member_row(
+            &pool,
+            GUILD_A,
+            MEMBER,
+            controls + 2,
+            joined + Duration::seconds(22),
+            None,
+        )
+        .await;
+        set_tags(
+            &pool,
+            cap,
+            "(SELECT array_agg('k' || g) FROM generate_series(1, 128) g)",
+        )
+        .await;
+
+        // 32-row page: 6 bad + 3 controls fit in one page.
+        let page = open_attendance_sessions(&pool, GUILD_A, MEMBER)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), bad.len() + 3);
+        for (row, (name, id)) in page.iter().zip(&bad) {
+            assert_eq!(row.id, *id, "{name}");
+            assert!(
+                row.event_keys.iter().map(String::len).sum::<usize>() > ATTENDANCE_MAX_TAG_BYTES,
+                "{name} must read as the oversize sentinel"
+            );
+        }
+        let controls_page = &page[bad.len()..];
+        assert_eq!(controls_page[0].id, empty);
+        assert!(controls_page[0].event_keys.is_empty());
+        assert_eq!(controls_page[1].id, healthy);
+        assert_eq!(
+            controls_page[1].event_keys,
+            [format!(
+                "{}",
+                20_000_000_000_000_000_u64 + controls as u64 + 1
+            )]
+        );
+        assert_eq!(controls_page[2].id, cap);
+        assert_eq!(controls_page[2].event_keys.len(), 128);
+
+        // Close-time expansion refuses each unsupported shape and mutates nothing.
+        let mut before = Vec::new();
+        for (name, id) in &bad {
+            let raw = raw_state(&pool, *id).await;
+            let shape = tag_shape(&pool, *id).await;
+            let refused =
+                close_attendance_session(&pool, *id, left, Some("Lobby"), &["new-tag".into()])
+                    .await;
+            assert!(refused.is_err(), "{name} must refuse expansion");
+            assert_eq!(raw_state(&pool, *id).await, raw, "{name}");
+            assert_eq!(tag_shape(&pool, *id).await, shape, "{name}");
+            before.push((raw, shape));
+        }
+
+        // Healthy and empty rows still expand/close normally.
+        assert_eq!(
+            close_attendance_session(&pool, empty, left, None, &["new-tag".into()])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            close_attendance_session(&pool, cap, left, None, &[])
+                .await
+                .unwrap(),
+            1
+        );
+
+        // By-id no-expansion close preserves exact tags, shape, bounds, name and observation.
+        for ((name, id), (raw, shape)) in bad.iter().zip(&before) {
+            assert_eq!(
+                close_attendance_session(&pool, *id, left, None, &[])
+                    .await
+                    .unwrap(),
+                1,
+                "{name}"
+            );
+            let (after, changed) = raw_state(&pool, *id).await;
+            assert_eq!(after.5, Some(left), "{name}");
+            assert_eq!(
+                (&after.0, &after.1, after.2, after.3, after.4, after.6, &after.7),
+                (&raw.0 .0, &raw.0 .1, raw.0 .2, raw.0 .3, raw.0 .4, raw.0 .6, &raw.0 .7),
+                "{name}"
+            );
+            assert_eq!(&tag_shape(&pool, *id).await, shape, "{name}");
+            // Idempotent retry: the second close changes nothing.
+            assert_eq!(
+                close_attendance_session(&pool, *id, left, None, &[])
+                    .await
+                    .unwrap(),
+                0,
+                "{name}"
+            );
+            assert_eq!(raw_state(&pool, *id).await, (after, changed), "{name}");
+        }
+
+        // The healthy neighbor was never touched by the malformed rows.
+        assert_eq!(
+            close_attendance_session(&pool, healthy, left, None, &[])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(tag_shape(&pool, healthy).await.1, Some(1));
+        assert!(open_attendance_sessions(&pool, GUILD_A, MEMBER)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(row_count(&pool).await, bad.len() as i64 + 3);
+        assert_eq!(count(&pool, "event_attendance_windows").await, 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn tag_shape_changed_between_open_read_and_close_refuses_then_drains_by_id() {
+    use self::raw_shape_state as raw_state;
+
+    with_database(|pool| async move {
+        let joined = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::hours(2);
+        let left = joined + Duration::hours(1);
+        let racing = seed_member_row(&pool, GUILD_A, MEMBER, 1, joined, None).await;
+        let neighbor = seed_member_row(
+            &pool,
+            GUILD_A,
+            MEMBER,
+            2,
+            joined + Duration::seconds(1),
+            None,
+        )
+        .await;
+
+        // The first site reads a healthy page and plans an expansion.
+        let page = open_attendance_sessions(&pool, GUILD_A, MEMBER)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [racing, neighbor]
+        );
+        assert_eq!(page[0].event_keys, ["20000000000000001"]);
+
+        // Keep the shape-changing write uncommitted while another connection
+        // starts the close. Its second sanitizer must read the new shape after
+        // the lock releases instead of trusting the earlier healthy page.
+        let mut changing = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE event_voice_sessions SET event_keys = '[0:1]={a,b}'::text[] WHERE id = $1",
+        )
+        .bind(racing)
+        .execute(&mut *changing)
+        .await
+        .unwrap();
+        let closing_pool = pool.clone();
+        let mut closing = tokio::spawn(async move {
+            close_attendance_session(
+                &closing_pool,
+                racing,
+                left,
+                Some("Lobby"),
+                &["new-tag".into()],
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), &mut closing)
+                .await
+                .is_err()
+        );
+        changing.commit().await.unwrap();
+        let raw = raw_state(&pool, racing).await;
+        let shape = tag_shape(&pool, racing).await;
+        assert_eq!(shape.2, Some(0));
+
+        let refused = closing.await.unwrap().unwrap_err();
+        assert!(is_unsupported_stored_tags(&refused), "{refused:?}");
+        assert_eq!(raw_state(&pool, racing).await, raw);
+        assert_eq!(tag_shape(&pool, racing).await, shape);
+
+        // The fallback closes by id and preserves the new shape; retry is a no-op.
+        assert_eq!(
+            close_attendance_session(&pool, racing, left, None, &[])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(tag_shape(&pool, racing).await, shape);
+        let (closed, changed) = raw_state(&pool, racing).await;
+        assert_eq!(closed.5, Some(left));
+        assert_eq!(
+            close_attendance_session(&pool, racing, left, None, &[])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(raw_state(&pool, racing).await, (closed, changed));
+
+        // The healthy neighbor still reads exactly and still closes with expansion.
+        let rest = open_attendance_sessions(&pool, GUILD_A, MEMBER)
+            .await
+            .unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, neighbor);
+        assert_eq!(rest[0].event_keys, ["20000000000000002"]);
+        assert_eq!(
+            close_attendance_session(&pool, neighbor, left, None, &["20000000000000002".into()])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(count(&pool, "event_attendance_windows").await, 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn null_stored_array_uses_bounded_sentinel_then_preserving_by_id_close() {
+    with_database(|pool| async move {
+        // Historical/imported NULL defense, confined to this disposable schema.
+        sqlx::query("ALTER TABLE event_voice_sessions ALTER COLUMN event_keys DROP NOT NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let joined = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::hours(2);
+        let id = seed_member_row(&pool, GUILD_A, MEMBER, 1, joined, None).await;
+        set_tags(&pool, id, "NULL::text[]").await;
+        let before = raw_shape_state(&pool, id).await;
+        assert!(before.0 .7.is_none());
+        let page = open_attendance_sessions(&pool, GUILD_A, MEMBER)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert!(page[0].event_keys[0].len() > ATTENDANCE_MAX_TAG_BYTES);
+        let refused = close_attendance_session(
+            &pool,
+            id,
+            joined + Duration::hours(1),
+            Some("replacement"),
+            &["new".into()],
+        )
+        .await
+        .unwrap_err();
+        assert!(is_unsupported_stored_tags(&refused));
+        assert_eq!(raw_shape_state(&pool, id).await, before);
+        assert_eq!(
+            close_attendance_session(&pool, id, joined + Duration::hours(1), None, &[])
+                .await
+                .unwrap(),
+            1
+        );
+        let after = raw_shape_state(&pool, id).await;
+        assert!(after.0 .7.is_none());
+        assert_eq!(after.0 .1, before.0 .1);
+        assert_eq!(after.0 .6, before.0 .6);
+        assert_eq!(after.0 .5, Some(joined + Duration::hours(1)));
+        assert!(open_attendance_sessions(&pool, GUILD_A, MEMBER)
+            .await
+            .unwrap()
+            .is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn member_recovery_page_is_identity_only_bounded_and_isolated_by_guild_and_member() {
+    with_database(|pool| async move {
+        let base = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap() - Duration::hours(2);
+        let other = "30000000000000099";
+        let total = ATTENDANCE_RECOVERY_PAGE_SIZE + 5;
+        let mut mine = Vec::new();
+        for n in 0..total {
+            mine.push(
+                seed_member_row(
+                    &pool,
+                    GUILD_A,
+                    MEMBER,
+                    n + 1,
+                    base + Duration::seconds(n as i64),
+                    None,
+                )
+                .await,
+            );
+        }
+        // Closed row, other member, and other guild must never appear.
+        seed_member_row(
+            &pool,
+            GUILD_A,
+            MEMBER,
+            100,
+            base,
+            Some(base + Duration::minutes(1)),
+        )
+        .await;
+        let other_member = seed_member_row(&pool, GUILD_A, other, 101, base, None).await;
+        let other_guild = seed_member_row(&pool, GUILD_B, MEMBER, 102, base, None).await;
+        // A poisoned shape must not affect the identity-only page.
+        set_tags(&pool, mine[0], "'{{a,b},{c,d}}'::text[]").await;
+
+        let first = attendance_member_recovery_page(&pool, GUILD_A, MEMBER, 0)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), ATTENDANCE_RECOVERY_PAGE_SIZE);
+        assert_eq!(
+            first.iter().map(|r| r.id).collect::<Vec<_>>(),
+            mine[..ATTENDANCE_RECOVERY_PAGE_SIZE]
+        );
+        assert!(first.iter().all(|r| r.member_id == MEMBER));
+        let last = first.last().unwrap().id;
+        let second = attendance_member_recovery_page(&pool, GUILD_A, MEMBER, last)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.iter().map(|r| r.id).collect::<Vec<_>>(),
+            mine[ATTENDANCE_RECOVERY_PAGE_SIZE..]
+        );
+        assert!(
+            attendance_member_recovery_page(&pool, GUILD_A, MEMBER, *mine.last().unwrap())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let theirs = attendance_member_recovery_page(&pool, GUILD_A, other, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            theirs.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [other_member]
+        );
+        let foreign = attendance_member_recovery_page(&pool, GUILD_B, MEMBER, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            foreign.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [other_guild]
+        );
+        assert!(attendance_member_recovery_page(&pool, GUILD_B, other, 0)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The guild-wide page is unchanged and still sees every open row.
+        let all = attendance_recovery_page(&pool, GUILD_A, 0).await.unwrap();
+        assert_eq!(all.len(), ATTENDANCE_RECOVERY_PAGE_SIZE);
     })
     .await;
 }

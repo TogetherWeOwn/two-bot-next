@@ -92,6 +92,34 @@ fn sessions_from_rows(rows: Vec<AttendanceSessionRow>) -> Vec<AttendanceSession>
         .collect()
 }
 
+/// Bounded, shape-checked read of stored `event_keys`. Any shape SQLx cannot
+/// decode as a plain one-dimensional, lower-bound-1 `text[]` (NULL array, more
+/// than 128 elements, NULL element, over-budget text, multi-dimensional or
+/// non-unit lower bound) reads as one over-budget sentinel tag. The canonical
+/// empty array is healthy. The sentinel is never persisted: callers refuse to
+/// expand it and drain the row by id with no replacement tags.
+macro_rules! bounded_event_keys_sql {
+    () => {
+        "CASE WHEN cardinality(event_keys) IS NULL OR cardinality(event_keys) > 128
+                   OR (cardinality(event_keys) > 0
+                       AND (array_ndims(event_keys) <> 1 OR array_lower(event_keys, 1) <> 1))
+                   OR EXISTS (SELECT 1 FROM unnest(event_keys) k WHERE k IS NULL)
+                   OR (SELECT COALESCE(sum(octet_length(k)), 0) FROM unnest(event_keys) k) > 16384
+              THEN ARRAY[repeat('x', 16385)] ELSE event_keys END"
+    };
+}
+
+/// Protocol-error text of a close that refused to expand stored tags it cannot
+/// safely decode (oversized, NULL element, or unsupported array shape).
+pub const ATTENDANCE_STORED_TAGS_UNSUPPORTED: &str = "attendance stored tags exceed budget";
+
+/// True when a [`close_attendance_session`] error is the stored-tags refusal.
+/// Nothing was mutated; the caller closes by id with no tags and must not open
+/// replacement rows from the pre-close read.
+pub fn is_unsupported_stored_tags(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Protocol(message) if message == ATTENDANCE_STORED_TAGS_UNSUPPORTED)
+}
+
 /// Maximum open rows examined or conservatively finalized per recovery turn.
 pub const ATTENDANCE_RECOVERY_PAGE_SIZE: usize = 32;
 /// Maximum candidate windows and tags examined by a transition page.
@@ -127,6 +155,43 @@ pub async fn attendance_recovery_page(
          WHERE guild_id = $1 AND left_at IS NULL AND id > $2 ORDER BY id LIMIT $3",
     )
     .bind(guild_id)
+    .bind(after_id)
+    .bind(ATTENDANCE_RECOVERY_PAGE_SIZE as i64)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, member_id, channel_id)| AttendanceRecoveryRow {
+            id,
+            member_id,
+            channel_id,
+        })
+        .collect())
+}
+
+/// Member-scoped identity-only recovery page: the same bounded SQL as
+/// [`attendance_recovery_page`], limited to one member's open rows in the guild.
+pub async fn attendance_member_recovery_page(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    member_id: &str,
+    after_id: i64,
+) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '900ms'")
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT id,
+                CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE '' END,
+                CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE '' END
+         FROM event_voice_sessions
+         WHERE guild_id = $1 AND member_id = $2 AND left_at IS NULL AND id > $3
+         ORDER BY id LIMIT $4",
+    )
+    .bind(guild_id)
+    .bind(member_id)
     .bind(after_id)
     .bind(ATTENDANCE_RECOVERY_PAGE_SIZE as i64)
     .fetch_all(&mut *tx)
@@ -305,23 +370,20 @@ pub async fn open_attendance_sessions(
     guild_id: &str,
     member_id: &str,
 ) -> Result<Vec<AttendanceSession>, sqlx::Error> {
-    sqlx::query_as::<_, AttendanceSessionRow>(
+    sqlx::query_as::<_, AttendanceSessionRow>(concat!(
         "SELECT id,
                 CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE repeat('x', 21) END,
                 CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE repeat('x', 21) END,
                 CASE WHEN octet_length(channel_name) <= 4096 THEN channel_name ELSE repeat('x', 4097) END,
                 is_bot, afk, joined_at, left_at,
-                CASE WHEN cardinality(event_keys) <= 128 THEN
-                     CASE WHEN EXISTS (SELECT 1 FROM unnest(event_keys) k WHERE k IS NULL)
-                          THEN ARRAY[repeat('x', 16385)] ELSE
-                     CASE WHEN (SELECT COALESCE(sum(octet_length(k)), 0) FROM unnest(event_keys) k) <= 16384
-                          THEN event_keys ELSE ARRAY[repeat('x', 16385)] END END
-                     ELSE ARRAY[repeat('x', 16385)] END,
+                ",
+        bounded_event_keys_sql!(),
+        ",
                 COALESCE(name_observed_at, joined_at)
          FROM event_voice_sessions
          WHERE guild_id = $1 AND member_id = $2 AND left_at IS NULL
-         ORDER BY joined_at, id LIMIT 32",
-    )
+         ORDER BY joined_at, id LIMIT 32"
+    ))
     .bind(guild_id)
     .bind(member_id)
     .fetch_all(pool)
@@ -494,15 +556,11 @@ pub async fn close_attendance_session(
         // Both close paths share the same update and commit state machine.
         None
     } else {
-        let existing: Option<(Vec<String>, OffsetDateTime)> = sqlx::query_as(
-            "SELECT CASE WHEN cardinality(event_keys) <= 128 THEN
-                     CASE WHEN EXISTS (SELECT 1 FROM unnest(event_keys) k WHERE k IS NULL)
-                          THEN ARRAY[repeat('x', 16385)] ELSE
-                         CASE WHEN (SELECT COALESCE(sum(octet_length(k)), 0) FROM unnest(event_keys) k) <= 16384
-                              THEN event_keys ELSE ARRAY[repeat('x', 16385)] END END
-                         ELSE ARRAY[repeat('x', 16385)] END,
-                    joined_at FROM event_voice_sessions WHERE id = $1 AND left_at IS NULL FOR UPDATE",
-        )
+        let existing: Option<(Vec<String>, OffsetDateTime)> = sqlx::query_as(concat!(
+            "SELECT ",
+            bounded_event_keys_sql!(),
+            ", joined_at FROM event_voice_sessions WHERE id = $1 AND left_at IS NULL FOR UPDATE"
+        ))
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -511,7 +569,7 @@ pub async fn close_attendance_session(
         };
         if tags.iter().map(String::len).sum::<usize>() > ATTENDANCE_MAX_TAG_BYTES {
             return Err(sqlx::Error::Protocol(
-                "attendance stored tags exceed budget".into(),
+                ATTENDANCE_STORED_TAGS_UNSUPPORTED.into(),
             ));
         }
         let requested: Vec<String> = event_keys
@@ -663,6 +721,16 @@ impl PgRoomStore {
         after_id: i64,
     ) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
         attendance_recovery_page(self.pool(), guild_id, after_id).await
+    }
+
+    /// [`attendance_member_recovery_page`] over this store's pool.
+    pub async fn attendance_member_recovery_page(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+        after_id: i64,
+    ) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
+        attendance_member_recovery_page(self.pool(), guild_id, member_id, after_id).await
     }
 
     /// [`recover_attendance_sessions`] over this store's pool.

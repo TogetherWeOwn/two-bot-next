@@ -79,6 +79,9 @@ impl AttendanceReadAuthority {
     }
 }
 
+/// Loss metadata is identity/incarnation only, never retained voice frames.
+pub(crate) const ATTENDANCE_LOSS_MEMBERS: usize = 32;
+
 #[derive(Debug, Default)]
 struct AttendanceFenceState {
     epoch: u64,
@@ -86,6 +89,14 @@ struct AttendanceFenceState {
     ready: bool,
     observations: usize,
     loss_generation: u64,
+    lost_members: Vec<(Snowflake, u64)>,
+    saturated: bool,
+}
+
+impl AttendanceFenceState {
+    fn capture_allowed(&self) -> bool {
+        self.ready && self.lost_members.is_empty() && !self.saturated
+    }
 }
 
 /// One guild's read/capture recovery epoch. Gateway interruption invalidates
@@ -120,14 +131,63 @@ impl AttendanceReadFence {
     /// Fence a gateway observation before enqueueing or changing live membership.
     /// Dropping it without acknowledgement records lost continuity, including
     /// capacity refusal and actor termination, without allocating another queue.
-    pub(crate) fn observe(&self) -> AttendanceObservation {
+    pub(crate) fn observe(&self, member: Snowflake) -> AttendanceObservation {
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         state.epoch += 1;
         state.observations += 1;
         AttendanceObservation {
             fence: self.clone(),
+            member,
             acknowledged: false,
         }
+    }
+
+    /// Only an actual actor/gateway discontinuity may clear unknown loss.
+    pub(crate) fn begin_full_recovery(&self) -> AttendanceRecoveryGuard {
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        state.epoch += 1;
+        state.recovery += 1;
+        state.ready = false;
+        state.lost_members.clear();
+        state.saturated = false;
+        AttendanceRecoveryGuard {
+            fence: self.clone(),
+            recovery: state.recovery,
+        }
+    }
+
+    pub(crate) fn capture_allowed(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .capture_allowed()
+    }
+
+    pub(crate) fn next_loss(&self) -> Option<(Snowflake, u64)> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .lost_members
+            .first()
+            .copied()
+    }
+
+    /// Compare incarnations after commit; an older page cannot erase newer loss.
+    pub(crate) fn finish_loss(&self, loss: (Snowflake, u64)) -> bool {
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = state.lost_members.iter().position(|entry| *entry == loss) {
+            state.lost_members.swap_remove(index);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn loss_is_current(&self, loss: (Snowflake, u64)) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .lost_members
+            .contains(&loss)
     }
 
     pub(crate) fn loss_generation(&self) -> u64 {
@@ -139,7 +199,7 @@ impl AttendanceReadFence {
 
     fn ticket(&self) -> Option<AttendanceReadTicket> {
         let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        (state.ready && state.observations == 0).then(|| AttendanceReadTicket {
+        (state.capture_allowed() && state.observations == 0).then(|| AttendanceReadTicket {
             fence: self.clone(),
             epoch: state.epoch,
         })
@@ -150,6 +210,7 @@ impl AttendanceReadFence {
 /// then its retained close continuation; room dispatch never waits on this guard.
 pub(crate) struct AttendanceObservation {
     fence: AttendanceReadFence,
+    member: Snowflake,
     acknowledged: bool,
 }
 
@@ -170,8 +231,19 @@ impl Drop for AttendanceObservation {
         if !self.acknowledged {
             state.loss_generation += 1;
             state.epoch += 1;
-            state.recovery += 1;
-            state.ready = false;
+            let incarnation = state.loss_generation;
+            if let Some(entry) = state
+                .lost_members
+                .iter_mut()
+                .find(|entry| entry.0 == self.member)
+            {
+                entry.1 = incarnation;
+            } else if state.lost_members.len() < ATTENDANCE_LOSS_MEMBERS {
+                state.lost_members.push((self.member, incarnation));
+            } else {
+                // Unknown loss stops capture/publication, never a guild sweep.
+                state.saturated = true;
+            }
         }
     }
 }
@@ -229,13 +301,59 @@ impl AttendanceReadTicket {
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        state.ready && state.observations == 0 && state.epoch == self.epoch
+        state.capture_allowed() && state.observations == 0 && state.epoch == self.epoch
     }
 }
 
 #[cfg(test)]
 mod ingress_fence_tests {
     use super::*;
+
+    #[test]
+    fn member_loss_incarnations_are_bounded_and_saturation_requires_real_recovery() {
+        let fence = AttendanceReadFence::default();
+        let actor = fence.begin_full_recovery();
+        assert!(actor.complete());
+        let ticket = fence.ticket().unwrap();
+        for member in 1..=32 {
+            drop(fence.observe(member));
+        }
+        assert_eq!(
+            fence.inner.lock().unwrap().lost_members.len(),
+            ATTENDANCE_LOSS_MEMBERS
+        );
+        let old_loss = fence.next_loss().unwrap();
+        drop(fence.observe(old_loss.0));
+        assert!(
+            !fence.finish_loss(old_loss),
+            "newer loss survives old completion"
+        );
+        assert_eq!(fence.inner.lock().unwrap().lost_members.len(), 32);
+        drop(fence.observe(33));
+        for member in 34..=1000 {
+            drop(fence.observe(member));
+        }
+        assert_eq!(fence.inner.lock().unwrap().lost_members.len(), 32);
+        assert!(fence.inner.lock().unwrap().saturated);
+        while let Some(loss) = fence.next_loss() {
+            assert!(fence.finish_loss(loss));
+        }
+        assert!(actor.complete());
+        assert!(!fence.capture_allowed(), "drain cannot clear saturation");
+        assert!(fence.ticket().is_none());
+        assert!(!ticket.is_current());
+        let transition = fence.begin_recovery();
+        assert!(transition.complete());
+        assert!(
+            !fence.capture_allowed(),
+            "ordinary close cannot clear saturation"
+        );
+        fence.invalidate();
+        let replacement = fence.begin_full_recovery();
+        assert!(replacement.complete());
+        assert!(fence.capture_allowed());
+        assert!(!ticket.is_current());
+    }
 
     #[test]
     fn all_queued_observations_must_finish_without_reviving_old_tickets() {
@@ -245,8 +363,8 @@ mod ingress_fence_tests {
         let actor = fence.begin_recovery();
         assert!(actor.complete());
         let old = authority.ticket(7).unwrap();
-        let join = fence.observe();
-        let movement = fence.observe();
+        let join = fence.observe(42);
+        let movement = fence.observe(42);
         assert!(!old.is_current());
         assert!(authority.ticket(7).is_none());
         assert!(
@@ -261,10 +379,16 @@ mod ingress_fence_tests {
         movement.acknowledge();
         assert!(authority.ticket(7).unwrap().is_current());
         assert!(!old.is_current());
-        drop(fence.observe());
-        assert!(!actor.complete(), "lost input cancels completion ownership");
-        assert!(authority.ticket(7).is_none());
-        let recovered = fence.begin_recovery();
+        drop(fence.observe(42));
+        assert!(
+            actor.complete(),
+            "member loss does not cancel actor ownership"
+        );
+        assert!(
+            authority.ticket(7).is_none(),
+            "member quarantine fences reads"
+        );
+        let recovered = fence.begin_full_recovery();
         assert!(recovered.complete());
         assert!(authority.ticket(7).unwrap().is_current());
         drop(actor);
@@ -283,6 +407,10 @@ mod ingress_fence_tests {
 /// `two_bot::event_attendance`.
 pub trait AttendanceStore: Send + Sync {
     type Error: std::fmt::Display;
+    /// A second SQL sanitizer can refuse metadata changed after the page read.
+    fn unsupported_stored_tags(_error: &Self::Error) -> bool {
+        false
+    }
     fn attendance_windows(
         &self,
         guild: Snowflake,
@@ -682,9 +810,9 @@ impl AttendanceTransition {
         Ok(())
     }
 
-    async fn advance(
+    async fn advance<S: AttendanceStore>(
         &mut self,
-        store: &impl AttendanceStore,
+        store: &S,
         may_open: impl Fn() -> bool,
     ) -> Result<(), ()> {
         if self.windows.is_none() {
@@ -708,10 +836,10 @@ impl AttendanceTransition {
         }
         let t = &self.transition;
         for _ in 0..CLOSES_PER_TURN {
-            let Some((close, name)) = self.closes.front() else {
+            let Some((close, name)) = self.closes.front_mut() else {
                 break;
             };
-            store
+            if let Err(error) = store
                 .close_attendance_session(
                     close.id,
                     datetime_of(close.left_ms),
@@ -719,7 +847,16 @@ impl AttendanceTransition {
                     &close.tag_union,
                 )
                 .await
-                .map_err(|_| ())?;
+            {
+                if S::unsupported_stored_tags(&error) {
+                    // The row changed shape since planning. Retain the observed
+                    // boundary, but retry by id without expansion or new capture.
+                    close.tag_union.clear();
+                    *name = None;
+                    self.allow_open = false;
+                }
+                return Err(());
+            }
             self.closes.pop_front();
         }
         if !self.closes.is_empty() || !self.rows_exhausted {

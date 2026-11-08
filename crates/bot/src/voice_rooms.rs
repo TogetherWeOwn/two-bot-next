@@ -153,6 +153,7 @@ pub enum StoreError {
     Unavailable,
     CredentialRefused,
     Conflict,
+    AttendanceMetadataUnsupported,
 }
 
 impl std::fmt::Display for StoreError {
@@ -163,6 +164,7 @@ impl std::fmt::Display for StoreError {
             Self::Unavailable => "the store is unavailable",
             Self::CredentialRefused => "the store refused the bot credential",
             Self::Conflict => "the store reported a conflict",
+            Self::AttendanceMetadataUnsupported => "the attendance metadata is unsupported",
         })
     }
 }
@@ -460,6 +462,18 @@ pub trait RoomPersistence: Send + Sync {
         let _ = (guild, after_id);
         async { Ok(Vec::new()) }
     }
+    /// Known observation loss cannot broaden to unrelated guild members.
+    fn attendance_member_recovery_page(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        after_id: i64,
+    ) -> impl Future<
+        Output = Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError>,
+    > + Send {
+        let _ = (guild, member, after_id);
+        async { Err(StoreError::Unavailable) }
+    }
     /// Conservative recovery only: no new rows, tags or inferred leave times.
     fn recover_attendance_sessions(
         &self,
@@ -551,6 +565,9 @@ pub trait RoomPersistence: Send + Sync {
 /// `two_bot::event_attendance`, so it needs no impl.
 impl<T: RoomPersistence> crate::event_attendance::AttendanceStore for T {
     type Error = StoreError;
+    fn unsupported_stored_tags(error: &Self::Error) -> bool {
+        *error == StoreError::AttendanceMetadataUnsupported
+    }
     fn attendance_windows(
         &self,
         guild: Snowflake,
@@ -941,6 +958,17 @@ impl RoomPersistence for PgRoomStore {
             .map_err(store_error)
     }
 
+    async fn attendance_member_recovery_page(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        after_id: i64,
+    ) -> Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError> {
+        self.attendance_member_recovery_page(&guild.to_string(), &member.to_string(), after_id)
+            .await
+            .map_err(store_error)
+    }
+
     async fn recover_attendance_sessions(
         &self,
         guild: Snowflake,
@@ -996,7 +1024,13 @@ impl RoomPersistence for PgRoomStore {
     ) -> Result<u64, StoreError> {
         self.close_attendance_session(id, left_at, channel_name.as_deref(), event_keys)
             .await
-            .map_err(store_error)
+            .map_err(|error| {
+                if two_bot_cutover::event_attendance::is_unsupported_stored_tags(&error) {
+                    StoreError::AttendanceMetadataUnsupported
+                } else {
+                    store_error(error)
+                }
+            })
     }
 
     async fn attendance_sessions_for_event_key(
@@ -1385,7 +1419,7 @@ fn observe_voice_actor_load_failure_kind(guild: Snowflake, error: &str, retrying
 }
 
 /// Fixed token naming a voice admin store failure without its internals.
-/// [`StoreError`] is already bounded to three variants with no driver detail,
+/// [`StoreError`] is already bounded to fixed variants with no driver detail,
 /// so the token is the variant in snake_case: rerun the failing admin command
 /// path for detail.
 fn admin_store_error_token(error: StoreError) -> &'static str {
@@ -1393,6 +1427,7 @@ fn admin_store_error_token(error: StoreError) -> &'static str {
         StoreError::Unavailable => "unavailable",
         StoreError::CredentialRefused => "credential_refused",
         StoreError::Conflict => "conflict",
+        StoreError::AttendanceMetadataUnsupported => "attendance_metadata_unsupported",
     }
 }
 
@@ -9148,7 +9183,7 @@ where
         // A refused send drops the guard and requests conservative recovery.
         let attendance_observation = (previous != channel
             && crate::event_attendance::logger_enabled())
-        .then(|| actor.live.attendance_reads.observe());
+        .then(|| actor.live.attendance_reads.observe(member));
         let command = match actor.live.voice_update_with_occupancy(member, channel, bot) {
             Some((ticket, occupancy_at_join)) => {
                 // Seeding TEST (occupancy-to-join curve): one label-free
@@ -10485,6 +10520,7 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
 struct AttendanceRecovery {
     generation: Option<u64>,
     loss_generation: u64,
+    member_loss: Option<(Snowflake, u64)>,
     pending_observation: Option<crate::event_attendance::AttendanceObservation>,
     after_id: i64,
     resetting: bool,
@@ -10496,13 +10532,12 @@ struct AttendanceRecovery {
 impl AttendanceRecovery {
     fn observe_generation(&mut self, live: &LiveGuild) {
         let state = live.read_state();
-        let loss_generation = live.attendance_reads.loss_generation();
-        if self.generation != Some(state.generation) || self.loss_generation != loss_generation {
+        if self.generation != Some(state.generation) {
             self.generation = Some(state.generation);
-            self.loss_generation = loss_generation;
             self.after_id = 0;
+            self.member_loss = None;
             self.resetting = true;
-            self.fence = Some(live.attendance_reads.begin_recovery());
+            self.fence = Some(live.attendance_reads.begin_full_recovery());
         }
     }
 
@@ -10511,7 +10546,7 @@ impl AttendanceRecovery {
             return false;
         }
         self.observe_generation(live);
-        live.read_state().ready && !self.resetting
+        live.read_state().ready && !self.resetting && live.attendance_reads.capture_allowed()
     }
 
     fn transition_allowed(&mut self, live: &LiveGuild, observed_at: OffsetDateTime) -> bool {
@@ -10526,15 +10561,21 @@ impl AttendanceRecovery {
     ) {
         if self.pending.is_some() {
             // Keep the original close evidence. Later frames still serve the
-            // room lane, but their lost attendance evidence requires a reset.
+            // room lane, but only that member's continuity was lost.
             return;
         }
-        if !transition.enabled || transition.previous == transition.current {
+        if transition.previous == transition.current {
             if let Some(observation) = observation {
                 observation.acknowledge();
             }
             return;
         }
+        if !transition.enabled {
+            // Flag-off ingress carries no guard. A fenced/skipped frame does:
+            // dropping it quarantines its member, without replaying evidence.
+            return;
+        }
+        self.loss_generation = worker.live.attendance_reads.loss_generation();
         self.pending_observation = observation;
         self.fence = Some(worker.live.attendance_reads.begin_recovery());
         self.pending = Some(crate::event_attendance::AttendanceTransition::new(
@@ -10573,15 +10614,84 @@ impl AttendanceRecovery {
                 observation.acknowledge();
             }
             let state = live.read_state();
-            if state.ready
-                && self.generation == Some(state.generation)
-                && self.loss_generation == live.attendance_reads.loss_generation()
-            {
+            if state.ready && self.generation == Some(state.generation) {
                 if let Some(fence) = &self.fence {
                     fence.complete();
                 }
             }
         }
+    }
+
+    async fn turn_member_loss<S: RoomPersistence, H: RoomWrites>(
+        &mut self,
+        worker: &GuildRoomWorker<S, H>,
+        generation: u64,
+    ) {
+        let fence = &worker.live.attendance_reads;
+        if self
+            .member_loss
+            .is_some_and(|loss| !fence.loss_is_current(loss))
+        {
+            self.member_loss = None;
+            self.after_id = 0;
+        }
+        if self.member_loss.is_none() {
+            self.member_loss = fence.next_loss();
+            self.after_id = 0;
+        }
+        let Some(loss) = self.member_loss else { return };
+        let guild = worker.live.guild_id;
+        let after_id = self.after_id;
+        type MemberPageResult = Result<Option<(i64, bool)>, StoreError>;
+        let recover: std::pin::Pin<Box<dyn Future<Output = MemberPageResult> + Send + '_>> =
+            Box::pin(async {
+                let rows = worker
+                    .store
+                    .attendance_member_recovery_page(guild, loss.0, after_id)
+                    .await?;
+                if rows.len() > two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE
+                    || rows.iter().any(|row| row.member_id != loss.0.to_string())
+                {
+                    return Ok::<_, StoreError>(None);
+                }
+                {
+                    let live = worker.live.read_state();
+                    if !live.ready || live.generation != generation {
+                        return Ok(None);
+                    }
+                }
+                // Read at most 32 identities, finalize at most eight rows per turn.
+                let ids: Vec<_> = rows.iter().take(8).map(|row| row.id).collect();
+                worker
+                    .store
+                    .recover_attendance_sessions(guild, &ids)
+                    .await?;
+                Ok(Some((
+                    ids.last().copied().unwrap_or(after_id),
+                    rows.len() <= 8,
+                )))
+            });
+        let result = tokio::time::timeout(Duration::from_millis(1_000), recover).await;
+        if let Ok(Ok(Some((cursor, exhausted)))) = result {
+            let live = worker.live.read_state();
+            if !live.ready || live.generation != generation {
+                return;
+            }
+            if !fence.loss_is_current(loss) {
+                self.member_loss = None;
+                self.after_id = 0;
+                return;
+            }
+            self.after_id = cursor;
+            if exhausted {
+                fence.finish_loss(loss);
+                self.member_loss = None;
+                self.after_id = 0;
+                // Queued observations from the fenced interval are not joins.
+                self.capture_since = Some(OffsetDateTime::now_utc());
+            }
+        }
+        // Failure/cancellation retains the same cursor; no immediate retry.
     }
 
     async fn turn<S: RoomPersistence, H: RoomWrites>(
@@ -10604,7 +10714,11 @@ impl AttendanceRecovery {
             let live = worker.live.read_state();
             (live.generation, live.ready)
         };
-        if !ready || !self.resetting {
+        if !ready {
+            return;
+        }
+        if !self.resetting {
+            self.turn_member_loss(worker, generation).await;
             return;
         }
         let guild = worker.live.guild_id;
