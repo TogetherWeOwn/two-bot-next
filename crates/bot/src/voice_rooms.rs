@@ -10674,55 +10674,6 @@ impl AttendanceRecovery {
         Ok(Some((ids.last().copied().unwrap_or(after_id), exhausted)))
     }
 
-    async fn turn_member_loss<S: RoomPersistence, H: RoomWrites>(
-        &mut self,
-        worker: &GuildRoomWorker<S, H>,
-        generation: u64,
-    ) {
-        let fence = &worker.live.attendance_reads;
-        if self
-            .member_loss
-            .is_some_and(|loss| !fence.loss_is_current(loss))
-        {
-            self.member_loss = None;
-            self.after_id = 0;
-        }
-        if self.member_loss.is_none() {
-            self.member_loss = fence.next_loss();
-            self.after_id = 0;
-        }
-        let Some(loss) = self.member_loss else { return };
-        type RecoveryPageResult = Result<Option<(i64, bool)>, StoreError>;
-        let recover: std::pin::Pin<Box<dyn Future<Output = RecoveryPageResult> + Send + '_>> =
-            Box::pin(Self::recover_page(
-                worker,
-                generation,
-                Some(loss.0),
-                self.after_id,
-            ));
-        let result = tokio::time::timeout(Duration::from_millis(1_000), recover).await;
-        if let Ok(Ok(Some((cursor, exhausted)))) = result {
-            let live = worker.live.read_state();
-            if !live.ready || live.generation != generation {
-                return;
-            }
-            if !fence.loss_is_current(loss) {
-                self.member_loss = None;
-                self.after_id = 0;
-                return;
-            }
-            self.after_id = cursor;
-            if exhausted {
-                fence.finish_loss(loss);
-                self.member_loss = None;
-                self.after_id = 0;
-                // Queued observations from the fenced interval are not joins.
-                self.capture_since = Some(OffsetDateTime::now_utc());
-            }
-        }
-        // Failure/cancellation retains the same cursor; no immediate retry.
-    }
-
     async fn turn<S: RoomPersistence, H: RoomWrites>(
         &mut self,
         worker: &GuildRoomWorker<S, H>,
@@ -10746,40 +10697,72 @@ impl AttendanceRecovery {
         if !ready {
             return;
         }
-        if !self.resetting {
-            self.turn_member_loss(worker, generation).await;
-            return;
-        }
-        let guild = worker.live.guild_id;
-        // Keep recovery SQL state out of the actor's timeout/select layout,
-        // just like a normal transition turn. Cancellation still drops the
-        // entire page future without advancing the retained cursor.
+        let fence = &worker.live.attendance_reads;
+        let loss = if self.resetting {
+            None
+        } else {
+            if self
+                .member_loss
+                .is_some_and(|loss| !fence.loss_is_current(loss))
+            {
+                self.member_loss = None;
+                self.after_id = 0;
+            }
+            if self.member_loss.is_none() {
+                self.member_loss = fence.next_loss();
+                self.after_id = 0;
+            }
+            let Some(loss) = self.member_loss else { return };
+            Some(loss)
+        };
+        // Share one timeout/await state for both scopes. Cancellation drops the
+        // entire page future without advancing either retained cursor.
         type RecoveryPageResult = Result<Option<(i64, bool)>, StoreError>;
         let recover: std::pin::Pin<Box<dyn Future<Output = RecoveryPageResult> + Send + '_>> =
-            Box::pin(Self::recover_page(worker, generation, None, self.after_id));
+            Box::pin(Self::recover_page(
+                worker,
+                generation,
+                loss.map(|loss| loss.0),
+                self.after_id,
+            ));
         let result = tokio::time::timeout(Duration::from_millis(1_000), recover).await;
-        match result {
-            Ok(Ok(Some((after_id, exhausted)))) => {
-                let live = worker.live.read_state();
-                if live.generation != generation
-                    || self.generation != Some(generation)
-                    || !live.ready
-                {
-                    return;
-                }
-                self.after_id = after_id;
-                if exhausted && self.fence.as_ref().is_some_and(|fence| fence.complete()) {
-                    self.after_id = 0;
-                    // Buffered pre-recovery frames are not new evidence;
-                    // never replay their joins into the repaired epoch.
-                    self.capture_since = Some(OffsetDateTime::now_utc());
-                    self.resetting = false;
-                }
+        let Ok(Ok(Some((after_id, exhausted)))) = result else {
+            // No cursor advance on failure/cancellation, including an
+            // uncertain commit. Never retry within the same turn.
+            if loss.is_none() {
+                debug!(
+                    guild = worker.live.guild_id.to_string(),
+                    "attendance recovery deferred"
+                );
             }
-            _ => {
-                // No cursor advance on failure/cancellation; next actor turn
-                // retries the same page, including an uncertain commit.
-                debug!(guild = guild.to_string(), "attendance recovery deferred");
+            return;
+        };
+        let live = worker.live.read_state();
+        if live.generation != generation || self.generation != Some(generation) || !live.ready {
+            return;
+        }
+        if let Some(loss) = loss {
+            if !fence.loss_is_current(loss) {
+                self.member_loss = None;
+                self.after_id = 0;
+                return;
+            }
+            self.after_id = after_id;
+            if exhausted {
+                fence.finish_loss(loss);
+                self.member_loss = None;
+                self.after_id = 0;
+                // Queued observations from the fenced interval are not joins.
+                self.capture_since = Some(OffsetDateTime::now_utc());
+            }
+        } else {
+            self.after_id = after_id;
+            if exhausted && self.fence.as_ref().is_some_and(|fence| fence.complete()) {
+                self.after_id = 0;
+                // Buffered pre-recovery frames are not new evidence;
+                // never replay their joins into the repaired epoch.
+                self.capture_since = Some(OffsetDateTime::now_utc());
+                self.resetting = false;
             }
         }
     }
