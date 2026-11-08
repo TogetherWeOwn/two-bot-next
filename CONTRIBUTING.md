@@ -56,6 +56,29 @@ instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
 
+### Complete PR inventories
+
+`pr-lint` requires the paginated PR files inventory to contain exactly the PR's
+reported `changed_files` entry count before expanding old and new rename paths.
+Empty, truncated, malformed or stale inventories fail closed. GitHub caps this
+API at 3000 files; a legitimately larger same-repository PR uses the existing
+manual validation route instead:
+
+```sh
+gh workflow run supply-chain.yml --ref <pr-head-branch> -f pr_number=<number>
+```
+
+The dispatch must target the exact current head branch/SHA of an open PR in this
+repository targeting `main`. It checks out complete history and derives every
+changed path from a merge-base diff of the immutable PR base/head SHAs, with
+rename detection disabled so both sides of a move reach the gate. Missing
+history or an empty/failed diff fails closed. The gate itself is checked out at
+that same base SHA. All title/body, T0 attestation, secret scanning, review and
+merge requirements still apply; dispatch is validation, not a skip or waiver.
+Fork PRs cannot use this same-repository dispatch route; reduce an oversized
+fork PR into independently reviewable PRs instead. Rerun validation after any
+head/base change; a stale check does not validate a new head.
+
 ### Production merge evidence
 
 The final-stage reviewer squash-merges the settled, exact reviewed head in the
