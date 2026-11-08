@@ -136,6 +136,19 @@ pub struct AttendanceRecoveryRow {
     pub channel_id: String,
 }
 
+// Decode directly into the retained page, without an intermediate tuple vector.
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for AttendanceRecoveryRow {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+
+        Ok(Self {
+            id: row.try_get(0)?,
+            member_id: row.try_get(1)?,
+            channel_id: row.try_get(2)?,
+        })
+    }
+}
+
 /// Read the next bounded recovery page. The cursor advances only after the
 /// corresponding finalization commits; failed pages can be retried safely.
 pub fn attendance_recovery_page<'a>(
@@ -185,7 +198,7 @@ async fn recovery_page(
          FROM event_voice_sessions
          WHERE guild_id = $1 AND left_at IS NULL AND id > $2 ORDER BY id LIMIT $3"
     };
-    let mut query = sqlx::query_as::<_, (i64, String, String)>(sql)
+    let mut query = sqlx::query_as::<_, AttendanceRecoveryRow>(sql)
         .bind(guild_id)
         .bind(after_id)
         .bind(ATTENDANCE_RECOVERY_PAGE_SIZE as i64);
@@ -194,14 +207,7 @@ async fn recovery_page(
     }
     let rows = query.fetch_all(&mut *tx).await?;
     tx.commit().await?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, member_id, channel_id)| AttendanceRecoveryRow {
-            id,
-            member_id,
-            channel_id,
-        })
-        .collect())
+    Ok(rows)
 }
 
 /// Finalize only the supplied bounded page with no inferred offline credit.
