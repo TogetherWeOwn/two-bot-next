@@ -425,7 +425,25 @@ pub async fn insert_attendance_session(
 /// Finalize one open row: stamp `left_at`, refresh the channel name to the
 /// latest the logger saw, and widen the tag union. Only touches open rows;
 /// returns rows closed (0 when the row already closed under a racing write).
-pub async fn close_attendance_session(
+pub fn close_attendance_session<'a>(
+    pool: &'a sqlx::PgPool,
+    id: i64,
+    left_at: OffsetDateTime,
+    channel_name: Option<&'a str>,
+    event_keys: &'a [String],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, sqlx::Error>> + Send + 'a>> {
+    // Keep the transactional state machine out of the store/actor forwards.
+    // Dropping the boxed future still cancels and rolls back the owned transaction.
+    Box::pin(close_attendance_session_inner(
+        pool,
+        id,
+        left_at,
+        channel_name,
+        event_keys,
+    ))
+}
+
+async fn close_attendance_session_inner(
     pool: &sqlx::PgPool,
     id: i64,
     left_at: OffsetDateTime,
