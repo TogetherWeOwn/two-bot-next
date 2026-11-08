@@ -10551,32 +10551,37 @@ impl AttendanceRecovery {
             return;
         }
         let guild = worker.live.guild_id;
-        let result = tokio::time::timeout(Duration::from_millis(1_000), async {
-            let rows = worker
-                .store
-                .attendance_recovery_page(guild, self.after_id)
-                .await?;
-            // A buggy alternate store cannot defeat the per-turn row bound.
-            if rows.len() > two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE {
-                return Ok::<_, StoreError>(None);
-            }
-            let ids: Vec<i64> = {
-                let live = worker.live.read_state();
-                if live.generation != generation || live.ready != ready {
-                    return Ok(None);
+        // Keep recovery SQL state out of the actor's timeout/select layout,
+        // just like a normal transition turn. Cancellation still drops the
+        // entire page future without advancing the retained cursor.
+        type RecoveryPageResult = Result<Option<(i64, usize)>, StoreError>;
+        let recover: std::pin::Pin<Box<dyn Future<Output = RecoveryPageResult> + Send + '_>> =
+            Box::pin(async {
+                let rows = worker
+                    .store
+                    .attendance_recovery_page(guild, self.after_id)
+                    .await?;
+                // A buggy alternate store cannot defeat the per-turn row bound.
+                if rows.len() > two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE {
+                    return Ok::<_, StoreError>(None);
                 }
-                rows.iter().map(|row| row.id).collect()
-            };
-            worker
-                .store
-                .recover_attendance_sessions(guild, &ids)
-                .await?;
-            Ok(Some((
-                rows.last().map(|row| row.id).unwrap_or(self.after_id),
-                rows.len(),
-            )))
-        })
-        .await;
+                let ids: Vec<i64> = {
+                    let live = worker.live.read_state();
+                    if live.generation != generation || live.ready != ready {
+                        return Ok(None);
+                    }
+                    rows.iter().map(|row| row.id).collect()
+                };
+                worker
+                    .store
+                    .recover_attendance_sessions(guild, &ids)
+                    .await?;
+                Ok(Some((
+                    rows.last().map(|row| row.id).unwrap_or(self.after_id),
+                    rows.len(),
+                )))
+            });
+        let result = tokio::time::timeout(Duration::from_millis(1_000), recover).await;
         match result {
             Ok(Ok(Some((after_id, count)))) => {
                 let live = worker.live.read_state();
