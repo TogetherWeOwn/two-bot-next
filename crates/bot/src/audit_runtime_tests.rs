@@ -585,18 +585,28 @@ async fn gateway_legacy_rows_bypass_a_full_diagnostic_queue() {
         )
     })
     .collect();
+    let mut bulk_moderation = event("legacy-bulk-moderation");
+    bulk_moderation.kind = AuditKind::ModerationAction;
+    bulk_moderation.action = Some("message_bulk_delete".to_owned());
+    rows.push(bulk_moderation);
+    let legacy_count = rows.len();
     let mut diagnostic = event("new-diagnostic");
     diagnostic.action = Some("baseline_missing".to_owned());
     rows.push(diagnostic);
+    let mut bulk_diagnostic = event("new-bulk-diagnostic");
+    bulk_diagnostic.kind = AuditKind::MessageDelete;
+    bulk_diagnostic.action = Some("message_bulk_delete".to_owned());
+    rows.push(bulk_diagnostic);
     crate::audit_gateway::record_into(&runtime, &rows).await;
     let store = AuditStore::new(db.pool());
-    for row in &rows[..rows.len() - 1] {
+    for row in &rows[..legacy_count] {
         assert!(store.get(&row.entry_id).await.unwrap().is_some());
     }
     assert!(store.get("new-diagnostic").await.unwrap().is_none());
+    assert!(store.get("new-bulk-diagnostic").await.unwrap().is_none());
     assert_eq!(
         runtime.capture.counts(),
-        (crate::audit_capture::CAPACITY, 1)
+        (crate::audit_capture::CAPACITY, 2)
     );
     assert!(
         mirror.posts().is_empty(),

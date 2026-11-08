@@ -275,8 +275,9 @@ pub(crate) async fn record_into<M: AuditMirror + Clone>(
                 | AuditKind::MemberUpdate
                 | AuditKind::ModerationAction
         ) && !matches!(
-            event.action.as_deref(),
-            Some("baseline_missing" | "message_bulk_delete")
+            (event.kind, event.action.as_deref()),
+            (AuditKind::MemberUpdate, Some("baseline_missing"))
+                | (AuditKind::MessageDelete, Some("message_bulk_delete"))
         );
         if legacy {
             if runtime.record(event).await.is_err() {
