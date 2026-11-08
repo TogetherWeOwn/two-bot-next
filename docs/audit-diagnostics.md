@@ -5,6 +5,11 @@ These diagnostics do not implement a public audit feed, change presentation,
 create a channel, grant permissions, request intents or change retention.
 Channel visibility and the configured audit/voice/moderation destinations remain
 operator-owned. Delivery still refuses a public or foreign-guild destination.
+Rename decisions are automation diagnostics and deliberately target the private
+**audit** destination, like command and other automation observations. The voice
+destination is for join/leave/move boundaries. A voice-only configuration stores
+rename observations without mirroring them; an audit destination is required for
+these operational diagnostics. This change does not reroute or grant a sink.
 
 ## Actual capture coverage
 
@@ -67,8 +72,16 @@ The emitting feature is known, but absent bot identity remains explicitly unknow
 
 ## Bounds, gaps and restart behavior
 
-Producers enqueue without database/REST I/O or per-event spawned tasks. The one
-process-local queue holds at most **256 rows**, each at most **16 KiB** serialized
+Added diagnostic producers enqueue without database/REST I/O or per-event spawned
+tasks. Legacy voice join/leave/move, member deltas, message edit/delete and
+moderation rows retain their prior awaited durable write before the Gateway
+checkpoint; they never compete for diagnostic queue capacity. That legacy path
+can still await connection/storage, and its existing log-and-continue behavior
+on storage failure is not a lossless guarantee. A `baseline_missing` member
+observation is new diagnostic evidence, not a legacy delta, and remains queued.
+This change does not claim that all Gateway recording is nonblocking.
+
+The diagnostic process-local queue holds at most **256 rows**, each at most **16 KiB** serialized
 (about 4 MiB payload maximum). Overflow/oversize drops the incoming row, preserving
 older queued evidence. `audit_capture_gap` warns at power-of-two loss counts;
 `audit_capture_swept` reports recorded/depth/dropped totals. No raw row or error
@@ -80,11 +93,13 @@ sweep with a **5-second total insert deadline**, then uses the existing bounded
 lossless archive: sustained capture above 25 rows per 30 seconds can overflow.
 A failed/uncertain insert keeps the front row for the next sweep. The durable
 entry-ID constraint makes acknowledgement-loss replay idempotent. The halt stops
-delivery, not capture/recording; a failed capture flush reports a database job
-failure and retains the queue.
+delivery, not capture/recording; a failed capture flush retains the queue but
+does not skip the halt read or the existing durable delivery batch. The sweep
+still reports the capture failure to the supervisor after attempting delivery.
+An unreadable halt still refuses delivery, and an engaged halt is never bypassed.
 
-**Admission is not a durable receipt.** A process stop before insertion can lose
-queued rows even after the gateway checkpoint commits. Restart starts an empty
+**Diagnostic admission is not a durable receipt.** A process stop before insertion
+can lose queued diagnostics even after the gateway checkpoint commits. Restart starts an empty
 capture queue and resets its process-local drop counter; no exact restart-loss
 count is claimed. Once inserted, the existing durable nonce/claim/history-marker
 protocol owns retries and restart reconciliation. An uncertain POST is never

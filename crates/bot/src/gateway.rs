@@ -1311,7 +1311,7 @@ fn apply_dispatch<I: InviteSource>(
     }
     if !audit_events.is_empty() {
         let pending = std::mem::take(&mut audit_events);
-        crate::audit_gateway::record_all(&pending);
+        handle.block_on(crate::audit_gateway::record_all(&pending));
     }
     let durable_job = match onboarding_job
         .as_ref()

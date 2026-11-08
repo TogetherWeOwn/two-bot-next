@@ -562,6 +562,40 @@ fn private_command_diagnostics_exclude_options_tokens_names_and_dm() {
     let received =
         crate::audit_changes::command_event(&interaction, "received", "gateway", at).unwrap();
     assert_eq!(received.actor_id.as_deref(), Some("88"));
+    assert_eq!(
+        received.source_channel_id.as_deref(),
+        Some(CHANNEL.to_string().as_str())
+    );
+    let mut channel_object_only: serde_json::Value = serde_json::to_value(&interaction).unwrap();
+    channel_object_only["channel"] = json!({"id": "1234", "type": 0});
+    channel_object_only
+        .as_object_mut()
+        .unwrap()
+        .remove("channel_id");
+    let object_only: Interaction = serde_json::from_value(channel_object_only.clone()).unwrap();
+    assert_eq!(
+        crate::audit_changes::command_event(&object_only, "received", "gateway", at)
+            .unwrap()
+            .source_channel_id
+            .as_deref(),
+        Some("1234")
+    );
+    channel_object_only["channel_id"] = json!(CHANNEL.to_string());
+    let both: Interaction = serde_json::from_value(channel_object_only).unwrap();
+    assert_eq!(
+        crate::audit_changes::command_event(&both, "received", "gateway", at)
+            .unwrap()
+            .source_channel_id
+            .as_deref(),
+        Some("1234")
+    );
+    let no_channel = slash("help", None, vec![]);
+    assert!(
+        crate::audit_changes::command_event(&no_channel, "received", "gateway", at)
+            .unwrap()
+            .source_channel_id
+            .is_none()
+    );
     let body = serde_json::to_string(&received).unwrap();
     assert!(!body.contains("SENTINEL"));
     let reply = crate::audit_changes::command_event(&interaction, "timeout", "finish", at).unwrap();

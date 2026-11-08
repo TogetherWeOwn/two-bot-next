@@ -2,11 +2,13 @@
 //!
 //! [`translate`] runs on the serial dispatch worker before the funnel mutates
 //! the cache: member role/nickname deltas and voice channel boundaries need
-//! the pre-update rows. [`record_all`] admits them to a bounded volatile queue
-//! through the shared [`crate::audit_runtime`] handle. It performs no I/O;
-//! the retry job stores and delivers them. Queue overflow is reported, and a
-//! process loss before the store write can lose rows even after a gateway
+//! the pre-update rows. [`record_all`] preserves the existing durable-before-
+//! checkpoint path for legacy voice/member/message/moderation rows; diagnostic
+//! load cannot evict them. Only added diagnostics enter the bounded volatile
+//! queue through the shared [`crate::audit_runtime`] handle. Queue overflow or
+//! a process loss before insertion can lose those diagnostics after a gateway
 //! checkpoint. Durable rows use replay-stable keys and the existing recovery.
+//! Legacy storage errors still log a scalar and continue, as before.
 //!
 //! Rows carry IDs, counts and flags plus bounded channel name diffs only. Correlation to the in-process
 //! moderation service (the `moderation-success:` rows) lands with the
@@ -18,17 +20,14 @@ use std::sync::OnceLock;
 
 use twilight_cache_inmemory::InMemoryCache;
 use twilight_gateway::Event;
-use two_bot_core::audit::AuditEvent;
-#[cfg(test)]
+use two_bot_core::audit::{AuditEvent, AuditKind};
 use two_bot_core::audit_mirror::AuditMirror;
 use two_bot_core::classify::{
     classify_member_update, classify_moderation_audit, classify_raw_message,
     classify_voice_boundary, MemberDelta, RawAuditLogEntry, RawDispatch, VoiceBoundary,
 };
 
-use crate::audit_runtime::handle;
-#[cfg(test)]
-use crate::audit_runtime::AuditRuntime;
+use crate::audit_runtime::{handle, AuditRuntime};
 
 /// `TWO_MODERATION_AUDIT_SECRET` is a container secret (see
 /// `wrangler/src/container-env.ts` `NOT_FORWARDED`): env-only here, read once
@@ -248,29 +247,40 @@ fn raw_message(
     classify_raw_message(&packet, observed_at)
 }
 
-/// Admit translated rows without I/O. No configured handle is a silent no-op;
-/// bounded admission gaps are counted by the shared capture queue.
-pub(crate) fn record_all(events: &[AuditEvent]) {
+/// Preserve legacy durable recording before the checkpoint; only added
+/// diagnostics use volatile admission. No configured handle is a silent no-op.
+pub(crate) async fn record_all(events: &[AuditEvent]) {
     if events.is_empty() {
         return;
     }
     let Some(runtime) = handle() else {
         return;
     };
-    for event in events {
-        runtime.submit(event.clone());
-    }
+    record_into(&runtime, events).await;
 }
 
-/// Direct durable-record test seam. Production capture is queued and bounded.
-#[cfg(test)]
+/// The production recording policy, with an explicit runtime for tests.
 pub(crate) async fn record_into<M: AuditMirror + Clone>(
     runtime: &AuditRuntime<M>,
     events: &[AuditEvent],
 ) {
     for event in events {
-        if runtime.record(event).await.is_err() {
-            tracing::warn!(entry_id = %event.entry_id, "audit_gateway_store_failed");
+        let legacy = matches!(
+            event.kind,
+            AuditKind::VoiceJoin
+                | AuditKind::VoiceLeave
+                | AuditKind::VoiceMove
+                | AuditKind::MessageEdit
+                | AuditKind::MessageDelete
+                | AuditKind::MemberUpdate
+                | AuditKind::ModerationAction
+        ) && event.action.as_deref() != Some("baseline_missing");
+        if legacy {
+            if runtime.record(event).await.is_err() {
+                tracing::warn!(entry_id = %event.entry_id, "audit_gateway_store_failed");
+            }
+        } else {
+            runtime.submit(event.clone());
         }
     }
 }

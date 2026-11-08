@@ -514,6 +514,103 @@ async fn capture_flush_bounds_batch_replays_ack_loss_and_roundtrips_new_kinds() 
     db.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn gateway_legacy_rows_bypass_a_full_diagnostic_queue() {
+    let Some(db) = database("gateway_legacy_rows_bypass_a_full_diagnostic_queue").await else {
+        return;
+    };
+    let mirror = ScriptMirror::default();
+    let runtime = runtime(db.pool(), &mirror);
+    for id in 0..crate::audit_capture::CAPACITY {
+        let mut row = event(&format!("diagnostic-{id}"));
+        row.kind = AuditKind::ChannelChange;
+        runtime.submit(row);
+    }
+    let mut rows: Vec<_> = [
+        AuditKind::VoiceJoin,
+        AuditKind::VoiceLeave,
+        AuditKind::VoiceMove,
+        AuditKind::MessageEdit,
+        AuditKind::MessageDelete,
+        AuditKind::MemberUpdate,
+        AuditKind::ModerationAction,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(id, kind)| {
+        AuditEvent::new(
+            format!("legacy-{id}"),
+            kind,
+            GUILD.to_owned(),
+            two_bot_core::now_iso(),
+        )
+    })
+    .collect();
+    let mut diagnostic = event("new-diagnostic");
+    diagnostic.action = Some("baseline_missing".to_owned());
+    rows.push(diagnostic);
+    crate::audit_gateway::record_into(&runtime, &rows).await;
+    let store = AuditStore::new(db.pool());
+    for row in &rows[..rows.len() - 1] {
+        assert!(store.get(&row.entry_id).await.unwrap().is_some());
+    }
+    assert!(store.get("new-diagnostic").await.unwrap().is_none());
+    assert_eq!(
+        runtime.capture.counts(),
+        (crate::audit_capture::CAPACITY, 1)
+    );
+    assert!(
+        mirror.posts().is_empty(),
+        "gateway recording never posts to Discord"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_capture_insert_does_not_starve_durable_delivery_or_halt() {
+    let Some(db) = database("failed_capture_insert_does_not_starve_durable_delivery_or_halt").await
+    else {
+        return;
+    };
+    let mirror = ScriptMirror::default();
+    let metrics: &'static Metrics = Box::leak(Box::new(Metrics::default()));
+    let runtime = runtime_with_metrics(db.pool(), &mirror, metrics);
+    record(&runtime, "already-durable").await;
+    sqlx::query("ALTER TABLE operational_audit_log ADD CONSTRAINT reject_capture_poison CHECK (entry_id <> 'capture-poison')")
+        .execute(db.pool()).await.unwrap();
+    runtime.submit(event("capture-poison"));
+    assert!(matches!(runtime.sweep().await, Err(ErrorClass::Database)));
+    assert_eq!(runtime.capture.counts(), (1, 0));
+    assert_eq!(mirror.posts().len(), 1);
+    assert_eq!(
+        AuditStore::new(db.pool())
+            .get("already-durable")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        DeliveryState::Delivered
+    );
+    assert_eq!(halt_gauge(metrics), "two_bot_audit_delivery_halt 0");
+
+    record(&runtime, "halted-durable").await;
+    assert!(AuditStore::new(db.pool())
+        .engage_halt(OPERATOR)
+        .await
+        .unwrap());
+    let calls = mirror.calls();
+    assert!(matches!(runtime.sweep().await, Err(ErrorClass::Database)));
+    assert_eq!(runtime.halted_for_test(), Some(true));
+    assert_eq!(halt_gauge(metrics), "two_bot_audit_delivery_halt 1");
+    assert_eq!(
+        mirror.calls(),
+        calls,
+        "failed capture never bypasses the halt"
+    );
+    assert_eq!(runtime.capture.counts(), (1, 0));
+    db.close().await.unwrap();
+}
+
 #[test]
 fn halt_transitions_cover_engage_disengage_and_clear() {
     // M4.48: the same booleans the sweep feeds to `two_bot_audit_delivery_halt`

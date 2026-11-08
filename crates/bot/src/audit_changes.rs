@@ -319,10 +319,7 @@ pub(crate) fn command_event(
         }),
     );
     event.actor_id = interaction.author_id().map(|id| id.to_string());
-    event.source_channel_id = interaction
-        .channel
-        .as_ref()
-        .map(|channel| channel.id.to_string());
+    event.source_channel_id = crate::command_runtime::interaction_channel(interaction);
     event.entry_id = if phase == "gateway" {
         format!("command:{}:received", interaction.id)
     } else {

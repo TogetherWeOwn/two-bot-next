@@ -543,7 +543,8 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
     }
 
     /// One retry sweep: record a bounded capture batch, then read the halt and
-    /// drain at most one bounded delivery batch.
+    /// drain at most one bounded delivery batch. A capture insert failure is
+    /// reported after delivery, so it cannot starve already-durable rows.
     /// Every readable halt also sets `two_bot_audit_delivery_halt` (1 while
     /// engaged, 0 once cleared) so the kill-switch state is visible to
     /// staleness evaluation; an unreadable halt keeps the last reported
@@ -551,7 +552,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
     pub(crate) async fn sweep(&self) -> Result<Sweep, ErrorClass> {
         let deadline = tokio::time::Instant::now() + (TIMEOUT - CHECKPOINT_RESERVE);
         let wired = self.wired().await?;
-        self.flush_capture(&wired).await?;
+        let capture_result = self.flush_capture(&wired).await;
         let Ok(halt) = wired.store.delivery_halt().await else {
             tracing::warn!(job = JOB, "audit_retry_halt_unreadable");
             return Err(ErrorClass::Database);
@@ -559,7 +560,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
         self.metrics.set_audit_delivery_halt(halt.is_some());
         if self.note_halt(halt.is_some()) {
             tracing::debug!(job = JOB, "audit_retry_halted");
-            return Ok(Sweep::Halted);
+            return capture_result.map(|()| Sweep::Halted);
         }
         let report = wired
             .service
@@ -567,7 +568,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
             .await
             .map_err(|_| ErrorClass::Database)?;
         log_report(&report);
-        Ok(Sweep::Drained(report))
+        capture_result.map(|()| Sweep::Drained(report))
     }
 
     /// Log halt transitions between sweeps; returns `halted`.

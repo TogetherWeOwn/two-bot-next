@@ -805,5 +805,6 @@ async fn record_without_a_handle_continues_silently() {
         AuditKind::VoiceJoin,
         guild_str(),
         AT.to_owned(),
-    )]);
+    )])
+    .await;
 }

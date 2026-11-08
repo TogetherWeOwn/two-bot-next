@@ -205,6 +205,41 @@ mod tests {
     }
 
     #[test]
+    fn rename_diagnostics_target_the_private_audit_sink_not_voice_boundaries() {
+        use two_bot_core::audit::{route_for_sink, AuditChannelIds, SinkRoute};
+        let row = snapshot(RenameSnapshot {
+            guild_id: 1,
+            channel_id: 2,
+            bot_id: Some(3),
+            old_name: None,
+            new_name: "Open seat",
+            human_count: 0,
+            ready: true,
+            generation: 1,
+            reason: "template_reconcile",
+        });
+        let audit = AuditChannelIds {
+            audit: Some("4".to_owned()),
+            voice: Some("5".to_owned()),
+            moderation: None,
+        };
+        assert_eq!(
+            route_for_sink(&row, &audit, &[], Some("1"), true),
+            SinkRoute::Mirror {
+                mirror_channel_id: "4".to_owned()
+            }
+        );
+        let voice_only = AuditChannelIds {
+            audit: None,
+            ..audit
+        };
+        assert_eq!(
+            route_for_sink(&row, &voice_only, &[], Some("1"), true),
+            SinkRoute::StoreOnly
+        );
+    }
+
+    #[test]
     fn unknown_outcomes_never_become_success_and_errors_are_fixed_tokens() {
         for (result, expected) in [
             (Ok(()), "accepted"),
