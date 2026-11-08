@@ -260,6 +260,16 @@ jobs:
                       or head != os.environ["GITHUB_SHA"]
                       or f"refs/heads/{pr['head']['ref']}" != os.environ["GITHUB_REF"]):
                   raise SystemExit("Dispatch ref/SHA must match an open same-repository PR targeting main")
+              # The PR API can retain an old base SHA after main advances.
+              # Capture current main for both the diff and the trusted gate;
+              # the gate checkout equality check still rejects later drift.
+              main = json.loads(subprocess.check_output([
+                  "gh", "api", f"repos/{repo}/git/ref/heads/main",
+              ], text=True))
+              base = main["object"]["sha"]
+              if (main.get("ref") != "refs/heads/main" or main["object"].get("type") != "commit"
+                      or not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base)):
+                  raise SystemExit("Missing or invalid main snapshot SHA")
               diff_repo = str(Path(os.environ["GITHUB_WORKSPACE"]) / "pr-diff")
               if subprocess.check_output(["git", "-C", diff_repo, "rev-parse", "--is-shallow-repository"], text=True).strip() != "false":
                   raise SystemExit("Dispatch requires complete git history")
