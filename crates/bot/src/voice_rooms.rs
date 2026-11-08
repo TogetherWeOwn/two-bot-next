@@ -10596,7 +10596,7 @@ impl AttendanceRecovery {
                     let live = worker.live.read_state();
                     live.ready
                         && generation == Some(live.generation)
-                        && worker.live.attendance_reads.loss_generation() == loss_generation
+                        && worker.live.attendance_reads.may_open(loss_generation)
                 })
                 .await;
         }

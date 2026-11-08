@@ -2388,6 +2388,41 @@ async fn attendance_pending_frame_loss_preserves_closes_but_revokes_replacement_
 }
 
 #[tokio::test(start_paused = true)]
+async fn attendance_loss_between_eligibility_and_record_never_opens_replacement() {
+    for lost in [1, 33] {
+        let (live, store, http, _) = fixture();
+        let authority = crate::event_attendance::AttendanceReadAuthority::default();
+        authority.register(GUILD, live.attendance_reads.clone());
+        let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        let mut recovery = AttendanceRecovery::default();
+        recovery.turn(&worker, true).await;
+        let observed_at = seed_open_attendance(&worker.store, 1);
+        // Use the fixture's stored millisecond precision for the ready boundary.
+        recovery.capture_since = Some(observed_at);
+        let mut movement = attendance_move(observed_at);
+        movement.enabled = recovery.transition_allowed(&worker.live, observed_at);
+        assert!(movement.enabled);
+        // Concurrent ingress loses continuity after eligibility but before the
+        // continuation samples its generation. A matching scalar is not enough.
+        lose_members(&worker, lost);
+        recovery
+            .record(
+                &worker,
+                movement,
+                Some(worker.live.attendance_reads.observe(MEMBER)),
+            )
+            .await;
+        assert!(recovery.pending.is_none());
+        let log = worker.store.attendance_close_log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].1, observed_at);
+        assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+        assert!(authority.ticket(GUILD).is_none());
+        assert!(!recovery.capture_allowed(&worker.live));
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn attendance_unsupported_metadata_close_retries_by_id_without_expansion_or_open() {
     let (live, store, http, _) = fixture();
     let authority = crate::event_attendance::AttendanceReadAuthority::default();

@@ -190,6 +190,15 @@ impl AttendanceReadFence {
             .contains(&loss)
     }
 
+    /// The transition itself holds readiness false; check only continuity at
+    /// its final open boundary, including loss before its baseline was sampled.
+    pub(crate) fn may_open(&self, loss_generation: u64) -> bool {
+        let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        state.loss_generation == loss_generation
+            && state.lost_members.is_empty()
+            && !state.saturated
+    }
+
     pub(crate) fn loss_generation(&self) -> u64 {
         self.inner
             .lock()
