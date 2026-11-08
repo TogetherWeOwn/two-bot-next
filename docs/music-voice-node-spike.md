@@ -162,8 +162,13 @@ no restart, traffic or other exercise authority.
 3. Playback: record actual sustained playback with no dropouts, including UTC
    bounds and duration. Complete the receipt within the 2h maximum investigation;
    neither a short join probe nor elapsed time alone proves sustained playback.
-4. Footprint: sample node CPU, RSS and bytes out at entry, completion and each
-   hourly point due while open; report actual duration and measured GB/hour.
+4. Footprint: retain a timestamped series of node CPU, RSS and bytes-out samples
+   throughout actual playback, including entry, completion and each hourly point
+   due while open. Record sampling cadence, gaps, actual duration and measured
+   GB/hour; report statistics only for the observed samples, not as proof that
+   unsampled peaks were absent. Entry and completion alone are insufficient,
+   including for a run shorter than one hour: missing playback-series evidence
+   stays NEEDS WORK under the existing attempt maximum and cleanup rule.
 
 Pass criteria (all must hold):
 
