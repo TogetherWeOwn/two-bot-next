@@ -284,17 +284,13 @@ fn window_open_ms(starts_ms: i64, ends_ms: i64) -> (i64, i64) {
     )
 }
 
-fn contains_ms(starts_ms: i64, ends_ms: i64, instant_ms: i64) -> bool {
-    let (open, close) = window_open_ms(starts_ms, ends_ms);
-    open <= instant_ms && instant_ms <= close
-}
-
 fn overlaps_ms(starts_ms: i64, ends_ms: i64, from_ms: i64, to_ms: i64) -> bool {
     let (open, close) = window_open_ms(starts_ms, ends_ms);
     open <= to_ms && from_ms <= close
 }
 
 /// Windows overlapping `[from_ms, to_ms]`, keys sorted and deduplicated.
+#[inline(never)]
 fn overlapping_keys(windows: &[AttendanceWindowMs], from_ms: i64, to_ms: i64) -> Vec<String> {
     let mut keys: Vec<String> = windows
         .iter()
@@ -304,6 +300,21 @@ fn overlapping_keys(windows: &[AttendanceWindowMs], from_ms: i64, to_ms: i64) ->
     keys.sort();
     keys.dedup();
     keys
+}
+
+// A join is a zero-width overlap. Share the bounded tag collector with closes,
+// without an intermediate window-reference vector.
+fn plan_open(
+    windows: &[AttendanceWindowMs],
+    previous: Option<Snowflake>,
+    current: Option<Snowflake>,
+    now_ms: i64,
+) -> Option<OpenPlan> {
+    if previous == current || current.is_none() {
+        return None;
+    }
+    let tags = overlapping_keys(windows, now_ms, now_ms);
+    (!tags.is_empty()).then_some(OpenPlan { tags })
 }
 
 /// Decide the writes for one voice transition. Pure over the stored windows,
@@ -331,10 +342,6 @@ pub(crate) fn plan_transition(
     if previous == current {
         return TransitionPlan::default();
     }
-    let open_now: Vec<&AttendanceWindowMs> = windows
-        .iter()
-        .filter(|window| contains_ms(window.starts_ms, window.ends_ms, now_ms))
-        .collect();
     let mut closes = Vec::new();
     for row in open_rows {
         // Only the observed previous channel proves continuity. A shared event
@@ -358,17 +365,7 @@ pub(crate) fn plan_transition(
             tag_union,
         });
     }
-    let open = if current.is_some() && !open_now.is_empty() {
-        let mut tags: Vec<String> = open_now
-            .iter()
-            .map(|window| window.event_key.clone())
-            .collect();
-        tags.sort();
-        tags.dedup();
-        Some(OpenPlan { tags })
-    } else {
-        None
-    };
+    let open = plan_open(windows, previous, current, now_ms);
     TransitionPlan { closes, open }
 }
 
