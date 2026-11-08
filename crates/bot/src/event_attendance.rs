@@ -999,7 +999,7 @@ pub fn project_attendance(
             name_at_close: &row.channel_name,
         })
         .collect();
-    let value = serde_json::to_value(AttendanceResult {
+    let bytes = serde_json::to_vec(&AttendanceResult {
         v: 1,
         event_key,
         window: AttendanceResultWindow {
@@ -1013,11 +1013,11 @@ pub fn project_attendance(
         r#final: now_ms >= close_ms,
     })
     .map_err(|_| AttendanceRefusal::OverBudget)?;
-    let bytes = serde_json::to_vec(&value).map_err(|_| AttendanceRefusal::OverBudget)?;
     if bytes.len() > MAX_ATTENDANCE_RESULT_BYTES {
         return Err(AttendanceRefusal::OverBudget);
     }
-    Ok(value)
+    // Materialize the receiver's Value only after checking the serialized budget.
+    serde_json::from_slice(&bytes).map_err(|_| AttendanceRefusal::OverBudget)
 }
 
 #[cfg(test)]
@@ -1497,6 +1497,23 @@ mod tests {
         let empty = project_attendance("event", &event, &rows, 20 * MIN).unwrap();
         let spare = MAX_ATTENDANCE_RESULT_BYTES - serde_json::to_vec(&empty).unwrap().len();
         rows[0].channel_name = "x".repeat(spare);
+        let exact = project_attendance("event", &event, &rows, 20 * MIN).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&exact).unwrap().len(),
+            MAX_ATTENDANCE_RESULT_BYTES
+        );
+        rows[0].channel_name.push('x');
+        assert_eq!(
+            project_attendance("event", &event, &rows, 20 * MIN),
+            Err(AttendanceRefusal::OverBudget)
+        );
+        // Escaping counts too, and the parsed value preserves the original text.
+        let escaped = "\"\\\n\u{0000}界";
+        rows[0].channel_name = escaped.to_owned();
+        let value = project_attendance("event", &event, &rows, 20 * MIN).unwrap();
+        assert_eq!(value["rooms"][0]["name_at_close"], json!(escaped));
+        rows[0].channel_name = "\"".repeat(spare / 2);
+        rows[0].channel_name.push_str(&"x".repeat(spare % 2));
         let exact = project_attendance("event", &event, &rows, 20 * MIN).unwrap();
         assert_eq!(
             serde_json::to_vec(&exact).unwrap().len(),
