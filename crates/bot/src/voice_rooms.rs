@@ -10730,14 +10730,8 @@ impl AttendanceRecovery {
         };
         // Share one timeout/await state for both scopes. Cancellation drops the
         // entire page future without advancing either retained cursor.
-        type RecoveryPageResult = Result<Option<(i64, bool)>, StoreError>;
-        let recover: std::pin::Pin<Box<dyn Future<Output = RecoveryPageResult> + Send + '_>> =
-            Box::pin(Self::recover_page(
-                worker,
-                generation,
-                loss.map(|loss| loss.0),
-                self.after_id,
-            ));
+        let recover =
+            Self::recover_page(worker, generation, loss.map(|loss| loss.0), self.after_id);
         let result = tokio::time::timeout(Duration::from_millis(1_000), recover).await;
         let Ok(Ok(Some((after_id, exhausted)))) = result else {
             // No cursor advance on failure/cancellation, including an
