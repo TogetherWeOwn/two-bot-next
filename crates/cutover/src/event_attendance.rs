@@ -157,49 +157,60 @@ pub async fn attendance_member_recovery_page(
     recovery_page(pool, guild_id, Some(member_id), after_id).await
 }
 
-// Share transaction/fetch machinery without making the member predicate optional
-// in SQL: known loss must retain its explicit, indexed member scope.
-async fn recovery_page(
-    pool: &sqlx::PgPool,
-    guild_id: &str,
-    member_id: Option<&str>,
+type RecoveryPageFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<Vec<AttendanceRecoveryRow>, sqlx::Error>>
+            + Send
+            + 'a,
+    >,
+>;
+
+// Keep one SQL transaction future behind both scope adapters, without making
+// the indexed member predicate optional in SQL. One allocation per bounded page.
+#[inline(never)]
+fn recovery_page<'a>(
+    pool: &'a sqlx::PgPool,
+    guild_id: &'a str,
+    member_id: Option<&'a str>,
     after_id: i64,
-) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET LOCAL statement_timeout = '900ms'")
-        .execute(&mut *tx)
-        .await?;
-    let sql = if member_id.is_some() {
-        "SELECT id,
-                CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE '' END,
-                CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE '' END
-         FROM event_voice_sessions
-         WHERE guild_id = $1 AND left_at IS NULL AND id > $2 AND member_id = $4
-         ORDER BY id LIMIT $3"
-    } else {
-        "SELECT id,
-                CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE '' END,
-                CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE '' END
-         FROM event_voice_sessions
-         WHERE guild_id = $1 AND left_at IS NULL AND id > $2 ORDER BY id LIMIT $3"
-    };
-    let mut query = sqlx::query_as::<_, (i64, String, String)>(sql)
-        .bind(guild_id)
-        .bind(after_id)
-        .bind(ATTENDANCE_RECOVERY_PAGE_SIZE as i64);
-    if let Some(member_id) = member_id {
-        query = query.bind(member_id);
-    }
-    let rows = query.fetch_all(&mut *tx).await?;
-    tx.commit().await?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, member_id, channel_id)| AttendanceRecoveryRow {
-            id,
-            member_id,
-            channel_id,
-        })
-        .collect())
+) -> RecoveryPageFuture<'a> {
+    Box::pin(async move {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL statement_timeout = '900ms'")
+            .execute(&mut *tx)
+            .await?;
+        let sql = if member_id.is_some() {
+            "SELECT id,
+                    CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE '' END,
+                    CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE '' END
+             FROM event_voice_sessions
+             WHERE guild_id = $1 AND left_at IS NULL AND id > $2 AND member_id = $4
+             ORDER BY id LIMIT $3"
+        } else {
+            "SELECT id,
+                    CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE '' END,
+                    CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE '' END
+             FROM event_voice_sessions
+             WHERE guild_id = $1 AND left_at IS NULL AND id > $2 ORDER BY id LIMIT $3"
+        };
+        let mut query = sqlx::query_as::<_, (i64, String, String)>(sql)
+            .bind(guild_id)
+            .bind(after_id)
+            .bind(ATTENDANCE_RECOVERY_PAGE_SIZE as i64);
+        if let Some(member_id) = member_id {
+            query = query.bind(member_id);
+        }
+        let rows = query.fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, member_id, channel_id)| AttendanceRecoveryRow {
+                id,
+                member_id,
+                channel_id,
+            })
+            .collect())
+    })
 }
 
 /// Finalize only the supplied bounded page with no inferred offline credit.
