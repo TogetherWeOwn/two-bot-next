@@ -635,6 +635,13 @@ impl Occurrence<'_> {
         reason: Option<&str>,
         audit_failed: &mut bool,
     ) {
+        crate::audit_actions::record(
+            crate::audit_actions::Family::Scheduled,
+            &self.row.guild_id,
+            Some(&self.row.channel_id),
+            &self.row.id,
+            outcome.audit_outcome(),
+        );
         let input = ScheduledAuditInput {
             guild_id: self.row.guild_id.clone(),
             actor_id: None,

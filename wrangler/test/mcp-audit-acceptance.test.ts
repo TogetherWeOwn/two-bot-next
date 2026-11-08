@@ -163,7 +163,7 @@ test("get_audit accepts mixed legacy and diagnostics without allowing private me
     ["role_change", "role_create"], ["role_change", "role_update"], ["role_change", "role_delete"],
     ["guild_change", "guild_update"], ["member_join", "member_join"], ["member_join", "bot_add"],
     ["member_leave", "member_leave"], ["member_update", "baseline_missing"],
-    ["command_action", "command"], ["automation_action", "voice_room_rename"],
+    ["command_action", "command"], ["automation_action", "voice_room_rename"], ["automation_action", "automation"],
     ["message_delete", "message_bulk_delete"],
   ];
   const rows = [AUDIT_ROWS[0]!, ...diagnosticActions.map(([kind, action], index) => ({

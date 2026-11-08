@@ -817,6 +817,13 @@ async fn audit(
     reason: &str,
     error: &mut Option<ErrorClass>,
 ) {
+    crate::audit_actions::record(
+        crate::audit_actions::Family::Feed,
+        &feed.guild_id,
+        Some(&feed.channel_id),
+        &feed.id,
+        outcome,
+    );
     if store::write_audit(
         pool,
         &FeedAudit {

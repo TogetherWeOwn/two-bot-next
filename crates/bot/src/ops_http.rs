@@ -479,6 +479,7 @@ impl AuditRow {
                             | "bot_add"
                             | "command"
                             | "voice_room_rename"
+                            | "automation"
                     )
             })
     }
@@ -590,6 +591,7 @@ mod tests {
             ("member_update", "baseline_missing"),
             ("command_action", "command"),
             ("automation_action", "voice_room_rename"),
+            ("automation_action", "automation"),
             ("message_delete", "message_bulk_delete"),
         ] {
             let mut row = audit_row();
@@ -599,7 +601,7 @@ mod tests {
         }
         let excerpt = AuditExcerpt::bounded(rows);
         assert!(excerpt.available);
-        assert_eq!(excerpt.rows.len(), 14);
+        assert_eq!(excerpt.rows.len(), 15);
         assert!(!excerpt.truncated);
         let body = serde_json::to_value(&excerpt).unwrap();
         for row in body["rows"].as_array().unwrap() {

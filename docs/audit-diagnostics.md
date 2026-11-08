@@ -18,16 +18,21 @@ operator-owned. Delivery still refuses a public or foreign-guild destination.
 | Guild update | guild/owner IDs, verification/MFA/filter levels, system flags/name-changed flag | No guild name, description, vanity URL or other free-form text. |
 | Message update/delete/bulk delete | message/channel IDs or bulk count | No content, attachments, URLs, embeds, audio or DMs. |
 | Application command interaction | interaction and command IDs; invoker; received phase | No command options, command text, component IDs, interaction tokens or user display names. A received command is not proof of execution. |
-| Shared command-runtime defer/answer/finish | reply phase and bounded accepted/error class | Delivery/dispatch diagnostics only, not business-success assertions. Other responder implementations and prefix-command decisions are not covered by these reply hooks. |
+| Shared command runtime | router selection/refusal/ignore/unknown; defer/answer/finish; channel/LFG handler return | Delivery/dispatch diagnostics only, not business-success assertions. A handler returning without error is not proof of a mutation. Other responder implementations and prefix-command decisions are not covered by these reply hooks. |
+| Scheduled sends, feed polls, sticky reposts | minimized outcome at the existing feature audit boundary | Channel ID, fixed family/outcome and entity-ID digest only; no body, source URL or free-text reason. Scheduled retry/uncertainty/stale/cleanup outcomes remain distinct. Poll result means the poll completed, not that every item posted. The observation precedes the feature-ledger write and does not prove that write succeeded. No extra work is scheduled. |
 | Voice-room rename worker | decision, attempt and result | Old/requested channel names, reason class, human count, readiness/generation evidence, UTC and per-attempt correlation. Rate limits, deferred/unknown outcomes and refused requests remain distinct. Detached completion records its outcome even if the actor's result channel closes. |
 | Discord audit-log event | existing 14 moderation types plus guild update, channel create/delete, bot add, role create/update/delete | Uses the recorded executor when present. Channel-name diffs only for channel actions; free-form reasons are not retained. No audit polling or extra permission request. |
 
 Audit-log events require Discord to deliver them under the existing intent and
 `VIEW_AUDIT_LOG` grant. No delivery is invented when access is absent. Unsupported
 families include threads/stages/invites/webhooks/integrations, message-create
-content, and uninstrumented feed/scheduled/internal-action decision paths. A
-bot action may have a separate Discord audit entry where Discord supports one;
-that is not comprehensive internal decision coverage.
+content, internal-action and prefix-command decision paths, and other automation
+families (for example giveaway, onboarding and self-role maintenance). Scheduled,
+feed and sticky observations cover their existing audit boundaries only: pre-audit
+DB errors, silent holds/no-ops and cancellation may leave no outcome row. Feed
+summaries deliberately omit per-item bodies/URLs and aggregate text; a poll-result
+row is not a per-item receipt. A bot action may have a separate Discord audit entry
+where Discord supports one; that is not comprehensive internal decision coverage.
 
 ## Attribution, time and correlation
 
@@ -54,6 +59,11 @@ numbers in the same session reuse that identity even when receipt time changes;
 a new session or rapid later change has a distinct identity. Audit-log IDs and
 interaction IDs keep their intrinsic dedupe keys. Each reply/rename attempt has
 its own correlation identity so failures and retries are not coalesced away.
+Automation boundary observations use independent IDs; an opaque entity-ID digest
+lets private readers group one schedule/feed/channel without retaining raw keys.
+This is not a durable occurrence ID or replay fence: repeated audit callbacks can
+produce repeated observations, and a restart cannot reconstruct missing callbacks.
+The emitting feature is known, but absent bot identity remains explicitly unknown.
 
 ## Bounds, gaps and restart behavior
 

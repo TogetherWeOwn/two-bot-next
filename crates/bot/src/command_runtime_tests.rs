@@ -503,6 +503,48 @@ fn lfg_select(values: Vec<String>) -> Interaction {
 }
 
 #[test]
+fn private_command_routing_diagnostics_do_not_promote_dispatch_to_business_success() {
+    use two_bot_core::{HandlerId, SlashOutcome};
+    use two_bot_discord::RoutedInteraction;
+    for (outcome, expected) in [
+        (
+            SlashOutcome::Handled {
+                handler: HandlerId::Help,
+            },
+            "handler_selected",
+        ),
+        (
+            SlashOutcome::Refuse {
+                refusal: RouterRefusal::GuildRestricted,
+            },
+            "router_refused",
+        ),
+        (SlashOutcome::Unknown, "unknown_command"),
+        (SlashOutcome::Ignore, "ignored"),
+    ] {
+        let routed = RoutedInteraction::Slash {
+            name: "PRIVATE NAME SENTINEL".to_owned(),
+            outcome,
+        };
+        assert_eq!(super::command_route_outcome(&routed), expected);
+        let row = crate::audit_changes::command_event(
+            &slash("help", Some(CHANNEL), vec![]),
+            super::command_route_outcome(&routed),
+            "router",
+            "2026-11-08T00:00:00.000Z",
+        )
+        .unwrap();
+        assert!(row.metadata_json.contains(expected));
+        assert!(row.metadata_json.contains("not_business_success"));
+        assert!(!row.metadata_json.contains("SENTINEL"));
+    }
+    assert_eq!(
+        super::command_route_outcome(&RoutedInteraction::Ignore),
+        "not_a_slash_route"
+    );
+}
+
+#[test]
 fn private_command_diagnostics_exclude_options_tokens_names_and_dm() {
     let mut interaction = slash(
         "COMMAND NAME SENTINEL",

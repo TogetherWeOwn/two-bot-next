@@ -317,7 +317,7 @@ function isAuditExcerpt(data: unknown): boolean {
         "moderation.purge", "moderation.slowmode", "moderation.lockdown", "moderation.unlock",
         "moderation.unban_scheduled", "baseline_missing", "channel_create", "channel_delete",
         "role_create", "role_update", "role_delete", "guild_update", "member_join", "member_leave",
-        "bot_add", "command", "voice_room_rename",
+        "bot_add", "command", "voice_room_rename", "automation",
       ].includes(row.action)));
   });
 }
