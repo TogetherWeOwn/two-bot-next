@@ -38,6 +38,7 @@ def inline_script(name):
 
 RESOLVE = inline_script("Resolve PR title/body")
 CHECK = inline_script("Check title, body, branch and commits")
+LIST_FILES = inline_script("List changed files")
 TITLE = "chore(main): release 0.2.0"
 BODY = "## Summary\n\nRelease the workspace with synchronized versions.\nPR_EOF\nauthor=dependabot[bot]\n\nFixes #12.\n"
 OVERFLOW_SENTENCE = "This release is too large to preview in the pull request body. View the full release notes here:"
@@ -419,6 +420,170 @@ class PRLintTests(unittest.TestCase):
         commits = json.dumps([{"id": "0123456789abcdef", "message": f"fix(release): repair validation ({TOG}-5)\n\nbody"}])
         output = self.validate({"event": "push", "commits": commits})
         self.assertIn(f"::warning title=Internal reference::Commit 0123456789 holds ticket id {TOG}-5", output)
+
+
+class ChangedFileInventoryTests(unittest.TestCase):
+    def inventory(self, entries, count=None, success=True, event="pull_request",
+                  metadata_overrides=None, after_overrides=None, git_changes=None,
+                  **env_overrides):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            root = Path(tmp)
+            metadata = {
+                "state": "open", "changed_files": len(entries) if count is None else count,
+                "head": {"sha": "a" * 40, "ref": "fix/inventory",
+                         "repo": {"full_name": "TogetherWeOwn/two-bot-next"}},
+                "base": {"sha": "b" * 40, "ref": "main"},
+            }
+            if git_changes is not None:
+                repo = root / "pr-diff"
+                repo.mkdir()
+                def git(*args):
+                    return subprocess.check_output(["git", "-C", str(repo), *args],
+                                                   text=True, stderr=subprocess.PIPE).strip()
+                git("init", "--quiet")
+                git("config", "user.name", "Fixture")
+                git("config", "user.email", "fixture@example.invalid")
+                for changes in git_changes:
+                    for name, content in changes.items():
+                        path = repo / name
+                        if content is None:
+                            path.unlink()
+                        else:
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_text(content)
+                    git("add", "--all")
+                    git("commit", "--quiet", "--allow-empty", "-m", "fixture")
+                metadata["base"]["sha"] = git("rev-parse", "HEAD~1")
+                metadata["head"]["sha"] = git("rev-parse", "HEAD")
+            metadata.update(metadata_overrides or {})
+            after = {**metadata, **(after_overrides or {})}
+            fixture = root / "fixture.json"
+            fixture.write_text(json.dumps({"before": metadata, "after": after,
+                                           "pages": [entries[i:i + 100] for i in range(0, len(entries), 100)] or [[]]}))
+            # Only gh is stubbed. The actual inline step and (on dispatch) git
+            # run as child processes; no GitHub credentials or network are used.
+            gh = root / "gh"
+            gh.write_text("#!/usr/bin/python3\n" + textwrap.dedent('''\
+                import json, pathlib, sys
+                root = pathlib.Path(__file__).parent
+                fixture = json.loads((root / "fixture.json").read_text())
+                with (root / "calls").open("a") as calls:
+                    calls.write(json.dumps(sys.argv[1:]) + "\\n")
+                if "/files?" in sys.argv[2]:
+                    if "--slurp" in sys.argv:
+                        print(json.dumps(fixture["pages"]))
+                    else:
+                        for page in fixture["pages"]:
+                            for entry in page:
+                                for key in ("filename", "previous_filename"):
+                                    if entry.get(key):
+                                        print(entry[key])
+                else:
+                    seen = root / "seen"
+                    print(json.dumps(fixture["after" if seen.exists() else "before"]))
+                    seen.touch()
+                '''))
+            gh.chmod(0o755)
+            output = root / "output"
+            output.touch()
+            env = {"PATH": f"{root}:{os.environ['PATH']}", "PR_NUMBER": "42",
+                   "GITHUB_REPOSITORY": "TogetherWeOwn/two-bot-next", "EVENT_NAME": event,
+                   "EVENT_HEAD_SHA": metadata["head"]["sha"],
+                   "EVENT_BASE_SHA": metadata["base"]["sha"],
+                   "GITHUB_SHA": metadata["head"]["sha"],
+                   "GITHUB_REF": "refs/heads/fix/inventory", "GITHUB_WORKSPACE": tmp,
+                   "GITHUB_OUTPUT": str(output), "RUNNER_TEMP": tmp, **env_overrides}
+            script = root / "list-step"
+            script.write_text(LIST_FILES)
+            command = ([sys.executable, "-I"] if "import json" in LIST_FILES else ["bash"])
+            result = subprocess.run([*command, str(script)], env=env, capture_output=True, text=True)
+            if not success:
+                self.assertNotEqual(result.returncode, 0, "Incomplete inventory passed the gate")
+                self.assertEqual(output.read_text(), "", "Failure must not publish an inventory")
+                return result.stderr
+            self.assertEqual(result.returncode, 0, result.stderr)
+            emitted = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            paths = Path(emitted["changed_files_file"]).read_text().splitlines()
+            calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+            return paths, emitted, calls
+
+    def test_truncated_files_fail_closed(self):
+        entries = [{"filename": f"docs/page-{n}.md"} for n in range(3000)]
+        self.inventory(entries, count=3001, success=False)
+
+    def test_complete_normal_and_exact_api_limit(self):
+        for count in (1, 101, 3000):
+            with self.subTest(count=count):
+                entries = [{"filename": f"docs/page-{n}.md"} for n in range(count)]
+                paths, _, calls = self.inventory(entries)
+                self.assertEqual(paths, [entry["filename"] for entry in entries])
+                self.assertIn("--paginate", calls[1])
+                self.assertIn("--slurp", calls[1])
+
+    def test_entry_count_precedes_rename_expansion(self):
+        entries = [{"filename": "docs/new.md", "previous_filename": "auth/old.rs"},
+                   {"filename": "docs/other.md", "status": "removed"}]
+        paths, _, _ = self.inventory(entries)
+        self.assertEqual(paths, ["docs/new.md", "auth/old.rs", "docs/other.md"])
+        self.inventory(entries, count=3, success=False)
+
+    def test_empty_missing_invalid_and_inconsistent_counts_fail_closed(self):
+        for entries, count in (([], 0), ([], 1), ([{"filename": "a.rs"}], 2),
+                               ([{"filename": "a.rs"}], 0), ([{"filename": "a.rs"}], "1"),
+                               ([{"filename": "a.rs"}], True), ([{"filename": "a.rs"}], -1)):
+            with self.subTest(count=count, entries=entries):
+                self.inventory(entries, count=count, success=False)
+        self.inventory([{"filename": "a.rs"}], metadata_overrides={"changed_files": None}, success=False)
+
+    def test_duplicate_or_unrepresentable_entries_fail_closed(self):
+        for entries in ([{"filename": "a.rs"}] * 2, [{}], [{"filename": ""}],
+                        [{"filename": "auth/a.rs\nother"}], [{"filename": 42}],
+                        [{"filename": "new.rs", "previous_filename": "auth/old.rs\n"}]):
+            with self.subTest(entries=entries):
+                self.inventory(entries, success=False)
+
+    def test_stale_or_changing_inventory_fails_closed(self):
+        entries = [{"filename": "a.rs"}]
+        for overrides in ({"EVENT_HEAD_SHA": "c" * 40}, {"EVENT_BASE_SHA": "c" * 40}):
+            with self.subTest(overrides=overrides):
+                self.inventory(entries, success=False, **overrides)
+        for after in ({"changed_files": 2}, {"head": {"sha": "c" * 40}},
+                      {"base": {"sha": "c" * 40}}):
+            with self.subTest(after=after):
+                self.inventory(entries, after_overrides=after, success=False)
+
+    def test_dispatch_uses_complete_pinned_diff_beyond_api_limit(self):
+        changes = {f"docs/page-{n}.md": str(n) for n in range(3000)}
+        changes["auth/policy.rs"] = "critical change"
+        paths, emitted, calls = self.inventory(
+            [], count=3001, event="workflow_dispatch", git_changes=[{}, changes])
+        self.assertEqual(set(paths), set(changes))
+        self.assertRegex(emitted["base_sha"], r"^[0-9a-f]{40}$")
+        self.assertFalse(any("/files?" in call[1] for call in calls))
+        # The complete diff still feeds the same base-branch T0 floor.
+        metadata = PRLintTests().resolve()
+        output = PRLintTests().validate({**metadata, "changed_files": "\n".join(paths)}, success=False)
+        self.assertIn("::error title=Attestation::", output)
+
+    def test_dispatch_diff_preserves_old_and_new_rename_paths(self):
+        paths, _, _ = self.inventory(
+            [], count=1, event="workflow_dispatch",
+            git_changes=[{"auth/old.rs": "unchanged"},
+                         {"auth/old.rs": None, "docs/new.md": "unchanged"}])
+        self.assertEqual(set(paths), {"auth/old.rs", "docs/new.md"})
+
+    def test_dispatch_rejects_stale_fork_closed_wrong_ref_or_missing_history(self):
+        entries = [{"filename": "a.rs"}]
+        for overrides in ({"GITHUB_SHA": "c" * 40}, {"GITHUB_REF": "refs/heads/other"}):
+            with self.subTest(overrides=overrides):
+                self.inventory(entries, event="workflow_dispatch", success=False, **overrides)
+        for metadata in ({"state": "closed"}, {"head": {"sha": "a" * 40, "ref": "fix/inventory",
+                                                          "repo": {"full_name": "other/fork"}}},
+                         {"base": {"sha": "b" * 40, "ref": "other"}}):
+            with self.subTest(metadata=metadata):
+                self.inventory(entries, event="workflow_dispatch", metadata_overrides=metadata, success=False)
+        self.inventory(entries, event="workflow_dispatch", success=False)
+        self.inventory([], count=1, event="workflow_dispatch", git_changes=[{}, {}], success=False)
 
 
 if __name__ == "__main__":
