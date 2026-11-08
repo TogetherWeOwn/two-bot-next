@@ -38,9 +38,13 @@ No probabilistic actor inference is used, so there is no implicit probable tier.
 An audit entry arriving after a change remains a separate record: proximity,
 matching names or occupancy do not join it to a gateway frame.
 
-Gateway `occurred_at` is the received UTC instant (`clock=gateway_receipt_utc`),
-not a claimed Discord event timestamp. Audit entries use their snowflake's UTC
-instant. A rename result records the result receipt time; its old/new and
+Gateway `occurred_at` normally uses the received UTC instant
+(`clock=gateway_receipt_utc`), not a claimed Discord event timestamp. Message
+edits with a usable Discord edit timestamp retain that timestamp instead
+(`clock=discord_edit_timestamp_utc`); edits without one fall back to receipt time.
+Every Gateway-derived row separately retains `receivedAtUtc`, including delayed
+audit entries, so event and receipt time remain distinguishable. Audit entries
+use their snowflake's UTC instant. A rename result records the result receipt time; its old/new and
 occupancy fields describe the decision snapshot, not a fresh result-time read.
 An accepted REST response is not a subsequent Gateway observation of the name.
 
@@ -90,6 +94,10 @@ units, with mention neutralization, control-character removal and inline-code
 escaping. They appear only in the existing private audit store/mirror, not process
 logs. Channel names can themselves be member-derived; existing access, retention,
 backup and erasure policy still apply. No new public projection is authorized.
+The authenticated operator `/ops/audit` and MCP excerpt accept the new fixed
+kind/action vocabulary but retain their exact eleven-field metadata-free schema.
+Channel names, reasons, occupancy and other private metadata are never loaded by
+that excerpt query; unknown kinds/actions or additional columns still fail closed.
 
 Deterministic fixtures live in `audit_capture.rs`, `audit_changes.rs`,
 `audit_rename.rs`, `audit_gateway_tests.rs`, `audit_runtime_tests.rs` and

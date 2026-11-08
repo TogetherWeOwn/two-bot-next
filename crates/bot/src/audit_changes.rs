@@ -12,19 +12,7 @@ use twilight_model::{
 };
 use two_bot_core::audit::{AuditEvent, AuditKind};
 
-/// Only channel names are intentionally retained as text. Do not reuse this
-/// for member names, topics, command arguments, reasons or remote error text.
-pub(crate) fn channel_name(value: &str) -> String {
-    let value: String = value
-        .chars()
-        .filter(|c| !c.is_control())
-        .map(|c| if c == '`' { ' ' } else { c })
-        .collect();
-    two_bot_core::message_safety::truncate(
-        &two_bot_core::message_safety::neutralize_mentions(&value),
-        100,
-    )
-}
+use crate::audit_rename::channel_name;
 
 fn row(
     kind: AuditKind,
@@ -235,6 +223,7 @@ pub(crate) fn decorate(
     packet: &Event,
     sequence: u64,
     bot_id: Option<&str>,
+    received_at: &str,
 ) {
     let mut metadata: Value =
         serde_json::from_str(&event.metadata_json).unwrap_or_else(|_| json!({}));
@@ -269,8 +258,17 @@ pub(crate) fn decorate(
             "bot",
         _ => "unknown",
     });
+    let edit_timestamp = match packet {
+        Event::MessageUpdate(message) => message
+            .edited_timestamp
+            .map(|stamp| two_bot_core::format_iso_millis(stamp.as_micros().div_euclid(1000))),
+        _ => None,
+    };
+    metadata["receivedAtUtc"] = json!(received_at);
     metadata["clock"] = json!(if audit_log {
         "audit_snowflake_utc"
+    } else if edit_timestamp.as_deref() == Some(event.occurred_at.as_str()) {
+        "discord_edit_timestamp_utc"
     } else {
         "gateway_receipt_utc"
     });
@@ -359,7 +357,7 @@ mod tests {
         let packet = Event::ChannelUpdate(Box::new(ChannelUpdate(channel("After"))));
         let mut events = translate(&packet, &cache, AT, 9);
         assert_eq!(events.len(), 1);
-        decorate(&mut events[0], &packet, 9, None);
+        decorate(&mut events[0], &packet, 9, None, AT);
         let meta: Value = serde_json::from_str(&events[0].metadata_json).expect("metadata");
         assert_eq!(meta["oldName"], "Before");
         assert_eq!(meta["newName"], "After");

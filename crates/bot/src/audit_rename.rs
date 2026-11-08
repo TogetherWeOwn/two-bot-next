@@ -1,11 +1,36 @@
 //! One correlated diagnostic per rename decision/attempt/outcome. Channel
 //! names belong only in the existing private mirror, never tracing output.
 
+use std::sync::OnceLock;
+
 use serde_json::{json, Value};
 use two_bot_core::audit::{AuditEvent, AuditKind};
 use two_bot_discord::voice_rooms::RoomHttpError;
 
-pub(crate) struct RenameSnapshot<'a> {
+static RECORDER: OnceLock<fn(AuditEvent)> = OnceLock::new();
+
+/// Connect shared library voice workers to the binary's existing capture queue.
+/// Installed once at audit-runtime boot; an unconfigured sink stays inert.
+/// The callback must perform bounded admission only, never blocking I/O.
+pub fn install_recorder(record: fn(AuditEvent)) {
+    RECORDER.get_or_init(|| record);
+}
+
+/// Only channel names are intentionally retained as text. Do not reuse this
+/// for member names, topics, command arguments, reasons or remote error text.
+pub fn channel_name(value: &str) -> String {
+    let value: String = value
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if c == '`' { ' ' } else { c })
+        .collect();
+    two_bot_core::message_safety::truncate(
+        &two_bot_core::message_safety::neutralize_mentions(&value),
+        100,
+    )
+}
+
+pub struct RenameSnapshot<'a> {
     pub guild_id: u64,
     pub channel_id: u64,
     pub bot_id: Option<u64>,
@@ -17,7 +42,7 @@ pub(crate) struct RenameSnapshot<'a> {
     pub reason: &'static str,
 }
 
-pub(crate) fn snapshot(input: RenameSnapshot<'_>) -> AuditEvent {
+pub fn snapshot(input: RenameSnapshot<'_>) -> AuditEvent {
     let mut event = AuditEvent::new(
         format!(
             "voice-rename:{}:{}:{:032x}",
@@ -34,8 +59,8 @@ pub(crate) fn snapshot(input: RenameSnapshot<'_>) -> AuditEvent {
     event.source_channel_id = Some(input.channel_id.to_string());
     event.action = Some("voice_room_rename".to_owned());
     event.metadata_json = json!({
-        "oldName": input.old_name.map(crate::audit_changes::channel_name),
-        "newName": crate::audit_changes::channel_name(input.new_name),
+        "oldName": input.old_name.map(channel_name),
+        "newName": channel_name(input.new_name),
         "humanCount": input.human_count,
         "occupancyEvidence": if input.ready { "live_voice_snapshot" } else { "unready_snapshot_not_proof_of_empty" },
         "generation": input.generation, "botReason": input.reason,
@@ -58,8 +83,10 @@ fn with_decision(base: &AuditEvent, decision: &str, retry_after_ms: u64) -> Audi
     event
 }
 
-pub(crate) fn decision(base: &AuditEvent, decision: &str, retry_after_ms: u64) {
-    crate::audit_capture::submit(with_decision(base, decision, retry_after_ms));
+pub fn decision(base: &AuditEvent, decision: &str, retry_after_ms: u64) {
+    if let Some(record) = RECORDER.get() {
+        record(with_decision(base, decision, retry_after_ms));
+    }
 }
 
 fn result_class(result: &Result<(), RoomHttpError>) -> (&'static str, u64) {
@@ -76,7 +103,7 @@ fn result_class(result: &Result<(), RoomHttpError>) -> (&'static str, u64) {
     }
 }
 
-pub(crate) fn outcome(base: &AuditEvent, result: &Result<(), RoomHttpError>) {
+pub fn outcome(base: &AuditEvent, result: &Result<(), RoomHttpError>) {
     let (class, retry) = result_class(result);
     decision(base, class, retry);
 }
@@ -84,6 +111,31 @@ pub(crate) fn outcome(base: &AuditEvent, result: &Result<(), RoomHttpError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_recorder_bridge_delivers_correlated_attempt_and_result() {
+        static ROWS: std::sync::Mutex<Vec<AuditEvent>> = std::sync::Mutex::new(Vec::new());
+        fn record(event: AuditEvent) {
+            // Other voice fixtures may run concurrently in this test binary.
+            if event.entry_id.starts_with("recorder-test-") {
+                ROWS.lock().unwrap().push(event);
+            }
+        }
+        install_recorder(record);
+        let base = AuditEvent::new(
+            "recorder-test-attempt".to_owned(),
+            AuditKind::AutomationAction,
+            "1".to_owned(),
+            two_bot_core::now_iso(),
+        );
+        decision(&base, "attempted", 0);
+        outcome(&base, &Err(RoomHttpError::UnknownOutcome));
+        let rows = ROWS.lock().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].entry_id, "recorder-test-attempt:attempted");
+        assert_eq!(rows[1].entry_id, "recorder-test-attempt:outcome_unknown");
+        assert_eq!(rows[0].guild_id, rows[1].guild_id);
+    }
 
     #[test]
     fn attempt_and_failure_share_names_occupancy_and_correlation_but_not_identity() {

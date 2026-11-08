@@ -303,7 +303,10 @@ function isAuditExcerpt(data: unknown): boolean {
       && snowflake(row.guild_id)
       && nullableIds.every((key) => row[key] === null || snowflake(row[key]))
       && typeof row.occurred_at === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(row.occurred_at)
-      && typeof row.kind === "string" && ["message_edit", "message_delete", "member_update", "voice_join", "voice_leave", "voice_move", "moderation_action"].includes(row.kind)
+      && typeof row.kind === "string" && [
+        "message_edit", "message_delete", "member_update", "voice_join", "voice_leave", "voice_move", "moderation_action",
+        "channel_change", "role_change", "guild_change", "member_join", "member_leave", "command_action", "automation_action",
+      ].includes(row.kind)
       && typeof row.delivery_state === "string" && ["none", "pending", "delivering", "delivered", "quarantined"].includes(row.delivery_state)
       && (row.action === null || (typeof row.action === "string" && [
         "member_kick", "member_prune", "member_ban", "member_unban", "member_update",
@@ -312,7 +315,9 @@ function isAuditExcerpt(data: unknown): boolean {
         "channel_overwrite_update", "channel_overwrite_delete", "moderation.ban",
         "moderation.tempban", "moderation.kick", "moderation.timeout", "moderation.warn",
         "moderation.purge", "moderation.slowmode", "moderation.lockdown", "moderation.unlock",
-        "moderation.unban_scheduled",
+        "moderation.unban_scheduled", "baseline_missing", "channel_create", "channel_delete",
+        "role_create", "role_update", "role_delete", "guild_update", "member_join", "member_leave",
+        "bot_add", "command", "voice_room_rename",
       ].includes(row.action)));
   });
 }

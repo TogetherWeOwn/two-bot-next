@@ -349,6 +349,28 @@ fn voice_join_leave_move_match_legacy_keys() {
 }
 
 #[test]
+fn message_edit_clock_distinguishes_discord_time_from_receipt_fallback() {
+    let cache = build_cache();
+    let received_at = "2026-09-30T00:06:03.000Z";
+    for edited in [Some("00:01:03"), None] {
+        let packet = Event::MessageUpdate(Box::new(
+            twilight_model::gateway::payload::incoming::MessageUpdate(message_inner(10, edited)),
+        ));
+        let rows = translate(&packet, &cache, received_at, 9, "fixture-session");
+        let metadata: serde_json::Value = serde_json::from_str(&rows[0].metadata_json).unwrap();
+        assert_eq!(metadata["receivedAtUtc"], received_at);
+        if edited.is_some() {
+            assert_eq!(rows[0].occurred_at, "2026-09-30T00:01:03.000Z");
+            assert_eq!(metadata["clock"], "discord_edit_timestamp_utc");
+            assert_ne!(rows[0].occurred_at, received_at);
+        } else {
+            assert_eq!(rows[0].occurred_at, received_at);
+            assert_eq!(metadata["clock"], "gateway_receipt_utc");
+        }
+    }
+}
+
+#[test]
 fn raw_message_edit_and_delete_match_core_contracts() {
     let cache = build_cache();
     let message_id = 4_000_000_000_000_000_001;

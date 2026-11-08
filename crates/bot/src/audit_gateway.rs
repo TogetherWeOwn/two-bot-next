@@ -82,7 +82,7 @@ pub(crate) fn translate(
     }
     for row in &mut rows {
         identify_dispatch(row, session_id, sequence);
-        crate::audit_changes::decorate(row, event, sequence, bot_id.as_deref());
+        crate::audit_changes::decorate(row, event, sequence, bot_id.as_deref(), observed_at);
     }
     rows
 }

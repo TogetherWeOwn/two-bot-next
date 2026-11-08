@@ -166,6 +166,7 @@ pub(crate) fn register(context: Arc<Context>, shutdown: watch::Receiver<bool>) -
             Arc::new(runtime)
         })
         .clone();
+    crate::audit_rename::install_recorder(crate::audit_capture::submit);
     Some(retry_job(
         runtime,
         shutdown,
