@@ -422,6 +422,27 @@ class PRLintTests(unittest.TestCase):
         self.assertIn(f"::warning title=Internal reference::Commit 0123456789 holds ticket id {TOG}-5", output)
 
 
+class BaseGateSnapshotTests(unittest.TestCase):
+    def test_base_checkout_must_match_the_inventory_snapshot(self):
+        script = inline_script("Verify base-branch gate snapshot")
+        for expected, actual, success in (("b" * 40, "b" * 40, True),
+                                          ("b" * 40, "c" * 40, False),
+                                          ("", "b" * 40, False),
+                                          ("main", "main", False)):
+            with self.subTest(expected=expected, actual=actual):
+                env = {"GITHUB_WORKSPACE": "/fixture", "EXPECTED_BASE_SHA": expected}
+                with patch.dict(os.environ, env, clear=True), patch(
+                        "subprocess.check_output", return_value=actual + "\n") as git:
+                    if success:
+                        exec(script, {})
+                    else:
+                        with self.assertRaises(SystemExit):
+                            exec(script, {})
+                if git.called:
+                    self.assertEqual(git.call_args.args[0],
+                                     ["git", "-C", "/fixture/base-gate", "rev-parse", "HEAD"])
+
+
 class ChangedFileInventoryTests(unittest.TestCase):
     def inventory(self, entries, count=None, success=True, event="pull_request",
                   metadata_overrides=None, after_overrides=None, git_changes=None,

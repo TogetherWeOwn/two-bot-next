@@ -73,8 +73,11 @@ repository targeting `main`. It checks out complete history and derives every
 changed path from a merge-base diff of the immutable PR base/head SHAs, with
 rename detection disabled so both sides of a move reach the gate. Submodule
 ignore settings cannot hide gitlink changes. Missing history or an empty/failed
-diff fails closed. The gate itself is checked out at
-that same base SHA. All title/body, T0 attestation, secret scanning, review and
+diff fails closed. The gate itself comes from the trusted PR base (or `main`
+for dispatch), and its checked-out commit must match that same inventory base
+SHA before any gate code runs. If `main` advances during collection, rerun
+validation rather than using a different policy snapshot. All title/body,
+T0 attestation, secret scanning, review and
 merge requirements still apply; dispatch is validation, not a skip or waiver.
 Fork PRs cannot use this same-repository dispatch route; reduce an oversized
 fork PR into independently reviewable PRs instead. Rerun validation after any
