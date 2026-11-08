@@ -792,19 +792,16 @@ pub fn project_attendance(
         return Err(AttendanceRefusal::OverBudget);
     }
     let (open_ms, close_ms) = window_open_ms(window.starts_ms, window.ends_ms);
-    let human: Vec<&SessionMs> = sessions.iter().filter(|row| !row.is_bot).collect();
-    if human.is_empty() {
-        return Err(AttendanceRefusal::NoRecord);
-    }
     // Per-member aggregation over window-clamped intervals.
     let mut members: std::collections::BTreeMap<Snowflake, MemberSpans> =
         std::collections::BTreeMap::new();
+    // Borrow the latest observation; clone its name only into the wire value.
     // Name order is independent of join and credit-capped leave times.
-    let mut rooms: std::collections::BTreeMap<Snowflake, (i128, String)> =
+    let mut rooms: std::collections::BTreeMap<Snowflake, &SessionMs> =
         std::collections::BTreeMap::new();
     // Sweep events for the peak: (instant, delta), ends before starts.
     let mut sweep: Vec<(i64, i32)> = Vec::new();
-    for row in &human {
+    for row in sessions.iter().filter(|row| !row.is_bot) {
         let end_ms = row.left_ms.unwrap_or(now_ms.min(close_ms));
         let from_ms = row.joined_ms.max(open_ms);
         let to_ms = end_ms.min(close_ms);
@@ -816,11 +813,9 @@ pub fn project_attendance(
         });
         entry.sessions += 1;
         entry.first_joined_ms = entry.first_joined_ms.min(row.joined_ms);
-        let room = rooms
-            .entry(row.channel_id)
-            .or_insert((i128::MIN, String::new()));
-        if row.name_observed_ns >= room.0 {
-            *room = (row.name_observed_ns, row.channel_name.clone());
+        let room = rooms.entry(row.channel_id).or_insert(row);
+        if row.name_observed_ns >= room.name_observed_ns {
+            *room = row;
         }
         if from_ms < to_ms {
             entry.intervals.push((from_ms, to_ms));
@@ -828,6 +823,9 @@ pub fn project_attendance(
                 entry.non_afk_intervals.push((from_ms, to_ms));
             }
         }
+    }
+    if members.is_empty() {
+        return Err(AttendanceRefusal::NoRecord);
     }
     let wire_members: Vec<Value> = members
         .into_iter()
@@ -857,10 +855,10 @@ pub fn project_attendance(
     }
     let wire_rooms: Vec<Value> = rooms
         .into_iter()
-        .map(|(channel_id, (_, name))| {
+        .map(|(channel_id, row)| {
             json!({
                 "channel_id": channel_id.to_string(),
-                "name_at_close": name,
+                "name_at_close": row.channel_name,
             })
         })
         .collect();
@@ -907,6 +905,39 @@ mod tests {
         let open = session(3, 7, "Newest", false, false, 45 * MIN, None);
         let result = project_attendance("event", &event, &[a, b, open], 50 * MIN).unwrap();
         assert_eq!(result["rooms"][0]["name_at_close"], "Newest");
+    }
+
+    #[test]
+    fn room_observation_ties_keep_last_human_name_in_channel_order() {
+        let event = window("event", 0, 60 * MIN);
+        let first = session(1, 9, "First", false, false, 0, Some(MIN));
+        let mut last = session(2, 9, "Last", false, false, 0, Some(MIN));
+        last.name_observed_ns = first.name_observed_ns;
+        let low = session(3, 7, "Lower", false, false, 0, Some(MIN));
+        let bot_rename = session(4, 9, "Bot name", true, false, MIN, Some(2 * MIN));
+        let bot_only = session(5, 5, "Bot room", true, false, MIN, Some(2 * MIN));
+        let result = project_attendance(
+            "event",
+            &event,
+            &[
+                first.clone(),
+                low.clone(),
+                last.clone(),
+                bot_rename,
+                bot_only,
+            ],
+            80 * MIN,
+        )
+        .unwrap();
+        assert_eq!(
+            result["rooms"],
+            json!([
+                {"channel_id": "7", "name_at_close": "Lower"},
+                {"channel_id": "9", "name_at_close": "Last"},
+            ])
+        );
+        let reversed = project_attendance("event", &event, &[last, low, first], 80 * MIN).unwrap();
+        assert_eq!(reversed["rooms"][1]["name_at_close"], "First");
     }
 
     #[test]
