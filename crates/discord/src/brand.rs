@@ -16,7 +16,8 @@ pub const BRAND_EMBED_COLOR: u32 = 0xFF0E52;
 ///
 /// The committed original remains the rollback asset; see
 /// `docs/staging-help-embed-smoke.md` for the delivery and rollback contract.
-pub const BRAND_ICON_URL: &str = "https://imagedelivery.net/cNVnKlHCCMxI9vqDkwBbUQ/two-icon1-dark512-4469ca165f03/public";
+pub const BRAND_ICON_URL: &str =
+    "https://imagedelivery.net/cNVnKlHCCMxI9vqDkwBbUQ/two-icon1-dark512-4469ca165f03/public";
 
 /// Footer text shown on bot-authored embeds.
 pub const BRAND_FOOTER_TEXT: &str = "Together We Own";
