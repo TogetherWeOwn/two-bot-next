@@ -585,8 +585,14 @@ async fn gateway_legacy_rows_bypass_a_full_diagnostic_queue() {
         )
     })
     .collect();
-    let mut bulk_moderation = event("legacy-bulk-moderation");
-    bulk_moderation.kind = AuditKind::ModerationAction;
+    // The constructor sets the matching moderation channel family; changing
+    // only the kind on a member-update fixture would be rejected by the store.
+    let mut bulk_moderation = AuditEvent::new(
+        "legacy-bulk-moderation".to_owned(),
+        AuditKind::ModerationAction,
+        GUILD.to_owned(),
+        two_bot_core::now_iso(),
+    );
     bulk_moderation.action = Some("message_bulk_delete".to_owned());
     rows.push(bulk_moderation);
     let legacy_count = rows.len();
@@ -600,7 +606,9 @@ async fn gateway_legacy_rows_bypass_a_full_diagnostic_queue() {
     crate::audit_gateway::record_into(&runtime, &rows).await;
     let store = AuditStore::new(db.pool());
     for row in &rows[..legacy_count] {
-        assert!(store.get(&row.entry_id).await.unwrap().is_some());
+        let stored = store.get(&row.entry_id).await.unwrap();
+        assert!(stored.is_some(), "missing legacy row: {}", row.entry_id);
+        assert_eq!(stored.unwrap().event, *row);
     }
     assert!(store.get("new-diagnostic").await.unwrap().is_none());
     assert!(store.get("new-bulk-diagnostic").await.unwrap().is_none());
