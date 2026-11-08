@@ -143,15 +143,15 @@ fn recovery_rows(
 ) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
     use sqlx::Row;
 
-    rows.iter()
-        .map(|row| {
-            Ok(AttendanceRecoveryRow {
-                id: row.try_get(0)?,
-                member_id: row.try_get(1)?,
-                channel_id: row.try_get(2)?,
-            })
-        })
-        .collect()
+    let mut decoded = Vec::with_capacity(rows.len());
+    for row in rows {
+        decoded.push(AttendanceRecoveryRow {
+            id: row.try_get(0)?,
+            member_id: row.try_get(1)?,
+            channel_id: row.try_get(2)?,
+        });
+    }
+    Ok(decoded)
 }
 
 /// Read the next bounded recovery page. The cursor advances only after the
