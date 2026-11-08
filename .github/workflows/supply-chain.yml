@@ -326,13 +326,32 @@ jobs:
           # neuter attestation_findings) and pass itself with no attestation.
           # Same shape as the gitleaks base-branch policy below: a weakened
           # gate merges first as its own small reviewed PR carrying a T0
-          # attestation, and only then judges others. Both inventory routes
-          # pin this checkout to the base SHA of their validated PR snapshot.
-          ref: ${{ steps.changed.outputs.base_sha }}
+          # attestation, and only then judges others. Dispatch uses the trusted
+          # main ref, never an API-derived checkout ref. Verify its commit below
+          # against the immutable inventory snapshot before running any gate code.
+          ref: ${{ github.event.pull_request.base.sha || 'main' }}
           path: base-gate
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: true
           persist-credentials: false
+
+      - name: Verify base-branch gate snapshot
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_BASE_SHA: ${{ steps.changed.outputs.base_sha }}
+        shell: python3 -I {0}
+        run: |
+          import os, re, subprocess
+
+          expected = os.environ["EXPECTED_BASE_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", expected):
+              raise SystemExit("Missing or invalid inventory base SHA")
+          actual = subprocess.check_output([
+              "git", "-C", os.path.join(os.environ["GITHUB_WORKSPACE"], "base-gate"),
+              "rev-parse", "HEAD",
+          ], text=True).strip()
+          if actual != expected:
+              raise SystemExit("Base-branch gate no longer matches the inventory snapshot; rerun")
 
       - name: Check title, body, branch and commits
         if: github.event_name != 'merge_group'
