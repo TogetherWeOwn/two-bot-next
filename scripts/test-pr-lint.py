@@ -479,7 +479,11 @@ class ChangedFileInventoryTests(unittest.TestCase):
                     git("commit", "--quiet", "--allow-empty", "-m", "fixture")
                 metadata["base"]["sha"] = git("rev-parse", "HEAD~1")
                 metadata["head"]["sha"] = git("rev-parse", "HEAD")
-            metadata.update(metadata_overrides or {})
+            overrides = dict(metadata_overrides or {})
+            # Retain real fixture SHAs when changing only a nested identity field.
+            for key in ("head", "base"):
+                metadata[key].update(overrides.pop(key, {}))
+            metadata.update(overrides)
             after = {**metadata, **(after_overrides or {})}
             entries = [{"status": "modified", **entry} for entry in entries]
             fixture = root / "fixture.json"
@@ -613,18 +617,30 @@ class ChangedFileInventoryTests(unittest.TestCase):
                          {"auth/old.rs": None, "docs/new.md": "unchanged"}])
         self.assertEqual(set(paths), {"auth/old.rs", "docs/new.md"})
 
-    def test_dispatch_rejects_stale_fork_closed_wrong_ref_or_missing_history(self):
-        entries = [{"filename": "a.rs"}]
+    def test_dispatch_rejects_stale_fork_closed_or_wrong_ref(self):
+        fixture = {"entries": [{"filename": "a.rs"}], "event": "workflow_dispatch",
+                   "git_changes": [{}, {"a.rs": "change"}]}
+        paths, _, _ = self.inventory(**fixture)
+        self.assertEqual(paths, ["a.rs"])
+        diagnostic = "Dispatch ref/SHA must match an open same-repository PR targeting main\n"
         for overrides in ({"GITHUB_SHA": "c" * 40}, {"GITHUB_REF": "refs/heads/other"}):
             with self.subTest(overrides=overrides):
-                self.inventory(entries, event="workflow_dispatch", success=False, **overrides)
-        for metadata in ({"state": "closed"}, {"head": {"sha": "a" * 40, "ref": "fix/inventory",
-                                                          "repo": {"full_name": "other/fork"}}},
-                         {"base": {"sha": "b" * 40, "ref": "other"}}):
+                error = self.inventory(**fixture, success=False, **overrides)
+                self.assertEqual(error, diagnostic)
+        for metadata in ({"state": "closed"}, {"head": {"repo": {"full_name": "other/fork"}}},
+                         {"base": {"ref": "other"}}, {"head": {"ref": "other"}}):
             with self.subTest(metadata=metadata):
-                self.inventory(entries, event="workflow_dispatch", metadata_overrides=metadata, success=False)
-        self.inventory(entries, event="workflow_dispatch", success=False)
-        self.inventory([], count=1, event="workflow_dispatch", git_changes=[{}, {}], success=False)
+                error = self.inventory(**fixture, metadata_overrides=metadata, success=False)
+                self.assertEqual(error, diagnostic)
+
+    def test_dispatch_rejects_missing_history_or_empty_diff(self):
+        error = self.inventory(
+            [{"filename": "a.rs"}], event="workflow_dispatch", success=False,
+            git_changes=[{}, {"a.rs": "change"}], metadata_overrides={"base": {"sha": "c" * 40}})
+        self.assertIn("Not a valid commit name", error)
+        error = self.inventory([], count=1, event="workflow_dispatch",
+                               git_changes=[{}, {}], success=False)
+        self.assertEqual(error, "Changed-file diff is empty or malformed\n")
 
 
 if __name__ == "__main__":
