@@ -71,8 +71,9 @@ gh workflow run supply-chain.yml --ref <pr-head-branch> -f pr_number=<number>
 The dispatch must target the exact current head branch/SHA of an open PR in this
 repository targeting `main`. It checks out complete history and derives every
 changed path from a merge-base diff of the immutable PR base/head SHAs, with
-rename detection disabled so both sides of a move reach the gate. Missing
-history or an empty/failed diff fails closed. The gate itself is checked out at
+rename detection disabled so both sides of a move reach the gate. Submodule
+ignore settings cannot hide gitlink changes. Missing history or an empty/failed
+diff fails closed. The gate itself is checked out at
 that same base SHA. All title/body, T0 attestation, secret scanning, review and
 merge requirements still apply; dispatch is validation, not a skip or waiver.
 Fork PRs cannot use this same-repository dispatch route; reduce an oversized

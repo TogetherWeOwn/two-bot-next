@@ -268,7 +268,7 @@ jobs:
               ], text=True).strip()
               raw = subprocess.check_output([
                   "git", "-C", diff_repo, "diff", "--no-ext-diff", "--no-textconv",
-                  "--name-only", "--no-renames", "-z", merge_base, head, "--",
+                  "--ignore-submodules=none", "--name-only", "--no-renames", "-z", merge_base, head, "--",
               ])
               if not raw or not raw.endswith(b"\0"):
                   raise SystemExit("Changed-file diff is empty or malformed")

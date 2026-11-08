@@ -5190,6 +5190,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('len(entries) != count', listed["run"])
         self.assertLess(listed["run"].index('len(entries) != count'),
                         listed["run"].index('entry.get("previous_filename")'))
+        self.assertIn('"--ignore-submodules=none"', listed["run"])
         self.assertIn('"--no-renames", "-z", merge_base, head', listed["run"])
         self.assertIn('"merge-base", base, head', listed["run"])
         self.assertIn('identity(snapshot()) != identity(pr)', listed["run"])
@@ -5198,7 +5199,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(history["uses"].startswith("actions/checkout@"))
         self.assertEqual(history["with"]["ref"], "${{ github.sha }}")
         self.assertEqual(history["with"]["path"], "pr-diff")
-        self.assertEqual(history["with"]["fetch-depth"], 0)
+        self.assertEqual(history["with"]["fetch-depth"], "0")
         self.assertEqual(history["with"]["persist-credentials"], "false")
         self.assertLess(steps.index(history), steps.index(listed))
         check = next(s for s in steps if s.get("name") == "Check title, body, branch and commits")
