@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -173,7 +174,8 @@ class HelpEmbedSmokeTests(unittest.TestCase):
         self.assertIn("BRAND_EMBED_COLOR: u32 = 0xFF0E52", source)
         self.assertEqual(0xFF0E52, EXPECTED["color"])
         self.assertIn(f'BRAND_FOOTER_TEXT: &str = "{EXPECTED["footer_text"]}"', source)
-        self.assertIn(f'BRAND_ICON_URL: &str = "{EXPECTED["icon_url"]}"', source)
+        self.assertRegex(
+            source, rf'BRAND_ICON_URL: &str =\s*"{re.escape(EXPECTED["icon_url"])}";')
 
     def test_both_embeds_post_read_back_assert_and_delete(self):
         fake = FakeDiscord()
