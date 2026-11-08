@@ -10,9 +10,8 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: base-attestation-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+# Native required-workflow runs must not share a cancellation/queuing group
+# with ordinary target runs. The helper refuses stale metadata independently.
 
 jobs:
   metadata:

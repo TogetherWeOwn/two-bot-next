@@ -27,6 +27,7 @@ import tempfile
 import unittest
 from collections import namedtuple
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 GATE_PATH = ROOT / ".github" / "scripts" / "base_attestation_gate.py"
@@ -850,6 +851,10 @@ class Source(unittest.TestCase):
         self.assertEqual(listed, {"opened", "edited", "synchronize", "reopened",
                                   "ready_for_review"})
 
+    def test_required_and_ordinary_runs_cannot_cancel_or_replace_each_other(self):
+        self.assertNotRegex(self.wf, r"(?m)^\s*concurrency:")
+        self.assertNotIn("cancel-in-progress", self.wf)
+
     def test_workflow_permissions_are_read_only(self):
         self.assertRegex(self.wf, r"(?m)^permissions:\s*\{\}\s*$")
         blocks = re.findall(r"^([ ]*)permissions:[ ]*\n((?:\1[ ]+\S[^\n]*\n)+)", self.wf, re.M)
@@ -907,6 +912,42 @@ class Source(unittest.TestCase):
         self.assertNotIn("..", script)
         self.assertIn("--event", rest)
         self.assertRegex(self.wf, r"GH_TOKEN:\s*\$\{\{\s*github\.token\s*\}\}")
+
+
+class HttpBoundary(unittest.TestCase):
+    def test_redirects_are_refused_without_forwarding_credentials(self):
+        with self.assertRaises(gate.GateError):
+            gate.NoRedirect().redirect_request(
+                None, None, 302, "redirect", {}, "https://example.invalid/")
+
+    def test_reader_uses_only_get_with_timeout_and_bounded_read(self):
+        with mock.patch.object(gate, "build_opener"):
+            reader = gate.RestReader(REPO, "synthetic-token")
+            response = reader.opener.open.return_value.__enter__.return_value
+            response.read.return_value = b'{"number":7}'
+            self.assertEqual(reader(PR_ROUTE), {"number": 7})
+            request = reader.opener.open.call_args.args[0]
+            self.assertEqual(request.get_method(), "GET")
+            self.assertEqual(request.full_url, f"https://api.github.com/{PR_ROUTE}")
+            self.assertEqual(reader.opener.open.call_args.kwargs, {"timeout": 30})
+            response.read.assert_called_once_with(gate.MAX_RESPONSE_BYTES + 1)
+            for route in ("https://example.invalid/", f"repos/Other/repo/pulls/7",
+                          f"repos/{REPO}/../other", f"{PR_ROUTE}#suffix"):
+                with self.subTest(route=route), self.assertRaises(gate.GateError):
+                    reader(route)
+            self.assertEqual(reader.opener.open.call_count, 1)
+
+    def test_oversized_and_malformed_responses_fail_with_constant_diagnostics(self):
+        with mock.patch.object(gate, "build_opener"), mock.patch.object(
+                gate, "MAX_RESPONSE_BYTES", 8):
+            reader = gate.RestReader(REPO, "synthetic-token")
+            response = reader.opener.open.return_value.__enter__.return_value
+            for payload in (b"x" * 9, b"not-json"):
+                with self.subTest(payload=payload), self.assertRaises(gate.GateError) as caught:
+                    response.read.return_value = payload
+                    reader(PR_ROUTE)
+                self.assertNotIn("synthetic-token", str(caught.exception))
+                self.assertNotIn(payload.decode(), str(caught.exception))
 
 
 class Cli(unittest.TestCase):

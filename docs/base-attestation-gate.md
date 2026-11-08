@@ -23,9 +23,12 @@ The helper fences the webhook against current PR metadata before and after
 validation: repository identities, number, open state, head/base SHAs and refs,
 author, title, body, update time and changed-file count must match. Its run SHA
 must be the event base SHA and the current `main` tip. A stale event or base
-fails; push or reopen the PR to obtain a fresh qualification. Per-PR concurrency
-cancels superseded runs. These are conservative read fences, not a transaction
-locking GitHub PR metadata until merge.
+fails; push or reopen the PR to obtain a fresh qualification. The workflow has
+no shared concurrency group: ordinary and ruleset-required executions must not
+cancel or replace one another. These are conservative read fences, not a
+transaction locking GitHub PR metadata until merge. GitHub's
+[ruleset concurrency guidance](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/troubleshooting-rules#concurrency)
+requires avoiding cancellation of required workflows.
 
 Fork heads are accepted as metadata, with the same immutable identity checks;
 no access to the fork's contents is needed. A missing or changed head repository
