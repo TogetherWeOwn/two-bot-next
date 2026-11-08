@@ -98,6 +98,9 @@ struct OccupiedRoom {
 #[derive(Debug, Default)]
 pub(crate) struct VoiceOccupancyClock {
     rooms: Mutex<HashMap<(Snowflake, Snowflake), OccupiedRoom>>,
+    /// Move admissions share this always-on gateway observer, not the gated
+    /// voice-room actor. The lock is never held across an await.
+    pub(crate) move_admissions: Mutex<crate::voice_move::VoiceMoveAdmissions>,
 }
 
 impl VoiceOccupancyClock {
@@ -151,6 +154,10 @@ impl VoiceOccupancyClock {
 
 impl two_bot_discord::VoiceTransitionObserver for VoiceOccupancyClock {
     fn observe_voice_transition(&self, transition: two_bot_discord::VoiceTransitionObservation) {
+        self.move_admissions
+            .lock()
+            .expect("voice move admissions")
+            .observe(transition.member_id, transition.current_channel_id);
         if transition.is_bot {
             return;
         }
@@ -597,6 +604,33 @@ mod tests {
         let mut rooms = vec![draft(10, "lobby", Some(0), &[7], false)];
         clock.stamp_rooms(9, &mut rooms);
         assert_eq!(rooms[0].occupied_since, None);
+    }
+
+    #[test]
+    fn move_admissions_reconcile_without_an_intervening_http_read() {
+        use two_bot_discord::VoiceTransitionObserver;
+        let clock = VoiceOccupancyClock::new();
+        clock
+            .move_admissions
+            .lock()
+            .unwrap()
+            .reserve(7, 11)
+            .unwrap();
+        // A stale source observation cannot release an unobserved move.
+        clock.observe_voice_transition(transition(7, None, Some((10, &[7])), None));
+        assert!(clock
+            .move_admissions
+            .lock()
+            .unwrap()
+            .reserve(7, 11)
+            .is_err());
+        clock.observe_voice_transition(transition(7, Some((10, &[])), Some((11, &[7])), None));
+        clock.observe_voice_transition(transition(7, Some((11, &[])), None, None));
+        assert!(clock.move_admissions.lock().unwrap().reserve(7, 11).is_ok());
+        let mut bot = transition(7, None, Some((11, &[])), None);
+        bot.is_bot = true;
+        clock.observe_voice_transition(bot);
+        assert!(clock.move_admissions.lock().unwrap().reserve(7, 11).is_ok());
     }
 
     #[test]

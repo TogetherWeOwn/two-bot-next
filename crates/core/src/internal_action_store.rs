@@ -347,6 +347,15 @@ pub struct VoiceMoveAudit<'a> {
     pub outcome: VoiceMoveOutcome,
 }
 
+/// `key_hash` for a claimless voice move audit. The NUL-delimited prefix keeps
+/// it disjoint from ordinary idempotency identities, whose keys are limited to
+/// alphanumerics and `._:-` and hash as `sha256(key)`: no ordinary key can
+/// reproduce this preimage, so a fresh nonce never collides with a key of the
+/// same text.
+fn voice_audit_key_hash(nonce_hash: &str) -> String {
+    body_hash(format!("voice.move_member\0nonce\0{nonce_hash}").as_bytes())
+}
+
 impl InternalActionStore {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
@@ -656,12 +665,13 @@ impl InternalActionStore {
     /// Claimless audit for one self-only voice move. The intent row starts
     /// `completed` and the log gains a single `terminal` row in the same
     /// transaction: repeats re-evaluate live voice state and converge on the
-    /// `already_in_room` no-op, so there is no claim to replay and no key to
-    /// collide on. `nonce_hash` is the audit key material
-    /// (`AuthDecision.nonce_hash`, `sha256_hex(nonce)`): the nonce burn
-    /// already proved this delivery ran once, and the (caller, nonce)
-    /// conflict below refuses a second write for the same delivery. The
-    /// guild and target are always known after shape validation;
+    /// `already_in_room` no-op, so there is no claim to replay. `nonce_hash`
+    /// (`AuthDecision.nonce_hash`, `sha256_hex(nonce)`) supplies the audit key
+    /// material: the nonce burn proved delivery admission, and the
+    /// (caller, voice-audit key) conflict refuses a second write for it.
+    /// `voice_audit_key_hash` domain-separates the stored identity from
+    /// ordinary idempotency keys, including keys matching the raw nonce.
+    /// The guild and target are always known after shape validation;
     /// `from_channel_id` is `None` exactly when the move never learned it
     /// (member not connected). Returns the intent id for operator tracing.
     pub async fn record_voice_move(
@@ -708,7 +718,7 @@ impl InternalActionStore {
              ON CONFLICT (caller_hash, key_hash) DO NOTHING RETURNING intent_id",
         )
         .bind(body_hash(caller.as_bytes()))
-        .bind(nonce_hash)
+        .bind(voice_audit_key_hash(nonce_hash))
         .bind(body_hash(authenticated_payload))
         .bind(guild_id)
         .bind(member_id)

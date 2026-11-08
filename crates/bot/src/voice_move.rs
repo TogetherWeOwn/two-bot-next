@@ -21,7 +21,7 @@
 //! The guild owner and `ADMINISTRATOR` holders pass every check, exactly like
 //! the moderation resolver.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use twilight_cache_inmemory::DefaultInMemoryCache;
 use two_bot_core::voice_permissions::{
@@ -72,6 +72,7 @@ pub(crate) struct VoiceMoveFacts {
     pub target_occupants: u32,
     pub member_id: Snowflake,
     pub member_roles: Vec<Snowflake>,
+    pub member_timed_out: bool,
     pub bot_id: Snowflake,
     pub bot_roles: Vec<Snowflake>,
 }
@@ -114,7 +115,10 @@ pub(crate) fn decide(facts: &VoiceMoveFacts) -> VoiceMoveDecision {
         None => return VoiceMoveDecision::Incomplete,
     };
     let member_room_bits = PERM_VIEW_CHANNEL | PERM_CONNECT;
-    if member_perms & member_room_bits != member_room_bits {
+    // Timeout removes Connect after overwrites; owner/admin are exempt.
+    if (facts.member_timed_out && member_perms & PERM_ADMINISTRATOR == 0)
+        || member_perms & member_room_bits != member_room_bits
+    {
         return VoiceMoveDecision::Refuse(VoiceMoveOutcome::NotPermitted);
     }
     if facts.target.user_limit > 0 && facts.target_occupants >= facts.target.user_limit {
@@ -223,6 +227,37 @@ pub(crate) fn parse_override(value: &serde_json::Value) -> Option<ChannelOverrid
     })
 }
 
+/// Successful/uncertain PATCH admissions not yet witnessed in the gateway.
+/// The executor holds one guild gate from gathering through PATCH completion.
+/// No time-based expiry can prove a seat free; a bounded full ledger refuses
+/// new effects until gateway observations reconcile it (or the runtime restarts).
+#[derive(Debug, Default)]
+pub(crate) struct VoiceMoveAdmissions {
+    targets: HashMap<Snowflake, Snowflake>,
+}
+
+impl VoiceMoveAdmissions {
+    const LIMIT: usize = 1024;
+
+    pub(crate) fn reserve(&mut self, member: Snowflake, target: Snowflake) -> Result<(), ()> {
+        if self.targets.len() >= Self::LIMIT || self.targets.contains_key(&member) {
+            return Err(());
+        }
+        self.targets.insert(member, target);
+        Ok(())
+    }
+
+    pub(crate) fn release(&mut self, member: Snowflake) {
+        self.targets.remove(&member);
+    }
+
+    pub(crate) fn observe(&mut self, member: Snowflake, channel: Option<Snowflake>) {
+        if channel.is_some_and(|channel| self.targets.get(&member) == Some(&channel)) {
+            self.release(member);
+        }
+    }
+}
+
 /// Read the member's current voice channel and the target room's occupant
 /// count from the shared gateway cache. A loaded guild and channel set plus
 /// enabled voice-state caching must prove the view first: gateway readiness
@@ -235,6 +270,7 @@ pub(crate) fn occupancy(
     guild_id: Snowflake,
     member_id: Snowflake,
     target_id: Snowflake,
+    admissions: &mut VoiceMoveAdmissions,
 ) -> Result<(Option<Snowflake>, u32), ()> {
     use twilight_model::id::{
         marker::{GuildMarker, UserMarker},
@@ -261,17 +297,33 @@ pub(crate) fn occupancy(
     }
     let users: Vec<Id<UserMarker>> = match cache.guild_voice_states(guild) {
         Some(users) => users.iter().copied().collect(),
-        None => return Ok((None, 0)),
+        None => Vec::new(),
     };
     let mut current = None;
     let mut occupants = 0u32;
+    let mut observed = Vec::new();
     for user in &users {
         let state = cache.voice_state(*user, guild).ok_or(())?;
-        if state.channel_id().get() == target_id {
+        let channel = state.channel_id().get();
+        if admissions.targets.get(&user.get()) == Some(&channel) {
+            observed.push(user.get());
+        }
+        if channel == target_id {
             occupants = occupants.saturating_add(1);
         }
         if user.get() == member_id {
-            current = Some(state.channel_id().get());
+            current = Some(channel);
+        }
+    }
+    for member in observed {
+        admissions.release(member);
+    }
+    if admissions.targets.contains_key(&member_id) {
+        return Err(());
+    }
+    for target in admissions.targets.values() {
+        if *target == target_id {
+            occupants = occupants.saturating_add(1);
         }
     }
     Ok((current, occupants))
@@ -323,9 +375,27 @@ mod tests {
             target_occupants: 0,
             member_id: MEMBER,
             member_roles: vec![20],
+            member_timed_out: false,
             bot_id: BOT,
             bot_roles: vec![20],
         }
+    }
+
+    #[test]
+    fn admission_ledger_is_bounded_and_only_observations_release_seats() {
+        let mut admissions = VoiceMoveAdmissions::default();
+        for member in 1..=VoiceMoveAdmissions::LIMIT as u64 {
+            admissions.reserve(member, TARGET).unwrap();
+        }
+        assert!(admissions.reserve(2000, TARGET).is_err());
+        admissions.observe(1, Some(SOURCE));
+        admissions.observe(1, None);
+        assert!(admissions.reserve(2000, TARGET).is_err());
+        admissions.observe(1, Some(TARGET));
+        assert!(admissions.reserve(2000, TARGET).is_ok());
+        admissions.release(2000);
+        assert!(admissions.reserve(2000, TARGET).is_ok());
+        assert!(admissions.reserve(2000, SOURCE).is_err());
     }
 
     #[test]
@@ -419,6 +489,30 @@ mod tests {
             decide(&facts),
             VoiceMoveDecision::Refuse(VoiceMoveOutcome::NotPermitted)
         );
+    }
+
+    #[test]
+    fn timeout_removes_connect_despite_member_allow() {
+        let mut facts = base_facts();
+        facts.member_timed_out = true;
+        facts.target.overwrites.push(ChannelOverride {
+            id: MEMBER,
+            kind: OverrideKind::Member,
+            allow: PERM_CONNECT,
+            deny: 0,
+        });
+        assert_eq!(
+            decide(&facts),
+            VoiceMoveDecision::Refuse(VoiceMoveOutcome::NotPermitted)
+        );
+        facts.member_timed_out = false;
+        assert!(matches!(decide(&facts), VoiceMoveDecision::Proceed { .. }));
+        facts.member_timed_out = true;
+        facts.member_id = facts.guild_owner_id;
+        assert!(matches!(decide(&facts), VoiceMoveDecision::Proceed { .. }));
+        facts.member_id = MEMBER;
+        facts.guild_roles[1].permissions |= PERM_ADMINISTRATOR;
+        assert!(matches!(decide(&facts), VoiceMoveDecision::Proceed { .. }));
     }
 
     #[test]

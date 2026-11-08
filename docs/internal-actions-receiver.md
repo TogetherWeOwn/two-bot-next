@@ -441,7 +441,19 @@ from its authenticated end-user session, never browser input. HMAC binds that
 subject to the body; the one-subject schema does not independently prove consent
 or constrain a compromised signer. The per-member token bucket has burst capacity
 six and continuously refills one token every 50 seconds, not a strict six-move
-rolling window.
+rolling window. Effective member permissions include active timeout state;
+owner/Administrator exemptions follow Discord's permission rules.
+
+One guild admission gate covers fact gathering through PATCH completion. A bounded
+1024-entry ledger counts successful or uncertain moves not yet witnessed by the
+gateway in addition to cached occupants (bots included). The always-on voice
+transition observer reconciles witnessed arrivals even without an HTTP read;
+known no-effect replies release their reservation. There is no timer-based seat
+release. An unresolved member cannot start another move, and a full ledger fails
+closed with retryable `discord_unavailable`. This fences this receiver's admissions,
+not independent Discord joins or moves outside it. An unexplained 400/404 after
+one fresh fact read also answers/audits retryable `discord_unavailable`, not a
+bot-grant diagnosis; proven fresh refusals retain their domain outcome.
 
 The voice response remains synchronous, but receiver-tracked work holds admission
 capacity through terminal audit persistence even if the HTTP handler is cancelled.

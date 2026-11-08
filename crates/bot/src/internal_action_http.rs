@@ -313,6 +313,8 @@ struct VoiceMoveExecutor {
     discord: ActionExecutor,
     voice_cache: Arc<DefaultInMemoryCache>,
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
+    admission_gate: tokio::sync::Mutex<()>,
+    voice_clock: Arc<VoiceOccupancyClock>,
 }
 
 impl VoiceMoveExecutor {
@@ -320,11 +322,14 @@ impl VoiceMoveExecutor {
         discord: ActionExecutor,
         voice_cache: Arc<DefaultInMemoryCache>,
         gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
+        voice_clock: Arc<VoiceOccupancyClock>,
     ) -> Self {
         Self {
             discord,
             voice_cache,
             gateway_state,
+            admission_gate: tokio::sync::Mutex::new(()),
+            voice_clock,
         }
     }
 
@@ -406,8 +411,21 @@ impl VoiceMoveExecutor {
             return Ok(VoiceMoveGathered::early(VoiceMoveOutcome::RoomGone));
         }
         let member_num: Snowflake = member_id.parse().unwrap_or(0);
-        let (current, occupants) = occupancy(&self.voice_cache, guild_num, member_num, target.id)
-            .map_err(|_| fail("voice_move_cache_race"))?;
+        let (current, occupants) = {
+            let mut admissions = self
+                .voice_clock
+                .move_admissions
+                .lock()
+                .map_err(|_| fail("voice_move_admissions_unavailable"))?;
+            occupancy(
+                &self.voice_cache,
+                guild_num,
+                member_num,
+                target.id,
+                &mut admissions,
+            )
+            .map_err(|_| fail("voice_move_cache_race"))?
+        };
         let Some(current) = current else {
             return Ok(VoiceMoveGathered::early(VoiceMoveOutcome::NotConnected));
         };
@@ -424,6 +442,8 @@ impl VoiceMoveExecutor {
             .await?
             .ok_or_else(|| fail("voice_move_member_gone"))?;
         let member_roles = parse_guild_member(&member_value, member_id)
+            .ok_or_else(|| fail("voice_move_member_unreadable"))?;
+        let member_timed_out = member_timed_out(&member_value, now_ms())
             .ok_or_else(|| fail("voice_move_member_unreadable"))?;
         let source_value = self
             .voice_get(&format!("/channels/{current}"))
@@ -452,6 +472,7 @@ impl VoiceMoveExecutor {
                 target_occupants: occupants,
                 member_id: member_num,
                 member_roles,
+                member_timed_out,
                 bot_id,
                 bot_roles,
             }),
@@ -516,6 +537,17 @@ fn parse_guild_member(member: &Value, expect_id: &str) -> Option<Vec<Snowflake>>
         roles.push(id);
     }
     Some(roles)
+}
+
+/// Missing/null means no timeout; a malformed supplied instant is unprovable.
+fn member_timed_out(member: &Value, now_ms: u64) -> Option<bool> {
+    match member.get("communication_disabled_until") {
+        None | Some(Value::Null) => Some(false),
+        Some(value) => {
+            let until = twilight_model::util::Timestamp::parse(value.as_str()?).ok()?;
+            Some(i128::from(until.as_micros()) > i128::from(now_ms) * 1_000)
+        }
+    }
 }
 
 /// One channel with the fields the decision needs. `require_voice` gates the
@@ -605,6 +637,17 @@ impl VoiceMoveEffect for VoiceMoveExecutor {
                         retry_after_secs,
                     }
                 };
+            // This executor serves one configured guild. Serialize only its
+            // admission transaction; successful/uncertain seats remain reserved
+            // after the REST call until the gateway witnesses them.
+            let _gate = tokio::time::timeout(REQUEST_TIMEOUT, self.admission_gate.lock())
+                .await
+                .map_err(|_| {
+                    Self::unavailable(
+                        "voice move admission busy; retryable",
+                        "voice_move_admission_busy",
+                    )
+                })?;
             let gathered = self
                 .gather_facts(guild_id, guild_num, bot_id, member_id, target_id)
                 .await?;
@@ -631,11 +674,45 @@ impl VoiceMoveEffect for VoiceMoveExecutor {
                 }
             }
             let from_string = from(&facts);
-            match self
+            self.voice_clock
+                .move_admissions
+                .lock()
+                .map_err(|_| {
+                    Self::unavailable(
+                        "voice move admissions unavailable; retryable",
+                        "voice_move_admissions_unavailable",
+                    )
+                })?
+                .reserve(facts.member_id, facts.target.id)
+                .map_err(|_| {
+                    Self::unavailable(
+                        "voice move admissions unresolved; retryable",
+                        "voice_move_admissions_full",
+                    )
+                })?;
+            let patch = self
                 .discord
                 .move_voice_member(guild_id, member_id, target_id)
-                .await
+                .await;
+            // Only a definitive no-effect response releases an unobserved seat.
+            // Transport/5xx uncertainty must not admit another member into it.
+            if matches!(
+                &patch,
+                Ok(VoiceMovePatch::Denied | VoiceMovePatch::Limited { .. } | VoiceMovePatch::Stale)
+            ) || matches!(&patch, Err(error) if error.code == ErrorCode::RateLimited)
             {
+                self.voice_clock
+                    .move_admissions
+                    .lock()
+                    .map_err(|_| {
+                        Self::unavailable(
+                            "voice move admissions unavailable; retryable",
+                            "voice_move_admissions_unavailable",
+                        )
+                    })?
+                    .release(facts.member_id);
+            }
+            match patch {
                 Ok(VoiceMovePatch::Moved) => {
                     Ok(receipt_for(VoiceMoveOutcome::Moved, from_string, None))
                 }
@@ -654,10 +731,9 @@ impl VoiceMoveEffect for VoiceMoveExecutor {
                     "voice_move_discord_uncertain",
                 )),
                 Ok(VoiceMovePatch::Stale) => {
-                    // The room raced the PATCH: re-evaluate live state once. A
-                    // refusal then is the fresh answer; a still-proceed means
-                    // the live grant disagrees with the evaluated snapshot, so
-                    // fail closed into `bot_not_permitted` like a denial.
+                    // Re-evaluate once, without retrying the PATCH. A fresh
+                    // refusal is proven; still-Proceed cannot diagnose the
+                    // error (for example a delayed gateway disconnect).
                     let regathered = self
                         .gather_facts(guild_id, guild_num, bot_id, member_id, target_id)
                         .await?;
@@ -674,10 +750,9 @@ impl VoiceMoveEffect for VoiceMoveExecutor {
                         VoiceMoveDecision::Refuse(outcome) => {
                             Ok(receipt_for(outcome, from(&refacts), None))
                         }
-                        VoiceMoveDecision::Proceed { .. } => Ok(receipt_for(
-                            VoiceMoveOutcome::BotNotPermitted,
-                            from(&refacts),
-                            None,
+                        VoiceMoveDecision::Proceed { .. } => Err(VoiceMoveExecutor::unavailable(
+                            "Discord move state changed; retryable",
+                            "voice_move_stale_unexplained",
                         )),
                         VoiceMoveDecision::Incomplete => Err(VoiceMoveExecutor::unavailable(
                             "voice move facts unprovable; retryable",
@@ -1748,6 +1823,7 @@ pub async fn bind(
         voice_discord,
         Arc::clone(&voice_cache),
         Arc::clone(&gateway_state),
+        Arc::clone(&voice_clock),
     );
     let listener = TcpListener::bind(config.listen_addr()).await?;
     Ok(BoundReceiver {

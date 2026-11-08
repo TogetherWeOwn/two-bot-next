@@ -115,9 +115,12 @@ audits keep those columns NULL, exactly like the uncompleted receipt they mirror
 `voice.move_member` verb: the intent row starts `completed` and the log gains
 a single `terminal` row in the same transaction, with no `intent`-phase row.
 Repeats re-evaluate live voice state and converge on the `already_in_room`
-no-op, so there is no claim to replay and no idempotency key to collide on;
-the (caller, nonce) conflict refuses a second write for one delivery. The
-audit key material is `sha256_hex(nonce)` carried on `AuthDecision.nonce_hash`.
+no-op, so there is no claim to replay. The audit identity is domain-separated
+from ordinary idempotency keys: `key_hash` is
+`sha256_hex("voice.move_member\0nonce\0" + AuthDecision.nonce_hash)` (literal
+NUL delimiters), where `nonce_hash` is `sha256_hex(nonce)`. The caller/key
+conflict still refuses a second write for one delivery, while an ordinary key
+and fresh voice nonce with the same raw text can coexist.
 `VoiceMoveOutcome` is the closed nine-word result set (`moved`,
 `already_in_room`, `not_connected`, `not_permitted`, `room_full`,
 `room_gone`, `bot_not_permitted`, `rate_limited`, `discord_unavailable`,

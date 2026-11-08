@@ -2920,6 +2920,106 @@ async fn resolve_event_intent_refuses_invalid_evidence_and_mappings() {
     db.cleanup().await;
 }
 
+/// Independent oracle for the voice audit identity: a NUL-delimited domain
+/// prefix that no ordinary idempotency key (alphanumeric plus `._:-`) can
+/// contain, so the digest cannot equal any ordinary `key_hash`.
+fn voice_audit_key_hash(nonce_hash: &str) -> String {
+    body_hash(format!("voice.move_member\0nonce\0{nonce_hash}").as_bytes())
+}
+
+#[tokio::test]
+async fn voice_move_nonce_coexists_with_same_text_idempotency_key_in_both_orders() {
+    use two_bot_core::internal_actions::{new_request_id, VoiceMoveOutcome};
+
+    let db = TestDb::new().await;
+    let store = db.store();
+    let payload = br#"{"action":"voice.move_member"}"#;
+    let (guild, member) = ("123456789012345678", "100000000000000011");
+    let (source, target) = ("100000000000000012", "100000000000000013");
+    let now_ms = db_now_secs(&db.pool).await as u64 * 1000;
+    // The raw nonce and ordinary key share text. Previously each stored
+    // sha256(text), colliding without any cryptographic hash collision.
+    let shared = "shared-key-and-nonce";
+    let other = "reverse-key-and-nonce";
+    let shared_nonce_hash = body_hash(shared.as_bytes());
+    let other_nonce_hash = body_hash(other.as_bytes());
+    let request_id = new_request_id(now_ms, &[7u8; 16]);
+    let request = request_id.as_str();
+    let voice = |reverse: bool| VoiceMoveAudit {
+        caller: "website",
+        nonce_hash: if reverse {
+            &other_nonce_hash
+        } else {
+            &shared_nonce_hash
+        },
+        authenticated_payload: payload,
+        guild_id: guild,
+        member_id: member,
+        from_channel_id: Some(source),
+        to_channel_id: target,
+        request_id: request,
+        outcome: VoiceMoveOutcome::Moved,
+    };
+    // Ordinary key first, then a fresh voice delivery whose raw nonce has
+    // the same text: both must persist, under different actions.
+    let ordinary = claimed(
+        store
+            .claim(
+                &identity(shared, "guild.add_member", br#"{"a":1}"#),
+                &subject(),
+            )
+            .await
+            .unwrap(),
+    );
+    let voice_id = store.record_voice_move(voice(false)).await.unwrap();
+    assert_ne!(ordinary.intent_id(), voice_id);
+    // Voice first, then an ordinary claim with the same text.
+    let voice_first = store.record_voice_move(voice(true)).await.unwrap();
+    let ordinary_after = claimed(
+        store
+            .claim(
+                &identity(other, "guild.add_member", br#"{"a":1}"#),
+                &subject(),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_ne!(ordinary_after.intent_id(), voice_first);
+    // The same voice delivery still refuses, and so does an ordinary replay
+    // of its own key (the ordinary identity is untouched).
+    assert_eq!(
+        store.record_voice_move(voice(false)).await,
+        Err(InternalStoreError::TransitionRefused)
+    );
+    assert_eq!(
+        store.record_voice_move(voice(true)).await,
+        Err(InternalStoreError::TransitionRefused)
+    );
+    assert!(!matches!(
+        store
+            .claim(
+                &identity(shared, "guild.add_member", br#"{"a":1}"#),
+                &subject()
+            )
+            .await
+            .unwrap(),
+        InternalClaim::Claimed(_)
+    ));
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_idempotency")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 4);
+    let ordinary_key: String =
+        sqlx::query_scalar("SELECT key_hash FROM internal_idempotency WHERE intent_id = $1")
+            .bind(ordinary.intent_id())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(ordinary_key, body_hash(shared.as_bytes()));
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn voice_move_records_completed_intent_and_terminal_audit() {
     use two_bot_core::internal_actions::{new_request_id, VoiceMoveOutcome};
@@ -3040,7 +3140,8 @@ async fn voice_move_records_completed_intent_and_terminal_audit() {
         assert_eq!(state, "completed", "terminal state per delivery");
         assert_eq!(action, "voice.move_member");
         assert_eq!(caller_hash, body_hash(b"website"));
-        assert_eq!(key_hash, nonce_hash.clone());
+        assert_eq!(key_hash, voice_audit_key_hash(&nonce_hash));
+        assert_ne!(key_hash, nonce_hash, "voice audit key is domain separated");
         assert_eq!(guild_id, Some(guild.to_owned()));
         assert_eq!(actor_id, None);
         assert_eq!(target_id, member.to_owned());
