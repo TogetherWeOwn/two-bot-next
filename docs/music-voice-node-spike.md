@@ -125,8 +125,8 @@ auto-leave, metrics).
 This is the music-node placement experiment, not a second B4 voice executor or
 an authorization to run. Current qualification timing follows the
 [evidence-bounded checklist](soak-checklist.md#evidence-bounded-timing-exits):
-consume the dedicated exact-SHA voice receipt, retain ≥49/50 audible joins,
-no4017, both rekeys and actual sustained playback. Two hours is the maximum
+retain ≥49/50 audible joins, no4017, both rekeys and actual sustained playback
+in the exact-SHA music-placement run log. Two hours is the maximum
 investigation, not a minimum endurance wait or proof by elapsed time. Before an
 authorized attempt, record its UTC start, deadline and cleanup within the
 separate grant; no grant means no start. Exit as soon as all actual receipts and
@@ -139,8 +139,22 @@ waits are superseded by the current receipt-based exit below, not an additional
 qualification gate. No measured run is claimed by this correction.
 
 When separately authorized, run from the staging bot against the staging guild,
-driven by a human with ears. Every step records its evidence in the run log
-linked below; B4 consumes that receipt rather than repeating these steps.
+driven by a human with ears. Every music step records its evidence in the
+music-placement run log linked below, for the Container-versus-VPS decision.
+That log is not the dedicated temporary-voice acceptance receipt. B4 consumes
+the existing exact-SHA dedicated voice evidence table and verdict named by the
+canonical checklist, with row/scenario IDs and UTC windows:
+
+- [s3-14 and s3-15](soak-checklist.md#3-gateway-event-handlers): channel-change
+  audit, leave→join ordering and XP hook, mute-only no-transition, and
+  restart/session-reset evidence with no outage-inflated duration or XP.
+- [s12-01](soak-checklist.md#12-baseline-additions-and-corrections): creator-room,
+  control-panel, `/voice` subcommand and leave/sweep evidence.
+
+Attach those existing dedicated receipts; do not repeat their live exercises.
+Missing or failing dedicated evidence leaves the applicable rows NEEDS WORK,
+even if music placement passes. These pointers appoint no executor and grant
+no restart, traffic or other exercise authority.
 
 1. Join reliability: 50 joins, expect at least 49 audible (98%), zero 4017.
 2. DAVE rekey: record both join and leave rekeys with 2 humans mid-track;
