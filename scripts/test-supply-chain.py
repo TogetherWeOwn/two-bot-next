@@ -80,6 +80,31 @@ class SupplyChainTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Debian runtime"):
             self.validate()
 
+    def runtime_inventory(self):
+        return [{"name": name, "version": version, "purl": f"pkg:deb/debian/{name}@{version}"}
+                for name, version in (("libc6", "2.41-12+deb13u4"),
+                                      ("libgcc-s1", "14.2.0-19"), ("gcc-14-base", "14.2.0-19"))]
+
+    def test_zlib_free_runtime_sbom_requires_real_debian_inventory(self):
+        inventory = self.runtime_inventory()
+        self.write_bom("container-image", inventory)
+        validator.validate(ROOT / "Cargo.lock", self.directory, check_runtime=True)
+        for missing in range(3):
+            with self.subTest(missing=missing):
+                self.write_bom("container-image", inventory[:missing] + inventory[missing + 1:])
+                with self.assertRaisesRegex(ValueError, "must inventory"):
+                    validator.validate(ROOT / "Cargo.lock", self.directory, check_runtime=True)
+        with self.assertRaisesRegex(ValueError, "must inventory"):
+            validator.validate_runtime_inventory([{**row, "purl": "pkg:cargo/" + row["name"]} for row in inventory])
+
+    def test_zlib_and_bad_runtime_sbom_versions_fail(self):
+        inventory = self.runtime_inventory()
+        with self.assertRaisesRegex(ValueError, "without zlib1g"):
+            validator.validate_runtime_inventory(inventory + [{"name": "zlib1g", "purl": "pkg:deb/debian/zlib1g@1.3"}])
+        for version, message in (("fixture", "invalid Debian"), ("", "invalid Debian"), ("14.3.0-1", "versions differ")):
+            with self.subTest(version=version), self.assertRaisesRegex(ValueError, message):
+                validator.validate_runtime_inventory([*inventory[:2], {**inventory[2], "version": version}])
+
     def test_bad_provenance_fails(self):
         for name in ["source-sha.txt", "image-id.txt"]:
             with self.subTest(name=name):
@@ -262,7 +287,7 @@ class SupplyChainTests(unittest.TestCase):
         for image in images:
             self.assertRegex(image, r"@sha256:[0-9a-f]{64}$")
         self.assertTrue(images[0].startswith("rust:1.99-trixie@"))
-        self.assertTrue(images[1].startswith("gcr.io/distroless/cc-debian13:nonroot@"))
+        self.assertTrue(images[1].startswith("gcr.io/distroless/base-nossl-debian13:nonroot@"))
         self.assertIn("package-ecosystem: docker", (ROOT / ".github/dependabot.yml").read_text())
 
     def test_distroless_runtime_installs_nothing_and_runs_as_nonroot(self):
@@ -274,13 +299,28 @@ class SupplyChainTests(unittest.TestCase):
         self.assertNotIn("apt-get", dockerfile)
         self.assertNotIn("useradd", dockerfile)
         self.assertNotIn("--force-depends", dockerfile)
-        self.assertNotIn("/var/lib/dpkg", dockerfile)
+        # The only added package records are copied verbatim from installed
+        # official builder packages, never forged or edited after the copy.
+        self.assertIn("for package in libgcc-s1 gcc-14-base; do", dockerfile)
+        self.assertIn("test \"$VERSION_CODENAME\" = trixie", dockerfile)
+        self.assertIn("dpkg-query -s \"$package\" > \"/runtime-root/var/lib/dpkg/status.d/$package\"", dockerfile)
+        self.assertIn("dpkg-query -W -f='${source:Package}'", dockerfile)
+        self.assertIn("cp -L --parents \"/usr/share/doc/$package/copyright\" /runtime-root/", dockerfile)
+        self.assertIn("dpkg-query -L libgcc-s1 | grep '/libgcc_s.so.1$'", dockerfile)
+        self.assertIn('cp -L --parents "$libgcc" /runtime-root/', dockerfile)
+        self.assertIn('dpkg-query --control-show "$package" md5sums', dockerfile)
+        self.assertIn('test -f "/runtime-root/$path"', dockerfile)
+        self.assertIn('> "/runtime-root/var/lib/dpkg/status.d/$package.md5sums"', dockerfile)
+        self.assertIn('md5sum -c var/lib/dpkg/status.d/*.md5sums', dockerfile)
+        self.assertNotIn("sed ", dockerfile)
+        self.assertNotIn("zlib1g", dockerfile)
         self.assertIn("USER 65532:65532", runtime)
         self.assertLess(runtime.index("USER 65532:65532"), runtime.index("ENTRYPOINT"))
         self.assertIn('ENTRYPOINT ["/home/nonroot/two-bot"]', runtime)
         self.assertIn('CMD ["/home/nonroot/two-bot", "--healthcheck"]', runtime)
         self.assertEqual(re.findall(r"(?m)^COPY .*", runtime),
-                         ["COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot"])
+                         ["COPY --from=builder /runtime-root/ /",
+                          "COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot"])
         supply = (ROOT / ".github/workflows/sbom.yml").read_text()
         self.assertEqual(supply.count("exit-code: '1'"), 2)
         self.assertEqual(supply.count("ignore-unfixed: false"), 2)
@@ -389,7 +429,8 @@ class SupplyChainTests(unittest.TestCase):
         # The verify job reads the exact inputs.ref lockfile handed over in
         # the artifact, never its own checkout's lockfile; the handoff copy
         # is removed before checksums so release assets stay pinned.
-        self.assertIn("python3 scripts/validate-sbom.py sbom/Cargo.lock sbom", verify)
+        self.assertIn("python3 scripts/validate-sbom.py sbom/Cargo.lock sbom --check-runtime", verify)
+        self.assertIn('python3 scripts/runtime-image-evidence.py "$IMAGE" sbom --check-runtime', verify)
         self.assertIn("cp source/Cargo.lock sbom/Cargo.lock", image)
         self.assertIn("rm sbom/Cargo.lock", verify)
         # Verify still runs after a failed gate (needs without a

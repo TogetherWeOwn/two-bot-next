@@ -44,13 +44,21 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: synthetic-user-flow
-  cancel-in-progress: false
-
+# No workflow-wide queue: a staging job waiting on a deployment must not
+# hold back a later production sample. Each environment serializes itself.
 jobs:
   staging:
     name: staging user-flow synthetic
+    # Read the existing control secret only in the observer step. No deployment
+    # record: this job observes authority, it never grants/starts staging.
+    environment:
+      name: staging
+      deployment: false
+    # Observe without the lifecycle lock: five-minute ticks must not replace
+    # pending deployments or promotion soaks in GitHub's single pending slot.
+    concurrency:
+      group: synthetic-user-flow-staging
+      cancel-in-progress: false
     permissions:
       actions: read
       contents: read
@@ -64,9 +72,21 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Observe the staging window without starting it
+        id: window
+        if: '!inputs.force_fail'
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-observer.jsonl
+        run: node wrangler/scripts/staging-use.mjs observe
       - name: Run the staging user-flow probe
         id: probe
-        if: vars.STAGING_WORKER_URL != '' || inputs.force_fail
+        if: (vars.STAGING_WORKER_URL != '' && steps.window.outputs.sample == 'true') || inputs.force_fail
         env:
           STAGING_WORKER_URL: ${{ (inputs.force_fail && 'https://example.invalid') || vars.STAGING_WORKER_URL }}
           RUN_ID: ${{ github.run_id }}
@@ -74,7 +94,7 @@ jobs:
           set -euo pipefail
           python3 scripts/staging_health_contract_probe.py --evidence "synthetic-staging-$RUN_ID.json"
       - name: Fail closed when the staging target binding is missing
-        if: steps.probe.outcome == 'skipped' && vars.STAGING_WORKER_URL == '' && !inputs.force_fail
+        if: always() && steps.probe.outcome == 'skipped' && vars.STAGING_WORKER_URL == '' && !inputs.force_fail
         run: |
           echo "::error::Staging synthetic has zero probe samples because STAGING_WORKER_URL is unset; refusing to report green"
           exit 1
@@ -88,7 +108,8 @@ jobs:
           retention-days: 14
       - name: Decide the synthetic alert event
         id: decide
-        if: always()
+        # Idle is neither a failed sample nor recovery; keep incidents open.
+        if: always() && (steps.window.outputs.sample != 'false' || inputs.force_fail)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PROBE_OUTCOME: ${{ steps.probe.outcome }}
@@ -107,8 +128,19 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/synthetic_alert.py --env staging --evidence "synthetic-staging-$RUN_ID.json" --post-only
+      - name: Retain the idle, active or refusal receipt
+        if: always() && !inputs.force_fail
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-use-user-flow-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-use-observer.jsonl
+          if-no-files-found: error
+          retention-days: 14
   prod-passive:
     name: prod passive user-flow synthetic
+    concurrency:
+      group: synthetic-user-flow-production
+      cancel-in-progress: false
     permissions:
       actions: read
       contents: read

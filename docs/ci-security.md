@@ -457,8 +457,10 @@ hosted minutes. The offline fixtures cannot observe repository visibility.
 
 ### Compatibility and limits
 
-The former public branch already selected `ubuntu-latest` for all 79 ordinary
-job definitions. Replacing it with the literal changes the source contract,
+The former public branch already selected `ubuntu-latest` for every ordinary
+job definition. The current inventory is 88 jobs across 29 changed workflows,
+including the split nightly legs and bounded staging startup/cleanup jobs.
+Replacing the expression with the literal changes the source contract,
 not the public runner platform. All job containers, service images/options,
 platforms, resource/time limits, permissions, protected environments and test
 selection remain unchanged. No runner registration, fleet setting, secret or
@@ -504,6 +506,11 @@ access to an optional deployment-notification webhook. Standard hosted IPs can
 change; an endpoint requiring a fixed IP or private network needs an explicit
 technical prerequisite, not a silent self-hosted/paid fallback. No live
 production dispatch or credentialed probe is part of runner qualification here.
+The split nightly legs retain the same container, six-partition inventory,
+fail-closed receipt aggregate and event-specific budgets. Bounded staging
+startup/cleanup jobs retain their exact-SHA readiness, finite-use grants,
+native expiry and failure/cancellation cleanup. Their Node/HTTPS runner needs
+are unchanged, but the historical runs above do not qualify those newer paths.
 Current-head CI and independent reviews remain required; production merge and
 any subsequent production exercise retain their separate release approval.
 

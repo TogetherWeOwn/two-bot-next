@@ -981,9 +981,10 @@ pub fn format_command_list_page(
 }
 
 /// `/command-inspect` sample-arguments bound in UTF-16 units, matching the
-/// published `max_length`. Samples are validated for size only and stay out
-/// of the invocation render: run paths substitute the captured `{args}`
-/// input, never the sample, and there is no second interpolation pass.
+/// published `max_length`. Samples are validated for size and become the
+/// preview input (dry-run only, never sent or audited); slash and prefix
+/// runs substitute only captured invocation text, and there is no second
+/// interpolation pass anywhere.
 pub const MAX_INSPECT_ARGUMENT_UNITS: usize = 500;
 
 /// `{args}` capture bound in UTF-16 units (`encode_utf16().count()`),
@@ -1011,6 +1012,48 @@ pub fn validate_args(args: &str) -> Result<(), ArgsError> {
         return Err(ArgsError::TooLong);
     }
     Ok(())
+}
+
+/// Slash option carrying invocation text for `{args}`: every custom command
+/// publishes one optional string option under this name, and the slash,
+/// prefix (as the remainder shape) and preview (as the sample) paths all
+/// converge on it. The unit count stays authoritative at every read.
+pub const ARGS_OPTION_NAME: &str = "arguments";
+
+/// Ephemeral slash correction for a duplicate or forged `arguments` option
+/// (expected a single text value). Fixed copy, answered directly without a
+/// public defer and with no audit row — a pre-execution input refusal in the
+/// same class as routing refusals.
+pub const INVALID_ARGS_REPLY: &str =
+    "Invalid arguments: expected a single text value. Example: /quote arguments:hello";
+
+/// Ephemeral slash correction for over-long `arguments`. Fixed copy, same
+/// direct-answer class as [`INVALID_ARGS_REPLY`].
+pub const ARGS_TOO_LONG_REPLY: &str =
+    "Arguments must be at most 500 UTF-16 units. Shorten them and retry.";
+
+/// Prefix audit reason for over-long remainder text: the attempt is already
+/// claimed, so overflow records a definitive failed `command.run` fact and
+/// sends nothing. Content-free: names no member text and no measurement.
+pub const ARGS_TOO_LONG_REASON: &str = "args_too_long";
+
+/// Closed vocabulary for the slash malformed class: slash refusals carry no
+/// audit row, so this names the contract case (agent fixtures `ARG-03`), not
+/// a persisted field.
+pub const ARGS_MALFORMED_REASON: &str = "args_malformed";
+
+/// Remainder after the first `!`-trigger token: skip the token, then one run
+/// of leading ASCII whitespace, and keep the rest verbatim (interior spacing,
+/// newlines and casing preserved). No remainder (or only whitespace after
+/// the token) captures empty. Call with message content whose first token is
+/// the matched trigger — leading whitespace before `!` never reaches here
+/// because it matches no trigger.
+#[must_use]
+pub fn capture_prefix_args(content: &str) -> &str {
+    match content.find(char::is_whitespace) {
+        None => "",
+        Some(index) => content[index..].trim_start_matches(|c: char| c.is_ascii_whitespace()),
+    }
 }
 
 /// Which private view `/command-inspect` renders. Summary never bundles the
@@ -1361,7 +1404,8 @@ pub fn format_inspect_template(row: &StoredCommand) -> String {
 
 /// Private rendered preview with the invoking member/channel context, or a
 /// truthful refusal with a correction example. Invalid saved templates
-/// refuse without rendering; the sample arguments are never interpolated.
+/// refuse without rendering; the `arguments` sample renders as the preview
+/// `{args}` input, dry-run only.
 #[must_use]
 pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> String {
     if let Err(error) = validate_template(&row.template) {
@@ -1950,6 +1994,19 @@ mod tests {
         assert_eq!(trigger_word("!"), None);
         assert_eq!(trigger_word("hi !faq"), None);
         assert_eq!(trigger_word(""), None);
+    }
+
+    #[test]
+    fn prefix_remainder_captures_verbatim_after_one_whitespace_run() {
+        // ARG-11: remainder after the first token is the argument verbatim —
+        // interior spacing, newlines and casing preserved, one leading
+        // ASCII-whitespace run skipped.
+        assert_eq!(capture_prefix_args("!faq"), "");
+        assert_eq!(capture_prefix_args("!faq   "), "");
+        assert_eq!(capture_prefix_args("!faq hello"), "hello");
+        assert_eq!(capture_prefix_args("!faq   hello  world "), "hello  world ");
+        assert_eq!(capture_prefix_args("!FAQ MiXeD"), "MiXeD");
+        assert_eq!(capture_prefix_args("!faq\tline1\nline2"), "line1\nline2");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -123,6 +123,9 @@ pub(crate) struct SelfRoleService {
     panels: Vec<SelfRolePanel>,
     dry_run: bool,
     recovery_cursor: AtomicUsize,
+    /// Test-only live-settings override: per-instance reader for consumer
+    /// acceptance. Production stays `None` and reads the poller snapshot.
+    live_override: Mutex<Option<LiveSettings>>,
 }
 
 impl SelfRoleService {
@@ -145,6 +148,7 @@ impl SelfRoleService {
             panels: gates.panels,
             dry_run: gates.dry_run,
             recovery_cursor: AtomicUsize::new(0),
+            live_override: Mutex::new(None),
         })
     }
 
@@ -214,15 +218,33 @@ impl SelfRoleService {
         Self::new(runtime, gates, staging_allowlist).map(Arc::new)
     }
 
+    /// Test-only per-instance live reader: real component, reaction and
+    /// stale-control entries resolve the catalogue from this instead of the
+    /// poller snapshot. No process-global installation; production services
+    /// never set it.
+    #[cfg(test)]
+    pub fn set_live_settings(&self, live: LiveSettings) {
+        *self.live_override.lock().expect("self-role live override") = Some(live);
+    }
+
+    /// Effective live source: the test override when set, else the poller.
+    fn live_source(&self) -> Option<LiveSettings> {
+        self.live_override
+            .lock()
+            .expect("self-role live override")
+            .clone()
+            .or_else(crate::settings_jobs::live)
+    }
+
     /// Catalogue for this operation: the live snapshot layered over the boot
     /// catalogue. Resolved once per entry point so a poll racing dispatch
     /// cannot pair a panel from one catalogue with options from another.
+    /// Admission and stale classification share this resolution, so a panel,
+    /// message or option removed by a published live update reads stale
+    /// instead of silently falling through.
     fn live_panels(&self) -> Vec<SelfRolePanel> {
-        live_panels_with(
-            &self.runtime.guild_id,
-            &self.panels,
-            crate::settings_jobs::live().as_ref(),
-        )
+        let live = self.live_source();
+        live_panels_with(&self.runtime.guild_id, &self.panels, live.as_ref())
     }
 
     /// Only actual button/text-select input on the configured source message.
@@ -426,7 +448,7 @@ impl SelfRoleService {
     pub async fn handle(&self, input: &SelfRoleInput) -> SelfRoleResult {
         // Pin the catalogue and revision together. The store rechecks this
         // revision under the settings writer lock before creating durable work.
-        let snapshot = crate::settings_jobs::live().map(|live| live.snapshot());
+        let snapshot = self.live_source().map(|live| live.snapshot());
         let panels =
             panels_from_snapshot(&self.runtime.guild_id, &self.panels, snapshot.as_deref());
         if !panels.contains(&input.panel) {

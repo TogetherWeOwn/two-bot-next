@@ -1026,96 +1026,17 @@ jobs:
             --expected-branch-id "$TWO_BOT_PRODUCTION_BRANCH_ID" \
             --mode "$MODE" --allow-unstaged "$ALLOW_UNSTAGED"
 
-  # Post-staging soak, OUTSIDE the deploy-production lane: sleeping here
-  # (instead of inside the production job) keeps an automatic run from
-  # holding the lane while it waits, so an operator rollback dispatch is
-  # never queued behind — or displaced by — a sleeping promotion. The
-  # remainder is recomputed here from the staging-green timestamp the guard
-  # reported, not carried from guard time, so the gate builds and any
-  # Environment approval wait do not extend the soak. The job first records
-  # the soak-baseline REST counters (the judged soak window starts at that
-  # sample), then sleeps.
+  # One canonical staging lock spans startup, baseline, a fresh full live
+  # interval, final regression evidence and release. Historical staging-green
+  # age is not live soak credit. Only this job holds staging: production and
+  # its rollback dispatch remain independent of the staging queue.
   soak:
-    name: post-staging soak (automatic runs only)
+    name: bounded live staging soak and regression evidence
     needs: guard
-    if: needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && needs.guard.outputs.soak_seconds != '0'
-    permissions:
-      contents: read
-    environment:
-      name: staging
-      deployment: false
-    # Runner routing: see the note on `check` in check.yml.
-    runs-on: ubuntu-latest
-    timeout-minutes: 35
-    outputs:
-      baseline: ${{ steps.baseline.outputs.receipt }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # Reviewed tooling from the workflow's own commit, never the guarded SHA.
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          fetch-depth: 1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-      - name: Record the soak-baseline REST counters
-        id: baseline
-        env:
-          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
-        run: |
-          set -euo pipefail
-          # The judged soak window starts here: the regression gate compares
-          # this baseline with the post-soak sample and records
-          # `insufficient_data` when the process identity changed between
-          # them (a restart resets the cumulative counters). A missing
-          # bearer records no data (exit 0); a failed scrape fails the soak
-          # closed.
-          node wrangler/scripts/rest-5xx-counters.mjs --metrics-url "$STAGING_WORKER_URL" \
-            --out "$RUNNER_TEMP/staging-soak-baseline.json"
-          echo "receipt=$(cat "$RUNNER_TEMP/staging-soak-baseline.json")" >> "$GITHUB_OUTPUT"
-      - name: Wait out the remainder of the 30-minute post-staging soak
-        env:
-          GREEN_AT: ${{ needs.guard.outputs.green_at }}
-        shell: python3 {0}
-        run: |
-          import os, time
-
-          SOAK_SECONDS = 1800
-          try:
-              green_at = float((os.environ.get("GREEN_AT") or "").strip())
-          except ValueError:
-              green_at = 0.0
-          # Recomputed here from the staging-green timestamp, not carried
-          # from guard time. An unreadable timestamp soaks the full window
-          # instead of skipping it.
-          if green_at <= 0:
-              remaining = SOAK_SECONDS
-          else:
-              remaining = max(0, SOAK_SECONDS - int(time.time() - green_at))
-          print(f"soaking {remaining}s of the 30 min post-staging window")
-          if remaining > 0:
-              time.sleep(remaining)
-
-  # Promotion regression gate, staging leg (docs/production-deploy.md,
-  # "Regression gate against production"). After the soak, it reads the
-  # candidate on staging: the user-flow probe (pinned to the guarded SHA and
-  # bound to the guarded run-attempt build: a same-SHA redeploy no longer
-  # proves the candidate soaked) and staging's cumulative REST counters,
-  # judged against the soak-baseline sample the `soak` job recorded. The
-  # `production` job compares them with production's own probe and counters
-  # before any mutation. Staging serving another build cannot be judged: an
-  # automatic run skips green when a main-branch staging run still promotes
-  # that build (`staging-superseded`: the newer build promotes itself) and
-  # refuses when nothing promotes it (the promotion stalled); a manual run
-  # refuses. `deployment: false` reads the staging scrape bearer without
-  # writing a staging deployment record. Rollback and live-SHA redeploys skip it.
-  staging-soak-evidence:
-    name: staging soak evidence for the regression gate
-    needs: [guard, soak]
-    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && (needs.soak.result == 'success' || needs.soak.result == 'skipped')"
+    if: needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true'
+    concurrency:
+      group: staging-lifecycle
+      cancel-in-progress: false
     permissions:
       contents: read
       actions: read # deploy-staging runs: which build the serving revision still promotes
@@ -1124,7 +1045,9 @@ jobs:
       deployment: false
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Keep ten minutes beyond the unchanged 40-minute authority cap for
+    # checkout/setup, confirmed stop and evidence. Never renew the grant.
+    timeout-minutes: 50
     outputs:
       skip: ${{ steps.judge.outputs.skip }}
       evidence: ${{ steps.judge.outputs.evidence }}
@@ -1139,6 +1062,39 @@ jobs:
         with:
           node-version: 22
           package-manager-cache: false
+      - name: Acquire and ready the guarded staging candidate
+        id: staging-use-begin
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_EXPECTED_SHA: ${{ needs.guard.outputs.sha }}
+          STAGING_USE_MINUTES: '40'
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-soak-use.ndjson
+        run: node wrangler/scripts/staging-use-pipeline.mjs begin
+      - name: Record the soak-baseline REST counters
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The judged soak window starts here: the regression gate compares
+          # this baseline with the post-soak sample and records
+          # `insufficient_data` when the process identity changed between
+          # them (a restart resets the cumulative counters). A missing
+          # bearer records no data (exit 0); a failed scrape fails the soak
+          # closed.
+          node wrangler/scripts/rest-5xx-counters.mjs --metrics-url "$STAGING_WORKER_URL" \
+            --out "$RUNNER_TEMP/staging-soak-baseline.json"
+      - name: Measure a fresh live staging interval
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_SHA: ${{ needs.guard.outputs.sha }}
+          STAGING_USE_DEPLOYMENT: ${{ steps.staging-use-begin.outputs.deployment_id }}
+          STAGING_USE_EXPIRES_AT: ${{ steps.staging-use-begin.outputs.expires_at }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-soak-use.ndjson
+          AUTO: ${{ needs.guard.outputs.auto }}
+        run: node wrangler/scripts/staging-soak-window.mjs
       - name: Read the candidate's staging journeys and soak REST counters
         id: judge
         env:
@@ -1148,7 +1104,6 @@ jobs:
           AUTO: ${{ needs.guard.outputs.auto }}
           RUN_ID: ${{ needs.guard.outputs.staging_run_id }}
           RUN_ATTEMPT: ${{ needs.guard.outputs.staging_attempt }}
-          BASELINE: ${{ needs.soak.outputs.baseline }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -1166,8 +1121,8 @@ jobs:
           # Which main-branch staging runs still promote the serving
           # revision: a serving build nothing promotes means the promotion
           # stalled, which refuses instead of skipping. A failed listing
-          # fails closed here. The soak was already over before this run
-          # started when the soak skipped, so no baseline is expected then.
+          # fails closed here. The baseline always belongs to this same
+          # bounded job; neither idle time nor a missing baseline is credit.
           # gh api switches to POST when -f fields are passed, but the
           # runs listing is a GET endpoint: request GET explicitly. The jq
           # filter wraps the rows in one JSON array, which read_runs needs.
@@ -1175,16 +1130,73 @@ jobs:
             -f branch=main -f per_page=100 \
             -q '[.workflow_runs[] | {head_sha, head_branch, status, conclusion}]' \
             > "$RUNNER_TEMP/staging-runs.json"
-          baseline_args=()
-          if [ -n "$BASELINE" ]; then
-            printf '%s\n' "$BASELINE" > "$RUNNER_TEMP/staging-soak-baseline.json"
-            baseline_args=(--baseline-counters "$RUNNER_TEMP/staging-soak-baseline.json")
-          fi
           python3 scripts/promotion_regression_gate.py staging \
             --probe "$RUNNER_TEMP/staging-soak-probe.json" --counters "$RUNNER_TEMP/staging-soak-counters.json" \
             --sha "$SHA" --auto "$AUTO" --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" \
-            --staging-runs "$RUNNER_TEMP/staging-runs.json" "${baseline_args[@]}" \
+            --staging-runs "$RUNNER_TEMP/staging-runs.json" \
+            --baseline-counters "$RUNNER_TEMP/staging-soak-baseline.json" \
             --out "$RUNNER_TEMP/staging-soak-evidence.json"
+      - name: Recheck the original grant after final sampling
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_SHA: ${{ needs.guard.outputs.sha }}
+          STAGING_USE_DEPLOYMENT: ${{ steps.staging-use-begin.outputs.deployment_id }}
+          STAGING_USE_EXPIRES_AT: ${{ steps.staging-use-begin.outputs.expires_at }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-soak-use.ndjson
+        run: node wrangler/scripts/staging-use-pipeline.mjs consume
+      - name: Release the original staging soak window
+        if: always() && steps.staging-use-begin.outputs.expires_at != ''
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_EXPIRES_AT: ${{ steps.staging-use-begin.outputs.expires_at }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-soak-use.ndjson
+        run: node wrangler/scripts/staging-use-pipeline.mjs finish
+      - name: Retain staging soak lifecycle and measurement evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-soak-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/staging-soak-use.ndjson
+            ${{ runner.temp }}/staging-soak-*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # Publish only the completed bounded job's verdict; no live staging reads
+  # can escape its lock. Failure, cancellation or unconfirmed release blocks it.
+  staging-soak-evidence:
+    name: staging soak evidence for the regression gate
+    needs: [guard, soak]
+    if: "!cancelled() && needs.guard.result == 'success' && needs.guard.outputs.skip == '' && needs.guard.outputs.mode == 'deploy' && needs.guard.outputs.allow_unstaged != 'true' && needs.soak.result == 'success'"
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.judge.outputs.skip }}
+      evidence: ${{ steps.judge.outputs.evidence }}
+    steps:
+      - name: Publish the completed bounded staging verdict
+        id: judge
+        env:
+          SKIP: ${{ needs.soak.outputs.skip }}
+          EVIDENCE: ${{ needs.soak.outputs.evidence }}
+        shell: python3 {0}
+        run: |
+          import json, os
+
+          evidence = os.environ["EVIDENCE"]
+          # Validate single-line JSON before writing an Actions output. Never
+          # turn absent evidence into a green promotion after failed cleanup.
+          if not isinstance(json.loads(evidence), dict) or "\n" in evidence or "\r" in evidence:
+              raise SystemExit("invalid bounded staging evidence")
+          skip = os.environ["SKIP"]
+          if "\n" in skip or "\r" in skip:
+              raise SystemExit("invalid bounded staging skip")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"skip={skip}\nevidence={evidence}\n")
 
   # Pre-deploy recheck for automatic runs: the guard's hold and live checks
   # go stale while the gates build, the Environment approval waits and the

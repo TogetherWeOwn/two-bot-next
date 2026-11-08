@@ -96,6 +96,7 @@ Live snapshot consumers (canonical table; gateway facts and attendance share\n\
 | audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`CHANNEL_KEYS`) | every record (`:483`) and sweep (`:497`), once installed |\n\
 | ticket | `ticket_runtime.rs:749-752`, `:1491` | 3 destinations + cooldown (`:311-339`, `:719-744`) | every execute/recovery and purge; effective ops changes included |\n\
 | self-role | `self_role_handlers.rs:213-219`, `:419-441` | `TWO_SELF_ROLE_PANELS` (`:53`) | every dispatch (`:224`, `:309`, `:377`, `:419`) and sweep (`:472-473`); retirement waits for durable work |\n\
+| command dispatch | `command_runtime.rs::on_interaction_with_live` | `TWO_ANNOUNCEMENTS` (`feed_jobs.rs::live_announcements_with`, `feed_jobs.rs::live_announcements_on`) | every feed invocation through `router.rs::live_gate_announcements_slash`; RSVP prepare reuses the same resolver (`gateway.rs` RSVP admission, `interactions.rs::prepare`, `rsvp.rs::prepare_rsvp_interaction`) |\n\
 | gateway classifier | `gateway.rs::refresh_channel_classifier_from_poller`, `gateway.rs::apply_dispatch` | seven channel + exclusion sets through `community_classifier.rs::classifier_config_from_live` | guild `MessageCreate`, `VoiceStateUpdate`, `MemberAdd`, `MemberUpdate`, `MemberRemove`, before fact collection/drain; classifier + facts sink swap together |\n\
 | attendance | `community_classifier.rs::LiveClassifier`, `rsvp.rs::execute`; installed by `main.rs::build_interaction_runtime` and `command_runtime.rs::CommandRuntime::build` | same seven channel + exclusion sets | execution-time read in both `handle` and `prepare`/`complete`, after successful acknowledgement and live membership reads, immediately before target classification |\n\
 | community | `community_jobs.rs:185-187` | 5 scorecard/presence/inactivity keys (`:174-180`) | every tick: probe (`:400`), scorecard (`:552`), sweep (`:638`) |\n\
@@ -142,7 +143,11 @@ refresh resolves `TWO_TICKET_COOLDOWN_SECONDS` from the effective layered values
 including ops apply, clearing and expiry without a database revision change, with\n\
 last-good fallback (`crates/bot/src/ticket_runtime.rs:719-744`); the feed poller\n\
 re-checks `TWO_ANNOUNCEMENTS` from the snapshot on every tick and skips while\n\
-a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); self-role\n\
+a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); feed\n\
+and RSVP command dispatch re-check the same gate on every invocation and\n\
+refuse with the disabled reply while a stored `0` stands\n\
+(`crates/bot/src/command_runtime.rs:1305-1323`, `crates/bot/src/gateway.rs:1498-1501`,\n\
+`crates/discord/src/rsvp.rs:86`, `crates/core/src/router.rs:308-341`); self-role\n\
 dispatch and recovery resolve `TWO_SELF_ROLE_PANELS` from the snapshot on every\n\
 interaction and sweep, falling back to the boot catalogue on absent or unparsable\n\
 rows (`crates/bot/src/self_role_handlers.rs:59-83`, `:224`, `:309`, `:377`, `:419`).\n\

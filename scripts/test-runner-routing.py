@@ -81,7 +81,7 @@ class RepositoryWorkflowTests(unittest.TestCase):
             text = path.read_text()
             self.assertEqual(violations(text), [], path.name)
             hosted_jobs += text.count(f"    runs-on: {PUBLIC_RUNNER}")
-        self.assertGreaterEqual(hosted_jobs, 79)
+        self.assertGreaterEqual(hosted_jobs, 88)
 
     def test_required_check_jobs_and_their_needs_are_hosted(self):
         check = jobs((WORKFLOWS / "check.yml").read_text())
@@ -119,6 +119,20 @@ class CheckerMutationTests(unittest.TestCase):
     def test_dormant_overflow_setting_fails(self):
         text = workflow("build", PUBLIC_RUNNER, "    env:\n      OLD_RUNNER: ${{ vars.CI_OVERFLOW_RUNNER }}\n")
         self.assertTrue(violations(text))
+
+    def test_nightly_partitions_use_explicit_public_hosted_runner(self):
+        for job in ("sweep-plan", "sweep-partition", "sweep-guarded", "sweep-docs"):
+            with self.subTest(job=job):
+                self.assertEqual(violations(workflow(job, PUBLIC_RUNNER)), [])
+                self.assertTrue(violations(workflow(job, LEGACY_ROUTED.replace("{job}", "sweep"))))
+                self.assertTrue(violations(workflow(job, LEGACY_ROUTED.replace("{job}", job))))
+                self.assertTrue(violations(workflow(job, LEGACY_ROUTED.replace("{job}", "check"))))
+
+    def test_all_workflows_reject_former_nightly_sweep_aliases(self):
+        for job in ("sweep-plan", "sweep-partition", "sweep-guarded", "sweep-docs", "sweep-extra"):
+            with self.subTest(job=job):
+                self.assertTrue(violations(workflow(job, LEGACY_ROUTED.replace("{job}", "sweep"))))
+                self.assertEqual(violations(workflow(job, PUBLIC_RUNNER)), [])
 
     def test_missing_runs_on_fails(self):
         text = "name: t\non:\n  push:\njobs:\n  build:\n    steps:\n      - run: true\n"

@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging
     concurrency:
-      group: deploy-staging
+      group: staging-lifecycle
       cancel-in-progress: false
     timeout-minutes: 30
     steps:
@@ -95,13 +95,16 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TARGET_VERSION: ${{ inputs.target_version }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-worker-drill-use.ndjson
         run: python3 scripts/staging_rollback_drill.py --target-version "$TARGET_VERSION" --evidence "$RUNNER_TEMP/staging-rollback-drill-evidence.json"
       - name: Upload the manual Worker drill evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: staging-worker-rollback-drill
-          path: ${{ runner.temp }}/staging-rollback-drill-evidence.json
+          path: |
+            ${{ runner.temp }}/staging-rollback-drill-evidence.json
+            ${{ runner.temp }}/staging-worker-drill-use.ndjson
           if-no-files-found: error
           retention-days: 14
           compression-level: 0

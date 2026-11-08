@@ -1,6 +1,6 @@
 name: staging-mcp-proveout
 
-# Manual, staging-only, read-only authenticated MCP prove-out (TOG-23456).
+# Manual, staging-only, read-only authenticated MCP prove-out.
 # Runs the Streamable HTTP read-only slice against the staging Worker with
 # the `staging` environment secret STAGING_MCP_TOKEN, so no agent ever holds
 # the bearer. The bearer travels only as `secrets.STAGING_MCP_TOKEN` into an
@@ -12,14 +12,16 @@ name: staging-mcp-proveout
 # uncorroborated (FENCE_UNCORROBORATED) unless the dispatcher explicitly
 # corroborates the fence with STAGING_MCP_EXPECT_FENCE=1; the pinned Run
 # step below sets no such flag, so a fenced-stage run reports the fence
-# instead of passing. Corroborate via /readyz before re-dispatching.
+# instead of passing. The separate lifecycle steps start and verify a finite
+# window before the probe and stop it afterwards. Native expiry handles runner
+# loss/cancellation; no MCP request can resurrect idle staging outside a grant.
 on:
   workflow_dispatch:
 
 permissions: {}
 
 concurrency:
-  group: staging-mcp-proveout
+  group: staging-lifecycle
   cancel-in-progress: false
 
 jobs:
@@ -29,8 +31,9 @@ jobs:
       contents: read
     # Dispatch from main only. The bearer binding is scoped to the `staging`
     # environment, so a workflow edited on another branch cannot read it.
-    # TOG-23397: STAGING_MCP_TOKEN is a `staging` environment secret; the job
-    # must declare the environment to read it.
+    # STAGING_MCP_TOKEN is a `staging` environment secret; the job must
+    # declare the environment to read it. Control and probe credentials stay
+    # on separate steps and neither is forwarded to the other client.
     if: github.ref == 'refs/heads/main'
     environment: staging
     runs-on: ubuntu-latest
@@ -40,6 +43,26 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Acquire and verify the finite MCP window
+        id: use
+        env:
+          STAGING_WORKER_URL: https://two-bot-next-staging.5150.workers.dev
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_MINUTES: '15'
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-mcp-start.jsonl
+        run: node wrangler/scripts/staging-use-pipeline.mjs begin
+      - name: Retain the acquisition and readiness receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-use-mcp-start-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-use-mcp-start.jsonl
+          if-no-files-found: error
+          retention-days: 14
       - name: Authenticated MCP prove-out (bearer via secrets, never echoed)
         env:
           # Must already exist as a staging environment secret; absent means
@@ -48,6 +71,22 @@ jobs:
           STAGING_MCP_URL: https://two-bot-next-staging.5150.workers.dev/mcp
           RUN_ID: ${{ github.run_id }}
         run: python3 scripts/staging_mcp_proveout.py --output "staging-mcp-proveout-$RUN_ID.json"
+      - name: Stop only this MCP run's window
+        if: always() && steps.use.outputs.expires_at != ''
+        env:
+          STAGING_WORKER_URL: https://two-bot-next-staging.5150.workers.dev
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_EXPIRES_AT: ${{ steps.use.outputs.expires_at }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-mcp-stop.jsonl
+        run: node wrangler/scripts/staging-use-pipeline.mjs finish
+      - name: Retain the stop or refusal receipt
+        if: always() && steps.use.outputs.expires_at != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-use-mcp-stop-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-use-mcp-stop.jsonl
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload the sanitized prove-out
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

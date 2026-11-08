@@ -34,6 +34,7 @@ fn raw(id: &str, name: &str, start: &str, status: i64) -> RawScheduledEvent {
         id: Some(id.to_owned()),
         name: Some(name.to_owned()),
         scheduled_start_time: Some(start.to_owned()),
+        scheduled_end_time: None,
         channel_id: Some("voice-1".to_owned()),
         description: Some("Join the weekly games night.".to_owned()),
         status: Some(status),

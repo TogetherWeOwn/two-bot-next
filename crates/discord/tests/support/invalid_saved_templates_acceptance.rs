@@ -65,13 +65,22 @@ impl Case {
 
     fn expected(self) -> String {
         match self {
-            // No invocation text reaches the run path yet, so `{args}`
-            // substitutes empty; capture lands with the run-path slice.
+            // The slash fixture passes no `arguments` option, so `{args}`
+            // substitutes empty on that surface.
             Self::Args => format!("{MARKER} "),
             Self::FourVariables => "Hi <@3333> tester in Test guild <#4444>".to_owned(),
             Self::LiteralBraces => "Literal {User} {bad_name} {9} {unfinished".to_owned(),
             Self::Utf16Ceiling => "😀".repeat(1000),
             _ => panic!("invalid definitions have no public output"),
+        }
+    }
+
+    fn prefix_expected(self) -> String {
+        match self {
+            // The prefix fixture invokes `!FaQ ignored arguments`, so the
+            // captured remainder renders through `{args}` on that surface.
+            Self::Args => format!("{MARKER} ignored arguments"),
+            _ => self.expected(),
         }
     }
 }
@@ -411,8 +420,8 @@ async fn slash_renders_args_row_with_empty_substitution() {
     audit(Surface::Slash, &observed.facts, "ok", None);
 }
 #[tokio::test]
-async fn prefix_renders_args_row_with_empty_substitution() {
-    // Same empty substitution on the prefix path: one POST, no refusal.
+async fn prefix_renders_args_row_with_captured_remainder() {
+    // The captured remainder renders through `{args}`: one POST, no refusal.
     let observed = observe(Case::Args, Surface::Prefix, true, Some("Test guild")).await;
     assert_eq!(observed.after, observed.before);
     assert!(matches!(
@@ -422,7 +431,7 @@ async fn prefix_renders_args_row_with_empty_substitution() {
     assert_eq!(observed.requests.len(), 1);
     let payload = body(&observed.requests[0]);
     no_mentions(&payload);
-    assert_eq!(payload["content"], Case::Args.expected());
+    assert_eq!(payload["content"], Case::Args.prefix_expected());
     audit(Surface::Prefix, &observed.facts, "ok", None);
 }
 #[tokio::test]
@@ -514,7 +523,11 @@ async fn valid_templates_including_args_stay_byte_identical() {
                     payload
                 }
             };
-            assert_eq!(payload["content"], case.expected(), "{case:?} {surface:?}");
+            let wanted = match surface {
+                Surface::Slash => case.expected(),
+                Surface::Prefix => case.prefix_expected(),
+            };
+            assert_eq!(payload["content"], wanted, "{case:?} {surface:?}");
             audit(surface, &observed.facts, "ok", None);
         }
     }
