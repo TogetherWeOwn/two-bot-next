@@ -5193,6 +5193,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('"--ignore-submodules=none"', listed["run"])
         self.assertIn('"--no-renames", "-z", merge_base, head', listed["run"])
         self.assertIn('"merge-base", base, head', listed["run"])
+        self.assertIn('f"repos/{repo}/git/ref/heads/main"', listed["run"])
+        self.assertLess(listed["run"].index('base = main["object"]["sha"]'),
+                        listed["run"].index('"merge-base", base, head'))
         self.assertIn('identity(snapshot()) != identity(pr)', listed["run"])
         history = next(s for s in steps if s.get("name") == "Check out complete dispatch history")
         self.assertEqual(history["if"], "github.event_name == 'workflow_dispatch'")

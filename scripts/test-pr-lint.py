@@ -446,7 +446,7 @@ class BaseGateSnapshotTests(unittest.TestCase):
 class ChangedFileInventoryTests(unittest.TestCase):
     def inventory(self, entries, count=None, success=True, event="pull_request",
                   metadata_overrides=None, after_overrides=None, git_changes=None,
-                  gitlink=None, **env_overrides):
+                  gitlink=None, pr_base_revision=None, main_sha=None, **env_overrides):
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             root = Path(tmp)
             metadata = {
@@ -479,6 +479,9 @@ class ChangedFileInventoryTests(unittest.TestCase):
                     git("commit", "--quiet", "--allow-empty", "-m", "fixture")
                 metadata["base"]["sha"] = git("rev-parse", "HEAD~1")
                 metadata["head"]["sha"] = git("rev-parse", "HEAD")
+            current_main = metadata["base"]["sha"] if main_sha is None else main_sha
+            if pr_base_revision is not None:
+                metadata["base"]["sha"] = git("rev-parse", pr_base_revision)
             overrides = dict(metadata_overrides or {})
             # Retain real fixture SHAs when changing only a nested identity field.
             for key in ("head", "base"):
@@ -488,6 +491,8 @@ class ChangedFileInventoryTests(unittest.TestCase):
             entries = [{"status": "modified", **entry} for entry in entries]
             fixture = root / "fixture.json"
             fixture.write_text(json.dumps({"before": metadata, "after": after,
+                                           "main": {"ref": "refs/heads/main", "object":
+                                                    {"type": "commit", "sha": current_main}},
                                            "pages": [entries[i:i + 100] for i in range(0, len(entries), 100)] or [[]]}))
             # Only gh is stubbed. The actual inline step and (on dispatch) git
             # run as child processes; no GitHub credentials or network are used.
@@ -498,7 +503,9 @@ class ChangedFileInventoryTests(unittest.TestCase):
                 fixture = json.loads((root / "fixture.json").read_text())
                 with (root / "calls").open("a") as calls:
                     calls.write(json.dumps(sys.argv[1:]) + "\\n")
-                if "/files?" in sys.argv[2]:
+                if sys.argv[2].endswith("/git/ref/heads/main"):
+                    print(json.dumps(fixture["main"]))
+                elif "/files?" in sys.argv[2]:
                     if "--slurp" in sys.argv:
                         print(json.dumps(fixture["pages"]))
                     else:
@@ -610,6 +617,29 @@ class ChangedFileInventoryTests(unittest.TestCase):
         output = PRLintTests().validate({**metadata, "changed_files": "\n".join(paths)}, success=False)
         self.assertIn("::error title=Attestation::", output)
 
+    def test_dispatch_uses_current_main_when_pr_base_is_stale(self):
+        paths, emitted, calls = self.inventory(
+            [], count=2, event="workflow_dispatch", pr_base_revision="HEAD~2",
+            git_changes=[{"base.md": "base"}, {"main-only.md": "merged"}, {"head.md": "pr"}])
+        self.assertEqual(paths, ["head.md"])
+        self.assertIn(["api", "repos/TogetherWeOwn/two-bot-next/git/ref/heads/main"], calls)
+        # The gate must accept this captured main SHA, but reject later drift.
+        script = inline_script("Verify base-branch gate snapshot")
+        env = {"GITHUB_WORKSPACE": "/fixture", "EXPECTED_BASE_SHA": emitted["base_sha"]}
+        with patch.dict(os.environ, env, clear=True), patch(
+                "subprocess.check_output", return_value=emitted["base_sha"] + "\n"):
+            exec(script, {})
+        with patch.dict(os.environ, env, clear=True), patch(
+                "subprocess.check_output", return_value="c" * 40 + "\n"):
+            with self.assertRaisesRegex(SystemExit, "no longer matches the inventory snapshot"):
+                exec(script, {})
+        for invalid in ("", "main", "c" * 39):
+            with self.subTest(main_sha=invalid):
+                error = self.inventory(
+                    [], count=1, event="workflow_dispatch", main_sha=invalid, success=False,
+                    git_changes=[{}, {"head.md": "pr"}])
+                self.assertEqual(error, "Missing or invalid main snapshot SHA\n")
+
     def test_dispatch_diff_preserves_old_and_new_rename_paths(self):
         paths, _, _ = self.inventory(
             [], count=1, event="workflow_dispatch",
@@ -636,7 +666,7 @@ class ChangedFileInventoryTests(unittest.TestCase):
     def test_dispatch_rejects_missing_history_or_empty_diff(self):
         error = self.inventory(
             [{"filename": "a.rs"}], event="workflow_dispatch", success=False,
-            git_changes=[{}, {"a.rs": "change"}], metadata_overrides={"base": {"sha": "c" * 40}})
+            git_changes=[{}, {"a.rs": "change"}], main_sha="c" * 40)
         self.assertIn("Not a valid commit name", error)
         error = self.inventory([], count=1, event="workflow_dispatch",
                                git_changes=[{}, {}], success=False)

@@ -70,8 +70,9 @@ gh workflow run supply-chain.yml --ref <pr-head-branch> -f pr_number=<number>
 
 The dispatch must target the exact current head branch/SHA of an open PR in this
 repository targeting `main`. It checks out complete history and derives every
-changed path from a merge-base diff of the immutable PR base/head SHAs, with
-rename detection disabled so both sides of a move reach the gate. Submodule
+changed path from a merge-base diff of the immutable current `main`/PR head SHAs,
+with rename detection disabled so both sides of a move reach the gate. Dispatch
+resolves `main` directly: the PR API can retain an older base SHA. Submodule
 ignore settings cannot hide gitlink changes. Missing history or an empty/failed
 diff fails closed. The gate itself comes from the trusted PR base (or `main`
 for dispatch), and its checked-out commit must match that same inventory base
