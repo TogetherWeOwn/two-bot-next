@@ -45,8 +45,11 @@ are outside this implementation's scope.
   through the scheduled-event mirror. The channel claim row
   (`event_voice_channels`) carries no member identity and is untouched.
   Event-window voice sessions (`event_voice_sessions`) record one row per
-  member, channel, join and leave only while a mapped event window is open —
-  never an always-on voice log. Erasure removes the erased member's rows by
+  member and channel, with join and leave times. When capture is enabled, a
+  session can open from 15 minutes before a mapped event starts to 15 minutes
+  after it ends; it can close later. Rows also store `channel_name`, `is_bot`,
+  `afk`, `event_keys` and `name_observed_at`. This is not an always-on voice log.
+  Erasure removes the erased member's rows by
   (`guild_id`, `member_id`), and rows roll off 90 days after joining.
   Erasure removes database tracking only, never the Discord channel.
   Guild room-command controls

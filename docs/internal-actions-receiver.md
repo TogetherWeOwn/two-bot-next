@@ -453,9 +453,6 @@ or additional gateway intent is added here. An ordinary missing poll row is
 never treated as a confirmed deletion.
 The production snapshot flag remains off pending separate rollout acceptance.
 
-Refusals keep their code, status and retry policy with the fixed message
-`request refused`:
-
 ### `event.attendance.read` result shape (§4)
 
 `result` is `{v: 1, event_key, window: {starts_at, ends_at}, threshold_minutes: 10,
@@ -546,6 +543,11 @@ bounds text cells and streams rows; overflow refuses the whole read as `internal
 never truncated totals. Overlong identities become invalid sentinels, not prefixes.
 The independent
 serialized-result budget still reserves the relay envelope below 64 KiB.
+
+### Refusal codes
+
+Refusals keep their code, status and retry policy with the fixed message
+`request refused`:
 
 | Code | Status | Retryable |
 | --- | --- | --- |

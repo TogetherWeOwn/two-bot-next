@@ -138,79 +138,70 @@ pub struct AttendanceRecoveryRow {
 
 /// Read the next bounded recovery page. The cursor advances only after the
 /// corresponding finalization commits; failed pages can be retried safely.
-pub async fn attendance_recovery_page(
-    pool: &sqlx::PgPool,
-    guild_id: &str,
+pub fn attendance_recovery_page<'a>(
+    pool: &'a sqlx::PgPool,
+    guild_id: &'a str,
     after_id: i64,
-) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
-    recovery_page(pool, guild_id, None, after_id).await
+) -> impl std::future::Future<Output = Result<Vec<AttendanceRecoveryRow>, sqlx::Error>> + Send + 'a
+{
+    recovery_page(pool, guild_id, None, after_id)
 }
 
 /// Member-scoped identity-only recovery page: the same bounded SQL as
 /// [`attendance_recovery_page`], limited to one member's open rows in the guild.
-pub async fn attendance_member_recovery_page(
-    pool: &sqlx::PgPool,
-    guild_id: &str,
-    member_id: &str,
-    after_id: i64,
-) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
-    recovery_page(pool, guild_id, Some(member_id), after_id).await
-}
-
-type RecoveryPageFuture<'a> = std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = Result<Vec<AttendanceRecoveryRow>, sqlx::Error>>
-            + Send
-            + 'a,
-    >,
->;
-
-// Keep one SQL transaction future behind both scope adapters, without making
-// the indexed member predicate optional in SQL. One allocation per bounded page.
-#[inline(never)]
-fn recovery_page<'a>(
+pub fn attendance_member_recovery_page<'a>(
     pool: &'a sqlx::PgPool,
     guild_id: &'a str,
-    member_id: Option<&'a str>,
+    member_id: &'a str,
     after_id: i64,
-) -> RecoveryPageFuture<'a> {
-    Box::pin(async move {
-        let mut tx = pool.begin().await?;
-        sqlx::query("SET LOCAL statement_timeout = '900ms'")
-            .execute(&mut *tx)
-            .await?;
-        let sql = if member_id.is_some() {
-            "SELECT id,
-                    CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE '' END,
-                    CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE '' END
-             FROM event_voice_sessions
-             WHERE guild_id = $1 AND left_at IS NULL AND id > $2 AND member_id = $4
-             ORDER BY id LIMIT $3"
-        } else {
-            "SELECT id,
-                    CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE '' END,
-                    CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE '' END
-             FROM event_voice_sessions
-             WHERE guild_id = $1 AND left_at IS NULL AND id > $2 ORDER BY id LIMIT $3"
-        };
-        let mut query = sqlx::query_as::<_, (i64, String, String)>(sql)
-            .bind(guild_id)
-            .bind(after_id)
-            .bind(ATTENDANCE_RECOVERY_PAGE_SIZE as i64);
-        if let Some(member_id) = member_id {
-            query = query.bind(member_id);
-        }
-        let rows = query.fetch_all(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, member_id, channel_id)| AttendanceRecoveryRow {
-                id,
-                member_id,
-                channel_id,
-            })
-            .collect())
-    })
+) -> impl std::future::Future<Output = Result<Vec<AttendanceRecoveryRow>, sqlx::Error>> + Send + 'a
+{
+    recovery_page(pool, guild_id, Some(member_id), after_id)
+}
+
+// Both adapters return this future directly: no boxed SQL future or forwarding
+// async state machines. Known loss retains its explicit indexed SQL predicate.
+async fn recovery_page(
+    pool: &sqlx::PgPool,
+    guild_id: &str,
+    member_id: Option<&str>,
+    after_id: i64,
+) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '900ms'")
+        .execute(&mut *tx)
+        .await?;
+    let sql = if member_id.is_some() {
+        "SELECT id,
+                CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE '' END,
+                CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE '' END
+         FROM event_voice_sessions
+         WHERE guild_id = $1 AND left_at IS NULL AND id > $2 AND member_id = $4
+         ORDER BY id LIMIT $3"
+    } else {
+        "SELECT id,
+                CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE '' END,
+                CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE '' END
+         FROM event_voice_sessions
+         WHERE guild_id = $1 AND left_at IS NULL AND id > $2 ORDER BY id LIMIT $3"
+    };
+    let mut query = sqlx::query_as::<_, (i64, String, String)>(sql)
+        .bind(guild_id)
+        .bind(after_id)
+        .bind(ATTENDANCE_RECOVERY_PAGE_SIZE as i64);
+    if let Some(member_id) = member_id {
+        query = query.bind(member_id);
+    }
+    let rows = query.fetch_all(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, member_id, channel_id)| AttendanceRecoveryRow {
+            id,
+            member_id,
+            channel_id,
+        })
+        .collect())
 }
 
 /// Finalize only the supplied bounded page with no inferred offline credit.
@@ -721,22 +712,24 @@ pub async fn is_attendance_voice_enabled(
 
 impl PgRoomStore {
     /// [`attendance_recovery_page`] over this store's pool.
-    pub async fn attendance_recovery_page(
-        &self,
-        guild_id: &str,
+    pub fn attendance_recovery_page<'a>(
+        &'a self,
+        guild_id: &'a str,
         after_id: i64,
-    ) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
-        attendance_recovery_page(self.pool(), guild_id, after_id).await
+    ) -> impl std::future::Future<Output = Result<Vec<AttendanceRecoveryRow>, sqlx::Error>> + Send + 'a
+    {
+        attendance_recovery_page(self.pool(), guild_id, after_id)
     }
 
     /// [`attendance_member_recovery_page`] over this store's pool.
-    pub async fn attendance_member_recovery_page(
-        &self,
-        guild_id: &str,
-        member_id: &str,
+    pub fn attendance_member_recovery_page<'a>(
+        &'a self,
+        guild_id: &'a str,
+        member_id: &'a str,
         after_id: i64,
-    ) -> Result<Vec<AttendanceRecoveryRow>, sqlx::Error> {
-        attendance_member_recovery_page(self.pool(), guild_id, member_id, after_id).await
+    ) -> impl std::future::Future<Output = Result<Vec<AttendanceRecoveryRow>, sqlx::Error>> + Send + 'a
+    {
+        attendance_member_recovery_page(self.pool(), guild_id, member_id, after_id)
     }
 
     /// [`recover_attendance_sessions`] over this store's pool.

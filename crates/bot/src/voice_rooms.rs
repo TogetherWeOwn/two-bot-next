@@ -10632,18 +10632,20 @@ impl AttendanceRecovery {
     ) -> Result<Option<(i64, bool)>, StoreError> {
         let guild = worker.live.guild_id;
         let page_size = two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE;
-        type RecoveryRows =
-            Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError>;
-        let fetch: std::pin::Pin<Box<dyn Future<Output = RecoveryRows> + Send + '_>> = match member
-        {
-            Some(member) => Box::pin(
+        let rows = match member {
+            Some(member) => {
                 worker
                     .store
-                    .attendance_member_recovery_page(guild, member, after_id),
-            ),
-            None => Box::pin(worker.store.attendance_recovery_page(guild, after_id)),
+                    .attendance_member_recovery_page(guild, member, after_id)
+                    .await?
+            }
+            None => {
+                worker
+                    .store
+                    .attendance_recovery_page(guild, after_id)
+                    .await?
+            }
         };
-        let rows = fetch.await?;
         if rows.len() > page_size
             || member.is_some_and(|member| {
                 let member = member.to_string();
