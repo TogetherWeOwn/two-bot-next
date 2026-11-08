@@ -800,7 +800,7 @@ pub fn project_attendance(
     let mut rooms: std::collections::BTreeMap<Snowflake, &SessionMs> =
         std::collections::BTreeMap::new();
     // Sweep events for the peak: (instant, delta), ends before starts.
-    let mut sweep: Vec<(i64, i32)> = Vec::new();
+    let mut sweep: Vec<(i64, i64)> = Vec::new();
     for row in sessions.iter().filter(|row| !row.is_bot) {
         let end_ms = row.left_ms.unwrap_or(now_ms.min(close_ms));
         let from_ms = row.joined_ms.max(open_ms);
@@ -846,11 +846,11 @@ pub fn project_attendance(
             })
         })
         .collect();
-    sweep.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    sweep.sort_unstable();
     let mut peak_concurrent = 0i64;
     let mut running = 0i64;
     for (_, delta) in sweep {
-        running += i64::from(delta);
+        running += delta;
         peak_concurrent = peak_concurrent.max(running);
     }
     let wire_rooms: Vec<Value> = rooms
