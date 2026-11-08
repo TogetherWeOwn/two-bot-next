@@ -10622,6 +10622,58 @@ impl AttendanceRecovery {
         }
     }
 
+    // Share the fetch/finalize state machine, but retain distinct store reads
+    // and close limits for member loss versus a genuine full discontinuity.
+    async fn recover_page<S: RoomPersistence, H: RoomWrites>(
+        worker: &GuildRoomWorker<S, H>,
+        generation: u64,
+        member: Option<Snowflake>,
+        after_id: i64,
+    ) -> Result<Option<(i64, bool)>, StoreError> {
+        let guild = worker.live.guild_id;
+        let page_size = two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE;
+        let rows = match member {
+            Some(member) => {
+                worker
+                    .store
+                    .attendance_member_recovery_page(guild, member, after_id)
+                    .await?
+            }
+            None => {
+                worker
+                    .store
+                    .attendance_recovery_page(guild, after_id)
+                    .await?
+            }
+        };
+        if rows.len() > page_size
+            || member.is_some_and(|member| {
+                let member = member.to_string();
+                rows.iter().any(|row| row.member_id != member)
+            })
+        {
+            return Ok(None);
+        }
+        {
+            let live = worker.live.read_state();
+            if !live.ready || live.generation != generation {
+                return Ok(None);
+            }
+        }
+        let close_limit = if member.is_some() { 8 } else { page_size };
+        let ids: Vec<_> = rows.iter().take(close_limit).map(|row| row.id).collect();
+        worker
+            .store
+            .recover_attendance_sessions(guild, &ids)
+            .await?;
+        let exhausted = if member.is_some() {
+            rows.len() <= close_limit
+        } else {
+            rows.len() < page_size
+        };
+        Ok(Some((ids.last().copied().unwrap_or(after_id), exhausted)))
+    }
+
     async fn turn_member_loss<S: RoomPersistence, H: RoomWrites>(
         &mut self,
         worker: &GuildRoomWorker<S, H>,
@@ -10640,37 +10692,14 @@ impl AttendanceRecovery {
             self.after_id = 0;
         }
         let Some(loss) = self.member_loss else { return };
-        let guild = worker.live.guild_id;
-        let after_id = self.after_id;
-        type MemberPageResult = Result<Option<(i64, bool)>, StoreError>;
-        let recover: std::pin::Pin<Box<dyn Future<Output = MemberPageResult> + Send + '_>> =
-            Box::pin(async {
-                let rows = worker
-                    .store
-                    .attendance_member_recovery_page(guild, loss.0, after_id)
-                    .await?;
-                if rows.len() > two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE
-                    || rows.iter().any(|row| row.member_id != loss.0.to_string())
-                {
-                    return Ok::<_, StoreError>(None);
-                }
-                {
-                    let live = worker.live.read_state();
-                    if !live.ready || live.generation != generation {
-                        return Ok(None);
-                    }
-                }
-                // Read at most 32 identities, finalize at most eight rows per turn.
-                let ids: Vec<_> = rows.iter().take(8).map(|row| row.id).collect();
-                worker
-                    .store
-                    .recover_attendance_sessions(guild, &ids)
-                    .await?;
-                Ok(Some((
-                    ids.last().copied().unwrap_or(after_id),
-                    rows.len() <= 8,
-                )))
-            });
+        type RecoveryPageResult = Result<Option<(i64, bool)>, StoreError>;
+        let recover: std::pin::Pin<Box<dyn Future<Output = RecoveryPageResult> + Send + '_>> =
+            Box::pin(Self::recover_page(
+                worker,
+                generation,
+                Some(loss.0),
+                self.after_id,
+            ));
         let result = tokio::time::timeout(Duration::from_millis(1_000), recover).await;
         if let Ok(Ok(Some((cursor, exhausted)))) = result {
             let live = worker.live.read_state();
@@ -10725,36 +10754,12 @@ impl AttendanceRecovery {
         // Keep recovery SQL state out of the actor's timeout/select layout,
         // just like a normal transition turn. Cancellation still drops the
         // entire page future without advancing the retained cursor.
-        type RecoveryPageResult = Result<Option<(i64, usize)>, StoreError>;
+        type RecoveryPageResult = Result<Option<(i64, bool)>, StoreError>;
         let recover: std::pin::Pin<Box<dyn Future<Output = RecoveryPageResult> + Send + '_>> =
-            Box::pin(async {
-                let rows = worker
-                    .store
-                    .attendance_recovery_page(guild, self.after_id)
-                    .await?;
-                // A buggy alternate store cannot defeat the per-turn row bound.
-                if rows.len() > two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE {
-                    return Ok::<_, StoreError>(None);
-                }
-                let ids: Vec<i64> = {
-                    let live = worker.live.read_state();
-                    if live.generation != generation || live.ready != ready {
-                        return Ok(None);
-                    }
-                    rows.iter().map(|row| row.id).collect()
-                };
-                worker
-                    .store
-                    .recover_attendance_sessions(guild, &ids)
-                    .await?;
-                Ok(Some((
-                    rows.last().map(|row| row.id).unwrap_or(self.after_id),
-                    rows.len(),
-                )))
-            });
+            Box::pin(Self::recover_page(worker, generation, None, self.after_id));
         let result = tokio::time::timeout(Duration::from_millis(1_000), recover).await;
         match result {
-            Ok(Ok(Some((after_id, count)))) => {
+            Ok(Ok(Some((after_id, exhausted)))) => {
                 let live = worker.live.read_state();
                 if live.generation != generation
                     || self.generation != Some(generation)
@@ -10763,9 +10768,7 @@ impl AttendanceRecovery {
                     return;
                 }
                 self.after_id = after_id;
-                if count < two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE
-                    && self.fence.as_ref().is_some_and(|fence| fence.complete())
-                {
+                if exhausted && self.fence.as_ref().is_some_and(|fence| fence.complete()) {
                     self.after_id = 0;
                     // Buffered pre-recovery frames are not new evidence;
                     // never replay their joins into the repaired epoch.
