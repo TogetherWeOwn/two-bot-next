@@ -613,6 +613,21 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let rooms: Vec<VoiceRoom> = self.rooms.values().cloned().collect();
         for room in rooms {
             let room_id = room.channel_id;
+            let move_pending = {
+                let live = self.live.read_state();
+                self.moves.contains_key(&room_id)
+                    || self
+                        .uncertain_moves
+                        .get(&room_id)
+                        .is_some_and(|ticket| live.ticket_valid(*ticket))
+            };
+            if move_pending {
+                // As with cleanup and succession, cached occupancy is not
+                // authoritative until the move's gateway echo or a refresh.
+                // Do not publish an empty render or cache its signature.
+                self.name_inputs = None;
+                continue;
+            }
             command.actor_id = room.owner_id;
             command.request = NameInteraction::Restore { room_id };
             // Playtime follows live presence, not automatic-name eligibility.

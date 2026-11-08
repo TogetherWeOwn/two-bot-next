@@ -72,6 +72,9 @@ async fn delayed_move_echo_does_not_rename_a_personal_room_as_empty() {
         assert!(worker.accept_join(ticket, "Alex", 7, NOW.to_owned()));
         dispatch(&mut worker, 0).await;
         assert_eq!(*worker.http.created_names.lock().unwrap(), ["Alex"]);
+        worker.refresh_template_names(0);
+        assert!(!worker.name_signatures.contains_key(&500));
+        assert!(worker.name_inputs.is_none());
         dispatch(&mut worker, 1).await;
         assert!(worker.uncertain_moves.contains_key(&500));
         assert_eq!(worker.live.read_state().humans(500), 0);
@@ -108,7 +111,67 @@ async fn delayed_move_echo_does_not_rename_a_personal_room_as_empty() {
             worker.desired_names.get(&500).map(String::as_str),
             Some("Alex")
         );
+
+        // Once a real departure proves the room empty, the existing idle
+        // template and cleanup policy still apply despite the retained ticket.
+        worker.live.voice_update(MEMBER, None, Some(false));
+        worker.refresh_template_names(600_001);
+        assert_eq!(worker.desired_names[&500], "Idle room 1");
+        dispatch(&mut worker, 1_200_000).await;
+        assert_eq!(renames_of(&trace), ["rename:500:Idle room 1"]);
+        worker.live.set_empty_grace(Duration::ZERO);
+        worker.reconcile();
+        for step in 0..8 {
+            worker.dispatch_one(2_000_000 + step * 1_000_000).await;
+        }
+        assert!(worker.tracked().is_empty());
     }
+}
+
+#[tokio::test]
+async fn rate_limited_move_defers_custom_rerender_until_occupancy_resolves() {
+    let (live, store, http, trace) = fixture();
+    store.creators.lock().unwrap()[0].name_template = "@@owner@@".to_owned();
+    http.move_errors
+        .lock()
+        .unwrap()
+        .push_back(RoomHttpError::RateLimited {
+            retry_after_ms: 1_000,
+            global: false,
+        });
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let ticket = worker
+        .live
+        .voice_update(MEMBER, Some(CREATOR), Some(false))
+        .unwrap();
+    assert!(worker.accept_join(ticket, "Alex", 7, NOW.to_owned()));
+    dispatch(&mut worker, 0).await;
+    worker
+        .custom_names
+        .insert(500, "@@owner@@ · @@num@@".to_owned());
+    dispatch(&mut worker, 1).await;
+    assert!(worker.moves.contains_key(&500));
+    for now in [2, 10, 100] {
+        worker.refresh_template_names(now);
+        assert!(!worker.name_signatures.contains_key(&500));
+        assert!(worker.name_inputs.is_none());
+    }
+    assert!(renames_of(&trace).is_empty(), "{trace:?}");
+
+    dispatch(&mut worker, 2_000).await;
+    assert!(!worker.moves.contains_key(&500));
+    assert!(worker.uncertain_moves.contains_key(&500));
+    worker.refresh_template_names(2_001);
+    assert!(!worker.name_signatures.contains_key(&500));
+    assert!(worker.name_inputs.is_none());
+
+    worker.live.voice_update(MEMBER, Some(500), Some(false));
+    worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
+    worker.live.voice_update(MEMBER + 1, None, Some(false));
+    worker.refresh_template_names(2_002);
+    dispatch(&mut worker, 600_000).await;
+    assert_eq!(renames_of(&trace), ["rename:500:Alex · 1"]);
+    assert!(override_saves_of(&trace).is_empty());
 }
 
 // --- re-render on fact changes (failing until V5 recalculation is wired) ----
