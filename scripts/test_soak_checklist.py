@@ -52,6 +52,40 @@ class SoakChecklistTests(unittest.TestCase):
                 self.assertIn(requirement, rendered)
         self.assertIn("[Evidence-bounded timing exits](#evidence-bounded-timing-exits)", rendered)
 
+    def test_promotion_policy_discloses_warning_only_enforcement(self):
+        instructions = "\n".join(self.checklist["instructions"])
+        for requirement in (
+            "at least 10 judged requests",
+            "same exact build/process incarnation",
+            "not a claim of current gate enforcement",
+            "`insufficient_data` for fewer than 10 judged requests",
+            "changed process incarnation with a clean post-restart window",
+            "overall `pass`, warns and exits zero",
+            "workflow consumes that exit",
+            "separate error-rate gate also treats insufficient data as warning-only",
+            "unsupported enforcement/qualification gap remains held",
+            "workflow green alone is not the required proof",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, instructions)
+                self.assertIn(requirement, render(self.checklist))
+
+    def test_b4_early_close_and_timeout_contract_survives_regeneration(self):
+        instructions = "\n".join(self.checklist["instructions"])
+        for requirement in (
+            "Record actual close UTC and complete receipt links",
+            "only checkpoints due while open require observations",
+            "later checkpoints/comparisons are N/A with the close UTC and reason",
+            "never fabricated evidence",
+            "At T0+48h incomplete stays INCOMPLETE",
+            "cutover lead, Release Manager and data lead decide hold/incident/rollback",
+            "Any continuation needs its own bounded decision, never automatic extension",
+            "prescribed actual timer/workload coverage, independent B2",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, instructions)
+                self.assertIn(requirement, render(self.checklist))
+
     def test_timer_rows_require_receipts_not_idle_holds(self):
         entries = {entry["id"]: entry for entry in self.checklist["entries"]}
         for entry_id, retained_cadences in (

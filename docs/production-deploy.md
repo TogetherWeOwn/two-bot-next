@@ -287,8 +287,25 @@ and at the boundaries. Historical staging-green age, runner queues and idle
 time supply no credit; the guard's historical remainder is advisory only.
 The 30min interval is required continuous coverage on the same exact build and
 process incarnation, not an arbitrary wait; no shorter equivalent is supported.
-Earliest automatic exit requires that coverage, at least 10 judged requests,
-the final pinned user-flow/readiness/original-grant proof and confirmed release.
+Required qualification for the earliest automatic exit is that coverage, at
+least 10 judged requests, the final pinned user-flow/readiness/original-grant
+proof and confirmed release. These are policy requirements, not a claim that
+the shipped gates enforce all of them.
+
+**Current enforcement gap — warning-only insufficient evidence.**
+`scripts/promotion_regression_gate.py::compare` reports `rest_5xx.verdict:
+"insufficient_data"` for fewer than ten judged requests, or a changed process
+incarnation with a clean post-restart window. With healthy journeys it still
+reports overall `verdict: "pass"`; `main` warns and exits zero, and
+`deploy-production.yml` consumes that exit as success. The separate
+`wrangler/scripts/promotion-error-gate.mjs` also treats insufficient data as a
+non-blocking warning. Thus nine clean requests, or clean counters after a
+restart, can leave the workflow green without the required evidence. This is an
+**unsupported enforcement/qualification gap**, not rate PASS or an authorized
+exception. Workflow green alone is not qualification proof: retain the hold and
+route the missing evidence/enforcement to the technical and release owners;
+do not authorize promotion without the required proof. This source-only
+correction does not repair the runtime or pipeline.
 Manual ordinary deploys retain their no-delay policy but use the same finite
 grant, baseline, final sample and release. Rollback and live-SHA cures skip
 the staging holder entirely. A superseded SHA refuses before acquisition;
