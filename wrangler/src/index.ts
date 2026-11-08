@@ -26,8 +26,9 @@ import { Container } from "@cloudflare/containers";
 export { ContainerProxy } from "@cloudflare/containers";
 import {
   OwnershipFence, OwnershipRefused, CONTROL_PATH, DEPLOYMENT_HEADER,
-  authenticated, deploymentId, readChange, refused,
+  authenticated, deploymentId, readChange, readControlBody, refused,
 } from "./ownership.ts";
+import { StagingLifecycle, STAGING_USE_PATH, parseStagingUseChange, type StagingUse } from "./staging-lifecycle.ts";
 import {
   TokenBuckets,
   RedirectMissCache,
@@ -151,6 +152,8 @@ export interface Env extends ForwardedFlagEnv, ForwardedDiscordIdEnv {
   CF_VERSION_METADATA?: { id: string };
   /** Dedicated control bearer secret; absent means no control operations. */
   OWNERSHIP_CONTROL_TOKEN?: string;
+  /** Staging-only lifecycle policy. Activation is separate from protocol rollout. */
+  STAGING_RUNTIME_POLICY?: string;
   DISCORD_TOKEN?: string;
   DATABASE_URL?: string;
   GUILD_ID?: string;
@@ -374,6 +377,9 @@ interface KeepalivePayload {
   startedAt: number;
   deploymentId?: string;
   epoch?: number;
+  runId?: string;
+  runAttempt?: number;
+  expiresAt?: number;
 }
 
 interface ReadinessState {
@@ -841,6 +847,7 @@ export class TwoBotContainer extends Container<Env> {
   override envVars = containerEnvVars(this.env, this.defaultPort);
 
   private readonly ownership = new OwnershipFence(this.ctx.storage);
+  private readonly stagingUse = new StagingLifecycle(this.ctx.storage);
   private readonly initialization: Promise<void>;
   private recoveryFailed = false;
   // Last container git SHA seen on /readyz this tick. Tags the keepalive
@@ -862,11 +869,18 @@ export class TwoBotContainer extends Container<Env> {
     // ingress or alarms are delivered, not just before the next cold start.
     this.initialization = ctx.blockConcurrencyWhile(async () => {
       try {
-        await this.ownership.require(this.id());
+        const owner = await this.ownership.require(this.id());
+        if (this.boundedStaging()) {
+          const use = await this.stagingUse.require({ deploymentId: this.id(), sha: this.env.CONTAINER_RELEASE ?? "", owner });
+          await this.scheduleStagingExpiry(use.expiresAt);
+        }
       } catch (error) {
         refused(error);
         try { await this.destroyInactive(); }
-        catch { this.recoveryFailed = true; }
+        catch {
+          this.recoveryFailed = true;
+          if (this.boundedStaging()) await this.scheduleStagingExpiry(Date.now() + 15_000);
+        }
       }
     });
   }
@@ -892,11 +906,112 @@ export class TwoBotContainer extends Container<Env> {
     return this.gated(async () => {
       if (this.recoveryFailed) throw new OwnershipRefused("shutdown_unconfirmed");
       await this.ownership.require(this.id());
-      return operation();
+      if (!this.boundedStaging()) return operation();
+      await this.requireStagingUse();
+      try { return await operation(); }
+      finally { await this.requireStagingUse(); }
     });
   }
 
+  private boundedStaging(): boolean {
+    return this.env.TWO_DEPLOY_ENV === "staging" && this.env.STAGING_RUNTIME_POLICY === "bounded";
+  }
+
+  private async requireStagingUse(): Promise<StagingUse> {
+    try {
+      const owner = await this.ownership.require(this.id());
+      const use = await this.stagingUse.require({ deploymentId: this.id(), sha: this.env.CONTAINER_RELEASE ?? "", owner });
+      await this.scheduleStagingExpiry(use.expiresAt);
+      return use;
+    } catch (error) {
+      try { await this.destroyInactive(); }
+      catch {
+        this.recoveryFailed = true;
+        await this.scheduleStagingExpiry(Date.now() + 15_000);
+      }
+      throw error;
+    }
+  }
+
+  private async scheduleStagingExpiry(expiresAt: number): Promise<void> {
+    const [pending] = await this.listSchedules("stagingExpiry");
+    // The pinned SDK persists schedule times in whole seconds. Ceil, never
+    // floor an expiry: an early callback must not discard the only deadline.
+    const when = Math.ceil(expiresAt / 1000);
+    if (pending?.time === when) return;
+    this.deleteSchedules("stagingExpiry");
+    await this.schedule(new Date(when * 1000), "stagingExpiry", null);
+  }
+
+  private async stopStagingUse(): Promise<void> {
+    try { await this.destroyInactive(); }
+    catch (error) {
+      // Acquisition has already persisted preparing denial; release has
+      // persisted released denial. Neither may wait for the original deadline
+      // after an unconfirmed stop. This successor can only retry teardown.
+      this.recoveryFailed = true;
+      await this.scheduleStagingExpiry(Date.now() + 15_000);
+      throw error;
+    }
+  }
+
+  private stagingReceipt(action: "acquire" | "release" | "expiry", use: StagingUse | undefined,
+    outcome: "authorized" | "stopped" | "stop_unconfirmed"): void {
+    // Project only validated finite-use correlation fields. Runner cancellation
+    // cannot upload artifacts, so native expiry also leaves a runtime receipt.
+    console.log(JSON.stringify({ event: "staging_use", action, outcome, environment: "staging",
+      observed_at: new Date().toISOString(), running: this.ctx.container?.running ?? false,
+      ...(use ? { run_id: use.runId, run_attempt: use.runAttempt, expires_at_ms: use.expiresAt,
+        deployment_id: use.deploymentId, sha: use.sha, epoch: use.epoch } : {}) }));
+  }
+
+  /** The SDK owns alarm(); its persisted callback re-reads authority on every wake. */
+  public async stagingExpiry(): Promise<void> {
+    if (!this.boundedStaging()) return;
+    await this.gated(async () => {
+      let use: StagingUse | undefined;
+      try {
+        use = await this.stagingUse.read();
+        if (use?.phase === "active" && use.expiresAt > Date.now() && !this.recoveryFailed) {
+          await this.scheduleStagingExpiry(use.expiresAt);
+          return;
+        }
+        await this.destroyInactive();
+        this.deleteSchedules("stagingExpiry");
+        this.recoveryFailed = false;
+        this.stagingReceipt("expiry", use, "stopped");
+      } catch {
+        // A storage failure is denial too. Do not keep a healthy gateway or
+        // an idle retry loop alive just because authority could not be read.
+        try {
+          if (this.ctx.container?.running) await super.destroy();
+          if (this.ctx.container?.running) throw new OwnershipRefused("shutdown_unconfirmed");
+          this.deleteSchedules("keepalive");
+          this.deleteSchedules("stagingExpiry");
+          this.recoveryFailed = false;
+          this.stagingReceipt("expiry", use, "stopped");
+        } catch {
+          // SDK 0.3.7 consumes a scheduled row even when its callback throws.
+          // Persist a successor before returning; never revive the gateway.
+          this.recoveryFailed = true;
+          await this.scheduleStagingExpiry(Date.now() + 15_000);
+          console.error(JSON.stringify({ event: "staging_stop_unconfirmed" }));
+          this.stagingReceipt("expiry", use, "stop_unconfirmed");
+        }
+      }
+    });
+  }
+
+  override async onActivityExpired(): Promise<void> {
+    if (!this.boundedStaging()) return super.onActivityExpired();
+    // Native inactivity is a second stop path, never a staging restart path.
+    await this.gated(() => this.destroyInactive());
+  }
+
   private async destroyInactive(): Promise<void> {
+    // Staging shutdown must still reach the native process if storage is
+    // unavailable. Production retains its existing cleanup/ownership ordering.
+    if (this.boundedStaging() && this.ctx.container?.running) await super.destroy();
     this.deleteSchedules("keepalive");
     await this.ctx.storage.delete(TwoBotContainer.KEEPALIVE_KEY);
     if (this.ctx.container?.running) await super.destroy();
@@ -906,6 +1021,7 @@ export class TwoBotContainer extends Container<Env> {
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === CONTROL_PATH) return this.control(request);
+    if (url.pathname === STAGING_USE_PATH) return this.stagingControl(request);
     if (url.pathname === ACTIONS_PATH) return this.internalActions(request);
     if (url.pathname === EVENTSUB_PATH) return this.internalEventsub(request);
     const mcpAuditRead = url.origin === "http://c" && url.pathname === OPS_AUDIT_PATH
@@ -1250,6 +1366,47 @@ export class TwoBotContainer extends Container<Env> {
     }
   }
 
+  private async stagingControl(request: Request): Promise<Response> {
+    if (!this.boundedStaging()) return notFound();
+    if (!await authenticated(request, this.env.OWNERSHIP_CONTROL_TOKEN)) {
+      return new Response("unauthorized", { status: 401, headers: withSecurityHeaders() });
+    }
+    if (request.method !== "GET" && request.method !== "POST") {
+      return new Response("method not allowed", { status: 405, headers: withSecurityHeaders({ allow: "GET, POST" }) });
+    }
+    const change = request.method === "POST" ? parseStagingUseChange(await readControlBody(request)) : null;
+    if (request.method === "POST" && !change) {
+      return new Response("invalid staging use", { status: 400, headers: withSecurityHeaders() });
+    }
+    try {
+      return await this.gated(async () => {
+        const id = this.id();
+        if (request.headers.get(DEPLOYMENT_HEADER) !== id) throw new OwnershipRefused("deployment_mismatch");
+        const owner = await this.ownership.require(id);
+        const identity = { deploymentId: id, sha: this.env.CONTAINER_RELEASE ?? "", owner };
+        let use = await this.stagingUse.read();
+        if (change) {
+          if (change.action === "acquire") {
+            use = await this.stagingUse.acquire(change, identity,
+              () => this.stopStagingUse(), (expiry) => this.scheduleStagingExpiry(expiry));
+            this.recoveryFailed = false;
+          } else {
+            use = await this.stagingUse.release(change, identity, () => this.stopStagingUse());
+            this.deleteSchedules("stagingExpiry");
+            this.recoveryFailed = false;
+          }
+          this.stagingReceipt(change.action, use, change.action === "acquire" ? "authorized" : "stopped");
+        }
+        // Acquisition authorizes, but does not itself start or certify the
+        // container. The pipeline must probe and verify the exact build next.
+        return Response.json({ deploymentId: id, sha: identity.sha, owner, use: use ?? null,
+          running: this.ctx.container?.running ?? false }, {
+          headers: withSecurityHeaders({ "cache-control": "no-store" }),
+        });
+      });
+    } catch (error) { return refused(error); }
+  }
+
   private async control(request: Request): Promise<Response> {
     if (!await authenticated(request, this.env.OWNERSHIP_CONTROL_TOKEN)) {
       return new Response("unauthorized", { status: 401, headers: withSecurityHeaders() });
@@ -1412,16 +1569,21 @@ export class TwoBotContainer extends Container<Env> {
   /** One persisted chain, with ownership checked outside fail-open monitoring. */
   private async armKeepalive(): Promise<void> {
     const owner = await this.ownership.require(this.id());
+    const use = this.boundedStaging() ? await this.requireStagingUse() : undefined;
+    if (use && Date.now() + this.keepaliveSeconds() * 1000 >= use.expiresAt) return;
     if (this.keepaliveRunning) return;
     if (this.keepaliveArming) return this.keepaliveArming;
     // SDK 0.3.7 inserts a new row on every schedule() call. An old epoch's
     // pending callback is never authority to keep this deployment alive.
     this.keepaliveArming = (async () => {
       const [pending] = await this.listSchedules<KeepalivePayload>("keepalive");
-      if (pending?.payload?.deploymentId === this.id() && pending.payload.epoch === owner.epoch) return;
+      if (pending?.payload?.deploymentId === this.id() && pending.payload.epoch === owner.epoch
+        && (!use || (pending.payload.runId === use.runId && pending.payload.runAttempt === use.runAttempt
+          && pending.payload.expiresAt === use.expiresAt))) return;
       this.deleteSchedules("keepalive");
       await this.schedule(this.keepaliveSeconds(), "keepalive", {
         startedAt: Date.now(), deploymentId: this.id(), epoch: owner.epoch,
+        ...(use ? { runId: use.runId, runAttempt: use.runAttempt, expiresAt: use.expiresAt } : {}),
       } satisfies KeepalivePayload);
     })().catch(() => {
       // Scheduling failures are monitoring failures, not permission failures.
@@ -1453,6 +1615,12 @@ export class TwoBotContainer extends Container<Env> {
         const owner = await this.ownership.require(this.id());
         if (payload?.deploymentId !== this.id() || payload.epoch !== owner.epoch) {
           throw new OwnershipRefused("stale_keepalive");
+        }
+        if (this.boundedStaging()) {
+          const use = await this.requireStagingUse();
+          if (payload.runId !== use.runId || payload.runAttempt !== use.runAttempt || payload.expiresAt !== use.expiresAt) {
+            throw new OwnershipRefused("stale_keepalive");
+          }
         }
         await this.keepaliveArming;
         this.renewActivityTimeout();
@@ -1552,7 +1720,10 @@ export class TwoBotContainer extends Container<Env> {
           this.deleteSchedules("keepalive");
           if (admitted) {
             await this.ownership.require(this.id());
-            await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
+            const use = this.boundedStaging() ? await this.requireStagingUse() : undefined;
+            if (!use || Date.now() + this.keepaliveSeconds() * 1000 < use.expiresAt) {
+              await this.schedule(this.keepaliveSeconds(), "keepalive", payload);
+            }
           }
         }
         // Persistence, primary logs, remediation and the successor are complete
@@ -1913,7 +2084,9 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === CONTROL_PATH) {
+    if (url.pathname === STAGING_USE_PATH
+      && (env.TWO_DEPLOY_ENV !== "staging" || env.STAGING_RUNTIME_POLICY !== "bounded")) return notFound();
+    if (url.pathname === CONTROL_PATH || url.pathname === STAGING_USE_PATH) {
       if (!await authenticated(request, env.OWNERSHIP_CONTROL_TOKEN)) {
         return new Response("unauthorized", { status: 401, headers: withSecurityHeaders() });
       }

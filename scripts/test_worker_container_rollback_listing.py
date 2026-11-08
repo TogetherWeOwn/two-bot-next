@@ -145,18 +145,30 @@ class ImageRestoreListingTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             snapshot = Path(tmp) / "snapshot.json"
-            # Legacy snapshot avoids unrelated version-provenance fixture calls.
+            # Staging recovery requires a stamped, finite-use-safe target.
             snapshot.write_text(json.dumps({
                 "has_previous": True, "worker": fixtures.WORKER,
                 "application": fixtures.APPLICATION, "application_id": fixtures.APP_ID,
                 "serving_version": fixtures.GOOD_VERSION, "serving_rollout_id": "r-prev",
-                "serving_image": fixtures.good_image()}))
+                "serving_sha": fixtures.SHA, "serving_image": fixtures.good_image()}))
+            routes[("GET", f"/workers/scripts/{fixtures.WORKER}/versions/{fixtures.GOOD_VERSION}")] = \
+                fixtures.version_route()
+            deployment_route = ("GET", f"/workers/scripts/{fixtures.WORKER}/deployments")
+            current_deployments = routes[deployment_route]
+            def with_history():
+                result = current_deployments()
+                result["result"]["deployments"].append({"versions": [
+                    {"version_id": fixtures.GOOD_VERSION, "percentage": 100}]})
+                return result
+            routes[deployment_route] = with_history
             routes[("GET", f"/containers/applications/{fixtures.APP_ID}/rollouts/r-prev")] = \
                 lambda: {"success": True, "result": fixtures.rollout_row(
                     "r-prev", fixtures.good_image())}
             evidence = Path(tmp) / "evidence.json"
             with (mock.patch.object(rollback, "Rollback", factory),
                   mock.patch.object(rollback, "control_client", return_value=fixtures.control_stub()[0]),
+                  mock.patch.object(rollback, "staging_restore_client",
+                                    return_value=lambda action: None),
                   redirect_stdout(io.StringIO())):
                 code = rollback.main([
                     "rollback", "--variant", "staging", "--worker-url",

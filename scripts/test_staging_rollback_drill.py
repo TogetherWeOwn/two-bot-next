@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError, URLError
@@ -18,6 +19,10 @@ spec = importlib.util.spec_from_file_location(
 drill = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(drill)
 GateError = drill.GateError
+# The drill module put scripts/ on sys.path; the finite-window adapter and its fake runtime live beside it.
+import staging_drill_use as use_module
+from test_staging_drill_use import (
+    CF_TOKEN, RECEIPT, SHA_A, SHA_B, WINDOW_MS, FakeRuntime, policy_bindings, version_payload)
 
 PRE = "11111111-1111-4111-8111-111111111111"
 TARGET = "22222222-2222-4222-8222-222222222222"
@@ -27,6 +32,7 @@ URL = "https://two-bot-next-staging.offline-fixture.workers.dev"
 ACCOUNT = "b" * 32
 SENTINEL = "RAW_SECRET_SENTINEL_never_disclose_ownership_token"
 DEPLOYMENTS_PATH = "/workers/scripts/two-bot-next-staging/deployments"
+VERSIONS_PATH = "/workers/scripts/two-bot-next-staging/versions/"
 
 
 class World:
@@ -44,9 +50,21 @@ class World:
         self.fail_control = {}  # (action, nth call) -> error to raise
         self.never_ready = set()  # versions whose Worker never reports ready
         self.events = []  # ordered API and ownership calls for the transport fixtures
+        self.shas = {}  # version -> deployed Git SHA; every version shares one image by default
+        self.bindings = {}  # version -> replacement binding list for policy refusals
+        self.unstamped = set()  # versions without a workers/message SHA annotation
+        self.reported = {}  # version -> build_revision its Worker reports on /readyz
+        self.probe_marks = []  # len(events) at each /readyz probe, to order probes against calls
+        self.use_expires_at = None
 
     def tick(self, seconds):
         self.t += seconds
+
+    def sha(self, version):
+        return self.shas.get(version, SHA_A)
+
+    def owner_view(self):
+        return {"phase": self.phase, "serving": self.history[0], "running": self.running}
 
 
 class FakeClient:
@@ -61,6 +79,14 @@ class FakeClient:
                     [{"version_id": PRE, "percentage": 50}, {"version_id": TARGET, "percentage": 50}]
                 rows.append({"id": "d", "versions": versions})
             return {"deployments": rows}
+        if path.startswith(VERSIONS_PATH):
+            version = path.removeprefix(VERSIONS_PATH)
+            if version not in self.world.history:
+                raise GateError("api_http_failure")
+            payload = version_payload(version, self.world.sha(version), self.world.bindings.get(version))
+            if version in self.world.unstamped:
+                payload["annotations"] = {}
+            return payload
         raise GateError("api_http_failure")  # container evidence is best effort
 
     def post(self, path, body):
@@ -76,13 +102,17 @@ class FakeClient:
     def request(self, url):
         world = self.world
         version = world.history[0]
+        if world.use_expires_at is not None:
+            world.running = world.phase == "active" and int(world.t * 1000) < world.use_expires_at
         if url.endswith("/health"):
-            return (200 if world.phase == "active" else 503), {}, b""
+            return (200 if world.phase == "active" and world.running else 503), {}, b""
         up = world.phase == "active" and world.running and version not in world.never_ready
         if up and world.polls_left > 0:
             world.polls_left -= 1
             up = False
-        body = json.dumps({"components": [["process", "ready"], ["gateway", "ready" if up else "starting"]]})
+        world.probe_marks.append(len(world.events))
+        body = json.dumps({"components": [["process", "ready"], ["gateway", "ready" if up else "starting"]],
+                           "build_revision": world.reported.get(version, world.sha(version))})
         return (200 if up else 503), {"x-two-worker-version": version}, body.encode()
 
 
@@ -593,7 +623,9 @@ class ClientAndControlTests(unittest.TestCase):
                      "NODE_OPTIONS": SENTINEL, "NODE_PATH": SENTINEL, "LD_PRELOAD": SENTINEL,
                      "HTTPS_PROXY": SENTINEL, "HOME": SENTINEL, "STAGING_WORKER_URL": SENTINEL,
                      "OWNERSHIP_CONTROL_TOKEN": "wrong", "OWNERSHIP_ACTOR": "wrong",
-                     "OWNERSHIP_RELEASE_FENCE": "true"}
+                     "OWNERSHIP_RELEASE_FENCE": "true", "STAGING_USE_RECEIPT": SENTINEL,
+                     "GITHUB_RUN_ATTEMPT": "1", "STAGING_USE_EXPIRES_AT": "1",
+                     "STAGING_USE_DEPLOYMENT": SENTINEL, "STAGING_USE_SHA": SENTINEL}
         done = subprocess.CompletedProcess([], 0, stdout='{"configured": true}', stderr="")
         actor = "github-actions:1:rollback-drill"
         control = drill.ownership_control(SENTINEL, URL, actor, root="/repo")
@@ -646,18 +678,25 @@ class ClientAndControlTests(unittest.TestCase):
 class MainTests(unittest.TestCase):
     def environ(self, **changes):
         env = {"STAGING_WORKER_URL": URL, "OWNERSHIP_CONTROL_TOKEN": SENTINEL, "GITHUB_RUN_ID": "123456",
+               "GITHUB_RUN_ATTEMPT": "1", "STAGING_USE_RECEIPT": RECEIPT, "PATH": "/runtime/bin",
                "CLOUDFLARE_ACCOUNT_ID": ACCOUNT, "CLOUDFLARE_API_TOKEN": "t" * 40}
         env.update(changes)
         return env
 
-    def invoke(self, env, world=None, args=None):
+    def invoke(self, env, world=None, args=None, runtime_fail=None):
         world = world or World()
+        # The real default StagingDrillUse runs; only its subprocess transport is a fake runtime.
+        world.t = time.time()
+        self.runtime = FakeRuntime(world.owner_view, lambda: world.t, world.sha, events=world.events)
+        self.runtime.fail.update(runtime_fail or {})
+        self.world = world
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "evidence.json"
             summary = Path(directory) / "summary.md"
             env = {**env, "GITHUB_STEP_SUMMARY": str(summary)}
             output = io.StringIO()
             with patch("builtins.print", lambda *a, **k: output.write(" ".join(map(str, a)) + "\n")), \
+                    patch.object(use_module.subprocess, "run", self.runtime), \
                     patch.object(drill, "POLL_SECONDS", 0):
                 code = drill.main(args or ["--target-version", TARGET, "--evidence", str(evidence)], environ=env,
                                   make_control=lambda token, url, actor: make_control(world),
@@ -702,6 +741,68 @@ class MainTests(unittest.TestCase):
                 self.assertNotIn(SENTINEL, output)
                 self.assertIn("refused before any change", output)
 
+    ALL_USE = ["acquire", "ready", "restore-check", "acquire", "acquire", "release"]
+
+    def test_default_lifecycle_runs_with_only_a_fake_transport(self):
+        code, output, evidence, summary = self.invoke(self.environ())
+        self.assertEqual(code, 0)
+        self.assertEqual(self.runtime.actions, self.ALL_USE)
+        self.assertEqual(self.runtime.violations, [])
+        data = json.loads(evidence)
+        self.assertEqual(data["staging_cleanup"], "release_confirmed")
+        self.assertEqual(data["staging_expires_at"],
+                         int(self.runtime.env_of(0)["STAGING_USE_EXPIRES_AT"]))
+        for _, _, env, kwargs, _ in self.runtime.calls:
+            self.assertEqual(env["PATH"], "/runtime/bin")
+            self.assertEqual(env["GITHUB_RUN_ATTEMPT"], "1")
+            self.assertEqual(env["STAGING_USE_RECEIPT"], RECEIPT)
+            self.assertEqual(env["OWNERSHIP_CONTROL_TOKEN"], SENTINEL)
+            self.assertNotIn("t" * 40, env.values())  # no Cloudflare API credential
+            self.assertNotIn("CLOUDFLARE_API_TOKEN", env)
+            self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+
+    def test_receipt_and_credentials_never_reach_output_evidence_or_summary(self):
+        cases = [({}, None), ({}, {("restore-check", 1): 1}), ({}, {("release", 1): 1}),
+                 ({}, {("acquire", 2): subprocess.TimeoutExpired(["node", RECEIPT], 1)})]
+        for change, fail in cases:
+            with self.subTest(fail=fail):
+                code, output, evidence, summary = self.invoke(self.environ(**change), runtime_fail=fail)
+                for text in (output, evidence, summary):
+                    for secret in (RECEIPT, SENTINEL, "t" * 40):
+                        self.assertNotIn(secret, text)
+
+    def test_missing_or_invalid_run_attempt_and_receipt_refuse_before_any_change(self):
+        cases = [self.environ(GITHUB_RUN_ATTEMPT="0"), self.environ(GITHUB_RUN_ATTEMPT="1; id"),
+                 self.environ(GITHUB_RUN_ATTEMPT=str(2 ** 53)), self.environ(STAGING_USE_RECEIPT="")]
+        for name in ("GITHUB_RUN_ATTEMPT", "STAGING_USE_RECEIPT"):
+            cases.append({k: v for k, v in self.environ().items() if k != name})
+        for env in cases:
+            with self.subTest(attempt=env.get("GITHUB_RUN_ATTEMPT"), receipt=bool(env.get("STAGING_USE_RECEIPT"))):
+                world = World()
+                code, output, evidence, _ = self.invoke(env, world)
+                self.assertEqual(code, 1)
+                self.assertIn("refused before any change", output)
+                self.assertEqual((world.calls, world.posts, self.runtime.calls), ([], [], []))
+                self.assertIsNone(evidence)
+                self.assertNotIn(RECEIPT, output)
+
+    def test_cleanup_failure_exits_nonzero_and_still_writes_evidence(self):
+        code, output, evidence, summary = self.invoke(self.environ(), runtime_fail={("release", 1): 1})
+        self.assertEqual(code, 1)
+        data = json.loads(evidence)
+        self.assertEqual(data["failures"], ["cleanup:staging_drill_control_failed"])
+        self.assertEqual(data["staging_cleanup"], "native_expiry_release_unconfirmed")
+        self.assertIn("FAIL", summary)
+
+    def test_unproved_policy_exits_nonzero_before_any_window_or_mutation(self):
+        world = World()
+        world.bindings[PRE] = [row for row in policy_bindings(SHA_A) if row["name"] != "TWO_DEPLOY_ENV"]
+        code, output, evidence, _ = self.invoke(self.environ(), world)
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(evidence)["failures"], ["drill:staging_restore_policy_unproved"])
+        self.assertEqual(json.loads(evidence)["staging_cleanup"], "not_acquired")
+        self.assertEqual((self.runtime.calls, world.calls, world.posts), ([], [], []))
+
     def invoke_real_client(self, env):
         output = io.StringIO()
         with tempfile.TemporaryDirectory() as directory, \
@@ -709,6 +810,246 @@ class MainTests(unittest.TestCase):
             code = drill.main(["--target-version", TARGET, "--evidence", str(Path(directory) / "e.json")],
                               environ=env, make_control=lambda *a: (_ for _ in ()).throw(AssertionError))
         return code, output.getvalue(), None, None
+
+
+class LifecycleTests(unittest.TestCase):
+    """Drill unit fixtures with the finite-window adapter and a fake runtime transport."""
+
+    ENV = {"GITHUB_RUN_ID": "123456", "GITHUB_RUN_ATTEMPT": "1", "STAGING_USE_RECEIPT": RECEIPT,
+           "PATH": "/runtime/bin"}
+    STEPS = [("control", "status"), ("use", "acquire"), ("use", "ready"), ("control", "status"),
+             ("use", "restore-check"), ("control", "status"), ("control", "fence"),
+             ("control", "deployment-takeover"), ("use", "acquire"),
+             ("control", "status"), ("control", "fence"), ("control", "deployment-takeover"),
+             ("use", "acquire"), ("use", "release")]
+
+    def go(self, world=None, *, control=None, sleep=None, target=TARGET, runtime_fail=None):
+        self.world = world or World()
+        self.runtime = FakeRuntime(self.world.owner_view, lambda: self.world.t, self.world.sha,
+                                   events=self.world.events)
+        self.runtime.fail.update(runtime_fail or {})
+        self.use = drill.StagingDrillUse(self.ENV, URL, SENTINEL, now=lambda: self.world.t, root="/repo")
+        self.logs = []
+        self.started_at = self.world.t
+        self.instance = drill.Drill(FakeClient(self.world), control or make_control(self.world), URL, "123456",
+                                    now=lambda: self.world.t, sleep=sleep or self.world.tick,
+                                    log=self.logs.append, staging_use=self.use)
+        with patch.object(use_module.subprocess, "run", self.runtime):
+            self.failures = self.instance.run(target)
+        return self.failures
+
+    def steps(self):
+        return [event for event in self.world.events if event[0] in ("control", "use")]
+
+    def refused_untouched(self, code):
+        self.assertEqual(self.failures, [code])
+        self.assertEqual((self.runtime.calls, self.world.calls, self.world.posts), ([], [], []))
+        self.assertFalse(self.instance.mutated)
+        self.assertEqual(self.instance.evidence["staging_cleanup"], "not_acquired")
+        self.assertIsNone(self.instance.evidence["staging_expires_at"])
+
+    def test_happy_path_orders_startup_pre_leg_check_and_per_takeover_acquires(self):
+        self.assertEqual(self.go(), [])
+        # Acquire+ready before any fence, one pre-leg assertion, no check in the
+        # recovery restore leg, a low-level acquire after each takeover, release last.
+        self.assertEqual(self.steps(), self.STEPS)
+        self.assertEqual(self.runtime.violations, [])
+        deployments = [call[2].get("STAGING_USE_DEPLOYMENT") for call in self.runtime.calls]
+        self.assertEqual(deployments, [PRE, PRE, None, TARGET, PRE, PRE])
+        self.assertEqual(self.instance.evidence["staging_cleanup"], "release_confirmed")
+
+    def test_idle_baseline_starts_only_inside_the_finite_window_and_stops_after_restore(self):
+        world = World()
+        world.running = False
+        self.assertEqual(self.go(world), [])
+        self.assertEqual(self.steps(), self.STEPS)
+        self.assertFalse(world.running)
+        self.assertEqual(world.history[0], PRE)
+        self.assertEqual(self.instance.evidence["staging_cleanup"], "release_confirmed")
+
+    def test_one_immutable_25_minute_deadline_for_every_call(self):
+        self.go(World(ready_polls=40))
+        self.assertGreater(self.world.t - self.started_at, 120)  # the clock moved a lot
+        expires = {call[2]["STAGING_USE_EXPIRES_AT"] for call in self.runtime.calls}
+        self.assertEqual(len(expires), 1)
+        deadline = int(expires.pop())
+        self.assertEqual(self.instance.evidence["staging_expires_at"], deadline)
+        begun = (deadline - WINDOW_MS) / 1000
+        self.assertGreaterEqual(begun, self.started_at)
+        self.assertLess(begun, self.started_at + 10)  # taken once, at startup
+        self.assertEqual(self.instance.staging_use.expires_at, deadline)
+
+    def test_every_takeover_acquires_before_any_readiness_probe(self):
+        self.go()
+        events = self.world.events
+        takeovers = [i for i, event in enumerate(events) if event == ("control", "deployment-takeover")]
+        self.assertEqual(len(takeovers), 2)
+        for takeover, version in zip(takeovers, (TARGET, PRE)):
+            acquire = next(i for i, event in enumerate(events) if i > takeover and event == ("use", "acquire"))
+            first_probe = min(mark for mark in self.world.probe_marks if mark > takeover)
+            self.assertGreater(first_probe, acquire)
+        self.assertEqual([call[2]["STAGING_USE_DEPLOYMENT"] for call in self.runtime.calls
+                          if call[1] == "acquire"][1:], [TARGET, PRE])
+        self.assertEqual(self.runtime.actions.count("ready"), 1)  # the leg's own wait_ready owns readiness
+
+    def test_failed_rebind_stops_before_any_probe_and_all_later_use(self):
+        self.go(runtime_fail={("acquire", 2): 1})
+        self.assertEqual(self.failures, ["drill:staging_drill_control_failed", "restore:staging_drill_window_ended"])
+        takeover = self.world.events.index(("control", "deployment-takeover"))
+        self.assertTrue(all(mark <= takeover for mark in self.world.probe_marks))
+        self.assertEqual(self.runtime.actions, ["acquire", "ready", "restore-check", "acquire"])
+        self.assertEqual([call[0] for call in self.world.calls].count("deployment-takeover"), 1)
+        self.assertEqual(self.instance.evidence["staging_cleanup"], "native_expiry_after_control_refusal")
+
+    def test_build_revision_must_match_the_validated_sha_in_the_original_wait(self):
+        world = World()
+        world.reported[TARGET] = SHA_B  # right Worker version header, wrong container revision
+        self.go(world)
+        self.assertEqual(len(self.failures), 1)
+        self.assertTrue(self.failures[0].startswith("drill:ready_timeout"))
+        self.assertEqual((world.phase, world.running, world.history[0]), ("active", False, PRE))
+        self.assertEqual(self.runtime.actions, ["acquire", "ready", "restore-check", "acquire", "acquire", "release"])
+
+    def test_running_baseline_with_wrong_build_revision_refuses_before_acquisition(self):
+        world = World()
+        world.reported[PRE] = SHA_B
+        self.go(world)
+        self.assertEqual(self.failures, ["drill:baseline_not_ready"])
+        self.assertEqual(world.posts, [])
+        self.assertNotIn("fence", [call[0] for call in world.calls])
+        self.assertEqual(self.runtime.actions, [])
+        self.assertEqual(self.instance.evidence["staging_cleanup"], "not_acquired")
+
+    def test_finite_policy_metadata_is_refused_before_startup_or_fence(self):
+        def without(name):
+            return [row for row in policy_bindings(SHA_A) if row["name"] != name]
+
+        cases = [
+            (TARGET, {"bindings": without("STAGING_RUNTIME_POLICY")}, "staging_restore_policy_unproved"),
+            (PRE, {"bindings": without("STAGING_RUNTIME_POLICY")}, "staging_restore_policy_unproved"),
+            (TARGET, {"bindings": [dict(row, text="indefinite") if row["name"] == "STAGING_RUNTIME_POLICY" else row
+                                   for row in policy_bindings(SHA_A)]}, "staging_restore_policy_unproved"),
+            (TARGET, {"bindings": policy_bindings(SHA_A) + policy_bindings(SHA_A)[:1]},
+             "staging_restore_policy_unproved"),
+            (TARGET, {"unstamped": True}, "staging_restore_identity_invalid"),
+        ]
+        for version, change, code in cases:
+            with self.subTest(version=version[:1], change=list(change), code=code):
+                world = World()
+                if "bindings" in change:
+                    world.bindings[version] = change["bindings"]
+                if change.get("unstamped"):
+                    world.unstamped.add(version)
+                self.go(world)
+                self.refused_untouched(f"drill:{code}")
+
+    def test_worker_target_must_share_the_serving_container_image(self):
+        world = World()
+        world.shas[TARGET] = SHA_B
+        self.go(world)
+        self.refused_untouched("drill:staging_drill_image_mismatch")
+
+    def test_other_preflight_refusals_never_open_a_window(self):
+        for world, target, code in ((World(), "latest", "invalid_target_version"),
+                                    (World(), PRE, "target_is_serving_version"),
+                                    (World(), NEVER, "target_never_served_traffic"),
+                                    (World(phase="fenced"), TARGET, "singleton_not_active_and_running")):
+            with self.subTest(code=code):
+                self.go(world, target=target)
+                self.assertEqual(self.failures, [f"drill:{code}"])
+                self.assertEqual(self.runtime.calls, [])
+                self.assertEqual(world.posts, [])
+
+    def test_pre_leg_assertion_refusal_stops_before_status_fence_or_rollback(self):
+        self.go(runtime_fail={("restore-check", 1): 1})
+        self.assertEqual(self.failures, ["drill:staging_drill_control_failed"])
+        self.assertEqual([call[0] for call in self.world.calls], ["status", "status"])  # preflight only
+        self.assertEqual(self.world.posts, [])
+        self.assertFalse(self.instance.mutated)
+        self.assertEqual(self.runtime.actions, ["acquire", "ready", "restore-check"])
+        self.assertEqual(self.instance.evidence["staging_cleanup"], "native_expiry_after_control_refusal")
+
+    def test_failed_leg_restores_without_a_new_check_and_releases(self):
+        world = World()
+        world.reject_post = GateError("api_http_failure", "status=409 codes=10220")
+        self.go(world)
+        self.assertEqual(self.failures, ["drill:api_http_failure"])
+        # Recovery retains the grant while fenced: no restore-check, acquire only after takeover.
+        self.assertEqual(self.runtime.actions, ["acquire", "ready", "restore-check", "acquire", "release"])
+        self.assertEqual(self.runtime.env_of(3)["STAGING_USE_DEPLOYMENT"], PRE)
+        self.assertEqual((world.phase, world.running, world.history[0]), ("active", False, PRE))
+        self.assertEqual(self.instance.evidence["staging_cleanup"], "release_confirmed")
+
+    def test_refused_restore_takeover_leaves_the_fence_and_never_substitutes_authority(self):
+        world = World()
+        world.reject_post = GateError("api_http_failure", "status=409 codes=10220")
+        world.fail_control[("deployment-takeover", 1)] = GateError("ownership_control_failed")
+        self.go(world)
+        self.assertEqual(self.failures[:2], ["drill:api_http_failure", "restore:ownership_control_failed"])
+        self.assertEqual((world.phase, world.running), ("fenced", False))
+        self.assertEqual(self.runtime.actions[:3], ["acquire", "ready", "restore-check"])
+        self.assertNotIn("acquire", self.runtime.actions[3:])  # no rebind after a refused takeover
+        self.assertEqual(len(world.posts), 1)
+
+    def test_ownership_authentication_failure_stops_use_and_cleanup(self):
+        world = World()
+        world.fail_control[("deployment-takeover", 1)] = GateError("ownership_auth_failed")
+        self.go(world)
+        self.assertEqual(self.failures, ["drill:ownership_auth_failed", "restore_skipped_after_auth_failure"])
+        self.assertEqual(self.runtime.actions, ["acquire", "ready", "restore-check"])
+        self.assertEqual(self.instance.evidence["staging_cleanup"], "native_expiry_after_control_refusal")
+        self.assertNotIn("release", self.runtime.actions)
+
+    def test_cloudflare_authentication_failure_stops_use_and_cleanup(self):
+        world = World()
+        world.reject_post = GateError("api_http_failure", "status=403 codes=10000")
+        self.go(world)
+        self.assertEqual(self.failures, ["drill:api_http_failure", "restore_skipped_after_auth_failure"])
+        self.assertEqual(self.runtime.actions, ["acquire", "ready", "restore-check"])
+        self.assertEqual(self.instance.evidence["staging_cleanup"], "native_expiry_after_control_refusal")
+
+    def test_expired_window_refuses_the_restore_leg_before_any_control(self):
+        world = World(ready_polls=1)
+        slept = []
+
+        def sleep(seconds):
+            world.tick(26 * 60 if not slept else seconds)  # the first readiness wait outlives the window
+            slept.append(seconds)
+
+        self.go(world, sleep=sleep)
+        self.assertEqual(self.failures, ["drill:staging_drill_window_ended",
+                                         "restore:staging_drill_window_ended"])
+        names = [call[0] for call in world.calls]
+        self.assertEqual((names.count("fence"), names.count("deployment-takeover"), len(world.posts)), (1, 1, 1))
+        self.assertEqual(world.history[0], TARGET)  # no restore was attempted past native expiry
+        self.assertFalse(world.running)
+        self.assertEqual(self.instance.evidence["staging_cleanup"], "release_confirmed")
+        self.assertEqual(self.runtime.actions, ["acquire", "ready", "restore-check", "acquire", "release"])
+
+    def test_cleanup_failure_is_a_failure_not_a_pass(self):
+        self.go(runtime_fail={("release", 1): 1})
+        self.assertEqual(self.failures, ["cleanup:staging_drill_control_failed"])
+        self.assertEqual(self.instance.evidence["staging_cleanup"], "native_expiry_release_unconfirmed")
+        self.assertEqual(self.instance.evidence["failures"], self.failures)
+
+    def test_use_errors_and_state_do_not_echo_receipt_or_credentials(self):
+        for fail in ({("acquire", 1): OSError(RECEIPT)}, {("restore-check", 1): 1},
+                     {("acquire", 2): subprocess.TimeoutExpired(["node", SENTINEL, CF_TOKEN], 1)}):
+            with self.subTest(fail=list(fail)):
+                self.go(runtime_fail=dict(fail))
+                text = "\n".join(self.logs) + json.dumps(self.instance.evidence) + \
+                    drill.summary(self.instance.evidence, self.failures)
+                for secret in (RECEIPT, SENTINEL, CF_TOKEN):
+                    self.assertNotIn(secret, text)
+
+    def test_drill_without_a_lifecycle_never_touches_the_use_transport(self):
+        world = World()
+        runtime = FakeRuntime(world.owner_view, lambda: world.t, world.sha)
+        with patch.object(use_module.subprocess, "run", runtime):
+            instance, failures, _ = run_drill(world)
+        self.assertEqual(failures, [])
+        self.assertEqual(runtime.calls, [])
+        self.assertNotIn("staging_cleanup", instance.evidence)
 
 
 class SourcePinTests(unittest.TestCase):
@@ -745,16 +1086,20 @@ class DryRunPlanPinTests(unittest.TestCase):
 
     def environ(self):
         return {"STAGING_WORKER_URL": URL, "OWNERSHIP_CONTROL_TOKEN": SENTINEL,
-                "GITHUB_RUN_ID": "123456", "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
+                "GITHUB_RUN_ID": "123456", "GITHUB_RUN_ATTEMPT": "1",
+                "STAGING_USE_RECEIPT": RECEIPT, "CLOUDFLARE_ACCOUNT_ID": ACCOUNT,
                 "CLOUDFLARE_API_TOKEN": "t" * 40}
 
-    def dry_run(self):
+    def dry_run(self, bindings=None):
         world = World()
+        world.bindings = bindings or {}
+        self.runtime = FakeRuntime(world.owner_view, time.time, world.sha, events=world.events)
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "evidence.json"
             output = io.StringIO()
             with patch("builtins.print",
                        lambda *a, **k: output.write(" ".join(map(str, a)) + "\n")), \
+                    patch.object(use_module.subprocess, "run", self.runtime), \
                     patch.object(drill, "POLL_SECONDS", 0):
                 code = drill.main(
                     ["--target-version", TARGET, "--dry-run",
@@ -781,6 +1126,15 @@ class DryRunPlanPinTests(unittest.TestCase):
         mutating = [call for call in world.calls
                     if call[0] in ("fence", "deployment-takeover")]
         self.assertEqual(mutating, [])
+        # Planning validates version metadata read-only; it never opens or uses a window.
+        self.assertEqual(self.runtime.calls, [])
+
+    def test_dry_run_refuses_unproved_policy_before_any_window(self):
+        code, out, world = self.dry_run(bindings={TARGET: [
+            row for row in policy_bindings(SHA_A) if row["name"] != "STAGING_RUNTIME_POLICY"]})
+        self.assertEqual(code, 1)
+        self.assertIn("staging_restore_policy_unproved", out)
+        self.assertEqual((self.runtime.calls, world.calls, world.posts), ([], [], []))
 
 
 if __name__ == "__main__":

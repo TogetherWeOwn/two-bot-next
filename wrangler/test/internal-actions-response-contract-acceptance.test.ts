@@ -167,7 +167,10 @@ const SUCCESSES: { name: string; value: Record<string, unknown> }[] = [
       ok: true,
       result: {
         v: 1, observed_at: "2026-11-03T10:00:00Z", total_in_voice: 1,
-        rooms: [{ channel_id: "222333444555666777", name: "synthetic-lobby", position: 0, user_limit: 5, member_ids: ["333444555666777888"] }],
+        rooms: [
+          { channel_id: "222333444555666777", name: "synthetic-lobby", position: 0, user_limit: 5, member_ids: ["333444555666777888"], occupied_since: "2026-11-03T09:58:00Z", event_key: "synthetic-showcase" },
+          { channel_id: "222333444555666778", name: "synthetic-quiet", position: 1, user_limit: 0, member_ids: [], occupied_since: null },
+        ],
       },
       request_id: REQUEST_ID,
     },

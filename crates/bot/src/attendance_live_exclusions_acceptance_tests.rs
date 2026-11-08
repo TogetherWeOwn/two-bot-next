@@ -182,7 +182,7 @@ async fn live_attendance(path: CheckinPath) {
         let prepared = if !matches!(path, CheckinPath::Direct) {
             Some(
                 runtime
-                    .prepare(interaction.clone())
+                    .prepare(interaction.clone(), runtime.router.gates().announcements)
                     .await
                     .expect("real acknowledgement path"),
             )

@@ -36,6 +36,7 @@ fn ctx() -> TemplateContext {
         username: "one".to_owned(),
         server: "TWO".to_owned(),
         channel: "#general".to_owned(),
+        args: String::new(),
     }
 }
 
@@ -190,6 +191,7 @@ fn hostile_expansion_refuses_as_bounded_render_too_long() {
         username: String::new(),
         server: String::new(),
         channel: String::new(),
+        args: String::new(),
     };
     match render_template(&"{user}".repeat(500), &big) {
         Err(TemplateError::RenderTooLong(len)) => {
@@ -210,6 +212,7 @@ fn over_ceiling_literal_refuses_with_exact_length() {
         username: String::new(),
         server: String::new(),
         channel: String::new(),
+        args: String::new(),
     };
     assert_eq!(
         render_template(&"x".repeat(MAX_RENDERED_CHARS + 1), &empty),
@@ -226,6 +229,7 @@ fn render_is_single_pass_and_preserves_unicode() {
         username: "not substituted twice".to_owned(),
         server: "世界".to_owned(),
         channel: "#rules".to_owned(),
+        args: String::new(),
     };
     let template = "😀 {user} {{server}} {User} {unknown}";
     let out = render_template(template, &ctx).expect("renders");

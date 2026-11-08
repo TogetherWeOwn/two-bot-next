@@ -244,13 +244,13 @@
         "row": [
           "14",
           "`/command`",
-          "`name` req ≤32, `template` req ≤2000 (`{user} {username} {server} {channel}`), `description` opt ≤100, `text-trigger` opt ≤33",
+          "`name` req ≤32, `template` req ≤2000 (`{user} {username} {server} {channel} {args}`), `description` opt ≤100, `text-trigger` opt ≤33",
           "`ManageGuild` (builder + runtime)"
         ]
       },
       "status": "manual",
-      "action": "Invoke /command name:soak-faq template:\"{user} {username} {server} {channel}\" description:soak text-trigger:soakfaq as manager; repeat as normal member.",
-      "expected": "Template stored and published only for manager; unsupported tokens/names rejected; runtime covered separately.",
+      "action": "Invoke /command name:soak-faq template:\"{user} {username} {server} {channel} {args}\" description:soak text-trigger:soakfaq as manager; repeat as normal member.",
+      "expected": "Template stored and published only for manager; unsupported tokens/names rejected; `{args}` accepted as the fifth token; runtime covered separately.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
     {

@@ -139,8 +139,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-13: 14 — `/command`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /command name:soak-faq template:"{user} {username} {server} {channel}" description:soak text-trigger:soakfaq as manager; repeat as normal member.
-- **Expected:** Template stored and published only for manager; unsupported tokens/names rejected; runtime covered separately.
+- **Action:** Invoke /command name:soak-faq template:"{user} {username} {server} {channel} {args}" description:soak text-trigger:soakfaq as manager; repeat as normal member.
+- **Expected:** Template stored and published only for manager; unsupported tokens/names rejected; `{args}` accepted as the fifth token; runtime covered separately.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-14: 15 — `/command-remove`

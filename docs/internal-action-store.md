@@ -121,11 +121,11 @@ audit key material is `sha256_hex(nonce)` carried on `AuthDecision.nonce_hash`.
 `VoiceMoveOutcome` is the closed nine-word result set (`moved`,
 `already_in_room`, `not_connected`, `not_permitted`, `room_full`,
 `room_gone`, `bot_not_permitted`, `rate_limited`, `discord_unavailable`,
-migration `0471`): the seven domain answers audit as `success`/200 (the move
+migration `0473`): the seven domain answers audit as `success`/200 (the move
 counts `affected` 1, the rest 0), while `rate_limited`/429 and
 `discord_unavailable`/502 keep `affected` NULL like every other refusal combo.
 The move columns (`from_channel_id`, `to_channel_id`, `request_id`, migration
-`0471`) ride the same audit copy, staying NULL on every older row.
+`0473`) ride the same audit copy, staying NULL on every older row.
 The adapter persists the whole typed response. It intentionally accepts neither
 `serde_json::Value` nor `ActionError` (which contains free-text log details).
 Receiver/executor follow-ups must map these typed scalars to their wire envelopes
