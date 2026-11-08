@@ -767,24 +767,29 @@ impl VoiceMoveEffect for VoiceMoveExecutor {
                 .await;
             // Only a definitive no-effect response releases an unobserved seat.
             // Transport/5xx uncertainty must not admit another member into it.
-            if matches!(
-                &patch,
-                Ok(VoiceMovePatch::Denied
-                    | VoiceMovePatch::Limited { .. }
-                    | VoiceMovePatch::Stale
-                    | VoiceMovePatch::NotSent)
-            ) || matches!(&patch, Err(error) if error.code == ErrorCode::RateLimited)
             {
-                self.voice_clock
-                    .move_admissions
-                    .lock()
-                    .map_err(|_| {
-                        Self::unavailable(
-                            "voice move admissions unavailable; retryable",
-                            "voice_move_admissions_unavailable",
-                        )
-                    })?
-                    .release(facts.member_id);
+                let mut admissions = self.voice_clock.move_admissions.lock().map_err(|_| {
+                    Self::unavailable(
+                        "voice move admissions unavailable; retryable",
+                        "voice_move_admissions_unavailable",
+                    )
+                })?;
+                if matches!(
+                    &patch,
+                    Ok(VoiceMovePatch::Denied
+                        | VoiceMovePatch::Limited { .. }
+                        | VoiceMovePatch::Stale
+                        | VoiceMovePatch::NotSent)
+                ) || matches!(&patch, Err(error) if error.code == ErrorCode::RateLimited)
+                {
+                    admissions.release(facts.member_id);
+                } else {
+                    // Pending callbacks cannot settle this operation. Arm its
+                    // observational hold at completion under the same mutex
+                    // that stamps gateway publications, excluding delayed
+                    // callbacks begun while the PATCH was locally pending.
+                    admissions.complete(facts.member_id);
+                }
             }
             match patch {
                 Ok(VoiceMovePatch::Moved) => {

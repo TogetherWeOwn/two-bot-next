@@ -3227,6 +3227,16 @@ struct MockVoiceApiConfig {
     patch_status_after_first: Option<u16>,
     /// JSON body of every well-formed PATCH answer.
     patch_json: Value,
+    /// Synthetic remote effect, deliberately separate from gateway publication.
+    patch_effect: Option<Arc<Mutex<Option<String>>>>,
+    /// Hold the response after the wire PATCH and synthetic effect, so the
+    /// real gateway arrival can precede local terminal completion.
+    patch_response_barrier: Option<Arc<PatchResponseBarrier>>,
+}
+
+struct PatchResponseBarrier {
+    entered: tokio::sync::Notify,
+    proceed: tokio::sync::Semaphore,
 }
 
 /// Misbehaving first member PATCH answer, served by a raw socket loop that
@@ -3381,6 +3391,8 @@ impl Default for MockVoiceApiConfig {
             patch_body: PatchBody::Normal,
             patch_status_after_first: None,
             patch_json: Value::Null,
+            patch_effect: None,
+            patch_response_barrier: None,
         }
     }
 }
@@ -3474,6 +3486,9 @@ impl MockVoiceApi {
                     let members_prefix = format!("{guild_path}/members/");
                     if let Some(user_id) = path.strip_prefix(members_prefix.as_str()) {
                         if method == axum::http::Method::PATCH && voice_move_known_member(user_id) {
+                            if let Some(effect) = &config.patch_effect {
+                                *effect.lock().unwrap() = Some(VOICE_MOVE_TARGET_ID.to_owned());
+                            }
                             let mut headers = HeaderMap::new();
                             if let Some(wait) = config.patch_retry_after {
                                 headers.insert(header::RETRY_AFTER, wait.parse().unwrap());
@@ -3489,6 +3504,10 @@ impl MockVoiceApi {
                                 (false, Some(later)) => later,
                                 _ => config.patch_status,
                             };
+                            if let Some(barrier) = &config.patch_response_barrier {
+                                barrier.entered.notify_one();
+                                barrier.proceed.acquire().await.unwrap().forget();
+                            }
                             return (
                                 StatusCode::from_u16(status)
                                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),

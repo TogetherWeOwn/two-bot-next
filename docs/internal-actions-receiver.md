@@ -445,16 +445,22 @@ rolling window. Effective member permissions include active timeout state;
 owner/Administrator exemptions follow Discord's permission rules.
 
 One guild admission gate covers fact gathering through PATCH completion. A bounded
-1024-entry ledger counts successful or uncertain moves not yet witnessed by the
-gateway in addition to cached occupants (bots included). The always-on voice
-transition observer reconciles witnessed arrivals or post-reseed departures even
-without an HTTP read. A generation fence captured before each gateway cache
-mutation prevents an older delayed observation from clearing a newer reservation.
-Cache equality alone never settles a hold: a pure guild reseed that places the
-member in the target conservatively retains the member fence and counts the
-reserved seat in addition to that cached occupant until a later fenced arrival
-or departure reconciles it. Another member's newer event is not evidence for
-this member. Reseeding never clears the ledger.
+1024-entry ledger counts pending, successful or uncertain moves in addition to
+cached occupants (bots included). Pending holds cannot settle: the local PATCH
+may still produce its effect. On local success or uncertainty, completion arms
+the hold at the current shared generation under the observer mutex. The always-on
+voice transition observer then reconciles same-member target arrivals or target
+departures (including post-reseed departure/disconnect) without an HTTP read,
+but only when their generation, captured before cache publication, is strictly
+newer than that completion floor. A callback begun while Pending cannot settle
+the hold even if delivered after completion. No early witness is replayed.
+Cache equality alone never settles a hold. A real arrival delivered before local
+completion, or a pure guild reseed that places the member in the target,
+conservatively retains the member fence and counts the reserved seat in addition
+to that cached occupant until a later eligible target transition. This intentional
+availability cost can refuse moves despite the member already being in the target.
+Another member's newer event is not evidence for this member. Reseeding never
+clears the ledger, and generation exhaustion fails closed without wrapping.
 Known no-effect replies and canonical pre-wire admission refusals (including
 admission-store unavailability) release their reservation; transport/5xx
 uncertainty does not. Received 400/403/404 rejections retain their status even
@@ -462,8 +468,14 @@ when their body fails or exhausts the shared attempt budget; 2xx success still
 requires the existing complete-body policy, and 429 still collects body timing
 before falling back to headers or a missing-timing hold. There is no timer-based
 seat release. An unresolved member cannot start another move, and a full ledger
-fails closed with retryable `discord_unavailable`. This fences this receiver's
-admissions, not independent Discord joins or moves outside it. An unexplained
+fails closed with retryable `discord_unavailable`. Cancellation before classified
+completion conservatively leaves the hold Pending. This fences this receiver's
+locally pending admissions, not independent Discord joins or moves outside it.
+Reconciliation after terminal uncertainty is observational, not a causal remote
+PATCH acknowledgement or proof of remote quiescence: Discord may still process
+delayed work after the local result. Arbitrary independent target visits after
+the completion fence cannot prove that no late remote effect will occur.
+An unexplained
 400/404 after one fresh fact read also answers/audits retryable
 `discord_unavailable`, not a bot-grant diagnosis; proven fresh refusals retain
 their domain outcome. No rejected PATCH is retried inside the move.

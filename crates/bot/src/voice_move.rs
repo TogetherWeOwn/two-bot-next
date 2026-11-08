@@ -227,14 +227,22 @@ pub(crate) fn parse_override(value: &serde_json::Value) -> Option<ChannelOverrid
     })
 }
 
-/// Successful/uncertain PATCH admissions not yet witnessed in the gateway.
+/// Pending PATCH admissions and terminal successful/uncertain holds.
 /// The executor holds one guild gate from gathering through PATCH completion.
 /// No time-based expiry can prove a seat free; a bounded full ledger refuses
 /// new effects until gateway observations reconcile it (or the runtime restarts).
 #[derive(Debug, Default)]
 pub(crate) struct VoiceMoveAdmissions {
-    targets: HashMap<Snowflake, (Snowflake, u64)>,
+    targets: HashMap<Snowflake, VoiceMoveAdmission>,
     generation: u64,
+}
+
+#[derive(Debug)]
+struct VoiceMoveAdmission {
+    target: Snowflake,
+    // None is Pending: no observation may settle an operation still in flight.
+    // Some is AwaitingObservation, fenced at local terminal completion.
+    completion_generation: Option<u64>,
 }
 
 impl VoiceMoveAdmissions {
@@ -247,8 +255,26 @@ impl VoiceMoveAdmissions {
         {
             return Err(());
         }
-        self.targets.insert(member, (target, self.generation));
+        self.targets.insert(
+            member,
+            VoiceMoveAdmission {
+                target,
+                completion_generation: None,
+            },
+        );
         Ok(())
+    }
+
+    /// Called under the observer mutex after local success or uncertainty.
+    /// Earlier publications remain ineligible even if their callbacks arrive
+    /// later. A cancelled attempt stays Pending; completion never replays an
+    /// early witness and never releases a seat by itself.
+    pub(crate) fn complete(&mut self, member: Snowflake) {
+        if let Some(admission) = self.targets.get_mut(&member) {
+            admission
+                .completion_generation
+                .get_or_insert(self.generation);
+        }
     }
 
     pub(crate) fn release(&mut self, member: Snowflake) {
@@ -268,11 +294,12 @@ impl VoiceMoveAdmissions {
         channel: Option<Snowflake>,
         generation: u64,
     ) {
-        if self
-            .targets
-            .get(&member)
-            .is_some_and(|(target, reserved)| channel == Some(*target) && *reserved < generation)
-        {
+        if self.targets.get(&member).is_some_and(|admission| {
+            channel == Some(admission.target)
+                && admission
+                    .completion_generation
+                    .is_some_and(|floor| floor < generation)
+        }) {
             self.release(member);
         }
     }
@@ -339,8 +366,8 @@ pub(crate) fn occupancy(
     if admissions.targets.contains_key(&member_id) {
         return Err(());
     }
-    for (target, _) in admissions.targets.values() {
-        if *target == target_id {
+    for admission in admissions.targets.values() {
+        if admission.target == target_id {
             occupants = occupants.saturating_add(1);
         }
     }
@@ -406,6 +433,7 @@ mod tests {
             admissions.reserve(member, TARGET).unwrap();
         }
         assert!(admissions.reserve(2000, TARGET).is_err());
+        admissions.complete(1);
         let generation = admissions.begin_transition();
         admissions.observe(1, Some(SOURCE), generation);
         admissions.observe(1, None, generation);
@@ -424,6 +452,12 @@ mod tests {
         admissions.reserve(MEMBER, TARGET).unwrap();
         admissions.observe(MEMBER, Some(TARGET), older);
         assert!(admissions.reserve(MEMBER, TARGET).is_err());
+        let pending = admissions.begin_transition();
+        admissions.observe(MEMBER, Some(TARGET), pending);
+        assert!(admissions.reserve(MEMBER, TARGET).is_err());
+        admissions.complete(MEMBER);
+        admissions.observe(MEMBER, Some(TARGET), pending);
+        assert!(admissions.reserve(MEMBER, TARGET).is_err());
         let newer = admissions.begin_transition();
         admissions.observe(MEMBER, Some(TARGET), newer);
         assert!(admissions.reserve(MEMBER, TARGET).is_ok());
@@ -439,6 +473,7 @@ mod tests {
             ..VoiceMoveAdmissions::default()
         };
         admissions.reserve(MEMBER, TARGET).unwrap();
+        admissions.complete(MEMBER);
         let generation = admissions.begin_transition();
         assert_eq!(generation, u64::MAX);
         admissions.observe(MEMBER, Some(TARGET), generation);
@@ -446,6 +481,16 @@ mod tests {
         assert!(admissions.reserve(MEMBER, TARGET).is_err());
         assert_eq!(admissions.begin_transition(), u64::MAX);
         assert!(admissions.reserve(MEMBER, TARGET).is_err());
+
+        // Exhaustion during Pending cannot turn the last generation into a
+        // qualifying completion witness or wrap back to an admissible value.
+        admissions.generation = u64::MAX - 1;
+        admissions.reserve(MEMBER, TARGET).unwrap();
+        assert_eq!(admissions.begin_transition(), u64::MAX);
+        admissions.complete(MEMBER);
+        let exhausted = admissions.begin_transition();
+        admissions.observe(MEMBER, Some(TARGET), exhausted);
+        assert!(admissions.targets.contains_key(&MEMBER));
     }
 
     #[test]

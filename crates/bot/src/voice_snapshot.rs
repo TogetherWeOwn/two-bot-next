@@ -635,6 +635,7 @@ mod tests {
             .unwrap()
             .reserve(7, 11)
             .unwrap();
+        clock.move_admissions.lock().unwrap().complete(7);
         let observe = |mut transition: two_bot_discord::VoiceTransitionObservation| {
             transition.generation = clock.begin_voice_transition();
             clock.observe_voice_transition(transition);
@@ -650,6 +651,7 @@ mod tests {
         observe(transition(7, Some((10, &[])), Some((11, &[7])), None));
         observe(transition(7, Some((11, &[])), None, None));
         assert!(clock.move_admissions.lock().unwrap().reserve(7, 11).is_ok());
+        clock.move_admissions.lock().unwrap().complete(7);
         let mut bot = transition(7, None, Some((11, &[])), None);
         bot.is_bot = true;
         observe(bot);
@@ -905,6 +907,7 @@ mod tests {
                 Ok((Some(201), 0))
             );
             admissions.reserve(7, 200).unwrap();
+            admissions.complete(7);
         }
         // HTTP admitted a newer source->target move from the published cache.
         // Delivery of the older departure must not make its last seat reusable.
@@ -952,7 +955,9 @@ mod tests {
         {
             let mut admissions = clock.move_admissions.lock().unwrap();
             admissions.reserve(7, 200).unwrap();
+            admissions.complete(7);
             admissions.reserve(8, 200).unwrap();
+            admissions.complete(8);
         }
         pipeline.handle_at(&pipeline_voice(7, Some(200)), "2026-11-03T10:00:03Z");
         let mut admissions = clock.move_admissions.lock().unwrap();
@@ -1012,6 +1017,7 @@ mod tests {
             .unwrap()
             .reserve(7, 200)
             .unwrap();
+        clock.move_admissions.lock().unwrap().complete(7);
         // The PATCH outcome is uncertain, so nothing releases the hold. The
         // cache already shows M in B, but equality must not settle it.
         assert_eq!(read_occupancy(&pipeline, &clock, 7), Err(()));
@@ -1063,6 +1069,7 @@ mod tests {
             .unwrap()
             .reserve(7, 200)
             .unwrap();
+        clock.move_admissions.lock().unwrap().complete(7);
         // GuildCreate caches M in the target without an arrival transition,
         // so nothing proves the cached seat is the reserved one.
         pipeline.handle_at(&pipeline_guild(&[7, 8]), "2026-11-03T10:00:00Z");
@@ -1087,6 +1094,43 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_early_arrival_is_not_replayed_at_completion_or_reseed() {
+        for destination in [None, Some(201)] {
+            let pipeline = two_bot_discord::MemPipeline::for_replay();
+            let clock = VoiceOccupancyClock::new();
+            pipeline.set_voice_transition_observer(clock.clone());
+            pipeline.handle_at(&pipeline_guild(&[8]), "2026-11-03T10:00:00Z");
+            pipeline.handle_at(&pipeline_voice(7, Some(201)), "2026-11-03T10:00:01Z");
+            clock
+                .move_admissions
+                .lock()
+                .unwrap()
+                .reserve(7, 200)
+                .unwrap();
+            // Even a genuine PATCH arrival can precede local completion. It
+            // cannot retire Pending, and completion must not reuse that witness.
+            pipeline.handle_at(&pipeline_voice(7, Some(200)), "2026-11-03T10:00:02Z");
+            assert_eq!(read_occupancy(&pipeline, &clock, 7), Err(()));
+            assert_eq!(read_occupancy(&pipeline, &clock, 8), Ok((Some(200), 3)));
+            clock.move_admissions.lock().unwrap().complete(7);
+            assert_eq!(read_occupancy(&pipeline, &clock, 7), Err(()));
+            assert_eq!(read_occupancy(&pipeline, &clock, 8), Ok((Some(200), 3)));
+            pipeline.handle_at(&pipeline_guild(&[7, 8]), "2026-11-03T10:00:03Z");
+            assert_eq!(read_occupancy(&pipeline, &clock, 7), Err(()));
+            assert_eq!(read_occupancy(&pipeline, &clock, 8), Ok((Some(200), 3)));
+            pipeline.handle_at(&pipeline_voice(7, destination), "2026-11-03T10:00:04Z");
+            assert_eq!(read_occupancy(&pipeline, &clock, 7), Ok((destination, 1)));
+            assert_eq!(read_occupancy(&pipeline, &clock, 8), Ok((Some(200), 1)));
+            assert!(clock
+                .move_admissions
+                .lock()
+                .unwrap()
+                .reserve(7, 200)
+                .is_ok());
+        }
+    }
+
+    #[test]
     fn pipeline_reseed_then_departure_reconciles_move_without_http_read() {
         for destination in [None, Some(201)] {
             let pipeline = two_bot_discord::MemPipeline::for_replay();
@@ -1098,6 +1142,7 @@ mod tests {
                 .unwrap()
                 .reserve(7, 200)
                 .unwrap();
+            clock.move_admissions.lock().unwrap().complete(7);
             pipeline.handle_at(&pipeline_guild(&[7]), "2026-11-03T10:00:00Z");
             assert!(clock
                 .move_admissions
