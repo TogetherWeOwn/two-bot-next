@@ -169,8 +169,19 @@ async fn rate_limited_move_defers_custom_rerender_until_occupancy_resolves() {
     worker.live.voice_update(MEMBER + 1, Some(500), Some(false));
     worker.live.voice_update(MEMBER + 1, None, Some(false));
     worker.refresh_template_names(2_002);
-    dispatch(&mut worker, 600_000).await;
+    assert_eq!(worker.desired_names[&500], "Alex · 1");
+    // A successful move also queues cosmetic respacing ahead of the rename.
+    // Drain that work as well, rather than assuming the next action renames.
+    for _ in 0..8 {
+        if !worker.dispatch_one(600_000).await {
+            break;
+        }
+    }
     assert_eq!(renames_of(&trace), ["rename:500:Alex · 1"]);
+    assert_eq!(
+        worker.live.read_state().channels[&500].name.as_deref(),
+        Some("Alex · 1")
+    );
     assert!(override_saves_of(&trace).is_empty());
 }
 
