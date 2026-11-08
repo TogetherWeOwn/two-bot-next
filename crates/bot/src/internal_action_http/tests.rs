@@ -4073,7 +4073,7 @@ const BROKEN_PATCH_BOUND: Duration = Duration::from_secs(5);
 
 async fn move_within_bound(
     executor: &VoiceMoveExecutor,
-    request: &VoiceMoveRequest,
+    request: &VoiceMoveRequest<'_>,
 ) -> Result<VoiceMoveReceipt, ActionError> {
     tokio::time::timeout(BROKEN_PATCH_BOUND, executor.execute_move(request))
         .await
