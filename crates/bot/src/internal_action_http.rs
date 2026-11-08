@@ -548,8 +548,12 @@ fn member_timed_out(member: &Value, now_ms: u64) -> Option<bool> {
     match member.get("communication_disabled_until") {
         None | Some(Value::Null) => Some(false),
         Some(value) => {
-            let until = twilight_model::util::Timestamp::parse(value.as_str()?).ok()?;
-            Some(i128::from(until.as_micros()) > i128::from(now_ms) * 1_000)
+            let until = time::OffsetDateTime::parse(
+                value.as_str()?,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .ok()?;
+            Some(until.unix_timestamp_nanos() > i128::from(now_ms) * 1_000_000)
         }
     }
 }

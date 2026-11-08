@@ -3861,6 +3861,8 @@ fn voice_move_timeout_parsing_is_strict_and_time_bounded() {
         json!({}),
         json!({"communication_disabled_until": null}),
         json!({"communication_disabled_until": "2020-01-01T00:00:00Z"}),
+        json!({"communication_disabled_until": "2020-01-01T00:00:00.123456+00:00"}),
+        json!({"communication_disabled_until": "1960-01-01T00:00:00Z"}),
     ] {
         assert_eq!(member_timed_out(&value, now), Some(false));
     }
@@ -3871,7 +3873,31 @@ fn voice_move_timeout_parsing_is_strict_and_time_bounded() {
         ),
         Some(true)
     );
-    for value in [json!(7), json!("not-a-timestamp"), json!({})] {
+    let boundary_ms = 1_577_836_800_000;
+    for until in [
+        "2020-01-01T00:00:00Z",
+        "2020-01-01T00:00:00.000000+00:00",
+        "2020-01-01T01:00:00+01:00",
+    ] {
+        let member = json!({"communication_disabled_until": until});
+        assert_eq!(member_timed_out(&member, boundary_ms - 1), Some(true));
+        assert_eq!(member_timed_out(&member, boundary_ms), Some(false));
+        assert_eq!(member_timed_out(&member, boundary_ms + 1), Some(false));
+    }
+    assert_eq!(
+        member_timed_out(
+            &json!({"communication_disabled_until": "2020-01-01T00:00:00.000001Z"}),
+            boundary_ms,
+        ),
+        Some(true)
+    );
+    for value in [
+        json!(7),
+        json!("not-a-timestamp"),
+        json!({}),
+        json!("2020-01-01T00:00:00"),
+        json!("2020-02-30T00:00:00Z"),
+    ] {
         assert_eq!(
             member_timed_out(&json!({"communication_disabled_until": value}), now),
             None
