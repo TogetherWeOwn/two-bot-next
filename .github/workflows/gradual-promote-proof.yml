@@ -118,7 +118,7 @@ jobs:
       # with the synthetic fixture.
       - name: Gradual promotion via the pinned central action
         id: gradual
-        uses: TogetherWeOwn/.github/actions/gradual-promote@89c290be20c0044efaf6916f28341c76e75fff06
+        uses: TogetherWeOwn/.github/actions/gradual-promote@d427f7212f478ea3823a605edb394b0722e152b5
         with:
           worker-name: two-bot-next-gradual-proof
           version-tag: ${{ inputs.candidate_tag }}

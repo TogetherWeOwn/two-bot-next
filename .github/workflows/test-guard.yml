@@ -32,4 +32,4 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    uses: TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95
+    uses: TogetherWeOwn/.github/.github/workflows/test-guard.yml@d427f7212f478ea3823a605edb394b0722e152b5
