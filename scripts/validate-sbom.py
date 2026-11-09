@@ -89,7 +89,19 @@ def read_bom(path):
     return inventory
 
 
-def validate(lockfile, directory):
+def validate_runtime_inventory(image):
+    debian = {pkg.get("name"): pkg for pkg in image
+              if pkg.get("purl", "").startswith("pkg:deb/debian/")}
+    required = {"libc6", "libgcc-s1", "gcc-14-base"}
+    if not required <= debian.keys() or "zlib1g" in debian:
+        raise ValueError("Runtime SBOM must inventory libc6 and both GCC packages without zlib1g")
+    if any(not re.fullmatch(r"[0-9][A-Za-z0-9.+:~\-]*", debian[name].get("version", "")) for name in required):
+        raise ValueError("Runtime SBOM has invalid Debian package versions")
+    if debian["libgcc-s1"]["version"] != debian["gcc-14-base"]["version"]:
+        raise ValueError("Runtime SBOM GCC package versions differ")
+
+
+def validate(lockfile, directory, check_runtime=False):
     rust = read_bom(directory / "rust-workspace.cdx.json")
     expected = {(pkg["name"], pkg["version"]) for pkg in parse_lockfile_text(
         read_capped_text(lockfile, JSON_CAP))["package"]}
@@ -100,6 +112,8 @@ def validate(lockfile, directory):
     image = read_bom(directory / "container-image.cdx.json")
     if not any(pkg.get("purl", "").startswith("pkg:deb/debian/") for pkg in image):
         raise ValueError("Image SBOM omitted Debian runtime packages")
+    if check_runtime:
+        validate_runtime_inventory(image)
     for name, pattern in [("source-sha.txt", r"[0-9a-f]{40}"), ("image-id.txt", r"sha256:[0-9a-f]{64}")]:
         if not re.fullmatch(pattern, read_capped_text(directory / name, TEXT_CAP).strip()):
             raise ValueError(f"Missing or invalid provenance: {name}")
@@ -110,9 +124,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("lockfile", type=Path)
     parser.add_argument("directory", type=Path)
+    parser.add_argument("--check-runtime", action="store_true", help="require the zlib-free runtime inventory")
     args = parser.parse_args()
     try:
-        validate(args.lockfile, args.directory)
+        validate(args.lockfile, args.directory, check_runtime=args.check_runtime)
     except ValueError as error:
         print(error, file=sys.stderr)
         raise SystemExit(1)

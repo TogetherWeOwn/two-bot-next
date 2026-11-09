@@ -1,5 +1,8 @@
 #![cfg(test)]
 //! Regression coverage for queued defers, accepted-work drain and RESUMED sync.
+#[path = "live_ordered_rsvp_consumer_acceptance_tests.rs"]
+mod live_ordered_rsvp_consumer_acceptance_tests;
+
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use two_bot_core::{
