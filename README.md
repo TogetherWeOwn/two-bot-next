@@ -22,6 +22,12 @@ failures. The [observability runbook](docs/runbook-observability.md) explains
 alert triage, deployment-to-PR correlation, and current monitoring limits. See
 also [backup procedures](docs/backup.md) and [staging soak](docs/staging-soak.md).
 
+## Roadmap
+
+See the [public roadmap](docs/ROADMAP.md) for direction, accepted specification
+links and non-goals. It describes intentions, not release commitments or live
+feature availability.
+
 ## Architecture
 
 - **`two-bot-core` (`crates/core`)**: framework-free domain logic, compiled command
