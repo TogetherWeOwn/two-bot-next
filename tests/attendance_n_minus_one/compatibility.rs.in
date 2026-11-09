@@ -781,8 +781,8 @@ async fn capture(stream: impl AsyncRead + Unpin, logs: Logs) {
     }
 }
 
-/// Loopback REST double. Identity probes answer; scheduled-event reads and any
-/// unknown route fail closed (404) so no website job can write the mirror.
+/// Loopback REST double. Identity and boot registry sync answer; scheduled-event
+/// reads and unknown routes fail closed so no website job can write the mirror.
 async fn serve_rest(listener: TcpListener) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
@@ -796,21 +796,45 @@ async fn serve_rest(listener: TcpListener) {
                     Ok(Ok(n)) if n > 0 => head.extend_from_slice(&buf[..n]),
                     _ => return,
                 }
-                if head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() > 64 * 1024 {
+                if head.len() > 256 * 1024 {
+                    return;
+                }
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
                     break;
                 }
             }
-            let request = String::from_utf8_lossy(&head).into_owned();
+            let body_start = head.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let request = String::from_utf8_lossy(&head[..body_start]).into_owned();
+            let content_length = request
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map_or(Some(0), |(_, length)| length.trim().parse::<usize>().ok());
+            let Some(content_length) = content_length.filter(|length| *length <= 256 * 1024) else {
+                return;
+            };
+            while head.len() - body_start < content_length {
+                match timeout(STEP, stream.read(&mut buf)).await {
+                    Ok(Ok(n)) if n > 0 => head.extend_from_slice(&buf[..n]),
+                    _ => return,
+                }
+            }
             let mut parts = request.lines().next().unwrap_or("").split_whitespace();
             let method = parts.next().unwrap_or("");
             let path = parts.next().unwrap_or("");
             let guild_path = format!("/api/v10/guilds/{GUILD}");
+            let registry_path = format!("/api/v10/applications/1111/guilds/{GUILD}/commands");
+            // Like the existing alive fixture, echo only the submitted command
+            // definitions. No real Discord command is published by this double.
+            let receipt = &head[body_start..body_start + content_length];
             let (status, body): (&str, &[u8]) = match (method, path) {
                 ("GET", "/api/v10/applications/@me") => ("200 OK", b"{\"id\":\"1111\"}"),
                 ("GET", "/api/v10/users/@me") => ("200 OK", b"{\"id\":\"999\",\"bot\":true}"),
                 ("GET", p) if p == guild_path => {
                     ("200 OK", b"{\"id\":\"9001001\",\"name\":\"n-minus-one\"}")
                 }
+                ("GET", p) if p == registry_path => ("200 OK", b"[]"),
+                ("PUT", p) if p == registry_path => ("200 OK", receipt),
                 _ => (
                     "404 Not Found",
                     b"{\"message\":\"n-minus-one mock: closed\"}",
