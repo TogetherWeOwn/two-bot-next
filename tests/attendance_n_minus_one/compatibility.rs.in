@@ -1,0 +1,985 @@
+//! N-1 compatibility harness for the attendance schema.
+//!
+//! This file is NOT part of the candidate build. The workflow copies it into a
+//! `git archive` export of a pinned prior source as
+//! `crates/bot/tests/attendance_n_minus_one.rs`, then compiles and runs it
+//! THERE, against that source's real `two-bot` binary and public store APIs.
+//!
+//! Required environment (the test panics loudly when one is missing):
+//! - `TWO_TEST_DATABASE_URL`: disposable CI Postgres bootstrap URL (the
+//!   testsupport guard still applies). Never staging or production.
+//! - `ATTENDANCE_CANDIDATE_ROOT`: absolute path of the candidate checkout; its
+//!   `crates/cutover/migrations` and `crates/store/migrations` are applied
+//!   dynamically to one owned fixture database.
+//! - `N_MINUS_ONE_SOURCE`: exactly the full pinned commit being exported, one of
+//!   `d314f4c63ecbea263aa953bc8a649a444a97da7c` (no `event_instance_store`)
+//!   or `ee44537ffced0f3cad734c8569fef7c96a985047` (has it).
+//!
+//! Required compile flag: `--cfg attendance_instance_source` exactly when the
+//! exported source is the ee44537 pin. `ScheduledEvent` gained `ends_at` and the
+//! `event_instance_store` module appeared there, so those two lines cannot
+//! compile on both pins. The runtime assertion below cross-checks the cfg
+//! against `N_MINUS_ONE_SOURCE`. Add `--check-cfg 'cfg(attendance_instance_source)'`
+//! to declare that custom test cfg on both pins.
+//!
+//! Upgrade path. The fixture starts as the OLD source's own schema (its embedded
+//! cutover and store chains, not an asserted live-target ledger), a pre-existing
+//! lifecycle row is written by the old public writer where the pin has one, and
+//! only then is the candidate's cutover chain applied dynamically. On the
+//! ee44537 pin that ledger already holds 0472, so the candidate's lower-numbered
+//! 0471 applies out of order afterwards, the real rollout shape. Both chains
+//! are strict (no `ignore_missing`): the candidate chain is a superset of the
+//! old one, so a version missing from it would be a real defect to surface.
+//!
+//! Scope, stated precisely. This proves what the OLD code does to a candidate
+//! schema: (1) its real entrypoint passes its database initialization against
+//! that schema (a loopback gateway TCP connect is observed; this is NOT gateway
+//! health, readiness or functional acceptance), (2) its public mirror writers
+//! run without error against it, and (3) neither the entrypoint nor those
+//! writers modify the retained attendance tables, pre-existing recovery values
+//! or migration ledgers. It does NOT prove candidate lifecycle semantics persist
+//! while old code runs. Far-future starts intentionally exclude old expired-row
+//! maintenance; that behavior is not tested as preservation. Operational rollback
+//! qualification and continuing data-lifecycle coverage are separate gates.
+
+use std::{
+    net::SocketAddr,
+    panic::AssertUnwindSafe,
+    path::PathBuf,
+    process::{ExitStatus, Stdio},
+    sync::Arc,
+    time::Duration,
+};
+
+use futures_util::FutureExt as _;
+use sqlx::{migrate::Migrator, PgPool};
+use tokio::{
+    io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
+    net::{TcpListener, TcpStream},
+    process::{Child, Command},
+    sync::Mutex,
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
+use two_bot_core::{
+    database_tls::{self, TlsPolicy},
+    scheduled_events::{EventStatus, ScheduledEvent},
+    website_store::{replace_events, upsert_event},
+};
+use two_bot_testsupport::TestDatabase;
+
+const PIN_NO_INSTANCE_STORE: &str = "d314f4c63ecbea263aa953bc8a649a444a97da7c";
+const PIN_WITH_INSTANCE_STORE: &str = "ee44537ffced0f3cad734c8569fef7c96a985047";
+
+const STEP: Duration = Duration::from_secs(10);
+const BOOT_DEADLINE: Duration = Duration::from_secs(60);
+const TOTAL: Duration = Duration::from_secs(420);
+const LOG_CAP: usize = 256 * 1024;
+
+const GUILD: &str = "9001001";
+const START: &str = "2099-06-01T00:00:00.000Z";
+const TL: &str = "2026-11-09T11:59:00.000Z";
+const T0: &str = "2026-11-09T12:00:00.000Z";
+const T1: &str = "2026-11-09T12:00:01.000Z";
+const T2: &str = "2026-11-09T12:00:02.000Z";
+const T3: &str = "2026-11-09T12:00:03.000Z";
+const T4: &str = "2026-11-09T12:00:04.000Z";
+const T5: &str = "2026-11-09T12:00:05.000Z";
+const T6: &str = "2026-11-09T12:00:06.000Z";
+#[cfg(attendance_instance_source)]
+const T7: &str = "2026-11-09T12:00:07.000Z";
+
+const SEEDED: &str = "evt-seeded";
+const NULL_RECOVERY: &str = "evt-null-recovery";
+const LEGACY: &str = "evt-legacy";
+const FRESH: &str = "evt-fresh";
+const CANCELLED: &str = "evt-cancelled";
+const WINDOW_KEY: &str = "evt-seeded@2099-06-01";
+
+type Logs = Arc<Mutex<String>>;
+
+fn required_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("{name} is required for the N-1 harness"))
+}
+
+/// True when the exported source has `event_instance_store`. The pin comes from
+/// the environment; the compile-time cfg must agree or the run is invalid.
+fn source_has_instance_store() -> bool {
+    let source = required_env("N_MINUS_ONE_SOURCE");
+    let has_store = match source.trim() {
+        PIN_NO_INSTANCE_STORE => false,
+        PIN_WITH_INSTANCE_STORE => true,
+        other => panic!("N_MINUS_ONE_SOURCE must be a pinned full SHA, got {other:?}"),
+    };
+    assert_eq!(
+        has_store,
+        cfg!(attendance_instance_source),
+        "--cfg attendance_instance_source must be set exactly for the ee44537 pin"
+    );
+    has_store
+}
+
+fn event(id: &str, name: &str, status: EventStatus) -> ScheduledEvent {
+    ScheduledEvent {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        starts_at: START.to_owned(),
+        #[cfg(attendance_instance_source)]
+        ends_at: None,
+        channel_id: Some("5001".to_owned()),
+        description: None,
+        status,
+    }
+}
+
+/// Owned fixture URL for the child: same host, user and database as the
+/// fixture pool, empty password, TLS disabled for the CI service. Validated by
+/// the old URL and TLS policy code before use.
+fn child_database_url(fixture: &TestDatabase) -> String {
+    let options = fixture.pool().connect_options();
+    let url = format!(
+        "postgres://{}@{}:{}/{}?sslmode=disable",
+        options.get_username(),
+        options.get_host(),
+        options.get_port(),
+        options.get_database().expect("fixture database name"),
+    );
+    two_bot_core::database_url::validate(&url).expect("fixture URL passes the old URL validator");
+    database_tls::enforce(&url, TlsPolicy::LocalOnly)
+        .expect("fixture URL passes the old local-only TLS policy");
+    url
+}
+
+async fn load_migrators() -> (Migrator, Migrator) {
+    let root = PathBuf::from(required_env("ATTENDANCE_CANDIDATE_ROOT"));
+    assert!(
+        root.is_absolute(),
+        "ATTENDANCE_CANDIDATE_ROOT must be absolute"
+    );
+    let cutover = Migrator::new(root.join("crates/cutover/migrations"))
+        .await
+        .expect("load candidate cutover migrations");
+    let mut store = Migrator::new(root.join("crates/store/migrations"))
+        .await
+        .expect("load candidate store migrations");
+    store.dangerous_set_table_name(two_bot_store::TABLE_NAME);
+    (cutover, store)
+}
+
+// ---------------------------------------------------------------- snapshots
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Retained {
+    windows: String,
+    sessions: String,
+    ledgers: String,
+    instance_windows: String,
+}
+
+async fn text(pool: &PgPool, sql: &'static str) -> String {
+    sqlx::query_scalar::<_, String>(sql)
+        .fetch_one(pool)
+        .await
+        .expect("snapshot query")
+}
+
+async fn retained(pool: &PgPool) -> Retained {
+    let ledgers = format!(
+        "{}|{}",
+        text(
+            pool,
+            "SELECT COALESCE(jsonb_agg(jsonb_build_array(version, success, encode(checksum, 'hex'))
+                    ORDER BY version)::text, '[]') FROM _sqlx_migrations",
+        )
+        .await,
+        text(
+            pool,
+            "SELECT COALESCE(jsonb_agg(jsonb_build_array(version, success, encode(checksum, 'hex'))
+                    ORDER BY version)::text, '[]') FROM _two_bot_migrations",
+        )
+        .await,
+    );
+    Retained {
+        windows: text(
+            pool,
+            "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.guild_id, t.event_key)::text, '[]')
+             FROM event_attendance_windows t",
+        )
+        .await,
+        sessions: text(
+            pool,
+            "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.id)::text, '[]')
+             FROM event_voice_sessions t",
+        )
+        .await,
+        ledgers,
+        instance_windows: text(
+            pool,
+            "SELECT COALESCE(jsonb_agg(to_jsonb(t)
+                    ORDER BY t.guild_id, t.event_id, t.instance_starts_at)::text, '[]')
+             FROM event_instance_windows t",
+        )
+        .await,
+    }
+}
+
+/// Attendance data, ledgers and capture state: must never change under old code.
+fn assert_attendance_retained(actual: &Retained, expected: &Retained, step: &str) {
+    assert_eq!(
+        actual.windows, expected.windows,
+        "{step}: attendance windows changed"
+    );
+    assert_eq!(
+        actual.sessions, expected.sessions,
+        "{step}: attendance sessions changed"
+    );
+    assert_eq!(
+        actual.ledgers, expected.ledgers,
+        "{step}: migration ledgers changed"
+    );
+}
+
+async fn column_count(pool: &PgPool, table: &str, column: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(pool)
+    .await
+    .expect("column lookup")
+}
+
+async fn assert_schema_retained(pool: &PgPool, cutover_versions: &[i64], step: &str) {
+    for version in [471_i64, 472, 475] {
+        assert!(
+            cutover_versions.contains(&version),
+            "candidate chain lacks attendance migration {version}"
+        );
+    }
+    for version in cutover_versions {
+        let applied: Option<bool> =
+            sqlx::query_scalar("SELECT success FROM _sqlx_migrations WHERE version = $1")
+                .bind(version)
+                .fetch_optional(pool)
+                .await
+                .expect("ledger lookup");
+        assert_eq!(
+            applied,
+            Some(true),
+            "{step}: candidate migration {version} missing from the ledger"
+        );
+    }
+    for (table, column) in [
+        ("event_instance_windows", "attendance_recovered_at"),
+        ("event_attendance_windows", "capture_stops"),
+        ("event_voice_sessions", "name_observed_at"),
+        ("event_voice_sessions", "event_keys"),
+    ] {
+        assert_eq!(
+            column_count(pool, table, column).await,
+            1,
+            "{step}: {table}.{column} must still exist"
+        );
+    }
+}
+
+// ------------------------------------------------------------------ upgrade
+
+async fn relation_absent(pool: &PgPool, name: &str) -> bool {
+    sqlx::query_scalar("SELECT to_regclass($1) IS NULL")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .expect("relation lookup")
+}
+
+/// The fixture holds the old source's own schema. Write a pre-existing
+/// lifecycle row with the old public writer (where the pin has one), apply the
+/// candidate chains on top, then return that row's recovered boundary: the
+/// migration default must have filled it, never left NULL.
+async fn upgrade_to_candidate(
+    pool: &PgPool,
+    has_store: bool,
+    cutover: &Migrator,
+    store: &Migrator,
+) -> Option<String> {
+    for table in ["event_attendance_windows", "event_voice_sessions"] {
+        assert!(
+            relation_absent(pool, table).await,
+            "{table} must not exist before the candidate upgrade"
+        );
+    }
+    assert_eq!(
+        relation_absent(pool, "event_instance_windows").await,
+        !has_store
+    );
+    upsert_event(
+        pool,
+        GUILD,
+        TL,
+        &event(LEGACY, "Legacy", EventStatus::Active),
+    )
+    .await
+    .expect("old upsert_event on the old schema");
+    if has_store {
+        assert_eq!(
+            column_count(pool, "event_instance_windows", "attendance_recovered_at").await,
+            0,
+            "the old schema predates 0475"
+        );
+        let pre_upgrade: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event_instance_windows WHERE guild_id = $1 AND event_id = $2",
+        )
+        .bind(GUILD)
+        .bind(LEGACY)
+        .fetch_one(pool)
+        .await
+        .expect("pre-upgrade lifecycle row");
+        assert_eq!(
+            pre_upgrade, 1,
+            "old writer must create the pre-existing row"
+        );
+    }
+
+    cutover
+        .run(pool)
+        .await
+        .expect("candidate cutover chain applies over the old ledger");
+    store
+        .run(pool)
+        .await
+        .expect("candidate store chain applies over the old ledger");
+
+    if has_store {
+        let out_of_order: bool = sqlx::query_scalar(
+            "SELECT (SELECT installed_on FROM _sqlx_migrations WHERE version = 471)
+                 >= (SELECT installed_on FROM _sqlx_migrations WHERE version = 472)",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("ledger order");
+        assert!(
+            out_of_order,
+            "0471 must apply after the already-applied 0472"
+        );
+        let legacy = instance(pool, LEGACY)
+            .await
+            .expect("legacy row survives upgrade");
+        assert_eq!(legacy.status, "active");
+        assert!(
+            legacy.recovered.is_some(),
+            "0475 must give a pre-existing row the non-null migration default"
+        );
+        legacy.recovered
+    } else {
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM event_instance_windows")
+            .fetch_one(pool)
+            .await
+            .expect("instance rows");
+        assert_eq!(rows, 0, "no old writer created lifecycle rows on this pin");
+        None
+    }
+}
+
+// ------------------------------------------------------------------ seeding
+
+async fn seed(pool: &PgPool) {
+    // Historical window with an accumulated capture-stop history.
+    sqlx::query(
+        "INSERT INTO event_attendance_windows
+           (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at,
+            capture_stops, updated_at, changed_at)
+         VALUES ($1, $2, 'evt-seeded', '2099-06-01T00:00:00Z', '2099-06-01T00:00:00Z',
+                 '2099-06-01T02:00:00Z',
+                 ARRAY['2099-06-01T01:00:00Z', '2099-06-01T01:30:00Z']::timestamptz[],
+                 '2026-01-02T03:05:00Z', '2026-01-02T03:05:00Z')",
+    )
+    .bind(GUILD)
+    .bind(WINDOW_KEY)
+    .execute(pool)
+    .await
+    .expect("seed attendance window");
+    // One closed session with its original tags, name and observation order, and
+    // one open session whose name observation is unknown (NULL).
+    sqlx::query(
+        "INSERT INTO event_voice_sessions
+           (guild_id, member_id, channel_id, channel_name, name_observed_at, changed_at,
+            is_bot, afk, joined_at, left_at, event_keys)
+         VALUES
+           ($1, 'member-1', 'chan-1', 'Original Stage', '2026-01-02T03:04:30Z',
+            '2026-01-02T03:30:00Z', FALSE, FALSE, '2026-01-02T03:00:00Z',
+            '2026-01-02T03:30:00Z', ARRAY['evt-seeded@2099-06-01']::text[]),
+           ($1, 'member-2', 'chan-1', 'Old Name', NULL, '2026-01-02T03:10:00Z',
+            FALSE, TRUE, '2026-01-02T03:10:00Z', NULL,
+            ARRAY['evt-seeded@2099-06-01', 'evt-null-recovery@2099-06-01']::text[])",
+    )
+    .bind(GUILD)
+    .execute(pool)
+    .await
+    .expect("seed attendance sessions");
+    // Lifecycle evidence: one explicit recovered boundary and one NULL boundary.
+    // Far-future starts keep old instance maintenance (which prunes expired,
+    // unreferenced rows) out of play: pruning is not tested as preservation.
+    sqlx::query(
+        "INSERT INTO event_instance_windows
+           (guild_id, event_id, instance_starts_at, starts_at, ends_at, status,
+            observed_at, attendance_recovered_at)
+         VALUES
+           ($1, 'evt-seeded', '2099-06-01T00:00:00Z', '2099-06-01T00:00:00Z', NULL,
+            'active', $2, '2026-01-02T03:04:05Z'),
+           ($1, 'evt-null-recovery', '2099-06-01T00:00:00Z', '2099-06-01T00:00:00Z', NULL,
+            'active', $2, NULL)",
+    )
+    .bind(GUILD)
+    .bind(T0)
+    .execute(pool)
+    .await
+    .expect("seed instance windows");
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InstanceRow {
+    status: String,
+    observed_at: String,
+    omitted_at: Option<String>,
+    revoked_at: Option<String>,
+    recovered: Option<String>,
+}
+
+async fn instance(pool: &PgPool, event_id: &str) -> Option<InstanceRow> {
+    sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
+        "SELECT status, observed_at, omitted_at, revoked_at, attendance_recovered_at::text
+         FROM event_instance_windows
+         WHERE guild_id = $1 AND event_id = $2 AND is_current",
+    )
+    .bind(GUILD)
+    .bind(event_id)
+    .fetch_optional(pool)
+    .await
+    .expect("instance lookup")
+    .map(
+        |(status, observed_at, omitted_at, revoked_at, recovered)| InstanceRow {
+            status,
+            observed_at,
+            omitted_at,
+            revoked_at,
+            recovered,
+        },
+    )
+}
+
+async fn mirror_ids(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT event_id FROM scheduled_events WHERE guild_id = $1 ORDER BY event_id",
+    )
+    .bind(GUILD)
+    .fetch_all(pool)
+    .await
+    .expect("mirror lookup")
+}
+
+// ------------------------------------------------------------ old writers
+
+/// Drive the old public writers (`upsert_event`, `replace_events`, and where the
+/// pin has it `event_instance_store::confirm_deleted`) and check what they do.
+async fn drive_old_writers(pool: &PgPool, has_store: bool, legacy_recovered: Option<String>) {
+    let seeded_before = instance(pool, SEEDED).await.expect("seeded instance");
+    assert!(seeded_before.recovered.is_some());
+    let null_before = instance(pool, NULL_RECOVERY).await.expect("null instance");
+    assert!(null_before.recovered.is_none());
+
+    // Fresh insert.
+    upsert_event(
+        pool,
+        GUILD,
+        T1,
+        &event(FRESH, "Fresh", EventStatus::Scheduled),
+    )
+    .await
+    .expect("old upsert_event fresh insert");
+    // Cancellation (scheduled, then cancelled).
+    upsert_event(
+        pool,
+        GUILD,
+        T1,
+        &event(CANCELLED, "Cancelled", EventStatus::Scheduled),
+    )
+    .await
+    .expect("old upsert_event pre-cancel insert");
+    upsert_event(
+        pool,
+        GUILD,
+        T2,
+        &event(CANCELLED, "Cancelled", EventStatus::Cancelled),
+    )
+    .await
+    .expect("old upsert_event cancellation");
+    // Positive refresh of an instance that already has a recovered boundary.
+    upsert_event(
+        pool,
+        GUILD,
+        T3,
+        &event(SEEDED, "Seeded", EventStatus::Active),
+    )
+    .await
+    .expect("old upsert_event positive refresh");
+
+    let fresh_recovered = if has_store {
+        let fresh = instance(pool, FRESH)
+            .await
+            .expect("old insert instance row");
+        assert_eq!(fresh.status, "scheduled");
+        assert!(
+            fresh.recovered.is_some(),
+            "old insert must receive the 0475 non-null column default"
+        );
+        let cancelled = instance(pool, CANCELLED).await.expect("cancelled row");
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(cancelled.revoked_at.as_deref(), Some(T2));
+        let seeded = instance(pool, SEEDED).await.expect("refreshed row");
+        assert_eq!(seeded.status, "active");
+        assert_eq!(seeded.observed_at, T3, "old refresh must have run");
+        assert_eq!(
+            seeded.recovered, seeded_before.recovered,
+            "old positive refresh must leave a recovered boundary unchanged"
+        );
+        fresh.recovered
+    } else {
+        for id in [FRESH, CANCELLED] {
+            assert!(
+                instance(pool, id).await.is_none(),
+                "{id}: this pin has no instance writer and must not create instance rows"
+            );
+        }
+        assert_eq!(instance(pool, SEEDED).await.as_ref(), Some(&seeded_before));
+        None
+    };
+
+    // Omission through the exact-replacement snapshot.
+    let skip = replace_events(
+        pool,
+        GUILD,
+        T4,
+        &[event(FRESH, "Fresh", EventStatus::Scheduled)],
+    )
+    .await
+    .expect("old replace_events omission");
+    assert!(skip.is_none(), "advancing snapshot must be accepted");
+    assert_eq!(mirror_ids(pool).await, vec![FRESH.to_owned()]);
+    if has_store {
+        let seeded = instance(pool, SEEDED).await.expect("omitted row");
+        assert_eq!(seeded.status, "missing");
+        assert_eq!(seeded.omitted_at.as_deref(), Some(T4));
+        assert_eq!(seeded.recovered, seeded_before.recovered);
+        let null = instance(pool, NULL_RECOVERY)
+            .await
+            .expect("omitted null row");
+        assert_eq!(null.status, "missing");
+        assert_eq!(null.recovered, None);
+    } else {
+        assert_eq!(instance(pool, SEEDED).await.as_ref(), Some(&seeded_before));
+        assert_eq!(
+            instance(pool, NULL_RECOVERY).await.as_ref(),
+            Some(&null_before)
+        );
+    }
+
+    // Recovery: missing back to active through the old mutation writer.
+    for (id, name) in [(SEEDED, "Seeded"), (NULL_RECOVERY, "Null recovery")] {
+        upsert_event(pool, GUILD, T5, &event(id, name, EventStatus::Active))
+            .await
+            .expect("old upsert_event recovery refresh");
+    }
+    if has_store {
+        let seeded = instance(pool, SEEDED).await.expect("recovered row");
+        assert_eq!(seeded.status, "active");
+        assert_eq!(seeded.observed_at, T5);
+        assert_eq!(
+            seeded.recovered, seeded_before.recovered,
+            "old missing-to-active must not restamp an existing recovery boundary"
+        );
+        let null = instance(pool, NULL_RECOVERY)
+            .await
+            .expect("recovered null row");
+        assert_eq!(null.status, "active");
+        assert_eq!(null.observed_at, T5);
+        assert_eq!(
+            null.recovered, None,
+            "old missing-to-active must not stamp attendance_recovered_at"
+        );
+    } else {
+        assert_eq!(instance(pool, SEEDED).await.as_ref(), Some(&seeded_before));
+        assert_eq!(
+            instance(pool, NULL_RECOVERY).await.as_ref(),
+            Some(&null_before)
+        );
+    }
+
+    // Omission of everything.
+    let skip = replace_events(pool, GUILD, T6, &[])
+        .await
+        .expect("old replace_events empty snapshot");
+    assert!(skip.is_none());
+    assert!(mirror_ids(pool).await.is_empty());
+    if has_store {
+        let fresh = instance(pool, FRESH).await.expect("omitted fresh row");
+        assert_eq!(fresh.status, "missing");
+        assert_eq!(fresh.recovered, fresh_recovered);
+        let seeded = instance(pool, SEEDED).await.expect("omitted seeded row");
+        assert_eq!(seeded.status, "missing");
+        assert_eq!(seeded.recovered, seeded_before.recovered);
+        assert_eq!(
+            instance(pool, NULL_RECOVERY)
+                .await
+                .expect("null row")
+                .recovered,
+            None
+        );
+    }
+
+    // Positively confirmed deletion exists only on the pin with the module.
+    #[cfg(attendance_instance_source)]
+    {
+        two_bot_core::event_instance_store::confirm_deleted(pool, GUILD, SEEDED, T7)
+            .await
+            .expect("old confirm_deleted");
+        let seeded = instance(pool, SEEDED).await.expect("deleted seeded row");
+        assert_eq!(seeded.status, "deleted");
+        assert_eq!(seeded.revoked_at.as_deref(), Some(T7));
+        assert_eq!(seeded.recovered, seeded_before.recovered);
+    }
+
+    if has_store {
+        assert_eq!(
+            instance(pool, LEGACY).await.expect("legacy row").recovered,
+            legacy_recovered,
+            "old writers must leave the migrated default untouched"
+        );
+    }
+
+    // The window's capture-stop history is old code's to ignore, not append to.
+    let stops: i32 = sqlx::query_scalar(
+        "SELECT cardinality(capture_stops) FROM event_attendance_windows
+         WHERE guild_id = $1 AND event_key = $2",
+    )
+    .bind(GUILD)
+    .bind(WINDOW_KEY)
+    .fetch_one(pool)
+    .await
+    .expect("capture stops");
+    assert_eq!(stops, 2, "old omit/delete must not append capture_stops");
+}
+
+// ------------------------------------------------- old startup constructors
+
+/// Constructor-level coverage of the two database seams the old `main` uses.
+/// Labelled as such: the entrypoint run below is the startup proof.
+async fn old_startup_constructors(url: &str) {
+    std::env::set_var(database_tls::POLICY_SETTING, "local-only");
+    let store = two_bot_store::Store::connect(url, true)
+        .await
+        .expect("old Store::connect(skip_migrations = true)");
+    assert!(two_bot_store::ping(store.pool()).await);
+    store.close().await;
+    let db = two_bot_cutover::connect(url, 2, true)
+        .await
+        .expect("old cutover::connect(skip_migrations = true)");
+    db.close().await;
+}
+
+// ---------------------------------------------------- old real entrypoint
+
+struct Bot {
+    child: Child,
+    readers: Vec<JoinHandle<()>>,
+    logs: Logs,
+}
+
+impl Bot {
+    fn spawn(database_url: &str, listen: SocketAddr, gateway: &str, api: &str) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_two-bot"))
+            .env_clear()
+            .env("LISTEN_ADDR", listen.to_string())
+            .env("DISCORD_TOKEN", "n-minus-one-synthetic-token")
+            .env("GUILD_ID", GUILD)
+            .env("DATABASE_URL", database_url)
+            .env(database_tls::POLICY_SETTING, "local-only")
+            .env("DISCORD_GATEWAY_URL", gateway)
+            .env("DISCORD_API_BASE", api)
+            .env("RUST_LOG", "two_bot=info")
+            .env("LOG_FORMAT", "json")
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start the old two-bot binary");
+        let logs: Logs = Arc::default();
+        let readers = vec![
+            tokio::spawn(capture(
+                child.stdout.take().expect("stdout pipe"),
+                logs.clone(),
+            )),
+            tokio::spawn(capture(
+                child.stderr.take().expect("stderr pipe"),
+                logs.clone(),
+            )),
+        ];
+        Self {
+            child,
+            readers,
+            logs,
+        }
+    }
+
+    async fn drain(&mut self) {
+        for mut reader in self.readers.drain(..) {
+            if timeout(STEP, &mut reader).await.is_err() {
+                reader.abort();
+            }
+        }
+    }
+
+    /// Kill and reap the child; the error text is returned, not panicked, so a
+    /// scenario panic is never masked by cleanup.
+    async fn cleanup(&mut self) -> Option<String> {
+        let _ = self.child.start_kill();
+        let waited = timeout(STEP, self.child.wait()).await;
+        self.drain().await;
+        match waited {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(format!("wait for killed child: {error}")),
+            Err(_) => Some("killed child was not reaped before the deadline".to_owned()),
+        }
+    }
+
+    async fn logs(&self) -> String {
+        self.logs.lock().await.clone()
+    }
+}
+
+async fn capture(stream: impl AsyncRead + Unpin, logs: Logs) {
+    let mut lines = BufReader::new(stream).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let mut logs = logs.lock().await;
+        if logs.len() < LOG_CAP {
+            logs.push_str(&line);
+            logs.push('\n');
+        }
+    }
+}
+
+/// Loopback REST double. Identity probes answer; scheduled-event reads and any
+/// unknown route fail closed (404) so no website job can write the mirror.
+async fn serve_rest(listener: TcpListener) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            break;
+        };
+        tokio::spawn(async move {
+            let mut buf = [0_u8; 4096];
+            let mut head = Vec::new();
+            loop {
+                match timeout(STEP, stream.read(&mut buf)).await {
+                    Ok(Ok(n)) if n > 0 => head.extend_from_slice(&buf[..n]),
+                    _ => return,
+                }
+                if head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() > 64 * 1024 {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&head).into_owned();
+            let mut parts = request.lines().next().unwrap_or("").split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let path = parts.next().unwrap_or("");
+            let guild_path = format!("/api/v10/guilds/{GUILD}");
+            let (status, body): (&str, &[u8]) = match (method, path) {
+                ("GET", "/api/v10/applications/@me") => ("200 OK", b"{\"id\":\"1111\"}"),
+                ("GET", "/api/v10/users/@me") => ("200 OK", b"{\"id\":\"999\",\"bot\":true}"),
+                ("GET", p) if p == guild_path => {
+                    ("200 OK", b"{\"id\":\"9001001\",\"name\":\"n-minus-one\"}")
+                }
+                _ => (
+                    "404 Not Found",
+                    b"{\"message\":\"n-minus-one mock: closed\"}",
+                ),
+            };
+            let header = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        });
+    }
+}
+
+enum Boot {
+    GatewayConnect(TcpStream),
+    Exited(ExitStatus),
+    Timeout,
+}
+
+/// Start the old entrypoint, then require it to reach its gateway connection to
+/// our loopback listener. Gateway connect happens after the old store and
+/// cutover pools open, so this proves database initialization passed. It does
+/// not prove gateway health, readiness or any functional behavior.
+async fn wait_for_gateway_connect(bot: &mut Bot, gateway: &TcpListener) {
+    let boot = tokio::select! {
+        accepted = gateway.accept() => Boot::GatewayConnect(accepted.expect("gateway accept").0),
+        status = bot.child.wait() => Boot::Exited(status.expect("child status")),
+        () = sleep(BOOT_DEADLINE) => Boot::Timeout,
+    };
+    match boot {
+        Boot::GatewayConnect(stream) => {
+            assert!(
+                bot.child.try_wait().expect("child status").is_none(),
+                "child exited right after the gateway connect"
+            );
+            let logs = bot.logs().await;
+            assert!(
+                !logs.contains("database initialization failed"),
+                "old entrypoint reported a database init failure: {logs}"
+            );
+            drop(stream);
+        }
+        Boot::Exited(status) => {
+            bot.drain().await;
+            panic!(
+                "old entrypoint exited ({status}) before its gateway connect: {}",
+                bot.logs().await
+            );
+        }
+        Boot::Timeout => panic!(
+            "old entrypoint did not reach its gateway connect within {BOOT_DEADLINE:?}: {}",
+            bot.logs().await
+        ),
+    }
+}
+
+async fn boot_old_entrypoint(database_url: &str) {
+    let gateway = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("gateway bind");
+    let gateway_url = format!("ws://{}", gateway.local_addr().expect("gateway addr"));
+    let rest = TcpListener::bind("127.0.0.1:0").await.expect("rest bind");
+    let api_base = format!("http://{}", rest.local_addr().expect("rest addr"));
+    let rest_task = tokio::spawn(serve_rest(rest));
+    // Reserve a loopback port for the child's own listener, then release it.
+    let listen = {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve listen port");
+        reserved.local_addr().expect("listen addr")
+    };
+    let mut bot = Bot::spawn(database_url, listen, &gateway_url, &api_base);
+    let outcome = AssertUnwindSafe(wait_for_gateway_connect(&mut bot, &gateway))
+        .catch_unwind()
+        .await;
+    let cleanup = bot.cleanup().await;
+    rest_task.abort();
+    let _ = rest_task.await;
+    match outcome {
+        Err(panic) => {
+            if let Some(error) = cleanup {
+                eprintln!("child cleanup after failure: {error}");
+            }
+            std::panic::resume_unwind(panic);
+        }
+        Ok(()) => assert!(cleanup.is_none(), "child cleanup: {cleanup:?}"),
+    }
+}
+
+// ---------------------------------------------------------------- scenario
+
+async fn scenario(fixture: &TestDatabase, has_store: bool, cutover: &Migrator, store: &Migrator) {
+    let pool = fixture.pool();
+    let url = child_database_url(fixture);
+    let cutover_versions: Vec<i64> = cutover.iter().map(|m| m.version).collect();
+    let cutover_versions = cutover_versions.as_slice();
+    let legacy_recovered = upgrade_to_candidate(pool, has_store, cutover, store).await;
+    assert_schema_retained(pool, cutover_versions, "after candidate migrations").await;
+    seed(pool).await;
+    let baseline = retained(pool).await;
+    assert_ne!(baseline.windows, "[]");
+    assert_ne!(baseline.sessions, "[]");
+
+    old_startup_constructors(&url).await;
+    assert_eq!(
+        retained(pool).await,
+        baseline,
+        "old startup constructors changed retained data"
+    );
+
+    boot_old_entrypoint(&url).await;
+    assert_eq!(
+        retained(pool).await,
+        baseline,
+        "old entrypoint changed retained data"
+    );
+
+    drive_old_writers(pool, has_store, legacy_recovered).await;
+    let after_writers = retained(pool).await;
+    assert_attendance_retained(&after_writers, &baseline, "after old writers");
+    if !has_store {
+        assert_eq!(
+            after_writers.instance_windows, baseline.instance_windows,
+            "a pin without event_instance_store must not touch instance rows"
+        );
+    }
+    assert_schema_retained(pool, cutover_versions, "after old writers").await;
+
+    // Restart: the old entrypoint must still start over the mutated state and
+    // again leave retained data untouched.
+    boot_old_entrypoint(&url).await;
+    assert_eq!(
+        retained(pool).await,
+        after_writers,
+        "old entrypoint restart changed retained data"
+    );
+    assert_schema_retained(pool, cutover_versions, "after old restart").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_binary_and_writers_retain_candidate_attendance_schema() {
+    let has_store = source_has_instance_store();
+    let bootstrap = required_env("TWO_TEST_DATABASE_URL");
+    let (cutover, store) = load_migrators().await;
+    // The fixture starts as the OLD source's own cutover chain.
+    let fixture = TestDatabase::create(&bootstrap, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create owned fixture with the old cutover chain");
+
+    let outcome = AssertUnwindSafe(async {
+        two_bot_store::migrate(fixture.pool())
+            .await
+            .expect("apply the old store chain to the same fixture");
+        timeout(TOTAL, scenario(&fixture, has_store, &cutover, &store))
+            .await
+            .expect("N-1 scenario exceeded its total deadline");
+    })
+    .catch_unwind()
+    .await;
+
+    // Verified teardown always runs; a scenario panic still wins afterwards.
+    let closed = fixture.close().await;
+    match outcome {
+        Err(panic) => {
+            if let Err(error) = closed {
+                eprintln!("fixture teardown after failure: {error:#}");
+            }
+            std::panic::resume_unwind(panic);
+        }
+        Ok(()) => closed.expect("fixture database dropped and verified"),
+    }
+}
