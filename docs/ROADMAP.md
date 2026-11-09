@@ -36,6 +36,9 @@ not a claim that every related runtime path is complete or enabled.
 The accepted scope is defined in these distinct repository specifications, not
 repeated as a second acceptance checklist here:
 
+- [Lockdown preview](lockdown-preview-spec.md): a private preview and stale-checked,
+  bound confirmation for the invoking channel. Its technical, publication and
+  release gates remain in force; inclusion here does not imply it is active.
 - [Automod verdict preview](automod-preview-spec.md): a private staff preview for
   synthetic input, without moderation effects or a member-facing testing oracle.
   Its technical and demand gates remain in force.
