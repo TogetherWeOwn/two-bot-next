@@ -117,6 +117,16 @@ pub const MAX_AUDIT_REASON_CHARS: usize = 512;
 /// Legacy message ceiling asserted before sending.
 pub const MAX_MESSAGE_CHARS: usize = 2000;
 
+enum MessageCompletion {
+    Unconfirmed,
+    Confirmed,
+    Before(tokio::time::Instant),
+}
+
+#[cfg(test)]
+#[path = "executor_deadline_tests.rs"]
+mod deadline_tests;
+
 /// Outcome of applying a reward plan: the role ids written (grants first,
 /// then revokes, in plan order), the first refused role with its
 /// fixed-vocabulary refusal reason, and the role ids never attempted because
@@ -641,6 +651,9 @@ impl HyperTransport {
         // unbounded admit would outlive the receipt/moderation/boot budgets.
         // A timed-out admit never resolved, so no permit exists to release;
         // it reports as a header stall so the caller spends one attempt.
+        if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+            return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
+        }
         let permit = match &self.admission {
             // Constructor restricts ungoverned transport to loopback fixtures.
             None => None,
@@ -653,6 +666,16 @@ impl HyperTransport {
                 },
             },
         };
+        // Timeout polls its inner future first. Admission can therefore return
+        // a permit at deadline equality even when its timer is already ready.
+        // Refuse BEFORE constructing the Hyper request future; no wire effect
+        // occurred, so this particular permit can be released safely.
+        if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+            if let Some(permit) = permit {
+                complete_early_release(permit, "expired_before_wire").await;
+            }
+            return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
+        }
         let mut attempt = crate::executor_metrics::Attempt::new(request);
         // Bound the header wait inside the permit scope so a stalled read
         // releases its lane instead of orphaning it: an outer cancellation
@@ -1352,19 +1375,24 @@ impl ActionExecutor {
         budget: Duration,
     ) -> AdmittedSendFuture<'a> {
         Box::pin(async move {
+            self.send_admitted_before(request, tokio::time::Instant::now() + budget)
+                .await
+        })
+    }
+
+    #[inline(never)]
+    fn send_admitted_before<'a>(
+        &'a self,
+        request: &'a Request,
+        deadline: tokio::time::Instant,
+    ) -> AdmittedSendFuture<'a> {
+        Box::pin(async move {
             self.count();
-            // The absolute attempt instant is fixed before durable admission, so
-            // the admit, the header wait and the body share the one deadline.
-            let deadline = tokio::time::Instant::now() + budget;
             self.inner
                 .transport
                 .send_request(request, Some(deadline))
                 .await
                 .map_err(|detail| {
-                    // A body that never completed inside the wire budget is
-                    // "Discord did not answer in time" (legacy `upstream_timeout`).
-                    // The stalled-header marker maps the same way: headers never
-                    // arrived in time.
                     if detail == BODY_TIMEOUT_MESSAGE || detail == HEADER_TIMEOUT_MESSAGE {
                         DiscordError::Timeout
                     } else {
@@ -1398,19 +1426,25 @@ impl ActionExecutor {
         lane: Option<bool>,
         timeout: Duration,
     ) -> Result<(RawResponse, bool), DiscordError> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        self.send_with_deadline(request, lane, tokio::time::Instant::now() + timeout)
+            .await
+    }
+
+    async fn send_with_deadline(
+        &self,
+        request: &Request,
+        lane: Option<bool>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(RawResponse, bool), DiscordError> {
         tokio::time::timeout_at(deadline, self.admit(request, lane))
             .await
             .map_err(|_| GuardError::AdmissionTimeout)??;
-        // The wire phase takes whatever is left of the caller's deadline, so
-        // guard admission, durable admission, headers and body together stay
-        // inside it (the receipt window refuses to land past it). No outer
-        // backstop: the transport's timers share the absolute deadline, and a
-        // stalled GET releases its lane where the permit is in scope.
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .unwrap_or(Duration::ZERO);
-        self.send_admitted_for(request, remaining).await
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DiscordError::Timeout);
+        }
+        // Carry the exact absolute deadline through durable admission, headers
+        // and body. Never remint it from a stale remaining-duration sample.
+        self.send_admitted_before(request, deadline).await
     }
 
     /// Singular role mutations use status only. A truncated/stalled provider
@@ -2956,8 +2990,36 @@ impl ActionExecutor {
         content: &str,
         nonce: &str,
     ) -> Result<String, DiscordError> {
-        self.send_message_components(channel_id, content, Some(nonce.into()), None, false, true)
-            .await
+        self.send_message_components(
+            channel_id,
+            content,
+            Some(nonce.into()),
+            None,
+            false,
+            MessageCompletion::Confirmed,
+        )
+        .await
+    }
+
+    /// Confirmed single-attempt delivery with an absolute caller deadline.
+    /// Guard and durable admission cannot renew it; transport checks again
+    /// after admission and before initiating HTTP. Expiry never grants replay.
+    pub async fn post_message_confirmed_before(
+        &self,
+        channel_id: &str,
+        content: &str,
+        nonce: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<String, DiscordError> {
+        self.send_message_components(
+            channel_id,
+            content,
+            Some(nonce.into()),
+            None,
+            false,
+            MessageCompletion::Before(deadline),
+        )
+        .await
     }
 
     /// Post a rendered feature message through the shared request factory.
@@ -2974,7 +3036,7 @@ impl ActionExecutor {
             Some(nonce.into()),
             Some(components),
             false,
-            false,
+            MessageCompletion::Unconfirmed,
         )
         .await
     }
@@ -3177,8 +3239,15 @@ impl ActionExecutor {
         nonce: Option<serde_json::Value>,
         after_authorization: bool,
     ) -> Result<String, DiscordError> {
-        self.send_message_components(channel_id, content, nonce, None, after_authorization, false)
-            .await
+        self.send_message_components(
+            channel_id,
+            content,
+            nonce,
+            None,
+            after_authorization,
+            MessageCompletion::Unconfirmed,
+        )
+        .await
     }
 
     async fn send_message_components(
@@ -3188,8 +3257,9 @@ impl ActionExecutor {
         nonce: Option<serde_json::Value>,
         components: Option<&[serde_json::Value]>,
         after_authorization: bool,
-        confirm_completion: bool,
+        completion: MessageCompletion,
     ) -> Result<String, DiscordError> {
+        let confirm_completion = !matches!(completion, MessageCompletion::Unconfirmed);
         // Legacy ceiling is UTF-16 units (two-bot counts JS string length),
         // not scalar values: 1001 astral chars are 2002 units and must be
         // rejected with zero wire calls (finding 8).
@@ -3252,7 +3322,15 @@ impl ActionExecutor {
         } else {
             // Feature posts with selects take the paced lane; the plain
             // `post_message` path keeps main's unpaced single attempt.
-            let mut res = if paced {
+            let mut res = if let MessageCompletion::Before(deadline) = completion {
+                let deadline =
+                    deadline.min(tokio::time::Instant::now() + self.inner.moderation_timeout);
+                let (res, _) = self.send_with_deadline(&req, None, deadline).await?;
+                if ![200, 201].contains(&res.status) {
+                    return Err(throw_for_status(&res));
+                }
+                res
+            } else if paced {
                 self.call_once_raw_paced(req, &[200, 201]).await?
             } else {
                 self.call_once_raw(req, &[200, 201]).await?

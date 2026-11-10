@@ -39,9 +39,13 @@ remain best effort, not guaranteed delivery. The urgent cutoff is applied in
 the store query before attendee rosters are materialized. The pending-event
 probe reads no rosters and deliberately does not require an RSVP.
 Admission checks the clock after connection and guild-lock waits, and dispatch
-checks again after commit. An event-start timeout also bounds transport
-admission and the POST; a timeout retains the immutable fence and is uncertain,
-not permission to retry.
+checks again after commit. The resulting absolute event-start deadline passes
+through guard and durable transport admission, headers and body. The transport
+explicitly rechecks after admission, before initiating HTTP: a timeout wrapper
+alone can poll an already-expired admitted future first. A provably unused
+transport permit is released, but the immutable reminder fence remains. A timeout
+is uncertain, not permission to retry. A request already in flight cannot be
+recalled or guaranteed to arrive before start.
 Ordinary scheduled messages run first as a separate phase: a completed
 schedule-store failure that stops their batch still permits the bounded
 reminder attempt on the same tick when activation and supervisor ownership

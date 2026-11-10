@@ -149,6 +149,23 @@ async fn urgent_cutoff_and_start_equality_have_explicit_controls() {
             .expect("admission at start is refused")
     );
     assert_eq!(reminder_fences(db.pool()).await.len(), 1);
+    assert!(
+        begin_event_reminder_delivery(db.pool(), GUILD, &due[0], NOW)
+            .await
+            .expect("fence the other included candidate")
+    );
+    let outside = due_event_reminders_before(db.pool(), GUILD, NOW, NOW + 15_000)
+        .await
+        .expect("cutoff without a masking batch limit");
+    assert!(
+        outside.is_empty(),
+        "the just-outside event must stay excluded"
+    );
+    let widened = due_event_reminders_before(db.pool(), GUILD, NOW, NOW + 15_001)
+        .await
+        .expect("just-outside positive control");
+    assert_eq!(widened.len(), 1);
+    assert_eq!(widened[0].event_id, IDS[3]);
     db.close().await.expect("verified teardown");
 }
 

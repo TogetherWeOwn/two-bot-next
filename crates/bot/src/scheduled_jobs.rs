@@ -310,9 +310,15 @@ async fn remind_event_attendees(
             (None, Some(_)) => ("failed", Some("invalid_or_oversized_reminder")),
             (Some(content), Some(remaining)) => {
                 let nonce = random_nonce();
-                let result = tokio::time::timeout(
-                    Duration::from_millis(remaining),
-                    rest.post_message_confirmed(&event.channel_id, &content, &nonce),
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(remaining);
+                let result = tokio::time::timeout_at(
+                    deadline,
+                    rest.post_message_confirmed_before(
+                        &event.channel_id,
+                        &content,
+                        &nonce,
+                        deadline,
+                    ),
                 )
                 .await
                 .unwrap_or(Err(DiscordError::Timeout));
