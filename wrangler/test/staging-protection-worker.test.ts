@@ -20,8 +20,9 @@ function env() {
   return { PROTECTION_ENABLED: "1", GITHUB_APP_ID: "1", GITHUB_INSTALLATION_ID: "2", GITHUB_REPOSITORY_ID: "3",
     GITHUB_APP_PRIVATE_KEY: "unused", GITHUB_WEBHOOK_SECRET: secret,
     PROTECTION_GATES: { idFromName: id => id, get: id => ({ fetch: async request => {
-      calls++; assert.equal(id, "37110947191"); assert.deepEqual(parseJson(new Uint8Array(await request.arrayBuffer())), parseJson(bytes(event())));
-      return new Response("approved");
+      calls++; assert.equal(id, "37110947191"); assert.equal(new URL(request.url).pathname, "/enqueue");
+      assert.deepEqual(parseJson(new Uint8Array(await request.arrayBuffer())), parseJson(bytes(event())));
+      return new Response("accepted", { status: 202 });
     } }) }, calls: () => calls };
 }
 function request(body, sig) {
@@ -32,7 +33,8 @@ test("webhook signature authenticates raw bytes before routing to the run-owned 
   const body = bytes(event()), settings = env();
   assert.equal(await authentic(body, await signature(body), secret), true);
   const result = await worker.fetch(request(body, await signature(body)), settings);
-  assert.equal(result.status, 200); assert.equal(settings.calls(), 1);
+  assert.equal(result.status, 202); assert.equal(settings.calls(), 1);
+  assert.equal(await result.text(), "accepted");
   assert.equal(result.headers.get("content-type"), "text/plain;charset=UTF-8");
 });
 test("signature tampering, missing key/header and malformed body never reach the gate", async () => {

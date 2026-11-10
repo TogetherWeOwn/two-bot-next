@@ -67,8 +67,13 @@ private key, installation token, webhook body or signed download URL is logged.
 - Runs/plans must start within 24 hours; the claim producer must have completed
   within 30 minutes. Future timestamps refuse. Fourteen-day retention is not
   freshness. Lists are capped at 100 and must be complete; pagination refuses.
-- Each evaluation has a 25-second network deadline and at most 24 authenticated
-  calls, with no retries. Token revocation has its own five-second deadline.
+- Ingress commits one bounded replaceable delivery and its alarm atomically to
+  the run's Durable Object before returning `202 accepted`. This acknowledges
+  receipt, **not** approval. No GitHub read or token mint is on the acknowledgement
+  path. Storage failure returns non-2xx; no `waitUntil`-only work can be lost after
+  a successful acknowledgement. Alarms recheck the enable flag before processing.
+- Each alarm evaluation has a 20-second network deadline and at most 24 authenticated
+  calls, with no transport retries. Token revocation has its own five-second deadline.
   Worker configuration caps CPU at 50 ms and subrequests at 40. No new paid
   service/plan is selected by the implementation.
 - App JWT lifetime is five minutes including clock skew. Installation tokens
@@ -77,10 +82,16 @@ private key, installation token, webhook body or signed download URL is logged.
   or logged. A `finally` block attempts revocation after every minted-token use;
   if GitHub is unavailable, its one-hour expiry is the remaining upper bound.
   A failed revocation is an audit signal, not a claim of successful teardown.
-- A Durable Object per run serializes deliveries. A durable write-ahead record
-  per attempt prevents repeating an uncertain callback after a crash. A duplicate
-  returns `duplicate`, not `approved`. Records expire after 25 hours, beyond the
-  accepted run lifetime. An uncertain result needs inspection, not blind retry.
+- A Durable Object per run serializes only short storage transactions, never
+  network I/O; redelivery can be acknowledged while an alarm is evaluating.
+  Atomic per-attempt fence acquisition prevents concurrent callbacks. A durable
+  write-ahead record prevents repeating an uncertain callback after a crash.
+  A duplicate evaluation audits `duplicate`, not `approved`. Alarms retain a
+  one-minute recovery wake during evaluation; a retry honors any persisted fence.
+  An interleaved delivery keeps its own wake so a rerun is not lost when the
+  earlier evaluation drains. After draining, records expire after 25 hours,
+  beyond the accepted run lifetime. An uncertain result needs inspection, not
+  blind retry.
 - Audit records contain only a fixed event/outcome, numeric run ID/attempt and
   `token_revoked`. Unsigned/refused ingress emits only a fixed refusal record.
 
@@ -171,9 +182,13 @@ API/download refusal, ingress authentication and repository/environment fencing.
 `staging-protection-gate.test.ts` exercises the actual verifier/callback chain
 against scripted transport and in-memory serialized storage, including injected
 storage/callback failures, reconstruction, replay, reruns and token revocation.
-Those tests are not workerd crash/input-gate proof. Actual Durable Object
-crash/replay and live-format registration evidence remain prerequisites for
-enabling the candidate; they are not inferred from the in-memory tests.
+Those tests are not workerd crash/input-gate proof.
+`staging-protection-handoff.test.ts` adds Miniflare/workerd checks for prompt
+acknowledgement during delayed outbound I/O, disable-before-alarm and persisted
+queue survival across a Worker/DO reload. A reload is not a process crash.
+Record their actual exact-head Actions result, not merely their presence.
+Actual Durable Object crash/replay and live-format registration evidence remain
+prerequisites for enabling the candidate; they are not inferred from these tests.
 CI is GitHub Actions, not a local full-suite transcript.
 
 REA angle: reuse GitHub's supported

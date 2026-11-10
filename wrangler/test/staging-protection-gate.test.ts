@@ -1,4 +1,4 @@
-// Real StagingProtectionGate.fetch -> installationClient -> verifyBinding -> decide/revoke call chain.
+// Real StagingProtectionGate.evaluate -> installationClient -> verifyBinding -> decide/revoke call chain.
 // Only two boundaries are faked, both in memory and both synthetic:
 //   1. globalThis.fetch is replaced by a scripted GitHub REST/blob server (no network, no real credentials).
 //   2. DurableObjectState is an in-memory storage plus a promise-chain blockConcurrencyWhile.
@@ -46,12 +46,13 @@ function webhook(sha = head0) {
     deployment_callback_url: `https://api.github.com/repos/${REPO}/actions/runs/${runId}/deployment_protection_rule` };
 }
 const bodyBytes = (sha) => new TextEncoder().encode(JSON.stringify(webhook(sha)));
-const gateRequest = (sha) => new Request("https://gate/evaluate", { method: "POST", body: bodyBytes(sha) });
+const gateRequest = (sha) => new Request("https://gate/enqueue", { method: "POST", body: bodyBytes(sha) });
 
 // In-memory DurableObjectStorage. failOn(op, key, value) may return "before" (throw, nothing persisted)
 // or "after" (persist, then throw) to inject a storage failure at an exact step.
 function memoryStorage(trace) {
   const map = new Map();
+  let transactionTail = Promise.resolve();
   const s = {
     map, alarm: null, failOn: null,
     async get(key) {
@@ -70,7 +71,18 @@ function memoryStorage(trace) {
       if (s.failOn?.("setAlarm")) throw new Error("synthetic storage failure");
       s.alarm = at;
     },
+    async delete(key) { return map.delete(key); },
     async deleteAll() { map.clear(); s.alarm = null; },
+    // Transactions serialize and roll back on failure; this remains a simulation, not workerd.
+    transaction(callback) {
+      const run = transactionTail.then(async () => {
+        const before = structuredClone([...map]), alarm = s.alarm;
+        try { return await callback(s); }
+        catch (error) { map.clear(); for (const [k, v] of before) map.set(k, v); s.alarm = alarm; throw error; }
+      });
+      transactionTail = run.catch(() => {});
+      return run;
+    },
   };
   return s;
 }
@@ -89,7 +101,7 @@ function harness(t) {
   const gh = {
     base: Date.now(), attempt: 2, head: head0, status: "waiting", pending: ["staging-migrate-apply"],
     compareStatus: "ahead", claimText: s => s, planJobs: true, blobStatus: 200,
-    tokenStatus: 201, revokeMode: "ok", callbackMode: "ok", callbackDelay: 0,
+    tokenStatus: 201, revokeMode: "ok", callbackMode: "ok", callbackDelay: 0, pauseToken: async () => {},
     before: () => {}, // before(key, count): mutate evidence between reads
     calls: [], decisions: [], tokens: 0, revoked: [], inflight: 0, maxInflight: 0, counts: {},
   };
@@ -128,9 +140,11 @@ function harness(t) {
     assert.equal(u.host, "api.github.com");
     if (method === "POST" && path === "/app/installations/2/access_tokens") {
       trace.push("github.token");
+      await gh.pauseToken();
       if (gh.tokenStatus !== 201) return json({ message: "denied" }, gh.tokenStatus);
       gh.tokens++;
-      return json({ token: `ghs_synthetic_installation_token_${gh.tokens}`, expires_at: stamp(3600000) }, 201);
+      return json({ token: `ghs_synthetic_installation_token_${gh.tokens}`,
+        expires_at: new Date(Date.now() + 3600000).toISOString() }, 201);
     }
     if (method === "DELETE" && path === "/installation/token") {
       trace.push("github.revoke");
@@ -193,7 +207,7 @@ function harness(t) {
 }
 
 async function deliver(gate, sha) {
-  const response = await gate.fetch(gateRequest(sha));
+  const response = await gate.evaluate(bodyBytes(sha));
   return { status: response.status, text: await response.text() };
 }
 // Everything a secret could reach: log sinks, storage contents, request URLs/bodies, thrown messages.
@@ -244,10 +258,67 @@ test("full chain through the worker route signs, routes to the run-owned gate an
   const sig = "sha256=" + Buffer.from(await crypto.subtle.sign("HMAC", key, body)).toString("hex");
   const post = () => worker.fetch(new Request("https://protection.invalid/hooks/staging-migration", { method: "POST", body,
     headers: { "X-GitHub-Event": "deployment_protection_rule", "X-Hub-Signature-256": sig } }), h.env);
-  assert.equal(await (await post()).text(), "approved");
-  assert.equal(await (await post()).text(), "duplicate");
+  assert.equal(await (await post()).text(), "accepted");
+  assert.deepEqual(h.gh.calls, [], "acknowledgement performs no GitHub I/O");
+  assert.ok(h.storage.map.has("queued")); assert.ok(h.storage.alarm);
+  await h.reconstructed().alarm();
+  assert.equal(stored(h), "approved");
+  assert.equal(await (await post()).text(), "accepted");
+  await h.reconstructed().alarm();
+  assert.deepEqual(h.audit().map(a => a.outcome), ["approved", "duplicate"]);
   assert.deepEqual(decisionStates(h), ["approved"]);
   assertNoSecretLeak(h);
+});
+
+test("handoff storage failures return no acknowledgement and commit neither queue nor alarm", async t => {
+  for (const operation of ["put", "setAlarm"]) {
+    const h = harness(t);
+    h.storage.failOn = op => op === operation ? "before" : undefined;
+    assert.equal((await h.gate().fetch(gateRequest())).status, 503);
+    assert.equal(h.storage.map.size, 0); assert.equal(h.storage.alarm, null);
+    assert.deepEqual(h.gh.calls, []);
+    h.storage.failOn = null;
+    assert.equal((await h.reconstructed().fetch(gateRequest())).status, 202);
+    await h.reconstructed().alarm();
+    assert.deepEqual(decisionStates(h), ["approved"]);
+  }
+});
+
+test("alarm evaluation does not hold the ingress lock; an interleaved delivery keeps its wake", async t => {
+  const h = harness(t), gate = h.gate();
+  await gate.fetch(gateRequest());
+  const entered = Promise.withResolvers(), resume = Promise.withResolvers();
+  h.gh.pauseToken = async () => { entered.resolve(); await resume.promise; };
+  const running = gate.alarm();
+  await entered.promise;
+  try {
+    assert.equal((await gate.fetch(gateRequest())).status, 202);
+    assert.equal(h.gh.decisions.length, 0, "acknowledged while token request is unresolved");
+  } finally { resume.resolve(); }
+  await running;
+  assert.equal(stored(h), "approved");
+  assert.ok(h.storage.map.has("queued"), "new delivery is not deleted with the earlier snapshot");
+  assert.ok(h.storage.alarm <= Date.now() + 1100, "new delivery retains a prompt durable wake");
+  await h.reconstructed().alarm();
+  assert.equal(h.storage.map.has("queued"), false);
+  assert.deepEqual(decisionStates(h), ["approved"]);
+  assertNoSecretLeak(h);
+});
+
+test("alarm restart before callback honors the attempt fence; disable before alarm never mints", async t => {
+  const h = harness(t);
+  await h.gate().fetch(gateRequest());
+  h.storage.map.set("attempt:2", { state: "approving", at: Date.now() });
+  await h.reconstructed().alarm();
+  assert.deepEqual(decisionStates(h), []);
+  assert.equal(stored(h), "approving");
+  assert.equal(h.storage.map.has("queued"), false);
+  const disabled = harness(t);
+  await disabled.gate().fetch(gateRequest());
+  disabled.env.PROTECTION_ENABLED = "0";
+  await disabled.reconstructed().alarm();
+  assert.deepEqual(disabled.gh.calls, []);
+  assert.equal(disabled.storage.map.has("queued"), false);
 });
 
 const rejections = [
@@ -519,7 +590,7 @@ test("revocation happens on every path that holds a token, and not when no token
   await deliver(ambiguous.gate());
   assert.equal(ambiguous.gh.revoked.length, 1);
   const denied = harness(t); denied.gh.tokenStatus = 500;
-  await assert.rejects(deliver(denied.gate()));
+  assert.deepEqual(await deliver(denied.gate()), { status: 503, text: "unavailable" });
   assert.equal(denied.gh.revoked.length, 0);
   assert.equal(denied.storage.map.size, 0);
   assert.deepEqual(denied.gh.decisions, []);
@@ -529,11 +600,11 @@ test("revocation happens on every path that holds a token, and not when no token
 test("invalid App key rejects before any network call and leaks nothing", async t => {
   const h = harness(t);
   h.env.GITHUB_APP_PRIVATE_KEY = "synthetic-invalid-key";
-  const failure = await deliver(h.gate()).then(() => null, error => String(error));
-  assert.ok(failure);
+  const failure = await deliver(h.gate());
+  assert.deepEqual(failure, { status: 503, text: "unavailable" });
   assert.deepEqual(h.gh.calls, []);
   assert.equal(h.storage.map.size, 0);
-  assertNoSecretLeak(h, [failure]);
+  assertNoSecretLeak(h, [JSON.stringify(failure)]);
 });
 
 test("audit sink holds only fixed non-secret fields across mixed outcomes", async t => {
