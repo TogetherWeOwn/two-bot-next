@@ -33,7 +33,9 @@ export function decimal(value: Json | undefined): string {
   return result;
 }
 export function same(left: Json | undefined, right: Json | undefined): boolean {
-  if (left === right) return true;
+  // Float metrics are permitted only outside binding evidence. In particular,
+  // rounded ledger values must never establish unchanged lossless evidence.
+  if (typeof left === "number" || typeof right === "number") return false;
   if (Array.isArray(left) && Array.isArray(right)) {
     return left.length === right.length && left.every((value, i) => same(value, right[i]));
   }
@@ -43,7 +45,7 @@ export function same(left: Json | undefined, right: Json | undefined): boolean {
     return keys.length === Object.keys(right).length
       && keys.every(key => Object.hasOwn(right, key) && same(left[key], right[key]));
   }
-  return false;
+  return left === right;
 }
 export async function sha256(bytes: Uint8Array): Promise<string> {
   const hash = await crypto.subtle.digest("SHA-256", bytes);

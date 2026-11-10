@@ -119,6 +119,7 @@ export class StagingProtectionGate extends DurableObject<ProtectionEnv> {
         approved = true;
       } catch { /* Every missing, stale, mismatched or failed read rejects. */ }
       // Re-read immediately before either decision. A rerun/gate transition invalidates it.
+      api.startDecision();
       const latest = await api.run(identity.runId, config, Date.now(), false);
       requireEvidence(id(latest.run_attempt) === attempt && latest.head_sha === identity.sha);
       await api.pending(identity.runId);

@@ -41,8 +41,15 @@ test("parseJson refuses duplicate keys including escaped aliases", () => {
   assert.ok(parseJson(enc('[{"a":1},{"a":2}]')));
 });
 
-test("parseJson refuses non-integer numbers", () => {
-  for (const t of ["1.0", "1.5", "1e3", "1E3", "1e-2", "-0", "01", "-", "+1", ".5", "1.", "0x10", "NaN", "Infinity", "[1.0]", '{"a":2e1}']) {
+test("parseJson keeps finite fractional and exponent tokens distinct from lossless integers", () => {
+  for (const token of ["4.0", "12.5", "1e3", "1E3", "1e-2", "-2.5"]) {
+    assert.equal(parseJson(enc(token)), Number(token));
+  }
+  assert.deepEqual(parseJson(enc('[9007199254740993,12.5]')), [9007199254740993n, 12.5]);
+});
+
+test("parseJson refuses malformed or non-finite numbers", () => {
+  for (const t of ["-0", "-0.0", "01", "01.5", "-", "+1", ".5", "1.", "1e", "1e+", "1e999", "0x10", "NaN", "Infinity", "[1.0.0]", '{"a":2e1e2}']) {
     refused(() => parseJson(enc(t)));
   }
 });

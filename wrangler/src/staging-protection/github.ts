@@ -70,6 +70,11 @@ export class GitHub {
     // workerd's native fetch requires the global receiver, not this client instance.
     this.token = token; this.signal = signal; this.fetcher = fetcher.bind(globalThis);
   }
+  startDecision(): void {
+    // Preserve the token and total call cap; only the final re-read/callback gets
+    // a fresh budget after verification (including a verification timeout).
+    this.signal = AbortSignal.timeout(20000);
+  }
   async request(path: string, method = "GET", body?: string): Promise<Response> {
     requireEvidence(++this.reads <= 24 && path.startsWith("/") && !path.startsWith("//"));
     const headers: Record<string, string> = {
@@ -87,7 +92,7 @@ export class GitHub {
   }
   async run(runId: string, config: AppConfig, now: number, prior: boolean) {
     const run = object(await this.json(`${ROOT}/actions/runs/${runId}`));
-    requireEvidence(id(run.id) === runId && run.path === WORKFLOW && run.event === "workflow_dispatch"
+    requireEvidence(id(run.id) === runId && text(run.path).split("@")[0] === WORKFLOW && run.event === "workflow_dispatch"
       && run.head_branch === "main" && /^[0-9a-f]{40}$/.test(text(run.head_sha)));
     requireEvidence(object(run.repository).full_name === REPOSITORY && id(object(run.repository).id) === config.repositoryId
       && id(object(run.head_repository).id) === config.repositoryId);
@@ -185,8 +190,10 @@ export async function verifyBinding(api: GitHub, config: AppConfig, pins: Target
   api.job(priorJobs, "staging-migrate (claim)", "skipped");
   api.job(priorJobs, "staging-migrate (apply)", "skipped");
   await validatePlan(await api.artifact(priorId, text(prior.head_sha), priorJob, "staging-migrate-manifest", now), claim);
-  const comparison = object(await api.json(`${ROOT}/compare/${text(claim.source_sha)}...main`));
-  requireEvidence(object(comparison.merge_base_commit).sha === claim.source_sha
-    && (comparison.status === "ahead" || comparison.status === "identical"));
+  // Reverse direction: a source already on main has no ahead commits or file
+  // patches, regardless of how far main advanced. Retain body/pagination caps.
+  const comparison = object(await api.json(`${ROOT}/compare/main...${text(claim.source_sha)}?per_page=1`));
+  requireEvidence(object(comparison.merge_base_commit).sha === claim.source_sha && comparison.ahead_by === 0n
+    && (comparison.status === "behind" || comparison.status === "identical"));
   return { attempt, head };
 }

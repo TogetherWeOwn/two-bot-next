@@ -49,6 +49,10 @@ Fresh GitHub reads must establish:
    Both ledgers are unchanged, counts are zero, role is read-only and source
    checksums agree. All integer tokens are parsed as bounded `bigint` values
    before comparison/hashing, including `9007199254740993` in the Rust vector.
+   Audit metrics such as `connection_usage.pct_full` may use finite fraction or
+   exponent syntax; those tokens remain floating-point values and cannot satisfy
+   any integer evidence field. Source ancestry uses `main...source` with zero
+   ahead commits and the source as merge base, avoiding forward diff payloads.
 6. Immediately before the callback, the current run/attempt/head and pending
    gate are re-read. Any change invalidates the decision.
 
@@ -60,7 +64,7 @@ private key, installation token, webhook body or signed download URL is logged.
 
 - `PROTECTION_ENABLED` must be exactly `1`; the checked-in value is `0`.
 - Webhook bodies are at most 64 KiB. JSON/artifact content is at most 1 MiB,
-  nesting 32, numeric tokens 20 digits. ZIP input is at most 1 MiB + 4096 bytes.
+  nesting 32, numeric integer parts 20 digits. ZIP input is at most 1 MiB + 4096 bytes.
   Only one exact stored entry is accepted; CRC, local/central metadata, optional
   descriptors and archive boundaries must agree. Extra files/fields, encryption,
   compression and ZIP64 refuse. Unknown archive layouts are not auto-relaxed.
@@ -72,8 +76,11 @@ private key, installation token, webhook body or signed download URL is logged.
   receipt, **not** approval. No GitHub read or token mint is on the acknowledgement
   path. Storage failure returns non-2xx; no `waitUntil`-only work can be lost after
   a successful acknowledgement. Alarms recheck the enable flag before processing.
-- Each alarm evaluation has a 20-second network deadline and at most 24 authenticated
-  calls, with no transport retries. Token revocation has its own five-second deadline.
+- Each alarm evaluation has a 20-second verification network deadline, then a
+  separate 20-second deadline for the final run/gate reads and callback. Verification
+  timeout can therefore reject, but never skips final evidence checks. The same
+  token and total cap of 24 authenticated calls apply across both phases, with no
+  transport retries. Token revocation has its own five-second deadline.
   Worker configuration caps CPU at 50 ms and subrequests at 40. No new paid
   service/plan is selected by the implementation.
 - App JWT lifetime is five minutes including clock skew. Installation tokens

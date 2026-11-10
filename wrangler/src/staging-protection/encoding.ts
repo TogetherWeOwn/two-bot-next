@@ -2,8 +2,9 @@
  *
  * `parseJson` is a strict JSON parser: every integer token becomes a `bigint`
  * (lossless), and duplicate keys (including escaped aliases), invalid UTF-8,
- * non-integer numbers, `-0`, lone surrogates, nesting deeper than 32,
- * integers over 20 digits, input over 1 MiB and any malformed text are refused.
+ * non-finite numbers, negative zero, lone surrogates, nesting deeper than 32,
+ * integer parts over 20 digits, input over 1 MiB and malformed text are refused.
+ * Fraction/exponent tokens remain `number`, never evidence integers (`bigint`).
  *
  * `storedArtifact` extracts the content of an archive that holds exactly one
  * stored (method 0) entry with an exact name, and refuses everything else.
@@ -12,7 +13,7 @@
  * neither the message nor the type leaks any input bytes.
  */
 
-export type Json = null | boolean | string | bigint | Json[] | { [key: string]: Json };
+export type Json = null | boolean | string | bigint | number | Json[] | { [key: string]: Json };
 
 export const ENCODING_ERROR_MESSAGE = "encoding refused";
 
@@ -72,10 +73,10 @@ class Reader {
     if (c === "t") return this.literal("true"), true;
     if (c === "f") return this.literal("false"), false;
     if (c === "n") return this.literal("null"), null;
-    return this.integer();
+    return this.number();
   }
 
-  private integer(): bigint {
+  private number(): bigint | number {
     const start = this.pos;
     if (this.s[this.pos] === "-") this.pos += 1;
     const first = this.s.charCodeAt(this.pos);
@@ -85,15 +86,29 @@ class Reader {
     } else {
       while (this.isDigit(this.pos)) this.pos += 1;
     }
-    // Any fraction, exponent, or stray digit (leading zero) is refused.
-    if (this.pos < this.s.length) {
-      const n = this.s[this.pos];
-      if (n === "." || n === "e" || n === "E" || this.isDigit(this.pos)) refuse();
+    if (this.isDigit(this.pos)) refuse(); // leading zero
+    const integerEnd = this.pos;
+    if (integerEnd - start - (this.s[start] === "-" ? 1 : 0) > MAX_JSON_INTEGER_DIGITS) refuse();
+    if (this.s[this.pos] === ".") {
+      this.pos += 1;
+      if (!this.isDigit(this.pos)) return refuse();
+      while (this.isDigit(this.pos)) this.pos += 1;
+    }
+    if (this.s[this.pos] === "e" || this.s[this.pos] === "E") {
+      this.pos += 1;
+      if (this.s[this.pos] === "+" || this.s[this.pos] === "-") this.pos += 1;
+      if (!this.isDigit(this.pos)) return refuse();
+      while (this.isDigit(this.pos)) this.pos += 1;
     }
     const token = this.s.slice(start, this.pos);
+    if (this.pos !== integerEnd) {
+      // Audit metrics use floats. Never promote even integral floats to bigint:
+      // every evidence integer validator requires the original integer syntax.
+      const value = Number(token);
+      if (!Number.isFinite(value) || Object.is(value, -0)) refuse();
+      return value;
+    }
     if (token === "-0") refuse();
-    // Bound the BigInt conversion: at most 20 digits (covers ids and i64).
-    if (token.length - (token[0] === "-" ? 1 : 0) > MAX_JSON_INTEGER_DIGITS) refuse();
     return BigInt(token);
   }
 

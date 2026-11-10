@@ -245,6 +245,14 @@ test("plan refuses pending lists that disagree with the claim or the source", as
   await planRefused(() => undefined, c => { c.expected_pending = ["1", "9007199254740992"]; });
 });
 
+test("same refuses floating-point values at every depth of binding evidence", () => {
+  const row = { version: 9007199254740992.0 };
+  assert.equal(same(1.0, 1.0), false);
+  assert.equal(same([row], [row]), false);
+  assert.equal(same(row, row), false);
+  assert.equal(same({ nested: [1.0] }, { nested: [1.0] }), false);
+});
+
 test("same compares bigint, array and object values structurally", () => {
   assert.equal(same(1n, 1n), true);
   assert.equal(same(1n, 2n), false);

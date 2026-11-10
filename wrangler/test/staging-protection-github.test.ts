@@ -30,7 +30,7 @@ function evidence() {
   const api = new GitHub("synthetic", AbortSignal.timeout(1000), async () => { throw Error("unexpected transport"); });
   const originals = { run: api.run.bind(api), jobs: api.jobs.bind(api), pending: api.pending.bind(api) };
   const values = { run, prior, currentJobs, priorJobs, claim: claim(), currentPlan: plan(), priorPlan: plan(),
-    comparison: { merge_base_commit: { sha: "a".repeat(40) }, status: "ahead" }, pending: [{ environment: { name: "staging-migrate-apply" } }] };
+    comparison: { merge_base_commit: { sha: "a".repeat(40) }, status: "behind", ahead_by: 0n }, pending: [{ environment: { name: "staging-migrate-apply" } }] };
   api.json = async path => {
     if (path.endsWith(`/runs/${runId}`)) return values.run;
     if (path.endsWith(`/runs/${priorId}`)) return values.prior;
@@ -49,6 +49,29 @@ function evidence() {
 test("independent current/prior evidence accepts exact two-chain binding", async () => {
   const { api } = evidence();
   assert.deepEqual(await verifyBinding(api, config, pins, runId, now), { attempt: "2", head });
+});
+
+test("GitHub workflow path accepts a ref suffix but still requires main branch evidence", async () => {
+  const { api, values } = evidence();
+  values.run.path += "@main";
+  values.prior.path += "@refs/heads/main";
+  assert.deepEqual(await verifyBinding(api, config, pins, runId, now), { attempt: "2", head });
+  values.run.head_branch = "feature";
+  await assert.rejects(verifyBinding(api, config, pins, runId, now));
+});
+
+test("ancestry uses the empty reverse comparison, independent of main's forward diff size", async () => {
+  const { api } = evidence();
+  const json = api.json;
+  let reads = 0;
+  const transport = new GitHub("synthetic", AbortSignal.timeout(1000), async url => {
+    reads++;
+    assert.equal(url, `https://api.github.com/repos/TogetherWeOwn/two-bot-next/compare/main...${"a".repeat(40)}?per_page=1`);
+    return new Response(JSON.stringify({ status: "behind", ahead_by: 0, merge_base_commit: { sha: "a".repeat(40) }, files: [], commits: [] }));
+  });
+  api.json = path => path.includes("/compare/") ? transport.json(path) : json(path);
+  assert.deepEqual(await verifyBinding(api, config, pins, runId, now), { attempt: "2", head });
+  assert.equal(reads, 1);
 });
 
 const refusals = [
@@ -79,7 +102,10 @@ const refusals = [
   ["prior apply job executed", e => { e.priorJobs[2].conclusion = "success"; }],
   ["prior binding differs", e => { e.priorPlan.source_sha = "c".repeat(40); }],
   ["source not on main", e => { e.comparison.merge_base_commit.sha = "d".repeat(40); }],
-  ["source ahead of main", e => { e.comparison.status = "behind"; }],
+  ["source ahead of main", e => { e.comparison.status = "ahead"; }],
+  ["source diverged from main", e => { e.comparison.status = "diverged"; }],
+  ["source has ahead commits", e => { e.comparison.ahead_by = 1n; }],
+  ["missing ahead count", e => { delete e.comparison.ahead_by; }],
 ];
 for (const [name, mutate] of refusals) {
   test(`fresh evidence refuses ${name}`, async () => {

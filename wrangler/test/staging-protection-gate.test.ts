@@ -100,7 +100,7 @@ function harness(t) {
   const trace = [];
   const gh = {
     base: Date.now(), attempt: 2, head: head0, status: "waiting", pending: ["staging-migrate-apply"],
-    compareStatus: "ahead", claimText: s => s, planJobs: true, blobStatus: 200,
+    compareStatus: "behind", claimText: s => s, planText: s => s, planJobs: true, blobStatus: 200,
     tokenStatus: 201, revokeMode: "ok", callbackMode: "ok", callbackDelay: 0, pauseToken: async () => {},
     before: () => {}, // before(key, count): mutate evidence between reads
     calls: [], decisions: [], tokens: 0, revoked: [], inflight: 0, maxInflight: 0, counts: {},
@@ -121,8 +121,8 @@ function harness(t) {
     .replace(/"workflow_head_sha": "b+"/, `"workflow_head_sha": "${gh.head}"`));
   const zips = () => ({
     9: storedZip("staging-migrate-apply-claim.json", new TextEncoder().encode(claimText())),
-    10: storedZip("staging-migrate-manifest.json", fixture("plan")),
-    11: storedZip("staging-migrate-manifest.json", fixture("plan")),
+    10: storedZip("staging-migrate-manifest.json", new TextEncoder().encode(gh.planText(fixture("plan").toString()))),
+    11: storedZip("staging-migrate-manifest.json", new TextEncoder().encode(gh.planText(fixture("plan").toString()))),
   });
   const artifact = async (id, name, owner, sha) => ({ id, name, expired: false, expires_at: stamp(600000),
     workflow_run: { id: Number(owner), head_sha: sha }, created_at: stamp(-100000), size_in_bytes: zips()[id].length,
@@ -130,11 +130,14 @@ function harness(t) {
   const json = (value, status = 200) => new Response(JSON.stringify(value), { status });
 
   async function handle(url, init = {}) {
+    init.signal?.throwIfAborted();
     const u = new URL(url), method = init.method ?? "GET", path = u.pathname;
     gh.calls.push({ method, host: u.host, path, headers: init.headers, body: init.body });
     const root = `/repos/${REPO}`;
     const hit = key => { gh.counts[key] = (gh.counts[key] ?? 0) + 1; gh.before(key, gh.counts[key]); };
     if (u.host.endsWith(".blob.core.windows.net")) {
+      hit("blob");
+      init.signal?.throwIfAborted();
       return gh.blobStatus === 200 ? new Response(zips()[Number(path.split("/").pop())]) : new Response("", { status: gh.blobStatus });
     }
     assert.equal(u.host, "api.github.com");
@@ -186,8 +189,9 @@ function harness(t) {
     }
     const zip = /^\/repos\/TogetherWeOwn\/two-bot-next\/actions\/artifacts\/(\d+)\/zip$/.exec(path);
     if (zip) return new Response(null, { status: 302, headers: { Location: `https://synthetic.blob.core.windows.net/artifact/${zip[1]}?sig=synthetic` } });
-    if (path === `${root}/compare/${"a".repeat(40)}...main`) {
-      return json({ merge_base_commit: { sha: "a".repeat(40) }, status: gh.compareStatus });
+    if (path === `${root}/compare/main...${"a".repeat(40)}`) {
+      assert.equal(u.search, "?per_page=1");
+      return json({ merge_base_commit: { sha: "a".repeat(40) }, status: gh.compareStatus, ahead_by: 0 });
     }
     throw new Error(`unscripted GitHub request ${method} ${path}`);
   }
@@ -321,9 +325,54 @@ test("alarm restart before callback honors the attempt fence; disable before ala
   assert.equal(disabled.storage.map.has("queued"), false);
 });
 
+test("real runner connection-usage floats in both plan archives do not alter binding", async t => {
+  const h = harness(t);
+  h.gh.planText = s => s.replace('"audit": {', '"audit": {"connection_usage":{"pct_full":12.5,"connections_used":5},');
+  assert.deepEqual(await deliver(h.gate()), { status: 200, text: "approved" });
+  assert.deepEqual(decisionStates(h), ["approved"]);
+  assertNoSecretLeak(h);
+});
+
+for (const chain of ["ledger", "ledger_store"]) {
+  for (const suffix of [".0", "e0"]) {
+    test(`float syntax cannot mask changed ${chain} evidence (${suffix})`, async t => {
+      const h = harness(t);
+      h.gh.planText = s => s.replace(`"${chain}_before": []`, `"${chain}_before": [{"version":9007199254740992${suffix}}]`)
+        .replace(`"${chain}_after": []`, `"${chain}_after": [{"version":9007199254740993${suffix}}]`);
+      assert.deepEqual(await deliver(h.gate()), { status: 200, text: "rejected" });
+      assert.deepEqual(decisionStates(h), ["rejected"]);
+      assertNoSecretLeak(h);
+    });
+  }
+}
+
+test("verification timeout has a separate bounded rejection phase and never retries a callback", async t => {
+  const h = harness(t), budgets = [], controllers = [];
+  t.mock.method(AbortSignal, "timeout", ms => {
+    budgets.push(ms);
+    const controller = new AbortController();
+    controllers.push(controller);
+    return controller.signal;
+  });
+  h.gh.before = key => { if (key === "blob") controllers[0].abort(new DOMException("synthetic timeout", "TimeoutError")); };
+  assert.deepEqual(await deliver(h.gate()), { status: 200, text: "rejected" });
+  assert.deepEqual(budgets, [20000, 20000, 5000]);
+  assert.equal(controllers[0].signal.aborted, true);
+  assert.equal(controllers[1].signal.aborted, false);
+  assert.equal(h.gh.tokens, 1);
+  assert.deepEqual(decisionStates(h), ["rejected"]);
+  assert.equal(stored(h), "rejected");
+  assert.equal(h.gh.revoked.length, 1);
+  assert.equal((await deliver(h.reconstructed())).text, "duplicate");
+  assert.deepEqual(decisionStates(h), ["rejected"]);
+  assertNoSecretLeak(h);
+});
+
 const rejections = [
+  ["fractional syntax is not an integer schema version", gh => { gh.claimText = s => s.replace('"schema_version": 1', '"schema_version": 1.0'); }],
+  ["fractional syntax is not a migration version", gh => { gh.planText = s => s.replace('"version": 9007199254740993', '"version": 9007199254740993.0'); }],
   ["claim names a different target", gh => { gh.claimText = s => s.replace('"host": "staging.invalid"', '"host": "other.invalid"'); }],
-  ["source is not on main", gh => { gh.compareStatus = "behind"; }],
+  ["source is not on main", gh => { gh.compareStatus = "ahead"; }],
   ["plan job is missing", gh => { gh.planJobs = false; }],
   ["artifact download fails", gh => { gh.blobStatus = 500; }],
   ["second pending gate", gh => { gh.pending = ["staging-migrate-apply", "staging-migrate-apply"]; }],
@@ -427,7 +476,7 @@ test("callback HTTP 500 after an approval fence behaves like an ambiguous callba
 
 test("ambiguous callback on the rejection path keeps the rejecting fence", async t => {
   const h = harness(t);
-  h.gh.compareStatus = "behind"; h.gh.callbackMode = "throw";
+  h.gh.compareStatus = "ahead"; h.gh.callbackMode = "throw";
   assert.equal((await deliver(h.gate())).status, 503);
   assert.equal(stored(h), "rejecting");
   assert.deepEqual(decisionStates(h), ["rejected"]);
@@ -485,7 +534,7 @@ test("storage failure after the callback leaves the fence and never repeats the 
 
 test("storage failure after a rejection callback also never repeats it", async t => {
   const h = harness(t);
-  h.gh.compareStatus = "behind";
+  h.gh.compareStatus = "ahead";
   h.storage.failOn = (op, key, value) => op === "put" && value.state === "rejected" ? "before" : undefined;
   assert.equal((await deliver(h.gate())).status, 503);
   assert.equal(stored(h), "rejecting");
@@ -586,7 +635,7 @@ test("revocation: failure is audited but does not change the decision; teardown 
 });
 
 test("revocation happens on every path that holds a token, and not when no token was issued", async t => {
-  const rejected = harness(t); rejected.gh.compareStatus = "behind";
+  const rejected = harness(t); rejected.gh.compareStatus = "ahead";
   await deliver(rejected.gate());
   assert.equal(rejected.gh.revoked.length, 1);
   const ambiguous = harness(t); ambiguous.gh.callbackMode = "throw";
