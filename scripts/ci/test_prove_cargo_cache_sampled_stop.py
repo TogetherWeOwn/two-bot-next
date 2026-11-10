@@ -41,17 +41,45 @@ class SampledStopProofTests(unittest.TestCase):
                 case = MagicMock()
                 case.pool.glob.return_value = [MagicMock()]
                 case.pool.glob.return_value[0].stat.return_value.st_blocks = 128
+                (case.pool / 'slot-0' / 'lease.json').read_text.return_value = '{"cargo_pgid": 123}'
 
                 def run(result):
-                    proof.fixtures.cache.time.sleep(.01)
+                    proof.fixtures.cache.usage(case.pool / 'slot-0')
                     result.testsRun = 1
                     result.errors = errors
                     result.failures = failures
 
                 case.run.side_effect = run
-                with patch.object(proof, 'baseline_case', return_value=case):
+                with patch.object(proof, 'baseline_case', return_value=case), \
+                        patch.object(proof.fixtures.cache, 'usage', return_value=65536):
                     with self.assertRaisesRegex(RuntimeError, 'baseline'):
                         proof.prove_baseline('', 'test_ceiling', 32768)
+
+    def test_delay_precedes_first_post_spawn_sample_without_changing_admission(self):
+        case = MagicMock()
+        slot = case.pool / 'slot-0'
+        lease = slot / 'lease.json'
+        lease.exists.side_effect = [False, True]
+        lease.read_text.return_value = '{"cargo_pgid": 123}'
+        case.pool.glob.return_value = [MagicMock()]
+        case.pool.glob.return_value[0].stat.return_value.st_blocks = 128
+
+        def run(result):
+            # No sleep call between admission and the first budget sample.
+            self.assertEqual(proof.fixtures.cache.usage(slot), 24576)
+            case.pool.glob.assert_not_called()
+            self.assertEqual(proof.fixtures.cache.usage(slot), 24576)
+            result.testsRun = 1
+            result.failures = [('case', 'self.assertLessEqual(\n65536 not less than or equal to 32768')]
+
+        case.run.side_effect = run
+        with patch.object(proof, 'baseline_case', return_value=case), \
+                patch.object(proof.fixtures.cache, 'usage', return_value=24576) as usage, \
+                patch.object(proof.time, 'sleep', side_effect=AssertionError('unexpected sleep')), \
+                contextlib.redirect_stdout(io.StringIO()):
+            proof.prove_baseline('', 'test_ceiling', 32768)
+        self.assertEqual(usage.call_count, 2)
+        case.pool.glob.assert_called_once_with('slot-0/*/*/growing')
 
     def test_main_runs_both_baselines_and_five_complete_corrected_suites(self):
         runner = MagicMock()

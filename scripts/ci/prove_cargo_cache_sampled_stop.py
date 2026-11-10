@@ -2,6 +2,7 @@
 """Actions-only baseline counterexample and five corrected sampled-stop runs."""
 
 import ast
+import json
 import linecache
 import os
 from pathlib import Path
@@ -45,27 +46,31 @@ def baseline_case(source, name):
 
 def prove_baseline(source, name, ceiling):
     case = baseline_case(source, name)
-    real_sleep = time.sleep
+    real_usage = fixtures.cache.usage
     observed = []
 
-    def delayed_sample(seconds):
-        if seconds != .01 or observed:
-            return real_sleep(seconds)
-        # Model a sampler descheduled while the original 4 KiB writer keeps
-        # running. Resume only after its file exceeds the unchanged ceiling.
-        # The deadline fails closed if the writer never reaches that point.
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            for growing in case.pool.glob('slot-0/*/*/growing'):
-                allocated = growing.stat().st_blocks * 512
-                if allocated > ceiling:
-                    observed.append(allocated)
-                    return
-            real_sleep(.01)
-        raise RuntimeError('baseline writer did not exceed the original ceiling')
+    def delayed_sample(path):
+        lease = path / 'lease.json'
+        # Admission is unchanged. cargo_pgid marks the first post-spawn sample,
+        # which precedes run_cargo's first sleep and may already hit the budget.
+        if (path == case.pool / 'slot-0' and not observed and lease.exists()
+                and 'cargo_pgid' in json.loads(lease.read_text())):
+            # Model descheduling the sampler while the original writer runs.
+            # Resume after its file exceeds the unchanged ceiling, or fail
+            # closed at the deadline. Still return the real allocated usage.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                for growing in case.pool.glob('slot-0/*/*/growing'):
+                    allocated = growing.stat().st_blocks * 512
+                    if allocated > ceiling:
+                        observed.append(allocated)
+                        return real_usage(path)
+                time.sleep(.01)
+            raise RuntimeError('baseline writer did not exceed the original ceiling')
+        return real_usage(path)
 
     result = unittest.TestResult()
-    with patch.object(fixtures.cache.time, 'sleep', delayed_sample):
+    with patch.object(fixtures.cache, 'usage', delayed_sample):
         case.run(result)
     # Only the original ceiling failure is evidence. Setup/refusal/cleanup
     # errors and unrelated assertions must not become an expected red result.
