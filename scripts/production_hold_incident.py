@@ -69,11 +69,35 @@ class History:
                 return
         raise incident_issue.IncidentError("production hold history exceeds the page cap")
 
+    def pending_reason(self, current_run_id):
+        data = self.get("actions/workflows/deploy-production.yml/runs", branch="main", per_page=20)
+        runs = data.get("workflow_runs") if isinstance(data, dict) else None
+        if not isinstance(runs, list) or len(runs) > 20:
+            raise incident_issue.IncidentError("production hold active runs are malformed")
+        for run in runs:
+            if not isinstance(run, dict) or type(run.get("id")) is not int or run["id"] <= 0:
+                raise incident_issue.IncidentError("production hold active run is malformed")
+            if str(run["id"]) == current_run_id:
+                continue
+            attempt = run.get("run_attempt")
+            if type(attempt) is not int or attempt <= 0:
+                raise incident_issue.IncidentError("production hold active attempt is malformed")
+            jobs = list(self.pages(f"actions/runs/{run['id']}/attempts/{attempt}/jobs", key="jobs"))
+            url = f"https://github.com/{self.repo}/actions/runs/{run['id']}"
+            for job in jobs:
+                if job.get("name") in (PRODUCTION_JOB, "wrangler rollback + readyz gate"):
+                    state = job.get("status")
+                    if state in ("waiting", "queued", "pending", "requested", "in_progress"):
+                        return f"production {state}", url
+            if any(job.get("conclusion") in ("failure", "cancelled") for job in jobs):
+                return "promotion gate not green - inspect promotion run", url
+            return "production skipped or pending - inspect promotion run", url
+        return "no successful production promotion", None
+
     def last_promotion(self):
         for row in self.pages("deployments", environment="production"):
             payload = row.get("payload")
             if (row.get("environment") != "production" or not isinstance(payload, dict)
-                    or payload.get("rollback") is True
                     or not build_identity.is_deploy_id_shape(payload.get("deploy_id"))):
                 continue
             revision = sha(row.get("sha"))
@@ -102,13 +126,27 @@ class History:
                 attempt = run.get("run_attempt")
                 if type(attempt) is not int or attempt <= 0:
                     raise incident_issue.IncidentError("production hold run attempt is malformed")
-                jobs = list(self.pages(f"actions/runs/{run_id}/attempts/{attempt}/jobs", key="jobs"))
-                production = [job for job in jobs if job.get("name") == PRODUCTION_JOB]
-                if (len(production) == 1 and production[0].get("status") == "completed"
-                        and production[0].get("conclusion") == "success"):
-                    return revision, moment(production[0].get("completed_at"))
-                # A record precedes the post-deploy watch: a failed watch or
-                # a skipped job on a rerun must not reset the hold clock.
+                # The deployment status is written inside its producing job,
+                # before the post-deploy watch. A later rerun must not erase
+                # that historical success or lend a failed attempt its verdict.
+                recorded_at = moment(status.get("created_at"))
+                expected_job = ("wrangler rollback + readyz gate"
+                                if payload.get("rollback") is True else PRODUCTION_JOB)
+                if attempt > 50:
+                    raise incident_issue.IncidentError("production hold attempt history exceeds the cap")
+                for historical_attempt in range(attempt, 0, -1):
+                    jobs = list(self.pages(
+                        f"actions/runs/{run_id}/attempts/{historical_attempt}/jobs", key="jobs"))
+                    production = [job for job in jobs if job.get("name") == expected_job]
+                    if (len(production) != 1 or production[0].get("status") != "completed"
+                            or production[0].get("conclusion") != "success"):
+                        continue
+                    started = moment(production[0].get("started_at"))
+                    completed = moment(production[0].get("completed_at"))
+                    if started <= recorded_at <= completed:
+                        # A successful rollback is the restored serving baseline,
+                        # not recovery; only a deploy-mode result closes an issue.
+                        return revision, completed
                 break
         raise incident_issue.IncidentError("no verified production promotion in bounded history")
 
@@ -177,6 +215,10 @@ def main():
         history = History(env)
         run_url = f"https://github.com/{history.repo}/actions/runs/{run_id}"
         report = decide(history, needs, datetime.now(timezone.utc), run_url)
+        if not needs and report["action"] == "alert":
+            report["reason"], pending_url = history.pending_reason(run_id)
+            if pending_url:
+                report["run_url"] = pending_url
         if not args.dry_run:
             if report["action"] == "alert":
                 incident_issue.open_incident(env, KEY, TITLE, body(report))

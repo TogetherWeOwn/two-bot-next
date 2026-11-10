@@ -289,15 +289,23 @@ and the first unpromoted main commit's committer time (main uses squash merges).
 It alerts only when main is ahead and the interval is **strictly greater than
 six hours**; an unchanged main is not an overdue deployment. Promotion history
 comes from deploy-ID production records backed by a completed successful
-`wrangler deploy + readyz gate` job in the recorded run's current attempt, not
-its workflow head SHA or overall conclusion. Rollback records and failed
-post-deploy watches do not reset the promotion clock. The issue includes the
+production job in the recorded run's producing attempt, not its workflow head
+SHA or overall conclusion. The deployment success-status timestamp must fall
+inside that successful job's start/completion interval; a later skipped rerun
+cannot erase a real earlier promotion or certify a failed attempt. A successful
+rollback establishes the restored serving SHA as the baseline, but does not
+close the incident. Failed post-deploy watches do not reset the clock. The issue includes the
 held-since time, last promoted SHA, current main SHA, skip/failure reason and
 promotion run URL. Missing, malformed or over-budget history fails the reporting
 job instead of inventing success. Its token can read history and write issues,
 not deploy; it has no Environment or live staging access. The daily backstop
 and completion triggers evaluate the threshold; this is not a six-hour polling
-schedule. For a read-only evaluation, run the helper with `--dry-run` and the
+schedule. The daily backstop's independent **`scheduled production hold watch`**
+job has no promotion dependencies, so a waiting production approval or deployment
+queue cannot suppress reporting. It uses the latest promotion job states for the
+reason and run link; only the terminal reporter can claim recovery. Both reporters
+share an issue-only concurrency group, separate from deployment locks.
+For a read-only evaluation, run the helper with `--dry-run` and the
 same `NEEDS_JSON`, repository, run ID and read-authorized token environment;
 it prints the decision without calling the issue sink. CI's synthetic history
 and in-memory issue fixtures exercise alert, repeat and recovery without any

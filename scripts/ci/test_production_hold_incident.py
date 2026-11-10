@@ -102,10 +102,24 @@ def run_row(head_sha=OLD, **overrides):
     return row
 
 
+FALLBACK_START = "2026-11-10T00:00:00Z"
+FALLBACK_CREATED = "2026-11-10T00:55:00Z"
+
+
+def shifted(raw, minutes, fallback):
+    """raw shifted by minutes when readable, else the fallback."""
+    try:
+        return iso(hold.moment(raw) + timedelta(minutes=minutes))
+    except incident_issue.IncidentError:
+        return fallback
+
+
 def job(name=hold.PRODUCTION_JOB, status="completed", conclusion="success",
-        completed_at="2026-11-10T01:00:00Z"):
+        completed_at="2026-11-10T01:00:00Z", started_at="auto"):
+    if started_at == "auto":
+        started_at = shifted(completed_at, -30, FALLBACK_START)
     return {"name": name, "status": status, "conclusion": conclusion,
-            "completed_at": completed_at}
+            "started_at": started_at, "completed_at": completed_at}
 
 
 def install_promotion(gh, deployment_id=11, revision=OLD, run_id=501,
@@ -117,9 +131,10 @@ def install_promotion(gh, deployment_id=11, revision=OLD, run_id=501,
     row.update(deployment or {})
     gh.routes.setdefault("deployments", [])
     gh.routes["deployments"].append(row)
+    created = shifted(completed_at, -5, FALLBACK_CREATED)
     gh.routes[f"deployments/{deployment_id}/statuses"] = statuses if statuses is not None else [
         {"state": "inactive", "log_url": ""},
-        {"state": "success",
+        {"state": "success", "created_at": created,
          "log_url": f"https://github.com/{REPO}/actions/runs/{run_id}"},
         {"state": "in_progress", "log_url": ""}]
     gh.routes[f"actions/runs/{run_id}"] = run or run_row()
@@ -202,6 +217,21 @@ class ThresholdTests(unittest.TestCase):
         report = decide(gh)
         self.assertEqual(report["action"], "none")
         self.assertNotIn("held_since", report)
+
+    def test_successful_rollback_does_not_hide_a_pending_main_revision(self):
+        gh = FakeGitHub()
+        install_promotion(gh, deployment_id=12, revision=OLD, run_id=502,
+                          jobs=[job(name="wrangler rollback + readyz gate")],
+                          deployment={"payload": {"deploy_id": deploy_id(OLD, 2),
+                                                  "rollback": True}})
+        install_promotion(gh, deployment_id=11, revision=MAIN, run_id=501,
+                          completed_at="2026-11-09T01:00:00Z")
+        finish(gh, promoted=OLD, pending_at="2026-11-09T02:00:00Z")
+        gh.routes[f"compare/{MAIN}...{MAIN}"] = {"status": "identical"}
+        report = decide(gh, needs={"guard": {"outputs": {"mode": "rollback"}},
+                                   "production": {"result": "success"}})
+        self.assertEqual(report["action"], "alert")
+        self.assertEqual(report["last_promoted_sha"], OLD)
 
     def test_diverged_or_unknown_comparison_fails_closed(self):
         for state in ("behind", "diverged", None, 7):
@@ -304,10 +334,12 @@ class HistoryTests(unittest.TestCase):
         gh = FakeGitHub()
         install_promotion(gh, statuses=[
             {"state": "inactive", "log_url": ""},
-            {"state": "success", "log_url": f"https://github.com/{REPO}/actions/runs/501"}])
+            {"state": "success", "created_at": FALLBACK_CREATED,
+             "log_url": f"https://github.com/{REPO}/actions/runs/501"}])
         self.assertEqual(self.promoted(gh), (OLD, hold.moment("2026-11-10T01:00:00Z")))
 
-    def test_rollback_deployment_is_excluded(self):
+    def test_rollback_without_a_rollback_job_is_not_certified(self):
+        # A deploy-mode job cannot certify a rollback record.
         gh = FakeGitHub()
         install_promotion(gh, deployment_id=12, revision=MAIN, run_id=502,
                           deployment={"payload": {"deploy_id": deploy_id(MAIN, 2),
@@ -345,8 +377,10 @@ class HistoryTests(unittest.TestCase):
     def test_only_the_first_success_status_run_is_consulted(self):
         gh = FakeGitHub()
         install_promotion(gh, jobs=[job(conclusion="failure")], statuses=[
-            {"state": "success", "log_url": f"https://github.com/{REPO}/actions/runs/501"},
-            {"state": "success", "log_url": f"https://github.com/{REPO}/actions/runs/502"}])
+            {"state": "success", "created_at": FALLBACK_CREATED,
+             "log_url": f"https://github.com/{REPO}/actions/runs/501"},
+            {"state": "success", "created_at": FALLBACK_CREATED,
+             "log_url": f"https://github.com/{REPO}/actions/runs/502"}])
         self.assertRejected(gh)
 
     def test_wrong_provenance_is_rejected(self):
@@ -371,7 +405,8 @@ class HistoryTests(unittest.TestCase):
                     f"https://github.com/{REPO}/actions/runs/501/attempts/1",
                     f"http://github.com/{REPO}/actions/runs/501", None):
             gh = FakeGitHub()
-            install_promotion(gh, statuses=[{"state": "success", "log_url": url}])
+            install_promotion(gh, statuses=[{"state": "success", "created_at": FALLBACK_CREATED,
+                                             "log_url": url}])
             with self.subTest(url=url):
                 self.assertRejected(gh)
 
@@ -410,6 +445,58 @@ class HistoryTests(unittest.TestCase):
             install_promotion(gh, jobs=[job(completed_at=stamp_value)])
             with self.subTest(stamp=stamp_value):
                 self.assertRejected(gh)
+
+    def test_unreadable_start_or_status_time_fails_closed(self):
+        for stamp_value in (None, "", "2026-11-10T00:30:00", "nope", 5):
+            gh = FakeGitHub()
+            install_promotion(gh, jobs=[job(started_at=stamp_value)])
+            with self.subTest(started=stamp_value):
+                self.assertRejected(gh)
+            gh = FakeGitHub()
+            install_promotion(gh, statuses=[{
+                "state": "success", "created_at": stamp_value,
+                "log_url": f"https://github.com/{REPO}/actions/runs/501"}])
+            with self.subTest(created=stamp_value):
+                self.assertRejected(gh)
+
+    def test_status_outside_the_job_window_is_not_certified(self):
+        for created in ("2026-11-10T00:29:59Z", "2026-11-10T01:00:01Z"):
+            gh = FakeGitHub()
+            install_promotion(gh, statuses=[{
+                "state": "success", "created_at": created,
+                "log_url": f"https://github.com/{REPO}/actions/runs/501"}])
+            with self.subTest(created=created):
+                self.assertRejected(gh)
+
+    def test_window_bounds_are_inclusive(self):
+        for created in ("2026-11-10T00:30:00Z", "2026-11-10T01:00:00Z"):
+            gh = FakeGitHub()
+            install_promotion(gh, statuses=[{
+                "state": "success", "created_at": created,
+                "log_url": f"https://github.com/{REPO}/actions/runs/501"}])
+            with self.subTest(created=created):
+                self.assertEqual(self.promoted(gh)[0], OLD)
+
+    def test_later_skipped_attempt_keeps_the_original_promotion(self):
+        gh = FakeGitHub()
+        install_promotion(gh, run=run_row(run_attempt=2))
+        gh.routes["actions/runs/501/attempts/2/jobs"] = {
+            "jobs": [job(status="completed", conclusion="skipped",
+                         completed_at="2026-11-10T03:00:00Z")]}
+        self.assertEqual(self.promoted(gh), (OLD, hold.moment("2026-11-10T01:00:00Z")))
+
+    def test_later_success_does_not_certify_an_earlier_failed_status(self):
+        gh = FakeGitHub()
+        install_promotion(gh, run=run_row(run_attempt=2),
+                          jobs=[job(conclusion="failure")])
+        gh.routes["actions/runs/501/attempts/2/jobs"] = {
+            "jobs": [job(completed_at="2026-11-10T03:00:00Z")]}
+        self.assertRejected(gh)
+
+    def test_attempt_history_is_capped(self):
+        gh = FakeGitHub()
+        install_promotion(gh, run=run_row(run_attempt=51))
+        self.assertRejected(gh)
 
 
 class EvidenceBoundTests(unittest.TestCase):
@@ -613,14 +700,127 @@ class MainLifecycleTests(unittest.TestCase):
         self.assertEqual(gh.writes, [])
 
 
+ACTIVE_RUNS = "actions/workflows/deploy-production.yml/runs"
+
+
+def install_active(gh, runs, jobs_by_run):
+    gh.routes[ACTIVE_RUNS] = {"workflow_runs": runs}
+    for run in runs:
+        rows = jobs_by_run.get(run["id"], [])
+        gh.routes[f"actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs"] = paged(
+            rows, "jobs")
+
+
+class PendingReasonTests(unittest.TestCase):
+    def reason_for(self, gh, own="777"):
+        with mock.patch.object(incident_issue, "_request", gh.request):
+            return history(gh).pending_reason(own)
+
+    def test_waiting_and_queued_production_job_is_reported_with_its_run(self):
+        for state in ("waiting", "queued", "pending", "requested", "in_progress"):
+            gh = FakeGitHub()
+            install_active(gh, [{"id": 888, "run_attempt": 2}],
+                           {888: [job(name="guard"),
+                                  job(status=state, conclusion=None)]})
+            with self.subTest(state=state):
+                self.assertEqual(self.reason_for(gh),
+                                 (f"production {state}",
+                                  f"https://github.com/{REPO}/actions/runs/888"))
+
+    def test_waiting_rollback_job_is_reported(self):
+        gh = FakeGitHub()
+        install_active(gh, [{"id": 888, "run_attempt": 1}],
+                       {888: [job(name="wrangler rollback + readyz gate",
+                                  status="waiting", conclusion=None)]})
+        self.assertEqual(self.reason_for(gh)[0], "production waiting")
+
+    def test_own_run_is_excluded(self):
+        gh = FakeGitHub()
+        install_active(gh, [{"id": 777, "run_attempt": 1}],
+                       {777: [job(status="waiting", conclusion=None)]})
+        self.assertEqual(self.reason_for(gh), ("no successful production promotion", None))
+        install_active(gh, [{"id": 777, "run_attempt": 1}, {"id": 888, "run_attempt": 1}],
+                       {777: [job(status="queued", conclusion=None)],
+                        888: [job(status="queued", conclusion=None)]})
+        self.assertEqual(self.reason_for(gh)[1],
+                         f"https://github.com/{REPO}/actions/runs/888")
+
+    def test_failed_gate_and_skipped_production_have_generic_reasons(self):
+        gh = FakeGitHub()
+        install_active(gh, [{"id": 888, "run_attempt": 1}],
+                       {888: [job(name="schema-gate", conclusion="failure")]})
+        self.assertIn("gate not green", self.reason_for(gh)[0])
+        install_active(gh, [{"id": 888, "run_attempt": 1}],
+                       {888: [job(name="guard"), job(conclusion="skipped")]})
+        self.assertIn("skipped or pending", self.reason_for(gh)[0])
+
+    def test_no_other_run_has_the_generic_fallback(self):
+        gh = FakeGitHub()
+        install_active(gh, [], {})
+        self.assertEqual(self.reason_for(gh), ("no successful production promotion", None))
+
+    def test_malformed_active_runs_fail_closed(self):
+        bad = [None, [], {"workflow_runs": None}, {"workflow_runs": [1]},
+               {"workflow_runs": [{"id": "9", "run_attempt": 1}]},
+               {"workflow_runs": [{"id": 0, "run_attempt": 1}]},
+               {"workflow_runs": [{"id": 9, "run_attempt": 0}]},
+               {"workflow_runs": [{"id": 9, "run_attempt": True}]},
+               {"workflow_runs": [{"id": 9, "run_attempt": 1}] * 21}]
+        for payload in bad:
+            gh = FakeGitHub()
+            gh.routes[ACTIVE_RUNS] = payload
+            with self.subTest(payload=payload), self.assertRaises(incident_issue.IncidentError):
+                self.reason_for(gh)
+
+    def test_active_run_query_is_bounded_to_main(self):
+        seen = []
+        gh = FakeGitHub()
+        gh.routes[ACTIVE_RUNS] = lambda query: seen.append(query) or {"workflow_runs": []}
+        self.reason_for(gh)
+        self.assertEqual(seen, [{"branch": "main", "per_page": "20"}])
+
+    def test_watch_lifecycle_opens_one_incident_naming_the_waiting_run(self):
+        gh = scenario("2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
+        install_active(gh, [{"id": 777, "run_attempt": 1}, {"id": 888, "run_attempt": 1}],
+                       {888: [job(status="waiting", conclusion=None)]})
+        runner = MainLifecycleTests()
+        code, out = runner.run_main(gh, {})
+        self.assertEqual(code, 0)
+        report = json.loads(out)
+        self.assertEqual((report["action"], report["reason"]), ("alert", "production waiting"))
+        self.assertEqual(report["run_url"], f"https://github.com/{REPO}/actions/runs/888")
+        issue = gh.issues[1]
+        self.assertIn("Skip/failure reason: production waiting", issue["body"])
+        self.assertIn("actions/runs/888", issue["body"])
+        # The next scheduled watch comments on the same issue.
+        self.assertEqual(runner.run_main(gh, {})[0], 0)
+        self.assertEqual(len(gh.issues), 1)
+        self.assertEqual(len(gh.comments[1]), 1)
+
+    def test_pending_lookup_runs_only_for_an_empty_needs_alert(self):
+        runner = MainLifecycleTests()
+        gh = scenario("2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
+        # No active-runs route registered: a lookup would raise KeyError.
+        needs = {"guard": {"result": "success", "outputs": {"skip": "ci-not-green"}}}
+        code, out = runner.run_main(gh, needs)
+        self.assertEqual((code, json.loads(out)["reason"]), (0, "ci-not-green"))
+        quiet = FakeGitHub()
+        install_promotion(quiet, completed_at="2020-01-01T00:00:00Z")
+        finish(quiet, main=OLD, status="identical")
+        self.assertEqual(json.loads(runner.run_main(quiet, {})[1])["action"], "none")
+
+
 class WorkflowContractTests(unittest.TestCase):
+    @staticmethod
+    def extract(name):
+        text = WORKFLOW_FILE.read_text()
+        match = re.search(rf"^  {name}:\n(.*?)(?=^  [a-z0-9-]+:\n)", text, re.S | re.M)
+        assert match, f"{name} job is missing"
+        return match[1]
+
     @classmethod
     def setUpClass(cls):
-        text = WORKFLOW_FILE.read_text()
-        match = re.search(r"^  promotion-hold-incident:\n(.*?)(?=^  [a-z0-9-]+:\n)", text,
-                          re.S | re.M)
-        assert match, "promotion-hold-incident job is missing"
-        cls.job = match[1]
+        cls.job = cls.extract("promotion-hold-incident")
 
     def test_runs_always_on_main_after_every_promotion_stage(self):
         self.assertRegex(self.job, r"(?m)^    if: always\(\) && github\.ref == 'refs/heads/main'$")
@@ -648,6 +848,28 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("GITHUB_TOKEN: ${{ github.token }}", self.job)
         self.assertIn("persist-credentials: false", self.job)
         self.assertNotIn("secrets.", self.job)
+
+    def test_independent_watch_job_does_not_wait_on_production(self):
+        watch = self.extract("promotion-hold-watch")
+        self.assertNotRegex(watch, r"(?m)^    needs:")
+        self.assertRegex(watch, r"(?m)^    if: .*github\.event_name == 'schedule'")
+        self.assertRegex(watch, r"(?m)^    if: .*github\.ref == 'refs/heads/main'")
+        self.assertNotRegex(watch, r"(?m)^    environment:")
+        self.assertNotIn("deployment-lock", watch)
+        self.assertIn("NEEDS_JSON: '{}'", watch)
+        self.assertIn("python3 scripts/production_hold_incident.py", watch)
+        block = re.search(r"(?m)^    permissions:\n((?:      .*\n)+)", watch)
+        self.assertIsNotNone(block)
+        self.assertEqual(dict(re.findall(r"(?m)^      ([a-z-]+): (\w+)", block[1])),
+                         {"contents": "read", "actions": "read",
+                          "deployments": "read", "issues": "write"})
+        # Both reporters share one group so issue writes and recovery serialize.
+        group = re.search(r"(?m)^      group: (\S+)$", watch)
+        self.assertIsNotNone(group)
+        self.assertEqual(group[1], "production-hold-incident")
+        self.assertEqual(group[1], re.search(r"(?m)^      group: (\S+)$", self.job)[1])
+        self.assertNotIn(group[1], ("deploy-production", "staging-lifecycle"))
+        self.assertIn("cancel-in-progress: false", watch)
 
     def test_helper_constants_match_the_workflow(self):
         text = WORKFLOW_FILE.read_text()

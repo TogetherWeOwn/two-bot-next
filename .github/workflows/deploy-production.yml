@@ -1466,6 +1466,32 @@ jobs:
           retention-days: 14
           compression-level: 0
 
+  # A production Environment approval can wait before the production timeout
+  # even starts. The daily backstop also reports independently of those jobs.
+  promotion-hold-watch:
+    name: scheduled production hold watch
+    if: github.event_name == 'schedule' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: production-hold-incident
+      cancel-in-progress: false
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'promotion-hold-watch') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      deployments: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Report holds without waiting on an approval or deployment queue
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NEEDS_JSON: '{}'
+        run: python3 scripts/production_hold_incident.py
+
   # Reporting only: a green skipped workflow is not a production promotion.
   # This separate lane never holds staging or the production deployment lock.
   promotion-hold-incident:

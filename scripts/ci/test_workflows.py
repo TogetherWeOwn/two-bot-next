@@ -50,7 +50,7 @@ JOB_INVENTORY = {
                   # like the Rust lanes.
                   "nextest"},
     "deploy-production.yml": {"guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck",
-                              "promotion-skipped", "promotion-hold-incident", "production"},
+                              "promotion-skipped", "promotion-hold-watch", "promotion-hold-incident", "production"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "help-embed-synthetic",
                            "user-flow-synthetic", "pinned-history-guard", "certify-promotion",
                            "staging-use-release"},
@@ -10438,7 +10438,7 @@ class WorkflowTests(unittest.TestCase):
                         # Reads immutable staging artifacts, then records this
                         # independent production Deployment event.
                         expected = {"contents": "read", "actions": "read", "deployments": "write"}
-                    elif (name, job_id) == ("deploy-production.yml", "promotion-hold-incident"):
+                    elif name == "deploy-production.yml" and job_id in ("promotion-hold-incident", "promotion-hold-watch"):
                         # Read actual promotion history; write only incident issues.
                         expected = {"contents": "read", "actions": "read",
                                     "deployments": "read", "issues": "write"}
