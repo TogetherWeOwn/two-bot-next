@@ -148,13 +148,33 @@ enable bypass; staging stays red if the consumer cannot decide safely.
 
 ## Verification and references
 
+Read-only archive inspection on 2026-11-10 observed the following immutable
+artifacts from [run 41375889399](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41375889399):
+
+| Artifact ID | Name | ZIP bytes | API/download SHA-256 |
+| --- | --- | ---: | --- |
+| 13111470704 | `staging-migrate-apply-claim` | 1124 | `0d55fc10c0b088319393c6414c8eba940b175c45cde3767ac96f7277b6eb9bd7` |
+| 13111012012 | `staging-migrate-manifest` | 86333 | `08657239c242283e40fd848500a6eefeae7fd5cbf7fadc0ffaf8c5b497acc9eb` |
+
+Each has one correctly named JSON entry, stored method 0, flag 8, version 20,
+zero local CRC/sizes and no extra fields. ZIP hashes matched the API digests.
+The existing decoder fixtures cover that descriptor layout. This is envelope
+inspection, **not** a claim that the consumer executed against these archives or
+that an old apply dispatch is an eligible prior plan. No archive content was
+executed or copied into source. Signed-webhook shape, a custom-rule-only pending
+gate and actual callback behavior still require registration-window evidence.
+
 The existing `worker check` Actions job runs `npm ci`, `npm run typecheck` and
 `npm test` for `wrangler/**`. No new dependency or CI lane is needed. Synthetic
 fixtures cover decoding, both projection chains, independent prior-plan checks,
 API/download refusal, ingress authentication and repository/environment fencing.
-Durable Object crash/replay and live-format registration evidence must also be
-recorded before the candidate is called ready; they are not inferred from these
-unit fixtures. CI is GitHub Actions, not a local full-suite transcript.
+`staging-protection-gate.test.ts` exercises the actual verifier/callback chain
+against scripted transport and in-memory serialized storage, including injected
+storage/callback failures, reconstruction, replay, reruns and token revocation.
+Those tests are not workerd crash/input-gate proof. Actual Durable Object
+crash/replay and live-format registration evidence remain prerequisites for
+enabling the candidate; they are not inferred from the in-memory tests.
+CI is GitHub Actions, not a local full-suite transcript.
 
 REA angle: reuse GitHub's supported
 [custom-rule protocol](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/create-custom-protection-rules),

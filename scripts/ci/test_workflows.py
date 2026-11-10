@@ -8706,15 +8706,24 @@ class WorkflowTests(unittest.TestCase):
                         step["run"] = step["run"].replace(
                             " --plan-manifest-path producing-plan/production-migrate-manifest.json", "")
             self.assertTrue(mutated(drop_path))
-        # Production and staging stay mirrors: same job ids, same step counts,
-        # same pinned actions and container, differing only by the documented
-        # production prefix (names, envs, secrets, artifacts, flags).
+        # The staging-only independent consumer needs a plan-dispatch marker.
+        # Pin its entire shape rather than adding it to production policy or
+        # ignoring arbitrary staging steps in the mirror comparison.
         staging = self.workflows["staging-migrate.yml"]
+        marker = {
+            "name": "Confirm read-only plan dispatch",
+            "if": "inputs.mode == 'plan'",
+            "run": "true",
+        }
+        markers = [step for step in staging["jobs"]["plan"]["steps"]
+                   if step.get("name") == marker["name"]]
+        self.assertEqual(markers, [marker])
         self.assertEqual(set(migrate["jobs"]), set(staging["jobs"]))
         for job_id in ("plan", "claim", "apply"):
             with self.subTest(mirror=job_id):
                 prod_job, stag_job = migrate["jobs"][job_id], staging["jobs"][job_id]
-                self.assertEqual(len(prod_job.get("steps", [])), len(stag_job.get("steps", [])))
+                self.assertEqual(len(prod_job.get("steps", [])) + (job_id == "plan"),
+                                 len(stag_job.get("steps", [])))
                 self.assertEqual(prod_job.get("permissions"), stag_job.get("permissions"))
                 self.assertEqual(prod_job.get("if"), stag_job.get("if"))
                 self.assertEqual(prod_job.get("runs-on"), stag_job.get("runs-on").replace("staging", "production") if "staging" in str(stag_job.get("runs-on")) else stag_job.get("runs-on"))
