@@ -3740,7 +3740,7 @@ mod tests {
                 serde_json::json!({"kind":"row","table":"voice_command_role_members","data":{"guild_id":"g","command":"lock","role_id":"7"}}),
                 serde_json::json!({"kind":"end","rows":3}),
             ]))
-            .unwrap_or_else(|e| panic!("v{version} legacy archive must inspect: {e}"));
+            .expect("v4..v16 legacy archives must inspect");
             assert_eq!(contents.manifest.version, version);
             assert_eq!(contents.buffers["voice_command_roles"].len(), 1);
             assert_eq!(contents.buffers["voice_command_role_members"].len(), 1);
