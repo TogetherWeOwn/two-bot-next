@@ -286,12 +286,33 @@ def stale_observation(text, report):
 
 
 def stale_activity(history, issue, report):
-    # Reporter writes serialize on the issue-only lock. Inspect every comment,
-    # not updated_at alone: an observation of an OLD generation can arrive after
-    # the new deploy completed. Unknown activity remains conservatively open.
-    if incident_issue._updated(issue) is None or not stale_observation(issue.get("body"), report):
+    # Reporter writes serialize on the issue-only lock, not with operators.
+    # A receipt proves comment delivery, never a failed close: a successful
+    # close followed by reopen must remain held against that same generation.
+    updated = incident_issue._updated(issue)
+    if updated is None:
         return False
     cutoff = moment(report["last_promoted_at"])
+    quiet_lifecycle = True
+    seen = set()
+    for event in history.pages(f"issues/{issue['number']}/events"):
+        event_id = event.get("id")
+        if (type(event_id) is not int or event_id <= 0 or event_id in seen
+                or not isinstance(event.get("event"), str) or not event["event"].strip()):
+            raise incident_issue.IncidentError("production hold lifecycle event is malformed")
+        seen.add(event_id)
+        if moment(event.get("created_at")) >= cutoff:
+            # No newer lifecycle kind is exempt, including unknown kinds and
+            # equal-cutoff reopens. Exhaust history even after finding a veto.
+            quiet_lifecycle = False
+    if not quiet_lifecycle:
+        return False
+    # Preserve the shared sink's original timestamp fence. Only unchanged
+    # older-generation content can justify activity newer than the promotion.
+    if updated <= cutoff:
+        return True
+    if not stale_observation(issue.get("body"), report):
+        return False
     for comment in history.pages(f"issues/{issue['number']}/comments"):
         updated = incident_issue._updated(comment)
         if updated is None or (updated > cutoff
@@ -335,7 +356,10 @@ def main():
             elif report["action"] == "recovery":
                 incident_issue.close_incident(
                     env, KEY, recovery_body(report, history.repo),
-                    quiet_since=moment(report["last_promoted_at"]),
+                    # Require lifecycle proof even when updated_at equals the
+                    # completion cutoff. The callback retains the usual fence;
+                    # other sink callers keep their unchanged default behavior.
+                    quiet_since=datetime.min.replace(tzinfo=timezone.utc),
                     activity_is_stale=lambda issue: stale_activity(history, issue, report))
         print(json.dumps(report, sort_keys=True))
         return 0

@@ -57,6 +57,9 @@ class FakeGitHub:
         self.issues = {}
         self.comments = {}
         self.comment_times = {}
+        self.events = {}
+        self.event_routes = {}
+        self.lose_patch_response = False
         self.clock = "2020-01-10T00:00:00Z"
         self.writes = []
         self.next_number = 1
@@ -74,6 +77,26 @@ class FakeGitHub:
         if not isinstance(commits, list) or not commits:
             raise incident_issue.IncidentError("production hold pending commit is unreadable")
         return hold.moment(commits[0].get("commit", {}).get("committer", {}).get("date"))
+
+    def share(self, other):
+        """Continue the same GitHub repository state on another fake."""
+        self.issues, self.comments = other.issues, other.comments
+        self.comment_times, self.events = other.comment_times, other.events
+        self.event_routes = other.event_routes
+        self.next_number = other.next_number
+        return self
+
+    def add_event(self, number, event, created_at=None):
+        rows = self.events.setdefault(number, [])
+        event_id = 1 + sum(len(items) for items in self.events.values())
+        rows.append({"id": event_id, "event": event, "created_at": created_at or self.clock})
+
+    def reopen(self, number, created_at):
+        """A manual reopen: state, lifecycle event and updated_at all move."""
+        self.clock = created_at
+        self.issues[number]["state"] = "open"
+        self.issues[number]["updated_at"] = created_at
+        self.add_event(number, "reopened", created_at)
 
     def request(self, method, path, token, body=None):
         assert token == "tok"
@@ -109,8 +132,21 @@ class FakeGitHub:
             return {}
         match = re.fullmatch(r"issues/(\d+)", rest)
         if method == "PATCH" and match:
-            self.issues[int(match[1])]["state"] = body["state"]
+            number, issue = int(match[1]), self.issues[int(match[1])]
+            if issue["state"] != body["state"]:
+                issue["state"] = body["state"]
+                issue["updated_at"] = self.clock
+                self.add_event(number, "closed" if body["state"] == "closed" else "reopened")
+            if self.lose_patch_response:
+                # The write landed on GitHub but the response never reached us.
+                raise incident_issue.IncidentError("incident issue PATCH failed (transport)")
             return {}
+        match = re.fullmatch(r"issues/(\d+)/events", rest)
+        if method == "GET" and match:
+            number = int(match[1])
+            if number in self.event_routes:
+                return self.event_routes[number](query)
+            return paged(self.events.get(number, []))(query)
         assert method == "GET", (method, rest)
         route = self.routes[rest]
         return route(query) if callable(route) else route
@@ -963,6 +999,269 @@ class MainLifecycleTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("no verified production promotion", out)
         self.assertEqual(gh.writes, [])
+
+
+CUTOFF = "2020-01-11T00:00:00Z"
+
+
+class IssueEventLifecycleTests(unittest.TestCase):
+    """Issue /events fence: a reopen at or after the promotion cutoff vetoes close."""
+
+    def setUp(self):
+        self.runner = MainLifecycleTests()
+
+    def alerted(self):
+        gh = self.runner.held_history()
+        self.assertEqual(self.runner.run_main(gh, self.runner.alert_needs())[0], 0)
+        return gh
+
+    def recovered(self, source, clock="2020-01-11T00:05:00Z", completed_at=CUTOFF):
+        recovered = self.runner.recovered_history(completed_at).share(source)
+        recovered.clock = clock
+        return recovered
+
+    def run_recovery(self, gh, run_id="999"):
+        return self.runner.run_main(gh, {}, run_id=run_id)
+
+    def assertHeld(self, gh, code=0, comments=None):
+        before = len(gh.writes)
+        self.assertEqual(self.run_recovery(gh)[0], code)
+        self.assertEqual(len(gh.writes), before)
+        self.assertEqual(gh.issues[1]["state"], "open")
+        if comments is not None:
+            self.assertEqual(len(gh.comments.get(1, [])), comments)
+
+    def test_successful_close_records_a_closed_event_with_a_valid_shape(self):
+        recovered = self.recovered(self.alerted())
+        self.assertEqual(self.run_recovery(recovered)[0], 0)
+        self.assertEqual(recovered.issues[1]["state"], "closed")
+        [event] = recovered.events[1]
+        self.assertEqual((event["id"], event["event"], event["created_at"]),
+                         (1, "closed", "2020-01-11T00:05:00Z"))
+
+    def test_manual_reopen_after_a_close_for_the_same_generation_writes_nothing(self):
+        recovered = self.recovered(self.alerted())
+        self.assertEqual(self.run_recovery(recovered)[0], 0)
+        recovered.reopen(1, "2020-01-11T01:00:00Z")
+        self.assertEqual([e["event"] for e in recovered.events[1]], ["closed", "reopened"])
+        self.assertHeld(recovered, comments=1)
+        # The veto is stable across repeated reporter runs.
+        self.assertHeld(recovered, comments=1)
+
+    def test_state_transition_through_patch_records_a_reopened_event(self):
+        gh = self.recovered(self.alerted())
+        gh.issues[1]["state"] = "closed"
+        gh.request("PATCH", f"/repos/{REPO}/issues/1", "tok", {"state": "open"})
+        self.assertEqual([e["event"] for e in gh.events[1]], ["reopened"])
+
+    def test_lost_close_response_then_manual_reopen_writes_nothing(self):
+        recovered = self.recovered(self.alerted())
+        recovered.lose_patch_response = True
+        self.assertEqual(self.run_recovery(recovered)[0], 1)
+        # GitHub really closed the issue; the reporter only lost the response.
+        self.assertEqual(recovered.issues[1]["state"], "closed")
+        self.assertEqual([e["event"] for e in recovered.events[1]], ["closed"])
+        recovered.lose_patch_response = False
+        before = len(recovered.writes)
+        self.assertEqual(self.run_recovery(recovered)[0], 0)
+        self.assertEqual(len(recovered.writes), before)
+        recovered.reopen(1, "2020-01-11T01:00:00Z")
+        self.assertHeld(recovered, comments=1)
+
+    def test_failed_patch_leaves_no_event_and_the_retry_still_closes(self):
+        recovered = self.recovered(self.alerted())
+        request = recovered.request
+
+        def fail_close(method, path, token, body=None):
+            if method == "PATCH":
+                raise incident_issue.IncidentError("incident issue PATCH failed (transport)")
+            return request(method, path, token, body)
+
+        with mock.patch.object(recovered, "request", side_effect=fail_close):
+            self.assertEqual(self.run_recovery(recovered)[0], 1)
+        self.assertEqual(recovered.issues[1]["state"], "open")
+        self.assertEqual(recovered.events, {})
+        self.assertEqual(self.run_recovery(recovered, run_id="1000")[0], 0)
+        self.assertEqual(recovered.issues[1]["state"], "closed")
+        self.assertEqual([e["event"] for e in recovered.events[1]], ["closed"])
+
+    def test_reopen_exactly_at_the_cutoff_vetoes_even_with_a_same_generation_receipt(self):
+        gh = self.recovered(self.alerted(), clock=CUTOFF)
+        self.assertEqual(self.run_recovery(gh)[0], 0)
+        self.assertTrue(hold.recovery_receipt(gh.comments[1][0], decide(gh)))
+        gh.reopen(1, CUTOFF)
+        self.assertHeld(gh, comments=1)
+
+    def test_reopen_at_the_cutoff_with_issue_updated_at_at_the_cutoff_and_no_receipt_holds(self):
+        gh = self.alerted()
+        gh.issues[1]["updated_at"] = CUTOFF
+        gh.add_event(1, "reopened", CUTOFF)
+        self.assertHeld(self.recovered(gh), comments=0)
+
+    def test_closed_event_at_or_after_the_cutoff_is_conservatively_held(self):
+        for created_at in (CUTOFF, "2020-01-11T00:00:01Z"):
+            gh = self.alerted()
+            gh.add_event(1, "closed", created_at)
+            with self.subTest(at=created_at):
+                self.assertHeld(self.recovered(gh), comments=0)
+
+    def test_veto_on_an_early_page_still_exhausts_every_events_page(self):
+        gh = self.alerted()
+        gh.add_event(1, "reopened", "2020-01-11T00:00:01Z")
+        for i in range(hold.PAGE_SIZE):
+            gh.add_event(1, "labeled", "2020-01-10T00:00:00Z")
+        seen = []
+        gh.event_routes[1] = lambda query: (
+            seen.append(int(query["page"])) or paged(gh.events[1])(query))
+        self.assertHeld(self.recovered(gh), comments=0)
+        self.assertEqual(seen, [1, 2])
+
+    def test_veto_followed_by_a_malformed_later_page_fails_closed(self):
+        gh = self.alerted()
+        rows = [{"id": 1, "event": "reopened", "created_at": "2020-01-11T00:00:01Z"}]
+        rows += [{"id": i + 2, "event": "labeled", "created_at": "2020-01-10T00:00:00Z"}
+                 for i in range(hold.PAGE_SIZE - 1)]
+        rows.append({"id": 0, "event": "labeled", "created_at": "2020-01-10T00:00:00Z"})
+        gh.event_routes[1] = paged(rows)
+        self.assertHeld(self.recovered(gh), code=1, comments=0)
+
+    def test_reopen_after_the_cutoff_vetoes_without_a_receipt(self):
+        gh = self.alerted()
+        gh.add_event(1, "reopened", "2020-01-11T00:00:01Z")
+        self.assertHeld(self.recovered(gh), comments=0)
+
+    def test_reopen_before_the_cutoff_does_not_veto(self):
+        gh = self.alerted()
+        gh.add_event(1, "reopened", "2020-01-10T23:59:59Z")
+        recovered = self.recovered(gh)
+        self.assertEqual(self.run_recovery(recovered)[0], 0)
+        self.assertEqual(recovered.issues[1]["state"], "closed")
+
+    def test_newer_or_unclassified_event_holds_while_an_older_one_does_not(self):
+        for name in ("labeled", "assigned", "renamed", "locked", "referenced", "mystery"):
+            for created_at in (CUTOFF, "2020-01-11T00:00:01Z"):
+                gh = self.alerted()
+                gh.add_event(1, name, created_at)
+                with self.subTest(event=name, at=created_at):
+                    self.assertHeld(self.recovered(gh), comments=0)
+            gh = self.alerted()
+            gh.add_event(1, name, "2020-01-10T23:59:59Z")
+            recovered = self.recovered(gh)
+            with self.subTest(event=name, at="older"):
+                self.assertEqual(self.run_recovery(recovered)[0], 0)
+                self.assertEqual(recovered.issues[1]["state"], "closed")
+
+    def test_later_generation_closes_over_a_reopen_older_than_its_own_cutoff(self):
+        recovered = self.recovered(self.alerted())
+        self.assertEqual(self.run_recovery(recovered)[0], 0)
+        recovered.reopen(1, "2020-01-11T01:00:00Z")
+        self.assertHeld(recovered, comments=1)
+        later = self.recovered(recovered, clock="2020-01-12T00:05:00Z",
+                               completed_at="2020-01-12T00:00:00Z")
+        self.assertEqual(self.run_recovery(later, run_id="1001")[0], 0)
+        self.assertEqual(later.issues[1]["state"], "closed")
+        self.assertEqual([e["event"] for e in later.events[1]],
+                         ["closed", "reopened", "closed"])
+
+    def test_later_generation_with_a_newer_reopen_stays_held(self):
+        gh = self.alerted()
+        gh.add_event(1, "reopened", "2020-01-12T00:00:00Z")
+        later = self.recovered(gh, clock="2020-01-12T00:05:00Z",
+                               completed_at="2020-01-12T00:00:00Z")
+        self.assertHeld(later, comments=0)
+
+    def test_events_are_paginated_to_the_end(self):
+        gh = self.alerted()
+        for i in range(hold.PAGE_SIZE * 2):
+            gh.add_event(1, "labeled", "2020-01-10T00:00:00Z")
+        gh.add_event(1, "reopened", "2020-01-11T00:00:01Z")
+        seen = []
+        gh.event_routes[1] = lambda query: (
+            seen.append(int(query["page"])) or paged(gh.events[1])(query))
+        self.assertHeld(self.recovered(gh), comments=0)
+        self.assertEqual(seen, [1, 2, 3])
+
+    def test_full_last_events_page_is_followed_by_one_more_read(self):
+        gh = self.alerted()
+        for i in range(hold.PAGE_SIZE):
+            gh.add_event(1, "labeled", "2020-01-10T00:00:00Z")
+        seen = []
+        gh.event_routes[1] = lambda query: (
+            seen.append(int(query["page"])) or paged(gh.events[1])(query))
+        recovered = self.recovered(gh)
+        self.assertEqual(self.run_recovery(recovered)[0], 0)
+        self.assertEqual(seen, [1, 2])
+        self.assertEqual(recovered.issues[1]["state"], "closed")
+
+    def test_event_page_cap_exhaustion_fails_closed_without_writes(self):
+        gh = self.alerted()
+        seen = []
+        gh.event_routes[1] = lambda query: (
+            seen.append(int(query["page"])) or
+            [{"id": int(query["page"]) * 1000 + i, "event": "labeled",
+              "created_at": "2020-01-10T00:00:00Z"} for i in range(hold.PAGE_SIZE)])
+        self.assertHeld(self.recovered(gh), code=1, comments=0)
+        self.assertEqual(seen, list(range(1, hold.MAX_PAGES + 1)))
+
+    def test_malformed_or_unreadable_events_fail_closed_without_writes(self):
+        good = {"id": 1, "event": "labeled", "created_at": "2020-01-10T00:00:00Z"}
+        payloads = [None, {"events": []}, "text", [1], [[]], [None],
+                    [good, good], [good] * (hold.PAGE_SIZE + 1)]
+        for value in (0, -1, "1", True, 1.5, None):
+            payloads.append([{**good, "id": value}])
+        for value in ("", " \t", None, 5, []):
+            payloads.append([{**good, "event": value}])
+        for value in (None, "", "nope", "2020-01-10T00:00:00", 5):
+            payloads.append([{**good, "created_at": value}])
+        for key in good:
+            payloads.append([{k: v for k, v in good.items() if k != key}])
+        for payload in payloads:
+            gh = self.alerted()
+            gh.event_routes[1] = lambda query, value=payload: value
+            with self.subTest(payload=payload):
+                self.assertHeld(self.recovered(gh), code=1, comments=0)
+
+    def test_malformed_event_on_a_later_page_still_fails_closed(self):
+        gh = self.alerted()
+        rows = [{"id": i + 1, "event": "labeled", "created_at": "2020-01-10T00:00:00Z"}
+                for i in range(hold.PAGE_SIZE)]
+        rows.append({"id": 0, "event": "labeled", "created_at": "2020-01-10T00:00:00Z"})
+        gh.event_routes[1] = paged(rows)
+        self.assertHeld(self.recovered(gh), code=1, comments=0)
+
+    def test_events_permission_or_transport_failure_writes_nothing(self):
+        for message in ("incident issue GET failed with status 403",
+                        "incident issue GET failed (transport)",
+                        "incident issue GET response exceeds the size cap"):
+            gh = self.alerted()
+
+            def fail_events(query):
+                raise incident_issue.IncidentError(message)
+
+            gh.event_routes[1] = fail_events
+            with self.subTest(message=message):
+                self.assertHeld(self.recovered(gh), code=1, comments=0)
+
+    def test_events_share_the_aggregate_request_budget(self):
+        gh = self.recovered(self.alerted())
+        get = hold.History.get
+        reached = []
+
+        def exhausted(history, path, **query):
+            if path.endswith("/events"):
+                reached.append(path)
+                history.requests = 100
+            return get(history, path, **query)
+
+        with mock.patch.object(hold.History, "get", exhausted):
+            self.assertHeld(gh, code=1, comments=0)
+        self.assertEqual(reached, ["issues/1/events"])
+
+    def test_alert_path_does_not_consult_events(self):
+        gh = self.runner.held_history()
+        gh.event_routes[1] = lambda query: self.fail("events read on the alert path")
+        self.assertEqual(self.runner.run_main(gh, self.runner.alert_needs())[0], 0)
+        self.assertEqual(self.runner.run_main(gh, self.runner.alert_needs())[0], 0)
 
 
 ACTIVE_RUNS = "actions/workflows/deploy-production.yml/runs"

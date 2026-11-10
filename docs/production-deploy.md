@@ -289,6 +289,17 @@ close when its generation predates that deploy; body/comment edits retaining the
 marker, a genuinely newer hold or unclassified newer activity remain open.
 Recovery comments also bind their content to the verified producing generation,
 so a failed close after a successful comment can retry against that same generation.
+Before recovery writes, the caller exhausts bounded issue lifecycle events and
+validates each event's identity, kind and timestamp. A reopen at or after the
+verified promotion completion vetoes that generation, even at equal timestamps
+or with an unchanged recovery receipt; a lost close response does not erase a
+later reopen. All other lifecycle activity at or after completion also holds,
+including unknown event kinds. A genuinely later promotion can supersede older
+lifecycle activity, subject to the existing content/generation checks. Missing,
+malformed, unreadable or incomplete history fails closed within the same
+100-row/10-page, aggregate 100-request and 1 MiB response limits. Comments stay
+classified separately; neither receipts nor actors prove a lifecycle transition.
+The final PATCH is not atomic with concurrent operator changes.
 The checksum detects edits, not hostile authorship. Legacy alerts without
 content-bound generation metadata retain the conservative timestamp fence.
 
