@@ -2700,8 +2700,8 @@ class ReadyzVerdictTests(unittest.TestCase):
             self.assertNotIn("payload", message)
 
     def test_decoder_overflow_is_refused_without_a_traceback(self):
-        # Deep enough to overflow the C JSON decoder itself, but below the
-        # body cap, so RecursionError precedes the iterative depth check.
+        # Deep enough to overflow the C JSON decoder on older CPython, but
+        # below the body cap: the lexical pre-scan refuses it on every version.
         body = "[" * 10_000
         for mode in ("deploy", "rollback"):
             code, message = self.judge("200", body, mode=mode)

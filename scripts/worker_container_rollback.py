@@ -150,13 +150,13 @@ class RollbackClient(base.Client):
         except base.HTTPError as error:
             codes = []
             try:
-                envelope = json.loads(error.read(base.MAX_BODY))
+                envelope = base._loads_bounded(error.read(base.MAX_BODY))
                 codes = [
                     str(item["code"])
                     for item in envelope.get("errors", [])
                     if isinstance(item, dict) and type(item.get("code")) is int
                 ][:4]
-            except (OSError, ValueError, AttributeError, TypeError):
+            except (OSError, ValueError, AttributeError, TypeError, RecursionError):
                 pass
             raise GateError(
                 "api_http_failure", f"status={error.code} codes={','.join(codes) or 'none'}"
@@ -452,7 +452,7 @@ def control_client(variant, token, worker_url, staging_url, actor, root=None):
             # step, which runs with release_fence=false by default.
             raise GateError("ownership_control_failed", detail)
         try:
-            return base.mapping(json.loads(result.stdout, object_pairs_hook=_reject_duplicate_keys))
+            return base.mapping(base._loads_bounded(result.stdout, object_pairs_hook=_reject_duplicate_keys))
         except (ValueError, RecursionError):
             raise GateError("ownership_control_invalid_response") from None
 
