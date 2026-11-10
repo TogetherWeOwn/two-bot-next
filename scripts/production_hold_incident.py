@@ -7,6 +7,7 @@ a green workflow whose production job skipped is never promotion evidence.
 """
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -16,6 +17,16 @@ import urllib.parse
 
 import build_identity
 import incident_issue
+from production_hold_pending import pending_since
+
+
+@dataclass(frozen=True)
+class Promotion:
+    revision: str
+    completed_at: datetime
+    run_id: str
+    attempt: int
+    mode: str
 
 KEY = "production-held"
 TITLE = "production held > 6h"
@@ -74,6 +85,7 @@ class History:
         runs = data.get("workflow_runs") if isinstance(data, dict) else None
         if not isinstance(runs, list) or len(runs) > 20:
             raise incident_issue.IncidentError("production hold active runs are malformed")
+        fallback = None
         for run in runs:
             if not isinstance(run, dict) or type(run.get("id")) is not int or run["id"] <= 0:
                 raise incident_issue.IncidentError("production hold active run is malformed")
@@ -89,10 +101,12 @@ class History:
                     state = job.get("status")
                     if state in ("waiting", "queued", "pending", "requested", "in_progress"):
                         return f"production {state}", url
-            if any(job.get("conclusion") in ("failure", "cancelled") for job in jobs):
-                return "promotion gate not green - inspect promotion run", url
-            return "production skipped or pending - inspect promotion run", url
-        return "no successful production promotion", None
+            if fallback is None:
+                text = ("promotion gate not green - inspect promotion run"
+                        if any(job.get("conclusion") in ("failure", "cancelled") for job in jobs)
+                        else "production skipped or pending - inspect promotion run")
+                fallback = text, url
+        return fallback or ("no successful production promotion", None)
 
     def last_promotion(self):
         for row in self.pages("deployments", environment="production"):
@@ -146,7 +160,8 @@ class History:
                     if started <= recorded_at <= completed:
                         # A successful rollback is the restored serving baseline,
                         # not recovery; only a deploy-mode result closes an issue.
-                        return revision, completed
+                        return Promotion(revision, completed, run_id, historical_attempt,
+                                         "rollback" if payload.get("rollback") is True else "deploy")
                 break
         raise incident_issue.IncidentError("no verified production promotion in bounded history")
 
@@ -167,28 +182,70 @@ def reason(needs):
 
 def decide(history, needs, now, run_url):
     main = sha(history.get("commits/main").get("sha"))
-    promoted, promoted_at = history.last_promotion()
-    comparison = history.get(f"compare/{promoted}...{main}", per_page=1)
-    state = comparison.get("status")
-    if state not in ("ahead", "identical"):
-        raise incident_issue.IncidentError("production hold main ancestry is unreadable")
-    report = {"main_sha": main, "last_promoted_sha": promoted,
-              "last_promoted_at": stamp(promoted_at), "run_url": run_url,
+    promotion = history.last_promotion()
+    # Local metadata has no patch payload, unlike the first compare API page.
+    # Missing objects (e.g. a newer main arriving after checkout) fail the report;
+    # a later watcher retries rather than certifying an incomplete comparison.
+    pending_at = pending_since(promotion.revision, main)
+    report = {"main_sha": main, "last_promoted_sha": promotion.revision,
+              "last_promoted_at": stamp(promotion.completed_at), "run_url": run_url,
+              "promotion_run_id": promotion.run_id, "promotion_attempt": promotion.attempt,
+              "promotion_mode": promotion.mode, "observed_at": stamp(now),
               "reason": reason(needs)}
-    if (needs.get("production", {}).get("result") == "success"
-            and needs.get("guard", {}).get("outputs", {}).get("mode") == "deploy"):
-        return {**report, "action": "recovery"}
-    if state == "identical":
-        return {**report, "action": "none"}
-    commits = comparison.get("commits")
-    if not isinstance(commits, list) or not commits:
-        raise incident_issue.IncidentError("production hold pending commit is unreadable")
-    # Main uses squash merges. The first unpromoted commit's committer time
-    # is its main integration time, not the author date of work on a branch.
-    pending_at = moment(commits[0].get("commit", {}).get("committer", {}).get("date"))
-    held_since = max(promoted_at, pending_at)
-    return {**report, "held_since": stamp(held_since),
-            "action": "alert" if now - held_since > timedelta(hours=6) else "none"}
+    if pending_at is not None:
+        held_since = max(promotion.completed_at, pending_at)
+        report["held_since"] = stamp(held_since)
+        if now - held_since > timedelta(hours=6):
+            return {**report, "action": "alert"}
+    # Reconcile from the latest verified serving generation, not ephemeral needs
+    # from a reporter that can be lost, delayed, or superseded by a rollback.
+    return {**report, "action": "recovery" if promotion.mode == "deploy" else "none"}
+
+
+OBSERVATION = re.compile(r"<!-- production-hold-observation: (\{[^\n]*\}) -->")
+
+
+def observation(report):
+    fields = ("last_promoted_sha", "last_promoted_at", "promotion_run_id",
+              "promotion_attempt", "promotion_mode", "main_sha", "observed_at", "held_since")
+    value = {key: report[key] for key in fields}
+    return "<!-- production-hold-observation: " + json.dumps(value, sort_keys=True) + " -->"
+
+
+def stale_observation(text, report):
+    matches = OBSERVATION.findall(text or "")
+    if len(matches) != 1:
+        return False
+    try:
+        value = json.loads(matches[0], object_pairs_hook=incident_issue._reject_duplicate_keys)
+        sha(value["last_promoted_sha"])
+        sha(value["main_sha"])
+        if (not re.fullmatch(r"[1-9][0-9]*", value["promotion_run_id"])
+                or type(value["promotion_attempt"]) is not int or value["promotion_attempt"] <= 0
+                or value["promotion_mode"] not in ("deploy", "rollback")):
+            return False
+        baseline = moment(value["last_promoted_at"])
+        held = moment(value["held_since"])
+        observed = moment(value["observed_at"])
+        return (baseline <= held <= observed
+                and baseline < moment(report["last_promoted_at"])
+                and held <= moment(report["last_promoted_at"]))
+    except (incident_issue.IncidentError, KeyError, TypeError, ValueError):
+        return False
+
+
+def stale_activity(history, issue, report):
+    # Reporter writes serialize on the issue-only lock. Inspect every comment,
+    # not updated_at alone: an observation of an OLD generation can arrive after
+    # the new deploy completed. Unknown activity remains conservatively open.
+    if incident_issue._updated(issue) is None or not stale_observation(issue.get("body"), report):
+        return False
+    cutoff = moment(report["last_promoted_at"])
+    for comment in history.pages(f"issues/{issue['number']}/comments"):
+        updated = incident_issue._updated(comment)
+        if updated is None or (updated > cutoff and not stale_observation(comment.get("body"), report)):
+            return False
+    return True
 
 
 def body(report):
@@ -221,10 +278,12 @@ def main():
                 report["run_url"] = pending_url
         if not args.dry_run:
             if report["action"] == "alert":
-                incident_issue.open_incident(env, KEY, TITLE, body(report))
+                incident_issue.open_incident(env, KEY, TITLE, body(report) + "\n" + observation(report))
             elif report["action"] == "recovery":
-                incident_issue.close_incident(env, KEY, "Production promotion recovered.\n\n" + body(report),
-                                              quiet_since=moment(report["last_promoted_at"]))
+                incident_issue.close_incident(
+                    env, KEY, "Production promotion recovered.\n\n" + body(report),
+                    quiet_since=moment(report["last_promoted_at"]),
+                    activity_is_stale=lambda issue: stale_activity(history, issue, report))
         print(json.dumps(report, sort_keys=True))
         return 0
     except (incident_issue.IncidentError, KeyError, TypeError, ValueError, AttributeError) as error:

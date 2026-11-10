@@ -280,14 +280,23 @@ red guards/gates, soak mismatches and green skips such as `ci-not-green`.
 one issue titled **`production held > 6h`**, labelled `incident`, under the
 stable `production-held` key. Repeated overdue evaluations comment on that
 issue; the next successful deploy-mode production job comments and closes it.
-A workflow success with a skipped production job cannot close it. An issue
-updated after the recovery evidence is retained rather than closed on stale
-evidence.
+A workflow success with a skipped production job is not recovery evidence.
+Both reporters reconcile from verified deployment history, so replacement of a
+queued terminal reporter cannot permanently lose recovery. Alert bodies and
+repeat comments carry the observed serving generation. A delayed alert written
+after a successful deploy can close when its generation predates that deploy;
+a genuinely newer hold or unclassified newer activity remains open. Legacy
+alerts without generation metadata retain the conservative timestamp fence.
 
 The clock starts at the later of the last verified promotion's completed time
-and the first unpromoted main commit's committer time (main uses squash merges).
-It alerts only when main is ahead and the interval is **strictly greater than
-six hours**; an unchanged main is not an overdue deployment. Promotion history
+and the first unpromoted runtime-affecting main commit's committer time (main uses
+squash merges). Commits touching only staging's `paths-ignore` paths do not start
+the clock; a failed or missing staging run for runtime changes still does. The
+reporters use full-depth local Git ancestry, commit times and path names, never
+comparison patches. Missing objects, non-linear ancestry and bounded-reader
+limits fail the report for a later retry rather than inventing a result.
+It alerts only when deployable work is pending and the interval is **strictly
+greater than six hours**; unchanged or ignored-path-only main is not overdue. Promotion history
 comes from deploy-ID production records backed by a completed successful
 production job in the recorded run's producing attempt, not its workflow head
 SHA or overall conclusion. The deployment success-status timestamp must fall
@@ -303,8 +312,12 @@ and completion triggers evaluate the threshold; this is not a six-hour polling
 schedule. The daily backstop's independent **`scheduled production hold watch`**
 job has no promotion dependencies, so a waiting production approval or deployment
 queue cannot suppress reporting. It uses the latest promotion job states for the
-reason and run link; only the terminal reporter can claim recovery. Both reporters
-share an issue-only concurrency group, separate from deployment locks.
+reason and run link, prioritizing active production jobs across the bounded run
+list before falling back to the newest terminal run. Both reporters can reconcile
+recovery from the latest verified deploy generation, including its producing run,
+attempt, mode and completion. A newer rollback can never lend an older deploy
+reporter its recovery cutoff. Both reporters share an issue-only concurrency group,
+separate from deployment locks.
 For a read-only evaluation, run the helper with `--dry-run` and the
 same `NEEDS_JSON`, repository, run ID and read-authorized token environment;
 it prints the decision without calling the issue sink. CI's synthetic history

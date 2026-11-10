@@ -1485,6 +1485,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0 # pending ancestry and path metadata, never comparison patches
           persist-credentials: false
       - name: Report holds without waiting on an approval or deployment queue
         env:
@@ -1512,6 +1513,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0 # pending ancestry and path metadata, never comparison patches
           persist-credentials: false
       - name: Open, update or close the overdue promotion incident
         env:

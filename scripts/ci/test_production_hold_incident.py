@@ -59,6 +59,20 @@ class FakeGitHub:
         self.writes = []
         self.next_number = 1
 
+    def pending_since(self, promoted, main):
+        # This fake supplies ancestry/time metadata instead of a local Git repo.
+        # The real patch-free Git reader has its own disposable-repo tests.
+        route = self.routes[f"compare/{promoted}...{main}"]
+        comparison = route({}) if callable(route) else route
+        if comparison.get("status") == "identical":
+            return None
+        if comparison.get("status") != "ahead":
+            raise incident_issue.IncidentError("production hold main ancestry is unreadable")
+        commits = comparison.get("commits")
+        if not isinstance(commits, list) or not commits:
+            raise incident_issue.IncidentError("production hold pending commit is unreadable")
+        return hold.moment(commits[0].get("commit", {}).get("committer", {}).get("date"))
+
     def request(self, method, path, token, body=None):
         assert token == "tok"
         parsed = urllib.parse.urlparse(path)
@@ -79,6 +93,10 @@ class FakeGitHub:
                                    "updated_at": self.clock}
             return {"number": number}
         match = re.fullmatch(r"issues/(\d+)/comments", rest)
+        if method == "GET" and match:
+            rows = [{"body": text, "updated_at": self.issues[int(match[1])]["updated_at"]}
+                    for text in self.comments.get(int(match[1]), [])]
+            return paged(rows)(query)
         if method == "POST" and match:
             number = int(match[1])
             self.comments.setdefault(number, []).append(body["body"])
@@ -164,7 +182,8 @@ def history(gh):
 
 
 def decide(gh, needs=None, now=NOW):
-    with mock.patch.object(incident_issue, "_request", gh.request):
+    with mock.patch.object(incident_issue, "_request", gh.request), \
+            mock.patch.object(hold, "pending_since", gh.pending_since):
         return hold.decide(history(gh), needs or {}, now, RUN_URL)
 
 
@@ -178,7 +197,7 @@ class ThresholdTests(unittest.TestCase):
     def test_exactly_six_hours_is_not_an_alert(self):
         gh = scenario("2026-11-01T00:00:00Z", iso(NOW - timedelta(hours=6)))
         report = decide(gh)
-        self.assertEqual(report["action"], "none")
+        self.assertEqual(report["action"], "recovery")
         self.assertEqual(report["held_since"], iso(NOW - timedelta(hours=6)))
 
     def test_one_second_over_six_hours_alerts(self):
@@ -189,13 +208,13 @@ class ThresholdTests(unittest.TestCase):
         # Pending since 20h ago, but the last deploy finished 2h ago.
         gh = scenario(iso(NOW - timedelta(hours=2)), iso(NOW - timedelta(hours=20)))
         report = decide(gh)
-        self.assertEqual(report["action"], "none")
+        self.assertEqual(report["action"], "recovery")
         self.assertEqual(report["held_since"], iso(NOW - timedelta(hours=2)))
 
     def test_old_promotion_does_not_alert_when_pending_commit_is_recent(self):
         gh = scenario(iso(NOW - timedelta(hours=20)), iso(NOW - timedelta(hours=2)))
         report = decide(gh)
-        self.assertEqual(report["action"], "none")
+        self.assertEqual(report["action"], "recovery")
         self.assertEqual(report["held_since"], iso(NOW - timedelta(hours=2)))
 
     def test_clock_starts_at_pending_commit_when_both_are_old(self):
@@ -215,7 +234,7 @@ class ThresholdTests(unittest.TestCase):
         install_promotion(gh, completed_at="2020-01-01T00:00:00Z")
         finish(gh, main=OLD, status="identical")
         report = decide(gh)
-        self.assertEqual(report["action"], "none")
+        self.assertEqual(report["action"], "recovery")
         self.assertNotIn("held_since", report)
 
     def test_successful_rollback_does_not_hide_a_pending_main_revision(self):
@@ -306,6 +325,26 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(report["action"], "recovery")
         self.assertEqual(report["last_promoted_at"], "2026-11-10T11:00:00Z")
 
+    def test_delayed_success_needs_cannot_recover_an_identical_rollback_baseline(self):
+        gh = FakeGitHub()
+        install_promotion(gh, revision=OLD, run_id=888,
+                          jobs=[job(name="wrangler rollback + readyz gate")],
+                          deployment={"payload": {"deploy_id": deploy_id(OLD), "rollback": True}})
+        finish(gh, main=OLD, status="identical")
+        report = decide(gh, self.deploy_needs())
+        self.assertEqual(report["action"], "none")
+        self.assertEqual((report["promotion_mode"], report["promotion_run_id"]), ("rollback", "888"))
+
+    def test_history_recovery_retains_the_successful_producing_attempt(self):
+        gh = FakeGitHub()
+        install_promotion(gh, run=run_row(run_attempt=2))
+        gh.routes["actions/runs/501/attempts/2/jobs"] = {"jobs": [job(conclusion="skipped")]}
+        finish(gh, main=OLD, status="identical")
+        report = decide(gh)
+        self.assertEqual(report["action"], "recovery")
+        self.assertEqual((report["promotion_run_id"], report["promotion_attempt"]), ("501", 1))
+        self.assertEqual(report["last_promoted_at"], "2026-11-10T01:00:00Z")
+
     def test_skipped_production_job_is_not_recovery(self):
         for result in ("skipped", "failure", "cancelled", None):
             gh = scenario("2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
@@ -322,7 +361,8 @@ class HistoryTests(unittest.TestCase):
     def promoted(self, gh):
         finish(gh, pending_at="2026-11-10T02:00:00Z")
         with mock.patch.object(incident_issue, "_request", gh.request):
-            return history(gh).last_promotion()
+            promotion = history(gh).last_promotion()
+            return promotion.revision, promotion.completed_at
 
     def assertRejected(self, gh):
         finish(gh, pending_at="2026-11-10T02:00:00Z")
@@ -579,6 +619,7 @@ class MainLifecycleTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(sys, "argv", ["production_hold_incident.py", *args]), \
                 mock.patch.object(incident_issue, "_request", gh.request), \
+                mock.patch.object(hold, "pending_since", gh.pending_since), \
                 contextlib.redirect_stdout(out):
             code = hold.main()
         return code, out.getvalue()
@@ -635,29 +676,113 @@ class MainLifecycleTests(unittest.TestCase):
         self.assertEqual(self.run_main(recovered, self.recovery_needs())[0], 0)
         self.assertEqual(len(recovered.writes), before)
 
+    def test_watch_recovers_when_terminal_reporter_was_lost(self):
+        gh = self.held_history()
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        recovered = self.recovered_history("2020-01-11T00:00:00Z")
+        recovered.issues, recovered.comments = gh.issues, gh.comments
+        code, out = self.run_main(recovered, {})
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["action"], "recovery")
+        self.assertEqual(gh.issues[1]["state"], "closed")
+
+    def test_delayed_deploy_reporter_cannot_recover_a_newer_rollback(self):
+        gh = self.held_history()
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        latest = FakeGitHub()
+        install_promotion(latest, deployment_id=12, revision=OLD, run_id=888,
+                          completed_at="2020-01-11T10:05:00Z",
+                          jobs=[job(name="wrangler rollback + readyz gate",
+                                    completed_at="2020-01-11T10:05:00Z")],
+                          deployment={"payload": {"deploy_id": deploy_id(OLD), "rollback": True}})
+        install_promotion(latest, revision=MAIN, run_id=777,
+                          completed_at="2020-01-11T10:00:00Z")
+        finish(latest, pending_at="2020-01-10T00:00:00Z")
+        latest.issues, latest.comments = gh.issues, gh.comments
+        latest.clock = "2020-01-11T10:06:00Z"
+        code, out = self.run_main(latest, self.recovery_needs())
+        self.assertEqual(code, 0)
+        report = json.loads(out)
+        self.assertEqual((report["action"], report["promotion_mode"]), ("alert", "rollback"))
+        self.assertEqual((report["promotion_run_id"], report["promotion_attempt"]), ("888", 1))
+        self.assertEqual(report["last_promoted_sha"], OLD)
+        self.assertEqual(gh.issues[1]["state"], "open")
+        self.assertNotIn("PATCH", [method for method, _ in latest.writes])
+
+    def test_watch_recovers_a_stale_alert_written_after_completion(self):
+        gh = self.held_history()
+        # The watch saw the old baseline before promotion, but its issue write
+        # lands after promotion completed. updated_at is NOT failure provenance.
+        gh.clock = "2020-01-11T00:05:00Z"
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        recovered = self.recovered_history("2020-01-11T00:00:00Z")
+        recovered.issues, recovered.comments = gh.issues, gh.comments
+        code, out = self.run_main(recovered, {})
+        self.assertEqual((code, json.loads(out)["action"]), (0, "recovery"))
+        self.assertEqual(gh.issues[1]["state"], "closed")
+
+    def test_recovery_preserves_a_genuinely_newer_generation(self):
+        gh = self.held_history()
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        # A second hold is observed against the recovered generation itself.
+        next_hold = scenario("2020-01-11T00:00:00Z", "2020-01-12T00:00:00Z")
+        next_hold.issues, next_hold.comments = gh.issues, gh.comments
+        next_hold.clock = "2020-01-20T00:00:00Z"
+        self.assertEqual(self.run_main(next_hold, self.alert_needs())[0], 0)
+        recovered = self.recovered_history("2020-01-11T00:00:00Z")
+        recovered.issues, recovered.comments = gh.issues, gh.comments
+        self.assertEqual(self.run_main(recovered, {})[0], 0)
+        self.assertEqual(gh.issues[1]["state"], "open")
+        self.assertEqual(len(gh.comments[1]), 1)
+        self.assertEqual(recovered.writes, [])
+
+    def test_malformed_observation_cannot_override_the_timestamp_fence(self):
+        gh = self.held_history()
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        gh.clock = "2020-01-20T00:00:00Z"
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        gh.comments[1][0] += '\n<!-- production-hold-observation: {"invalid":true} -->'
+        recovered = self.recovered_history("2020-01-11T00:00:00Z")
+        recovered.issues, recovered.comments = gh.issues, gh.comments
+        self.assertEqual(self.run_main(recovered, {})[0], 0)
+        self.assertEqual(gh.issues[1]["state"], "open")
+        self.assertEqual(recovered.writes, [])
+
+    def test_dry_run_recovery_does_not_close_an_open_issue(self):
+        gh = self.held_history()
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        recovered = self.recovered_history("2020-01-11T00:00:00Z")
+        recovered.issues, recovered.comments = gh.issues, gh.comments
+        code, out = self.run_main(recovered, {}, ["--dry-run"])
+        self.assertEqual((code, json.loads(out)["action"]), (0, "recovery"))
+        self.assertEqual(gh.issues[1]["state"], "open")
+        self.assertEqual(recovered.writes, [])
+
     def test_recovery_holds_an_issue_with_activity_after_the_promotion(self):
         gh = self.held_history()
         self.run_main(gh, self.alert_needs())
         gh.issues[1]["updated_at"] = "2020-01-20T00:00:00Z"
+        gh.comments[1] = ["Unclassified newer incident activity; do not auto-close."]
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
         recovered.issues, recovered.comments = gh.issues, gh.comments
         self.assertEqual(self.run_main(recovered, self.recovery_needs())[0], 0)
         self.assertEqual(gh.issues[1]["state"], "open")
-        self.assertEqual(gh.comments, {})
+        self.assertEqual(gh.comments[1], ["Unclassified newer incident activity; do not auto-close."])
 
     def test_unchanged_main_writes_nothing(self):
         gh = FakeGitHub()
         install_promotion(gh, completed_at="2020-01-01T00:00:00Z")
         finish(gh, main=OLD, status="identical")
         code, out = self.run_main(gh, self.alert_needs())
-        self.assertEqual((code, json.loads(out)["action"]), (0, "none"))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "recovery"))
         self.assertEqual(gh.writes, [])
 
     def test_recent_hold_writes_nothing(self):
         recent = iso(datetime.now(timezone.utc) - timedelta(hours=1))
         gh = scenario(recent, recent)
         code, out = self.run_main(gh, self.alert_needs())
-        self.assertEqual((code, json.loads(out)["action"]), (0, "none"))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "recovery"))
         self.assertEqual(gh.writes, [])
 
     def test_dry_run_reads_but_never_writes(self):
@@ -726,6 +851,25 @@ class PendingReasonTests(unittest.TestCase):
                 self.assertEqual(self.reason_for(gh),
                                  (f"production {state}",
                                   f"https://github.com/{REPO}/actions/runs/888"))
+
+    def test_older_approval_wait_takes_priority_over_newer_terminal_run(self):
+        for conclusion in ("skipped", "failure"):
+            gh = FakeGitHub()
+            install_active(gh, [{"id": 999, "run_attempt": 1}, {"id": 888, "run_attempt": 2}],
+                           {999: [job(conclusion=conclusion)],
+                            888: [job(status="waiting", conclusion=None)]})
+            with self.subTest(conclusion=conclusion):
+                self.assertEqual(self.reason_for(gh),
+                                 ("production waiting",
+                                  f"https://github.com/{REPO}/actions/runs/888"))
+
+    def test_no_active_run_keeps_the_newest_terminal_fallback(self):
+        gh = FakeGitHub()
+        install_active(gh, [{"id": 999, "run_attempt": 1}, {"id": 888, "run_attempt": 1}],
+                       {999: [job(conclusion="skipped")], 888: [job(conclusion="failure")]})
+        self.assertEqual(self.reason_for(gh),
+                         ("production skipped or pending - inspect promotion run",
+                          f"https://github.com/{REPO}/actions/runs/999"))
 
     def test_waiting_rollback_job_is_reported(self):
         gh = FakeGitHub()
@@ -807,7 +951,7 @@ class PendingReasonTests(unittest.TestCase):
         quiet = FakeGitHub()
         install_promotion(quiet, completed_at="2020-01-01T00:00:00Z")
         finish(quiet, main=OLD, status="identical")
-        self.assertEqual(json.loads(runner.run_main(quiet, {})[1])["action"], "none")
+        self.assertEqual(json.loads(runner.run_main(quiet, {})[1])["action"], "recovery")
 
 
 class WorkflowContractTests(unittest.TestCase):
@@ -870,6 +1014,12 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(group[1], re.search(r"(?m)^      group: (\S+)$", self.job)[1])
         self.assertNotIn(group[1], ("deploy-production", "staging-lifecycle"))
         self.assertIn("cancel-in-progress: false", watch)
+
+    def test_reporters_have_full_history_for_patch_free_pending_metadata(self):
+        for name in ("promotion-hold-watch", "promotion-hold-incident"):
+            text = self.extract(name)
+            self.assertIn("fetch-depth: 0", text)
+            self.assertIn("persist-credentials: false", text)
 
     def test_helper_constants_match_the_workflow(self):
         text = WORKFLOW_FILE.read_text()
