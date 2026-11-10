@@ -754,7 +754,14 @@ Keep the existing rollout receipts on the same remediation/handoff card.
    Do not trust the container's `/home` reading.
 2. Before scratch checks or pool creation, establish and record the supported
    **bounded TWO-only build-admission restriction**: method, scope, start, expiry
-   and release/undo. Keep it effective through pool provisioning, policy write
+   and release/undo. Record its scope explicitly: refuse direct compiling Cargo
+   commands and builds against the legacy shared cache throughout rollout. Refuse
+   real-pool wrapper builds until the step-3 policy with retained quota and scratch
+   coverage receipts exists; before then, use only disposable offline fixture pools
+   for admission tests. Once that policy exists, admit only repo-wrapper invocations
+   against the new bounded pool, including the step-4 concurrent adoption checks.
+   This narrow allowance does not release the restriction on direct Cargo or legacy
+   builds. Keep the restriction effective through pool provisioning, policy write
    and post-verification in steps 2–4; release it only in step 5. If it expires or
    loses coverage, **stop rollout**; re-establish and verify the supported bounded
    restriction before resuming. Do not extend it indefinitely for review.
@@ -788,7 +795,8 @@ Keep the existing rollout receipts on the same remediation/handoff card.
 4. Pin the monitor script at the merged SHA in the existing host monitoring
    mechanism; test both quiet healthy output and a synthetic threshold finding by
    setting the threshold above current available bytes. Register the existing alert
-   route. Adopt the repo wrapper for subsequent TWO builds; no full Rust build is
+   route. Adopt the repo wrapper for subsequent TWO builds under the step-2 scope,
+   using only the new pool with the step-3 policy in place; no full Rust build is
    needed for this rollout. Record slot usage, quota enforcement and zero new
    per-worktree targets for the first concurrent isolated invocations.
 5. Release the rollout admission restriction only after the guard, quota, monitor **and scratch
