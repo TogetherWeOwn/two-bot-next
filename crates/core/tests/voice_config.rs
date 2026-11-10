@@ -951,8 +951,7 @@ fn lists_are_bounded_in_count_choices_and_text() {
 
 #[test]
 fn command_roles_accept_only_restrictable_voice_commands() {
-    // Config import and runtime enforcement use different stores: config writes
-    // `voice_command_roles` while the runtime reads `voice_access_controls`.
+    // Config import and runtime enforcement share `voice_access_controls`.
     // `/myroom` carries no per-command role policy at all, so it is outside the
     // restrictable `VOICE_COMMANDS` vocabulary and config import must refuse
     // it too. Otherwise a guild would believe `myroom` is gated while it stays

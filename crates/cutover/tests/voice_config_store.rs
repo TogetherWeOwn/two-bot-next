@@ -201,9 +201,31 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
         .bind(schema)
         .execute(pool)
         .await?;
+    // Keep the 0469 proof on its historical schema, before the contract.
+    let mut historical = sqlx::migrate!("./migrations");
+    historical.migrations = historical
+        .iter()
+        .filter(|migration| migration.version < 476)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    historical.run(pool).await?;
+    verify_0469_backfill(pool).await?;
     sqlx::migrate!("./migrations").run(pool).await?;
     let store = PgVoiceConfigStore::new(pool.clone());
     let rooms = PgRoomStore::new(pool.clone());
+    assert_eq!(
+        rooms.access_controls(44).await?.command_roles,
+        BTreeMap::from([("kick".to_owned(), vec![5]), ("limit".to_owned(), vec![])])
+    );
+    let removed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.tables
+         WHERE table_schema = current_schema()
+           AND table_name IN ('voice_command_roles', 'voice_command_role_members')",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(removed, 0, "0476 removes both legacy relations");
     let (config, inventory) = fixture();
 
     // A guild that was never configured exports its defaults and no rows.
@@ -357,58 +379,6 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     rooms.save_access_controls(GUILD, &sorted, &gated).await?;
     assert_eq!(store.snapshot(GUILD).await?, stored);
 
-    // 0469 backfill: a legacy-only restriction moves into the gate's store,
-    // an enforced one keeps its roles, a name the gate refuses is dropped
-    // (else the whole guild's row would fail to decode), and the legacy
-    // tables keep every row for the previous binary (expand/contract).
-    sqlx::query(
-        "INSERT INTO voice_command_roles (guild_id, command) VALUES
-           ('44','kick'), ('44','limit'), ('44','retired'), ('45','transfer'),
-           ('46','retired')",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO voice_command_role_members (guild_id, command, role_id) VALUES
-           ('44','kick','2010'), ('44','kick','201'), ('44','retired','3'),
-           ('45','transfer','7'), ('46','retired','3')",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO voice_access_controls (guild_id, required_role_id, command_roles)
-         VALUES ('44', '9', '{\"kick\": [\"5\"]}'::jsonb)",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::raw_sql(include_str!(
-        "../migrations/0469_voice_command_roles_authority.sql"
-    ))
-    .execute(pool)
-    .await?;
-    let backfilled = rooms.access_controls(44).await?;
-    assert_eq!(backfilled.required_role, Some(9));
-    assert_eq!(
-        backfilled.command_roles,
-        BTreeMap::from([("kick".to_owned(), vec![5]), ("limit".to_owned(), vec![])])
-    );
-    assert_eq!(
-        rooms.access_controls(45).await?.command_roles,
-        BTreeMap::from([("transfer".to_owned(), vec![7])])
-    );
-    assert_eq!(rooms.access_controls(46).await?, AccessControls::default());
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT (SELECT count(*) FROM voice_command_roles
-                      WHERE guild_id IN ('44', '45', '46'))
-                  + (SELECT count(*) FROM voice_command_role_members
-                      WHERE guild_id IN ('44', '45', '46'))"
-        )
-        .fetch_one(pool)
-        .await?,
-        10
-    );
-
     // 0470 backfill: an imported-only switch and role move into the gates'
     // store; where both stores disagree the enforced value wins (creation
     // off beats on, an enforced role beats the imported one), so nothing
@@ -485,11 +455,7 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     let smaller_expected = store.snapshot(GUILD).await?;
     store.apply(GUILD, &smaller, &smaller_expected).await?;
     assert_eq!(store.snapshot(GUILD).await?, smaller);
-    assert_eq!(
-        legacy_rows(pool, GUILD_ID).await?,
-        Vec::new(),
-        "lifted restrictions leave the legacy mirror"
-    );
+    assert!(rooms.access_controls(GUILD).await?.command_roles.is_empty());
     assert_eq!(
         store.snapshot(42).await?,
         neighbour,
@@ -521,25 +487,10 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     store.apply(GUILD, &config, &restore_expected).await?;
     let before = store.snapshot(GUILD).await?;
     assert_eq!(before, config);
-    // Apply mirrors the restrictions into the legacy tables, so the previous
-    // binary's `/export` shows the same after a backout.
-    let mirrored: Vec<(String, Option<String>)> = config
-        .settings
-        .command_roles
-        .iter()
-        .flat_map(|restriction| {
-            let roles: Vec<Option<String>> = if restriction.role_ids.is_empty() {
-                vec![None]
-            } else {
-                restriction.role_ids.iter().cloned().map(Some).collect()
-            };
-            roles
-                .into_iter()
-                .map(move |role| (restriction.command.clone(), role))
-        })
-        .collect();
-    assert!(!mirrored.is_empty(), "fixture restricts a command");
-    assert_eq!(legacy_rows(pool, GUILD_ID).await?, mirrored);
+    assert_eq!(
+        rooms.access_controls(GUILD).await?.command_roles,
+        gated.command_roles
+    );
     let rows_before = config_rows(pool, GUILD_ID).await?;
     let mut bad_creator = alternate(&config);
     bad_creator.creators[0].first_number = 0; // CHECK first_room_number >= 1
@@ -878,21 +829,60 @@ async fn verify_inherit_edges(pool: &PgPool, schema: &str) -> TestResult {
     Ok(())
 }
 
-/// The legacy 0229 command-role rows, in the order `config.settings` lists
-/// them: one `(command, None)` for a command with no roles.
-async fn legacy_rows(
-    pool: &PgPool,
-    guild: &str,
-) -> Result<Vec<(String, Option<String>)>, sqlx::Error> {
-    sqlx::query_as(
-        r#"SELECT c.command, m.role_id
-             FROM voice_command_roles c
-             LEFT JOIN voice_command_role_members m
-               ON m.guild_id = c.guild_id AND m.command = c.command
-            WHERE c.guild_id = $1
-            ORDER BY c.command COLLATE "C", length(m.role_id), m.role_id"#,
+/// Historical 0469 proof; called before applying the destructive contract.
+async fn verify_0469_backfill(pool: &PgPool) -> TestResult {
+    let rooms = PgRoomStore::new(pool.clone());
+    // 0469 backfill: a legacy-only restriction moves into the gate's store,
+    // an enforced one keeps its roles, a name the gate refuses is dropped
+    // (else the whole guild's row would fail to decode), and the legacy
+    // tables keep every row for the previous binary (expand/contract).
+    sqlx::query(
+        "INSERT INTO voice_command_roles (guild_id, command) VALUES
+           ('44','kick'), ('44','limit'), ('44','retired'), ('45','transfer'),
+           ('46','retired')",
     )
-    .bind(guild)
-    .fetch_all(pool)
-    .await
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO voice_command_role_members (guild_id, command, role_id) VALUES
+           ('44','kick','2010'), ('44','kick','201'), ('44','retired','3'),
+           ('45','transfer','7'), ('46','retired','3')",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO voice_access_controls (guild_id, required_role_id, command_roles)
+         VALUES ('44', '9', '{\"kick\": [\"5\"]}'::jsonb)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0469_voice_command_roles_authority.sql"
+    ))
+    .execute(pool)
+    .await?;
+    let backfilled = rooms.access_controls(44).await?;
+    assert_eq!(backfilled.required_role, Some(9));
+    assert_eq!(
+        backfilled.command_roles,
+        BTreeMap::from([("kick".to_owned(), vec![5]), ("limit".to_owned(), vec![])])
+    );
+    assert_eq!(
+        rooms.access_controls(45).await?.command_roles,
+        BTreeMap::from([("transfer".to_owned(), vec![7])])
+    );
+    assert_eq!(rooms.access_controls(46).await?, AccessControls::default());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT (SELECT count(*) FROM voice_command_roles
+                      WHERE guild_id IN ('44', '45', '46'))
+                  + (SELECT count(*) FROM voice_command_role_members
+                      WHERE guild_id IN ('44', '45', '46'))"
+        )
+        .fetch_one(pool)
+        .await?,
+        10
+    );
+
+    Ok(())
 }

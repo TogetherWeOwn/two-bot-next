@@ -699,7 +699,7 @@ fn voice_translation_notes(
     let mut notes = Vec::new();
     if translated_voice_command_roles > 0 || translated_voice_command_role_members > 0 {
         notes.push(format!(
-            "restore: replayed the 0469 translation for {translated_voice_command_roles} legacy voice command restriction(s) into voice_access_controls.command_roles (unknown command names dropped); legacy voice_command_roles tables emptied"
+            "restore: replayed the 0469 translation for {translated_voice_command_roles} legacy voice command restriction(s) into voice_access_controls.command_roles (unknown command names dropped); historical mirror rows consumed from the archive, not restored"
         ));
     }
     if translated_voice_creation_gates > 0 {
@@ -726,7 +726,7 @@ fn voice_replay_warnings(manifest: &dump_file::DumpManifest) -> Vec<&'static str
                 && table.count > 0
         })
     {
-        warnings.push("restore: apply replays the 0469 translation, moving legacy voice command restrictions into voice_access_controls.command_roles (unknown command names dropped) and emptying the legacy voice_command_roles tables");
+        warnings.push("restore: apply replays the 0469 translation, moving legacy voice command restrictions into voice_access_controls.command_roles (unknown command names dropped) without restoring the historical mirror tables");
     }
     if !manifest.applied_cutover(470)
         && manifest

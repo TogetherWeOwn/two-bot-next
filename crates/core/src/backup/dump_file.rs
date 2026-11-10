@@ -1,4 +1,4 @@
-//! The v16 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15): manifest / rows / end marker, gzipped NDJSON.
+//! The v17 backup envelope (also reads v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16): manifest / rows / end marker, gzipped NDJSON.
 //!
 //! Port of the file half of legacy `src/store/dump.ts`. The writer side lives
 //! in [`super::dump`]; everything here touches no database, so every refusal
@@ -180,8 +180,6 @@ pub const DUMP_TABLES: &[&str] = &[
     "voice_logging_mention_members",
     "voice_logging_mention_roles",
     "voice_guild_settings",
-    "voice_command_roles",
-    "voice_command_role_members",
     // V4 vote-kick audit trail (0417): append-only, guild-keyed, no foreign keys.
     "voice_vote_kick_audit",
     // V5 adds accepted-create history; see [`V5_ADDED_TABLES`]. The seasonal
@@ -323,6 +321,25 @@ pub const V15_ADDED_TABLES: &[&str] = &["giveaways", "giveaway_entries", "giveaw
 /// contain the table so lifecycle, order and revocation evidence survives.
 pub const V16_ADDED_TABLES: &[&str] = &["event_instance_windows"];
 
+/// Legacy command-role tables retired from the live schema (issue 1934).
+/// Archives written at v16 or earlier carry them, still declare them in their
+/// frozen inventories and stay readable: restore translates their rows into
+/// `voice_access_controls.command_roles` from the archive buffers, never by
+/// writing the dropped tables. v17 and later archives never contain them; a
+/// v17+ manifest that declares one is refused. They are deliberately absent
+/// from [`DUMP_TABLES`], so the writer, the coverage checks and restore's
+/// table-by-table replay never touch them.
+pub const RETIRED_V16_TABLES: &[&str] = &["voice_command_roles", "voice_command_role_members"];
+
+/// True when archives of `version` carry the [`RETIRED_V16_TABLES`] inventory.
+/// Every released version from v3 through v16 may; v3 predates their coverage
+/// (its fixed prefix is the first 22 tables), so only v4 through v16 require
+/// them.
+#[must_use]
+pub fn version_carries_retired_tables(version: u64) -> bool {
+    (3..=16).contains(&version)
+}
+
 /// Covered tables not created by the current cutover migration set, if any.
 /// Keep legacy data when such tables exist, but do not require nonexistent
 /// legacy subsystems. A table created by migrations must leave this list
@@ -404,8 +421,9 @@ pub fn is_destination_owned(table: &str, column: &str) -> bool {
         .any(|(owned_table, owned_column)| *owned_table == table && *owned_column == column)
 }
 
-/// Write complete v16 coverage; the reader also accepts frozen v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15 coverage.
-pub const DUMP_VERSION: u32 = 16;
+/// Write complete v17 coverage (the legacy command-role tables are retired);
+/// the reader also accepts frozen v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16 coverage.
+pub const DUMP_VERSION: u32 = 17;
 
 /// A table name in the dump, validated against [`DUMP_TABLES`].
 pub type DumpTable = String;
@@ -647,9 +665,14 @@ pub enum DumpError {
 /// trusted input — bytes off a disk someone else may have written. Without
 /// this gate a crafted dump naming `website_users` would be
 /// truncated-and-inserted like one of ours.
+///
+/// This is the read-side gate: it also admits the [`RETIRED_V16_TABLES`] so
+/// old archives inspect. Whether a given version may declare them is decided
+/// per version in the manifest validation, and restore replays only
+/// [`DUMP_TABLES`].
 #[must_use]
 pub fn is_dump_table(name: &str) -> bool {
-    DUMP_TABLES.contains(&name)
+    DUMP_TABLES.contains(&name) || RETIRED_V16_TABLES.contains(&name)
 }
 
 /// Tombstone high-water marks compare as TEXT, so restore must preserve the
@@ -997,10 +1020,11 @@ fn inspect_reader(input: impl Read, limits: InspectLimits) -> Result<DumpContent
                     && version != 13
                     && version != 14
                     && version != 15
+                    && version != 16
                     && version != u64::from(DUMP_VERSION)
                 {
                     return Err(refuse(format!(
-                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 and {DUMP_VERSION}"
+                        "dump version {version}, this build reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 and {DUMP_VERSION}"
                     )));
                 }
                 retain_within_cap(&mut retained, &obj, limits.retained)?;
@@ -1300,14 +1324,22 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
+    // Retired legacy tables belong only to frozen v3..v16 inventories.
+    let version = obj.get("version").and_then(Value::as_u64);
+    if !version.is_some_and(version_carries_retired_tables) {
+        if let Some(name) = RETIRED_V16_TABLES.iter().find(|n| names.contains(**n)) {
+            return Err(refuse(format!(
+                "manifest table {name} was retired after v16 and is not part of this version"
+            )));
+        }
+    }
     // Historical inventories are pinned by fixtures. Each old version waives
-    // only tables first covered by a later version. New v16 archives require
+    // only tables first covered by a later version. New v17 archives require
     // the full inventory, including both guild counters (0441/0442/0446/0447),
     // the epoch-claim guard (0450/0451), the delete tombstones (0452/0453),
     // the token registry (0456/0457), the event voice pair (0455) and
     // the starboard tables (0458/0459) and giveaways (0460/0461),
     // and the event instance windows (0472).
-    let version = obj.get("version").and_then(Value::as_u64);
     let missing: Vec<&str> = DUMP_TABLES
         .iter()
         .copied()
@@ -1390,6 +1422,14 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)
+        // The retired pair stays mandatory in every frozen v4..v16 inventory
+        // (v3 predates its coverage), placed where it sat in DUMP_TABLES.
+        .chain(
+            RETIRED_V16_TABLES
+                .iter()
+                .copied()
+                .filter(|_| matches!(version, Some(4..=16))),
+        )
         .filter(|name| !names.contains(*name))
         .collect();
     if !missing.is_empty() {
@@ -1700,6 +1740,27 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    /// Relabel a test manifest. Frozen v3..v16 inventories carry the retired
+    /// legacy command-role pair; v17 and later never declare it.
+    fn set_version(m: &mut Value, version: u32) {
+        m["version"] = serde_json::json!(version);
+        let tables = m["tables"].as_array_mut().unwrap();
+        if version_carries_retired_tables(u64::from(version)) {
+            for name in RETIRED_V16_TABLES {
+                if !tables.iter().any(|t| t["name"] == *name) {
+                    tables.push(serde_json::json!({
+                        "name": name,
+                        "columns": [],
+                        "column_types": [],
+                        "count": 0,
+                    }));
+                }
+            }
+        } else {
+            tables.retain(|t| !RETIRED_V16_TABLES.iter().any(|n| t["name"] == *n));
+        }
     }
 
     fn manifest(tables: Vec<Value>) -> Value {
@@ -2403,6 +2464,16 @@ mod tests {
                     ]
                     .contains(name)
             })
+            .flat_map(|name| {
+                // The frozen v4 inventory still carries the retired pair,
+                // right after the voice guild settings.
+                let retired: &[&str] = if name == "voice_guild_settings" {
+                    RETIRED_V16_TABLES
+                } else {
+                    &[]
+                };
+                std::iter::once(name).chain(retired.iter().copied())
+            })
             .collect();
         assert_eq!(names, expected);
         // The frozen v4 archive predates every v5 table, in DUMP_TABLES order.
@@ -2436,13 +2507,13 @@ mod tests {
         );
         assert_eq!(contents.buffers["voice_rooms"][0]["channel_id"], "500");
         let mut manifest = serde_json::to_value(&contents.manifest).unwrap();
-        manifest["version"] = serde_json::json!(DUMP_VERSION);
+        set_version(&mut manifest, DUMP_VERSION);
         let err = validate_manifest(&manifest).unwrap_err().to_string();
         assert!(err.contains("voice_create_reservations"), "{err}");
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
         assert!(err.contains("event_store"), "{err}");
         // V4 has a fixed complete inventory, not a blanket missing-table waiver.
-        manifest["version"] = serde_json::json!(4);
+        set_version(&mut manifest, 4);
         manifest["tables"].as_array_mut().unwrap().remove(0);
         assert!(validate_manifest(&manifest)
             .unwrap_err()
@@ -2475,7 +2546,7 @@ mod tests {
             })
             .collect();
         let mut v5 = manifest(v5_tables);
-        v5["version"] = serde_json::json!(5);
+        set_version(&mut v5, 5);
         assert!(
             validate_manifest(&v5).is_ok(),
             "v5 predates the event store and stays readable"
@@ -2499,9 +2570,9 @@ mod tests {
         );
         // The same inventory at the current version refuses: new archives must
         // cover the event store.
-        assert_eq!(DUMP_VERSION, 16);
+        assert_eq!(DUMP_VERSION, 17);
         let mut current = v5;
-        current["version"] = serde_json::json!(DUMP_VERSION);
+        set_version(&mut current, DUMP_VERSION);
         assert!(validate_manifest(&current)
             .unwrap_err()
             .to_string()
@@ -2541,10 +2612,10 @@ mod tests {
             })
             .collect();
         let mut v5 = manifest(tables);
-        v5["version"] = serde_json::json!(5);
+        set_version(&mut v5, 5);
         validate_manifest(&v5).expect("v5 without v6 tables must validate");
         let mut v6 = v5.clone();
-        v6["version"] = serde_json::json!(6);
+        set_version(&mut v6, 6);
         let err = validate_manifest(&v6).unwrap_err().to_string();
         assert!(err.contains("event_store"), "{err}");
         // A v5 archive missing reservations is still refused: only the v6,
@@ -2592,7 +2663,7 @@ mod tests {
             })
             .collect();
         let mut v5 = manifest(tables);
-        v5["version"] = serde_json::json!(5);
+        set_version(&mut v5, 5);
         assert!(
             validate_manifest(&v5).is_ok(),
             "frozen v5 without event_store stays readable"
@@ -2602,14 +2673,14 @@ mod tests {
         assert_eq!(contents.manifest.version, 5);
         // v6 still requires the event store; so does the current version.
         let mut v6 = v5.clone();
-        v6["version"] = serde_json::json!(6);
+        set_version(&mut v6, 6);
         assert!(validate_manifest(&v6)
             .unwrap_err()
             .to_string()
             .contains("event_store"));
         let mut current = v5;
-        current["version"] = serde_json::json!(DUMP_VERSION);
-        assert_eq!(DUMP_VERSION, 16, "frozen v5 test pins the v16 bump");
+        set_version(&mut current, DUMP_VERSION);
+        assert_eq!(DUMP_VERSION, 17, "frozen v5 test pins the v17 bump");
         assert!(validate_manifest(&current)
             .unwrap_err()
             .to_string()
@@ -2647,7 +2718,7 @@ mod tests {
             complete_tables(&BTreeMap::new()),
             "member_season_xp",
         ));
-        v6["version"] = serde_json::json!(6);
+        set_version(&mut v6, 6);
         assert!(
             validate_manifest(&v6).is_ok(),
             "v6 without member_season_xp reads"
@@ -2685,7 +2756,7 @@ mod tests {
             "member_season_xp",
         ));
         assert_eq!(v7_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 16, "frozen v6 test pins the v16 bump");
+        assert_eq!(DUMP_VERSION, 17, "frozen v6 test pins the v17 bump");
         assert!(validate_manifest(&v7_gap)
             .unwrap_err()
             .to_string()
@@ -2731,7 +2802,7 @@ mod tests {
             ],
         );
         let mut v6 = manifest(pre_retention);
-        v6["version"] = serde_json::json!(6);
+        set_version(&mut v6, 6);
         assert!(
             validate_manifest(&v6).is_ok(),
             "v6 without the v7 retention queues reads"
@@ -2767,10 +2838,10 @@ mod tests {
             .contains("event_store"));
         // v7 without the retention queues refuses.
         let mut v7_gap = v6.clone();
-        v7_gap["version"] = serde_json::json!(DUMP_VERSION);
+        set_version(&mut v7_gap, DUMP_VERSION);
         assert_eq!(
-            DUMP_VERSION, 16,
-            "frozen pre-retention test pins the v16 bump"
+            DUMP_VERSION, 17,
+            "frozen pre-retention test pins the v17 bump"
         );
         let err = validate_manifest(&v7_gap).unwrap_err().to_string();
         assert!(err.contains("retention_guild_purge_queue"), "{err}");
@@ -2809,7 +2880,7 @@ mod tests {
             complete_tables(&BTreeMap::new()),
             "stream_live_claims",
         ));
-        v7["version"] = serde_json::json!(7);
+        set_version(&mut v7, 7);
         assert!(
             validate_manifest(&v7).is_ok(),
             "v7 without stream_live_claims reads"
@@ -2847,7 +2918,7 @@ mod tests {
             "stream_live_claims",
         ));
         assert_eq!(v8_gap["version"], serde_json::json!(DUMP_VERSION));
-        assert_eq!(DUMP_VERSION, 16, "frozen v7 test pins the v16 bump");
+        assert_eq!(DUMP_VERSION, 17, "frozen v7 test pins the v17 bump");
         assert!(validate_manifest(&v8_gap)
             .unwrap_err()
             .to_string()
@@ -2874,7 +2945,7 @@ mod tests {
             .collect();
         let mut old = manifest(tables);
         for version in 4..=8 {
-            old["version"] = serde_json::json!(version);
+            set_version(&mut old, version);
             let contents = inspect_bytes(&gzip_lines(&[
                 old.clone(),
                 serde_json::json!({"kind":"end","rows":0}),
@@ -2905,13 +2976,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 16, "new dumps require both guild counters");
+        assert_eq!(DUMP_VERSION, 17, "new dumps require both guild counters");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v16 archive inspects");
+        .expect("complete v17 archive inspects");
         for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -2951,7 +3022,7 @@ mod tests {
             .collect();
         let mut old = manifest(tables);
         for version in 4..=9 {
-            old["version"] = serde_json::json!(version);
+            set_version(&mut old, version);
             let contents = inspect_bytes(&gzip_lines(&[
                 old.clone(),
                 serde_json::json!({"kind":"end","rows":0}),
@@ -2981,13 +3052,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 16, "new dumps require the epoch-claim guard");
+        assert_eq!(DUMP_VERSION, 17, "new dumps require the epoch-claim guard");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v16 archive inspects");
+        .expect("complete v17 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -3027,7 +3098,7 @@ mod tests {
             .collect();
         let mut old = manifest(tables);
         for version in 4..=10 {
-            old["version"] = serde_json::json!(version);
+            set_version(&mut old, version);
             let contents = inspect_bytes(&gzip_lines(&[
                 old.clone(),
                 serde_json::json!({"kind":"end","rows":0}),
@@ -3060,11 +3131,11 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 16, "new dumps require the delete tombstones");
+        assert_eq!(DUMP_VERSION, 17, "new dumps require the delete tombstones");
         // v11 kept the tombstones mandatory but predates registry and starboard:
         // the frozen old-v11 shape carries the tombstone and omits the
         // registry, event voice pair and starboard three.
-        assert_eq!(DUMP_VERSION, 16, "new dumps require the v11 tombstones");
+        assert_eq!(DUMP_VERSION, 17, "new dumps require the v11 tombstones");
         let old_v11: Vec<Value> = complete_tables(&BTreeMap::new())
             .into_iter()
             .filter(|table| {
@@ -3081,7 +3152,7 @@ mod tests {
             })
             .collect();
         let mut at_v11 = manifest(old_v11);
-        at_v11["version"] = serde_json::json!(11);
+        set_version(&mut at_v11, 11);
         let contents = inspect_bytes(&gzip_lines(&[
             at_v11.clone(),
             serde_json::json!({"kind":"end","rows":0}),
@@ -3117,7 +3188,7 @@ mod tests {
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v16 archive inspects");
+        .expect("complete v17 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -3156,7 +3227,7 @@ mod tests {
             .collect();
         let mut old = manifest(tables);
         for version in 4..=11 {
-            old["version"] = serde_json::json!(version);
+            set_version(&mut old, version);
             let contents = inspect_bytes(&gzip_lines(&[
                 old.clone(),
                 serde_json::json!({"kind":"end","rows":0}),
@@ -3189,18 +3260,18 @@ mod tests {
                 .contains("missing tables: events"));
         }
         let mut v12_gap = old.clone();
-        v12_gap["version"] = serde_json::json!(12);
+        set_version(&mut v12_gap, 12);
         assert!(validate_manifest(&v12_gap)
             .unwrap_err()
             .to_string()
             .contains("admin_api_tokens"));
-        assert_eq!(DUMP_VERSION, 16, "new dumps require the token registry");
+        assert_eq!(DUMP_VERSION, 17, "new dumps require the token registry");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v16 archive inspects");
+        .expect("complete v17 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -3235,7 +3306,7 @@ mod tests {
             .collect();
         let mut old = manifest(tables);
         for version in 4..=12 {
-            old["version"] = serde_json::json!(version);
+            set_version(&mut old, version);
             let contents = inspect_bytes(&gzip_lines(&[
                 old.clone(),
                 serde_json::json!({"kind":"end","rows":0}),
@@ -3266,13 +3337,13 @@ mod tests {
                 .to_string()
                 .contains("missing tables: events"));
         }
-        assert_eq!(DUMP_VERSION, 16, "new dumps require the event voice pair");
+        assert_eq!(DUMP_VERSION, 17, "new dumps require the event voice pair");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v16 archive inspects");
+        .expect("complete v17 archive inspects");
         for name in ["event_voice_channels", "event_voice_presence"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -3296,7 +3367,7 @@ mod tests {
         }).collect();
         let mut old = manifest(tables);
         for version in 4..=12 {
-            old["version"] = serde_json::json!(version);
+            set_version(&mut old, version);
             let contents = inspect_bytes(&gzip_lines(&[
                 old.clone(),
                 serde_json::json!({"kind":"end","rows":0}),
@@ -3329,7 +3400,7 @@ mod tests {
                 .contains("missing tables: events"));
         }
         let mut missing_registry = old;
-        missing_registry["version"] = serde_json::json!(12);
+        set_version(&mut missing_registry, 12);
         missing_registry["tables"]
             .as_array_mut()
             .unwrap()
@@ -3348,17 +3419,24 @@ mod tests {
             .collect();
         assert_eq!(released_without_voice, FROZEN_V12_TABLES);
         assert_eq!(
-            DUMP_VERSION, 16,
+            DUMP_VERSION, 17,
             "new dumps require the v14 starboard tables"
         );
         assert_eq!(
             DUMP_TABLES.len(),
-            108,
-            "released 101 plus three starboard, three giveaway and one event instance table"
+            106,
+            "released 101 minus the two retired tables, plus three starboard, three giveaway and one event instance table"
         );
-        assert_eq!(&DUMP_TABLES[..101], FROZEN_V13_TABLES.as_slice());
+        // The retired pair is excluded from the current inventory but stays
+        // in the frozen v13 list, in its original position.
+        let v13_without_retired: Vec<&str> = FROZEN_V13_TABLES
+            .iter()
+            .copied()
+            .filter(|name| !RETIRED_V16_TABLES.contains(name))
+            .collect();
+        assert_eq!(&DUMP_TABLES[..99], v13_without_retired.as_slice());
         assert_eq!(
-            &DUMP_TABLES[101..],
+            &DUMP_TABLES[99..],
             [
                 "starboard_config",
                 "starboard_starrers",
@@ -3374,7 +3452,7 @@ mod tests {
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v16 archive inspects");
+        .expect("complete v17 archive inspects");
         for name in [
             "starboard_config",
             "starboard_starrers",
@@ -3410,7 +3488,7 @@ mod tests {
             serde_json::json!({"name": name, "columns": [], "column_types": [], "count": 0})
         }).collect();
         let mut old = manifest(tables);
-        old["version"] = serde_json::json!(13);
+        set_version(&mut old, 13);
         let contents = inspect_bytes(&gzip_lines(&[
             old.clone(),
             serde_json::json!({"kind":"end","rows":0}),
@@ -3457,7 +3535,7 @@ mod tests {
             );
         }
         let mut mislabeled = old;
-        mislabeled["version"] = serde_json::json!(14);
+        set_version(&mut mislabeled, 14);
         let error = inspect_bytes(&gzip_lines(&[
             mislabeled,
             serde_json::json!({"kind":"end","rows":0}),
@@ -3566,7 +3644,7 @@ mod tests {
 
     #[test]
     fn v15_archives_read_without_event_instance_windows_but_v16_requires_them() {
-        assert_eq!(DUMP_VERSION, 16, "new dumps require the instance windows");
+        assert_eq!(DUMP_VERSION, 17, "new dumps require the instance windows");
         assert_eq!(V16_ADDED_TABLES.to_vec(), ["event_instance_windows"]);
         // Literal name, not V16_ADDED_TABLES: this reproduces the released v15
         // inventory even if the version waiver is accidentally removed.
@@ -3575,7 +3653,7 @@ mod tests {
             .filter(|table| table["name"] != "event_instance_windows")
             .collect();
         let mut old = manifest(v15_tables);
-        old["version"] = serde_json::json!(15);
+        set_version(&mut old, 15);
         let contents = inspect_bytes(&gzip_lines(&[
             old.clone(),
             serde_json::json!({"kind":"end","rows":0}),
@@ -3600,7 +3678,7 @@ mod tests {
             .contains("missing tables: giveaways"));
         // The same inventory labelled v16 refuses: new archives must carry it.
         let mut mislabeled = old;
-        mislabeled["version"] = serde_json::json!(DUMP_VERSION);
+        set_version(&mut mislabeled, DUMP_VERSION);
         let error = inspect_bytes(&gzip_lines(&[
             mislabeled,
             serde_json::json!({"kind":"end","rows":0}),
@@ -3611,9 +3689,111 @@ mod tests {
     }
 
     #[test]
+    fn retired_command_role_tables_are_frozen_in_v16_and_older_but_absent_from_v17() {
+        assert_eq!(DUMP_VERSION, 17, "the retirement is the v17 bump");
+        assert_eq!(
+            RETIRED_V16_TABLES,
+            ["voice_command_roles", "voice_command_role_members"]
+        );
+        for name in RETIRED_V16_TABLES {
+            assert!(
+                !DUMP_TABLES.contains(name),
+                "{name} must not be in the current inventory"
+            );
+            // Read-side gate still admits the historical names.
+            assert!(is_dump_table(name), "{name} stays readable");
+        }
+        // Frozen released inventories keep the pair; the current one drops it.
+        for frozen in [FROZEN_V12_TABLES.as_slice(), FROZEN_V13_TABLES.as_slice()] {
+            for name in RETIRED_V16_TABLES {
+                assert!(frozen.contains(name), "{name} frozen in released lists");
+            }
+        }
+        // v4..v16 archives still declare it and are read with its rows.
+        let mut over = BTreeMap::new();
+        over.insert("events", (vec!["id", "guild_id"], 1));
+        let mut legacy = manifest(complete_tables(&over));
+        let legacy_columns: [(&str, &[&str]); 2] = [
+            ("voice_command_roles", &["guild_id", "command"]),
+            (
+                "voice_command_role_members",
+                &["guild_id", "command", "role_id"],
+            ),
+        ];
+        for version in 4..=16 {
+            set_version(&mut legacy, version);
+            for (name, columns) in legacy_columns {
+                let table = legacy["tables"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|t| t["name"] == name)
+                    .unwrap();
+                table["columns"] = serde_json::json!(columns);
+                table["column_types"] = serde_json::json!(vec!["text"; columns.len()]);
+                table["count"] = serde_json::json!(1);
+            }
+            let contents = inspect_bytes(&gzip_lines(&[
+                legacy.clone(),
+                serde_json::json!({"kind":"row","table":"events","data":{"id":"1","guild_id":"g"}}),
+                serde_json::json!({"kind":"row","table":"voice_command_roles","data":{"guild_id":"g","command":"lock"}}),
+                serde_json::json!({"kind":"row","table":"voice_command_role_members","data":{"guild_id":"g","command":"lock","role_id":"7"}}),
+                serde_json::json!({"kind":"end","rows":3}),
+            ]))
+            .unwrap_or_else(|e| panic!("v{version} legacy archive must inspect: {e}"));
+            assert_eq!(contents.manifest.version, version);
+            assert_eq!(contents.buffers["voice_command_roles"].len(), 1);
+            assert_eq!(contents.buffers["voice_command_role_members"].len(), 1);
+            // The legacy pair is not part of the current inventory, so it is
+            // not reported as a table the archive "misses".
+            assert!(!contents
+                .manifest
+                .missing_tables()
+                .iter()
+                .any(|n| RETIRED_V16_TABLES.contains(n)));
+            // Frozen v4..v16 inventories still require the pair.
+            for name in RETIRED_V16_TABLES {
+                let mut gap = legacy.clone();
+                gap["tables"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|t| t["name"] != *name);
+                let error = validate_manifest(&gap).unwrap_err().to_string();
+                assert!(error.contains(name), "v{version} requires {name}: {error}");
+            }
+        }
+        // v17 and later archives never declare the retired tables.
+        for name in RETIRED_V16_TABLES {
+            let mut current = manifest(complete_tables(&BTreeMap::new()));
+            current["tables"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "name": name, "columns": [], "column_types": [], "count": 0,
+                }));
+            let error = validate_manifest(&current).unwrap_err().to_string();
+            assert!(error.contains(name) && error.contains("retired"), "{error}");
+        }
+        // A v17 archive without them, and without rows for them, inspects.
+        inspect_bytes(&gzip_lines(&good_dump())).expect("v17 archive without legacy tables");
+    }
+
+    #[test]
+    fn retired_tables_are_not_required_by_frozen_v3() {
+        // v3 predates the legacy pair's coverage: only its first 22 tables.
+        let mut v3 = manifest(complete_tables(&BTreeMap::new()));
+        set_version(&mut v3, 3);
+        v3["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|t| !RETIRED_V16_TABLES.iter().any(|n| t["name"] == *n));
+        validate_manifest(&v3).expect("v3 does not require the retired pair");
+    }
+
+    #[test]
     fn v14_archives_read_without_giveaways_but_v15_requires_them() {
         assert_eq!(
-            DUMP_VERSION, 16,
+            DUMP_VERSION, 17,
             "giveaways follow the released v14 starboard format"
         );
         // Literal names, not V15_ADDED_TABLES: this reproduces the pre-change
@@ -3635,7 +3815,7 @@ mod tests {
         let tables = without_giveaways(complete_tables(&BTreeMap::new()));
         let mut old = manifest(tables);
         for version in 4..=14 {
-            old["version"] = serde_json::json!(version);
+            set_version(&mut old, version);
             let contents = inspect_bytes(&gzip_lines(&[
                 old.clone(),
                 serde_json::json!({"kind":"end","rows":0}),
@@ -3662,7 +3842,7 @@ mod tests {
                 .contains("missing tables: events"));
         }
         let mut v12_registry_gap = old.clone();
-        v12_registry_gap["version"] = serde_json::json!(12);
+        set_version(&mut v12_registry_gap, 12);
         v12_registry_gap["tables"]
             .as_array_mut()
             .unwrap()
@@ -3687,13 +3867,13 @@ mod tests {
             let error = validate_manifest(&v14_gap).unwrap_err().to_string();
             assert!(error.contains(name), "{error}");
         }
-        assert_eq!(DUMP_VERSION, 16, "new dumps require the giveaway tables");
+        assert_eq!(DUMP_VERSION, 17, "new dumps require the giveaway tables");
         let current = manifest(complete_tables(&BTreeMap::new()));
         inspect_bytes(&gzip_lines(&[
             current.clone(),
             serde_json::json!({"kind":"end","rows":0}),
         ]))
-        .expect("complete v16 archive inspects");
+        .expect("complete v17 archive inspects");
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -3734,7 +3914,7 @@ mod tests {
         // lifecycle, message/reaction, stage/interaction/audit), and the v5
         // waiver covers every v6 table.
         let mut v5 = manifest(without(complete_tables(&BTreeMap::new()), "event_store"));
-        v5["version"] = serde_json::json!(5);
+        set_version(&mut v5, 5);
         assert!(
             validate_manifest(&v5).is_ok(),
             "v5 without event_store reads"
@@ -3781,7 +3961,7 @@ mod tests {
         // bump: `validate_manifest` waives newer tables for v5, but the gate
         // must also let a v5 archive reach it.
         let mut v5 = good_dump();
-        v5[0]["version"] = serde_json::json!(5);
+        set_version(&mut v5[0], 5);
         v5[0]["tables"].as_array_mut().unwrap().retain(|t| {
             t.get("name").and_then(Value::as_str) != Some("event_store")
                 && ![
@@ -3840,7 +4020,7 @@ mod tests {
             .to_string()
             .contains("missing tables"));
         let mut incomplete_v4 = legacy;
-        incomplete_v4["version"] = serde_json::json!(4);
+        set_version(&mut incomplete_v4, 4);
         assert!(validate_manifest(&incomplete_v4)
             .unwrap_err()
             .to_string()
@@ -4037,7 +4217,7 @@ mod tests {
         // A v5 manifest legitimately omits event_store, so a row naming it
         // is a row for a real dump table this manifest never declared.
         let mut objs = good_dump();
-        objs[0]["version"] = serde_json::json!(5);
+        set_version(&mut objs[0], 5);
         objs[0]["tables"]
             .as_array_mut()
             .unwrap()
@@ -4160,7 +4340,7 @@ mod tests {
         // The same distinct-column contract applies to typed and legacy rows.
         for strip_types in [false, true] {
             if strip_types {
-                objs[0]["version"] = serde_json::json!(3);
+                set_version(&mut objs[0], 3);
                 for table in objs[0]["tables"].as_array_mut().unwrap() {
                     table.as_object_mut().unwrap().shift_remove("column_types");
                 }
@@ -4201,7 +4381,7 @@ mod tests {
         // Frozen v3 has declared columns but no column_types at all, and its
         // cells are native JSON scalars; parity checks must not refuse it.
         let mut objs = good_dump();
-        objs[0]["version"] = serde_json::json!(3);
+        set_version(&mut objs[0], 3);
         for table in objs[0]["tables"].as_array_mut().unwrap() {
             table.as_object_mut().unwrap().shift_remove("column_types");
         }

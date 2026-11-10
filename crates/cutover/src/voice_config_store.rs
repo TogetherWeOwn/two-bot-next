@@ -10,11 +10,9 @@
 //!
 //! `settings.command_roles` lives in `voice_access_controls.command_roles`,
 //! the column the command gate and `/access` use (0469), so an imported
-//! restriction is enforced and an `/access` restriction is exported. The 0229
-//! `voice_command_roles` tables are legacy and nothing here reads them; apply
-//! still mirrors the imported restrictions into them so the previous binary's
-//! `/export` and `/import` match after a backout, until a contract migration
-//! drops them. `settings.creation_enabled` and `settings.command_role_id`
+//! restriction is enforced and an `/access` restriction is exported. Migration
+//! 0476 removes the legacy per-command mirror; apply writes only the authority.
+//! `settings.creation_enabled` and `settings.command_role_id`
 //! live the same way in `voice_access_controls.room_creation_enabled` and
 //! `required_role_id` (0470) — the spec's creation switch and guild-wide
 //! command role — so an imported switch or role is enforced and an `/access`
@@ -496,13 +494,10 @@ async fn write_settings(
         .as_deref()
         .map(snowflake)
         .transpose()?;
-    for table in [
-        "DELETE FROM voice_command_role_members WHERE guild_id = $1",
-        "DELETE FROM voice_command_roles WHERE guild_id = $1",
-        "DELETE FROM voice_guild_settings WHERE guild_id = $1",
-    ] {
-        sqlx::query(table).bind(guild).execute(&mut **tx).await?;
-    }
+    sqlx::query("DELETE FROM voice_guild_settings WHERE guild_id = $1")
+        .bind(guild)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query(
         "INSERT INTO voice_guild_settings
          (guild_id, creation_enabled, unique_names, no_game_label, force_single_game,
@@ -566,26 +561,6 @@ async fn write_settings(
     .bind(serde_json::to_string(&command_roles).map_err(invalid_argument)?)
     .execute(&mut **tx)
     .await?;
-    // Expand/contract mirror (0469): the previous binary reads the legacy
-    // tables, so a backout keeps showing what was imported here.
-    for (command, roles) in &command_roles {
-        sqlx::query("INSERT INTO voice_command_roles (guild_id, command) VALUES ($1,$2)")
-            .bind(guild)
-            .bind(command)
-            .execute(&mut **tx)
-            .await?;
-        for role in roles {
-            sqlx::query(
-                "INSERT INTO voice_command_role_members (guild_id, command, role_id)
-                 VALUES ($1,$2,$3)",
-            )
-            .bind(guild)
-            .bind(command)
-            .bind(role)
-            .execute(&mut **tx)
-            .await?;
-        }
-    }
     Ok(())
 }
 

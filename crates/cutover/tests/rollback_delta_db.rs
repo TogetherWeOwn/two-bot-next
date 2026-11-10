@@ -254,8 +254,6 @@ async fn delta_counts_are_exact_and_nothing_is_silently_skipped() -> TestResult 
             "voice_logging_mention_members",
             "voice_logging_mention_roles",
             "voice_guild_settings",
-            "voice_command_roles",
-            "voice_command_role_members",
             "voice_logging_settings",
             "voice_access_controls",
         ] {
