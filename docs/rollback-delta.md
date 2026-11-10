@@ -123,7 +123,7 @@ alternate evidence for the voice window.
 ### Replay rule for the voice window
 
 When a `rollback-delta --since T_f` report's only `unmeasurable` entries
-are the thirteen tables above, the watermark-gap trigger does not fire for
+are the eleven tables above, the watermark-gap trigger does not fire for
 lack of disposition: each table is covered either by an accepted reason or
 by the named alternate evidence, which the rollback operator attaches to
 the window record. The trigger still fires on an export-cap refusal (any
