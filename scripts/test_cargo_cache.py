@@ -681,12 +681,13 @@ class CacheTests(unittest.TestCase):
         self.assertTrue((slot / 'lease.json').exists())
         self.assertEqual(list(idle_dir.iterdir()), [])
         child = children[0]
-        # Both leader and descendant hold these pipes. A surviving writer can
-        # accept this command and append another block even if Cargo is dead.
+        # Both leader and descendant hold these pipes. Wait for bounded EOF
+        # before probing stdin: KILL can reap the leader before the writer exits.
+        # A surviving writer fails EOF rather than accepting another append.
+        self.assertEqual(read_reply(child), b'')
         with self.assertRaises(BrokenPipeError):
             child.stdin.write(b'after-stop\n')
             child.stdin.flush()
-        self.assertEqual(read_reply(child), b'')
         self.assertIsNotNone(child.poll(), 'Cargo leader survived budget refusal')
         self.assertEqual(growing.read_bytes(), payload)
         self.assertEqual(growing.stat().st_blocks * 512, allocated)
