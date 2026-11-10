@@ -34,7 +34,10 @@ roadmap honest: presence of a spec is not a commitment.
 
 ## Consequences
 
-- December revisit dates for these items are removed.
+- December revisit dates and early-slot triggers for these items are removed.
+  Each deferred spec's status header now records this 2026-11-10 decision;
+  the superseded 2026-11-01 December and early-slot lines are preserved as
+  history in that header's supersession wording and in git history.
 - If one is commissioned, every gate still applies: security review,
   usability review, database discipline, CI and release approval.
 - Deferred specs stay in the [documentation map](../README.md) as

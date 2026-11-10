@@ -32,8 +32,9 @@ disagree, the live queue wins and this file needs a dated update.
   (#2021). This snapshot does not duplicate it; the approved-vs-proposed
   summary above already names what counts as scope without relying on
   that entry point.
-- M2 state: lockdown preview is implemented, dark and unpublished
-  (planner #1920, executor reads #1925, dark slash #1929); `{args}`
+- M2 state: lockdown preview merged slices are implemented, dark and
+  unpublished (planner #1920, executor reads #1925, dark slash #1929);
+  the confirm/cancel build step #1938 remains open; `{args}`
   build slices merged in #1970/#1974 (spec Status correction open as
   #2002); automod preview slices #1959, #1961–#1965 are open; warning
   history is spec-only. See the current-state plan for the per-item
@@ -68,14 +69,8 @@ disagree, the live queue wins and this file needs a dated update.
 ## How to run the checks
 
 Follow the pre-push checklist in
-[`CONTRIBUTING.md`](../CONTRIBUTING.md#pre-push-checklist). In short:
-
-```sh
-cargo fmt --all -- --check
-python3 scripts/generate_command_reference.py
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
-```
+[`CONTRIBUTING.md`](../CONTRIBUTING.md#pre-push-checklist). That file is
+the authoritative list; this handoff does not reproduce it.
 
 On the persistent controller, run compiling Cargo commands through
 `python3 scripts/cargo_cache.py run -- <check|test|clippy|build> ...`
@@ -106,7 +101,9 @@ Resume the three remaining M2 items once staging recovery lands:
 automod preview (W3) first, then warning history (W4), then `{args}`
 (W5) gated release — re-checking each spec's seams on current `main`
 first, building behind the spec's own gates and staging behavior
-evidence before any merge approval. The lockdown preview is already
-implemented dark; only its publication/activation remains, behind its
-own spec §8 gates. Until then, keep M3 deferred and keep release
+evidence before any merge approval. The lockdown preview's merged slices
+are already implemented dark; publication/activation remains behind its
+own spec §8 gates, and the confirm/cancel build step remains open as
+#1938 (candidate accepts only application-command interactions).
+Until then, keep M3 deferred and keep release
 holds in force.

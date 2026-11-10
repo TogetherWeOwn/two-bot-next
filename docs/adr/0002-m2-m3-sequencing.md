@@ -17,8 +17,11 @@ front of older unfinished risk-reduction work.
 
 ## Decision
 
-- M3 drafts may be built independently, but they may not merge until the
-  M2 work items they follow have merged or been explicitly cut.
+- No M3 PR may merge until all M2 work items W2–W5 have merged or been
+  explicitly cut. This is the binding D1 merge rule and applies to every
+  M3 merge, not only to the M2 items a particular M3 item follows.
+- M3 drafts may be built independently (decision D-2, separate from D1);
+  independent drafting does not relax the D1 merge rule above.
 - Real producer dependencies (a PR that needs another PR's code) stay as
   merge blockers. Merge-order-only edges are replaced by this single
   sequencing rule, so the checkable form is easier to keep honest.
@@ -37,10 +40,10 @@ ad-hoc blockers.
 
 The M2 items are defined by their accepted specifications:
 
-- [Lockdown preview](../lockdown-preview-spec.md)
-- [Automod verdict preview](../automod-preview-spec.md)
-- [Warning history](../warning-history-spec.md)
-- [Custom-command arguments](../custom-command-args-spec.md)
+- W2: [Lockdown preview](../lockdown-preview-spec.md)
+- W3: [Automod verdict preview](../automod-preview-spec.md)
+- W4: [Warning history](../warning-history-spec.md)
+- W5: [Custom-command arguments](../custom-command-args-spec.md)
 
 Inclusion in this list is not proof of implementation or production
 activation; see [plans/current-state-2026-11.md](../plans/current-state-2026-11.md).

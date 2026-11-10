@@ -15,7 +15,7 @@ publication and release gates still apply before any build PR merges.
 
 | Item | Specification | Status of the spec | What remains |
 |---|---|---|---|
-| Lockdown preview | [Lockdown preview](../lockdown-preview-spec.md) | Implemented, dark and unpublished — planner, executor snapshot/roles reads and dark slash with pending store merged (#1920, #1925, #1929) | Publication/activation behind its gates (spec §8). Direct lockdown stays unchanged. |
+| Lockdown preview | [Lockdown preview](../lockdown-preview-spec.md) | Implemented, dark and unpublished — planner, executor snapshot/roles reads and dark slash with pending store merged (#1920, #1925, #1929) | Publication/activation behind its gates (spec §8), plus the open confirm/cancel build step (#1938, open). Direct lockdown stays unchanged. |
 | Automod verdict preview | [Automod verdict preview](../automod-preview-spec.md) | Approved — private staff preview for synthetic input, no moderation effects | Build the dry-run preview command and its rate/audit limits. Not a member-facing oracle. |
 | Warning history | [Warning history](../warning-history-spec.md) | Approved — private, bounded, metadata-only staff read, reasons withheld | Independent history-read gates still open; no historical-data grant follows from acceptance alone. |
 | Custom-command arguments | [Custom-command arguments](../custom-command-args-spec.md) | Built in this stack — one literal, bounded, non-recursive `{args}` substitution with output-safety controls; build slices merged (#1970, #1974) | Gated release. The spec Status line still reads "merges pending"; open #2002 records it shipped. Not a general template language. |
@@ -64,11 +64,13 @@ it does not make a feature active.
 - Before building: re-check the spec's `file:line` seams on current
   `main`; confirm the spec's technical gates and kill rule still hold.
 - Before merging: run the pre-push checks in
-  [`CONTRIBUTING.md`](../../CONTRIBUTING.md#pre-push-checklist) and
-  link the exact-head CI results in the PR body.
+  [`CONTRIBUTING.md`](../../CONTRIBUTING.md#pre-push-checklist), meet
+  the applicable production merge requirements in
+  [`CONTRIBUTING.md`](../../CONTRIBUTING.md#production-merge-evidence)
+  (including Release Manager confirmation on the exact head, even for
+  docs-only changes), and link the exact-head CI results in the PR body.
 - Before activating: stage, exercise the behavior once on staging and
-  attach evidence, and meet the production merge requirements in
-  [`CONTRIBUTING.md`](../../CONTRIBUTING.md#production-merge-evidence).
+  attach evidence.
   Deploy and rollback procedures live in the
   [production deploy runbook](../production-deploy.md) and the
   [operations runbook](../runbook.md); incident and release holds are
