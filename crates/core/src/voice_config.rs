@@ -242,6 +242,35 @@ pub fn validate_time_zone_change(
     ))
 }
 
+/// Import-time rule for `settings.command_role_id`, the guild-wide role gate.
+///
+/// Config import writes `voice_guild_settings.command_role_id`, but every
+/// command gate reads `voice_access_controls.required_role_id` instead
+/// (`PgRoomStore::access_controls`), and `/import` Confirm only rewrites the
+/// former. An imported global role is therefore never enforced: a guild that
+/// sets one believes its commands are gated while a non-admin without the
+/// role still runs them, `/myroom` included.
+///
+/// Refuse the change instead of writing a value that cannot take effect. A
+/// value equal to the one already stored is accepted as is, so a guild whose
+/// earlier configuration carries one can still re-import its own export
+/// (the same escape hatch [`validate_time_zone_change`] uses). Clearing it to
+/// `null` is always allowed. Not part of [`validate_configuration`], which
+/// `/export` also runs, so an existing document stays exportable.
+pub fn validate_command_role_change(
+    previous: &VoiceConfiguration,
+    candidate: &VoiceConfiguration,
+) -> Result<(), VoiceConfigError> {
+    match candidate.settings.command_role_id.as_deref() {
+        None => Ok(()),
+        Some(role) if Some(role) == previous.settings.command_role_id.as_deref() => Ok(()),
+        Some(_) => Err(invalid(
+            "settings.command_role_id",
+            "cannot be imported: this guild-wide role is not enforced by any command gate; set the role gate with /access in Discord",
+        )),
+    }
+}
+
 /// Strict decode only: size cap, an object at the document and every nested
 /// DTO boundary (no positional arrays), no duplicate keys, no trailing data.
 /// It does not validate against an inventory, so callers that must report and
@@ -279,6 +308,44 @@ pub fn export_configuration(
         });
     }
     Ok(compact)
+}
+
+/// Remove role IDs the guild no longer has from `settings.command_roles`
+/// and return how many went. `/access restrict` stores live role IDs and
+/// nothing prunes them when Discord deletes a role, so without this `/export`
+/// would refuse the whole guild. Enforcement is unchanged: nobody holds a
+/// deleted role, and a restriction left with no roles still denies every
+/// non-admin, which is what it did before.
+///
+/// Prunes nothing unless the inventory holds the guild's `@everyone` role
+/// (its ID is the guild ID), which Discord always sends with the full role
+/// list. Without it the role cache is not loaded and an absent role may be
+/// live, so export keeps refusing rather than writing a backup that would
+/// drop a live role on re-import.
+///
+/// The inventory is a snapshot taken when the `/export` interaction arrived,
+/// before the configuration is read. A role created after that snapshot and
+/// saved by `/access` in between is absent yet live, so only roles whose
+/// snowflake predates `snapshot_id` (the interaction ID) are pruned. A newer
+/// absent role, or one that is not a snowflake, is kept, and export refuses.
+pub fn drop_deleted_command_roles(
+    config: &mut VoiceConfiguration,
+    inventory: &GuildInventory,
+    snapshot_id: u64,
+) -> usize {
+    if inventory.roles.get(&inventory.guild_id) != Some(&inventory.guild_id) {
+        return 0;
+    }
+    let mut dropped = 0;
+    for restriction in &mut config.settings.command_roles {
+        let before = restriction.role_ids.len();
+        restriction.role_ids.retain(|role| {
+            inventory.roles.get(role) == Some(&inventory.guild_id)
+                || !role.parse::<u64>().is_ok_and(|id| id < snapshot_id)
+        });
+        dropped += before - restriction.role_ids.len();
+    }
+    dropped
 }
 
 pub fn validate_configuration(
@@ -425,6 +492,9 @@ pub fn validate_configuration(
     let mut commands = BTreeSet::new();
     for (i, restriction) in settings.command_roles.iter().enumerate() {
         let path = format!("settings.command_roles[{i}]");
+        // Config import writes voice_command_roles, not the live access-policy
+        // store. Only names from the restrictable vocabulary (`VOICE_COMMANDS`)
+        // may be imported; `myroom` is not in it and refuses here.
         if !is_voice_command(&restriction.command) {
             return Err(invalid(
                 &format!("{path}.command"),

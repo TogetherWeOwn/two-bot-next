@@ -1,21 +1,73 @@
 #!/usr/bin/env python3
 """Explicitly generate the ignored command reference, never tracked configuration.
 
-Run before workspace tests or all-targets Clippy. Use --controller for bounded
-Cargo admission; Paperclip runs select it automatically. Successful stdout is
+Run before workspace tests or all-targets Clippy. Use --controller (or
+TWO_CARGO_CONTROLLER=1) for bounded Cargo admission on the persistent
+controller; the bounded pool policy also selects it implicitly there, while
+hosted CI keeps running plain cargo. Successful stdout is
 command_reference.v1 JSON. Generation and the read-only reference_docs check
 are separate operations: this command does not replace that check.
 """
 
 import argparse
+import errno
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = "generate_command_reference"
+
+# Bounded-pool policy path shared with scripts/cargo_cache.py (DEFAULT_POOL).
+# Present only on the persistent controller; hosted CI runners are ephemeral
+# and never carry it.
+BOUNDED_POOL_POLICY = Path("/paperclip/.cache/two-bot-next-bounded/policy.json")
+
+# Lookup failures that mean "no policy here", as opposed to a broken lookup.
+# Only ENOENT: any other OSError (EACCES, ELOOP, ENOTDIR, ...) must fail
+# closed rather than silently fall back to plain cargo.
+_POLICY_ABSENT = (errno.ENOENT,)
+
+
+def bounded_pool_present():
+    """True when the controller's bounded Cargo pool policy exists.
+
+    Raises OSError when the lookup itself fails, so the caller fails closed
+    instead of silently falling back to plain cargo. Probes with stat()
+    directly: Path.is_file() swallows ELOOP and ENOTDIR into False, which
+    would select plain cargo on a broken lookup.
+    """
+    try:
+        mode = BOUNDED_POOL_POLICY.stat().st_mode
+    except OSError as exc:
+        if exc.errno in _POLICY_ABSENT:
+            return False
+        raise
+    if not stat.S_ISREG(mode):
+        raise OSError(errno.EINVAL, os.strerror(errno.EINVAL),
+                      str(BOUNDED_POOL_POLICY))
+    return True
+
+
+def controller_selected(explicit_flag):
+    """True when the generator build must go through bounded Cargo admission.
+
+    An explicit --controller flag or TWO_CARGO_CONTROLLER=1 always wins, and
+    TWO_CARGO_CONTROLLER=0 opts out unless --controller is passed. Otherwise
+    the bounded pool policy selects controller mode implicitly, except on
+    hosted CI (GITHUB_ACTIONS), which keeps running plain cargo.
+    """
+    forced = os.environ.get("TWO_CARGO_CONTROLLER")
+    if explicit_flag or forced == "1":
+        return True
+    if forced == "0":
+        return False
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        return False
+    return bounded_pool_present()
 
 
 def error(code, next_action, retryable=False):
@@ -66,7 +118,15 @@ def main(argv=None):
     parser.add_argument("--verify-lifecycle", action="store_true",
                         help="also run independent real-binary mutation tests in an isolated fixture")
     args = parser.parse_args(argv)
-    controller = args.controller or bool(os.environ.get("PAPERCLIP_RUN_ID"))
+    # PAPERCLIP_RUN_ID alone never selects controller mode: other agent
+    # runtimes set it but have no bounded cache pool.
+    try:
+        controller = controller_selected(args.controller)
+    except OSError:
+        error("controller_policy_unreadable",
+              "Fix the pool policy permissions, or set TWO_CARGO_CONTROLLER "
+              "explicitly; refusing to fall back to plain cargo.")
+        return 1
     cargo = ([sys.executable, str(ROOT / "scripts/cargo_cache.py"), "run", "--"]
              if controller else ["cargo"])
     executable, status = build_executable(

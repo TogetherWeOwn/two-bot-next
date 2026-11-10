@@ -1,10 +1,11 @@
 # Ticket transcript delivery to the opener
 
-Status: **Proposed; design only**. Written 2026-10-26; intent review **not
-before 2026-11-02**. This indexed repository file is the editable contract;
-the task spec records its exact commit and SHA-256. Merge publishes a proposal,
-not permission to build, export content or enable DMs. No code, migrations,
-close-mechanics changes, live reads, new service, spend or activation here.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-26. This indexed repository file is the editable contract; the task spec
+records its exact commit and SHA-256. Merge publishes a proposal, not permission
+to build, export content or enable DMs. No code, migrations, close-mechanics
+changes, live reads, new service, spend or activation here.
 
 ## 1. Decision, alternatives and prior boundary
 
@@ -401,7 +402,7 @@ if one cannot fit, split it again without dropping its controls. None created he
 
 All new behavior stays dark until schema/provenance/erasure, private UX, dispatch
 and fallback are jointly verified; partially merged foundations grant no reads.
-Ordinary CI, independent Paperclip Review and per-builder CISO gates still apply.
+Ordinary CI, CodeRabbit, Devin Review and per-builder CISO gates still apply.
 Staging fixtures only, never real production tickets. Future auto-close work owns
 its lifecycle; no timer or warning becomes a transcript-delivery grant here.
 

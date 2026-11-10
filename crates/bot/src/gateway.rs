@@ -250,7 +250,70 @@ struct LiveInteraction {
     generation: u64,
 }
 
-type LiveInteractions = Arc<std::sync::Mutex<HashMap<i64, LiveInteraction>>>;
+// Upper bound on committed interactions awaiting a worker claim. Claims
+// queue behind `ONBOARDING_WORKER_LIMIT` workers (90 s each), so a sustained
+// burst would otherwise grow the map without limit. An evicted entry is not
+// lost: its claim falls back to the durable `OnboardingJob::recover` path.
+const LIVE_INTERACTION_CAP: usize = 1024;
+
+/// Arrival-ordered live-interaction cache: at most `LIVE_INTERACTION_CAP`
+/// entries, evicting the oldest arrival on insert. Eviction drops the
+/// interaction and its ACK ticket receiver.
+#[derive(Default)]
+struct LiveCache {
+    entries: HashMap<i64, LiveInteraction>,
+    arrival: std::collections::VecDeque<i64>,
+    evicted: u64,
+}
+
+impl LiveCache {
+    fn insert(&mut self, id: i64, live: LiveInteraction) -> Option<LiveInteraction> {
+        let replaced = self.remove(&id);
+        while self.entries.len() >= LIVE_INTERACTION_CAP {
+            let Some(oldest) = self.arrival.pop_front() else {
+                break;
+            };
+            if self.entries.remove(&oldest).is_some() {
+                self.evicted += 1;
+                tracing::warn!(
+                    event = "live_interaction_evicted",
+                    job_id = oldest,
+                    cap = LIVE_INTERACTION_CAP,
+                    evicted_total = self.evicted,
+                    "live interaction cache full; evicted the oldest, its claim recovers from the durable job"
+                );
+            }
+        }
+        self.arrival.push_back(id);
+        self.entries.insert(id, live);
+        replaced
+    }
+
+    fn remove(&mut self, id: &i64) -> Option<LiveInteraction> {
+        let live = self.entries.remove(id)?;
+        if let Some(position) = self.arrival.iter().position(|queued| queued == id) {
+            self.arrival.remove(position);
+        }
+        Some(live)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, id: &i64) -> bool {
+        self.entries.contains_key(id)
+    }
+}
+
+type LiveInteractions = Arc<std::sync::Mutex<LiveCache>>;
 
 async fn generation_changed(generation: &AtomicU64, wake: &tokio::sync::Notify, expected: u64) {
     loop {
@@ -1733,7 +1796,22 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                     Some(permit) => {
                                         let interaction = interaction.0.clone();
                                         let runtime = Arc::clone(runtime);
-                                        let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction).await });
+                                        // Per-invocation live announcements bit for the
+                                        // ordered RSVP path (self-role per-dispatch
+                                        // pattern): a stored `0` refuses RSVP commands
+                                        // with the disabled reply before any defer.
+                                        // The runtime's installed test source wins;
+                                        // production reads the poller snapshot.
+                                        let guild = interaction.guild_id.map(|id| id.get().to_string()).unwrap_or_default();
+                                        let boot = runtime.router.gates().announcements;
+                                        let live = runtime
+                                            .live_settings_override()
+                                            .or_else(crate::settings_jobs::live);
+                                        let announcements_live =
+                                            crate::feed_jobs::live_announcements_with(
+                                                &guild, boot, live.as_ref(),
+                                            );
+                                        let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction, announcements_live).await });
                                         // Track owned acknowledgement work so the bounded
                                         // completion policy can cancel it on timeout or
                                         // shard cancellation instead of detaching it.
@@ -2310,11 +2388,15 @@ pub async fn build_persistent_pipeline(
     guild_id: Snowflake,
     token: String,
     leveling: Option<LevelingRuntime>,
+    cache: Arc<twilight_cache_inmemory::DefaultInMemoryCache>,
 ) -> Result<GatewayPipeline<HttpInvites>, sqlx::Error> {
     tokio::time::timeout(CHECKPOINT_IO_MAX, async {
         let buffer = GatewayFunnelBuffer::from_milestones(store.milestones().await?);
         buffer.seed_snapshots(guild_id, store.invite_snapshots().await?);
-        Ok(OrderedLevelingPipeline::with_snapshots(
+        // The shared gateway cache: the same handle the internal-actions
+        // receiver projects `voice.snapshot` from, so the read sees the live
+        // voice states this pipeline feeds.
+        Ok(OrderedLevelingPipeline::with_shared_cache(
             buffer.clone(),
             leveling,
             HttpInvites {
@@ -2322,6 +2404,7 @@ pub async fn build_persistent_pipeline(
                 handle: tokio::runtime::Handle::current(),
             },
             buffer,
+            cache,
         ))
     })
     .await
@@ -2335,10 +2418,15 @@ pub async fn build_persistent_pipeline(
 /// Anything missing — or any construction failure — degrades to voice-off
 /// with a warn; the gateway and /readyz keep working. Secrets never appear
 /// in the logs.
+///
+/// The returned handle is the game-activity flush loop. The caller latches
+/// `drained` once the gateway task has joined, so no producer is left, and
+/// then joins the handle so the trailing flush finishes before exit.
 pub async fn build_voice_runtime(
     config: &Config,
     voice_enabled: bool,
-) -> Option<Arc<dyn VoiceEventSink>> {
+    drained: tokio::sync::watch::Receiver<bool>,
+) -> Option<(Arc<dyn VoiceEventSink>, tokio::task::JoinHandle<()>)> {
     if !voice_enabled {
         return None;
     }
@@ -2384,14 +2472,16 @@ pub async fn build_voice_runtime(
         Ok(runtime) => {
             info!("voice rooms enabled; gateway sink attached");
             // Hourly guild-aggregate persist for the game-activity collector
-            // fed by the presence/voice frames below. Detached: each tick
-            // persists at most once per interval, so a deploy boundary drops
-            // at worst the current partial interval, never double-counts.
-            tokio::spawn(two_bot::voice_rooms::game_activity::flush_loop(
+            // fed by the presence/voice frames below. The caller latches
+            // `drained` after the gateway joins; the loop then runs one
+            // trailing flush of the buffered partial interval, never
+            // double-counting.
+            let flush = tokio::spawn(two_bot::voice_rooms::game_activity::flush_loop(
                 db.pool().clone(),
                 runtime.runtime().game_activity_collector().clone(),
+                drained,
             ));
-            Some(Arc::new(runtime))
+            Some((Arc::new(runtime), flush))
         }
         Err(err) => {
             warn!(error = %err, "voice HTTP setup failed; voice rooms disabled");
@@ -3163,22 +3253,92 @@ mod tests {
         }
     }
 
+    fn live_entry() -> (LiveInteraction, tokio::sync::oneshot::Sender<bool>) {
+        let interaction: twilight_model::application::interaction::Interaction =
+            serde_json::from_value(serde_json::json!({
+                "id": "9", "application_id": "1111", "type": 2,
+                "token": "synthetic-interaction-token", "version": 1,
+                "guild_id": "22",
+                "channel": {"id": "4444", "type": 0, "name": "commands"},
+                "authorizing_integration_owners": {"0": "22"}, "entitlements": [],
+                "member": {
+                    "permissions": "0", "roles": [], "joined_at": null,
+                    "deaf": false, "mute": false, "flags": 0,
+                    "user": {"id": "3333", "username": "tester",
+                             "discriminator": "0000", "avatar": null}
+                },
+                "data": {"id": "5555", "name": "fixture", "type": 1, "options": []}
+            }))
+            .expect("synthetic interaction");
+        let (sender, ticket) = tokio::sync::oneshot::channel();
+        (
+            LiveInteraction {
+                interaction: Box::new(interaction),
+                ticket,
+                generation: 1,
+            },
+            sender,
+        )
+    }
+
+    #[test]
+    fn live_cache_evicts_oldest_arrival_once_past_the_cap() {
+        let mut cache = LiveCache::default();
+        let mut tickets = Vec::new();
+        for id in 0..=LIVE_INTERACTION_CAP as i64 {
+            let (live, sender) = live_entry();
+            cache.insert(id, live);
+            tickets.push(sender);
+        }
+        assert_eq!(cache.len(), LIVE_INTERACTION_CAP);
+        assert!(!cache.contains_key(&0), "oldest arrival must be evicted");
+        assert!(cache.contains_key(&1) && cache.contains_key(&(LIVE_INTERACTION_CAP as i64)));
+        assert!(
+            tickets.remove(0).send(true).is_err(),
+            "evicted ticket freed"
+        );
+        // A claim frees its slot, so the next insert evicts nothing.
+        assert!(cache.remove(&1).is_some());
+        let (live, _sender) = live_entry();
+        cache.insert(-1, live);
+        assert_eq!(cache.len(), LIVE_INTERACTION_CAP);
+        assert!(cache.contains_key(&2));
+        // Re-inserting an id replaces it instead of consuming a second slot.
+        let (live, _sender) = live_entry();
+        assert!(cache.insert(2, live).is_some());
+        assert_eq!(cache.len(), LIVE_INTERACTION_CAP);
+        assert_eq!(cache.arrival.len(), LIVE_INTERACTION_CAP);
+        assert!(!cache.is_empty());
+    }
+
     #[tokio::test]
     async fn voice_runtime_off_without_gate() {
         let config = voice_config(Some("token"), Some("postgres://localhost/unused"));
-        assert!(build_voice_runtime(&config, false).await.is_none());
+        assert!(
+            build_voice_runtime(&config, false, tokio::sync::watch::channel(false).1)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn voice_runtime_off_without_token() {
         let config = voice_config(None, Some("postgres://localhost/unused"));
-        assert!(build_voice_runtime(&config, true).await.is_none());
+        assert!(
+            build_voice_runtime(&config, true, tokio::sync::watch::channel(false).1)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn voice_runtime_off_without_database() {
         let config = voice_config(Some("token"), None);
-        assert!(build_voice_runtime(&config, true).await.is_none());
+        assert!(
+            build_voice_runtime(&config, true, tokio::sync::watch::channel(false).1)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3209,7 +3369,11 @@ mod tests {
         // remain useful without exposing the rejected credential-bearing value.
         let url = "fixture-invalid-scheme://fixture-user:fixture-db-password@agent-testdb/db";
         let config = voice_config(Some("fixture-discord-token"), Some(url));
-        assert!(build_voice_runtime(&config, true).await.is_none());
+        assert!(
+            build_voice_runtime(&config, true, tokio::sync::watch::channel(false).1)
+                .await
+                .is_none()
+        );
         let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert!(output.contains("voice database unavailable; voice rooms disabled"));
         for secret in [

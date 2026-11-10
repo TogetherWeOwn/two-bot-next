@@ -1,0 +1,227 @@
+name: help-embed-synthetic
+
+# Live staging /help embed smoke (docs/staging-help-embed-smoke.md): the
+# dedicated staging test bot posts the exact embeds the two help builders
+# produce to a staging test channel and scripts/staging_help_embed_smoke.py
+# asserts the brand colour, footer text and footer icon URL on the
+# read-back, then deletes both messages, so no human Discord client is
+# needed to prove a rendered message carries the brand. Payloads come from
+# the reviewed Rust builders (help_embed_smoke_payloads example), never
+# from a Python copy. Staging only; the script refuses any other guild, a
+# product-bot token, or a bot that lives anywhere else.
+#
+# When it runs:
+#   - after every deploy-staging (called from deploy-staging.yml, so a
+#     failing smoke fails the staging deploy and certify-promotion);
+#   - by hand.
+# No schedule: deploys are the drift surface, and each run builds the
+# payload example. On pull requests only the offline suites run: a PR's
+# code is not on staging yet.
+#
+# Its bindings are the existing `voice-synthetic` environment secret
+# TWO_VOICE_SYNTHETIC_BOT_TOKEN (the dedicated test bot's token; the
+# staging product bot's token never enters GitHub, by the recorded
+# decision in docs/staging-slash-smoke.md) and the repository variables
+# DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID and HELP_EMBED_SYNTHETIC_REQUIRED.
+# While unconfigured the run notice-passes so provisioning can land after
+# the code; once the operator sets HELP_EMBED_SYNTHETIC_REQUIRED to `true`,
+# a missing binding fails closed and an unconfigured gate cannot read green.
+on:
+  workflow_call:
+    # The test token crosses the boundary by name. The control token stays in
+    # the separate staging-environment job and never enters the consumer.
+    inputs:
+      staging_use_expires_at:
+        type: string
+        required: true
+      staging_use_sha:
+        type: string
+        required: true
+      staging_use_deployment:
+        type: string
+        required: true
+    secrets:
+      TWO_VOICE_SYNTHETIC_BOT_TOKEN:
+        required: false
+      # The caller must pass this name for the staging Environment to resolve
+      # it in the authorization job; the consumer never references it.
+      STAGING_OWNERSHIP_CONTROL_TOKEN:
+        required: true
+  workflow_dispatch:
+
+permissions: {}
+
+# Standalone owns the global window; a called run must never wait on its
+# parent's lock. Inputs are workflow_call-only and come from deploy outputs.
+concurrency:
+  group: ${{ inputs.staging_use_expires_at != '' && format('staging-help-consumer-{0}', github.run_id) || 'staging-lifecycle' }}
+  cancel-in-progress: false
+
+jobs:
+  staging-window:
+    name: authorize staging use before the consumer
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    environment: staging
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'staging-window') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 8
+    outputs:
+      expires_at: ${{ steps.begin.outputs.expires_at }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Acquire a finite standalone window and prove readiness
+        id: begin
+        if: inputs.staging_use_expires_at == ''
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_MINUTES: '45'
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use.jsonl
+        run: node wrangler/scripts/staging-use-pipeline.mjs begin
+      - name: Assert the caller's exact window and readiness
+        if: inputs.staging_use_expires_at != ''
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_SHA: ${{ inputs.staging_use_sha }}
+          STAGING_USE_DEPLOYMENT: ${{ inputs.staging_use_deployment }}
+          STAGING_USE_EXPIRES_AT: ${{ inputs.staging_use_expires_at }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use.jsonl
+        run: node wrangler/scripts/staging-use.mjs ready
+      - name: Retain the acquisition or assertion receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-use-help-start-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-use.jsonl
+          if-no-files-found: error
+          retention-days: 14
+
+  # Called runs never release the parent's grant. The workflow lock covers
+  # standalone begin, consumer and cleanup; native expiry covers runner loss.
+  staging-use-release:
+    needs: [staging-window, help-embed-smoke]
+    if: inputs.staging_use_expires_at == '' && always() && github.ref == 'refs/heads/main' && needs.staging-window.outputs.expires_at != ''
+    permissions:
+      contents: read
+    environment: staging
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'staging-use-release') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Release only this standalone run's window
+        if: inputs.staging_use_expires_at == ''
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.staging-window.outputs.expires_at }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-release.jsonl
+        run: node wrangler/scripts/staging-use-pipeline.mjs finish
+      - name: Retain the cleanup receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-use-help-stop-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-use-release.jsonl
+          if-no-files-found: error
+          retention-days: 14
+
+  help-embed-smoke:
+    name: staging help embed smoke
+    needs: staging-window
+    permissions:
+      contents: read
+    if: github.ref == 'refs/heads/main'
+    environment: voice-synthetic
+    # Runner routing: see the note on `check` in check.yml.
+    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'help-embed-smoke') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      # Binding gate first: while unconfigured (and not required) the run
+      # notice-passes here, before any toolchain or cargo step can fail the
+      # optional job and block certify-promotion. This step sees only
+      # whether the token secret is set, never its value.
+      - name: Decide whether the smoke is configured
+        id: gate
+        env:
+          HAS_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN != '' }}
+          DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID: ${{ vars.DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID }}
+          HELP_EMBED_SYNTHETIC_REQUIRED: ${{ vars.HELP_EMBED_SYNTHETIC_REQUIRED }}
+        run: |
+          set -euo pipefail
+          if [ "${HAS_TOKEN}" != "true" ] || [ -z "${DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID:-}" ]; then
+            if [ "${HELP_EMBED_SYNTHETIC_REQUIRED:-false}" = "true" ]; then
+              echo "::error::help embed smoke bindings missing and the gate is required (set HELP_EMBED_SYNTHETIC_REQUIRED=false to opt out)"
+              exit 1
+            fi
+            echo "::notice::help embed smoke not configured yet (no test bot token or test channel); see docs/staging-help-embed-smoke.md"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+      - name: Install pinned Rust toolchain
+        if: steps.gate.outputs.configured == 'true'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
+        with:
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+      - name: Generate the help embed payloads from the Rust builders
+        if: steps.gate.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          cargo run --locked -p two-bot-discord --example help_embed_smoke_payloads -- "$RUNNER_TEMP/help-embed-payloads.json"
+          test -s "$RUNNER_TEMP/help-embed-payloads.json"
+      - name: Run the staging help embed smoke
+        if: steps.gate.outputs.configured == 'true'
+        env:
+          TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
+          DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID: ${{ vars.DISCORD_STAGING_HELP_SMOKE_CHANNEL_ID }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Two retries absorb a transient Discord REST hiccup; three
+          # failures fail the run. Exit 3 means a cleanup delete failed and
+          # a message may remain in the test channel: fail at once, because
+          # a later clean attempt must never read green over it.
+          for attempt in 1 2 3; do
+            status=0
+            python3 scripts/staging_help_embed_smoke.py \
+                --payloads "$RUNNER_TEMP/help-embed-payloads.json" \
+                --evidence "help-embed-synthetic-$RUN_ID-$attempt.json" || status=$?
+            if [ "$status" = 0 ]; then
+              exit 0
+            fi
+            if [ "$status" = 3 ]; then
+              echo "::error::help embed smoke cleanup failed on attempt $attempt; not retrying (see the evidence artifact)"
+              exit 1
+            fi
+            echo "::warning::help embed smoke attempt $attempt failed"
+            [ "$attempt" = 3 ] || sleep 60
+          done
+          exit 1
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: help-embed-synthetic-${{ github.run_id }}
+          path: help-embed-synthetic-${{ github.run_id }}-*.json
+          if-no-files-found: ignore
+          retention-days: 14

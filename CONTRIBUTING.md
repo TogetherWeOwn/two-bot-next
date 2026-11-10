@@ -44,6 +44,8 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
 The rulesets on `main` require one PR and squash-only merges, and block deletion
 and force-pushes. `ci-ok`, `gitleaks` and `pr-lint` are required checks on `main`.
 `ci-ok` runs from `check.yml`; the other two run from `supply-chain.yml`.
+The review apps CodeRabbit and Devin Review are required checks too. No approving
+review is required.
 `pr-lint` runs `.github/scripts/pr_standards.py` (tests beside it): it checks
 the title format, the 100-character limit, the trailing period and a non-empty
 body as errors, and the two required template sections (Linked Issues and
@@ -52,6 +54,61 @@ Verification), the advisory title/body remainder and branch names in warn mode
 instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
+
+### Production merge evidence
+
+The final-stage reviewer squash-merges the exact reviewed head after all required
+checks pass and every review finding is fixed or answered with evidence. The
+author merges only when there is no review stage. Pin the merge to that head SHA;
+record the squash SHA and the release decision in the release log.
+
+`main` reaches production through staging and automatic promotion. A path ignored
+by `deploy-staging.yml` does not exempt a merge from production safeguards: even a
+docs-only PR needs a fresh, per-PR Release Manager `request_confirmation` on its
+exact head before merge. A manual production dispatch or rollback needs its own
+Release Manager confirmation too.
+
+Exact-head staging qualification remains the default. The artifact-identical
+rule (owner decision 2026-11-05) removes only that staging prerequisite, and only
+when **all** of the following hold:
+
+1. **Qualifying actual diff.** Every change is only tests (`test/`, `e2e/`,
+   `*.test.*`, fixtures), documentation (`docs/`, `*.md`), or CI unrelated to
+   build, deploy, release or promotion. Inspect content, not just paths or PR
+   labels. Deploy/release workflows, Wrangler/Worker configuration, Dockerfiles,
+   migrations, package manifests and lockfiles are excluded, even under an
+   otherwise qualifying path. Any runtime, dependency or deployment change is
+   outside this rule.
+2. **Byte-identical production artifacts.** Compare the complete production build
+   artifacts for the exact PR head and current `main`, using the existing
+   production build and artifact definitions. Record both full head SHAs, both
+   bundle/image hashes, and evidence identifying the compared artifacts on the
+   confirmation card. For multiple deployed components, record the paired hashes
+   for each: this bot's container image and Worker bundle must both be covered,
+   including all deployed assets and image metadata. An identical source tree,
+   file label, PR title, isolated Rust binary, or partial build output is not
+   artifact proof. Do not strip provenance stamps to manufacture equality.
+3. **Exact-head gates pass.** Required CI and Devin Review pass on that same PR
+   head, and all review findings are fixed or answered with evidence.
+
+The Release Manager verifies the classification and records it with both SHAs
+and both hashes (per deployed component) in each decision. Missing/incomplete
+proof, any hash mismatch, or a non-qualifying diff retains the full exact-head
+staging requirement. Supply the normal staging/e2e evidence in that case; in
+either case retain the migration ledger entry (or `no migration`) and rollback
+target with the decision.
+
+This rule waives no required check, review gate or red deterministic gate. Keep
+incident, freeze and hold safeguards, identity/capability holds, exact-head
+per-PR confirmation, SHA-pinned squash merge and release-log recording. Any new
+PR head needs fresh review/check evidence and a new Release Manager confirmation;
+if the `main` comparison SHA changes, revalidate the artifact comparison before
+merge. Previously rejected requests remain historical rejections, not approvals:
+qualifying candidates must supply hashes and be freshly submitted. This policy
+authorizes no pipeline skip/no-op implementation, deployment or other production
+action. On owner revocation, revert this documented rule through normal gates.
+
+### CI lanes
 
 `check.yml` runs its Rust work as parallel lanes that all start once `job-inputs`
 finishes: `check` (lint: offline guards, cargo-deny, fmt, clippy), `rust tests`
@@ -87,6 +144,57 @@ can cause component-install conflicts before fmt runs. The offline workflow
 policy suite pins all ten installers to the repository version; bump them and
 the toolchain and builder-image pins together.
 
+### Nightly test partitions
+
+`nightly.yml` retains its wiring-change PR selector and event timeout allow-list:
+45 minutes per heavy PR job (also the fallback for any other event), 180 minutes
+only for schedule/manual runs. Do not raise the PR cap to accommodate workload.
+The original serial all-feature workload is split into:
+
+- `sweep-plan`: generate the command reference, compile Cargo's default workspace
+  test selection (`--no-run`, including ordinary examples), and discover each
+  libtest target's original runnable inventory with the existing substring skips.
+- `sweep-partition`: six deterministic partitions, at most two in parallel. Each
+  re-discovers the same workspace/feature inventory and executes exact subsets
+  within binaries, including the bot binary, with one test thread per disposable
+  database. Duplicate names in different targets are separate identities. Unknown,
+  missing, duplicated or empty expected execution fails rather than passing.
+- `sweep-guarded`: the original guarded-URL routes and dedicated backup proofs,
+  including the CLI build and scratch prerequisites, still executed serially.
+- `sweep-docs`: workspace doctests with the plan's original include-ignored/skip
+  semantics, followed by `cargo doc --workspace --all-features --no-deps --locked`
+  under `RUSTDOCFLAGS=-D warnings`.
+
+The `nightly ignored tests and docs` aggregate requires the selector, plan, all six
+partitions, guarded suites/backups and docs. It compares exact-source-SHA receipts
+against the complete/disjoint plan; a failed, cancelled, missing or skipped
+selected job cannot pass. Matrix fail-fast is disabled. Plan and receipts are
+seven-day run artifacts, not executable build downloads. Artifact names are stable
+within one workflow run so failed-job reruns can reuse successful producers;
+rerun producers replace their own artifact, and SHA/plan-digest checks still apply.
+Native test processes
+retain their package working directory; the partition helper does not use
+nextest's per-test process isolation or llvm-cov's failure-tolerance flags.
+Each invocation uses a fresh libtest `--logfile` for exact status/name evidence,
+independent of inherited child stdout/stderr. Console diagnostic bytes still stream
+unchanged, including non-UTF-8 output. Only the closing harness summary supplies
+summary/count evidence; earlier summary-looking child lines are diagnostics.
+The successful closing summary/counts and process exit remain mandatory.
+Missing, empty, duplicate, failed, ignored or unknown result records fail closed.
+The pinned Rust 1.99.1 supports this deprecated flag; recheck its protocol when
+upgrading the toolchain rather than falling back to parsing mixed console output.
+
+Verify a change with an actual executing `pull_request` run on its exact head,
+record each heavy job's time and headroom, and aim for at most 35 minutes per
+leg. Test counts are not a runtime guarantee. Rebalance only from measured
+results; a skipped job or a 180-minute manual pass is not PR-cap evidence.
+Offline contracts run in the existing source-level CI suite:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_nightly_partition*.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
+```
+
 ### Pull-request size labels (advisory)
 
 `.github/workflows/pr-size.yml` labels every pull request `size/S` (up to 100
@@ -108,25 +216,39 @@ Use an issue form: bug report, feature request, enhancement or documentation
 issue. Blank issues are off. Report a vulnerability privately; see
 [`SECURITY.md`](SECURITY.md).
 
+### Design-only specs
+
+A new design-only spec under `docs/` needs a linked tracking card or issue that
+names the date the owner will decide it. Say so in the PR body. The spec's
+`Status:` line then records the decision: accepted for a milestone, deferred to
+a month or a roadmap, declined (no build), or merged into another spec. A spec
+with no decision stays no-build. Keep a declined spec as the record.
+
 ## Releases
 
-The daily `daily-digest` workflow tags the live production commit `vYYYY.MM.DD`
-when production has moved forward since the last digest, and publishes a GitHub
-Release from Conventional Commit subjects. Deploys never create version tags.
+The daily `daily-digest` workflow tags the live production commit with a
+stable CalVer version `vYYYY.MDD.P` (for example `v2026.1101.0`) when
+production has moved forward since the last digest, and publishes a GitHub
+Release from Conventional Commit subjects. The shared releaser in
+`TogetherWeOwn/.github` (`actions/calver`, `live-digest` policy) cuts it, at
+most once a day, so `P` stays 0. Deploys never create version tags.
 There is no release PR or freeze. One digest tag covers the whole repository,
-not one release per crate. See [`docs/releases.md`](docs/releases.md) for repair
-and dry-run dispatches. Never tag or release by hand.
+not one release per crate. Legacy `vYYYY.MM.DD` and `vX.Y.Z` tags stay as they
+are. See [`docs/releases.md`](docs/releases.md) for repair and dry-run
+dispatches. Never tag or release by hand.
 
 Release notes use the [Common Changelog](https://common-changelog.org/)
 categories, in its order: **Changed** (`perf`, `revert`), **Added** (`feat`),
-**Fixed** (`fix`). `chore`, `docs`, `test`, `ci`, `build`, `refactor` and
-`style` stay out of the notes. Each squash-merged PR title becomes one
+**Fixed** (`fix`, `security`). The digest adapter passes the
+`changelog-sections` from `release-please-config.json` to the shared
+releaser; `chore`, `docs`, `test`, `ci`, `build`, `refactor`, `style` and
+`deps` stay out of the notes. Each squash-merged PR title becomes one
 entry, so write it for a reader of the release notes: imperative mood, one
 user-facing change.
 
-Release tags use UTC calendar dates. Cargo package versions stay at `0.4.0`;
-`feat!` and `BREAKING CHANGE` still appear in the breaking-changes notes but
-no longer choose a SemVer bump.
+Release tags use the UTC date the release was planned. Cargo package versions
+stay at `0.4.0`; `feat!` and `BREAKING CHANGE` still appear in the
+breaking-changes notes but never choose a version bump.
 
 ## Local development
 
@@ -141,8 +263,10 @@ cargo test --workspace --locked
 
 Generate `docs/generated/commands.md` before compiling workspace tests or
 all-targets Clippy: one test embeds the generated Markdown at compile time.
-On the persistent controller use `python3 scripts/generate_command_reference.py --controller`,
-which builds only the generator through bounded Cargo admission. The output is
+On the persistent controller the bounded pool policy selects controller mode implicitly
+(`--controller` still forces it, as does `TWO_CARGO_CONTROLLER=1`; `TWO_CARGO_CONTROLLER=0`
+forces plain cargo), which builds only the generator through bounded
+Cargo admission. A Paperclip run alone never selects it, and hosted CI keeps plain `cargo`. The output is
 ignored; never commit generated registry rows. The authored
 [command-reference landing page](docs/commands.md) links to same-head CI artifacts.
 Normal reference-doc tests compare bytes without writing. Missing or stale output
@@ -175,6 +299,7 @@ python3 scripts/test-docker-deps.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
 python3 scripts/check_soak_checklist.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist_noexec_acceptance.py' -v
 python3 tests/voice_templates/validate.py
 python3 -m unittest discover -s tests/voice_templates -p 'test_*.py' -v
 ```
@@ -190,6 +315,44 @@ shared guard refuses loopback URLs even with CI flags set. Do not
 use `DATABASE_URL`, application credentials, credential fallbacks, or libpq
 `PG*` connection variables. A configured connection/setup failure must fail the
 test, not skip it.
+
+#### One-command local harness
+
+`python3 scripts/local_testdb.py test` mirrors the CI `rust-tests` job with Docker:
+it starts the same digest-pinned Postgres as `agent-testdb:5432` (trust auth,
+tmpfs data, bounded WAL) on a private network, creates the same bootstrap
+databases, and runs the job's test steps with the same step-scoped environment
+in a runner built from the job's `rust:bookworm` image. The guard accepts only
+the literal `agent-testdb` host, so Cargo runs inside that runner rather than on
+the host. Unlike CI it adds `--no-fail-fast`, so one failing test binary does not
+hide the rest, and it prints per-step exit codes and pass/fail/ignored totals.
+It also runs the job's property-test 30-second budget and metrics RSS steps; the
+budget is timed on your host, so a local pass does not prove the CI runner's.
+
+```sh
+python3 scripts/local_testdb.py test                  # fresh DB + rust-tests steps + summary
+python3 scripts/local_testdb.py exec -- python3 scripts/generate_command_reference.py  # once per fresh checkout
+python3 scripts/local_testdb.py exec [--fresh] -- cargo test -p two-bot-core --features db --locked
+python3 scripts/local_testdb.py env                   # the exported test environment
+python3 scripts/local_testdb.py down [--volumes]      # --volumes also drops the target cache
+```
+
+Each checkout gets its own network, database, runner and Cargo target volume.
+`test` always starts on an empty database; `up`/`exec` reuse it unless `--fresh`
+is given. The database tmpfs defaults to 4 GiB (`TWO_LOCAL_TESTDB_TMPFS_GIB`), not
+CI's 1 GiB: a many-core host keeps more fixture databases alive at once, and a full
+tmpfs surfaces as `No space left on device` (SQLSTATE 53100) failures.
+The Cargo registry and rustup toolchain live in a shared `two-localtest-cache`
+volume. `scripts/ci/test_local_testdb.py` fails when `check.yml` and the
+harness drift apart.
+
+Retention: run `down` when the checkout is done, adding `--volumes` once its
+target cache is no longer needed. A `two-localtest-*-target` volume whose
+workspace no longer exists and whose containers are gone is a removal
+candidate for the operator (exact volume name only, after re-verifying no
+container references it); never prune another checkout's live volume.
+
+#### Manual setup
 
 Create one empty bootstrap database `two_bot_test_local` on the disposable
 service, owned by its documented `agent_test` principal (empty password, with

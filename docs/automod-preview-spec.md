@@ -1,10 +1,15 @@
 # Automod verdict preview (private, dry-run)
 
-Status: **Proposed; design only**. Written 2026-10-26; intent review **not
-before 2026-11-02**. This indexed repository file is the editable contract.
-Merge publishes a proposal, not permission to build, publish a command, or
-change any automod scope. No code, config keys, dashboard surface, live-guild
-scope change, or deploy here.
+Status: **Accepted for M2** (owner decision 2026-11-01). Build is tracked on
+linked cards; each build re-checks this spec's `file:line` seams on current
+`main` first. This acceptance is the owner intent review the original proposal
+waits for; its own technical gates, test matrix and kill rule still apply before
+any build PR merges. Acceptance does not lift the no-build state in section 1;
+A/no-build stays in force until those gates are met on a build PR. Original
+proposal: written 2026-10-26. This indexed
+repository file is the editable contract. Merge publishes a proposal, not
+permission to build, publish a command, or change any automod scope. No code,
+config keys, dashboard surface, live-guild scope change, or deploy here.
 
 Question the preview answers, privately, for one synthetic message: *if I
 posted this text now, in this channel, which single automod filter would
@@ -163,14 +168,30 @@ One command, guild-only, published only in the final build slice (§9):
   the count as data. Because the count is decoupled from `text`, modelling
   a real mention-only post means pasting the mention tokens as the text
   (so repeat identity sees the same content) *and* setting the count.
-- **`attachments`** is a comma-separated list of at most 10 bare filenames,
-  each 1–255 UTF-16 units, no `/`, `\`, `,`, or control characters; total
-  option ≤1,000 UTF-16 units. Comma rejection keeps entry boundaries
-  unambiguous: without it `safe.exe,txt` would split into two names and
-  diverge from the live matcher. Names pass to the same matcher helper as
-  live, which extracts the extension internally
-  (`crates/core/src/automod.rs:623-629`). No file upload option: the
-  bot must never receive a blocked-type file to prove it is blocked.
+- **`attachments`** is an optional string containing one to ten bare
+  filenames. Separate entries **only** with the literal two-character
+  sequence comma followed by ASCII SPACE (U+002C U+0020). A comma anywhere
+  else is invalid; there is no CSV quoting, escaping, alternate separator,
+  or automatic whitespace trimming. A delimiter consumes exactly its comma
+  and first ASCII space; any additional spaces are literal filename
+  characters. Preserve every other filename character exactly. Each name
+  is 1–255 UTF-16 code units, excluding `/`, `\`, comma, and control
+  characters. Count the entire raw option, including delimiters, against
+  the existing 1,000-UTF-16-unit bound. Empty option/entries refuse;
+  omission means zero names. Reject the entire option on any invalid
+  entry or bound; never salvage a prefix. Pass decoded names unchanged to
+  the same live matcher helper, which extracts extensions internally
+  (`crates/core/src/automod.rs:623-629`); do not extract extensions in the
+  decoder. Retain builder validation as defense in depth. Refusals occur
+  before config reads, rate consumption, or evaluation and never echo
+  filenames. No file upload option: the bot must never receive a
+  blocked-type file to prove it is blocked.
+  Canonical examples: `safe.exe, txt` → [`safe.exe`, `txt`];
+  `a.txt, b.png` → [`a.txt`, `b.png`]; `a.txt,  b.png` →
+  [`a.txt`, ` b.png`] (one extra space preserved); `a b.txt` stays one name.
+  `safe.exe,txt`, `a.txt,b.png`, comma+tab and comma+NBSP refuse.
+  This explicit delimiter is a product-spec amendment, not a claim that
+  the prior comma-separated wording authorized arbitrary comma splitting.
 - **`text`** is 1–2,000 UTF-16 units (Discord's message bound; slash
   `max_length` 2000, revalidated in the handler). Zero-width, full-width,
   and whitespace-obfuscated forms are accepted — fidelity requires them,
@@ -618,6 +639,7 @@ until slice 4. Each row names the proof, not a vague area.
 | T9 | Output disclosure | Verdict struct field inventory test; for a property set of inputs, replies contain no input substring and render no threshold value (only knob names) |
 | T10 | Canary | Raw/normalized sentinel and digests (SHA-256/MD5 hex plus actual matcher repeat digest, including decimal u64 Debug/Display and hex forms) absent from captured logs, audit rows, metrics, errors, and reply; independently, tracker rows unchanged (§6). Deliberately logging a computed repeat digest must fail the sink check even with an unchanged tracker |
 | T11 | Bounds | 2,000 units ok / 2,001 refused; astral-plane chars counted in UTF-16; 10 attachments ok / 11 refused; `safe.exe,txt` refused (comma in filename); a filename without a dot is treated as its own extension, as live; `mentions` 100 ok / 101 refused; whitespace-only text refused bare, evaluated with attachments, and evaluated with `mentions` at the limit → `mention_spam` (§3.1) |
+| T11a | Attachment delimiter amendment | Actual option decode with valid text: `safe.exe, txt` → [`safe.exe`, `txt`], `a.txt,  b.png` → [`a.txt`, ` b.png`]; empty entries, residual commas, comma+tab/NBSP, paths and controls refuse the whole option; filename 255/256 and raw option 1,000/1,001 UTF-16 units include astral characters and delimiter units; decoded `exe`, `txt`, `EXE`, `archive.tar.GZ` and the dotless second name in `safe.exe, txt` retain live extension parity; malformed input causes zero config/rate/evaluator calls at the handler boundary (§3.1) |
 | T12 | Rate limiter | Paused-clock boundaries for 5 s / hourly / daily caps; refusal does not evaluate (matcher call count 0); full-map refuses new actor |
 | T13 | Zero pipeline writes | Mock ledger/executor/funnel counters all 0 after matched preview in enforce mode |
 | T14 | Audit fail-closed and abandoned claim | Inject insert failure, cancellation, and connection loss after lock acquisition and before commit: no verdict exposed, transaction/claim released, later delivery can retry, no permanent claimed-without-row state; ordinary errors return generic unavailable and increment metric. Lock/transaction timeout also fails closed; unknown commit outcome permits only a locked replay read, not an assumed rollback |

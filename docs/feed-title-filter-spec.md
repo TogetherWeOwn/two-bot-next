@@ -1,10 +1,12 @@
 # Quiet feed title filtering — proposed contract
 
-Status: **proposed, design only**. Written 2026-10-25; review **2026-11-01**.
-**Choose no build now**: prefer an already narrow source, or remove an unwanted
-relay through existing controls after resolving pending deliveries. No source
-change, sample fetch, filter write, command, runtime, migration or activation is
-authorized here. Merge records a proposal, not host intent or security acceptance.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-25. **Choose no build now**: prefer an already narrow source, or remove
+an unwanted relay through existing controls after resolving pending deliveries.
+No source change, sample fetch, filter write, command, runtime, migration or
+activation is authorized here. Merge records a proposal, not host intent or
+security acceptance.
 
 ## 1. Decision and evidence
 

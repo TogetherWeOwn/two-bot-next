@@ -1,10 +1,12 @@
 # Tickets: replay-safe release of my own staff claim
 
-Status: **proposed, design only**. Written 2026-10-25; review by 2026-10-31.
-No implementation, migration run, Discord mutation, new credential, spend or
-production activation. Merge publishes a proposal, not an execution grant.
-This file is the single repository contract; the task document mirrors it.
-Intent review binds the exact file SHA-256 and commit, not a moving branch.
+Status: **Deferred to 2026-12** (owner decision 2026-11-01). Revisit then, or
+earlier if a host names a need and an M2 slot opens. Bundle with [ticket
+priority](ticket-priority-spec.md). Original proposal: written 2026-10-25. No
+implementation, migration run, Discord mutation, new credential, spend or
+production activation. Merge publishes a proposal, not an execution grant. This
+file is the single repository contract; the task document mirrors it. Intent
+review binds the exact file SHA-256 and commit, not a moving branch.
 
 ## 1. Decision and evidence
 
@@ -368,7 +370,7 @@ is acceptable; an actor-equality-only toggle, override release, silent generatio
 upgrade, new permission effect or migrationless activation is refused. This is
 an assessment of the proposal, **not independent approval of our own request**.
 An independent boundary disposition remains required for future security-sensitive
-implementation, alongside exact-head CI and independent Paperclip Review 5/5.
+implementation, alongside exact-head CI, CodeRabbit and Devin Review.
 
 Request CEO acceptance and actual staff-host intent alignment on this exact
 spec through the President/COO, not directly from the owner. The decision must

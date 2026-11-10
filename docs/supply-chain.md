@@ -19,8 +19,24 @@ recoverable by image analysis, so the separate lockfile scan is intentional.
 
 Both gates run in the `image` job and use SHA-pinned Trivy Action 0.36.0 with
 Trivy v0.69.3 (see the `uses: aquasecurity/trivy-action@... # 0.36.0` pins
-and `version: v0.69.3` in [`sbom.yml`](../.github/workflows/sbom.yml)). They
-fail on HIGH/CRITICAL in OS and library dependencies,
+and `version: v0.69.3` in [`sbom.yml`](../.github/workflows/sbom.yml)). Before
+checking out the source to scan, [`scripts/install-trivy.sh`](../scripts/install-trivy.sh)
+downloads the Linux/amd64 archive directly from the pinned GitHub release and
+checks its committed SHA-256 before extracting or executing the binary. Revalidate
+that pin against both the release checksum file and GitHub asset digest when
+bumping. Downloads require HTTPS (including redirects), allow at most three
+redirects and two retries, and cap the archive at 100 MiB. Each attempt has a
+10-second connect and 120-second total timeout; the whole retry sequence has a
+360-second deadline (with a five-second kill grace). Curl errors and HTTP status
+remain visible without logging signed redirect URLs or response bodies. A failed
+download, checksum, extraction or version check publishes no PATH entry and fails
+the job. All four pinned actions skip duplicate setup only after this install;
+the runtime gate's failure-tolerant condition also requires a successful install.
+The binary lives only in a fresh runner-temp directory; no shared cache is used.
+Offline installer and wiring fixtures run through `scripts/ci/test_trivy_install.py`
+in the existing `check` lane's Python discovery.
+
+Both gates fail on HIGH/CRITICAL in OS and library dependencies,
 **including unfixed findings**. A fresh vulnerability DB is downloaded by Trivy
 on every run. No shared cache is written or read: the BuildKit GitHub-Actions
 cache is disabled and every Trivy step sets `cache: false`, so a poisoned
@@ -186,6 +202,11 @@ gh run download <run-id> -n supply-chain -D <run-owned-scratch-directory>
 gh workflow run release.yml --ref main -f release_tag=vX.Y.Z
 ```
 
+Repair works only for a tag built at or after `9d064fa38` (#2004). `verify`
+runs `--check-runtime` on every ref, so an older tag fails the zlib-free
+composition check at the inventory step by design, with no per-tag waiver.
+`v0.2.0` stays without SBOM assets; see `docs/releases.md`.
+
 On a selected PR, the dry-run inventories the exact PR head SHA and records
 source SHA and image ID before scanning; `verify` then validates lockfile
 coverage and Debian image components and records SHA256SUMS after the image
@@ -208,26 +229,47 @@ persisted in their checkout.
 
 ## Pins and maintenance
 
-The builder is `rust:1.98-trixie` and the runtime is
-`gcr.io/distroless/cc-debian13:nonroot`, both pinned by multi-platform index
-SHA-256. Both are Debian 13, so the binary links against the glibc it runs on.
-Dependabot's weekly `docker` updates follow both references. The distroless
-`nonroot` tag is unversioned: if no digest bump arrives after a Debian point
-release, refresh the pin by hand. There is no builder argument override, so a
-build arg cannot select an unpinned base.
+The builder is `rust:1.99-trixie` and the runtime is
+`gcr.io/distroless/base-nossl-debian13:nonroot`, both pinned by multi-platform
+index SHA-256 (builder `sha256:09027f87…0137`, runtime `sha256:e6b0f825…5c67`;
+full digests are in `Dockerfile`). Both are Debian 13, so the binary links
+against the glibc it runs on. Dependabot's weekly `docker` updates follow both
+references. The distroless `nonroot` tag is unversioned: if no digest bump
+arrives after a Debian point release, refresh the pin by hand. There is no
+builder argument override, so a build arg cannot select an unpinned base.
 
 On 2026-10-02 the runtime moved off Bookworm under the CEO's TOG-11974 scope
 decision. Step A, `debian:trixie-slim` (13.7), still measured 48 HIGH rows over
-11 CVEs with no CISO disposition. Step B, the distroless image, measured 0
-HIGH/CRITICAL with Trivy v0.69.3. CI re-measures every head; that note is not a
-standing PASS.
+11 CVEs with no CISO disposition. Step B, the distroless `cc-debian13` image,
+measured 0 HIGH/CRITICAL with Trivy v0.69.3. CI re-measures every head; that
+note is not a standing PASS.
 
-The runtime contains 14 Debian packages (base-files, ca-certificates,
-gcc-14-base, libc6, libgcc-s1, libgomp1, libssl3t64, libstdc++6, libzstd1,
-media-types, netbase, tzdata, tzdata-legacy and zlib1g). It has no shell, apt,
-dpkg or OpenSSL command. Trust data is the base's own `ca-certificates` bundle
-at `/etc/ssl/certs/ca-certificates.crt`; nothing is installed or copied in
-except the release binary. The bot runs as uid/gid 65532 (`nonroot`) from
+The runtime is now moving from `cc-debian13` to `base-nossl-debian13`. The
+`cc` measurements above are prior evidence about a different image. The
+`base-nossl` candidate is unmeasured: full CI, the Trivy gates, container smoke
+and the staging drill have not run for it, and nothing here claims they pass or
+that the image is accepted for production. Security review and the staging
+drill / Release Manager gates remain.
+
+The base-nossl runtime has seven base Debian packages (base-files,
+ca-certificates, libc6, media-types, netbase, tzdata and tzdata-legacy). The
+Dockerfile adds two more from the official Debian 13 repository, without apt
+installation: `libgcc-s1` (only `libgcc_s.so.1`) and `gcc-14-base`. It copies
+the `libgcc_s.so.1` library, the `libgcc-s1` and `gcc-14-base` copyright files
+and truthful `dpkg-query -s` records into `/var/lib/dpkg/status.d/<package>`, so
+the status.d inventory above lists nine packages. It ships no `zlib1g`,
+`libz.so*`, `libssl`, `libzstd`, `libstdc++` or `libgomp`; no zlib is taken from
+sid, forky or any other suite. The trusted `verify` job's use of
+`scripts/runtime-image-evidence.py` is to require that the binary's `DT_NEEDED`
+set is a subset of `libc.so.6`, `libm.so.6` and `libgcc_s.so.1`, that each
+resolves inside the image, that no `libz` is present, and that the required
+package records and SBOM entries exist. The Trivy HIGH/CRITICAL and unfixed
+gates and the empty `.trivyignore.yaml` are unchanged.
+
+The runtime has no shell, apt, dpkg or OpenSSL command. Trust data is the
+base's own `ca-certificates` bundle at `/etc/ssl/certs/ca-certificates.crt`;
+nothing else is installed or copied in except the release binary and the
+`libgcc-s1`/`gcc-14-base` files above. The bot runs as uid/gid 65532 (`nonroot`) from
 `/home/nonroot/two-bot`, and the exec-form `HEALTHCHECK` calls the binary's own
 `--healthcheck`, so no shell is needed.
 

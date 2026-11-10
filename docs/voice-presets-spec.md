@@ -1,11 +1,12 @@
 # Member-owned voice presets — Proposed
 
-Status: **Proposed, design only**, 2026-10-26. Review **2026-11-02**.
-**Recommend no build now.** No authorized community-host use case beyond current
-explicit room/creator settings has been established. This page authorizes no
-command, schema, production migration, live experiment, activation or role
-restoration. Merge accepts documentation, not host intent or a security boundary.
-Numeric limits below are engineering proposals, not current settings.
+Status: **Declined: no build** (owner decision 2026-11-01). This doc stays as
+the record; reopen only with a named host problem. Original proposal: written
+2026-10-26. **Recommend no build now.** No authorized community-host use case
+beyond current explicit room/creator settings has been established. This page
+authorizes no command, schema, production migration, live experiment, activation
+or role restoration. Merge accepts documentation, not host intent or a security
+boundary. Numeric limits below are engineering proposals, not current settings.
 
 ## 1. Decision and evidence
 
@@ -17,7 +18,7 @@ here); vendor capability is not evidence of TWO demand.
 | Option | Benefit / cost | Recommendation |
 | --- | --- | --- |
 | A: current explicit room controls and creator defaults | No member catalog, retained room text or new recovery surface; two manual settings may suffice | **Choose now** |
-| B: self-owned, guild-local explicit save/review/apply | Reuses two settings across sessions; adds personal storage, ownership fencing and uncertain-effect handling | Conditional design only |
+| B: self-owned, guild-local explicit save/review/apply | Reuses two settings across sessions; adds personal storage, ownership fencing and uncertain-effect handling | Conditional; declined 2026-11-01 |
 | C: auto-apply on join, copied access/roles/privacy/bitrate, other owners' rooms | Broader authority and silent future effects | Excluded |
 
 On 2026-11-02 retain B only if at least one authorized community host describes a

@@ -57,7 +57,7 @@ use std::sync::OnceLock;
 
 use super::command_permissions::command_permission;
 use super::commands::{
-    core_commands, merge_commands, CommandDefinition, CustomCommand, RegistryError,
+    core_commands, merge_registry, CommandDefinition, CustomCommand, MergedRegistry, RegistryError,
 };
 use super::feature_commands::{
     announcement_commands, automation_commands, scorecard_attendance_command, FeatureGates,
@@ -103,10 +103,26 @@ pub const MANAGE_EVENTS_REQUIRED: &str =
 pub const GUILD_RESTRICTED_REPLY: &str = "This command is restricted to the configured guild.";
 /// Announcement gate: env-gated, not a Discord role — say who enables it.
 pub const ANNOUNCEMENTS_DISABLED_REPLY: &str = "Announcements are disabled on this server. Ask a server admin to enable them in the bot configuration — this is a host setting, not a Discord role.";
+
+/// The one optional builtin a publication may withhold when an otherwise
+/// valid complete catalog exceeds Discord's 100-command ceiling (see
+/// [`InteractionRouter::publish_set_capacity_deferred`]). `/myroom` is
+/// additive member discovery: withholding it for one publication preserves
+/// a historical catalog's boot, and a later normal sync re-admits it when
+/// capacity allows. Nothing else is deferrable — a baseline that is itself
+/// invalid still fails publication.
+pub const OPTIONAL_CAPACITY_BUILTIN: &str = "myroom";
 /// Moderation gate: env-gated, not a Discord role — say who enables it.
 pub const MODERATION_DISABLED_REPLY: &str = "Moderation is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
 /// Scorecard gate: env-gated, not a Discord role — say who enables it.
 pub const SCORECARD_DISABLED_REPLY: &str = "Attendance capture is not enabled on this server. Ask a server admin to enable it in the bot configuration — this is a host setting, not a Discord role.";
+
+/// Slash names routed while dark (unpublished until their slice lands).
+/// Dispatch shadows each name (see `route_slash`), so a custom row under
+/// one could publish yet never execute. [`crate::custom_commands::reserved_command_names`]
+/// mirrors this set on the write path (`/command`, imports), so writes
+/// refuse the names instead of accepting rows that can never publish.
+pub const DARK_RESERVED_NAMES: &[&str] = &["lockdown-preview", "automod-preview"];
 
 // --- handler identity ----------------------------------------------------------
 
@@ -143,6 +159,8 @@ pub enum HandlerId {
     Moderation(ModerationAction),
     PurgePreview,
     ChannelInspect,
+    LockdownPreview,
+    AutomodPreview,
     TempbanList,
     ModerationRecent,
 }
@@ -284,6 +302,8 @@ pub enum RouterRefusal {
     ModerationPermission(ModerationAction),
     PurgePreviewPermission,
     ChannelInspectPermission,
+    LockdownPreviewPermission,
+    AutomodPreviewPermission,
     TempbanListPermission,
     ModerationRecentPermission,
 }
@@ -303,6 +323,8 @@ impl RouterRefusal {
             Self::GuildRestricted => GUILD_RESTRICTED_REPLY.to_owned(),
             Self::PurgePreviewPermission => "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it.".to_owned(),
             Self::ChannelInspectPermission => "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it.".to_owned(),
+            Self::LockdownPreviewPermission => "You need the Manage Channels permission to use /lockdown-preview. Ask a server moderator or admin to grant it.".to_owned(),
+            Self::AutomodPreviewPermission => "You need the Manage Server permission to use /automod-preview. Ask a server admin to grant it.".to_owned(),
             Self::TempbanListPermission => "You need the Ban Members permission to use /tempban-list. Ask a server moderator or admin to grant it.".to_owned(),
             Self::ModerationRecentPermission => "You need the Moderate Members permission to use /moderation-recent. Ask a server moderator or admin to grant it.".to_owned(),
             // Names the Discord permission (Ban Members, …) and the slash
@@ -325,6 +347,87 @@ pub enum SlashOutcome {
     Refuse { refusal: RouterRefusal },
     Unknown,
     Ignore,
+}
+
+/// Per-dispatch live overlay for the announcements command surface: while the
+/// resolved announcements bit is off, the eight live-gated commands (feed add,
+/// remove, pause, resume, list and inspect, RSVP and RSVP totals) refuse with
+/// the same disabled reply the boot-off router produces. Callers pass the
+/// already-resolved bit (live snapshot store-first over boot), so an absent row
+/// executes through the boot value before this helper ever runs. Refuse-only:
+/// boot-off rows were already refused upstream and pass through, so enabling
+/// from a boot-off deployment still needs a restart (no registration exists to
+/// dispatch through).
+///
+/// LFG stays boot-gated by design: `/lfg` and `/lfg-close` share their
+/// execution arm with the LFG signup buttons, which answer boot-off with
+/// silence rather than a refusal, so live-gating the slash half alone would
+/// split one surface across two semantics. Scorecard `attendance` answers to
+/// its own gate, not this one.
+#[must_use]
+pub fn live_gate_announcements_slash(
+    outcome: SlashOutcome,
+    announcements_live: bool,
+) -> SlashOutcome {
+    match outcome {
+        SlashOutcome::Handled {
+            handler:
+                HandlerId::FeedAdd
+                | HandlerId::FeedRemove
+                | HandlerId::FeedPause
+                | HandlerId::FeedResume
+                | HandlerId::FeedList
+                | HandlerId::FeedInspect
+                | HandlerId::Rsvp
+                | HandlerId::RsvpAttendance,
+        } if !announcements_live => SlashOutcome::Refuse {
+            refusal: RouterRefusal::AnnouncementsDisabled,
+        },
+        other => other,
+    }
+}
+
+/// Slash-command names under the per-dispatch live overlay: the six feed verbs
+/// plus RSVP and RSVP totals. Keep in sync with the `RowGate::Announcements`
+/// rows in [`InteractionRouter::route_slash`] and the `Handled` match in
+/// [`live_gate_announcements_slash`]; `live_gated_names_match_routed_rows`
+/// routes every name here to catch drift.
+const LIVE_GATED_ANNOUNCEMENT_COMMANDS: &[&str] = &[
+    "feed-add",
+    "feed-remove",
+    "feed-pause",
+    "feed-resume",
+    "feed-list",
+    "feed-inspect",
+    "rsvp",
+    "rsvp-attendance",
+];
+
+/// [`live_gate_announcements_slash`] over a routed slash-command name. While
+/// live-off, a permission refusal for a live-gated command becomes the
+/// disabled reply: boot-off routing checks the feature gate before permissions
+/// in `route_slash`, so an unprivileged member hears the actionable state
+/// instead of a permission fetch-quest that cannot help while live-off.
+/// Live-on, foreign-guild (`Ignore`), unknown and unrelated outcomes pass
+/// through untouched, so permission checks still run once live.
+#[must_use]
+pub fn live_gate_announcements_slash_named(
+    name: &str,
+    outcome: SlashOutcome,
+    announcements_live: bool,
+) -> SlashOutcome {
+    if announcements_live || !LIVE_GATED_ANNOUNCEMENT_COMMANDS.contains(&name) {
+        return outcome;
+    }
+    match outcome {
+        SlashOutcome::Handled { .. } => live_gate_announcements_slash(outcome, false),
+        SlashOutcome::Refuse {
+            refusal: RouterRefusal::ManageServerRequired,
+        } => SlashOutcome::Refuse {
+            refusal: RouterRefusal::AnnouncementsDisabled,
+        },
+        other => other,
+    }
 }
 
 /// Component / modal-submit routing outcome.
@@ -414,6 +517,8 @@ impl InteractionRouter {
             }
             register(HandlerId::PurgePreview);
             register(HandlerId::ChannelInspect);
+            register(HandlerId::LockdownPreview);
+            register(HandlerId::AutomodPreview);
             register(HandlerId::ModerationRecent);
         }
         if gates.automations {
@@ -595,6 +700,18 @@ impl InteractionRouter {
                 HandlerId::ChannelInspect,
                 RouterRefusal::ChannelInspectPermission,
             )),
+            // Dark until the publication slice: routed and adjudicated like
+            // the other channel reads, but with no published definition.
+            "lockdown-preview" => Some((
+                HandlerId::LockdownPreview,
+                RouterRefusal::LockdownPreviewPermission,
+            )),
+            // Dark until the publication slice: routed and adjudicated like
+            // the other private reads, but with no published definition.
+            "automod-preview" => Some((
+                HandlerId::AutomodPreview,
+                RouterRefusal::AutomodPreviewPermission,
+            )),
             "moderation-recent" => Some((
                 HandlerId::ModerationRecent,
                 RouterRefusal::ModerationRecentPermission,
@@ -720,9 +837,9 @@ impl InteractionRouter {
                 gate: RowGate::Scorecard,
                 permission_refusal: Some(RouterRefusal::ManageEventsRequired),
             },
-            "command" | "command-remove" | "command-list" | "command-inspect"
-            | "command-disable" | "command-enable" | "schedule" | "schedule-remove"
-            | "schedule-list" | "sticky" | "sticky-remove" => Row {
+            "command" | "command-remove" | "command-list" | "command-inspect" | "command-clone"
+            | "command-disable" | "command-enable" | "command-edit" | "schedule"
+            | "schedule-remove" | "schedule-list" | "sticky" | "sticky-remove" => Row {
                 handler: HandlerId::AutomationAdmin,
                 gate: RowGate::Automations,
                 permission_refusal: Some(RouterRefusal::ManageServerRequired),
@@ -900,6 +1017,10 @@ impl InteractionRouter {
             reserved.extend(voice_command_names().iter().cloned());
         }
         reserved.insert("templateassistant".to_owned());
+        // Dark routed names (see [`DARK_RESERVED_NAMES`]): dispatch shadows
+        // each one until its publish slice lands, so a custom row under it
+        // could publish yet never execute.
+        reserved.extend(DARK_RESERVED_NAMES.iter().map(|name| (*name).to_owned()));
         reserved
     }
 
@@ -908,7 +1029,7 @@ impl InteractionRouter {
     /// announcement, moderation, then the voice set — then DB custom
     /// commands). `/templateassistant` stays unpublished until its slice
     /// lands with a handler: no published command may lack one. First-wins
-    /// dedupe and the 100-command ceiling come from `merge_commands`; voice
+    /// dedupe and the 100-command ceiling come from `merge_registry`; voice
     /// `kick` loses to moderation `/kick` there.
     ///
     /// Two publish/routing agreements keep a published command executable:
@@ -923,6 +1044,96 @@ impl InteractionRouter {
         &self,
         custom: &[CustomCommand],
     ) -> Result<Vec<CommandDefinition>, RegistryError> {
+        self.build_publish_set(custom, None)
+    }
+
+    /// [`Self::publish_set`] plus the historical-catalog transition: when the
+    /// complete baseline (gate-constrained builtins plus every persisted
+    /// enabled custom row under the existing name/precedence rules) is valid
+    /// but adding the optional [`OPTIONAL_CAPACITY_BUILTIN`] entry alone
+    /// would exceed Discord's 100-command ceiling, publish the baseline
+    /// without only that builtin. A guild whose stored catalog predates the
+    /// new builtin keeps booting instead of failing publication.
+    ///
+    /// Deferral applies only when the baseline without the optional builtin
+    /// fits every custom row: the merge reports overflow through withheld
+    /// customs as well as through [`RegistryError::BuiltinLimit`], so the
+    /// full set is compared against the baseline including withheld rows.
+    /// A baseline that still withholds customs (or fails) is not a clean
+    /// historical catalog, so the full truncated set returns with no deferral
+    /// claim instead of a successfully truncated "fallback".
+    ///
+    /// Returns the definitions actually fit for publication and the withheld
+    /// builtin name when deferral applied. No custom row is truncated,
+    /// disabled, deleted or evicted on the deferral path, and no registry
+    /// error is swallowed: a baseline that is itself invalid still returns
+    /// its own error, and the next serialized registry sync re-evaluates
+    /// from scratch (no timer, key or retry mechanism is added).
+    pub fn publish_set_capacity_deferred(
+        &self,
+        custom: &[CustomCommand],
+    ) -> Result<(Vec<CommandDefinition>, Option<&'static str>), RegistryError> {
+        match self.merged_publish_set(custom, None) {
+            Err(RegistryError::BuiltinLimit(_)) => {
+                match self.merged_publish_set(custom, Some(OPTIONAL_CAPACITY_BUILTIN)) {
+                    Ok(baseline) if baseline.withheld.is_empty() => {
+                        Ok((baseline.commands, Some(OPTIONAL_CAPACITY_BUILTIN)))
+                    }
+                    Ok(baseline) => {
+                        Self::log_withheld(self.gates.configured_guild, &baseline.withheld);
+                        Ok((baseline.commands, None))
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            Ok(full) if full.withheld.is_empty() => Ok((full.commands, None)),
+            Ok(full) => match self.merged_publish_set(custom, Some(OPTIONAL_CAPACITY_BUILTIN)) {
+                Ok(baseline) if baseline.withheld.is_empty() => {
+                    Ok((baseline.commands, Some(OPTIONAL_CAPACITY_BUILTIN)))
+                }
+                Ok(_) => {
+                    Self::log_withheld(self.gates.configured_guild, &full.withheld);
+                    Ok((full.commands, None))
+                }
+                Err(_) => {
+                    Self::log_withheld(self.gates.configured_guild, &full.withheld);
+                    Ok((full.commands, None))
+                }
+            },
+        }
+    }
+
+    fn build_publish_set(
+        &self,
+        custom: &[CustomCommand],
+        withhold_builtin: Option<&str>,
+    ) -> Result<Vec<CommandDefinition>, RegistryError> {
+        let merged = self.merged_publish_set(custom, withhold_builtin)?;
+        Self::log_withheld(self.gates.configured_guild, &merged.withheld);
+        Ok(merged.commands)
+    }
+
+    fn log_withheld(configured_guild: Option<u64>, withheld: &[String]) {
+        if withheld.is_empty() {
+            return;
+        }
+        // Operator signal for a guild whose stored custom commands no
+        // longer fit beside the builtins (for example after a release adds
+        // one). Names are validated slash names, never member content.
+        tracing::warn!(
+            target: "two_bot_core::command_registry",
+            guild_id = configured_guild.map(|id| id.to_string()),
+            withheld_count = withheld.len(),
+            withheld = ?withheld,
+            "custom_commands_withheld_over_guild_limit"
+        );
+    }
+
+    fn merged_publish_set(
+        &self,
+        custom: &[CustomCommand],
+        withhold_builtin: Option<&str>,
+    ) -> Result<MergedRegistry, RegistryError> {
         let mut extra: Vec<Vec<CommandDefinition>> = Vec::with_capacity(6);
         if self.gates.scorecard {
             extra.push(vec![scorecard_attendance_command()]);
@@ -937,7 +1148,12 @@ impl InteractionRouter {
             extra.push(super::moderation::moderation_commands());
         }
         if self.gates.voice {
-            extra.push(voice_commands());
+            extra.push(
+                voice_commands()
+                    .into_iter()
+                    .filter(|definition| Some(definition.name.as_str()) != withhold_builtin)
+                    .collect(),
+            );
             // No assistant push: the name stays reserved (see
             // `reserved_names`) and dispatch keeps shadowing it, so the
             // slice re-activates by publishing again.
@@ -956,7 +1172,7 @@ impl InteractionRouter {
         } else {
             Vec::new()
         };
-        merge_commands(&extra, &visible)
+        merge_registry(&extra, &visible)
     }
 }
 
@@ -1036,14 +1252,18 @@ mod tests {
             ("unlock", HandlerId::Moderation(ModerationAction::Unlock)),
             ("purge-preview", HandlerId::PurgePreview),
             ("channel-inspect", HandlerId::ChannelInspect),
+            ("lockdown-preview", HandlerId::LockdownPreview),
+            ("automod-preview", HandlerId::AutomodPreview),
             ("moderation-recent", HandlerId::ModerationRecent),
             ("attendance", HandlerId::ScorecardAttendance),
             ("command", HandlerId::AutomationAdmin),
             ("command-remove", HandlerId::AutomationAdmin),
             ("command-list", HandlerId::AutomationAdmin),
             ("command-inspect", HandlerId::AutomationAdmin),
+            ("command-clone", HandlerId::AutomationAdmin),
             ("command-disable", HandlerId::AutomationAdmin),
             ("command-enable", HandlerId::AutomationAdmin),
+            ("command-edit", HandlerId::AutomationAdmin),
             ("schedule", HandlerId::AutomationAdmin),
             ("schedule-remove", HandlerId::AutomationAdmin),
             ("schedule-list", HandlerId::AutomationAdmin),
@@ -1063,7 +1283,7 @@ mod tests {
             ("feed-list", HandlerId::FeedList),
             ("feed-inspect", HandlerId::FeedInspect),
         ];
-        assert_eq!(cases.len(), 45, "all 45 handler-owned builtins covered");
+        assert_eq!(cases.len(), 49, "all 49 handler-owned builtins covered");
         for (name, handler) in cases {
             assert_eq!(
                 r.route_slash(&ctx(name, Some(GUILD), Some(u64::MAX))),
@@ -1178,6 +1398,168 @@ mod tests {
     }
 
     #[test]
+    fn live_gate_refuses_only_the_live_announcement_surface() {
+        // The per-dispatch live overlay: a stored `0` refuses the eight
+        // live-gated announcement commands with the same disabled reply the
+        // boot-off router produces; LFG (slash and signup share one arm) and
+        // the scorecard surface stay boot-gated.
+        for handler in [
+            HandlerId::FeedAdd,
+            HandlerId::FeedRemove,
+            HandlerId::FeedPause,
+            HandlerId::FeedResume,
+            HandlerId::FeedList,
+            HandlerId::FeedInspect,
+            HandlerId::Rsvp,
+            HandlerId::RsvpAttendance,
+        ] {
+            assert_eq!(
+                live_gate_announcements_slash(SlashOutcome::Handled { handler }, false),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::AnnouncementsDisabled
+                },
+                "{handler:?} refuses while live-off"
+            );
+            assert_eq!(
+                live_gate_announcements_slash(SlashOutcome::Handled { handler }, true),
+                SlashOutcome::Handled { handler },
+                "{handler:?} executes while live-on"
+            );
+        }
+        // Boot-gated surface passes through untouched either way.
+        for handler in [
+            HandlerId::Lfg,
+            HandlerId::LfgClose,
+            HandlerId::ScorecardAttendance,
+            HandlerId::Rank,
+        ] {
+            for live in [false, true] {
+                assert_eq!(
+                    live_gate_announcements_slash(SlashOutcome::Handled { handler }, live),
+                    SlashOutcome::Handled { handler },
+                    "{handler:?} ignores the live bit"
+                );
+            }
+        }
+        // Non-handled outcomes pass through: the router already refused
+        // boot-off rows, and silence/unknown are not announcements business.
+        for outcome in [
+            SlashOutcome::Refuse {
+                refusal: RouterRefusal::AnnouncementsDisabled,
+            },
+            SlashOutcome::Unknown,
+            SlashOutcome::Ignore,
+        ] {
+            for live in [false, true] {
+                assert_eq!(
+                    live_gate_announcements_slash(outcome, live),
+                    outcome,
+                    "{outcome:?} passes through"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_gated_names_match_routed_rows() {
+        // Drift catch for `LIVE_GATED_ANNOUNCEMENT_COMMANDS`: every listed
+        // name must still be a `RowGate::Announcements` row. Feed verbs are
+        // permission-gated, so a permissionless boot-on dispatch refuses with
+        // the permission refusal; RSVP rows carry no permission refusal and
+        // route straight through.
+        let r = InteractionRouter::new(all_on());
+        for name in [
+            "feed-add",
+            "feed-remove",
+            "feed-pause",
+            "feed-resume",
+            "feed-list",
+            "feed-inspect",
+        ] {
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(GUILD), Some(0))),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::ManageServerRequired
+                },
+                "{name} stays a permission-gated announcements row"
+            );
+        }
+        for (name, handler) in [
+            ("rsvp", HandlerId::Rsvp),
+            ("rsvp-attendance", HandlerId::RsvpAttendance),
+        ] {
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(GUILD), Some(0))),
+                SlashOutcome::Handled { handler },
+                "{name} stays a permission-free announcements row"
+            );
+        }
+    }
+
+    #[test]
+    fn live_gate_named_reports_disabled_before_permissions() {
+        // Live-off permissionless dispatch on a gated name hears the disabled
+        // reply, matching boot-off gate-before-permission order; live-on keeps
+        // the permission refusal, and ungated names pass through either way.
+        for name in LIVE_GATED_ANNOUNCEMENT_COMMANDS {
+            assert_eq!(
+                live_gate_announcements_slash_named(
+                    name,
+                    SlashOutcome::Refuse {
+                        refusal: RouterRefusal::ManageServerRequired
+                    },
+                    false
+                ),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::AnnouncementsDisabled
+                },
+                "{name} converts the permission refusal while live-off"
+            );
+            assert_eq!(
+                live_gate_announcements_slash_named(
+                    name,
+                    SlashOutcome::Refuse {
+                        refusal: RouterRefusal::ManageServerRequired
+                    },
+                    true
+                ),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::ManageServerRequired
+                },
+                "{name} keeps the permission refusal while live-on"
+            );
+        }
+        for name in ["lfg", "rank", "no-such-command"] {
+            for live in [false, true] {
+                let outcome = SlashOutcome::Refuse {
+                    refusal: RouterRefusal::ManageServerRequired,
+                };
+                assert_eq!(
+                    live_gate_announcements_slash_named(name, outcome, live),
+                    outcome,
+                    "{name} ignores the live bit"
+                );
+            }
+        }
+        // Already-refused, silent and unknown outcomes are not rewritten.
+        for outcome in [
+            SlashOutcome::Refuse {
+                refusal: RouterRefusal::AnnouncementsDisabled,
+            },
+            SlashOutcome::Unknown,
+            SlashOutcome::Ignore,
+        ] {
+            for live in [false, true] {
+                assert_eq!(
+                    live_gate_announcements_slash_named("feed-resume", outcome, live),
+                    outcome,
+                    "{outcome:?} passes through"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn refusal_texts_are_actionable() {
         // Disabled features name the admin-only enable path (host setting, not
         // a Discord role).
@@ -1246,6 +1628,10 @@ mod tests {
              "You need the Manage Messages permission to use /purge-preview. Ask a server moderator or admin to grant it."),
             ("channel-inspect", 16, HandlerId::ChannelInspect, RouterRefusal::ChannelInspectPermission,
              "You need the Manage Channels permission to use /channel-inspect. Ask a server moderator or admin to grant it."),
+            ("lockdown-preview", 16, HandlerId::LockdownPreview, RouterRefusal::LockdownPreviewPermission,
+             "You need the Manage Channels permission to use /lockdown-preview. Ask a server moderator or admin to grant it."),
+            ("automod-preview", 32, HandlerId::AutomodPreview, RouterRefusal::AutomodPreviewPermission,
+             "You need the Manage Server permission to use /automod-preview. Ask a server admin to grant it."),
             ("moderation-recent", 1_099_511_627_776, HandlerId::ModerationRecent, RouterRefusal::ModerationRecentPermission,
              "You need the Moderate Members permission to use /moderation-recent. Ask a server moderator or admin to grant it."),
         ] {
@@ -1679,9 +2065,9 @@ mod tests {
         }];
         let set = r.publish_set(&custom).expect("full set assembles");
         let names: Vec<_> = set.iter().map(|c| c.name.as_str()).collect();
-        // 7 core + 1 scorecard + 12 automation + 12 announcements + 9 moderation
-        // + 4 reads + 1 custom = 46, in publish order, guild-only throughout.
-        assert_eq!(set.len(), 46);
+        // 7 core + 1 scorecard + 14 automation + 12 announcements + 9 moderation
+        // + 4 reads + 1 custom = 48, in publish order, guild-only throughout.
+        assert_eq!(set.len(), 48);
         assert_eq!(
             &names[..8],
             [
@@ -1696,13 +2082,16 @@ mod tests {
             ]
         );
         assert_eq!(names[11], "command-inspect");
-        assert_eq!(&names[18..21], ["sticky-remove", "giveaway", "rsvp"]);
+        assert_eq!(names[12], "command-clone");
+        assert_eq!(&names[13..15], ["command-disable", "command-enable"]);
+        assert_eq!(names[15], "command-edit");
+        assert_eq!(&names[20..23], ["sticky-remove", "giveaway", "rsvp"]);
         assert!(names.contains(&"rsvp-attendance"));
         assert_eq!(names.iter().filter(|n| **n == "attendance").count(), 1);
-        assert_eq!(names[24], "lfg-edit");
-        assert_eq!(names[25], "lfg-list");
+        assert_eq!(names[26], "lfg-edit");
+        assert_eq!(names[27], "lfg-list");
         assert_eq!(
-            &names[26..32],
+            &names[28..34],
             [
                 "feed-add",
                 "feed-remove",
@@ -1713,7 +2102,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            &names[32..42],
+            &names[34..44],
             [
                 "ban",
                 "tempban",
@@ -1728,10 +2117,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            &names[42..45],
+            &names[44..47],
             ["purge-preview", "channel-inspect", "moderation-recent"]
         );
-        assert_eq!(names[45], "faq");
+        assert_eq!(names[47], "faq");
         assert!(set.iter().all(|c| !c.dm_permission));
     }
 
@@ -1744,8 +2133,10 @@ mod tests {
             "command-remove",
             "command-list",
             "command-inspect",
+            "command-clone",
             "command-disable",
             "command-enable",
+            "command-edit",
             "schedule",
             "schedule-remove",
             "schedule-list",
@@ -1849,6 +2240,7 @@ mod tests {
                 for (name, enabled, permission) in [
                     ("command-disable", gates.automations, "32"),
                     ("command-enable", gates.automations, "32"),
+                    ("command-edit", gates.automations, "32"),
                     ("lfg-edit", gates.announcements, "8589934592"),
                 ] {
                     let found = defs.iter().find(|def| def.name == name);
@@ -2005,9 +2397,9 @@ mod tests {
         assert!(gates.voice && gates.voice_assistant);
     }
 
-    /// The 22 voice names in published order (pinned independently in
+    /// The 23 voice names in published order (pinned independently in
     /// `voice_rooms::tests::voice_command_shapes_and_gates`).
-    const VOICE_NAMES: [&str; 22] = [
+    const VOICE_NAMES: [&str; 24] = [
         "create",
         "setup",
         "ping",
@@ -2030,6 +2422,8 @@ mod tests {
         "public",
         "limit",
         "unlimit",
+        "myroom",
+        "room-access-inspect",
     ];
 
     fn voice_on() -> RouterGates {
@@ -2049,7 +2443,7 @@ mod tests {
     fn voice_set_publishes_after_moderation_only_while_gated() {
         let off = published(all_on());
         let off_names: Vec<_> = off.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(off.len(), 45);
+        assert_eq!(off.len(), 47);
         for name in VOICE_NAMES.iter().filter(|name| **name != "kick") {
             assert!(
                 !off_names.contains(name),
@@ -2059,16 +2453,16 @@ mod tests {
 
         let on = published(voice_on());
         let on_names: Vec<_> = on.iter().map(|c| c.name.as_str()).collect();
-        // 45 builtins keep their order; the 21 voice names that survive
+        // 47 builtins keep their order; the 23 voice names that survive
         // first-wins follow in voice order. `kick` is already moderation's.
-        assert_eq!(on.len(), 66);
-        assert_eq!(on_names[..45], off_names[..]);
+        assert_eq!(on.len(), 70);
+        assert_eq!(on_names[..47], off_names[..]);
         let expected: Vec<_> = VOICE_NAMES
             .iter()
             .copied()
             .filter(|name| *name != "kick")
             .collect();
-        assert_eq!(on_names[45..], expected[..]);
+        assert_eq!(on_names[47..], expected[..]);
         assert!(!on_names.contains(&"templateassistant"));
         assert!(on.iter().all(|c| !c.dm_permission));
     }
@@ -2114,6 +2508,47 @@ mod tests {
     }
 
     #[test]
+    fn capacity_deferred_withholds_only_myroom_when_the_baseline_fits() {
+        fn customs(count: usize) -> Vec<CustomCommand> {
+            (0..count)
+                .map(|index| CustomCommand {
+                    name: format!("zzcap{index:02}"),
+                    description: "Capacity probe".to_owned(),
+                    enabled: true,
+                })
+                .collect()
+        }
+
+        let router = InteractionRouter::new(voice_on());
+        // 70 builtins: 30 customs fit exactly (70+30=100), nothing deferred.
+        let (defs, withheld) = router
+            .publish_set_capacity_deferred(&customs(30))
+            .expect("exact fit publishes");
+        assert_eq!(withheld, None);
+        assert_eq!(defs.len(), 100);
+        assert!(defs.iter().any(|def| def.name == "myroom"));
+
+        // 31 customs: the full set would withhold one custom (70+31=101),
+        // but the baseline without /myroom fits (69+31=100), so only the
+        // optional builtin is withheld and every custom still publishes.
+        let (defs, withheld) = router
+            .publish_set_capacity_deferred(&customs(31))
+            .expect("single overflow defers myroom");
+        assert_eq!(withheld, Some(OPTIONAL_CAPACITY_BUILTIN));
+        assert_eq!(defs.len(), 100);
+        assert!(!defs.iter().any(|def| def.name == "myroom"));
+        assert!(defs.iter().any(|def| def.name == "zzcap30"));
+
+        // 32 customs: even the baseline overflows (69+32=101), so the
+        // overflow is not /myroom's alone and no deferral is claimed.
+        let (defs, withheld) = router
+            .publish_set_capacity_deferred(&customs(32))
+            .expect("double overflow truncates");
+        assert_eq!(withheld, None);
+        assert_eq!(defs.len(), 100);
+    }
+
+    #[test]
     fn templateassistant_stays_unpublished_until_its_slice_lands() {
         // No handler yet, so no publish in any gate state; the slice
         // re-activates by publishing again (dispatch keeps shadowing the
@@ -2129,13 +2564,13 @@ mod tests {
                 "voice={voice} assistant={assistant}"
             );
         }
-        // Both gates on is the full voice set without the assistant: 45
-        // builtins plus the 21 surviving voice names.
+        // Both gates on is the full voice set without the assistant: 47
+        // builtins plus the 23 surviving voice names.
         let both = published(RouterGates {
             voice_assistant: true,
             ..voice_on()
         });
-        assert_eq!(both.len(), 66);
+        assert_eq!(both.len(), 70);
     }
 
     #[test]

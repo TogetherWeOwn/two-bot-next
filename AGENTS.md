@@ -36,6 +36,7 @@ its remaining findings, then push the resolution before expecting GitHub to merg
 - Use the PR template, in short, active sentences. Required: Linked Issues or
   Issue Description, and Verification (commands run and their results). What
   Changed and Notes for reviewers are optional.
+- PRs follow the org contract in `TogetherWeOwn/.github` CONTRIBUTING + this repo's overrides; use this repo's PR template, which replaces the org template; its Attestation section is mandatory.
 - Keep references public-safe. Put no secret, token, private URL or internal
   tracker ID (`TOG-`, `PAP-`) in any title, body, commit, comment or branch name.
   Link public GitHub issues as `Closes #123`.
@@ -61,8 +62,11 @@ cargo test --workspace --locked
 
 The generated reference is ignored at `docs/generated/commands.md`; the tracked
 `docs/commands.md` is its landing page. Generate explicitly before test-target
-compilation. On the controller use `python3 scripts/generate_command_reference.py --controller`;
-this builds only the generator through the bounded cache wrapper. The generator
+compilation. On the controller the bounded pool policy selects controller mode
+implicitly (`--controller` and `TWO_CARGO_CONTROLLER=1` still force it;
+`TWO_CARGO_CONTROLLER=0` forces plain cargo); this builds only the generator
+through the bounded cache wrapper. Being inside a Paperclip run does not
+select it, and hosted CI keeps plain cargo. The generator
 never rewrites tracked configuration or independent publication fixtures.
 
 On the persistent Paperclip controller, run the compiling commands through the
@@ -71,6 +75,8 @@ cache wrapper described under [Controller builds](#controller-builds).
 The `wrangler/` Worker wrapper has its own `npm ci`, `npm run typecheck` and
 `npm test`. Database tests run only against a disposable test database, never
 staging or production; see [`CONTRIBUTING.md`](CONTRIBUTING.md#database-tests).
+`python3 scripts/local_testdb.py test` runs the CI `rust-tests` steps against a
+disposable Docker Postgres in one command.
 
 ## Definition of done
 

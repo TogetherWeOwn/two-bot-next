@@ -585,7 +585,9 @@ async fn verify_access_controls(store: &PgRoomStore, pool: &PgPool) -> TestResul
             ("template".to_owned(), vec![]),
         ]),
     };
-    store.save_access_controls(100, &controls).await?;
+    store
+        .save_access_controls(100, &AccessControls::default(), &controls)
+        .await?;
     assert_eq!(store.access_controls(100).await?, controls);
     assert_eq!(
         PgRoomStore::new(pool.clone()).access_controls(100).await?,
@@ -599,20 +601,36 @@ async fn verify_access_controls(store: &PgRoomStore, pool: &PgPool) -> TestResul
 
     // Saving replaces the whole row: lifting every restriction sticks.
     store
-        .save_access_controls(100, &AccessControls::default())
+        .save_access_controls(100, &controls, &AccessControls::default())
         .await?;
     assert_eq!(store.access_controls(100).await?, AccessControls::default());
+    // A save from a stale read refuses and changes nothing.
+    assert!(matches!(
+        store
+            .save_access_controls(100, &controls, &AccessControls::default())
+            .await,
+        Err(sqlx::Error::RowNotFound)
+    ));
 
     // Refused before the database: unknown command, zero role ids.
     let mut bad = AccessControls::default();
     bad.command_roles.insert("kik".to_owned(), vec![7]);
-    assert!(store.save_access_controls(100, &bad).await.is_err());
+    assert!(store
+        .save_access_controls(100, &AccessControls::default(), &bad)
+        .await
+        .is_err());
     bad.command_roles.clear();
     bad.required_role = Some(0);
-    assert!(store.save_access_controls(100, &bad).await.is_err());
+    assert!(store
+        .save_access_controls(100, &AccessControls::default(), &bad)
+        .await
+        .is_err());
     bad.required_role = None;
     bad.command_roles.insert("kick".to_owned(), vec![0]);
-    assert!(store.save_access_controls(100, &bad).await.is_err());
+    assert!(store
+        .save_access_controls(100, &AccessControls::default(), &bad)
+        .await
+        .is_err());
     assert_eq!(store.access_controls(100).await?, AccessControls::default());
 
     // The table's own checks hold when SQL bypasses the adapter.

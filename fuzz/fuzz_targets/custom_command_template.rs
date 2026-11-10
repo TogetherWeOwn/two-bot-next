@@ -82,6 +82,7 @@ fuzz_target!(|data: &[u8]| {
         username: String::new(),
         server: String::new(),
         channel: String::new(),
+        args: String::new(),
     };
     assert!(
         matches!(
@@ -118,6 +119,7 @@ fuzz_target!(|data: &[u8]| {
         username: truncate_chars(field(USERNAME_IDX), MAX_CTX_FIELD_CHARS),
         server: truncate_chars(field(SERVER_IDX), MAX_CTX_FIELD_CHARS),
         channel: truncate_chars(field(CHANNEL_IDX), MAX_CTX_FIELD_CHARS),
+        args: String::new(),
     };
 
     // Placeholder extraction is total-bounded on every input: at most the cap,

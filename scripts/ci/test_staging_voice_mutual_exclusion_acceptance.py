@@ -1,26 +1,158 @@
-"""Protected offline contract for staging deploy / voice lifecycle exclusion.
+"""Protected offline contract for the full-window staging lifecycle lock.
 
-Run with check.yml's scripts/ci unittest discovery. Only YAML and Python source
-are read; no workflow is dispatched and no Discord, database or deploy is used.
-The positive controls add locks to in-memory copies, never repository files.
-These tests prove the declared lock scope, not GitHub scheduler execution,
-queue fairness, or that a runtime deletion failure has been repaired.
+QA-owned replacement of the Test Author contract that pinned job-level
+``deploy`` + voice ``synthetic`` locks. Every guarantee of that contract is
+kept (fixed, nonempty, non-expression, explicitly non-cancelling, case-
+insensitive group; no waiting ancestor may hold it; the called voice gate
+waits for a successful deploy and propagates failure; the live voice entry
+point and its deletion budget are unchanged) and the exclusion window grows:
+
+* deploy-staging holds one fixed repository-wide group at workflow level, so
+  baseline, deploy, takeover, readiness, rollback, every in-run consumer,
+  certify-promotion and the final staging-use release share one window;
+* standalone consumers (voice, help), the staging drills and the manual MCP
+  prove-out hold that same group for their whole start/proof/stop window, so
+  no split lock survives a rename;
+* the five-minute user-flow staging probe is a read-only observer, not a
+  holder: it never holds the lifecycle group (or a legacy alias, in any case
+  or expression form) at workflow or job level, so it cannot keep replacing a
+  pending deploy-staging or promotion soak run in GitHub's one-slot queue. It
+  serializes on its own fixed, non-cancelling queue that no other workflow
+  or job shares, runs only the ``observe`` lifecycle action (never acquire,
+  ready/assert, release or extend), and reads staging only after the observer
+  reports an active window, so an idle staging is never woken;
+* reusable voice/help invoked inside that window take a provably disjoint
+  per-run nested group, never re-hold the caller's group (no deadlock), and
+  bind the caller's exact SHA/deployment/expiry before live consumption
+  without acquiring or releasing the caller's grant;
+* the scheduled rollback-proof orchestrator and production passive probes
+  hold nothing that waits on staging;
+* deploy-production's ``soak`` is a job-level whole-window holder: only
+  ordinary guarded deploys enter it (never rollback or the live-SHA cure),
+  one original grant bound to the guarded SHA covers every live read from
+  baseline through the fresh interval, final probe and post-sample recheck,
+  that grant is capped at 40 minutes while the job ceiling (at most 50) keeps
+  at least 10 minutes past it for checkout, stop and evidence,
+  an always-run release closes it, only lifecycle-only steps see the control
+  credential and the run/attempt evidence is always retained. No other
+  deploy-production node (workflow, guard, gates, recheck, production lane)
+  can wait on the staging group, and ``staging-soak-evidence`` is a pure
+  no-secret/no-environment/no-live-read publisher of a successful soak.
+
+Run with check.yml's scripts/ci unittest discovery. Only YAML and Python
+source are read; no workflow is dispatched and no Discord, database or deploy
+is used. Controls mutate in-memory copies only. These tests prove the
+declared lock scope, not GitHub scheduler execution, queue fairness (GitHub
+keeps one pending run per group and replaces it), runtime expiry, or that a
+runtime deletion failure has been repaired.
 """
 
 import ast
 from copy import deepcopy
+from functools import lru_cache
 import importlib.util
 import os
 from pathlib import Path
+import re
 import unittest
 from unittest import mock
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+WORKFLOWS = ROOT / ".github/workflows"
 DEPLOY = "deploy-staging.yml"
 VOICE = "voice-synthetic.yml"
+HELP = "help-embed-synthetic.yml"
+USER_FLOW = "synthetic-user-flow.yml"
+CONTAINER = "staging-container-drill.yml"
+ROLLBACK = "staging-rollback-drill.yml"
+MCP = "staging-mcp-proveout.yml"
+PRODUCTION = "deploy-production.yml"
+SOAK = "soak"
+PUBLISHER = "staging-soak-evidence"
 INVOCATIONS = ("schedule", "workflow_dispatch", "workflow_call")
+EXPRESSION = "${{"
+
+# Both historical spellings of the staging lock. Whichever deploy-staging
+# holds is canonical; any other holder of either spelling is a split lock.
+LEGACY_GROUPS = ("deploy-staging", "staging-lifecycle")
+# deploy-staging jobs that must sit inside the full window (all jobs of the
+# workflow are covered by its workflow-level lock; these must exist).
+WINDOW_JOBS = ("deploy", "voice-synthetic", "help-embed-synthetic",
+               "user-flow-synthetic", "certify-promotion")
+# Reusable caller job in deploy-staging -> called workflow.
+CHILDREN = {"voice-synthetic": VOICE, "help-embed-synthetic": HELP}
+# Called workflow -> (live consumer job, live entry point).
+CONSUMERS = {VOICE: ("synthetic", "scripts/staging_voice_synthetic.py"),
+             HELP: ("help-embed-smoke", "scripts/staging_help_embed_smoke.py")}
+# workflow_call-only inputs carrying the caller's grant -> client env name.
+INHERITED = {"staging_use_expires_at": "STAGING_USE_EXPIRES_AT",
+             "staging_use_sha": "STAGING_USE_SHA",
+             "staging_use_deployment": "STAGING_USE_DEPLOYMENT"}
+OWNERSHIP_TOKEN = "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"
+STANDALONE_GUARD = "inputs.staging_use_expires_at == ''"
+INHERITED_GUARD = "inputs.staging_use_expires_at != ''"
+MAIN_ONLY = "github.ref == 'refs/heads/main'"
+# (workflow, job) that must hold the canonical group when run standalone,
+# and whether the hold must be job-level (to keep sibling prod probes free).
+STANDALONE_HOLDERS = {(VOICE, "synthetic"): False,
+                      (HELP, "help-embed-smoke"): False,
+                      (CONTAINER, "container-drill"): False,
+                      (ROLLBACK, "drill"): True,
+                      (MCP, "proveout"): False,
+                      (PRODUCTION, SOAK): True}
+# Periodic read-only observers of the staging window. They hold their own
+# exclusive job-level queue, never the lifecycle group: a */5 holder would
+# keep replacing pending deploy-staging and soak runs (one pending run per
+# group). Formerly a holder; reclassified, not exempted.
+OBSERVERS = {(USER_FLOW, "staging"): "user-flow staging observer"}
+OBSERVE = "observe"
+# The observer's own step outputs that gate every live read on an active window.
+SAMPLE = re.compile(r"steps\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.sample\s*==\s*'true'")
+LIVE_INPUT = re.compile(r"vars\.STAGING_WORKER_URL|secrets\.STAGING_|secrets\.TWO_VOICE")
+# Dispatch-only failure drill: the staging origin is replaced by a literal one.
+REROUTED = re.compile(r"\$\{\{\(inputs\.force_fail&&'(https://[^'$]+)'\)\|\|"
+                      r"vars\.STAGING_WORKER_URL\}\}")
+# Jobs that must hold nothing that can wait on the staging lifecycle.
+FREE_JOBS = {(USER_FLOW, "prod-passive"): "production passive probe",
+             (ROLLBACK, "proof"): "rollback-proof orchestrator",
+             (PRODUCTION, "production"): "production deploy/rollback lane"}
+# Staging-touching jobs outside the lifecycle lock, each with a reason. A new
+# staging-touching job fails the inventory until it is classified here or
+# made a holder. Reclassify (do not silently extend) when one goes live.
+# The promotion soak was reclassified to a holder and its publisher must not
+# touch staging at all (promotion_soak_errors), so neither is exempt.
+EXEMPT = {
+    ("deploy-production.yml", "production"): "production deploy; staging origin is evidence input only",
+    ("gradual-promote-proof.yml", "proof"): "passive: target lock refuses before any Cloudflare call",
+    ("slow-burn-tracker.yml", "tracker"): "read-only /ops/metrics scrape",
+    ("staging-ownership-status.yml", "status"): "read-only ownership GET; never starts a container",
+    ("staging-events-read.yml", "read"): "database read only",
+    ("staging-fixture-census.yml", "fixture-census"): "database read only",
+    ("staging-migrate.yml", "plan"): "database plan only",
+    ("staging-migrate.yml", "apply"): "database migration; staging-migrate lane",
+    ("staging-privacy-verify-read.yml", "read"): "database read only",
+    ("staging-retention-census.yml", "census"): "database read only",
+}
+STAGING_TOUCH = re.compile(r"STAGING_WORKER_URL|STAGING_OWNERSHIP_CONTROL_TOKEN|"
+                           r"TWO_VOICE_SYNTHETIC_BOT_TOKEN|staging-use\.mjs")
+# The only accepted expression group forms. Anything else is unprovable and is
+# rejected on a holder and treated as holding the lock on an ancestor.
+CALLED_FORM = re.compile(
+    r"\$\{\{\s*inputs\.staging_use_expires_at\s*!=\s*''\s*&&\s*"
+    r"format\('([a-z0-9][a-z0-9-]*)\{0\}',\s*github\.run_id\)\s*\|\|\s*"
+    r"'([A-Za-z0-9_.-]+)'\s*\}\}")
+EVENT_FORM = re.compile(r"([A-Za-z0-9_.-]*)\$\{\{\s*github\.event_name\s*\}\}")
+GRANT_OUTPUT = re.compile(r"\$\{\{\s*needs\.deploy\.outputs\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
+# Same semantic actions through the redacting composition client. Keep the
+# direct-client fixture controls and classify begin/finish just as strictly.
+STAGING_USE = re.compile(r"staging-use(?:-pipeline)?\.mjs\s+([a-z]+)")
+ACTION_NAMES = {"begin": "acquire", "rebind": "acquire", "finish": "release", "consume": "ready"}
+
+
+def staging_use_actions(command):
+    return [ACTION_NAMES.get(action, action) for action in STAGING_USE.findall(command)]
 
 
 class UniqueKeyLoader(yaml.BaseLoader):
@@ -35,197 +167,1572 @@ class UniqueKeyLoader(yaml.BaseLoader):
         return result
 
 
-def workflows():
-    return tuple(yaml.load((ROOT / ".github/workflows" / name).read_text(),
-                           Loader=UniqueKeyLoader) for name in (DEPLOY, VOICE))
+@lru_cache(maxsize=None)
+def _parsed(root):
+    return {path.name: yaml.load(path.read_text(), Loader=UniqueKeyLoader)
+            for path in sorted(root.glob("*.yml"))}
 
 
-def job_group(job, label, errors):
-    lock = job.get("concurrency")
-    if not isinstance(lock, dict):
-        errors.append(f"{label}: missing job-level lifecycle lock")
+def load_all(root=WORKFLOWS):
+    # Parse once; callers may mutate their copy.
+    return deepcopy(_parsed(root))
+
+
+def events(workflow):
+    on = workflow.get("on") or {}
+    return (on,) if isinstance(on, str) else tuple(on)
+
+
+def group_values(raw, context, triggers):
+    """Possible casefolded values of a group, or None when not provable.
+
+    Values are ("lit", text) or ("run", prefix) for prefix + github.run_id.
+    ``context`` is "standalone" (own triggers; workflow_call-only inputs are
+    empty) or "called" (inside deploy-staging, inherited inputs non-empty).
+    """
+    if raw is None:
+        return frozenset()
+    if not isinstance(raw, str) or not raw.strip():
         return None
-    group = lock.get("group")
-    if not isinstance(group, str) or not group.strip() or "${{" in group:
-        errors.append(f"{label}: lifecycle group must be fixed, nonempty, not expression-derived")
+    if EXPRESSION not in raw:
+        return frozenset({("lit", raw.casefold())})
+    called = CALLED_FORM.fullmatch(raw.strip())
+    if called:
+        prefix, fallback = called.groups()
+        return frozenset({("run", prefix.casefold())} if context == "called"
+                         else {("lit", fallback.casefold())})
+    event = EVENT_FORM.fullmatch(raw.strip())
+    if event and context == "standalone" and triggers:
+        return frozenset(("lit", (event.group(1) + name).casefold()) for name in triggers)
+    return None
+
+
+def lock_parts(node):
+    """(group, cancel, form) of a node's concurrency, form None when absent."""
+    lock = node.get("concurrency")
+    if lock is None:
+        return None, None, None
+    if isinstance(lock, str):
+        return lock, None, "shorthand"
+    if isinstance(lock, dict):
+        return lock.get("group"), lock.get("cancel-in-progress"), "mapping"
+    return lock, None, "invalid"
+
+
+def node_values(node, context, triggers):
+    group, _, form = lock_parts(node)
+    if form is None:
+        return frozenset()
+    if form == "mapping" and group is None:
         return None
-    if lock.get("cancel-in-progress") != "false":
-        errors.append(f"{label}: lifecycle lock must explicitly preserve the running job")
+    return group_values(group, context, triggers) if form != "invalid" else None
+
+
+def may_equal(value, canonical):
+    kind, text = value
+    if kind == "lit":
+        return text == canonical
+    return re.fullmatch(re.escape(text) + r"[0-9]+", canonical) is not None
+
+
+def may_hold(node, context, triggers, canonical):
+    values = node_values(node, context, triggers)
+    return values is None or any(may_equal(v, canonical) for v in values)
+
+
+def holds_exactly(node, context, triggers, canonical):
+    """Error text unless the node holds exactly the canonical group, non-cancelling."""
+    group, cancel, form = lock_parts(node)
+    if form != "mapping":
+        return "lifecycle lock must be a mapping with an explicit cancel policy"
+    if group_values(group, context, triggers) != frozenset({("lit", canonical)}):
+        return "lifecycle group must resolve to the fixed canonical group"
+    if cancel != "false":
+        return "lifecycle lock must explicitly preserve the running job"
+    return None
+
+
+def canonical_group(deploy, errors):
+    group, cancel, form = lock_parts(deploy)
+    if form is None:
+        errors.append("deploy-staging: missing workflow-level full-window lock")
+        return None
+    if form != "mapping":
+        errors.append("deploy-staging: full-window lock must explicitly preserve the running run")
+        return None
+    if not isinstance(group, str) or not group.strip() or EXPRESSION in group:
+        errors.append("deploy-staging: full-window group must be fixed, nonempty, "
+                      "not expression-derived")
+        return None
+    if cancel != "false":
+        errors.append("deploy-staging: full-window lock must explicitly preserve the running run")
     # GitHub concurrency group matching is case-insensitive, repository-scoped.
     return group.casefold()
 
 
-def lock_group(node):
-    lock = node.get("concurrency")
-    return lock.get("group", "").casefold() if isinstance(lock, dict) else ""
+def step_runs(job):
+    return [step for step in job.get("steps") or [] if isinstance(step.get("run"), str)]
 
 
-def lifecycle_errors(deploy, voice, invocation):
-    """Accept only a shared fixed lock on both execution jobs, not their caller.
+def staging_use_steps(job, action):
+    return [step for step in step_runs(job)
+            if action in staging_use_actions(step["run"])]
 
-    No expression evaluator: a run-, workflow-, event-, ref-, matrix-, input- or
-    variable-derived key is not the fixed repository-wide exclusion contract.
-    In particular a reusable workflow inherits caller context, so matching
-    expression *text* is insufficient to establish matching lock values.
-    """
+
+def bare(condition):
+    text = (condition or "").strip()
+    if text.startswith(EXPRESSION) and text.endswith("}}"):
+        text = text[len(EXPRESSION):-2].strip()
+    return text
+
+
+def window_errors(wfs, canonical):
     errors = []
-    if invocation not in (voice.get("on") or {}):
-        errors.append(f"voice: missing {invocation} invocation")
-    deploy_job = deploy.get("jobs", {}).get("deploy", {})
-    voice_job = voice.get("jobs", {}).get("synthetic", {})
-    deploy_group = job_group(deploy_job, "deploy", errors)
-    voice_group = job_group(voice_job, "synthetic", errors)
-    if deploy_group and voice_group and deploy_group != voice_group:
-        errors.append("deploy and synthetic: lifecycle job groups do not match")
-
-    caller = deploy.get("jobs", {}).get("voice-synthetic", {})
-    if invocation == "workflow_call":
-        if caller.get("uses") != "./.github/workflows/voice-synthetic.yml":
-            errors.append("caller: must invoke the local voice workflow")
-        needs = caller.get("needs")
-        if needs != "deploy" and needs != ["deploy"]:
-            errors.append("caller: must wait for deploy completion")
-        if "if" in caller or "continue-on-error" in caller:
-            errors.append("caller: must retain default success-only, failure-propagating gate")
-
-    # These nodes remain active while their children run. Holding the same
-    # group here would deadlock (or cancel) the nested lifecycle job.
-    for group in {deploy_group, voice_group} - {None}:
-        for label, ancestor in (("deploy workflow", deploy),
-                                ("voice workflow", voice),
-                                ("reusable caller", caller)):
-            if lock_group(ancestor) == group:
-                errors.append(f"{label}: waiting ancestor holds lifecycle lock")
+    deploy = wfs[DEPLOY]
+    jobs = deploy.get("jobs", {})
+    triggers = events(deploy)
+    for name in WINDOW_JOBS:
+        if name not in jobs:
+            errors.append(f"window: missing {name}")
+    # The workflow holds the group while every job runs; re-holding it at job
+    # level, in any form, deadlocks (or is cancelled by) the waiting run.
+    for name, job in jobs.items():
+        if may_hold(job, "standalone", triggers, canonical):
+            errors.append(f"{name}: job-level lock re-holds the full-window group")
+    if not any(staging_use_steps(job, "acquire") for job in jobs.values()):
+        errors.append("window: deploy-staging never acquires the staging-use grant")
+    releases = [(name, job) for name, job in jobs.items() if staging_use_steps(job, "release")]
+    if not releases:
+        errors.append("release: deploy-staging never releases the staging-use grant")
+    for name, job in releases:
+        needs = job.get("needs")
+        needs = {needs} if isinstance(needs, str) else set(needs or ())
+        if not set(WINDOW_JOBS) <= needs:
+            errors.append(f"release {name}: must wait for every window consumer")
+        if "always()" not in (job.get("if") or ""):
+            errors.append(f"release {name}: must run even after a failed or cancelled consumer")
+        if "continue-on-error" in job or any(
+                "continue-on-error" in step for step in staging_use_steps(job, "release")):
+            errors.append(f"release {name}: release failure must fail the run")
     return errors
 
 
-def locked_fixture(group="fixture-staging-lifecycle"):
-    deploy, voice = deepcopy(workflows())
-    for job in (deploy["jobs"]["deploy"], voice["jobs"]["synthetic"]):
-        job["concurrency"] = {"group": group, "cancel-in-progress": "false"}
-    return deploy, voice
+def child_errors(wfs, canonical):
+    errors = []
+    deploy = wfs[DEPLOY]
+    jobs = deploy.get("jobs", {})
+    outputs = (jobs.get("deploy") or {}).get("outputs") or {}
+    for caller_name, callee_name in CHILDREN.items():
+        caller = jobs.get(caller_name, {})
+        label = f"caller {caller_name}"
+        if caller.get("uses") != f"./.github/workflows/{callee_name}":
+            errors.append(f"{label}: must invoke the local {callee_name}")
+        needs = caller.get("needs")
+        if needs != "deploy" and needs != ["deploy"]:
+            errors.append(f"{label}: must wait for deploy completion")
+        if "if" in caller or "continue-on-error" in caller:
+            errors.append(f"{label}: must retain default success-only, failure-propagating gate")
+        if "concurrency" in caller:
+            errors.append(f"{label}: waiting reusable caller declares concurrency")
+        passed = caller.get("with") or {}
+        for name in INHERITED:
+            match = GRANT_OUTPUT.fullmatch(str(passed.get(name, "")).strip())
+            if not match or match.group(1) not in outputs:
+                errors.append(f"{label}: {name} must come from a declared deploy job output")
+
+        callee = wfs.get(callee_name, {})
+        on = callee.get("on") or {}
+        call_inputs = (on.get("workflow_call") or {}).get("inputs") or {}
+        dispatch_inputs = (on.get("workflow_dispatch") or {}).get("inputs") or {}
+        for name in INHERITED:
+            spec = call_inputs.get(name) or {}
+            if spec.get("type") != "string" or spec.get("required") != "true":
+                errors.append(f"{callee_name}: {name} must be a required workflow_call string")
+            if name in dispatch_inputs:
+                errors.append(f"{callee_name}: standalone dispatch can inject {name}")
+        # Nested groups inside the caller's window (workflow- or job-level, or
+        # none): provable, disjoint from the caller's group, non-cancelling.
+        if may_hold(callee, "called", (), canonical):
+            errors.append(f"{callee_name}: called nested group not provably disjoint")
+        for job_name, job in (callee.get("jobs") or {}).items():
+            if may_hold(job, "called", (), canonical):
+                errors.append(f"{callee_name} {job_name}: called job re-holds the caller's group")
+        for job_name, node in [("workflow", callee)] + list((callee.get("jobs") or {}).items()):
+            _, cancel, form = lock_parts(node)
+            if form is not None and cancel != "false":
+                errors.append(f"{callee_name} {job_name}: nested lock must explicitly "
+                              "preserve the running run")
+        errors += consumer_errors(callee_name, callee)
+    return errors
+
+
+def consumer_errors(callee_name, callee):
+    errors = []
+    jobs = callee.get("jobs") or {}
+    for job_name, job in jobs.items():
+        for action in ("acquire", "release"):
+            for step in staging_use_steps(job, action):
+                guard = bare(step.get("if"))
+                if guard != STANDALONE_GUARD and not guard.startswith(STANDALONE_GUARD + " && "):
+                    errors.append(f"{callee_name} {job_name}: {action} can touch the caller's grant")
+    consumer_name, entry = CONSUMERS[callee_name]
+    consumer = jobs.get(consumer_name, {})
+    live = [i for i, step in enumerate(consumer.get("steps") or [])
+            if entry in str(step.get("run", ""))]
+    if not live:
+        errors.append(f"{callee_name}: live consumer {entry} missing")
+        return errors
+    # Credential separation (test_workflows pins the same for voice): the
+    # live consumer job never holds the staging control credential or client.
+    text = str(consumer).lower()
+    if "ownership_control" in text or "staging-use.mjs" in text:
+        errors.append(f"{callee_name}: live consumer job holds the staging control credential")
+    if bare(consumer.get("if")) not in ("", MAIN_ONLY) or "continue-on-error" in consumer:
+        errors.append(f"{callee_name}: live consumer must keep the main-only, "
+                      "success-gated, failure-propagating gate")
+    needs = consumer.get("needs")
+    needs = {needs} if isinstance(needs, str) else set(needs or ())
+    asserted = False
+    for owner_name, owner in jobs.items():
+        for step in owner.get("steps") or []:
+            actions = staging_use_actions(str(step.get("run", "")))
+            if not {"assert", "ready"} & set(actions):
+                continue
+            before = owner_name in needs and owner_name != consumer_name
+            env = step.get("env") or {}
+            bound = all(str(env.get(var, "")).replace(" ", "") ==
+                        f"${{{{inputs.{name}}}}}" for name, var in INHERITED.items())
+            # Only the inherited-path guard may skip the assert; its job keeps
+            # the plain main-only gate so a skip cannot silently skip consumers.
+            gated_off = (bare(step.get("if")) not in ("", INHERITED_GUARD)
+                         or bare(owner.get("if")) not in ("", MAIN_ONLY))
+            if (before and bound
+                    and str(env.get("OWNERSHIP_CONTROL_TOKEN", "")) == OWNERSHIP_TOKEN
+                    and "continue-on-error" not in step and "continue-on-error" not in owner
+                    and not gated_off):
+                asserted = True
+    if not asserted:
+        errors.append(f"{callee_name}: no authenticated window/readiness assert "
+                      "bound to the caller's grant before live consumption")
+    return errors
+
+
+def standalone_errors(wfs, canonical):
+    errors = []
+    for (file, job_name), job_level in STANDALONE_HOLDERS.items():
+        workflow = wfs.get(file, {})
+        job = (workflow.get("jobs") or {}).get(job_name)
+        label = f"{file} {job_name}"
+        if job is None:
+            errors.append(f"{label}: standalone consumer missing")
+            continue
+        triggers = tuple(t for t in events(workflow) if t != "workflow_call")
+        holders = [node for node in (workflow, job)
+                   if may_hold(node, "standalone", triggers, canonical)]
+        if len(holders) != 1:
+            errors.append(f"{label}: must hold the lifecycle group exactly once "
+                          f"(held {len(holders)} times)")
+            continue
+        if job_level and holders[0] is workflow:
+            errors.append(f"{label}: must hold the lifecycle group at job level")
+        problem = holds_exactly(holders[0], "standalone", triggers, canonical)
+        if problem:
+            errors.append(f"{label}: {problem}")
+    for (file, job_name), role in FREE_JOBS.items():
+        workflow = wfs.get(file, {})
+        job = (workflow.get("jobs") or {}).get(job_name)
+        if job is None:
+            errors.append(f"{file} {job_name}: {role} missing")
+            continue
+        triggers = events(workflow)
+        if any(may_hold(node, "standalone", triggers, canonical) for node in (workflow, job)):
+            errors.append(f"{file} {job_name}: {role} holds the lifecycle group")
+    # Even an unrelated workflow-level group is unsafe here: a previous run
+    # retains it while staging waits, indirectly queueing later prod samples.
+    if "concurrency" in wfs.get(USER_FLOW, {}):
+        errors.append("prod-passive: shared workflow queue couples production to staging waits")
+    passive = (wfs.get(USER_FLOW, {}).get("jobs") or {}).get("prod-passive") or {}
+    needs = passive.get("needs")
+    if needs == "staging" or (isinstance(needs, list) and "staging" in needs):
+        errors.append("prod-passive: production passive probe waits on the staging probe")
+    voice_on = wfs.get(VOICE, {}).get("on") or {}
+    for invocation in INVOCATIONS:
+        if invocation not in voice_on:
+            errors.append(f"voice: missing {invocation} invocation")
+    return errors
+
+
+def observer_errors(wfs, canonical):
+    """Read-only observers: own exclusive queue, observe-only, idle-gated reads."""
+    errors = []
+    aliases = {canonical, *LEGACY_GROUPS}
+    for (file, job_name), role in OBSERVERS.items():
+        workflow = wfs.get(file, {})
+        job = (workflow.get("jobs") or {}).get(job_name)
+        label = f"{file} {job_name}"
+        if job is None:
+            errors.append(f"{label}: {role} missing")
+            continue
+        triggers = tuple(t for t in events(workflow) if t != "workflow_call")
+        # Neither ancestor may queue on the lifecycle group under any spelling;
+        # an unprovable expression counts as holding it.
+        for name, node in (("workflow", workflow), ("job", job)):
+            if any(may_hold(node, "standalone", triggers, alias) for alias in aliases):
+                errors.append(f"{label}: {name} ancestor can queue on the lifecycle group")
+        if "concurrency" in workflow:
+            errors.append(f"{label}: observer queue must be job-level, never workflow-wide")
+        group, cancel, form = lock_parts(job)
+        values = node_values(job, "standalone", triggers)
+        if form != "mapping":
+            errors.append(f"{label}: observer queue must be a mapping with an explicit cancel policy")
+        elif (not isinstance(group, str) or EXPRESSION in group or not values
+              or len(values) != 1):
+            errors.append(f"{label}: observer queue must be fixed, nonempty, not expression-derived")
+        elif cancel != "false":
+            errors.append(f"{label}: observer queue must explicitly preserve the running observation")
+        elif next(iter(values))[1] not in aliases:
+            errors += observer_queue_errors(wfs, label, (file, job_name), next(iter(values))[1])
+        errors += observer_authority_errors(label, job)
+    return errors
+
+
+def observer_queue_errors(wfs, label, owner, own):
+    """No other workflow or job may share the observer's queue, in any context."""
+    errors = []
+    for file, workflow in wfs.items():
+        triggers = tuple(t for t in events(workflow) if t != "workflow_call")
+        contexts = ("standalone", "called") if file in CONSUMERS else ("standalone",)
+        nodes = [("workflow", workflow)] + list((workflow.get("jobs") or {}).items())
+        for name, node in nodes:
+            if (file, name) == owner:
+                continue
+            # Unprovable unrelated groups are out of scope; holders are literal.
+            if any(may_equal(value, own) for context in contexts
+                   for value in node_values(node, context, triggers) or ()):
+                errors.append(f"{label}: observer queue {own} is shared with {file} {name}")
+    return errors
+
+
+def observer_authority_errors(label, job):
+    """Observe once with the control credential; never acquire/ready/release."""
+    errors = []
+    if LIVE_INPUT.search(str(job.get("env") or {})) or "ownership_control" in str(
+            job.get("env") or {}).lower():
+        errors.append(f"{label}: job-level env exposes staging to every observer step")
+    if "continue-on-error" in job:
+        errors.append(f"{label}: a refused observation must fail the observer")
+    steps = list(job.get("steps") or [])
+    observes = []
+    for i, step in enumerate(steps):
+        run = str(step.get("run", ""))
+        for action in staging_use_actions(run):
+            if action != OBSERVE:
+                errors.append(f"{label}: step {i} can {action} the staging window (observe only)")
+        if staging_use_actions(run) == [OBSERVE]:
+            observes.append(i)
+        if ("ownership_control" in str(step).lower()
+                and not re.fullmatch(r"node wrangler/scripts/staging-use\.mjs observe", run.strip())):
+            errors.append(f"{label}: step {i} mixes the staging control credential with other work")
+    if len(observes) != 1:
+        errors.append(f"{label}: must observe the staging window exactly once (found {len(observes)})")
+        return errors
+    observer = steps[observes[0]]
+    oid = observer.get("id")
+    if not oid:
+        errors.append(f"{label}: observe step needs an id to gate live reads")
+    if "continue-on-error" in observer:
+        errors.append(f"{label}: a refused observation must fail the observer")
+    if str((observer.get("env") or {}).get("OWNERSHIP_CONTROL_TOKEN", "")) != OWNERSHIP_TOKEN:
+        errors.append(f"{label}: observe step must authenticate with the staging control credential")
+    for i, step in enumerate(steps):
+        if i == observes[0]:
+            continue
+        reads = [str(v) for v in (step.get("env") or {}).values() if LIVE_INPUT.search(str(v))]
+        if LIVE_INPUT.search(str(step.get("run", "")) + str(step.get("with") or {})):
+            reads.append(None)
+        if reads and not live_read_gated(bare(step.get("if")), oid, reads):
+            errors.append(f"{label}: step {i} reads staging without an observed active window")
+    return errors
+
+
+def live_read_gated(condition, oid, reads):
+    """Every disjunct requires the observer's active sample, or is the
+    dispatch-only force_fail path whose every staging input is rerouted."""
+    if not condition or not oid:
+        return False
+    for disjunct in condition.split("||"):
+        conjuncts = [part.strip(" ()") for part in disjunct.split("&&")]
+        if any((m := SAMPLE.fullmatch(part)) and m.group(1) == oid for part in conjuncts):
+            continue
+        if conjuncts == ["inputs.force_fail"] and all(
+                r is not None and (m := REROUTED.fullmatch(squash(r)))
+                and "staging" not in m.group(1).casefold() for r in reads):
+            continue
+        return False
+    return True
+
+
+def repository_errors(wfs, canonical):
+    """Split locks, caller closure and the staging-consumer inventory."""
+    errors = []
+    callers = {f"./.github/workflows/{name}" for name in CHILDREN.values()}
+    holders = set(STANDALONE_HOLDERS) | set(OBSERVERS)
+    for file, workflow in wfs.items():
+        triggers = tuple(t for t in events(workflow) if t != "workflow_call")
+        nodes = [("workflow", workflow)] + list((workflow.get("jobs") or {}).items())
+        for name, node in nodes:
+            for kind, text in node_values(node, "standalone", triggers) or ():
+                if kind == "lit" and text in LEGACY_GROUPS and text != canonical:
+                    errors.append(f"split lifecycle lock: {file} {name} holds {text}")
+            if name == "workflow":
+                continue
+            if node.get("uses") in callers and (file != DEPLOY or name not in CHILDREN):
+                errors.append(f"caller closure: {file} {name} calls a window consumer")
+            env = str(node.get("environment") or "")
+            touches = STAGING_TOUCH.search(str(node)) or "staging" in env
+            classified = (file in (DEPLOY, *CONSUMERS) or (file, name) in holders
+                          or (file, name) in EXEMPT)
+            if touches and not classified:
+                errors.append(f"inventory: unclassified staging consumer {file} {name}")
+    for file, name in EXEMPT:
+        if name not in (wfs.get(file, {}).get("jobs") or {}):
+            errors.append(f"inventory: stale exemption {file} {name}")
+    return errors
+
+
+def need_set(node):
+    needs = node.get("needs")
+    return {needs} if isinstance(needs, str) else set(needs or ())
+
+
+def squash(value):
+    return re.sub(r"\s+", "", str(value or ""))
+
+
+def expr(text):
+    return f"${{{{ {text} }}}}"
+
+
+GUARD_SHA = expr("needs.guard.outputs.sha")
+# Ordinary guarded deploy only: rollback and the live-SHA cure never queue on
+# staging. Every clause is required and the condition is a pure conjunction.
+SOAK_CLAUSES = ("needs.guard.outputs.skip == ''", "needs.guard.outputs.mode == 'deploy'",
+                "needs.guard.outputs.allow_unstaged != 'true'")
+# Any of these can re-admit a failed/cancelled/rollback path into a condition.
+WIDENING = ("||", "always()", "cancelled()", "failure()")
+# The grant (original authority) stays capped at 40 minutes. The job ceiling is
+# separate and must leave at least 10 minutes past the grant for checkout and
+# the always-run stop/artifact steps; expiry is never renewed to fit.
+MAX_SOAK_MINUTES = 40
+MAX_SOAK_JOB_MINUTES = 50
+MIN_SOAK_STOP_MARGIN_MINUTES = 10
+# A credential-bearing step may run exactly one lifecycle client command.
+LIFECYCLE_ONLY = re.compile(r"node wrangler/scripts/(?:staging-use(?:-pipeline)?\.mjs [a-z]+|"
+                            r"staging-soak-window\.mjs)")
+LIVE_READ = re.compile(r"STAGING_WORKER_URL|METRICS_SCRAPE_TOKEN|OWNERSHIP_CONTROL")
+SOAK_WINDOW = "staging-soak-window.mjs"
+BASELINE = "rest-5xx-counters.mjs"
+FINAL_PROBE = "promotion_regression_gate.py staging"
+STEP_OUTPUT = re.compile(r"\$\{\{\s*steps\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.[A-Za-z_][A-Za-z0-9_-]*\s*\}\}")
+SOAK_OUTPUT = re.compile(r"\$\{\{\s*needs\.soak\.outputs\.[A-Za-z_][A-Za-z0-9_-]*\s*\}\}")
+PUBLISHED = f"needs.{PUBLISHER}.result == 'success'"
+
+
+def soak_step_errors(job):
+    """Whole-window shape of the promotion soak's steps (spelling-agnostic)."""
+    errors = []
+    steps = list(job.get("steps") or [])
+    runs = [str(step.get("run", "")) for step in steps]
+    acquires = [i for i, step in enumerate(steps)
+                if "acquire" in staging_use_actions(runs[i])]
+    if len(acquires) != 1:
+        return [f"soak: must acquire exactly one original grant (found {len(acquires)})"]
+    start = acquires[0]
+    grant = steps[start]
+    gid = grant.get("id")
+    env = grant.get("env") or {}
+    if not gid or "if" in grant:
+        errors.append("soak: acquire must be an unconditional step with an id")
+    if squash(env.get("STAGING_USE_EXPECTED_SHA")) != squash(GUARD_SHA):
+        errors.append("soak: acquire must refuse any build but the guarded SHA")
+    if str(env.get("OWNERSHIP_CONTROL_TOKEN", "")) != OWNERSHIP_TOKEN:
+        errors.append("soak: acquire must use the staging control credential")
+    # Budget findings never short-circuit the structural checks below.
+    budget = []
+    minutes, timeout = str(env.get("STAGING_USE_MINUTES", "")), str(job.get("timeout-minutes", ""))
+    if not (minutes.isdigit() and 0 < int(minutes) <= MAX_SOAK_MINUTES):
+        budget.append("soak: grant must hold one literal bounded expiry "
+                      f"(0 < minutes <= {MAX_SOAK_MINUTES})")
+    if not (timeout.isdigit() and 0 < int(timeout) <= MAX_SOAK_JOB_MINUTES):
+        budget.append("soak: job must hold one literal bounded timeout "
+                      f"(0 < timeout <= {MAX_SOAK_JOB_MINUTES})")
+    elif minutes.isdigit() and int(timeout) - int(minutes) < MIN_SOAK_STOP_MARGIN_MINUTES:
+        budget.append("soak: job timeout must exceed the grant by at least "
+                      f"{MIN_SOAK_STOP_MARGIN_MINUTES} minutes for stop and evidence")
+    binding = {"STAGING_USE_EXPIRES_AT": expr(f"steps.{gid}.outputs.expires_at"),
+               "STAGING_USE_DEPLOYMENT": expr(f"steps.{gid}.outputs.deployment_id"),
+               "STAGING_USE_SHA": GUARD_SHA}
+    receipt = env.get("STAGING_USE_RECEIPT")
+
+    def find(predicate):
+        return [i for i, run in enumerate(runs) if predicate(run)]
+
+    windows = find(lambda run: SOAK_WINDOW in run)
+    baselines = find(lambda run: BASELINE in run)
+    outputs = job.get("outputs") or {}
+    judge_ids = {m.group(1) for v in outputs.values() for m in [STEP_OUTPUT.fullmatch(str(v).strip())] if m}
+    judges = [i for i, step in enumerate(steps) if step.get("id") in judge_ids and FINAL_PROBE in runs[i]]
+    readies = [i for i in find(lambda run: "ready" in staging_use_actions(run)) if i != start]
+    releases = find(lambda run: "release" in staging_use_actions(run))
+    if len(windows) != 1:
+        errors.append("soak: exactly one fresh live interval must be measured")
+    if not baselines:
+        errors.append("soak: baseline metrics missing")
+    if (len(judges) != 1 or set(outputs) != {"skip", "evidence"} or len(judge_ids) != 1
+            or not all(STEP_OUTPUT.fullmatch(str(v).strip()) for v in outputs.values())):
+        errors.append("soak: verdict outputs must come from the one final candidate probe")
+    if len(releases) != 1:
+        errors.append(f"soak: must release the original grant exactly once (found {len(releases)})")
+    if errors:
+        return errors + budget
+    window, judge, release = windows[0], judges[0], releases[0]
+    after = [i for i in readies if judge < i < release]
+    if not (any(start < i < window for i in baselines) and start < window < judge):
+        errors.append("soak: grant, baseline, live interval and final probe out of order")
+    if not after:
+        errors.append("soak: original grant must be rechecked after final sampling, before release")
+    if "--baseline-counters" not in runs[judge]:
+        errors.append("soak: final probe must be judged against this window's baseline")
+    if squash(steps[window].get("env", {}).get("AUTO")) != squash(expr("needs.guard.outputs.auto")):
+        errors.append("soak: interval length must follow the guarded run's automatic flag")
+    for i in [window, *after, release]:
+        step = steps[i]
+        senv = step.get("env") or {}
+        names = ("STAGING_USE_EXPIRES_AT",) if i == release else tuple(binding)
+        if any(squash(senv.get(name)) != squash(binding[name]) for name in names):
+            errors.append(f"soak: step {i} is not bound to the original grant")
+        if senv.get("STAGING_USE_RECEIPT") != receipt:
+            errors.append(f"soak: step {i} writes a different lifecycle receipt")
+        if i != release and "if" in step:
+            errors.append(f"soak: step {i} can skip a lifecycle assertion")
+    guard = bare(steps[release].get("if"))
+    if not guard.startswith("always()") or f"steps.{gid}.outputs.expires_at" not in guard:
+        errors.append("soak: release must always run once the original expiry exists")
+    # Every live read (control, Worker or metrics) sits inside the grant.
+    for i, step in enumerate(steps):
+        if LIVE_READ.search(str(step)) and not start <= i <= release:
+            errors.append(f"soak: step {i} reads staging outside the held grant")
+    # Credential isolation: metrics/probe/artifact steps never see the token.
+    if "ownership_control" in str(job.get("env") or {}).lower():
+        errors.append("soak: job-level env leaks the staging control credential")
+    for i, step in enumerate(steps):
+        if "ownership_control" in str(step).lower() and not LIFECYCLE_ONLY.fullmatch(runs[i].strip()):
+            errors.append(f"soak: step {i} mixes the staging control credential with other work")
+    retained = [step for step in steps[release + 1:]
+                if "actions/upload-artifact@" in str(step.get("uses", ""))]
+    if not any(bare(step.get("if")) == "always()"
+               and {"github.run_id", "github.run_attempt"} <= set(
+                   re.findall(r"github\.run_(?:id|attempt)", str((step.get("with") or {}).get("name"))))
+               and str(receipt) in str((step.get("with") or {}).get("path"))
+               for step in retained):
+        errors.append("soak: lifecycle evidence must always be retained per run attempt")
+    return errors + budget
+
+
+def promotion_soak_errors(wfs, canonical):
+    """deploy-production: soak is the only staging holder; publisher is pure."""
+    errors = []
+    workflow = wfs.get(PRODUCTION, {})
+    jobs = workflow.get("jobs") or {}
+    triggers = tuple(t for t in events(workflow) if t != "workflow_call")
+    # Production and its rollback must never queue behind staging.
+    for name, node in [("workflow", workflow)] + list(jobs.items()):
+        if name != SOAK and may_hold(node, "standalone", triggers, canonical):
+            errors.append(f"production coupling: {PRODUCTION} {name} can wait on staging")
+    soak = jobs.get(SOAK)
+    if soak is not None:
+        if need_set(soak) != {"guard"}:
+            errors.append("soak: must wait only on the guard, never a production-lane job")
+        condition = bare(soak.get("if"))
+        if (any(token in condition for token in WIDENING)
+                or not all(clause in condition for clause in SOAK_CLAUSES)):
+            errors.append("soak: only an ordinary guarded deploy may enter the staging window")
+        if "continue-on-error" in soak or any("continue-on-error" in s for s in soak.get("steps") or []):
+            errors.append("soak: a failed lifecycle or sample step must fail the soak")
+        errors += soak_step_errors(soak)
+    publisher = jobs.get(PUBLISHER)
+    if publisher is None:
+        errors.append("publisher: staging-soak-evidence missing")
+        return errors
+    condition = bare(publisher.get("if"))
+    if (SOAK not in need_set(publisher) or "needs.soak.result == 'success'" not in condition
+            # `!cancelled()` is harmless here: it is AND-ed with soak success.
+            or any(token in condition for token in ("||", "always()", "failure()"))
+            or "skipped" in condition):
+        errors.append("publisher: only a successful soak may qualify")
+    text = str(publisher)
+    if ("environment" in publisher or "secrets." in text or STAGING_TOUCH.search(text)
+            or re.search(r"vars\.STAGING", text) or "continue-on-error" in text):
+        errors.append("publisher: must hold no environment, secret or live staging input")
+    if (publisher.get("permissions") or {}) not in ({}, {"contents": "read"}):
+        errors.append("publisher: must hold no read/write scope beyond contents")
+    steps = publisher.get("steps") or []
+    if (len(steps) != 1 or "uses" in steps[0] or "if" in steps[0]
+            or not all(SOAK_OUTPUT.fullmatch(str(v).strip())
+                       for v in (steps[0].get("env") or {}).values())):
+        errors.append("publisher: must be one step republishing only soak outputs")
+    for name in ("production", "recheck"):
+        if PUBLISHED not in bare((jobs.get(name) or {}).get("if")):
+            errors.append(f"publisher: {name} must require the published soak verdict")
+    return errors
+
+
+def lifecycle_errors(wfs):
+    errors = []
+    canonical = canonical_group(wfs.get(DEPLOY, {}), errors)
+    if canonical is None:
+        return errors
+    for check in (window_errors, child_errors, standalone_errors, observer_errors,
+                  repository_errors, promotion_soak_errors):
+        errors += check(wfs, canonical)
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Conceptual target fixture. It is built from the checked-in workflows and
+# rewired in memory to the accepted shape, so the controls below are
+# executable today and do not depend on the final #2004 spelling. The
+# repository assertions (RepositoryContractTests) read only checked-in YAML.
+# ---------------------------------------------------------------------------
+
+FIXTURE_GROUP = "fixture-staging-lifecycle"
+FIXTURE_OBSERVER = "fixture-user-flow-observer"
+
+
+def called_group(prefix, fallback):
+    return (f"${{{{ inputs.staging_use_expires_at != '' && "
+            f"format('{prefix}{{0}}', github.run_id) || '{fallback}' }}}}")
+
+
+def assert_step():
+    env = {var: f"${{{{ inputs.{name} }}}}" for name, var in INHERITED.items()}
+    env["OWNERSHIP_CONTROL_TOKEN"] = OWNERSHIP_TOKEN
+    return {"name": "Assert the caller's staging window",
+            "env": env, "run": "node wrangler/scripts/staging-use.mjs ready"}
+
+
+def strip_staging_use(workflow):
+    """Drop checked-in staging-use wiring so the fixture is the only wiring.
+
+    Keeps every control meaningful before and after #2004 lands: a mutation
+    that removes the fixture's step cannot be masked by a real one.
+    """
+    jobs = workflow["jobs"]
+    for name in [n for n, job in jobs.items()
+                 if staging_use_steps(job, "release") and n not in WINDOW_JOBS]:
+        del jobs[name]
+    for job in jobs.values():
+        if "steps" in job:
+            job["steps"] = [step for step in job["steps"]
+                            if not STAGING_USE.search(str(step.get("run", "")))]
+
+
+def target_fixture(group=FIXTURE_GROUP):
+    wfs = load_all()
+    lock = {"group": group, "cancel-in-progress": "false"}
+    deploy = wfs[DEPLOY]
+    deploy["concurrency"] = dict(lock)
+    jobs = deploy["jobs"]
+    for workflow in (deploy, wfs[VOICE], wfs[HELP]):
+        strip_staging_use(workflow)
+    for job in jobs.values():
+        job.pop("concurrency", None)
+    jobs["deploy"].setdefault("outputs", {}).update(
+        {"staging_use_expires_at": "${{ steps.use.outputs.expires_at }}",
+         "staging_use_sha": "${{ steps.use.outputs.sha }}",
+         "staging_use_deployment": "${{ steps.use.outputs.deployment }}"})
+    jobs["deploy"]["steps"].insert(0, {"id": "use", "run": "node wrangler/scripts/staging-use.mjs acquire"})
+    for caller in CHILDREN:
+        jobs[caller]["with"] = {name: f"${{{{ needs.deploy.outputs.{name} }}}}" for name in INHERITED}
+    jobs["staging-use-release"] = {
+        "needs": list(WINDOW_JOBS), "if": "always()",
+        "steps": [{"run": "node wrangler/scripts/staging-use.mjs release"}]}
+    for name, prefix in ((VOICE, "staging-voice-consumer-"), (HELP, "staging-help-consumer-")):
+        callee = wfs[name]
+        callee["concurrency"] = {"group": called_group(prefix, group), "cancel-in-progress": "false"}
+        callee["on"]["workflow_call"]["inputs"] = {
+            input_name: {"type": "string", "required": "true"} for input_name in INHERITED}
+        consumer_name, _ = CONSUMERS[name]
+        consumer = callee["jobs"][consumer_name]
+        consumer.pop("concurrency", None)
+        # Separate staging-environment job; the consumer keeps only its bot token.
+        step = assert_step()
+        step["if"] = INHERITED_GUARD
+        callee["jobs"]["staging-window"] = {"if": MAIN_ONLY, "environment": "staging",
+                                            "steps": [step]}
+        consumer["needs"] = "staging-window"
+    wfs[USER_FLOW]["jobs"]["staging"]["concurrency"] = {"group": FIXTURE_OBSERVER,
+                                                        "cancel-in-progress": "false"}
+    wfs[CONTAINER]["concurrency"] = dict(lock)
+    wfs[ROLLBACK]["jobs"]["drill"]["concurrency"] = dict(lock)
+    wfs[MCP]["concurrency"] = dict(lock)
+    jobs = wfs[PRODUCTION]["jobs"]
+    jobs[SOAK] = soak_fixture(dict(lock))
+    jobs[PUBLISHER] = publisher_fixture()
+    return wfs
+
+
+FIXTURE_RECEIPT = "${{ runner.temp }}/fixture-use.ndjson"
+
+
+def soak_fixture(lock):
+    """Conceptual whole-window soak, deliberately spelled unlike #2004."""
+    url = {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"}
+    grant = {**url, "OWNERSHIP_CONTROL_TOKEN": OWNERSHIP_TOKEN,
+             "STAGING_USE_SHA": GUARD_SHA,
+             "STAGING_USE_DEPLOYMENT": expr("steps.grant.outputs.deployment_id"),
+             "STAGING_USE_EXPIRES_AT": expr("steps.grant.outputs.expires_at"),
+             "STAGING_USE_RECEIPT": FIXTURE_RECEIPT}
+    metrics = {**url, "METRICS_SCRAPE_TOKEN": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"}
+    return {
+        "needs": "guard", "if": " && ".join(SOAK_CLAUSES), "concurrency": lock,
+        "environment": {"name": "staging", "deployment": "false"}, "timeout-minutes": "45",
+        "outputs": {"skip": expr("steps.verdict.outputs.skip"),
+                    "evidence": expr("steps.verdict.outputs.evidence")},
+        "steps": [
+            {"uses": "actions/checkout@fixture"},
+            {"id": "grant", "env": {**url, "OWNERSHIP_CONTROL_TOKEN": OWNERSHIP_TOKEN,
+                                    "STAGING_USE_EXPECTED_SHA": GUARD_SHA, "STAGING_USE_MINUTES": "35",
+                                    "STAGING_USE_RECEIPT": FIXTURE_RECEIPT},
+             "run": "node wrangler/scripts/staging-use-pipeline.mjs begin"},
+            {"env": metrics, "run": "node wrangler/scripts/rest-5xx-counters.mjs --out b.json"},
+            {"env": {**grant, "AUTO": expr("needs.guard.outputs.auto")},
+             "run": "node wrangler/scripts/staging-soak-window.mjs"},
+            {"id": "verdict", "env": metrics,
+             "run": "python3 scripts/promotion_regression_gate.py staging --baseline-counters b.json"},
+            {"env": dict(grant), "run": "node wrangler/scripts/staging-use-pipeline.mjs consume"},
+            {"if": "always() && steps.grant.outputs.expires_at != ''",
+             "env": {key: grant[key] for key in ("STAGING_WORKER_URL", "OWNERSHIP_CONTROL_TOKEN",
+                                                 "STAGING_USE_EXPIRES_AT", "STAGING_USE_RECEIPT")},
+             "run": "node wrangler/scripts/staging-use-pipeline.mjs finish"},
+            {"if": "always()", "uses": "actions/upload-artifact@fixture",
+             "with": {"name": "fixture-${{ github.run_attempt }}-${{ github.run_id }}",
+                      "path": f"{FIXTURE_RECEIPT}\nb.json"}}]}
+
+
+def publisher_fixture():
+    return {"needs": ["guard", SOAK],
+            "if": "!cancelled() && needs.guard.result == 'success' && needs.soak.result == 'success'",
+            "permissions": {"contents": "read"},
+            "outputs": {"skip": expr("steps.publish.outputs.skip"),
+                        "evidence": expr("steps.publish.outputs.evidence")},
+            "steps": [{"id": "publish", "shell": "python3 {0}", "run": "print('republish')",
+                       "env": {"SKIP": expr("needs.soak.outputs.skip"),
+                               "EVIDENCE": expr("needs.soak.outputs.evidence")}}]}
 
 
 class RepositoryContractTests(unittest.TestCase):
-    def test_scheduled_synthetic_excludes_deploy(self):
-        self.assertEqual(lifecycle_errors(*workflows(), "schedule"), [])
+    """Executable against the checked-in workflows; red until #2004 wires them."""
 
-    def test_manual_synthetic_excludes_deploy(self):
-        self.assertEqual(lifecycle_errors(*workflows(), "workflow_dispatch"), [])
-
-    def test_called_synthetic_excludes_deploy_without_nested_lock(self):
-        self.assertEqual(lifecycle_errors(*workflows(), "workflow_call"), [])
+    def test_checked_in_workflows_meet_the_full_window_contract(self):
+        self.assertEqual(lifecycle_errors(load_all()), [])
 
 
 class LockOracleControls(unittest.TestCase):
-    def assert_rejected(self, deploy, voice, claim):
-        for invocation in INVOCATIONS:
-            with self.subTest(invocation=invocation):
-                self.assertTrue(any(claim in e for e in lifecycle_errors(
-                    deploy, voice, invocation)), (claim, invocation))
+    def test_composition_actions_keep_the_same_mutation_and_readiness_guards(self):
+        self.assertEqual(staging_use_actions("node staging-use-pipeline.mjs begin"), ["acquire"])
+        self.assertEqual(staging_use_actions("node staging-use-pipeline.mjs finish"), ["release"])
+        self.assertEqual(staging_use_actions("node staging-use-pipeline.mjs consume"), ["ready"])
+        self.assertEqual(staging_use_actions("node staging-use-pipeline.mjs rebind"), ["acquire"])
+        wfs = target_fixture()
+        for workflow in wfs.values():
+            for job in workflow.get("jobs", {}).values():
+                for step in step_runs(job):
+                    step["run"] = (step["run"].replace("staging-use.mjs acquire", "staging-use-pipeline.mjs begin")
+                                   .replace("staging-use.mjs release", "staging-use-pipeline.mjs finish"))
+        self.assertEqual(lifecycle_errors(wfs), [])
+        # The composed client cannot bypass either the final-release dependency
+        # closure or the inherited path's prohibition on acquire/release.
+        release = next(job for job in wfs[DEPLOY]["jobs"].values() if staging_use_steps(job, "release"))
+        release["needs"] = ["deploy"]
+        self.assert_rejected(wfs, "must wait for every window consumer")
+        wfs = target_fixture()
+        wfs[VOICE]["jobs"]["staging-window"]["steps"].append({
+            "run": "node staging-use-pipeline.mjs finish", "if": INHERITED_GUARD})
+        self.assert_rejected(wfs, "release can touch the caller's grant")
 
-    def test_fixed_job_locks_accept_all_entrypoints_without_pinning_spelling(self):
-        for group in ("fixture-staging-lifecycle", "another-valid-lifecycle-key"):
-            deploy, voice = locked_fixture(group)
-            for invocation in INVOCATIONS:
-                with self.subTest(group=group, invocation=invocation):
-                    self.assertEqual(lifecycle_errors(deploy, voice, invocation), [])
+    def assert_rejected(self, wfs, claim):
+        errors = lifecycle_errors(wfs)
+        self.assertTrue(any(claim in e for e in errors), (claim, errors))
+
+    def test_target_shape_is_accepted_without_pinning_spelling(self):
+        for group in (FIXTURE_GROUP, "another-valid-lifecycle-key", *LEGACY_GROUPS):
+            with self.subTest(group=group):
+                self.assertEqual(lifecycle_errors(target_fixture(group)), [])
+
+    def test_production_probe_cannot_wait_on_an_unrelated_shared_workflow_queue(self):
+        wfs = target_fixture()
+        wfs[USER_FLOW]["jobs"]["prod-passive"]["concurrency"] = {
+            "group": "production-samples", "cancel-in-progress": "false"}
+        self.assertEqual(lifecycle_errors(wfs), [])
+        wfs[USER_FLOW]["concurrency"] = {"group": "synthetic-user-flow", "cancel-in-progress": "false"}
+        self.assert_rejected(wfs, "shared workflow queue couples production")
 
     def test_group_comparison_is_case_insensitive(self):
-        deploy, voice = locked_fixture()
-        voice["jobs"]["synthetic"]["concurrency"]["group"] = "FIXTURE-STAGING-LIFECYCLE"
-        for invocation in INVOCATIONS:
-            self.assertEqual(lifecycle_errors(deploy, voice, invocation), [])
+        wfs = target_fixture()
+        wfs[ROLLBACK]["jobs"]["drill"]["concurrency"]["group"] = FIXTURE_GROUP.upper()
+        wfs[DEPLOY]["concurrency"]["group"] = FIXTURE_GROUP.swapcase()
+        self.assertEqual(lifecycle_errors(wfs), [])
 
-    def test_missing_lock_on_either_execution_job_is_rejected(self):
-        for target in ("deploy", "synthetic"):
-            deploy, voice = locked_fixture()
-            (deploy if target == "deploy" else voice)["jobs"][target].pop("concurrency")
-            with self.subTest(target=target):
-                self.assert_rejected(deploy, voice, "missing job-level")
-
-    def test_distinct_job_groups_are_rejected(self):
-        deploy, voice = locked_fixture()
-        voice["jobs"]["synthetic"]["concurrency"]["group"] = "different-lifecycle"
-        self.assert_rejected(deploy, voice, "groups do not match")
-
-    def test_empty_missing_and_expression_derived_keys_are_rejected(self):
-        keys = (None, "", " ", "${{ github.run_id }}", "${{ github.workflow }}-staging",
-                "staging-${{ github.event_name }}", "staging-${{ github.ref }}",
-                "${{ inputs.lock }}", "${{ vars.LIFECYCLE_GROUP }}",
-                "staging-${{ matrix.target }}")
-        for key in keys:
-            for target in ("deploy", "synthetic", "both"):
-                deploy, voice = locked_fixture()
-                jobs = {"deploy": deploy["jobs"]["deploy"],
-                        "synthetic": voice["jobs"]["synthetic"]}
-                for name, job in jobs.items():
-                    if target in (name, "both"):
-                        job["concurrency"]["group"] = key
-                with self.subTest(key=key, target=target):
-                    self.assert_rejected(deploy, voice, "must be fixed")
+    # Old guarantee: fixed, nonempty, non-expression, non-cancelling group.
+    def test_missing_empty_or_expression_full_window_group_is_rejected(self):
+        for key in (None, "", " ", "${{ github.run_id }}", "${{ github.workflow }}-staging",
+                    "staging-${{ github.event_name }}", "staging-${{ github.ref }}",
+                    "${{ inputs.lock }}", "${{ vars.LIFECYCLE_GROUP }}",
+                    called_group("staging-x-", FIXTURE_GROUP)):
+            wfs = target_fixture()
+            wfs[DEPLOY]["concurrency"]["group"] = key
+            with self.subTest(key=key):
+                self.assert_rejected(wfs, "must be fixed")
+        wfs = target_fixture()
+        del wfs[DEPLOY]["concurrency"]
+        self.assert_rejected(wfs, "missing workflow-level full-window lock")
+        wfs = target_fixture()
+        wfs[DEPLOY]["concurrency"] = FIXTURE_GROUP
+        self.assert_rejected(wfs, "full-window lock must explicitly preserve")
 
     def test_cancelling_or_implicit_cancel_policy_is_rejected(self):
-        for target in ("deploy", "synthetic"):
-            for value in ("true", "${{ github.event_name == 'push' }}", None):
-                deploy, voice = locked_fixture()
-                lock = (deploy if target == "deploy" else voice)["jobs"][target]["concurrency"]
+        for value in ("true", "${{ github.event_name == 'push' }}", None):
+            for target in ("deploy", "voice", "help", "rollback", "mcp", "observer"):
+                wfs = target_fixture()
+                lock = {"deploy": wfs[DEPLOY]["concurrency"],
+                        "voice": wfs[VOICE]["concurrency"],
+                        "help": wfs[HELP]["concurrency"],
+                        "rollback": wfs[ROLLBACK]["jobs"]["drill"]["concurrency"],
+                        "mcp": wfs[MCP]["concurrency"],
+                        "observer": wfs[USER_FLOW]["jobs"]["staging"]["concurrency"]}[target]
                 if value is None:
                     lock.pop("cancel-in-progress")
                 else:
                     lock["cancel-in-progress"] = value
                 with self.subTest(target=target, value=value):
-                    self.assert_rejected(deploy, voice, "preserve the running job")
+                    self.assert_rejected(wfs, "preserve the running")
 
-    def test_workflow_level_only_lock_is_not_execution_job_exclusion(self):
-        deploy, voice = locked_fixture()
-        for workflow, job in ((deploy, "deploy"), (voice, "synthetic")):
-            workflow["concurrency"] = workflow["jobs"][job].pop("concurrency")
-        self.assert_rejected(deploy, voice, "missing job-level")
+    # Expanded window: the old job-level-only shape is now insufficient.
+    def test_old_job_level_only_shape_is_rejected(self):
+        # The pre-#2004 shape: deploy-staging serializes on its own group while
+        # only the deploy and voice execution jobs share staging-lifecycle.
+        wfs = target_fixture("deploy-staging")
+        old = {"group": "staging-lifecycle", "cancel-in-progress": "false"}
+        wfs[DEPLOY]["jobs"]["deploy"]["concurrency"] = dict(old)
+        wfs[VOICE]["concurrency"] = {"group": "voice-synthetic", "cancel-in-progress": "false"}
+        wfs[VOICE]["jobs"]["synthetic"]["concurrency"] = dict(old)
+        self.assert_rejected(wfs, "split lifecycle lock")
+        self.assert_rejected(wfs, f"{VOICE} synthetic: must hold the lifecycle group exactly once")
 
-    def test_waiting_workflow_or_reusable_caller_cannot_hold_shared_lock(self):
-        for target in ("deploy workflow", "voice workflow", "caller"):
-            deploy, voice = locked_fixture()
-            ancestor = {"deploy workflow": deploy, "voice workflow": voice,
-                        "caller": deploy["jobs"]["voice-synthetic"]}[target]
-            ancestor["concurrency"] = {"group": "FIXTURE-STAGING-LIFECYCLE",
-                                       "cancel-in-progress": "false"}
-            self.assert_rejected(deploy, voice, "waiting ancestor holds")
+    def test_each_window_job_must_remain(self):
+        for name in WINDOW_JOBS:
+            wfs = target_fixture()
+            del wfs[DEPLOY]["jobs"][name]
+            with self.subTest(job=name):
+                self.assert_rejected(wfs, f"window: missing {name}")
 
-    def test_lock_on_preflight_instead_of_deploy_is_rejected(self):
-        deploy, voice = locked_fixture()
-        deploy["jobs"]["schema-gate"]["concurrency"] = deploy["jobs"]["deploy"].pop("concurrency")
-        self.assert_rejected(deploy, voice, "deploy: missing job-level")
+    def test_job_level_rehold_inside_window_is_rejected_in_every_form(self):
+        forms = (FIXTURE_GROUP, FIXTURE_GROUP.upper(),
+                 {"group": FIXTURE_GROUP, "cancel-in-progress": "false"},
+                 "${{ vars.LIFECYCLE_GROUP }}", {"group": "${{ github.workflow }}"})
+        for job in ("deploy", "user-flow-synthetic", "certify-promotion", "staging-use-release"):
+            for form in forms:
+                wfs = target_fixture()
+                wfs[DEPLOY]["jobs"][job]["concurrency"] = deepcopy(form)
+                with self.subTest(job=job, form=form):
+                    self.assert_rejected(wfs, f"{job}: job-level lock re-holds")
 
-    def test_each_invocation_must_remain_available(self):
-        for invocation in INVOCATIONS:
-            deploy, voice = locked_fixture()
-            voice["on"].pop(invocation)
-            with self.subTest(invocation=invocation):
-                self.assertIn(f"voice: missing {invocation} invocation",
-                              lifecycle_errors(deploy, voice, invocation))
+    def test_unrelated_job_level_group_inside_window_is_accepted(self):
+        wfs = target_fixture()
+        wfs[DEPLOY]["jobs"]["certify-promotion"]["concurrency"] = {
+            "group": "certify-promotion", "cancel-in-progress": "false"}
+        self.assertEqual(lifecycle_errors(wfs), [])
 
-    def test_called_synthetic_requires_successful_deploy_and_local_call(self):
-        changes = ({"needs": "schema-gate"}, {"uses": "./wrong.yml"},
-                   {"if": "always()"}, {"continue-on-error": "true"})
-        for change in changes:
-            deploy, voice = locked_fixture()
-            deploy["jobs"]["voice-synthetic"].update(change)
+    def test_missing_acquire_or_release_is_rejected(self):
+        wfs = target_fixture()
+        del wfs[DEPLOY]["jobs"]["deploy"]["steps"][0]
+        self.assert_rejected(wfs, "never acquires")
+        wfs = target_fixture()
+        del wfs[DEPLOY]["jobs"]["staging-use-release"]
+        self.assert_rejected(wfs, "never releases")
+
+    def test_release_must_close_the_window_and_fail_honestly(self):
+        changes = (({"needs": ["deploy"]}, "every window consumer"),
+                   ({"if": "success()"}, "even after a failed"),
+                   ({"continue-on-error": "true"}, "must fail the run"))
+        for change, claim in changes:
+            wfs = target_fixture()
+            wfs[DEPLOY]["jobs"]["staging-use-release"].update(change)
             with self.subTest(change=change):
-                self.assertTrue(any(e.startswith("caller:") for e in
-                                    lifecycle_errors(deploy, voice, "workflow_call")))
+                self.assert_rejected(wfs, claim)
+
+    # Old guarantee: called gate waits for a successful deploy, local call,
+    # failure propagates, waiting caller holds nothing.
+    def test_called_consumer_requires_successful_deploy_and_local_call(self):
+        changes = ({"needs": "schema-gate"}, {"uses": "./wrong.yml"},
+                   {"if": "always()"}, {"continue-on-error": "true"},
+                   {"concurrency": "unrelated-caller-group"})
+        for caller in CHILDREN:
+            for change in changes:
+                wfs = target_fixture()
+                wfs[DEPLOY]["jobs"][caller].update(change)
+                with self.subTest(caller=caller, change=change):
+                    self.assert_rejected(wfs, f"caller {caller}:")
+
+    def test_grant_must_come_from_deploy_outputs(self):
+        for value in ("", "1767225600000", "${{ inputs.sha }}", "${{ github.sha }}",
+                      "${{ needs.deploy.outputs.undeclared }}"):
+            wfs = target_fixture()
+            wfs[DEPLOY]["jobs"]["voice-synthetic"]["with"]["staging_use_sha"] = value
+            with self.subTest(value=value):
+                self.assert_rejected(wfs, "staging_use_sha must come from")
+
+    def test_inherited_inputs_are_call_only_and_required(self):
+        wfs = target_fixture()
+        wfs[VOICE]["on"]["workflow_dispatch"] = {"inputs": {
+            "staging_use_expires_at": {"type": "string"}}}
+        self.assert_rejected(wfs, "standalone dispatch can inject")
+        wfs = target_fixture()
+        wfs[HELP]["on"]["workflow_call"]["inputs"]["staging_use_deployment"]["required"] = "false"
+        self.assert_rejected(wfs, "must be a required workflow_call string")
+
+    # Unsafe nested ancestor forms on the reusable workflow itself.
+    def test_unsafe_nested_groups_are_rejected(self):
+        unsafe = (FIXTURE_GROUP, FIXTURE_GROUP.upper(), "${{ github.workflow }}",
+                  "${{ vars.LIFECYCLE_GROUP }}",
+                  f"${{{{ inputs.staging_use_expires_at == '' && "
+                  f"format('x-{{0}}', github.run_id) || '{FIXTURE_GROUP}' }}}}",
+                  f"${{{{ inputs.staging_use_expires_at != '' && '{FIXTURE_GROUP}' || 'x' }}}}",
+                  f"${{{{ inputs.staging_use_expires_at != '' && "
+                  f"format('{{0}}', github.run_id) || '{FIXTURE_GROUP}' }}}}",
+                  f"${{{{ inputs.staging_use_expires_at != '' && "
+                  f"format('x-{{0}}', github.run_attempt) || '{FIXTURE_GROUP}' }}}}")
+        for callee in (VOICE, HELP):
+            for group in unsafe:
+                wfs = target_fixture()
+                wfs[callee]["concurrency"]["group"] = group
+                with self.subTest(callee=callee, group=group):
+                    self.assert_rejected(wfs, "not provably disjoint")
+
+    def test_job_level_called_form_without_nested_workflow_group_is_accepted(self):
+        # "No nested global group": the consumer job itself carries the form.
+        wfs = target_fixture()
+        for callee, (job, _) in CONSUMERS.items():
+            wfs[callee]["jobs"][job]["concurrency"] = wfs[callee].pop("concurrency")
+        self.assertEqual(lifecycle_errors(wfs), [])
+
+    def test_shorthand_nested_group_is_rejected(self):
+        wfs = target_fixture()
+        wfs[VOICE]["concurrency"] = FIXTURE_GROUP
+        self.assert_rejected(wfs, "not provably disjoint")
+
+    def test_called_job_rehold_is_rejected(self):
+        for callee, (job, _) in CONSUMERS.items():
+            for form in (FIXTURE_GROUP, {"group": FIXTURE_GROUP.upper(),
+                                         "cancel-in-progress": "false"}):
+                wfs = target_fixture()
+                wfs[callee]["jobs"][job]["concurrency"] = deepcopy(form)
+                with self.subTest(callee=callee, form=form):
+                    self.assert_rejected(wfs, "called job re-holds")
+
+    def test_consumer_must_assert_the_caller_grant_first(self):
+        for callee, (job, _) in CONSUMERS.items():
+            for mutation in ("drop", "unordered", "unbound", "token", "gated", "soft",
+                             "never", "job-never", "job-soft"):
+                wfs = target_fixture()
+                jobs = wfs[callee]["jobs"]
+                step = jobs["staging-window"]["steps"][0]
+                if mutation == "drop":
+                    del jobs["staging-window"]
+                    del jobs[job]["needs"]
+                elif mutation == "unordered":
+                    del jobs[job]["needs"]
+                elif mutation == "unbound":
+                    step["env"]["STAGING_USE_EXPIRES_AT"] = "${{ github.run_id }}"
+                elif mutation == "token":
+                    step["env"]["OWNERSHIP_CONTROL_TOKEN"] = "${{ secrets.OTHER }}"
+                elif mutation == "gated":
+                    step["if"] = STANDALONE_GUARD
+                elif mutation == "never":
+                    step["if"] = "false"
+                elif mutation == "job-never":
+                    jobs["staging-window"]["if"] = f"{MAIN_ONLY} && {STANDALONE_GUARD}"
+                elif mutation == "job-soft":
+                    jobs["staging-window"]["continue-on-error"] = "true"
+                else:
+                    step["continue-on-error"] = "true"
+                with self.subTest(callee=callee, mutation=mutation):
+                    self.assert_rejected(wfs, "no authenticated window/readiness assert")
+
+    def test_consumer_gate_cannot_tolerate_a_failed_or_skipped_assert(self):
+        for callee, (job, _) in CONSUMERS.items():
+            for change in ({"if": f"always() && {MAIN_ONLY}"}, {"if": "!cancelled()"},
+                           {"continue-on-error": "true"}):
+                wfs = target_fixture()
+                wfs[callee]["jobs"][job].update(change)
+                with self.subTest(callee=callee, change=change):
+                    self.assert_rejected(wfs, "live consumer must keep the main-only")
+
+    def test_assert_inside_consumer_job_mixes_credentials_and_is_rejected(self):
+        for callee, (job, entry) in CONSUMERS.items():
+            wfs = target_fixture()
+            jobs = wfs[callee]["jobs"]
+            step = jobs.pop("staging-window")["steps"][0]
+            del jobs[job]["needs"]
+            steps = jobs[job]["steps"]
+            index = next(i for i, s in enumerate(steps) if entry in str(s.get("run", "")))
+            steps.insert(index, step)
+            with self.subTest(callee=callee):
+                self.assert_rejected(wfs, "holds the staging control credential")
+                self.assert_rejected(wfs, "no authenticated window/readiness assert")
+
+    def test_called_consumer_cannot_acquire_or_release_caller_grant(self):
+        for callee in CONSUMERS:
+            for action in ("acquire", "release"):
+                for guard in (None, "always()", f"always() || {STANDALONE_GUARD}"):
+                    wfs = target_fixture()
+                    step = {"run": f"node wrangler/scripts/staging-use.mjs {action}"}
+                    if guard:
+                        step["if"] = guard
+                    wfs[callee]["jobs"]["staging-window"]["steps"].append(step)
+                    with self.subTest(callee=callee, action=action, guard=guard):
+                        self.assert_rejected(wfs, f"{action} can touch the caller's grant")
+                wfs = target_fixture()
+                wfs[callee]["jobs"]["staging-window"]["steps"].append(
+                    {"if": f"${{{{ {STANDALONE_GUARD} }}}}",
+                     "run": f"node wrangler/scripts/staging-use.mjs {action}"})
+                self.assertEqual(lifecycle_errors(wfs), [])
+
+    # Standalone consumers and drills: same group, exactly once.
+    def test_missing_standalone_holder_is_rejected(self):
+        for (file, job), job_level in STANDALONE_HOLDERS.items():
+            wfs = target_fixture()
+            (wfs[file]["jobs"][job] if job_level else wfs[file]).pop("concurrency", None)
+            if file in (VOICE, HELP):
+                wfs[file]["concurrency"] = {"group": called_group("x-", "unrelated"),
+                                            "cancel-in-progress": "false"}
+            with self.subTest(file=file, job=job):
+                self.assert_rejected(wfs, f"{file} {job}: must hold the lifecycle group exactly once")
+
+    def test_double_hold_by_standalone_consumer_is_rejected(self):
+        wfs = target_fixture()
+        wfs[VOICE]["jobs"]["synthetic"]["concurrency"] = {"group": FIXTURE_GROUP,
+                                                          "cancel-in-progress": "false"}
+        self.assert_rejected(wfs, "exactly once (held 2 times)")
+
+    def test_mcp_proveout_holds_the_full_window_group(self):
+        # Formerly exempt as read-only; it now starts and stops staging, so it
+        # is a full-window holder, checked by this oracle independently of the
+        # builder's exact-shape pin.
+        self.assertNotIn((MCP, "proveout"), EXEMPT)
+        wfs = target_fixture()
+        wfs[MCP]["jobs"]["proveout"]["concurrency"] = wfs[MCP].pop("concurrency")
+        self.assertEqual(lifecycle_errors(wfs), [])
+        label = f"{MCP} proveout:"
+        wrong = ({"group": "staging-mcp-proveout", "cancel-in-progress": "false"},
+                 {"group": f"{FIXTURE_GROUP}-${{{{ github.event_name }}}}",
+                  "cancel-in-progress": "false"})
+        for lock in (None, *wrong):
+            wfs = target_fixture()
+            if lock is None:
+                del wfs[MCP]["concurrency"]
+            else:
+                wfs[MCP]["concurrency"] = lock
+            with self.subTest(lock=lock):
+                self.assert_rejected(wfs, f"{label} must hold the lifecycle group exactly once")
+        for change, claim in (({"cancel-in-progress": "true"}, "preserve the running job"),
+                              ({"cancel-in-progress": None}, "preserve the running job"),
+                              ({"group": "${{ vars.LIFECYCLE_GROUP }}"}, "fixed canonical group"),
+                              ({"group": "${{ github.run_id }}"}, "fixed canonical group")):
+            wfs = target_fixture()
+            lock = wfs[MCP]["concurrency"]
+            lock.update(change)
+            if lock["cancel-in-progress"] is None:
+                del lock["cancel-in-progress"]
+            with self.subTest(change=change):
+                self.assert_rejected(wfs, claim)
+        wfs = target_fixture()
+        wfs[MCP]["concurrency"] = FIXTURE_GROUP
+        self.assert_rejected(wfs, f"{label} lifecycle lock must be a mapping")
+        wfs = target_fixture()
+        wfs[MCP]["jobs"]["proveout"]["concurrency"] = dict(wfs[MCP]["concurrency"])
+        self.assert_rejected(wfs, f"{label} must hold the lifecycle group exactly once (held 2 times)")
+        wfs = target_fixture()
+        del wfs[MCP]["jobs"]["proveout"]
+        self.assert_rejected(wfs, f"{label} standalone consumer missing")
+
+    def test_user_flow_queue_must_not_delay_production_probe(self):
+        # Hoisting the observer's own queue workflow-wide couples production.
+        wfs = target_fixture()
+        wfs[USER_FLOW]["concurrency"] = wfs[USER_FLOW]["jobs"]["staging"].pop("concurrency")
+        self.assert_rejected(wfs, "shared workflow queue couples production")
+        self.assert_rejected(wfs, f"{USER_FLOW} staging: observer queue must be job-level")
+        # A workflow-wide lifecycle hold also makes the production probe a holder.
+        wfs = target_fixture()
+        wfs[USER_FLOW]["concurrency"] = {"group": FIXTURE_GROUP, "cancel-in-progress": "false"}
+        self.assert_rejected(wfs, "production passive probe holds")
+        self.assert_rejected(wfs, f"{USER_FLOW} staging: workflow ancestor can queue")
+        wfs = target_fixture()
+        wfs[USER_FLOW]["jobs"]["prod-passive"]["needs"] = "staging"
+        self.assert_rejected(wfs, "waits on the staging probe")
+        wfs = target_fixture()
+        del wfs[USER_FLOW]["jobs"]["prod-passive"]
+        self.assert_rejected(wfs, "production passive probe missing")
+
+    # Read-only observer (replaces the obsolete "user-flow staging holds the
+    # lifecycle group" assumption): a */5 holder replaced pending deploy and
+    # soak runs, so the observer must never enter that queue at all.
+    def test_user_flow_staging_is_an_observer_not_a_holder(self):
+        self.assertNotIn((USER_FLOW, "staging"), STANDALONE_HOLDERS)
+        self.assertNotIn((USER_FLOW, "staging"), EXEMPT)
+        self.assertIn((USER_FLOW, "staging"), OBSERVERS)
+
+    def lifecycle_aliases(self, canonical):
+        """Every spelling that can resolve to (or is unprovably) the lifecycle group."""
+        literal = [g for name in (canonical, *LEGACY_GROUPS)
+                   for g in (name, name.upper(), name.swapcase(), name.title())]
+        return literal + [f"${{{{ '{canonical}' }}}}", "${{ vars.LIFECYCLE_GROUP }}",
+                          "${{ github.workflow }}", f"{canonical}-${{{{ github.run_id }}}}",
+                          f"${{{{ inputs.lock || '{canonical}' }}}}",
+                          called_group("user-flow-observer-", canonical)]
+
+    def test_observer_cannot_queue_on_any_lifecycle_alias_at_either_ancestor(self):
+        for canonical in (FIXTURE_GROUP, *LEGACY_GROUPS):
+            for alias in self.lifecycle_aliases(canonical):
+                for ancestor in ("job", "workflow"):
+                    wfs = target_fixture(canonical)
+                    lock = {"group": alias, "cancel-in-progress": "false"}
+                    if ancestor == "job":
+                        wfs[USER_FLOW]["jobs"]["staging"]["concurrency"] = lock
+                    else:
+                        wfs[USER_FLOW]["concurrency"] = lock
+                    with self.subTest(canonical=canonical, alias=alias, ancestor=ancestor):
+                        self.assert_rejected(wfs, f"{USER_FLOW} staging: {ancestor} ancestor "
+                                                  "can queue on the lifecycle group")
+                # Shorthand spelling of the same alias at job level.
+                wfs = target_fixture(canonical)
+                wfs[USER_FLOW]["jobs"]["staging"]["concurrency"] = canonical.upper()
+                self.assert_rejected(wfs, "job ancestor can queue on the lifecycle group")
+
+    def test_observer_requires_its_own_fixed_preserving_queue(self):
+        for lock, claim in ((None, "must be a mapping"),
+                            ("fixture-user-flow-observer", "must be a mapping"),
+                            ({"group": FIXTURE_OBSERVER}, "must explicitly preserve the running observation"),
+                            ({"group": FIXTURE_OBSERVER, "cancel-in-progress": "true"},
+                             "must explicitly preserve the running observation"),
+                            ({"group": "", "cancel-in-progress": "false"}, "must be fixed"),
+                            ({"group": "observer-${{ github.event_name }}",
+                              "cancel-in-progress": "false"}, "must be fixed")):
+            wfs = target_fixture()
+            job = wfs[USER_FLOW]["jobs"]["staging"]
+            if lock is None:
+                job.pop("concurrency")
+            else:
+                job["concurrency"] = lock
+            with self.subTest(lock=lock):
+                self.assert_rejected(wfs, f"{USER_FLOW} staging: observer queue {claim}")
+
+    def test_observer_queue_is_exclusive(self):
+        # Sharing it with any holder, window job or the production probe would
+        # let staging work (or a staging wait) delay observation or production.
+        for file, node in ((USER_FLOW, "prod-passive"), (DEPLOY, "certify-promotion"),
+                           (ROLLBACK, "proof"), (MCP, "proveout"), (PRODUCTION, "production")):
+            wfs = target_fixture()
+            wfs[file]["jobs"][node]["concurrency"] = {"group": FIXTURE_OBSERVER.upper(),
+                                                      "cancel-in-progress": "false"}
+            with self.subTest(file=file, node=node):
+                self.assert_rejected(wfs, f"observer queue {FIXTURE_OBSERVER} is shared with {file} {node}")
+        # Called context: a reusable consumer's fallback cannot alias it either.
+        wfs = target_fixture()
+        wfs[VOICE]["jobs"]["synthetic"]["concurrency"] = {
+            "group": called_group("x-", FIXTURE_OBSERVER), "cancel-in-progress": "false"}
+        self.assert_rejected(wfs, f"is shared with {VOICE} synthetic")
+        wfs = target_fixture()
+        wfs["copycat.yml"] = {"on": {"schedule": ""}, "concurrency": FIXTURE_OBSERVER, "jobs": {}}
+        self.assert_rejected(wfs, "is shared with copycat.yml workflow")
+        # Non-vacuous: an unrelated fixed observer spelling is accepted.
+        wfs = target_fixture()
+        wfs[USER_FLOW]["jobs"]["staging"]["concurrency"]["group"] = "synthetic-user-flow-staging"
+        self.assertEqual(lifecycle_errors(wfs), [])
+
+    def test_observer_cannot_acquire_ready_extend_or_release(self):
+        commands = ["node wrangler/scripts/staging-use.mjs " + a for a in
+                    ("acquire", "assert", "ready", "release", "status", "extend")]
+        commands += ["node wrangler/scripts/staging-use-pipeline.mjs " + a for a in
+                     ("begin", "rebind", "consume", "finish")]
+        for command in commands:
+            for where in ("replace", "append"):
+                wfs = target_fixture()
+                steps = wfs[USER_FLOW]["jobs"]["staging"]["steps"]
+                observe = steps[step_index(wfs[USER_FLOW]["jobs"]["staging"], "mjs observe")]
+                if where == "replace":
+                    observe["run"] = command
+                else:
+                    steps.append({"env": dict(observe["env"]), "run": command})
+                with self.subTest(command=command, where=where):
+                    self.assert_rejected(wfs, "the staging window (observe only)")
+        wfs = target_fixture()
+        job = wfs[USER_FLOW]["jobs"]["staging"]
+        job["steps"].append(dict(job["steps"][step_index(job, "mjs observe")]))
+        self.assert_rejected(wfs, "observe the staging window exactly once (found 2)")
+
+    def test_observer_refusal_fails_closed_and_credential_stays_isolated(self):
+        def observe(job):
+            return job["steps"][step_index(job, "mjs observe")]
+        mutations = (
+            (lambda job: observe(job).update({"continue-on-error": "true"}), "must fail the observer"),
+            (lambda job: job.update({"continue-on-error": "true"}), "must fail the observer"),
+            (lambda job: observe(job).pop("id"), "needs an id"),
+            (lambda job: observe(job)["env"].update(OWNERSHIP_CONTROL_TOKEN="${{ secrets.OTHER }}"),
+             "authenticate with the staging control credential"),
+            (lambda job: observe(job).update(run=observe(job)["run"] + " && curl \"$STAGING_WORKER_URL\""),
+             "mixes the staging control credential"),
+            (lambda job: job.update(env={"OWNERSHIP_CONTROL_TOKEN": OWNERSHIP_TOKEN}),
+             "job-level env exposes staging"),
+            (lambda job: job.update(env={"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"}),
+             "job-level env exposes staging"),
+            (lambda job: job["steps"][step_index(job, "staging_health_contract_probe")]["env"].update(
+                OWNERSHIP_CONTROL_TOKEN=OWNERSHIP_TOKEN), "mixes the staging control credential"))
+        for index, (mutate, claim) in enumerate(mutations):
+            wfs = target_fixture()
+            mutate(wfs[USER_FLOW]["jobs"]["staging"])
+            with self.subTest(mutation=index):
+                self.assert_rejected(wfs, f"{USER_FLOW} staging: ")
+                self.assert_rejected(wfs, claim)
+
+    def test_observer_never_reads_an_idle_staging(self):
+        probe = "staging_health_contract_probe"
+        for condition in ("", "always()", "vars.STAGING_WORKER_URL != ''",
+                          "steps.window.outputs.sample != 'false'",
+                          "steps.other.outputs.sample == 'true'",
+                          "!(steps.window.outputs.sample == 'true')",
+                          "steps.window.outputs.sample == 'true' || always()",
+                          "(steps.window.outputs.sample == 'true') || inputs.force_fail || true"):
+            wfs = target_fixture()
+            job = wfs[USER_FLOW]["jobs"]["staging"]
+            step = job["steps"][step_index(job, probe)]
+            if condition:
+                step["if"] = condition
+            else:
+                step.pop("if", None)
+            with self.subTest(condition=condition):
+                self.assert_rejected(wfs, "reads staging without an observed active window")
+        # The dispatch-only failure drill may bypass the observer only when it
+        # points the probe at a literal non-staging origin.
+        for url in ("${{ vars.STAGING_WORKER_URL }}",
+                    "${{ (inputs.force_fail && vars.STAGING_WORKER_URL) || vars.STAGING_WORKER_URL }}",
+                    "${{ (inputs.force_fail && 'https://staging.example') || vars.STAGING_WORKER_URL }}"):
+            wfs = target_fixture()
+            job = wfs[USER_FLOW]["jobs"]["staging"]
+            job["steps"][step_index(job, probe)]["env"]["STAGING_WORKER_URL"] = url
+            with self.subTest(url=url):
+                self.assert_rejected(wfs, "reads staging without an observed active window")
+        # A new unguarded live read anywhere in the observer job.
+        wfs = target_fixture()
+        wfs[USER_FLOW]["jobs"]["staging"]["steps"].append(
+            {"run": "curl \"${{ vars.STAGING_WORKER_URL }}/readyz\""})
+        self.assert_rejected(wfs, "reads staging without an observed active window")
+
+    def test_observer_cannot_hide_in_the_inventory(self):
+        wfs = target_fixture()
+        with mock.patch.dict(OBSERVERS, clear=True):
+            self.assert_rejected(wfs, f"unclassified staging consumer {USER_FLOW} staging")
+        wfs = target_fixture()
+        del wfs[USER_FLOW]["jobs"]["staging"]
+        self.assert_rejected(wfs, f"{USER_FLOW} staging: user-flow staging observer missing")
+
+    def test_rollback_orchestrator_cannot_hold_child_lock(self):
+        for node in ("workflow", "job"):
+            wfs = target_fixture()
+            target = wfs[ROLLBACK] if node == "workflow" else wfs[ROLLBACK]["jobs"]["proof"]
+            target["concurrency"] = {"group": FIXTURE_GROUP, "cancel-in-progress": "false"}
+            with self.subTest(node=node):
+                self.assert_rejected(wfs, "rollback-proof orchestrator holds")
+        wfs = target_fixture()
+        wfs[ROLLBACK]["concurrency"]["group"] = "${{ vars.PROOF_GROUP }}"
+        self.assert_rejected(wfs, "rollback-proof orchestrator holds")
+
+    def test_split_legacy_lock_is_rejected(self):
+        for legacy in LEGACY_GROUPS:
+            for file, node in ((CONTAINER, None), (ROLLBACK, "drill"), (MCP, None)):
+                wfs = target_fixture(group=[g for g in LEGACY_GROUPS if g != legacy][0])
+                target = wfs[file] if node is None else wfs[file]["jobs"][node]
+                target["concurrency"]["group"] = legacy
+                with self.subTest(legacy=legacy, file=file):
+                    self.assert_rejected(wfs, "split lifecycle lock")
+
+    def test_each_voice_invocation_must_remain_available(self):
+        for invocation in INVOCATIONS:
+            wfs = target_fixture()
+            wfs[VOICE]["on"].pop(invocation)
+            with self.subTest(invocation=invocation):
+                self.assert_rejected(wfs, f"voice: missing {invocation} invocation")
+
+    def test_caller_closure_rejects_other_callers(self):
+        wfs = target_fixture()
+        wfs[USER_FLOW]["jobs"]["sneaky"] = {"uses": f"./.github/workflows/{VOICE}"}
+        self.assert_rejected(wfs, "caller closure")
+        wfs = target_fixture()
+        wfs[DEPLOY]["jobs"]["voice-again"] = {"uses": f"./.github/workflows/{HELP}"}
+        self.assert_rejected(wfs, "caller closure")
+
+    def test_unclassified_staging_consumer_is_rejected(self):
+        for job in ({"environment": "staging", "steps": []},
+                    {"steps": [{"run": "curl \"$STAGING_WORKER_URL\"",
+                                "env": {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"}}]}):
+            wfs = target_fixture()
+            wfs["new-staging-consumer.yml"] = {"on": {"workflow_dispatch": ""},
+                                               "jobs": {"probe": job}}
+            with self.subTest(job=job):
+                self.assert_rejected(wfs, "unclassified staging consumer")
+        wfs = target_fixture()
+        del wfs["staging-ownership-status.yml"]
+        self.assert_rejected(wfs, "stale exemption")
+        # A demoted holder cannot hide in the inventory either.
+        wfs = target_fixture()
+        with mock.patch.dict(STANDALONE_HOLDERS, clear=False):
+            del STANDALONE_HOLDERS[(MCP, "proveout")]
+            self.assert_rejected(wfs, f"unclassified staging consumer {MCP} proveout")
 
     def test_duplicate_yaml_keys_cannot_hide_a_lock_or_trigger(self):
         with self.assertRaisesRegex(ValueError, "duplicate workflow key"):
             yaml.load("concurrency:\n  group: one\n  group: two\n", Loader=UniqueKeyLoader)
 
 
+def step_index(job, needle):
+    return next(i for i, step in enumerate(job["steps"]) if needle in str(step))
+
+
+class PromotionSoakControls(unittest.TestCase):
+    """Each mutation must be rejected on the fixture AND the checked-in YAML."""
+
+    def variants(self):
+        return (("fixture", target_fixture()), ("repository", load_all()))
+
+    def assert_mutation_rejected(self, mutate, claim):
+        for label, wfs in self.variants():
+            jobs = wfs[PRODUCTION]["jobs"]
+            mutate(wfs, jobs, jobs[SOAK], jobs[PUBLISHER])
+            with self.subTest(source=label, claim=claim):
+                errors = lifecycle_errors(wfs)
+                self.assertTrue(any(claim in e for e in errors), (claim, errors))
+
+    def test_soak_and_publisher_are_not_exempt(self):
+        self.assertNotIn((PRODUCTION, SOAK), EXEMPT)
+        self.assertNotIn((PRODUCTION, PUBLISHER), EXEMPT)
+        self.assertIs(STANDALONE_HOLDERS[(PRODUCTION, SOAK)], True)
+        for _, wfs in self.variants():
+            self.assertEqual(lifecycle_errors(wfs), [])
+
+    def test_missing_split_or_cancelling_soak_lock_is_rejected(self):
+        label = f"{PRODUCTION} {SOAK}:"
+        self.assert_mutation_rejected(lambda w, j, s, p: s.pop("concurrency"),
+                                      f"{label} must hold the lifecycle group exactly once")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: s.update(concurrency={"group": "staging-soak", "cancel-in-progress": "false"}),
+            f"{label} must hold the lifecycle group exactly once")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: s["concurrency"].update(group="${{ github.workflow }}-soak"),
+            f"{label} lifecycle group must resolve")
+        for cancel in ("true", None):
+            def cancelling(w, j, s, p, cancel=cancel):
+                if cancel is None:
+                    del s["concurrency"]["cancel-in-progress"]
+                else:
+                    s["concurrency"]["cancel-in-progress"] = cancel
+            self.assert_mutation_rejected(cancelling, "preserve the running job")
+        self.assert_mutation_rejected(lambda w, j, s, p: s.update(concurrency=s["concurrency"]["group"]),
+                                      f"{label} lifecycle lock must be a mapping")
+        # Split: the soak keeps the other historical spelling.
+        for _, wfs in self.variants():
+            canonical = wfs[DEPLOY]["concurrency"]["group"].casefold()
+            soak = wfs[PRODUCTION]["jobs"][SOAK]
+            soak["concurrency"]["group"] = next(g for g in LEGACY_GROUPS if g != canonical)
+            self.assertTrue(any("split lifecycle lock" in e for e in lifecycle_errors(wfs)))
+
+    def test_workflow_level_or_production_lane_coupling_is_rejected(self):
+        def workflow_level(w, j, s, p):
+            w[PRODUCTION]["concurrency"] = s.pop("concurrency")
+        self.assert_mutation_rejected(workflow_level, "must hold the lifecycle group at job level")
+        self.assert_mutation_rejected(workflow_level, "production coupling: deploy-production.yml workflow")
+        for name in ("guard", "recheck", "production", PUBLISHER):
+            def holder(w, j, s, p, name=name):
+                j[name]["concurrency"] = dict(s["concurrency"])
+            self.assert_mutation_rejected(holder, f"production coupling: {PRODUCTION} {name}")
+        # Unprovable expression group on the lane is treated as holding.
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: j["production"].update(concurrency={"group": "${{ vars.LANE }}"}),
+            "production coupling")
+        self.assert_mutation_rejected(lambda w, j, s, p: s.update(needs=["guard", "recheck"]),
+                                      "soak: must wait only on the guard")
+
+    def test_rollback_and_live_sha_cure_never_enter_staging(self):
+        for clause in SOAK_CLAUSES:
+            self.assert_mutation_rejected(
+                lambda w, j, s, p, c=clause: s.update({"if": s["if"].replace(c, "true")}),
+                "only an ordinary guarded deploy")
+        for widen in (" || needs.guard.outputs.mode == 'rollback'", " && always()", " && !cancelled()"):
+            self.assert_mutation_rejected(lambda w, j, s, p, x=widen: s.update({"if": s["if"] + x}),
+                                          "only an ordinary guarded deploy")
+
+    def test_original_grant_and_expiry_binding(self):
+        def acquire(s):
+            return s["steps"][step_index(s, "mjs begin")]
+        self.assert_mutation_rejected(lambda w, j, s, p: s["steps"].pop(step_index(s, "mjs begin")),
+                                      "exactly one original grant (found 0)")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: s["steps"].insert(step_index(s, SOAK_WINDOW), {
+                "env": acquire(s)["env"], "run": "node wrangler/scripts/staging-use-pipeline.mjs rebind"}),
+            "exactly one original grant (found 2)")
+        for value in ("", "${{ github.sha }}", "${{ inputs.sha }}"):
+            self.assert_mutation_rejected(
+                lambda w, j, s, p, v=value: acquire(s)["env"].update(STAGING_USE_EXPECTED_SHA=v),
+                "refuse any build but the guarded SHA")
+        self.assert_mutation_rejected(lambda w, j, s, p: acquire(s).update({"if": "success()"}),
+                                      "acquire must be an unconditional step")
+        def bound(m, t):
+            def mutate(w, j, s, p):
+                acquire(s)["env"]["STAGING_USE_MINUTES"] = m
+                s["timeout-minutes"] = t
+            return mutate
+        # Grant (original authority) cap, even when the job ceiling fits.
+        for minutes, timeout in (("0", "40"), ("41", "50"), ("41", "41"), ("360", "360"),
+                                 ("${{ inputs.minutes }}", "50"), ("", "50")):
+            self.assert_mutation_rejected(bound(minutes, timeout), "grant must hold one literal bounded expiry")
+        with mock.patch(f"{__name__}.MAX_SOAK_JOB_MINUTES", 60):
+            self.assert_mutation_rejected(bound("41", "55"), "grant must hold one literal bounded expiry")
+        # Job ceiling.
+        for minutes, timeout in (("40", "51"), ("40", ""), ("40", "${{ inputs.timeout }}"), ("40", "0")):
+            self.assert_mutation_rejected(bound(minutes, timeout), "job must hold one literal bounded timeout")
+        # Stop/evidence margin: equal, shorter or under-margin timeouts fail.
+        for minutes, timeout in (("40", "40"), ("40", "39"), ("40", "49"), ("35", "44"), ("1", "10")):
+            self.assert_mutation_rejected(bound(minutes, timeout), "exceed the grant by at least 10 minutes")
+        for minutes, timeout in (("40", "50"), ("30", "40"), ("1", "11")):
+            for label, wfs in self.variants():
+                soak = wfs[PRODUCTION]["jobs"][SOAK]
+                bound(minutes, timeout)(wfs, None, soak, None)
+                with self.subTest(source=label, minutes=minutes, timeout=timeout):
+                    self.assertFalse([e for e in soak_step_errors(soak) if "minutes" in e or "timeout" in e])
+        for needle in (SOAK_WINDOW, "mjs consume", "mjs finish"):
+            for var, value in (("STAGING_USE_EXPIRES_AT", "${{ github.run_id }}"),
+                               ("STAGING_USE_RECEIPT", "/tmp/other.ndjson")):
+                def rebound(w, j, s, p, n=needle, k=var, v=value):
+                    s["steps"][step_index(s, n)]["env"][k] = v
+                self.assert_mutation_rejected(rebound, "soak: step")
+        for needle in (SOAK_WINDOW, "mjs consume"):
+            self.assert_mutation_rejected(
+                lambda w, j, s, p, n=needle: s["steps"][step_index(s, n)]["env"].update(
+                    STAGING_USE_DEPLOYMENT="${{ steps.other.outputs.deployment_id }}"),
+                "not bound to the original grant")
+
+    def test_window_sample_and_recheck_order(self):
+        self.assert_mutation_rejected(lambda w, j, s, p: s["steps"].pop(step_index(s, SOAK_WINDOW)),
+                                      "exactly one fresh live interval")
+        def baseline_first(w, j, s, p):
+            s["steps"].insert(1, s["steps"].pop(step_index(s, BASELINE)))
+        self.assert_mutation_rejected(baseline_first, "out of order")
+        self.assert_mutation_rejected(baseline_first, "reads staging outside the held grant")
+        self.assert_mutation_rejected(lambda w, j, s, p: s["steps"].pop(step_index(s, "mjs consume")),
+                                      "rechecked after final sampling")
+        def recheck_early(w, j, s, p):
+            s["steps"].insert(step_index(s, SOAK_WINDOW) + 1, s["steps"].pop(step_index(s, "mjs consume")))
+        self.assert_mutation_rejected(recheck_early, "rechecked after final sampling")
+        for needle in (SOAK_WINDOW, "mjs consume"):
+            self.assert_mutation_rejected(
+                lambda w, j, s, p, n=needle: s["steps"][step_index(s, n)].update({"if": "false"}),
+                "can skip a lifecycle assertion")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: s["steps"][step_index(s, SOAK_WINDOW)]["env"].update(AUTO="true"),
+            "automatic flag")
+        def unjudged(w, j, s, p):
+            step = s["steps"][step_index(s, FINAL_PROBE)]
+            step["run"] = step["run"].replace("--baseline-counters", "--counters")
+        self.assert_mutation_rejected(unjudged, "against this window's baseline")
+        self.assert_mutation_rejected(lambda w, j, s, p: s["outputs"].update(evidence="{}"),
+                                      "verdict outputs must come from")
+
+    def test_failed_or_skipped_cleanup_is_rejected(self):
+        def release(s):
+            return s["steps"][step_index(s, "mjs finish")]
+        self.assert_mutation_rejected(lambda w, j, s, p: s["steps"].remove(release(s)),
+                                      "release the original grant exactly once (found 0)")
+        for guard in ("success()", "steps.grant.outputs.expires_at != ''", "always()"):
+            self.assert_mutation_rejected(lambda w, j, s, p, g=guard: release(s).update({"if": g}),
+                                          "release must always run")
+        self.assert_mutation_rejected(lambda w, j, s, p: release(s).update({"continue-on-error": "true"}),
+                                      "must fail the soak")
+        self.assert_mutation_rejected(lambda w, j, s, p: s.update({"continue-on-error": "true"}),
+                                      "must fail the soak")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: s["steps"].append({"env": {"STAGING_WORKER_URL": "${{ vars.STAGING_WORKER_URL }}"},
+                                                  "run": "curl \"$STAGING_WORKER_URL/readyz\""}),
+            "reads staging outside the held grant")
+
+    def test_control_credential_stays_in_lifecycle_only_steps(self):
+        for needle in (BASELINE, FINAL_PROBE, "upload-artifact"):
+            def leak(w, j, s, p, n=needle):
+                s["steps"][step_index(s, n)].setdefault("env", {})["OWNERSHIP_CONTROL_TOKEN"] = OWNERSHIP_TOKEN
+            self.assert_mutation_rejected(leak, "mixes the staging control credential")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: s.update(env={"OWNERSHIP_CONTROL_TOKEN": OWNERSHIP_TOKEN}),
+            "job-level env leaks")
+        def chained(w, j, s, p):
+            step = s["steps"][step_index(s, "mjs consume")]
+            step["run"] += "\nnode wrangler/scripts/rest-5xx-counters.mjs --out c.json"
+        self.assert_mutation_rejected(chained, "mixes the staging control credential")
+
+    def test_lifecycle_evidence_is_retained_per_attempt(self):
+        def artifact(s):
+            return s["steps"][step_index(s, "upload-artifact")]
+        self.assert_mutation_rejected(lambda w, j, s, p: s["steps"].remove(artifact(s)),
+                                      "always be retained per run attempt")
+        self.assert_mutation_rejected(lambda w, j, s, p: artifact(s).pop("if"),
+                                      "always be retained per run attempt")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: artifact(s)["with"].update(name="staging-soak-${{ github.run_id }}"),
+            "always be retained per run attempt")
+        self.assert_mutation_rejected(lambda w, j, s, p: artifact(s)["with"].update(path="b.json"),
+                                      "always be retained per run attempt")
+
+    def test_publisher_is_a_pure_successful_soak_republisher(self):
+        for condition in ("!cancelled() && (needs.soak.result == 'success' || needs.soak.result == 'skipped')",
+                          "always() && needs.soak.result == 'success'",
+                          "!cancelled() && needs.guard.result == 'success'"):
+            self.assert_mutation_rejected(lambda w, j, s, p, c=condition: p.update({"if": c}),
+                                          "only a successful soak may qualify")
+        self.assert_mutation_rejected(lambda w, j, s, p: p.update(needs="guard"),
+                                      "only a successful soak may qualify")
+        for change in ({"environment": {"name": "staging", "deployment": "false"}},
+                       {"env": {"T": "${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}"}},
+                       {"env": {"U": "${{ vars.STAGING_WORKER_URL }}"}},
+                       {"continue-on-error": "true"}):
+            self.assert_mutation_rejected(lambda w, j, s, p, c=change: p.update(c),
+                                          "no environment, secret or live staging input")
+        self.assert_mutation_rejected(lambda w, j, s, p: p.update(permissions={"contents": "read", "actions": "read"}),
+                                      "no read/write scope beyond contents")
+        self.assert_mutation_rejected(lambda w, j, s, p: p["steps"].insert(0, {"uses": "actions/checkout@x"}),
+                                      "one step republishing only soak outputs")
+        self.assert_mutation_rejected(
+            lambda w, j, s, p: p["steps"][0]["env"].update(EVIDENCE="${{ needs.guard.outputs.sha }}"),
+            "one step republishing only soak outputs")
+        # Removing the publisher, or production/recheck no longer needing it.
+        self.assert_mutation_rejected(lambda w, j, s, p: j.pop(PUBLISHER), "staging-soak-evidence missing")
+        for name in ("production", "recheck"):
+            self.assert_mutation_rejected(
+                lambda w, j, s, p, n=name: j[n].update({"if": j[n]["if"].replace(PUBLISHED, "true")}),
+                f"{name} must require the published soak verdict")
+
+
 class ExistingSafetyControls(unittest.TestCase):
-    def test_existing_workflow_serialization_and_live_entrypoint_stay_intact(self):
-        deploy, voice = workflows()
-        for workflow, group in ((deploy, "deploy-staging"), (voice, "voice-synthetic")):
-            self.assertEqual(workflow["concurrency"],
-                             {"group": group, "cancel-in-progress": "false"})
+    def test_existing_live_entrypoint_stays_intact(self):
+        wfs = load_all()
+        deploy, voice = wfs[DEPLOY], wfs[VOICE]
         self.assertEqual(set(voice["on"]), set(INVOCATIONS))
         self.assertEqual(voice["on"]["schedule"], [{"cron": "41 */6 * * *"}])
         self.assertEqual(deploy["on"]["push"]["branches"], ["main"])
@@ -235,8 +1742,11 @@ class ExistingSafetyControls(unittest.TestCase):
         self.assertEqual(job["timeout-minutes"], "10")
         self.assertEqual(job["permissions"], {"contents": "read"})
         self.assertNotIn("continue-on-error", job)
-        live = [step for step in job["steps"] if "run" in step]
+        live = [step for step in step_runs(job)
+                if "scripts/staging_voice_synthetic.py" in step["run"]]
         self.assertEqual(len(live), 1)
+        self.assertNotIn("if", live[0])
+        self.assertNotIn("continue-on-error", live[0])
         self.assertIn('python3 scripts/staging_voice_synthetic.py --evidence', live[0]["run"])
         self.assertIn("for attempt in 1 2 3; do", live[0]["run"])
         self.assertIn('[ "$attempt" = 3 ] || sleep 60', live[0]["run"])
@@ -248,8 +1758,7 @@ class ExistingSafetyControls(unittest.TestCase):
                          "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}")
 
     def test_deploy_lock_scope_contains_takeover_readiness_and_rollback(self):
-        deploy, _ = workflows()
-        job = deploy["jobs"]["deploy"]
+        job = load_all()[DEPLOY]["jobs"]["deploy"]
         self.assertEqual(job["environment"], "staging")
         self.assertEqual(job["needs"], ["schema-gate", "roles-gate"])
         steps = job["steps"]
@@ -262,6 +1771,13 @@ class ExistingSafetyControls(unittest.TestCase):
         self.assertIn("--variant staging", rollback["run"])
         self.assertEqual(rollback["if"], "failure() && steps.deploy.outcome == 'success' "
                          "&& steps.snapshot.outcome == 'success'")
+
+    def test_certify_promotion_still_needs_every_live_gate(self):
+        job = load_all()[DEPLOY]["jobs"]["certify-promotion"]
+        self.assertLessEqual({"deploy", "voice-synthetic", "help-embed-synthetic",
+                              "user-flow-synthetic", "pinned-history-guard"}, set(job["needs"]))
+        self.assertTrue(job["if"].startswith("success() && "))
+        self.assertNotIn("continue-on-error", job)
 
     def test_deletion_budget_and_live_failure_assertion_are_unchanged(self):
         path = ROOT / "scripts/staging_voice_synthetic.py"

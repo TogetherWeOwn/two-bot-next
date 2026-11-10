@@ -15,8 +15,10 @@ use std::collections::HashSet;
 use super::commands::{merge_commands, CommandDefinition, CustomCommand, GUILD_COMMAND_LIMIT};
 
 /// Placeholders a custom-command template may reference (legacy
-/// `TEMPLATE_PLACEHOLDERS`).
-pub const TEMPLATE_PLACEHOLDERS: [&str; 4] = ["user", "username", "server", "channel"];
+/// `TEMPLATE_PLACEHOLDERS`, plus the bounded `{args}` invocation echo:
+/// `args` substitutes the member-supplied invocation text literally in one
+/// pass, never re-scanned, so it cannot nest or re-trigger substitution).
+pub const TEMPLATE_PLACEHOLDERS: [&str; 5] = ["user", "username", "server", "channel", "args"];
 
 /// Stored-template bound in UTF-16 units (legacy JavaScript string.length).
 pub const MAX_TEMPLATE_CHARS: usize = 2000;
@@ -31,8 +33,8 @@ pub const MAX_COMMAND_NAME_CHARS: usize = 32;
 /// `TRIGGER_PATTERN` `^![a-z0-9_-]{1,32}$`: one `!` plus a command name).
 pub const MAX_TEXT_TRIGGER_CHARS: usize = MAX_COMMAND_NAME_CHARS + 1;
 /// Placeholder-extraction bound: `placeholders_in` returns at most this many
-/// distinct keys in first-seen order, then stops scanning. Only four keys are
-/// ever known, so any five distinct keys already contain an unknown one —
+/// distinct keys in first-seen order, then stops scanning. Only five keys are
+/// ever known, so any six distinct keys already contain an unknown one —
 /// capping at 64 preserves `validate_template`'s unknown-placeholder refusal
 /// exactly while keeping hostile inputs total-bounded in time and memory.
 pub const MAX_PLACEHOLDERS: usize = 64;
@@ -55,6 +57,13 @@ pub struct TemplateContext {
     pub server: String,
     /// Channel the command ran in.
     pub channel: String,
+    /// Member-supplied invocation text for `{args}` (empty when the path
+    /// carries none). Substituted literally in the same single pass as the
+    /// other keys; never re-scanned, so braces inside render literally.
+    /// Channel-bound output still passes through `neutralize_mentions` plus
+    /// `allowed_mentions: { parse: [] }`, exactly like any other template
+    /// input, so this field grants no mention.
+    pub args: String,
 }
 
 /// Template validation/render failure (legacy `validateTemplate` /
@@ -64,7 +73,7 @@ pub enum TemplateError {
     #[error("Template must be between 1 and 2000 characters.")]
     InvalidLength,
     #[error(
-        "Unknown placeholder {{{0}}}. Supported: {{user}}, {{username}}, {{server}}, {{channel}}."
+        "Unknown placeholder {{{0}}}. Supported: {{user}}, {{username}}, {{server}}, {{channel}}, {{args}}."
     )]
     UnknownPlaceholder(String),
     #[error("Rendered command output is {0} characters; Discord's ceiling is 2000.")]
@@ -154,6 +163,7 @@ pub fn render_template(template: &str, ctx: &TemplateContext) -> Result<String, 
                     "username" => ctx.username.as_str(),
                     "server" => ctx.server.as_str(),
                     "channel" => ctx.channel.as_str(),
+                    "args" => ctx.args.as_str(),
                     _ => &template[i..end],
                 };
                 if out.len() > MAX_RENDERED_CHARS * 3 {
@@ -212,6 +222,13 @@ pub struct PutCommandInput {
     pub description: String,
     pub template: String,
     pub text_trigger: Option<String>,
+}
+
+/// Management-only clone: both names are normalized and validated by the service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneCommandInput {
+    pub source: String,
+    pub destination: String,
 }
 
 /// Custom-command validation refusal (legacy `validateCommandInput` throws +
@@ -322,11 +339,15 @@ pub fn builtin_command_names() -> HashSet<String> {
 }
 
 /// Names a custom command may not be *written* under: every builtin plus the
-/// voice-room and assistant sets. The voice sink dispatches by name, so a custom
-/// command named `setup` or `export` would reach the voice handlers the moment `TWO_VOICE`
-/// turns on, even if it was created while voice was off. This guards writes
-/// only (`/command`, imports). Dispatch keeps [`builtin_command_names`], so a
-/// stored row that predates the reservation keeps running while voice is off.
+/// voice-room and assistant sets, plus the dark routed names (see
+/// [`super::router::DARK_RESERVED_NAMES`]). The voice sink dispatches by name,
+/// so a custom command named `setup` or `export` would reach the voice handlers
+/// the moment `TWO_VOICE` turns on, even if it was created while voice was off.
+/// A custom row under a dark name would validate yet never publish (the router
+/// withholds it while dispatch shadows the name), so writes refuse those too.
+/// This guards writes only (`/command`, imports). Dispatch keeps
+/// [`builtin_command_names`], so a stored row that predates the reservation
+/// keeps running while voice is off.
 #[must_use]
 pub fn reserved_command_names() -> HashSet<String> {
     let mut names = builtin_command_names();
@@ -334,6 +355,29 @@ pub fn reserved_command_names() -> HashSet<String> {
         super::voice_rooms::voice_commands()
             .into_iter()
             .chain(super::voice_assistant::assistant_commands())
+            .map(|def| def.name),
+    );
+    names.extend(
+        super::router::DARK_RESERVED_NAMES
+            .iter()
+            .map(|name| (*name).to_owned()),
+    );
+    names
+}
+
+/// Builtin names that occupy a Discord publication slot when every publish
+/// gate is on: all dispatch builtins plus the voice set (first-wins dedupe
+/// applies at merge, so voice `kick` shares moderation's slot). Excludes the
+/// squatted-but-unpublished names in [`reserved_command_names`]
+/// (`templateassistant`, dark names): they block writes but occupy no slot,
+/// so capacity math must count this set, not the reservation set, or guilds
+/// with unused slots reject custom commands they could still publish.
+#[must_use]
+pub fn publishable_builtin_names() -> HashSet<String> {
+    let mut names = builtin_command_names();
+    names.extend(
+        super::voice_rooms::voice_commands()
+            .into_iter()
             .map(|def| def.name),
     );
     names
@@ -435,6 +479,21 @@ impl AuditRecord {
                 "command.disable"
             })
             .to_owned(),
+            target_key: Some(bounded_audit_name(name)),
+            outcome: "ok".to_owned(),
+            reason: None,
+        }
+    }
+
+    /// One content-free fact per committed `/command-edit`. The action names
+    /// an in-place patch, distinct from `command.update` (full replacement),
+    /// and never carries the changed values or even which fields changed.
+    #[must_use]
+    pub fn edit(guild_id: &str, actor_id: &str, name: &str) -> Self {
+        Self {
+            guild_id: guild_id.to_owned(),
+            actor_id: Some(actor_id.to_owned()),
+            action: "command.edit".to_owned(),
             target_key: Some(bounded_audit_name(name)),
             outcome: "ok".to_owned(),
             reason: None,
@@ -563,6 +622,142 @@ pub fn adjudicate_toggle(
             resync_registry: true,
         },
     }
+}
+
+/// What `/command-edit` does with the saved text trigger. `Keep` is the
+/// omitted option; `Clear` is the explicit `clear-trigger:true` operation and
+/// is never inferred from a missing or empty `text-trigger`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerPatch {
+    Keep,
+    Set(String),
+    Clear,
+}
+
+/// A PATCH-like edit of one saved definition: every `None`/`Keep` field is
+/// preserved exactly. Name, creator, enabled state and identity are not
+/// patchable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditPatch {
+    pub template: Option<String>,
+    pub description: Option<String>,
+    pub text_trigger: TriggerPatch,
+}
+
+impl EditPatch {
+    /// The complete definition after the patch. Only patched columns differ.
+    #[must_use]
+    pub fn apply(&self, existing: &StoredCommand) -> StoredCommand {
+        let mut merged = existing.clone();
+        if let Some(template) = &self.template {
+            merged.template.clone_from(template);
+        }
+        if let Some(description) = &self.description {
+            merged.description.clone_from(description);
+        }
+        match &self.text_trigger {
+            TriggerPatch::Keep => {}
+            TriggerPatch::Set(trigger) => merged.text_trigger = Some(trigger.clone()),
+            TriggerPatch::Clear => merged.text_trigger = None,
+        }
+        merged
+    }
+}
+
+/// Outcome of a `/command-edit` request against the stored row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditOutcome {
+    /// At least one field changed; the caller must republish the registry.
+    Changed,
+    /// The patch matches the saved definition (including an empty patch): an
+    /// explicit no-op that writes, audits and publishes nothing.
+    Unchanged,
+    /// No such row in this guild: a zero-write refusal, never an upsert.
+    Missing,
+}
+
+/// Outcome of an edit: the audit row exists only for a committed change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditDecision {
+    pub outcome: EditOutcome,
+    /// Field names that changed, in definition order. Reply text only.
+    pub changed: Vec<&'static str>,
+    pub audit: Option<AuditRecord>,
+    pub resync_registry: bool,
+}
+
+/// Adjudicate a patch against the stored row. Missing rows refuse, identical
+/// definitions are explicit no-ops, and only a real change audits and
+/// republishes.
+#[must_use]
+pub fn adjudicate_edit(
+    guild_id: &str,
+    actor_id: &str,
+    name: &str,
+    existing: Option<&StoredCommand>,
+    patch: &EditPatch,
+) -> EditDecision {
+    let Some(existing) = existing else {
+        return EditDecision {
+            outcome: EditOutcome::Missing,
+            changed: Vec::new(),
+            audit: None,
+            resync_registry: false,
+        };
+    };
+    let merged = patch.apply(existing);
+    let mut changed = Vec::new();
+    if merged.template != existing.template {
+        changed.push("template");
+    }
+    if merged.description != existing.description {
+        changed.push("description");
+    }
+    if merged.text_trigger != existing.text_trigger {
+        changed.push("text-trigger");
+    }
+    if changed.is_empty() {
+        return EditDecision {
+            outcome: EditOutcome::Unchanged,
+            changed,
+            audit: None,
+            resync_registry: false,
+        };
+    }
+    EditDecision {
+        outcome: EditOutcome::Changed,
+        changed,
+        audit: Some(AuditRecord::edit(guild_id, actor_id, name)),
+        resync_registry: true,
+    }
+}
+
+/// Validate the complete definition an edit would save, not just the
+/// supplied fields: an imported row whose omitted template is no longer valid
+/// must not be re-saved. A newly supplied trigger must also not shadow a
+/// builtin name (the dispatch rule); an untouched stored trigger is left
+/// alone so unrelated corrections stay possible.
+pub fn validate_edit(
+    merged: &StoredCommand,
+    patch: &EditPatch,
+    reserved: &HashSet<String>,
+    dispatch: &HashSet<String>,
+) -> Result<(), CommandError> {
+    validate_put_input(
+        &PutCommandInput {
+            name: merged.name.clone(),
+            description: merged.description.clone(),
+            template: merged.template.clone(),
+            text_trigger: merged.text_trigger.clone(),
+        },
+        reserved,
+    )?;
+    if let TriggerPatch::Set(trigger) = &patch.text_trigger {
+        if is_builtin_trigger(trigger, dispatch) {
+            return Err(CommandError::ReservedTextTrigger(trigger.clone()));
+        }
+    }
+    Ok(())
 }
 
 /// Validate a stored definition for re-enable: the same write rules as
@@ -786,10 +981,80 @@ pub fn format_command_list_page(
 }
 
 /// `/command-inspect` sample-arguments bound in UTF-16 units, matching the
-/// published `max_length`. Samples are validated for size only: the
-/// four-variable template language ignores them, so accepting a sample must
-/// never introduce `{args}` or a second interpolation pass.
+/// published `max_length`. Samples are validated for size and become the
+/// preview input (dry-run only, never sent or audited); slash and prefix
+/// runs substitute only captured invocation text, and there is no second
+/// interpolation pass anywhere.
 pub const MAX_INSPECT_ARGUMENT_UNITS: usize = 500;
+
+/// `{args}` capture bound in UTF-16 units (`encode_utf16().count()`),
+/// matching the inspect-sample bound so the preview sample becomes the
+/// preview input unchanged. The unit count is authoritative; byte length is
+/// total-bounded (worst case 500 BMP units × 3 bytes), so no separate byte
+/// check exists. The rendered-output bound still applies after substitution
+/// and still refuses the whole render.
+pub const MAX_ARGS_UNITS: usize = 500;
+
+/// Member-supplied `{args}` text refused before render (legacy has no throw
+/// for this; run paths answer their own correction instead). Content-free:
+/// the reason names no member text and no content-derived measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ArgsError {
+    #[error("Arguments must be at most 500 UTF-16 units.")]
+    TooLong,
+}
+
+/// Bound invocation arguments before substitution: over-long input refuses
+/// whole, never truncates into a render. Absent and empty values substitute
+/// the empty string, so templates without `{args}` behave byte-identically.
+pub fn validate_args(args: &str) -> Result<(), ArgsError> {
+    if args.encode_utf16().count() > MAX_ARGS_UNITS {
+        return Err(ArgsError::TooLong);
+    }
+    Ok(())
+}
+
+/// Slash option carrying invocation text for `{args}`: every custom command
+/// publishes one optional string option under this name, and the slash,
+/// prefix (as the remainder shape) and preview (as the sample) paths all
+/// converge on it. The unit count stays authoritative at every read.
+pub const ARGS_OPTION_NAME: &str = "arguments";
+
+/// Ephemeral slash correction for a duplicate or forged `arguments` option
+/// (expected a single text value). Fixed copy, answered directly without a
+/// public defer and with no audit row — a pre-execution input refusal in the
+/// same class as routing refusals.
+pub const INVALID_ARGS_REPLY: &str =
+    "Invalid arguments: expected a single text value. Example: /quote arguments:hello";
+
+/// Ephemeral slash correction for over-long `arguments`. Fixed copy, same
+/// direct-answer class as [`INVALID_ARGS_REPLY`].
+pub const ARGS_TOO_LONG_REPLY: &str =
+    "Arguments must be at most 500 UTF-16 units. Shorten them and retry.";
+
+/// Prefix audit reason for over-long remainder text: the attempt is already
+/// claimed, so overflow records a definitive failed `command.run` fact and
+/// sends nothing. Content-free: names no member text and no measurement.
+pub const ARGS_TOO_LONG_REASON: &str = "args_too_long";
+
+/// Closed vocabulary for the slash malformed class: slash refusals carry no
+/// audit row, so this names the contract case (agent fixtures `ARG-03`), not
+/// a persisted field.
+pub const ARGS_MALFORMED_REASON: &str = "args_malformed";
+
+/// Remainder after the first `!`-trigger token: skip the token, then one run
+/// of leading ASCII whitespace, and keep the rest verbatim (interior spacing,
+/// newlines and casing preserved). No remainder (or only whitespace after
+/// the token) captures empty. Call with message content whose first token is
+/// the matched trigger — leading whitespace before `!` never reaches here
+/// because it matches no trigger.
+#[must_use]
+pub fn capture_prefix_args(content: &str) -> &str {
+    match content.find(char::is_whitespace) {
+        None => "",
+        Some(index) => content[index..].trim_start_matches(|c: char| c.is_ascii_whitespace()),
+    }
+}
 
 /// Which private view `/command-inspect` renders. Summary never bundles the
 /// template body or a preview: two full 2,000-unit bodies plus metadata
@@ -941,28 +1206,153 @@ pub fn format_inspect_miss(name: &str) -> String {
     )
 }
 
-/// Private definition summary: saved description, existing enabled state,
-/// text trigger and usable template/preview/correction examples. Never the
-/// template body or a preview — those are their own views. Disabled rows
-/// stay inspectable; nothing here enables them.
+/// Why a saved row is not currently a prefix-dispatch candidate. Each reason is
+/// derived from the same inputs as the live text path: the row, the effective
+/// text-command gate and [`builtin_command_names`] (never the wider write
+/// reservation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextBlocker {
+    NoTrigger,
+    Paused,
+    GateOff,
+    Builtin,
+}
+
+/// Current text-trigger eligibility for one saved row. `gate` is the effective
+/// automations-and-text-commands flag; `None` means the caller could not read
+/// it, which is reported as unknown, never as enabled.
+fn text_blockers(row: &StoredCommand, gate: Option<bool>) -> Vec<TextBlocker> {
+    let mut blockers = Vec::new();
+    match row.text_trigger.as_deref() {
+        None => blockers.push(TextBlocker::NoTrigger),
+        Some(trigger) => {
+            if trigger_word(trigger)
+                .is_some_and(|word| is_builtin_trigger(&word, &builtin_command_names()))
+            {
+                blockers.push(TextBlocker::Builtin);
+            }
+        }
+    }
+    if !row.enabled {
+        blockers.push(TextBlocker::Paused);
+    }
+    if gate == Some(false) {
+        blockers.push(TextBlocker::GateOff);
+    }
+    blockers
+}
+
+fn text_eligibility_lines(row: &StoredCommand, gate: Option<bool>) -> String {
+    let blockers = text_blockers(row, gate);
+    let name = &row.name;
+    // Stored names predate validation on raw rows, so display echoes go
+    // through the same escape as the summary examples; the reservation
+    // check below keeps the raw stored value.
+    let shown = escape_inspect_text(name);
+    // Both replacement and resume enforce the wider write reservation.
+    let reserved = reserved_command_names();
+    let name_reserved = reserved.contains(name);
+    if blockers.is_empty() {
+        return if gate.is_some() {
+            "\nText-trigger eligibility: Eligible, subject to normal per-message permission checks and automod. This is not a delivery guarantee and says nothing about slash-command registration.".to_owned()
+        } else {
+            "\nText-trigger eligibility: Unknown (the current text commands gate is unavailable to this view; the saved definition itself has no blocker). Nothing here is a delivery guarantee.".to_owned()
+        };
+    }
+    let reasons = blockers
+        .iter()
+        .map(|blocker| match blocker {
+            TextBlocker::NoTrigger => "no text trigger",
+            TextBlocker::Paused => "paused definition",
+            TextBlocker::GateOff => "text commands gate off",
+            TextBlocker::Builtin => "builtin-reserved trigger",
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut out = format!("\nText-trigger eligibility: Not eligible ({reasons})");
+    if gate.is_none() {
+        out.push_str("; text commands gate unknown");
+    }
+    for blocker in &blockers {
+        match blocker {
+            TextBlocker::NoTrigger | TextBlocker::Builtin | TextBlocker::Paused if name_reserved => {
+                out.push_str(&format!(
+                    "\nNext: the name \"{shown}\" is reserved, so this definition cannot be resumed or replaced under this name. Recreate it under a different name with /command, or delete it with /command-remove name:{shown}."
+                ));
+            }
+            TextBlocker::NoTrigger => out.push_str(&format!(
+                "\nNext: add a trigger with /command name:{shown} template:... text-trigger:!word (replaces the definition)."
+            )),
+            TextBlocker::Builtin => out.push_str(&format!(
+                "\nNext: choose a non-builtin trigger with /command name:{shown} template:... text-trigger:!word (replaces the definition)."
+            )),
+            TextBlocker::Paused => {
+                if validate_toggle_enable(row, &reserved, &builtin_command_names()).is_ok() {
+                    out.push_str(&format!("\nNext: resume it with /command-enable name:{shown}."));
+                } else {
+                    out.push_str(&format!(
+                        "\nNext: repair the saved definition with /command name:{shown} template:... description:... text-trigger:!word (replaces the definition). It cannot be resumed as stored."
+                    ));
+                }
+            }
+            TextBlocker::GateOff => out.push_str(
+                "\nNext: text commands follow the TWO_TEXT_COMMANDS configuration; ask the bot operator to review it. Inspecting changes nothing.",
+            ),
+        }
+    }
+    out
+}
+
+/// Private definition summary with the current text-trigger eligibility
+/// unknown: the caller has no effective text-command gate to report.
 #[must_use]
 pub fn format_inspect_summary(row: &StoredCommand) -> String {
+    format_inspect_summary_with_gate(row, None)
+}
+
+/// Private definition summary: saved description, saved enabled state (kept
+/// separate from live dispatch), text trigger, current text-trigger
+/// eligibility with a safe next action per blocker, and usable
+/// template/preview/correction examples. Never the template body or a
+/// preview — those are their own views. Disabled rows stay inspectable;
+/// nothing here enables them. `text_commands_gate` is the effective
+/// automations-and-text-commands flag the text path uses, or `None` when
+/// unavailable. A passing result stays subject to per-message permission
+/// checks and automod.
+#[must_use]
+pub fn format_inspect_summary_with_gate(
+    row: &StoredCommand,
+    text_commands_gate: Option<bool>,
+) -> String {
     let heading = InspectView::Summary.heading(&row.name);
-    let status = if row.enabled { "Enabled" } else { "Disabled" };
+    let status = if row.enabled {
+        "Enabled"
+    } else {
+        "Disabled (paused)"
+    };
     let trigger = escape_inspect_text(row.text_trigger.as_deref().unwrap_or("none (slash-only)"));
     let shown = escape_inspect_text(&row.name);
+    let eligibility = text_eligibility_lines(row, text_commands_gate);
+    let correction = if reserved_command_names().contains(&row.name) {
+        "Recreate under a different name: /command name:another-name template:...".to_owned()
+    } else {
+        format!("Replace the definition: /command name:{shown} template:...")
+    };
     let examples = format!(
-        "\nSaved template: /command-inspect name:{shown} view:template\nPrivate preview: /command-inspect name:{shown} view:preview\nReplace the definition: /command name:{shown} template:..."
+        "\nSaved template: /command-inspect name:{shown} view:template\nPrivate preview: /command-inspect name:{shown} view:preview\n{correction}"
     );
     // Fixed overhead first: only the escaped description is unbounded (raw
     // rows predate validation), so only it can be cut — with an explicit
     // marker, never a silent partial.
     let fixed_units = heading.encode_utf16().count()
         + "\nDescription: ".encode_utf16().count()
-        + "\nStatus: ".encode_utf16().count()
+        + "\nSaved definition \u{2014} Status: "
+            .encode_utf16()
+            .count()
         + status.encode_utf16().count()
         + "\nText trigger: ".encode_utf16().count()
         + trigger.encode_utf16().count()
+        + eligibility.encode_utf16().count()
         + examples.encode_utf16().count();
     let mut description = escape_inspect_text(&row.description);
     let budget = MAX_RENDERED_CHARS.saturating_sub(fixed_units);
@@ -974,7 +1364,7 @@ pub fn format_inspect_summary(row: &StoredCommand) -> String {
         );
         description = format!("{cut}{MARKER}");
     }
-    let reply = format!("{heading}\nDescription: {description}\nStatus: {status}\nText trigger: {trigger}{examples}");
+    let reply = format!("{heading}\nDescription: {description}\nSaved definition \u{2014} Status: {status}\nText trigger: {trigger}{eligibility}{examples}");
     debug_assert!(reply.encode_utf16().count() <= MAX_RENDERED_CHARS);
     reply
 }
@@ -1014,7 +1404,8 @@ pub fn format_inspect_template(row: &StoredCommand) -> String {
 
 /// Private rendered preview with the invoking member/channel context, or a
 /// truthful refusal with a correction example. Invalid saved templates
-/// refuse without rendering; the sample arguments are never interpolated.
+/// refuse without rendering; the `arguments` sample renders as the preview
+/// `{args}` input, dry-run only.
 #[must_use]
 pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> String {
     if let Err(error) = validate_template(&row.template) {
@@ -1051,6 +1442,16 @@ pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> Str
             );
         }
     };
+    // Previews stay truthful about delivery: a render with no message text
+    // (for example an `{args}`-only template with an empty sample) refuses
+    // at run time, so the preview says so instead of showing a blank body.
+    // Fixed copy only — the rendered text may carry member content.
+    if !crate::message_safety::has_message_text(&rendered) {
+        let shown = escape_inspect_text(&row.name);
+        return format!(
+            "Template for /{shown} renders no message text with these arguments. Add text around {{args}} with /command name:{shown} template:..."
+        );
+    }
     format_bounded_view(
         &InspectView::Preview.heading(&row.name),
         &escape_inspect_text(&rendered),
@@ -1063,10 +1464,18 @@ pub fn format_inspect_preview(row: &StoredCommand, ctx: &TemplateContext) -> Str
 #[must_use]
 pub fn format_draft_preview(template: &str, ctx: &TemplateContext) -> String {
     match validate_template(template).and_then(|()| render_template(template, ctx)) {
-        Ok(rendered) => format_bounded_view(
-            "Draft preview — not saved or published",
-            &escape_inspect_text(&rendered),
-        ),
+        Ok(rendered)
+            if crate::message_safety::has_message_text(&rendered) =>
+        {
+            format_bounded_view(
+                "Draft preview — not saved or published",
+                &escape_inspect_text(&rendered),
+            )
+        }
+        // A draft that renders no message text would refuse at run time, so
+        // the preview says so. Fixed copy only — never the rendered text.
+        Ok(_) => "Draft renders no message text with these arguments. Add text around {args} and retry /command-inspect draft:Hello. Nothing was saved or published."
+            .to_owned(),
         Err(error) => {
             let detail = escape_inspect_text(&error.to_string());
             let detail = if detail.encode_utf16().count() > 256 {
@@ -1230,6 +1639,7 @@ mod tests {
             username: String::new(),
             server: String::new(),
             channel: String::new(),
+            args: String::new(),
         };
         let template = "{user}".repeat(500);
         let result = render_template(&template, &ctx);
@@ -1253,17 +1663,29 @@ mod tests {
     }
 
     #[test]
-    fn template_render_substitutes_all_four() {
+    fn template_render_substitutes_all_five() {
         let ctx = TemplateContext {
             user: "<@1>".to_owned(),
             username: "one".to_owned(),
             server: "TWO".to_owned(),
             channel: "#general".to_owned(),
+            args: "extra words".to_owned(),
         };
         assert_eq!(
             render_template("hey {user} ({username}) of {server} in {channel}", &ctx),
             Ok("hey <@1> (one) of TWO in #general".to_owned())
         );
+        // `{args}` echoes the invocation text literally in the same pass.
+        assert_eq!(
+            render_template("Says {args}", &ctx),
+            Ok("Says extra words".to_owned())
+        );
+        // Absent invocation text substitutes empty, never a literal key.
+        let ctx = TemplateContext {
+            args: String::new(),
+            ..ctx
+        };
+        assert_eq!(render_template("Says {args}", &ctx), Ok("Says ".to_owned()));
     }
 
     #[test]
@@ -1273,6 +1695,7 @@ mod tests {
             username: "x".repeat(50),
             server: String::new(),
             channel: String::new(),
+            args: String::new(),
         };
         assert!(matches!(
             render_template(&format!("{{username}}{}", "x".repeat(2000)), &ctx),
@@ -1292,6 +1715,7 @@ mod tests {
             username: "😀".repeat(1001),
             server: String::new(),
             channel: String::new(),
+            args: String::new(),
         };
         assert_eq!(
             render_template("{username}", &ctx),
@@ -1312,6 +1736,7 @@ mod tests {
             username: "not substituted twice".to_owned(),
             server: "世界".to_owned(),
             channel: "#rules".to_owned(),
+            args: String::new(),
         };
         assert_eq!(
             render_template("😀 {user} {{server}} {User} {unknown}", &ctx),
@@ -1422,19 +1847,34 @@ mod tests {
         let reserved = reserved_command_names();
         let definitions = router.publish_set(&[]).unwrap();
         let published: HashSet<_> = definitions.iter().map(|def| def.name.clone()).collect();
-        // `templateassistant` is unpublished until its slice lands, but the name
-        // stays squatted: reservations cover the publish set plus exactly that
-        // one held name (which keeps holding its guild slot in the capacity
-        // math below, so the slot count does not churn when it republishes).
+        // `templateassistant`, `lockdown-preview`, and `automod-preview` are
+        // unpublished until their slices land, but the names stay squatted:
+        // reservations cover the publish set plus exactly those three held
+        // names. Capacity math counts only the publishable set, so unused
+        // slots keep accepting custom commands; the held names rejoin the
+        // budget when published.
         assert!(published.is_subset(&reserved));
-        assert_eq!(reserved.len(), published.len() + 1);
+        assert_eq!(reserved.len(), published.len() + 3);
         assert!(reserved.contains("templateassistant"));
+        assert!(reserved.contains("lockdown-preview"));
+        assert!(reserved.contains("automod-preview"));
         assert!(!published.contains("templateassistant"));
+        assert!(!published.contains("lockdown-preview"));
+        assert!(!published.contains("automod-preview"));
         assert_eq!(
             validate_put_input(&put_input("templateassistant"), &reserved),
             Err(CommandError::ReservedName("templateassistant".to_owned()))
         );
-        let capacity = max_custom_commands(reserved.len());
+        assert_eq!(
+            validate_put_input(&put_input("lockdown-preview"), &reserved),
+            Err(CommandError::ReservedName("lockdown-preview".to_owned()))
+        );
+        assert_eq!(
+            validate_put_input(&put_input("automod-preview"), &reserved),
+            Err(CommandError::ReservedName("automod-preview".to_owned()))
+        );
+        assert_eq!(publishable_builtin_names(), published);
+        let capacity = max_custom_commands(published.len());
         let custom: Vec<_> = (0..capacity)
             .map(|index| CustomCommand {
                 name: format!("custom-{index}"),
@@ -1447,7 +1887,7 @@ mod tests {
             published.len() + capacity
         );
         assert_eq!(
-            check_capacity(capacity, true, reserved.len()),
+            check_capacity(capacity, true, published.len()),
             Err(CommandError::OverCapacity(capacity))
         );
     }
@@ -1554,6 +1994,19 @@ mod tests {
         assert_eq!(trigger_word("!"), None);
         assert_eq!(trigger_word("hi !faq"), None);
         assert_eq!(trigger_word(""), None);
+    }
+
+    #[test]
+    fn prefix_remainder_captures_verbatim_after_one_whitespace_run() {
+        // ARG-11: remainder after the first token is the argument verbatim —
+        // interior spacing, newlines and casing preserved, one leading
+        // ASCII-whitespace run skipped.
+        assert_eq!(capture_prefix_args("!faq"), "");
+        assert_eq!(capture_prefix_args("!faq   "), "");
+        assert_eq!(capture_prefix_args("!faq hello"), "hello");
+        assert_eq!(capture_prefix_args("!faq   hello  world "), "hello  world ");
+        assert_eq!(capture_prefix_args("!FAQ MiXeD"), "MiXeD");
+        assert_eq!(capture_prefix_args("!faq\tline1\nline2"), "line1\nline2");
     }
 
     #[test]
@@ -1668,6 +2121,141 @@ mod tests {
         assert_eq!(audit.outcome, "ok");
     }
 
+    fn patch(
+        template: Option<&str>,
+        description: Option<&str>,
+        text_trigger: TriggerPatch,
+    ) -> EditPatch {
+        EditPatch {
+            template: template.map(str::to_owned),
+            description: description.map(str::to_owned),
+            text_trigger,
+        }
+    }
+
+    #[test]
+    fn edit_patch_replaces_only_supplied_fields() {
+        let mut row = stored("faq");
+        row.text_trigger = Some("!faq".to_owned());
+        row.enabled = false;
+        let merged = patch(Some("New {user}"), None, TriggerPatch::Keep).apply(&row);
+        assert_eq!(merged.template, "New {user}");
+        assert_eq!(merged.description, row.description);
+        assert_eq!(merged.text_trigger.as_deref(), Some("!faq"));
+        assert!(!merged.enabled, "a disabled row stays disabled");
+        assert_eq!((&merged.guild_id, &merged.name), (&row.guild_id, &row.name));
+        let set = patch(None, Some("D"), TriggerPatch::Set("!x".to_owned())).apply(&row);
+        assert_eq!(set.description, "D");
+        assert_eq!(set.text_trigger.as_deref(), Some("!x"));
+        let cleared = patch(None, None, TriggerPatch::Clear).apply(&row);
+        assert_eq!(cleared.text_trigger, None);
+        assert_eq!(cleared.template, row.template);
+    }
+
+    #[test]
+    fn edit_adjudication_is_missing_noop_or_audited_change() {
+        let mut row = stored("faq");
+        row.text_trigger = Some("!faq".to_owned());
+        let missing = adjudicate_edit(
+            GUILD,
+            ACTOR,
+            "faq",
+            None,
+            &patch(None, None, TriggerPatch::Keep),
+        );
+        assert_eq!(missing.outcome, EditOutcome::Missing);
+        assert!(missing.audit.is_none() && !missing.resync_registry);
+        for noop in [
+            patch(None, None, TriggerPatch::Keep),
+            patch(Some(&row.template), None, TriggerPatch::Keep),
+            patch(
+                None,
+                Some(&row.description),
+                TriggerPatch::Set("!faq".to_owned()),
+            ),
+        ] {
+            let decision = adjudicate_edit(GUILD, ACTOR, "faq", Some(&row), &noop);
+            assert_eq!(decision.outcome, EditOutcome::Unchanged);
+            assert!(decision.audit.is_none() && !decision.resync_registry);
+            assert!(decision.changed.is_empty());
+        }
+        let changed = adjudicate_edit(
+            GUILD,
+            ACTOR,
+            "faq",
+            Some(&row),
+            &patch(Some("Other"), Some("Desc"), TriggerPatch::Clear),
+        );
+        assert_eq!(changed.outcome, EditOutcome::Changed);
+        assert_eq!(changed.changed, ["template", "description", "text-trigger"]);
+        assert!(changed.resync_registry);
+        assert_eq!(
+            changed.audit.expect("a change audits"),
+            AuditRecord {
+                guild_id: GUILD.to_owned(),
+                actor_id: Some(ACTOR.to_owned()),
+                action: "command.edit".to_owned(),
+                target_key: Some("faq".to_owned()),
+                outcome: "ok".to_owned(),
+                reason: None,
+            }
+        );
+        // Clearing an absent trigger is a no-op, not a change.
+        let slash_only = stored("faq");
+        let decision = adjudicate_edit(
+            GUILD,
+            ACTOR,
+            "faq",
+            Some(&slash_only),
+            &patch(None, None, TriggerPatch::Clear),
+        );
+        assert_eq!(decision.outcome, EditOutcome::Unchanged);
+    }
+
+    #[test]
+    fn edit_validates_the_merged_definition_and_new_triggers() {
+        let reserved = reserved_command_names();
+        let dispatch = builtin_command_names();
+        let mut row = stored("faq");
+        row.template = "Imported {guild}".to_owned();
+        let description_only = patch(None, Some("Fine"), TriggerPatch::Keep);
+        assert!(matches!(
+            validate_edit(
+                &description_only.apply(&row),
+                &description_only,
+                &reserved,
+                &dispatch
+            ),
+            Err(CommandError::InvalidTemplate(_))
+        ));
+        let row = stored("faq");
+        let builtin_trigger = patch(None, None, TriggerPatch::Set("!rank".to_owned()));
+        assert_eq!(
+            validate_edit(
+                &builtin_trigger.apply(&row),
+                &builtin_trigger,
+                &reserved,
+                &dispatch
+            ),
+            Err(CommandError::ReservedTextTrigger("!rank".to_owned()))
+        );
+        let empty_trigger = patch(None, None, TriggerPatch::Set(String::new()));
+        assert_eq!(
+            validate_edit(
+                &empty_trigger.apply(&row),
+                &empty_trigger,
+                &reserved,
+                &dispatch
+            ),
+            Err(CommandError::InvalidTextTrigger)
+        );
+        // An untouched stored builtin-named trigger does not block unrelated edits.
+        let mut grandfathered = stored("faq");
+        grandfathered.text_trigger = Some("!rank".to_owned());
+        let keep = patch(Some("Hi"), None, TriggerPatch::Keep);
+        assert!(validate_edit(&keep.apply(&grandfathered), &keep, &reserved, &dispatch).is_ok());
+    }
+
     #[test]
     fn toggle_enable_revalidates_the_stored_definition() {
         let reserved = reserved_command_names();
@@ -1692,7 +2280,7 @@ mod tests {
         }
         // Invalid stored content refuses without reactivating.
         let mut broken = valid.clone();
-        broken.template = "Unknown {args}".to_owned();
+        broken.template = "Unknown {guild}".to_owned();
         assert!(matches!(
             validate_toggle_enable(&broken, &reserved, &dispatch),
             Err(CommandError::InvalidTemplate(_))
@@ -1874,6 +2462,7 @@ mod tests {
             username: "tester".to_owned(),
             server: "TWO".to_owned(),
             channel: "<#4444>".to_owned(),
+            args: String::new(),
         }
     }
 
@@ -1961,6 +2550,168 @@ mod tests {
         assert!(summary.contains("Disabled"));
         assert!(!summary.to_lowercase().contains("enabled"));
         assert!(summary.contains("none (slash-only)"));
+    }
+
+    #[test]
+    fn inspect_summary_eligibility_follows_gate_trigger_state_and_reservation() {
+        let eligibility = |row: &StoredCommand, gate| {
+            format_inspect_summary_with_gate(row, gate)
+                .lines()
+                .find(|line| line.starts_with("Text-trigger eligibility:"))
+                .expect("eligibility line")
+                .to_owned()
+        };
+        let row = inspect_row();
+        assert!(eligibility(&row, Some(true)).contains("Eligible, subject to"));
+        assert!(eligibility(&row, Some(true)).contains("automod"));
+        assert!(eligibility(&row, Some(false)).contains("text commands gate off"));
+        assert!(eligibility(&row, None).contains("Unknown"));
+        let mut paused = inspect_row();
+        paused.enabled = false;
+        assert!(eligibility(&paused, Some(true)).contains("paused definition"));
+        let mut reserved = inspect_row();
+        reserved.text_trigger = Some("!HELP".to_owned());
+        assert!(eligibility(&reserved, Some(true)).contains("builtin-reserved trigger"));
+        // Dispatch reserves builtin names only, not the wider write set.
+        let mut write_only = inspect_row();
+        write_only.text_trigger = Some("!setup".to_owned());
+        assert!(eligibility(&write_only, Some(true)).contains("Eligible"));
+        let mut slash_only = inspect_row();
+        slash_only.text_trigger = None;
+        let summary = format_inspect_summary_with_gate(&slash_only, Some(true));
+        assert!(summary.contains("no text trigger"));
+        assert!(summary.contains("text-trigger:"));
+        assert!(!summary.contains("registration"));
+    }
+
+    #[test]
+    fn inspect_summary_paused_reserved_name_points_at_replace_or_delete_not_resume() {
+        assert!(
+            reserved_command_names().contains("setup"),
+            "test premise: setup is a voice-room name in the write reservation"
+        );
+        let mut row = inspect_row();
+        row.name = "setup".to_owned();
+        row.text_trigger = Some("!setup".to_owned());
+        row.enabled = false;
+        let summary = format_inspect_summary_with_gate(&row, Some(true));
+        assert!(summary.contains("paused definition"));
+        assert!(!summary.contains("builtin-reserved trigger"));
+        assert!(!summary.contains("/command-enable"));
+        assert!(summary.contains("is reserved"));
+        assert!(summary.contains("cannot be resumed"));
+        assert!(summary.contains("/command-remove name:setup"));
+        assert!(summary.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        // Control: an ordinary paused row still offers resume.
+        let mut plain = inspect_row();
+        plain.enabled = false;
+        let control = format_inspect_summary_with_gate(&plain, Some(true));
+        assert!(control.contains("/command-enable name:faq"));
+    }
+
+    #[test]
+    fn inspect_summary_reserved_name_trigger_repairs_require_a_different_name() {
+        let reserved = reserved_command_names();
+        for enabled in [true, false] {
+            for trigger in [None, Some("!help")] {
+                let mut row = inspect_row();
+                row.name = "setup".to_owned();
+                row.enabled = enabled;
+                row.text_trigger = trigger.map(str::to_owned);
+                assert_eq!(
+                    validate_put_input(
+                        &PutCommandInput {
+                            name: row.name.clone(),
+                            description: row.description.clone(),
+                            template: row.template.clone(),
+                            text_trigger: Some("!word".to_owned()),
+                        },
+                        &reserved,
+                    ),
+                    Err(CommandError::ReservedName("setup".to_owned()))
+                );
+                let summary = format_inspect_summary_with_gate(&row, Some(true));
+                assert!(summary.contains("Not eligible"));
+                assert!(summary.contains("Recreate it under a different name with /command"));
+                assert!(summary.contains("/command-remove name:setup"));
+                assert!(!summary.contains("/command name:setup"));
+                assert!(!summary.contains("/command-enable name:setup"));
+                assert!(summary.encode_utf16().count() <= MAX_RENDERED_CHARS);
+            }
+        }
+    }
+
+    #[test]
+    fn inspect_summary_offers_resume_only_when_the_full_enable_validator_accepts() {
+        let reserved = reserved_command_names();
+        let dispatch = builtin_command_names();
+        let mut row = inspect_row();
+        row.enabled = false;
+        for (template, description, trigger, expected) in [
+            (
+                "Hello {unknown}",
+                "FAQ",
+                "!faq",
+                CommandError::InvalidTemplate(TemplateError::UnknownPlaceholder(
+                    "unknown".to_owned(),
+                )),
+            ),
+            ("Hello", "", "!faq", CommandError::InvalidDescription),
+            (
+                "Hello",
+                "FAQ",
+                "!help",
+                CommandError::ReservedTextTrigger("!help".to_owned()),
+            ),
+        ] {
+            row.template = template.to_owned();
+            row.description = description.to_owned();
+            row.text_trigger = Some(trigger.to_owned());
+            assert_eq!(
+                validate_toggle_enable(&row, &reserved, &dispatch),
+                Err(expected)
+            );
+            let summary = format_inspect_summary_with_gate(&row, Some(true));
+            assert!(summary.contains("paused definition"));
+            assert!(!summary.contains("/command-enable"));
+            assert!(summary.contains("Next: repair the saved definition with /command name:faq"));
+            assert!(summary.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        }
+        row = inspect_row();
+        row.enabled = false;
+        assert_eq!(validate_toggle_enable(&row, &reserved, &dispatch), Ok(()));
+        assert!(format_inspect_summary_with_gate(&row, Some(true))
+            .contains("Next: resume it with /command-enable name:faq."));
+    }
+
+    #[test]
+    fn inspect_summary_next_actions_escape_markdown_active_names() {
+        for (enabled, trigger, expected) in [
+            (
+                false,
+                Some("!faq"),
+                "Next: resume it with /command-enable name:\\_\\_forged\\_\\_.",
+            ),
+            (
+                true,
+                None,
+                "Next: add a trigger with /command name:\\_\\_forged\\_\\_ template:",
+            ),
+            (
+                true,
+                Some("!help"),
+                "Next: choose a non-builtin trigger with /command name:\\_\\_forged\\_\\_ template:",
+            ),
+        ] {
+            let mut row = inspect_row();
+            row.name = "__forged__".to_owned();
+            row.enabled = enabled;
+            row.text_trigger = trigger.map(str::to_owned);
+            let summary = format_inspect_summary_with_gate(&row, Some(true));
+            assert!(summary.lines().any(|line| line.starts_with(expected)));
+            assert!(!summary.contains("name:__forged__"));
+            assert!(summary.encode_utf16().count() <= MAX_RENDERED_CHARS);
+        }
     }
 
     #[test]
@@ -2061,6 +2812,42 @@ mod tests {
     }
 
     #[test]
+    fn inspect_preview_refuses_a_render_with_no_message_text() {
+        // ARG-20: an `{args}`-only template with an empty sample renders no
+        // message text, which run paths refuse — so the preview says so in
+        // fixed copy instead of showing a blank body.
+        let row = StoredCommand {
+            template: "{args}".to_owned(),
+            ..inspect_row()
+        };
+        assert_eq!(
+            format_inspect_preview(&row, &inspect_ctx()),
+            "Template for /faq renders no message text with these arguments. Add text around {args} with /command name:faq template:..."
+        );
+        // Text around the placeholder still previews normally.
+        let row = StoredCommand {
+            template: "Says {args}".to_owned(),
+            ..inspect_row()
+        };
+        assert_eq!(
+            format_inspect_preview(&row, &inspect_ctx()),
+            "Preview /faq\nSays "
+        );
+    }
+
+    #[test]
+    fn draft_preview_refuses_a_render_with_no_message_text() {
+        assert_eq!(
+            format_draft_preview("{args}", &inspect_ctx()),
+            "Draft renders no message text with these arguments. Add text around {args} and retry /command-inspect draft:Hello. Nothing was saved or published."
+        );
+        assert_eq!(
+            format_draft_preview("Says {args}", &inspect_ctx()),
+            "Draft preview — not saved or published\nSays "
+        );
+    }
+
+    #[test]
     fn draft_long_invalid_template_preserves_bounded_detail_and_correction() {
         let template = format!("{{{}}}", "a".repeat(1998));
         let view = format_draft_preview(&template, &inspect_ctx());
@@ -2086,7 +2873,7 @@ mod tests {
 
     #[test]
     fn inspect_preview_refuses_invalid_templates_with_correction() {
-        for template in ["Hello {unknown}", "{args}", &"😀".repeat(1001)] {
+        for template in ["Hello {unknown}", "{guild}", &"😀".repeat(1001)] {
             let mut row = inspect_row();
             row.template = template.to_owned();
             let view = format_inspect_preview(&row, &inspect_ctx());

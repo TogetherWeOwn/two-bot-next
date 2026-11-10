@@ -85,6 +85,7 @@ use two_bot_core::{
     help::{canonical_help_selector, unknown_help_branch_correction, unknown_help_correction},
     moderation::ModerationAction,
     router::replies::EXPIRED_COMPONENT_REPLY,
+    settings::LiveSettings,
     sticky::{
         activity_eligible, decide_activity, sticky_removed_reply, sticky_set_reply, store,
         ActivityDecision, ActivityOutcome, PutSticky, RemoveOutcome, StickyAudit,
@@ -306,6 +307,9 @@ pub struct CommandRuntime {
     /// answerer of `/kick`: moderation first, then this delegate for room
     /// occupants the moderation path refused.
     voice_kick_vote: Mutex<Option<VoiceKickVote>>,
+    /// Test-only live-settings override: per-instance reader for consumer
+    /// acceptance. Production stays `None` and reads the poller snapshot.
+    live_override: Mutex<Option<LiveSettings>>,
 }
 
 // Each in-flight LFG execution holds up to two connections of the shared pool;
@@ -391,6 +395,7 @@ impl CommandRuntime {
             registry_synced: tokio::sync::Mutex::new(false),
             attempts: AtomicU64::new(now_millis_for_test().max(0) as u64),
             voice_kick_vote: Mutex::new(None),
+            live_override: Mutex::new(None),
         })
     }
 
@@ -398,6 +403,23 @@ impl CommandRuntime {
     #[cfg(test)]
     pub(crate) fn test_interactions(&self) -> &two_bot_discord::interactions::InteractionRuntime {
         &self.interactions
+    }
+
+    /// Test-only per-instance live reader: the real [`Self::on_interaction`]
+    /// entry resolves announcements from this instead of the poller snapshot.
+    /// No process-global installation; production instances never set it.
+    #[cfg(test)]
+    pub(crate) fn set_live_settings(&self, live: LiveSettings) {
+        *self.live_override.lock().expect("command live override") = Some(live);
+    }
+
+    /// Effective live source: the test override when set, else the poller.
+    fn live_source(&self) -> Option<LiveSettings> {
+        self.live_override
+            .lock()
+            .expect("command live override")
+            .clone()
+            .or_else(crate::settings_jobs::live)
     }
 
     pub(crate) fn published_commands(&self) -> Option<Arc<[two_bot_core::CommandDefinition]>> {
@@ -1393,6 +1415,20 @@ impl CommandRuntime {
     /// commands own their defer/audit lifecycle. Unwired builtins
     /// get an unavailable reply; router Ignore (unknown/guild) stays silent.
     pub(crate) async fn on_interaction(&self, interaction: &Interaction) {
+        let live = self.live_source();
+        self.on_interaction_with_live(interaction, live.as_ref())
+            .await;
+    }
+
+    /// [`on_interaction`] over an injectable live snapshot, for tests (the
+    /// `register_gated_with` shape). Production reads the poller-published
+    /// snapshot; a stored `0` refuses the live-gated announcement commands
+    /// with the disabled reply before any defer.
+    pub(crate) async fn on_interaction_with_live(
+        &self,
+        interaction: &Interaction,
+        live: Option<&LiveSettings>,
+    ) {
         let application_id = self.application_id.load(Ordering::Relaxed);
         if application_id != 0 && interaction.application_id.get() != application_id {
             return;
@@ -1421,6 +1457,33 @@ impl CommandRuntime {
             return;
         }
         let routed = route_interaction(&self.interactions.router, interaction, None);
+        // Per-invocation live overlay (self-role per-dispatch pattern): the
+        // live snapshot wins over the boot value the router already admitted,
+        // so a stored `0` refuses with the disabled reply while an absent row
+        // executes. Refuse-only, so boot-off registration is unchanged. The
+        // name-aware overlay also rewrites a live-gated permission refusal to
+        // the disabled reply while live-off, matching boot-off
+        // gate-before-permission order for unprivileged members.
+        let routed = match routed {
+            RoutedInteraction::Slash { name, outcome } => {
+                let guild = interaction
+                    .guild_id
+                    .map(|id| id.get().to_string())
+                    .unwrap_or_default();
+                let boot = self.interactions.router.gates().announcements;
+                let announcements_live =
+                    crate::feed_jobs::live_announcements_with(&guild, boot, live);
+                RoutedInteraction::Slash {
+                    outcome: two_bot_core::live_gate_announcements_slash_named(
+                        &name,
+                        outcome,
+                        announcements_live,
+                    ),
+                    name,
+                }
+            }
+            other => other,
+        };
         if matches!(
             &routed,
             RoutedInteraction::Slash {
@@ -3439,7 +3502,13 @@ pub(crate) fn publication_definitions(
         return Ok(None);
     }
     router
-        .publish_set(custom.unwrap_or_default())
+        .publish_set_capacity_deferred(custom.unwrap_or_default())
+        .map(|(defs, withheld)| {
+            if let Some(builtin) = withheld {
+                warn!(builtin, "guild command registry at Discord's 100-command ceiling; optional builtin withheld this publication (custom commands preserved)");
+            }
+            defs
+        })
         .map(Some)
         .map_err(|_| RegistrySyncError::Invalid)
 }

@@ -108,7 +108,7 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'check') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       CARGO_TERM_COLOR: always
       # Disk hygiene (same pins as the test lanes): smaller binaries, no incremental artifacts.
@@ -296,6 +296,7 @@ jobs:
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist_noexec_acceptance.py' -v
 
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_probe.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_probe_timeout_location_acceptance.py' -v
@@ -310,6 +311,14 @@ jobs:
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_slow_burn_tracker_duplicate_key_acceptance.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_check_docker_manifests_no_assert_acceptance.py' -v
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docker_deps_no_assert.py' -v
+      - name: Docker replay confinement acceptance (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_docker_replay_intake_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -O -m unittest discover -s scripts -p 'test_docker_replay_intake_acceptance.py' -v
+      - name: Tracker scratch failure acceptance (offline)
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_slow_burn_tracker_scratch_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -O -m unittest discover -s scripts -p 'test_slow_burn_tracker_scratch_acceptance.py' -v
 
       - name: soak evidence parser (offline, fixtures only)
         run: |
@@ -374,17 +383,21 @@ jobs:
       # includes the advisory scan, and the deny image carries its own
       # toolchain, so this also reports advisories on docs-only PRs for the
       # cost of one advisory-DB fetch. Advisory findings fail the PR (HARD).
+      # `--workspace` is required: the root manifest is also a package, so
+      # without it the graph holds only `two-bot-next` and every check
+      # passes on one crate with no dependencies.
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check all
+          arguments: --workspace --all-features
 
       - name: Install Rust toolchain
         id: toolchain
         if: needs.job-inputs.outputs.rust != 'false'
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -399,8 +412,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -575,7 +588,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       CARGO_TERM_COLOR: always
       TWO_CUSTOM_COMMAND_TEST_CI: "1"
@@ -703,7 +716,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
         # The installer retries only checksum-rotation failures, so a
         # transient download failure (`Network is unreachable` syncing the
@@ -724,8 +737,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -888,6 +901,11 @@ jobs:
       - name: cargo test (isolated ticket skip/budget acceptance)
         run: cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked ticket_runtime::cursor_budget -- --test-threads=1
 
+      # The gateway lifecycle acceptance target is generated from live source
+      # (never committed), so the integration sweep below compiles and runs it.
+      - name: prepare gateway lifecycle acceptance
+        run: python3 tests/gateway_lifecycle/prepare.py --prepare
+
       # The standalone backup fixture has its own scratch-only URL guard.
       # Supplying it here executes the round trip rather than its local skip.
       - name: cargo test (integration, including website acceptance and backup round trip)
@@ -986,7 +1004,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
         # The installer retries only checksum-rotation failures, so a
         # transient download failure fails the job before planning runs.
         # Continue so the next step can retry the same pin; it fails closed below.
@@ -1003,8 +1021,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -1071,7 +1089,7 @@ jobs:
     # rides separately in `rust-tests`, so the three fail independently.
     timeout-minutes: 45
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       CARGO_TERM_COLOR: always
       TWO_CUSTOM_COMMAND_TEST_CI: "1"
@@ -1209,7 +1227,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
         # The installer retries only checksum-rotation failures, so a
         # transient download failure (`Network is unreachable` syncing the
@@ -1230,8 +1248,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -1766,22 +1784,25 @@ jobs:
     uses: ./.github/workflows/reusable-rust-nextest.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
-    # R2 write credentials flow only on push to main and workflow_dispatch:
-    # the lane compiles and executes code, and any other event (pull_request,
-    # merge_group, ...) runs a head that is not on `main` yet. The reusable
-    # lane independently refuses shared backends off those two events
-    # (defense in depth; see its backend step). Empty elsewhere, so the lane
-    # falls back to local-disk sccache.
-    # NOTE: the gate must read `(== 'push' || == 'workflow_dispatch') &&
-    # secrets.X || ''`. A `!= 'pull_request' && secrets.X` form forwards the
-    # secret on merge_group, and `== 'pull_request' && '' || secrets.X`
-    # forwards it everywhere, because '' is falsy in GitHub expressions.
+    # R2 write credentials flow only on push and workflow_dispatch runs on
+    # `main`: the lane compiles and executes code, and any other event
+    # (pull_request, merge_group, ...) or ref (a manual dispatch can target
+    # any branch or tag) runs a head that is not on `main`. The reusable
+    # lane independently refuses shared backends off `main` (defense in
+    # depth; see its backend step). Empty elsewhere, so the lane falls back
+    # to local-disk sccache.
+    # NOTE: the gate must read `ref == 'refs/heads/main' && (== 'push' ||
+    # == 'workflow_dispatch') && secrets.X || ''`. Event name alone is not
+    # enough, because workflow_dispatch accepts any ref. A
+    # `!= 'pull_request' && secrets.X` form forwards the secret on
+    # merge_group, and `== 'pull_request' && '' || secrets.X` forwards it
+    # everywhere, because '' is falsy in GitHub expressions.
     secrets:
-      SCCACHE_BUCKET: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_BUCKET || '' }}
-      SCCACHE_ENDPOINT: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_ENDPOINT || '' }}
-      SCCACHE_REGION: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_REGION || '' }}
-      AWS_ACCESS_KEY_ID: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_ACCESS_KEY_ID || '' }}
-      AWS_SECRET_ACCESS_KEY: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_SECRET_ACCESS_KEY || '' }}
+      SCCACHE_BUCKET: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_BUCKET || '' }}
+      SCCACHE_ENDPOINT: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_ENDPOINT || '' }}
+      SCCACHE_REGION: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.SCCACHE_REGION || '' }}
+      AWS_ACCESS_KEY_ID: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && secrets.AWS_SECRET_ACCESS_KEY || '' }}
 
   ignored-db-stores:
     name: ignored db (stores)
@@ -1798,7 +1819,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       # Same env as `rust-tests`: disk hygiene pins and CI-service-only settings.
       CARGO_TERM_COLOR: always
@@ -1916,7 +1937,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -1931,8 +1952,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -2273,7 +2294,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       # Same env as `rust-tests`: disk hygiene pins and CI-service-only settings.
       CARGO_TERM_COLOR: always
@@ -2391,7 +2412,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: rustfmt, clippy
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -2406,8 +2427,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component rustfmt --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -2704,7 +2725,7 @@ jobs:
     # Each job container has a private service network; never publish a fixed
     # host port on the shared self-hosted runner Docker host.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     services:
       agent-testdb:
         image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
@@ -2726,7 +2747,7 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         if: needs.job-inputs.outputs.rust != 'false'
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -2741,8 +2762,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -2803,7 +2824,7 @@ jobs:
     # A job container resolves service names directly. The test's fixed
     # agent-testdb endpoint cannot fall back to an inherited DATABASE_URL.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     services:
       agent-testdb:
         image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
@@ -2825,7 +2846,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
 
@@ -2839,8 +2860,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -3086,7 +3107,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     services:
       agent-testdb:
         image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
@@ -3107,7 +3128,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -3122,8 +3143,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -3173,7 +3194,7 @@ jobs:
     # across concurrent jobs. A job container gets its own network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       TWO_TEST_DATABASE_URL: postgres://agent_test@agent-testdb:5432/agent_test
     services:
@@ -3194,7 +3215,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
           components: clippy
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
@@ -3209,8 +3230,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host --component clippy; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host --component clippy; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -3241,7 +3262,7 @@ jobs:
     timeout-minutes: 15
     # Service DNS stays inside this job's network; never publish a shared port.
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     services:
       agent-testdb:
         image: postgres:18.6-bookworm@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650
@@ -3264,7 +3285,7 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
         with:
-          toolchain: "1.98.1" # Match rust-toolchain.toml; floating stable can drift.
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
 
@@ -3278,8 +3299,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.98.1" --profile minimal --no-self-update --force-non-host; then
-              rustup default "1.98.1" --force-non-host
+            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.99.1" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1
@@ -3336,7 +3357,7 @@ jobs:
     runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'fuzz-compile') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
     timeout-minutes: 30
     container:
-      image: rust:bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       CARGO_TERM_COLOR: always
       CARGO_PROFILE_DEV_DEBUG: 'line-tables-only'
@@ -3373,7 +3394,7 @@ jobs:
       # feeds_http, self_role_custom_id, and helix_subscription_listing seeds.
       # Bounded vote_kick and helix_token smokes are manual (README).
       # The `+nightly-2026-10-01` selector is load-bearing: rustup resolves the
-      # toolchain from the repo-root rust-toolchain.toml (stable 1.98.1) even
+      # toolchain from the repo-root rust-toolchain.toml (stable 1.99.1) even
       # with working-directory fuzz/, so a bare `cargo fuzz build` runs under
       # stable and fails on `-Zsanitizer`. The `+toolchain` form bypasses it.
       - name: Compile-only fuzz build (no execution)
@@ -3510,6 +3531,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_deploy_id.py -v
       - name: Verify daily staging rollback proof and freshness (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_rollback_proof.py -v
+      - name: Verify finite staging drill authority (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_drill_use.py -v
       - name: Verify staging rollback drill (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_rollback_drill.py -v
       - name: Verify staging rollback drill duplicate-key refusal (offline fixtures)
@@ -3526,6 +3549,14 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback_dry_run_acceptance.py -v
       - name: Verify worker-container rollback dry-run pins (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_worker_container_rollback_dry_run_pins.py -v
+      - name: Verify production rollback-target preflight (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_rollback_target_preflight.py -v
+      - name: Verify promotion regression gate (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_promotion_regression_gate.py -v
+      - name: Verify production post-deploy watch (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_post_deploy_watch.py -v
+      - name: Verify production deploy-notify (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_deploy_notify.py -v
       - name: Verify staging container backout/restore drill (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_container_drill.py -v
       - name: Verify staging container drill duplicate-key refusal (offline fixtures)
@@ -3559,6 +3590,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s ../scripts -p 'test_staging_redirect_smoke*.py' -v
       - name: Verify staging automation read smoke (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_automation_read_smoke.py -v
+      - name: Verify staging help embed smoke (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_help_embed_smoke.py -v
       - name: Verify staging voice smoke (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_staging_voice_smoke.py -v
       # Voice synthetic offline suite, only when voice inputs change (owner
@@ -3587,6 +3620,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_build_identity_acceptance.py -v
       - name: Verify passive production probe duplicate-key refusal (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_prod_passive_probe_duplicate_key_acceptance.py -v
+      - name: Verify incident issue sink (offline fixtures)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_incident_issue.py -v
       - name: Verify synthetic alert delivery (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_synthetic_alert.py -v
       - name: Verify synthetic history admission boundaries (offline fixtures)
@@ -3637,9 +3672,9 @@ jobs:
         run: python3 ../scripts/test-commit-parse-guard-ci.py
       - name: Verify the daily digest release (offline fixtures)
         if: needs.job-inputs.outputs.worker != 'false'
-        # Digest tags, notes, quiet-day and rollback skips, off-main refusal
-        # and the 200-commit ENOBUFS regression against a throwaway git
-        # repository (no network, no token).
+        # CalVer adapter modes: plan/publish requests, classified skips, SBOM
+        # redispatch and the stalled-production warning against a mocked gh
+        # (no network, no token).
         run: node ../scripts/test-daily-digest.cjs
       - name: Verify the production digest resolver (offline fixtures)
         run: PYTHONDONTWRITEBYTECODE=1 python3 ../scripts/test_digest_resolve.py -v

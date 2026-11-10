@@ -184,6 +184,93 @@ test("staging firing receipt recommends R1 with trigger correlation", async (t) 
   assert.deepEqual(receipts[0].guard, h.values.get("two-bot:remediation"));
 });
 
+// A deaf voice actor: the live view's not-ready age past the 120 s bound.
+function deafMetrics(age: number | undefined): () => string {
+  return () => metricsBody()
+    .split("\n")
+    .filter((row) => age !== undefined || !row.startsWith("two_bot_voice_live_not_ready_seconds "))
+    .map((row) => age !== undefined && row.startsWith("two_bot_voice_live_not_ready_seconds ")
+      ? `two_bot_voice_live_not_ready_seconds ${age}` : row)
+    .join("\n");
+}
+
+test("staging deaf voice actor: takeover, frozen across a missing age, resumed on a fresh one", async (t) => {
+  let scrape = deafMetrics(121);
+  let clock = 1_760_000_000_000;
+  t.mock.method(Date, "now", () => clock);
+  const h = await receiptHarness(t, { TWO_DEPLOY_ENV: "staging" }, () => scrape());
+  const alerting = () => (h.values.get("two-bot:metrics-alerts") as { firing: string[] } | undefined)?.firing ?? [];
+
+  await h.tick();
+  const [first] = h.receipts();
+  assert.equal(first.ok, true);
+  assert.equal(first.decision, "recommend");
+  assert.equal(first.action, "same-sha-takeover");
+  assert.deepEqual(first.firing, ["voice_live_not_ready"]);
+  assert.equal(first.guard.scopes["voice-live"].phase, "takeover-recommended");
+  assert.ok(h.logs.some((row) => row.includes("REMEDIATION voice-live: same-sha-takeover")));
+  const guardAfterTakeover = structuredClone(h.values.get("two-bot:remediation"));
+
+  // Past the cooldown, the scrape omits the optional age gauge: the alert is
+  // held, but the guard must not move and the receipt names the evidence hold.
+  scrape = deafMetrics(undefined);
+  clock += 1_801_000;
+  await h.tick();
+  const gap = h.receipts().at(-1);
+  assert.deepEqual(alerting(), ["voice_live_not_ready"]);
+  assert.equal(gap.ok, true);
+  assert.equal(gap.decision, "held-evidence");
+  assert.deepEqual(h.values.get("two-bot:remediation"), guardAfterTakeover);
+
+  // A fresh age sample resumes progression from the untouched guard.
+  scrape = deafMetrics(121);
+  clock += 60_000;
+  await h.tick();
+  const resumed = h.receipts().at(-1);
+  assert.equal(resumed.decision, "recommend");
+  assert.equal(resumed.action, "same-sha-takeover");
+  assert.equal(resumed.guard.scopes["voice-live"].consecutiveFailures, 1);
+});
+
+test("a rejected scrape gap is not recovery: the stopped deaf scope needs a fresh observed window", async (t) => {
+  let scrape = deafMetrics(0);
+  let clock = 1_760_000_000_000;
+  t.mock.method(Date, "now", () => clock);
+  const h = await receiptHarness(t, { TWO_DEPLOY_ENV: "staging" }, () => scrape());
+  const t0 = Math.floor(clock / 1000);
+  const stopped = {
+    phase: "takeover-recommended", consecutiveFailures: 2, suppressed: true, clearSinceSeconds: 0,
+  };
+  const idle = { phase: "idle", consecutiveFailures: 0, suppressed: false, clearSinceSeconds: 0 };
+  h.values.set("two-bot:remediation", {
+    lastRecommendedAtSeconds: t0 - 60,
+    scopes: { "voice-stall": { ...idle }, "voice-live": { ...stopped }, "crash-loop": { ...idle } },
+  });
+  const live = () => (h.values.get("two-bot:remediation") as { scopes: Record<string, typeof stopped> }).scopes["voice-live"];
+
+  // One observed quiet sample starts the clear clock.
+  await h.tick();
+  assert.equal(live().clearSinceSeconds, t0);
+  // A full window of rejected scrapes (a malformed age fails the whole scrape).
+  scrape = () => deafMetrics(0)().replace("two_bot_voice_live_not_ready_seconds 0", "two_bot_voice_live_not_ready_seconds NaN");
+  clock += 1_860_000;
+  await h.tick();
+  assert.ok(h.logs.some((row) => row.includes("two-bot metrics scrape failed")));
+  assert.deepEqual(live(), stopped);
+  // The next observed quiet sample starts a fresh window instead of resetting.
+  scrape = deafMetrics(0);
+  clock += 60_000;
+  await h.tick();
+  assert.equal(live().suppressed, true);
+  assert.equal(live().clearSinceSeconds, Math.floor(clock / 1000));
+  // And a refire right after is still stopped: no fresh takeover.
+  scrape = deafMetrics(121);
+  clock += 60_000;
+  await h.tick();
+  assert.equal(live().suppressed, true);
+  assert.ok(!h.logs.some((row) => row.includes("REMEDIATION voice-live: same-sha-takeover")));
+});
+
 test("production emits no guard receipt", async (t) => {
   for (const env of [{}, { TWO_DEPLOY_ENV: "production" }, { TWO_DEPLOY_ENV: "" }]) {
     const h = await receiptHarness(t, env, () => metricsBody());

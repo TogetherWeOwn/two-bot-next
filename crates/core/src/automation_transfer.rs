@@ -19,8 +19,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::commands::GUILD_COMMAND_LIMIT;
 use super::custom_commands::{
-    error_code, max_custom_commands, reserved_command_names, validate_put_input, CommandError,
+    error_code, max_custom_commands, publishable_builtin_names, validate_put_input, CommandError,
     PutCommandInput, StoredCommand,
 };
 use super::mee6::{parse_mee6_entry, translate_export, Mee6CommandInput};
@@ -246,11 +247,14 @@ pub fn parse_import_document(
     }
 }
 
-/// Maximum import entries for this guild: definitions past the remaining
-/// command budget are refused before planning.
+/// Maximum import entries: a document longer than the guild command ceiling
+/// is refused before planning. The parser cannot see stored rows, so the
+/// per-guild budget is left to [`diff_import`]: deriving this bound from the
+/// reserved set would refuse an unchanged re-export of a guild that saved the
+/// old maximum before a release added a builtin.
 #[must_use]
 pub fn max_import_entries() -> usize {
-    max_custom_commands(reserved_command_names().len())
+    GUILD_COMMAND_LIMIT
 }
 
 /// One dry-run rejection: the definition plus its stable reason code
@@ -290,8 +294,23 @@ pub fn diff_import(
 ) -> Result<ImportDiff, CommandError> {
     let mut valid = Vec::with_capacity(parsed.entries.len());
     let mut rejected: Vec<ImportRejection> = Vec::new();
+    // A pre-existing saved row keeps the same exemption PUT and toggle use:
+    // the additive voice surface must not strand a custom `myroom` that
+    // predates it. Reimporting its edited export converges instead of
+    // reporting `ReservedName`; a fresh, colliding name is still refused.
+    // Remove it once, not per entry: a maximal import is 100 rows.
+    let grandfathered = existing.iter().any(|row| row.name == "myroom");
+    let reserved: HashSet<String> = if grandfathered {
+        builtins
+            .iter()
+            .filter(|name| name.as_str() != "myroom")
+            .cloned()
+            .collect()
+    } else {
+        builtins.clone()
+    };
     for (index, entry) in parsed.entries.iter().enumerate() {
-        match validate_put_input(entry, builtins) {
+        match validate_put_input(entry, &reserved) {
             Ok(()) => valid.push((index, entry)),
             Err(err) => rejected.push(ImportRejection {
                 name: entry.name.clone(),
@@ -299,12 +318,19 @@ pub fn diff_import(
             }),
         }
     }
-    let max = max_custom_commands(builtins.len());
+    // Capacity counts publication slots, not the wider write-reservation set
+    // in `builtins`: `templateassistant` and dark names block writes but
+    // occupy no slot, so holding their slots would reject imports that still
+    // fit under the 100-command ceiling.
+    let max = max_custom_commands(publishable_builtin_names().len());
     let mut union: HashSet<&str> = existing.iter().map(|row| row.name.as_str()).collect();
+    let stored = union.len();
     for (_, entry) in &valid {
         union.insert(entry.name.as_str());
     }
-    if union.len() > max {
+    // No-growth path, like a same-name `/command` update: rows saved under an
+    // older, larger budget stay re-importable as long as the import adds none.
+    if union.len() > max && union.len() > stored {
         return Err(CommandError::OverCapacity(max));
     }
     let mut by_name: HashMap<&str, PutCommandInput> = existing
@@ -393,6 +419,7 @@ pub struct ImportOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custom_commands::reserved_command_names;
     use serde_json::json;
 
     fn builtins() -> HashSet<String> {
@@ -432,6 +459,32 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&doc).expect("serializes")["schedules"],
             serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_grandfathered_myroom_export_reimports_but_a_fresh_one_stays_reserved() {
+        // A saved custom `myroom` predates the voice command of the same name.
+        // Reimporting its edited export must converge (PUT and toggle already
+        // exempt the existing row); a guild that has no such row must still
+        // refuse the colliding name.
+        let rows = vec![stored("myroom", "old {user}", Some("!myroom"))];
+        let mut body = serde_json::to_value(export_document(&rows)).expect("serializes");
+        body["commands"][0]["template"] = json!("new {user}");
+        let parsed = parse(&body);
+        assert_eq!(parsed.entries.len(), 1);
+        let diff = diff_import(&rows, &parsed, &builtins(), true).expect("diff plans");
+        assert!(diff.rejected.is_empty(), "{:?}", diff.rejected);
+        assert_eq!(diff.to_update, ["myroom"]);
+
+        // No stored row: the same entry is a fresh collision, still refused.
+        let fresh = diff_import(&[], &parsed, &builtins(), true).expect("diff plans");
+        assert!(fresh.to_create.is_empty());
+        assert_eq!(fresh.rejected.len(), 1);
+        assert_eq!(fresh.rejected[0].name, "myroom");
+        assert_eq!(
+            fresh.rejected[0].code,
+            error_code(&CommandError::ReservedName("myroom".to_owned()))
         );
     }
 
@@ -639,7 +692,7 @@ mod tests {
     #[test]
     fn union_capacity_fails_the_whole_diff() {
         let builtins = builtins();
-        let max = max_custom_commands(builtins.len());
+        let max = max_custom_commands(publishable_builtin_names().len());
         let desired: Vec<PutCommandInput> = (0..=max)
             .map(|i| PutCommandInput {
                 name: format!("fresh-{i}"),
@@ -656,6 +709,47 @@ mod tests {
         };
         assert_eq!(
             diff_import(&[], &parsed, &builtins, true),
+            Err(CommandError::OverCapacity(max))
+        );
+    }
+
+    #[test]
+    fn rows_saved_under_an_older_budget_stay_reimportable() {
+        // The guild saved one more row than today's budget allows, as if a
+        // release added a builtin after it filled the old maximum.
+        let builtins = builtins();
+        let max = max_custom_commands(publishable_builtin_names().len());
+        let existing: Vec<StoredCommand> = (0..=max)
+            .map(|i| stored(&format!("saved-{i:02}"), "t", None))
+            .collect();
+        let export = export_document(&existing);
+        let wire = serde_json::to_value(&export).expect("export serializes");
+        let parsed = parse_import_document(&wire, max_import_entries())
+            .expect("an unchanged export of a stranded guild still parses");
+        let diff = diff_import(&existing, &parsed, &builtins, false).expect("no growth");
+        assert_eq!(diff.unchanged.len(), max + 1);
+        assert!(diff.to_create.is_empty() && diff.rejected.is_empty());
+
+        // A one-entry update of a saved row also adds nothing.
+        let one = ParsedImport {
+            entries: vec![PutCommandInput {
+                name: "saved-00".to_owned(),
+                description: "Edited".to_owned(),
+                template: "t".to_owned(),
+                text_trigger: None,
+            }],
+            translation_conflicts: Vec::new(),
+            invalid_entries: 0,
+            overwrite: true,
+        };
+        let diff = diff_import(&existing, &one, &builtins, true).expect("update fits");
+        assert_eq!(diff.to_update, ["saved-00"]);
+
+        // Any new name still refuses while the guild is over the budget.
+        let mut grow = one.clone();
+        grow.entries[0].name = "fresh".to_owned();
+        assert_eq!(
+            diff_import(&existing, &grow, &builtins, true),
             Err(CommandError::OverCapacity(max))
         );
     }

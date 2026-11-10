@@ -20,6 +20,10 @@ pub mod audit_store;
 pub mod automation_quota;
 pub mod automation_transfer;
 pub mod automod;
+pub mod automod_preview;
+pub mod automod_preview_input;
+pub mod automod_preview_limiter;
+pub mod automod_preview_report;
 pub mod automod_runtime;
 #[cfg(feature = "db")]
 pub mod automod_store;
@@ -101,6 +105,7 @@ pub mod lfg;
 pub mod lfg_list;
 #[cfg(feature = "db")]
 pub mod lfg_store;
+pub mod lockdown_preview;
 pub mod mac;
 pub mod mee6;
 pub mod member_leave_gap;
@@ -141,6 +146,8 @@ pub mod scheduled_store;
 pub mod secret;
 pub mod tempban_inventory;
 pub use secret::Secret;
+#[cfg(feature = "db")]
+pub mod event_instance_store;
 pub mod self_roles;
 pub mod send_admission;
 pub mod settings;
@@ -224,7 +231,9 @@ pub use channel_moderation_store::{
     STATEMENT_TIMEOUT_MS,
 };
 pub use clock_guard::{ClockGuard, ClockRollback, CLOCK_SKEW_TOLERANCE_MS};
-pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
+pub use commands::{
+    merge_commands, merge_registry, CommandDefinition, CustomCommand, MergedRegistry, RegistryError,
+};
 pub use community::{
     build_scorecard, classify, is_scorecard_run_time, previous_closed_week, scorecard_tick,
     week_start_ms, Classification, ClassifierConfig, ClassifyInput, FactRow, ScorecardGates,
@@ -255,9 +264,9 @@ pub use custom_command_store::{
 pub use custom_commands::{
     accepted_text_trigger, adjudicate_delete, adjudicate_put, adjudicate_run,
     builtin_command_names, check_capacity, deregister_set, error_code, format_command_list,
-    is_builtin_trigger, max_custom_commands, placeholders_in, registry_with_custom,
-    render_template, require_automations_enabled, reserved_command_names, trigger_word,
-    validate_put_input, validate_template, AuditRecord, CommandError, DeleteDecision,
+    is_builtin_trigger, max_custom_commands, placeholders_in, publishable_builtin_names,
+    registry_with_custom, render_template, require_automations_enabled, reserved_command_names,
+    trigger_word, validate_put_input, validate_template, AuditRecord, CommandError, DeleteDecision,
     PutCommandInput, PutDecision, RunOutcome, StoredCommand, TemplateContext, TemplateError,
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS,
     MAX_TEXT_TRIGGER_CHARS, TEMPLATE_PLACEHOLDERS,
@@ -403,11 +412,12 @@ pub use raid::{
     DEFAULT_RAID_MAX_IDS, DEFAULT_RAID_THRESHOLD, DEFAULT_RAID_WINDOW_SECONDS,
 };
 pub use router::{
-    ComponentHandler, ComponentOutcome, HandlerId, InteractionHandler, InteractionRouter,
-    RouterGates, RouterRefusal, SlashContext, SlashOutcome, SurfaceFlags,
-    ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY, GUILD_RESTRICTED_REPLY, LFG_PREFIX,
-    MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY,
-    SCORECARD_DISABLED_REPLY, SELF_ROLE_PREFIX, TICKET_CLAIM_ID, TICKET_CLOSE_ID, TICKET_OPEN_ID,
+    live_gate_announcements_slash, live_gate_announcements_slash_named, ComponentHandler,
+    ComponentOutcome, HandlerId, InteractionHandler, InteractionRouter, RouterGates, RouterRefusal,
+    SlashContext, SlashOutcome, SurfaceFlags, ANNOUNCEMENTS_DISABLED_REPLY,
+    AUTOMATIONS_DISABLED_REPLY, GUILD_RESTRICTED_REPLY, LFG_PREFIX, MANAGE_EVENTS_REQUIRED,
+    MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY, SCORECARD_DISABLED_REPLY, SELF_ROLE_PREFIX,
+    TICKET_CLAIM_ID, TICKET_CLOSE_ID, TICKET_OPEN_ID,
 };
 pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,

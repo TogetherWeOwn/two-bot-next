@@ -1,14 +1,18 @@
 # Dashboard self-role panel parity contract
 
-Status: **proposed; design only**. Written 2026-10-26; intent review by
-2026-11-02. This proposal adds no runtime, page, migration, permission, live
-write or activation. Publication is not implementation or production approval.
-This file is the single repository source for panel-parity semantics,
-including the manifest and fixture oracle. It narrows the sibling
-[onboarding/self-role proposal](dashboard-onboarding-self-roles-spec.md),
-which treats the catalogue as one writable blob: blob writes stay, but the
-page operates per panel with truthful publish. It extends neither the
-voice/moderation pages nor the ticket config page.
+Status: **Deferred to the two-web-next roadmap** (owner decision 2026-11-01).
+Build the bot half only when a two-web-next goal claims this page. This doc now
+owns the self-role half of
+[onboarding/self-roles](dashboard-onboarding-self-roles-spec.md); that doc's W2
+is SR-W3 here. Original proposal: written 2026-10-26. This proposal adds no
+runtime, page, migration, permission, live write or activation. Publication is
+not implementation or production approval. This file is the single repository
+source for panel-parity semantics, including the manifest and fixture oracle. It
+narrows the sibling [onboarding/self-role
+proposal](dashboard-onboarding-self-roles-spec.md), which treats the catalogue
+as one writable blob: blob writes stay, but the page operates per panel with
+truthful publish. It extends neither the voice/moderation pages nor the ticket
+config page.
 
 ## Decision
 

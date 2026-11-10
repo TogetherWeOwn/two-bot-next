@@ -7,6 +7,10 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use tower::ServiceExt;
+use twilight_cache_inmemory::DefaultInMemoryCache;
+use twilight_gateway::Event;
+use twilight_model::gateway::payload::incoming::{GuildCreate, VoiceStateUpdate};
+use twilight_model::guild::Guild;
 use two_bot_core::internal_actions::{sign, ActionError, ErrorCode};
 use two_bot_core::internal_actions::{GuildAddMemberRequest, RoleAssignRequest};
 use two_bot_discord::executor::member::MemberOutcome;
@@ -1902,6 +1906,677 @@ fn read_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {
         Arc::new(MockModeration::default()),
         Arc::new(MockChannel::default()),
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Keyless `voice.snapshot` (gateway-cache projection)
+// ---------------------------------------------------------------------------
+
+fn voice_snapshot_payload() -> String {
+    serde_json::json!({"action": "voice.snapshot"}).to_string()
+}
+
+fn set_voice_snapshot_flag(on: bool) {
+    if on {
+        std::env::set_var("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT", "1");
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT");
+    }
+}
+
+fn voice_member(user_id: &str, bot: bool) -> Value {
+    serde_json::json!({
+        "user": {"id": user_id, "username": "fixture", "discriminator": "0", "bot": bot},
+        "roles": [],
+        "deaf": false,
+        "mute": false,
+        "joined_at": "2026-09-30T00:00:00.000000+00:00",
+        "flags": 0,
+    })
+}
+
+fn voice_channel(id: &str, channel_type: u8, name: &str, position: u32, user_limit: u32) -> Value {
+    serde_json::json!({
+        "id": id,
+        "guild_id": staging_guild(),
+        "type": channel_type,
+        "name": name,
+        "position": position,
+        "bitrate": 64000,
+        "user_limit": user_limit,
+        "permission_overwrites": [],
+    })
+}
+
+fn voice_state(user_id: &str, channel_id: Option<&str>) -> VoiceStateUpdate {
+    let mut state = serde_json::json!({
+        "guild_id": staging_guild(),
+        "user_id": user_id,
+        "session_id": "fixture-voice",
+        "deaf": false,
+        "mute": false,
+        "self_deaf": false,
+        "self_mute": false,
+        "self_video": false,
+        "suppress": false,
+    });
+    if let Some(channel) = channel_id {
+        state["channel_id"] = Value::String(channel.to_owned());
+    }
+    serde_json::from_value(state).expect("fixture voice state deserializes")
+}
+
+/// Gateway cache holding a small guild: five voice rooms (one AFK, one
+/// empty), one stage channel and one text channel, with a bot, an unknown
+/// user and a stage speaker among the occupants.
+fn seeded_voice_cache() -> Arc<DefaultInMemoryCache> {
+    let cache = voice_snapshot::new_shared_cache();
+    cache.update(&seeded_guild_event());
+    cache
+}
+
+/// The guild event behind [`seeded_voice_cache`], exposed so the end-to-end
+/// test feeds the same bytes through the pipeline instead of writing the
+/// cache directly.
+fn seeded_guild_event() -> Event {
+    let mut guild: Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/voice_guild.json"))
+            .expect("voice guild fixture parses");
+    guild["id"] = Value::String(staging_guild().to_owned());
+    guild["afk_channel_id"] = Value::String("34".to_owned());
+    guild["channels"] = serde_json::json!([
+        voice_channel("31", 2, "lobby", 0, 5),
+        voice_channel("32", 2, "alpha", 1, 0),
+        voice_channel("33", 2, "beta", 1, 0),
+        voice_channel("34", 2, "afk-room", 2, 0),
+        voice_channel("35", 2, "quiet", 3, 0),
+        voice_channel("36", 13, "stage", 4, 0),
+        voice_channel("37", 0, "chat", 5, 0),
+    ]);
+    guild["members"] = serde_json::json!([
+        voice_member("41", false),
+        voice_member("42", false),
+        voice_member("43", true),
+        voice_member("45", false),
+    ]);
+    guild["voice_states"] = serde_json::json!([
+        {"guild_id": staging_guild(), "channel_id": "31", "user_id": "41",
+         "session_id": "s1", "deaf": false, "mute": false,
+         "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false},
+        {"guild_id": staging_guild(), "channel_id": "32", "user_id": "42",
+         "session_id": "s2", "deaf": false, "mute": false,
+         "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false},
+        {"guild_id": staging_guild(), "channel_id": "31", "user_id": "43",
+         "session_id": "s3", "deaf": false, "mute": false,
+         "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false},
+        {"guild_id": staging_guild(), "channel_id": "34", "user_id": "44",
+         "session_id": "s4", "deaf": false, "mute": false,
+         "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false},
+        {"guild_id": staging_guild(), "channel_id": "36", "user_id": "45",
+         "session_id": "s5", "deaf": false, "mute": false,
+         "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false},
+    ]);
+    let guild: Guild = serde_json::from_value(guild).expect("patched guild deserializes");
+    Event::GuildCreate(Box::new(GuildCreate::Available(guild)))
+}
+
+/// Live gateway state for the ready-path tests: the supervisor publishes
+/// `Connected` only on a committed READY/RESUMED.
+fn connected_gateway() -> Arc<tokio::sync::RwLock<crate::gateway::GatewayState>> {
+    Arc::new(tokio::sync::RwLock::new(
+        crate::gateway::GatewayState::Connected,
+    ))
+}
+
+fn voice_app(pool: sqlx::PgPool, cache: Arc<DefaultInMemoryCache>) -> Router {
+    let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    router(Arc::new(
+        ReceiverState::new(
+            config(),
+            pool,
+            effect.clone(),
+            effect,
+            Arc::new(MockEventRead::default()),
+            Arc::new(MockEventMutate),
+            Arc::new(MockModeration::default()),
+            Arc::new(MockChannel::default()),
+        )
+        .with_voice_cache(cache)
+        .with_gateway_state(connected_gateway()),
+    ))
+}
+
+/// Same shared cache but the gateway mid-reconnect: `Armed`, never
+/// `Connected`. Stale occupancy must refuse, never serve.
+fn voice_app_not_ready(pool: sqlx::PgPool, cache: Arc<DefaultInMemoryCache>) -> Router {
+    let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    router(Arc::new(
+        ReceiverState::new(
+            config(),
+            pool,
+            effect.clone(),
+            effect,
+            Arc::new(MockEventRead::default()),
+            Arc::new(MockEventMutate),
+            Arc::new(MockModeration::default()),
+            Arc::new(MockChannel::default()),
+        )
+        .with_voice_cache(cache),
+    ))
+}
+
+#[tokio::test]
+async fn voice_snapshot_flag_off_is_refused_before_any_effect() {
+    // The nonce burns durably before authorize, so even the flag-off refusal
+    // needs the migrated test database, like the `event.read` tests.
+    let Some(db) = database().await else { return };
+    let state = state(
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+    );
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(false);
+    // Keyless like `event.read`: no Idempotency-Key header is sent.
+    let (status, _, body) =
+        answer(router(state), signed_read(&voice_snapshot_payload(), "old")).await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(body["error"]["retryable"], false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_snapshot_cold_cache_is_discord_unavailable() {
+    // Ready gateway, cold cache: the gateway has not fed it (or the receiver
+    // runs split from the gateway's writes), so the read refuses instead of
+    // reporting an empty guild. The nonce burn still needs the migrated test
+    // database.
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    let (status, _, body) = answer(
+        voice_app(db.pool().clone(), voice_snapshot::new_shared_cache()),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"]["code"], "discord_unavailable");
+    assert_eq!(body["error"]["retryable"], true);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_snapshot_warm_cache_while_reconnecting_is_discord_unavailable() {
+    // Warm cache, gateway mid-reconnect (`Armed`, never `Connected`): the
+    // occupants are stale pre-gap state, so the read refuses instead of
+    // stamping them with a fresh `observed_at`.
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    let (status, _, body) = answer(
+        voice_app_not_ready(db.pool().clone(), seeded_voice_cache()),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"]["code"], "discord_unavailable");
+    assert_eq!(body["error"]["retryable"], true);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_snapshot_disconnect_during_key_lookup_refuses_stale_cache() {
+    let Some(db) = database().await else { return };
+    let gateway = connected_gateway();
+    let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    let state = ReceiverState::new(
+        config(),
+        db.pool().clone(),
+        effect.clone(),
+        effect,
+        Arc::new(MockEventRead::default()),
+        Arc::new(MockEventMutate),
+        Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
+    )
+    .with_voice_cache(seeded_voice_cache())
+    .with_gateway_state(gateway.clone());
+    // Exhaust the fixture pool so the handler yields at the new key query,
+    // after its initial readiness check. No sleeps or timing assumptions.
+    let mut held = Vec::new();
+    for _ in 0..db.pool().options().get_max_connections() {
+        held.push(db.pool().acquire().await.unwrap());
+    }
+    let mut read = std::pin::pin!(read_voice_snapshot(
+        &state,
+        "fixture",
+        KeyLabel::Invalid,
+        ActionLabel::Unknown,
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(read.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    *gateway.write().await = crate::gateway::GatewayState::Armed;
+    drop(held);
+    let response = tokio::time::timeout(Duration::from_secs(5), read)
+        .await
+        .expect("snapshot read completes");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let raw = to_bytes(response.into_body(), 8192).await.unwrap();
+    let body: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(body["error"]["code"], "discord_unavailable");
+    assert_eq!(body["error"]["retryable"], true);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_snapshot_serves_pipeline_fed_shared_cache() {
+    // End to end across the contract's integration risk: the same cache
+    // handle feeds the gateway pipeline and the signed receiver read. The
+    // event travels through `OrderedLevelingPipeline::handle` — the
+    // production `with_shared_cache` wiring — never a direct cache write.
+    use two_bot_discord::{NoInvites, OrderedLevelingPipeline, PipelineSnapshots};
+
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    let cache = voice_snapshot::new_shared_cache();
+    let pipeline = OrderedLevelingPipeline::with_shared_cache(
+        two_bot_core::MemStore::new(),
+        None,
+        NoInvites,
+        PipelineSnapshots::new(),
+        Arc::clone(&cache),
+    );
+    let event = seeded_guild_event();
+    pipeline
+        .handle(&event)
+        .await
+        .expect("pipeline feeds the shared cache");
+    let (status, _, body) = answer(
+        voice_app(db.pool().clone(), cache),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    let result = &body["result"];
+    assert_eq!(result["v"], 1);
+    // Same projection as the directly-seeded cache: lobby plus alpha humans,
+    // the bot, the AFK occupant and the stage speaker out of the total.
+    assert_eq!(result["total_in_voice"], 2);
+    let rooms = result["rooms"].as_array().expect("rooms array");
+    let ids: Vec<&str> = rooms
+        .iter()
+        .map(|room| room["channel_id"].as_str().expect("channel id"))
+        .collect();
+    assert_eq!(ids, vec!["31", "32", "33", "34", "35"]);
+    assert_eq!(rooms[0]["member_ids"], serde_json::json!(["41"]));
+    assert_eq!(rooms[3]["afk"], true);
+    assert_eq!(rooms[3]["member_ids"], serde_json::json!(["44"]));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_snapshot_projects_the_live_cache_shape() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    let (status, headers, body) = answer(
+        voice_app(db.pool().clone(), seeded_voice_cache()),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("idempotent-replay"));
+    assert_eq!(
+        headers
+            .get(header::CACHE_CONTROL)
+            .map(HeaderValue::as_bytes),
+        Some(b"no-store".as_slice())
+    );
+    let result = &body["result"];
+    assert_eq!(result["v"], 1);
+    let observed = result["observed_at"].as_str().expect("zulu timestamp");
+    assert!(
+        observed.len() == 20 && observed.ends_with('Z') && observed.contains('T'),
+        "whole-second Zulu shape: {observed}"
+    );
+    // Lobby human plus alpha human; the bot, the AFK occupant and the stage
+    // speaker stay out of the total.
+    assert_eq!(result["total_in_voice"], 2);
+    let rooms = result["rooms"].as_array().expect("rooms array");
+    let ids: Vec<&str> = rooms
+        .iter()
+        .map(|room| room["channel_id"].as_str().expect("channel id"))
+        .collect();
+    // Position then name; stage and text channels are not rooms.
+    assert_eq!(ids, vec!["31", "32", "33", "34", "35"]);
+    assert_eq!(rooms[0]["name"], "lobby");
+    assert_eq!(rooms[0]["member_ids"], serde_json::json!(["41"]));
+    assert_eq!(rooms[0]["user_limit"], 5);
+    assert_eq!(rooms[1]["member_ids"], serde_json::json!(["42"]));
+    assert_eq!(rooms[2]["member_ids"], serde_json::json!([]));
+    // The AFK room flags itself and still lists its occupant, who leaves the
+    // total out; the unknown user (no cached identity) counts as human.
+    assert_eq!(rooms[3]["afk"], true);
+    assert_eq!(rooms[3]["member_ids"], serde_json::json!(["44"]));
+    assert!(rooms[0].get("afk").is_none());
+    assert_eq!(rooms[4]["member_ids"], serde_json::json!([]));
+    db.close().await.unwrap();
+}
+
+/// Same shared cache but with a caller-owned join clock: the pipeline's
+/// transition observer stamps the clock, and the receiver stamps rooms from
+/// it. Tests that exercise witnessed joins attach their own clock; the plain
+/// `voice_app` keeps the empty default, which reads every room as `null`.
+fn voice_app_with_clock(
+    pool: sqlx::PgPool,
+    cache: Arc<DefaultInMemoryCache>,
+    clock: Arc<voice_snapshot::VoiceOccupancyClock>,
+) -> Router {
+    let effect: Arc<MockEffect> = Arc::new(MockEffect::new(MockOutcome::Success));
+    router(Arc::new(
+        ReceiverState::new(
+            config(),
+            pool,
+            effect.clone(),
+            effect,
+            Arc::new(MockEventRead::default()),
+            Arc::new(MockEventMutate),
+            Arc::new(MockModeration::default()),
+            Arc::new(MockChannel::default()),
+        )
+        .with_voice_cache(cache)
+        .with_voice_clock(clock)
+        .with_gateway_state(connected_gateway()),
+    ))
+}
+
+#[tokio::test]
+async fn voice_snapshot_unwitnessed_rooms_read_null_without_event_keys() {
+    // A directly-seeded cache proves no joins: the default (unwired) clock
+    // stamps nothing, so every room carries explicit `occupied_since: null`,
+    // and with no windowed event rows no room carries `event_key`.
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    let (status, _, body) = answer(
+        voice_app(db.pool().clone(), seeded_voice_cache()),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    let rooms = body["result"]["rooms"].as_array().expect("rooms array");
+    assert_eq!(rooms.len(), 5);
+    for room in rooms {
+        assert_eq!(
+            room["occupied_since"],
+            serde_json::Value::Null,
+            "unwitnessed room {} reads null, never a guess",
+            room["channel_id"]
+        );
+        assert!(
+            room.get("event_key").is_none(),
+            "unlinked room {} omits the key",
+            room["channel_id"]
+        );
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_snapshot_pipeline_witnessed_join_stamps_occupied_since() {
+    // The gateway witnessed member 46 join the empty quiet room after boot
+    // (a member the seed never listed), so that room proves a start. The
+    // preoccupied lobby stays unknown. Same cache feeds pipeline and read.
+    use two_bot_discord::{NoInvites, OrderedLevelingPipeline, PipelineSnapshots};
+
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    let cache = voice_snapshot::new_shared_cache();
+    let clock = voice_snapshot::VoiceOccupancyClock::new();
+    let pipeline = OrderedLevelingPipeline::with_shared_cache(
+        two_bot_core::MemStore::new(),
+        None,
+        NoInvites,
+        PipelineSnapshots::new(),
+        Arc::clone(&cache),
+    );
+    pipeline.set_voice_transition_observer(clock.clone());
+    pipeline
+        .handle(&seeded_guild_event())
+        .await
+        .expect("pipeline feeds the shared cache");
+    pipeline
+        .handle(&Event::VoiceStateUpdate(Box::new(voice_state(
+            "46",
+            Some("35"),
+        ))))
+        .await
+        .expect("pipeline observes the witnessed join");
+    let (status, _, body) = answer(
+        voice_app_with_clock(db.pool().clone(), cache, clock),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    let rooms = body["result"]["rooms"].as_array().expect("rooms array");
+    let lobby = &rooms[0];
+    assert_eq!(lobby["member_ids"], serde_json::json!(["41"]));
+    assert_eq!(lobby["occupied_since"], serde_json::Value::Null);
+    let quiet = &rooms[4];
+    assert_eq!(quiet["member_ids"], serde_json::json!(["46"]));
+    let since = quiet["occupied_since"].as_str().expect("witnessed start");
+    assert!(
+        since.len() == 20 && since.ends_with('Z') && since.contains('T'),
+        "whole-second Zulu shape: {since}"
+    );
+    assert_eq!(rooms[1]["occupied_since"], serde_json::Value::Null);
+    assert_eq!(rooms[2]["member_ids"], serde_json::json!([]));
+    assert_eq!(rooms[2]["occupied_since"], serde_json::Value::Null);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_snapshot_windowed_event_key_stamps_the_linked_room() {
+    // Room 31 has an open-ended live event, room 35 a completed event
+    // inside its finite closing grace. Unknown ends, expired grace, future,
+    // cancelled and orphaned bindings all stay out.
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    for (event_id, event_key, channel, status, starts_in, ends_in) in [
+        (
+            "100000000000000001",
+            "showcase",
+            "31",
+            "scheduled",
+            "-1 hour",
+            None,
+        ),
+        (
+            "100000000000000002",
+            "afterparty",
+            "32",
+            "completed",
+            "-3 hours",
+            None,
+        ),
+        (
+            "100000000000000003",
+            "later",
+            "33",
+            "scheduled",
+            "+2 hours",
+            Some("+3 hours"),
+        ),
+        (
+            "100000000000000004",
+            "closing-grace",
+            "35",
+            "completed",
+            "-1 hour",
+            Some("-5 minutes"),
+        ),
+        (
+            "100000000000000005",
+            "expired",
+            "34",
+            "completed",
+            "-2 hours",
+            Some("-16 minutes"),
+        ),
+        (
+            "100000000000000006",
+            "cancelled",
+            "36",
+            "cancelled",
+            "-1 hour",
+            Some("+5 minutes"),
+        ),
+        (
+            "100000000000000007",
+            "orphaned",
+            "37",
+            "active",
+            "-1 hour",
+            Some("+5 minutes"),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO internal_event_keys (guild_id, event_key, event_id) VALUES ($1, $2, $3)",
+        )
+        .bind(staging_guild())
+        .bind(event_key)
+        .bind(event_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO event_voice_channels (event_id, instance_starts_at, starts_at, ends_at, status, voice_channel_id) \
+             VALUES ($1, NOW() + $3::text::interval, NOW() + $3::text::interval, NOW() + $4::text::interval, 'creating', $2)",
+        )
+        .bind(event_id)
+        .bind(channel)
+        .bind(starts_in)
+        .bind(ends_in)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let (starts_at, ends_at): (String, Option<String>) = sqlx::query_as(
+            "SELECT to_char(starts_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+                    to_char(ends_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+             FROM event_voice_channels WHERE event_id = $1",
+        )
+        .bind(event_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let event = two_bot_core::scheduled_events::ScheduledEvent {
+            id: event_id.to_owned(),
+            name: "fixture".to_owned(),
+            starts_at,
+            ends_at,
+            channel_id: Some(channel.to_owned()),
+            description: None,
+            status: match status {
+                "completed" => two_bot_core::scheduled_events::EventStatus::Completed,
+                "active" => two_bot_core::scheduled_events::EventStatus::Active,
+                "cancelled" => two_bot_core::scheduled_events::EventStatus::Cancelled,
+                _ => two_bot_core::scheduled_events::EventStatus::Scheduled,
+            },
+        };
+        two_bot_core::website_store::upsert_event(
+            db.pool(),
+            staging_guild(),
+            "2026-11-03T10:00:00.000Z",
+            &event,
+        )
+        .await
+        .unwrap();
+        if event_key == "orphaned" {
+            sqlx::query("UPDATE event_voice_channels SET status = 'orphaned' WHERE event_id = $1")
+                .bind(event_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+    }
+    let keys = InternalActionStore::new(db.pool().clone())
+        .windowed_event_voice_keys(staging_guild())
+        .await
+        .unwrap();
+    assert_eq!(
+        keys.len(),
+        2,
+        "only live and finite completed grace windows"
+    );
+    assert_eq!(keys.get("35").map(String::as_str), Some("closing-grace"));
+    let (status, _, body) = answer(
+        voice_app(db.pool().clone(), seeded_voice_cache()),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    let rooms = body["result"]["rooms"].as_array().expect("rooms array");
+    assert_eq!(rooms[0]["event_key"], serde_json::json!("showcase"));
+    assert!(rooms[1].get("event_key").is_none());
+    assert!(rooms[2].get("event_key").is_none());
+    assert!(rooms[3].get("event_key").is_none());
+    assert_eq!(rooms[4]["event_key"], serde_json::json!("closing-grace"));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_snapshot_key_store_error_propagates_unavailable() {
+    // Fail-closed key map, store half: when the store is gone the window
+    // query propagates instead of yielding an empty map the handler could
+    // mistake for "no room linked". The handler maps this to `internal`,
+    // never key-omitted rooms.
+    let Some(db) = database().await else { return };
+    let pool = db.pool().clone();
+    db.close().await.unwrap();
+    let store = InternalActionStore::new(pool);
+    let err = store
+        .windowed_event_voice_keys(staging_guild())
+        .await
+        .expect_err("closed store propagates");
+    assert!(matches!(err, InternalStoreError::Unavailable));
+}
+
+#[tokio::test]
+async fn voice_snapshot_empty_guild_lists_rooms_with_zero_total() {
+    // Twilight drops the voice-state set when the last member leaves; for a
+    // held guild that means "nobody in voice", so the rooms stay listed with
+    // a zero total instead of refusing.
+    let cache = seeded_voice_cache();
+    for user in ["41", "42", "43", "44", "45"] {
+        cache.update(&Event::VoiceStateUpdate(Box::new(voice_state(user, None))));
+    }
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    let (status, _, body) = answer(
+        voice_app(db.pool().clone(), cache),
+        signed_read(&voice_snapshot_payload(), "old"),
+    )
+    .await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["total_in_voice"], 0);
+    assert_eq!(body["result"]["rooms"].as_array().expect("rooms").len(), 5);
+    db.close().await.unwrap();
 }
 
 fn mutate_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {

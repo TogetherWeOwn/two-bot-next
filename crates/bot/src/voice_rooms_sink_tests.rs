@@ -25,9 +25,12 @@ impl RoomPersistence for Arc<Store> {
     async fn save_access_controls(
         &self,
         guild: u64,
+        expected: &AccessControls,
         controls: &AccessControls,
     ) -> Result<(), StoreError> {
-        self.as_ref().save_access_controls(guild, controls).await
+        self.as_ref()
+            .save_access_controls(guild, expected, controls)
+            .await
     }
     async fn logging_settings(&self, guild: u64) -> Result<LoggingSettings, StoreError> {
         self.as_ref().logging_settings(guild).await

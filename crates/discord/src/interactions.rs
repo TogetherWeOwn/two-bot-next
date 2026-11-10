@@ -29,6 +29,8 @@ use two_bot_core::{
     SlashOutcome,
 };
 
+use crate::brand::brand_embed;
+
 /// A routed interaction: what the core router decided, with the wire
 /// identity the executor needs to answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +144,7 @@ pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
             allowed_mentions: Some(Default::default()),
-            embeds: Some(vec![Embed {
+            embeds: Some(vec![brand_embed(Embed {
                 author: None,
                 color: None,
                 description: Some(text),
@@ -156,7 +158,7 @@ pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
                 title: None,
                 url: None,
                 video: None,
-            }]),
+            })]),
             flags: Some(MessageFlags::EPHEMERAL),
             ..Default::default()
         }),
@@ -188,7 +190,7 @@ pub fn help_detail_response(detail: String) -> InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
             allowed_mentions: Some(Default::default()),
-            embeds: Some(vec![Embed {
+            embeds: Some(vec![brand_embed(Embed {
                 author: None,
                 color: None,
                 description: Some(description),
@@ -202,7 +204,7 @@ pub fn help_detail_response(detail: String) -> InteractionResponse {
                 title: None,
                 url: None,
                 video: None,
-            }]),
+            })]),
             flags: Some(MessageFlags::EPHEMERAL),
             ..Default::default()
         }),
@@ -369,6 +371,10 @@ pub struct InteractionRuntime {
     giveaway: crate::giveaway::GiveawayRuntime,
     bot_user_id: std::sync::atomic::AtomicU64,
     application_id: std::sync::atomic::AtomicU64,
+    /// Test-only live-settings override: per-instance reader for ordered
+    /// consumer acceptance. Production stays `None`; gateway reception then
+    /// reads the poller snapshot through the bot crate.
+    live_override: std::sync::Mutex<Option<two_bot_core::settings::LiveSettings>>,
 }
 
 #[cfg(feature = "db")]
@@ -529,9 +535,13 @@ impl InteractionRuntime {
         crate::rsvp::is_rsvp_command(name.as_str())
     }
 
+    /// Ordered acknowledge: `announcements_live` is the gateway-resolved
+    /// announcements bit (live snapshot store-first over boot); a stored `0`
+    /// refuses RSVP commands with the disabled reply before any defer.
     pub async fn prepare(
         &self,
         interaction: Interaction,
+        announcements_live: bool,
     ) -> Result<crate::rsvp::PreparedRsvp, crate::DiscordError> {
         // Same application-identity refusal as `handle`/`handle_routed`, before
         // any callback or store work: the callback route carries no app check.
@@ -549,7 +559,13 @@ impl InteractionRuntime {
         else {
             return Ok(crate::rsvp::PreparedRsvp::ignored());
         };
-        crate::rsvp::prepare_rsvp_interaction(&self.router, &self.executor, interaction).await
+        crate::rsvp::prepare_rsvp_interaction(
+            &self.router,
+            &self.executor,
+            interaction,
+            announcements_live,
+        )
+        .await
     }
 
     pub async fn complete(
@@ -634,6 +650,7 @@ impl InteractionRuntime {
             giveaway: crate::giveaway::GiveawayRuntime::new(pool.clone(), executor.clone()),
             bot_user_id: std::sync::atomic::AtomicU64::new(bot_user_id),
             application_id: std::sync::atomic::AtomicU64::new(0),
+            live_override: std::sync::Mutex::new(None),
         }
     }
 
@@ -677,6 +694,26 @@ impl InteractionRuntime {
     pub fn set_application_id(&self, id: u64) {
         self.application_id
             .store(id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test-only per-instance live reader: gateway reception resolves the
+    /// ordered announcements bit from this instead of the poller snapshot.
+    /// No process-global installation; production runtimes never set it.
+    pub fn set_live_settings(&self, live: two_bot_core::settings::LiveSettings) {
+        *self
+            .live_override
+            .lock()
+            .expect("interaction live override") = Some(live);
+    }
+
+    /// Installed per-instance live source, if any. Gateway reception reads
+    /// the poller snapshot when this is `None`, so production behavior is
+    /// unchanged.
+    pub fn live_settings_override(&self) -> Option<two_bot_core::settings::LiveSettings> {
+        self.live_override
+            .lock()
+            .expect("interaction live override")
+            .clone()
     }
 
     /// Current application pin (0 = unpinned). READY callers check this before
@@ -1269,9 +1306,15 @@ mod help_response_tests {
             );
             assert!(wire["data"]["content"].is_null());
             assert_eq!(wire["data"]["embeds"].as_array().unwrap().len(), 1);
-            let description = wire["data"]["embeds"][0]["description"]
-                .as_str()
-                .expect("embed description");
+            let embed = &wire["data"]["embeds"][0];
+            assert_eq!(
+                embed["color"].as_u64(),
+                Some(crate::brand::BRAND_EMBED_COLOR as u64),
+                "help embed carries the brand color"
+            );
+            assert_eq!(embed["footer"]["text"], crate::brand::BRAND_FOOTER_TEXT);
+            assert_eq!(embed["footer"]["icon_url"], crate::brand::BRAND_ICON_URL);
+            let description = embed["description"].as_str().expect("embed description");
             assert_eq!(description, text, "no truncation at the REST boundary");
             // The RSVP note carries a copyable event-link example whose
             // slashes tokenize as path fragments, not commands; exclude it
@@ -1349,6 +1392,15 @@ mod help_response_tests {
             assert!(wire["data"]["content"].is_null());
             assert_eq!(wire["data"]["embeds"].as_array().expect("embeds").len(), 1);
             assert_eq!(wire["data"]["embeds"][0]["description"], detail);
+            assert_eq!(
+                wire["data"]["embeds"][0]["color"].as_u64(),
+                Some(crate::brand::BRAND_EMBED_COLOR as u64),
+                "detail embed carries the brand color"
+            );
+            assert_eq!(
+                wire["data"]["embeds"][0]["footer"]["icon_url"],
+                crate::brand::BRAND_ICON_URL
+            );
         }
     }
 

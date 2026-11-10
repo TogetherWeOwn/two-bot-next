@@ -5,8 +5,9 @@
 //! Boundary contract: `/command-inspect name:<name>` defaults to `summary`;
 //! `view:template` and `view:preview` are separate private responses. Optional
 //! `arguments` is a UTF-16-bounded (500-unit) sample of ordinary invocation
-//! arguments. The existing four-variable language ignores arguments: accepting
-//! a sample MUST NOT introduce `{args}` or a second interpolation pass.
+//! arguments. The five-variable language renders the sample as the preview
+//! `{args}` input, dry-run only: slash and prefix runs substitute solely
+//! captured invocation text, and no path rescans substituted output.
 //!
 //! Visible view headings are `Summary /name`, `Saved template /name`, and
 //! `Preview /name`. The body is plain, markdown-escaped untrusted text; headings
@@ -43,6 +44,9 @@ use two_bot_discord::{
     ActionExecutor,
 };
 use two_bot_testsupport::TestDatabase;
+
+#[path = "support/custom_command_trigger_eligibility.rs"]
+mod trigger_eligibility;
 
 const MANAGEMENT: &str = "command-inspect";
 const TOKEN: &str = "inspect-acceptance-fixture";
@@ -810,7 +814,7 @@ async fn inspect_missing_other_guild_only_and_deleted_definitions_are_truthful_m
 }
 
 #[tokio::test]
-async fn inspect_preview_preserves_the_four_variable_single_pass_language_with_sample_arguments() {
+async fn inspect_preview_preserves_the_five_variable_single_pass_language_with_sample_arguments() {
     let db = database().await;
     seed(db.pool(), "2222", "faq", "literal {User} {}", true).await;
     seed(
@@ -1025,7 +1029,7 @@ async fn inspect_invalid_saved_templates_refuse_without_rendering_or_running() {
     // the shared input validator correctly refuses their 2002 UTF-16 units.
     for (index, template) in [
         "Hello {unknown}".to_owned(),
-        "{args}".to_owned(),
+        "{guild}".to_owned(),
         "😀".repeat(1001),
     ]
     .into_iter()
@@ -1166,4 +1170,74 @@ async fn inspect_preview_does_not_spend_text_cooldown_or_claim_and_ordinary_pref
     assert!(facts
         .iter()
         .all(|fact| fact["id"] != "custom:run:480" && fact["id"] != "custom:run:481"));
+}
+
+#[tokio::test]
+async fn inspect_preview_renders_sample_as_args_input_without_sending_or_auditing() {
+    // ARG-14/15: the validated `arguments` sample is the preview `{args}`
+    // input — substituted literally in one pass, escaped like any other
+    // rendered text — while an over-long sample keeps the existing
+    // correction. Previews never send and never record `command.run`.
+    let db = database().await;
+    seed(db.pool(), "2222", "faq", "Says {args}", true).await;
+    let before = definitions(db.pool()).await;
+    let mock = discord().await;
+    let runtime = runtime(db.pool().clone(), &mock, true);
+    let substituted = observe(
+        &runtime,
+        &mock,
+        &inspect(500, "faq", Some("preview"), Some("one two")),
+        Some("TWO"),
+    )
+    .await;
+    assert_eq!(
+        view_body(&private_content(&substituted), "Preview /faq"),
+        "Says one two"
+    );
+    let literal = observe(
+        &runtime,
+        &mock,
+        &inspect(501, "faq", Some("preview"), Some("{user} @everyone")),
+        Some("TWO"),
+    )
+    .await;
+    assert_eq!(
+        view_body(&private_content(&literal), "Preview /faq"),
+        "Says {user} @everyone",
+        "sample braces never rescan and grant no mention"
+    );
+    let draft = interaction(
+        502,
+        32,
+        vec![
+            option("draft", "Echo {args}"),
+            option("view", "preview"),
+            option("arguments", "dry"),
+        ],
+    );
+    let draft = observe(&runtime, &mock, &draft, Some("TWO")).await;
+    assert_eq!(
+        view_body(
+            &private_content(&draft),
+            "Draft preview — not saved or published"
+        ),
+        "Echo dry"
+    );
+    let overflow = observe(
+        &runtime,
+        &mock,
+        &inspect(503, "faq", Some("preview"), Some(&"a".repeat(501))),
+        Some("TWO"),
+    )
+    .await;
+    assert!(
+        private_content(&overflow).contains("sample arguments must be at most 500 characters"),
+        "existing sample bound and correction are unchanged"
+    );
+    let after = definitions(db.pool()).await;
+    let facts = execution_facts(db.pool()).await;
+    mock.shutdown().await;
+    db.close().await.expect("fixture teardown");
+    assert_eq!(after, before);
+    assert!(facts.is_empty(), "previews never audit");
 }

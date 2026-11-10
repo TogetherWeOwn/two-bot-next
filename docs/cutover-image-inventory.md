@@ -6,9 +6,9 @@ no secret access. Static rows come from the `Dockerfile` at sample source SHA
 that main head, described under Measured sample image.
 
 - Baseline inventory commit: `7797b1e166d2aa7b28725cdddc1b8f0c097a5ed5` (2026-10-03)
-- Builder-row refresh (2026-10-04): [`Dockerfile:10` at `723663df9c74fd24734170a981cf59908aadd33a`](https://github.com/TogetherWeOwn/two-bot-next/blob/723663df9c74fd24734170a981cf59908aadd33a/Dockerfile#L10).
+- Builder-row refresh (2026-11-01): [`Dockerfile:10` at `e403836cec544d6a1c4f74c6fa0c8daebcf91734`](https://github.com/TogetherWeOwn/two-bot-next/blob/e403836cec544d6a1c4f74c6fa0c8daebcf91734/Dockerfile#L10).
   The baseline used `rust:1.94-trixie`; only the builder row now records the
-  Rust 1.98 tag and digest. Runtime, layer, SBOM and size notes below are measured on a CI-built
+  Rust 1.99 tag and digest. Runtime, layer, SBOM and size notes below are measured on a CI-built
   main-head sample, not the cutover candidate and not the baseline estimate.
 - Source files: `Dockerfile`, `.github/workflows/sbom.yml`,
   `docs/supply-chain.md`, `scripts/container-smoke.py`, `.trivyignore.yaml`
@@ -20,18 +20,36 @@ that main head, described under Measured sample image.
 
 | Stage | Reference (pinned) | OS | Purpose |
 |---|---|---|---|
-| builder | `rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546` | Debian 13 (trixie) | Full toolchain; compiles the release binary, then discarded |
-| runtime | `gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2` | Debian 13, distroless `cc` | Ships glibc, libgcc, CA trust data and the `nonroot` account (uid/gid 65532); carries only the release binary |
+| builder | `rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137` | Debian 13 (trixie) | Full toolchain; compiles the release binary, then discarded |
+| runtime (selected, unmeasured) | `gcr.io/distroless/base-nossl-debian13:nonroot@sha256:e6b0f82595aa1edde72c8054de7a9dca30f0f8f54820c37a167c0ddfc21c5c67` | Debian 13, distroless `base-nossl` | Ships glibc, CA trust data and the `nonroot` account (uid/gid 65532); carries the release binary plus official Trixie `libgcc-s1`/`gcc-14-base` files (below) |
+| runtime (prior, measured sample) | `gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2` | Debian 13, distroless `cc` | Replaced by the row above; every measurement below is of this image |
 
 Both stages are Debian 13, so the binary links against the glibc it runs on.
 Tags stay readable for automated Docker updates while the digests make both
 stages immutable. There is no build-arg override for either base.
 
+Selected runtime package set: base-files, ca-certificates, media-types,
+netbase, tzdata, tzdata-legacy and libc6 from the base, plus `libgcc-s1` and
+`gcc-14-base` (9 packages). The Dockerfile copies only `libgcc_s.so.1`, both
+copyright files and truthful `dpkg-query -s` records into
+`/var/lib/dpkg/status.d/<package>`, with no apt installation and no zlib, sid or
+forky package. There is no `zlib1g`, `libz.so*`, `libssl`, `libzstd`,
+`libstdc++` or `libgomp`. The trusted `verify` job is to require a `DT_NEEDED`
+subset of `libc.so.6`, `libm.so.6` and `libgcc_s.so.1` resolved in the image, no
+`libz`, and the required package records and SBOM entries. The Trivy gates and
+empty `.trivyignore.yaml` are unchanged. Full CI, scan, container smoke and
+staging have not run on this candidate; this is not a pass or production
+acceptance, and security review and the staging drill / Release Manager gates
+remain.
+
 ## Runtime layer breakdown (measured)
 
 The shipped image is the `runtime` stage only. Builder layers are cache
 scaffolding and never ship. Byte counts are measured from the CI-built
-sample image named under Measured sample image.
+sample image named under Measured sample image, which used the prior
+`cc-debian13` base. The `base-nossl` candidate adds `libgcc-s1`/`gcc-14-base`
+copy layers and has no layer or size measurement yet; rows R1 and the
+14-package notes describe the `cc` sample only.
 
 | # | Dockerfile step | Ships a layer? | Notes |
 |---|---|---|---|
@@ -147,14 +165,18 @@ or the current PR diff.
 - The distroless runtime is now the default image in `Dockerfile`; its
   provenance arguments and labels are part of the cutover image build. Earlier
   trial measurements remain historical evidence, not a separate build path.
-- Runtime is Debian 13 distroless (`cc-debian13:nonroot`); the older Bookworm
+- Runtime is Debian 13 distroless (`base-nossl-debian13:nonroot` selected,
+  `cc-debian13:nonroot` in the measured sample); the older Bookworm
   notes and conditional dispositions in `docs/supply-chain.md` do not carry
   over. Automated Docker updates track both pinned references; the unversioned
   `nonroot` tag needs a manual digest refresh if no bump arrives after a
   Debian point release.
-- Trust data is the base image's own `ca-certificates` bundle; nothing is
-  installed or copied into the runtime except the release binary. The bot runs
-  as `nonroot` and its only in-image exec is its own `--healthcheck`.
+- Trust data is the base image's own `ca-certificates` bundle. The measured
+  `cc-debian13` sample copied only the release binary; the selected base-nossl
+  composition also copies the official GCC runtime library, copyright files,
+  installed package records and matching file-checksum manifests. Nothing is
+  installed in the runtime stage. The bot runs as `nonroot` and its only
+  in-image exec is its own `--healthcheck`.
 
 ## What remains for cutover readiness
 

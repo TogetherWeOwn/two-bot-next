@@ -57,6 +57,8 @@ mod kick;
 mod kick_ballot_delivery;
 #[path = "voice_rooms_limit_tests.rs"]
 mod limit_command;
+#[path = "voice_myroom_acceptance_tests.rs"]
+mod myroom_acceptance;
 #[path = "voice_name_tests.rs"]
 mod name;
 #[path = "voice_name_filter_acceptance_tests.rs"]
@@ -71,12 +73,18 @@ mod private;
 mod responder_admission_acceptance;
 #[path = "voice_import_review_regressions_tests.rs"]
 mod review_regressions;
+#[path = "voice_room_access_inspect_acceptance_tests.rs"]
+mod room_access_inspect_acceptance;
+#[path = "voice_room_access_inspect_tests.rs"]
+mod room_access_inspect_tests;
 #[path = "voice_setup_access_paging_acceptance_tests.rs"]
 mod setup_access_paging_acceptance;
 #[path = "voice_rooms_sink_tests.rs"]
 mod sink;
 #[path = "voice_snapshot_fence_acceptance_tests.rs"]
 mod snapshot_fence_acceptance;
+#[path = "voice_textchannels_reset_acceptance_tests.rs"]
+mod textchannels_reset_acceptance;
 #[path = "../../core/tests/support/tracing_capture.rs"]
 mod tracing_capture;
 #[path = "voice_votekick_ballot_truth_acceptance_tests.rs"]
@@ -211,6 +219,9 @@ struct Store {
     access: Arc<Mutex<AccessControls>>,
     access_error: Option<StoreError>,
     save_access_error: Option<StoreError>,
+    /// Stored right after the next `access_controls` read, as a confirmed
+    /// `/import` landing between an `/access` read and its save.
+    import_after_access_read: Mutex<Option<AccessControls>>,
     logging: Arc<Mutex<LoggingSettings>>,
     logging_error: Option<StoreError>,
     save_logging_error: Option<StoreError>,
@@ -294,6 +305,7 @@ impl Store {
             access: Arc::new(Mutex::new(AccessControls::default())),
             access_error: None,
             save_access_error: None,
+            import_after_access_read: Mutex::new(None),
             logging: Arc::new(Mutex::new(LoggingSettings::default())),
             logging_error: None,
             save_logging_error: None,
@@ -344,18 +356,29 @@ impl RoomPersistence for Store {
     async fn access_controls(&self, _: u64) -> Result<AccessControls, StoreError> {
         match self.access_error {
             Some(error) => Err(error),
-            None => Ok(self.access.lock().unwrap().clone()),
+            None => {
+                let read = self.access.lock().unwrap().clone();
+                if let Some(imported) = self.import_after_access_read.lock().unwrap().take() {
+                    *self.access.lock().unwrap() = imported;
+                }
+                Ok(read)
+            }
         }
     }
     async fn save_access_controls(
         &self,
         _: u64,
+        expected: &AccessControls,
         controls: &AccessControls,
     ) -> Result<(), StoreError> {
         if let Some(error) = self.save_access_error {
             return Err(error);
         }
-        *self.access.lock().unwrap() = controls.clone();
+        let mut stored = self.access.lock().unwrap();
+        if *stored != *expected {
+            return Err(StoreError::Conflict);
+        }
+        *stored = controls.clone();
         Ok(())
     }
     async fn logging_settings(&self, _: u64) -> Result<LoggingSettings, StoreError> {
@@ -5069,7 +5092,9 @@ fn voice_command_set_is_gated_on_two_voice() {
             "private",
             "public",
             "limit",
-            "unlimit"
+            "unlimit",
+            "myroom",
+            "room-access-inspect"
         ]
     );
     let off = VoiceGates::from_map(&Default::default());
@@ -6794,6 +6819,26 @@ async fn access_command_refuses_bad_input_without_changing_anything() {
     }
 }
 
+#[tokio::test]
+async fn access_save_never_reverts_an_import_confirmed_after_its_read() {
+    // `/access creation off` reads `{}`, an import then confirms a `/kick`
+    // restriction, and only then does `/access` save: the save must refuse,
+    // not write back the stale `{}` and silently unrestrict `/kick`.
+    let store = Store::new(Trace::default());
+    let mut imported = AccessControls::default();
+    imported.command_roles.insert("kick".to_owned(), vec![201]);
+    *store.import_after_access_read.lock().unwrap() = Some(imported.clone());
+    let mut saved = None;
+    let text = execute_access(&store, GUILD, AccessAction::Creation(false), |controls| {
+        saved = Some(controls);
+    })
+    .await;
+    assert!(!text.starts_with("Saved."), "{text}");
+    assert!(text.contains("Nothing was changed"), "{text}");
+    assert_eq!(saved, None);
+    assert_eq!(*store.access.lock().unwrap(), imported);
+}
+
 // These tests share the process-global log capture. Serialize every admin
 // store-failure emitter, including the two reply-only tests, so each capture
 // window contains only its own operation's warning. Hold the guard across await.
@@ -7775,17 +7820,17 @@ fn parse_textchannels_extracts_every_option() {
         ],
         Some(Permissions::MANAGE_CHANNELS),
     );
-    assert_eq!(
-        parse_voice_command(&interaction),
-        Some(VoiceCommand::TextChannels {
-            channel_id: CREATOR,
-            request: TextChannelsRequest {
-                enabled: Some(false),
-                name: Some("lounge".to_owned()),
-                viewer_role: Some(42),
-            },
-        })
-    );
+    let Some(VoiceCommand::TextChannels {
+        channel_id,
+        request,
+    }) = parse_voice_command(&interaction)
+    else {
+        panic!("textchannels must parse");
+    };
+    assert_eq!(channel_id, CREATOR);
+    assert_eq!(request.enabled, Some(false));
+    assert_eq!(request.name.as_deref(), Some("lounge"));
+    assert_eq!(request.viewer_role, Some(42));
 }
 
 #[test]
@@ -7797,17 +7842,17 @@ fn parse_textchannels_leaves_unset_options_unset() {
         )],
         Some(Permissions::MANAGE_CHANNELS),
     );
-    assert_eq!(
-        parse_voice_command(&interaction),
-        Some(VoiceCommand::TextChannels {
-            channel_id: CREATOR,
-            request: TextChannelsRequest {
-                enabled: None,
-                name: None,
-                viewer_role: None,
-            },
-        })
-    );
+    let Some(VoiceCommand::TextChannels {
+        channel_id,
+        request,
+    }) = parse_voice_command(&interaction)
+    else {
+        panic!("textchannels must parse");
+    };
+    assert_eq!(channel_id, CREATOR);
+    assert_eq!(request.enabled, None);
+    assert_eq!(request.name, None);
+    assert_eq!(request.viewer_role, None);
 }
 
 #[test]
@@ -7883,10 +7928,33 @@ fn textchannels_shape_correction_names_the_field_before_the_usage_example() {
 }
 
 fn request(enabled: Option<bool>, name: Option<&str>, role: Option<u64>) -> TextChannelsRequest {
-    TextChannelsRequest {
-        enabled,
-        name: name.map(str::to_owned),
-        viewer_role: role,
+    // Build old-field requests through the existing parser so additive reset
+    // controls need not change the preserved decision-test fixtures' shape.
+    let mut options = vec![typed_option(
+        "channel",
+        CommandOptionValue::Channel(Id::new(CREATOR)),
+    )];
+    if let Some(value) = enabled {
+        options.push(typed_option("enabled", CommandOptionValue::Boolean(value)));
+    }
+    if let Some(value) = name {
+        options.push(typed_option(
+            "name",
+            CommandOptionValue::String(value.to_owned()),
+        ));
+    }
+    if let Some(value) = role {
+        options.push(typed_option(
+            "viewer-role",
+            CommandOptionValue::Role(Id::new(value)),
+        ));
+    }
+    match parse_voice_command(&textchannels_interaction(
+        options,
+        Some(Permissions::MANAGE_CHANNELS),
+    )) {
+        Some(VoiceCommand::TextChannels { request, .. }) => request,
+        other => panic!("valid old-field request did not parse: {other:?}"),
     }
 }
 
@@ -8000,6 +8068,13 @@ fn command_names_key_the_role_restrictions() {
         );
     }
     assert_eq!(commands[4].name(), "textchannels");
+    // The owner read keeps its own name, so it never inherits another
+    // command's restriction. It is not per-command restrictable: a stored
+    // key would make an older binary reject the guild's whole controls row
+    // on rollback. The guild-wide required role still gates it.
+    let inspect = VoiceCommand::RoomAccessInspect(PageArg::Missing);
+    assert_eq!(inspect.name(), "room-access-inspect");
+    assert!(!two_bot_core::voice_access::VOICE_COMMANDS.contains(&inspect.name()));
 }
 
 #[test]
@@ -13887,6 +13962,29 @@ async fn a_pool_too_small_to_vary_keeps_the_drawn_seed() {
 }
 
 #[tokio::test]
+async fn voice_name_reload_refreshes_the_cached_creation_switch() {
+    // An out-of-process writer (the operator CLI applying a file with
+    // `creation_enabled: false`) cannot push `AccessChanged`, so the
+    // periodic snapshot reload must converge the worker's cached gates.
+    let (live, mut store, http, _) = fixture();
+    store.snapshot_uses_creator_rows = false;
+    *store.config.lock().unwrap() = empty_config();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    assert!(may_create_room(&worker.access));
+    worker
+        .store
+        .config
+        .lock()
+        .unwrap()
+        .settings
+        .creation_enabled = false;
+    worker.store.config.lock().unwrap().settings.command_role_id = Some(MENTION_ROLE.to_string());
+    worker.reload_name_settings(0).await;
+    assert!(!may_create_room(&worker.access));
+    assert_eq!(worker.access.required_role, Some(MENTION_ROLE));
+}
+
+#[tokio::test]
 async fn voice_name_reload_rerenders_unchanged_facts_after_list_edit() {
     let (live, mut store, http, trace) = fixture();
     store.snapshot_uses_creator_rows = false;
@@ -14257,6 +14355,97 @@ async fn a_confirmed_import_hands_its_settings_to_the_worker() {
     assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
     let (settings, _) = runtime.naming_probe(GUILD).await.expect("probe");
     assert_eq!(settings, NameSettings::from_config(&full_config()));
+}
+
+#[tokio::test]
+async fn a_confirmed_import_turns_creation_off_at_the_worker_without_a_reload() {
+    // End to end: the Confirm handoff, not the five-minute reload, is what
+    // stops creation. The worker is warmed on the old settings (its first
+    // reload already read them), so deleting `access_imported` leaves the
+    // post-confirm join creating a room and fails this test.
+    let trace = Trace::default();
+    let mut candidate = full_config();
+    candidate.settings.creation_enabled = false;
+    let bytes = serde_json::to_vec(&candidate).unwrap();
+    let (runtime, _) = import_harness(trace.clone(), empty_config(), vec![Ok(bytes.clone())]);
+    let (probe_store, _) = runtime.make_pair();
+    let reads = probe_store.config_reads.clone();
+    let initial_reads = reads.load(Ordering::Relaxed);
+    let inventory = config_inventory();
+    let upload = import_interaction(bytes.len() as u64, manager(), UPLOADER);
+    let (_, preview) = handle_import_capture(&runtime, &upload, Some(&inventory)).await;
+    let (confirm_id, _) = preview_buttons(&preview.expect("preview"));
+    let (before, _) = runtime
+        .naming_probe(GUILD)
+        .await
+        .expect("loaded worker probe");
+    assert_eq!(before, NameSettings::from_config(&empty_config()));
+    // Let the worker's first reload finish on the OLD settings, like the
+    // full-inbox sibling: preview read, load read, first paced reload.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while reads.load(Ordering::Relaxed) < initial_reads + 3 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("old-settings worker reload before the confirm");
+    // Baseline: creation is on at the warmed worker.
+    assert!(runtime.voice_frame(GUILD, MEMBER, Some(CREATOR), Some(false), "on".to_owned()));
+    assert!(
+        wait_for_trace(&trace, "create").await,
+        "creation on before the confirm: {:?}",
+        trace.lock().unwrap()
+    );
+    let confirm = component_interaction(&confirm_id, manager(), UPLOADER);
+    let (_, response) = handle_import_capture(&runtime, &confirm, Some(&inventory)).await;
+    assert!(response_text(&response.expect("applied")).starts_with("Import applied:"));
+    assert!(runtime.voice_frame(
+        GUILD,
+        MEMBER + 1,
+        Some(CREATOR),
+        Some(false),
+        "off".to_owned()
+    ));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let creates = trace
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.as_str() == "create")
+        .count();
+    assert_eq!(
+        creates,
+        1,
+        "the confirmed import stopped creation at the worker: {:?}",
+        trace.lock().unwrap()
+    );
+    runtime.remove_guild(GUILD);
+}
+
+#[test]
+fn imported_settings_map_to_the_runtime_gates() {
+    // The values a confirmed import hands the worker: creation switch,
+    // guild-wide command role and per-command restrictions, in the shape
+    // `may_create_room` / `may_use_command` read.
+    let mut config = empty_config();
+    config.settings.creation_enabled = false;
+    config.settings.command_role_id = Some(MENTION_ROLE.to_string());
+    config.settings.command_roles = vec![config_codec::CommandRoles {
+        command: "kick".to_owned(),
+        role_ids: vec![MENTION_ROLE.to_string()],
+    }];
+    assert_eq!(
+        import_access_controls(&config),
+        Some(AccessControls {
+            room_creation_enabled: false,
+            required_role: Some(MENTION_ROLE),
+            command_roles: BTreeMap::from([("kick".to_owned(), vec![MENTION_ROLE])]),
+        })
+    );
+    // A value the planner would never let through maps to nothing, so the
+    // worker keeps its previous controls instead of a half-built set.
+    config.settings.command_role_id = Some("not-a-role".to_owned());
+    assert_eq!(import_access_controls(&config), None);
 }
 
 #[tokio::test]

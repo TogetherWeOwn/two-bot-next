@@ -86,6 +86,29 @@ The offline suites (`scripts/test_staging_voice_synthetic.py`,
 caps, the exact-cap passes, the cap-plus-one refusals on every path and the
 fixed messages.
 
+## Bounded staging prerequisite
+
+Voice and [help-embed checks](staging-help-embed-smoke.md) must use the same
+[bounded staging contract](staging-rollout-gate.md#no-always-on-staging-rule-and-activation-hold)
+as deployment and rollback consumers: acquire/start through the trusted pipeline,
+verify the exact SHA/environment before live checks, serialize the complete use
+window, then release with native expiry surviving cancellation or runner loss.
+A workflow's retry loop must fit inside the original window, not renew it.
+Keep every existing active-use check and cleanup obligation; a stopped gateway
+is not a passing room-lifecycle test.
+
+The workflow wiring is not activation. A separate `staging-window` job in the
+`staging` environment asserts a called deploy's exact grant; the live `synthetic`
+job needs it and never holds the ownership credential. A standalone run holds
+the canonical workflow lock, begins at most 45 minutes, and releases after the
+consumer. Called runs use a disjoint per-run group and never release the parent.
+Start/assert and cleanup receipts are retained for 14 days. Use **Re-run all
+jobs** after a failure: re-running only failed jobs changes the attempt and the
+inherited assert refuses. See the linked contract for pending-slot replacement
+and exact-SHA re-dispatch recovery. Full rollout still requires the remaining
+consumer/rollback wiring, live inventory and acceptance. Production is unchanged;
+no permanent staging keepalive, host timer or new always-on cost is authorized.
+
 ## When it runs
 
 - After every `deploy-staging` run (job `voice-synthetic`). A failure fails the
@@ -111,6 +134,15 @@ uploaded as the `voice-synthetic-<run id>` artifact for 14 days.
 The test bot is a separate Discord application, **TWO Voice Synthetic
 (staging)**, invited only to the TWO Staging guild with View Channels, Connect
 and View Audit Log. It is never the bot under test.
+
+The same test bot and the same `voice-synthetic` environment secret also
+drive the [help embed smoke](staging-help-embed-smoke.md): it posts the two
+help builders' embeds to one dedicated staging text channel (a channel
+overwrite granting View Channel, Send Messages, Embed Links and Read
+Message History on that channel only), asserts the brand fields on the
+read-back, and deletes its own messages. That reuse is deliberate: the
+staging product bot's token never enters GitHub, and no second test
+credential is created.
 
 Discord marks it as a bot, and bots never count as room occupants. The staging
 Worker therefore sets `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` to its user ID, so

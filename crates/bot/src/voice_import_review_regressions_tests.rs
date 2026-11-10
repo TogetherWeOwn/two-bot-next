@@ -180,9 +180,12 @@ impl RoomPersistence for RaceStore {
     async fn save_access_controls(
         &self,
         guild: Snowflake,
+        expected: &AccessControls,
         controls: &AccessControls,
     ) -> Result<(), StoreError> {
-        self.inner.save_access_controls(guild, controls).await
+        self.inner
+            .save_access_controls(guild, expected, controls)
+            .await
     }
     async fn logging_settings(&self, guild: Snowflake) -> Result<LoggingSettings, StoreError> {
         self.inner.logging_settings(guild).await

@@ -40,7 +40,8 @@ def delivered_outage(failures):
 class FakeGitHub:
     """Paginated stand-in for the two GitHub reads history reconstruction uses."""
 
-    def __init__(self, samples, extra_runs=(), fail_page=None, fail_first=False):
+    def __init__(self, samples, extra_runs=(), fail_page=None, fail_first=False,
+                 legacy_runs=0):
         # samples: chronological (probe, alert_step) pairs, oldest first.
         # extra_runs: chronological dicts merged in by position via run_number
         # offsets is overkill; extras are appended as the newest runs instead
@@ -63,6 +64,8 @@ class FakeGitHub:
                           "run_number": len(self.runs) + 1, "event": "schedule"})
         self.fail_page = fail_page
         self.fail_first = fail_first
+        # The oldest legacy_runs samples carry the pre-issue Discord step name.
+        self.legacy_ids = set(range(BASE_ID, BASE_ID + legacy_runs))
         self.runs_calls = 0
         self.jobs_calls = 0
 
@@ -94,7 +97,9 @@ class FakeGitHub:
                     {"name": history.PROBE_STEPS[ENV_NAME], "conclusion": probe},
                     {"name": history.DECIDE_STEPS[ENV_NAME],
                      "conclusion": "success"},
-                    {"name": history.ALERT_STEPS[ENV_NAME],
+                    {"name": (history.LEGACY_ALERT_STEP
+                              if int(match.group(1)) in self.legacy_ids
+                              else history.ALERT_STEPS[ENV_NAME]),
                      "conclusion": delivery},
                 ],
             }]}
@@ -125,6 +130,37 @@ class RolloverAcceptanceTests(unittest.TestCase):
                           "15th failure of an already-alerted outage must not re-alert")
         self.assertEqual(self.decide(fake, "success"), "recovery",
                          "first healthy sample owes the recovery, not an alert")
+
+    def test_outage_alerted_only_to_discord_re_alerts_into_an_issue(self):
+        # Delivered by the legacy Discord step, which reached no agent.
+        samples = [("success", "skipped")] + delivered_outage(5)
+        fake = FakeGitHub(samples, legacy_runs=len(samples))
+        self.assertEqual(self.decide(fake, "failure"), "alert")
+        self.assertEqual(self.decide(fake, "success"), "alert",
+                         "an undelivered incident owes its late alert first")
+
+    def test_issue_delivered_after_a_discord_era_outage_does_not_repeat(self):
+        legacy = [("success", "skipped")] + delivered_outage(5)
+        fake = FakeGitHub(legacy + [("failure", "success"), ("failure", "skipped")],
+                          legacy_runs=len(legacy))
+        self.assertIsNone(self.decide(fake, "failure"))
+        self.assertEqual(self.decide(fake, "success"), "recovery")
+
+    def test_a_recovered_discord_incident_does_not_mute_the_next_outage(self):
+        legacy = ([("success", "skipped"), ("failure", "skipped"), ("failure", "success"),
+                   ("success", "success")])
+        fake = FakeGitHub(legacy + [("success", "skipped"), ("failure", "skipped")],
+                          legacy_runs=len(legacy))
+        self.assertEqual(self.decide(fake, "failure"), "alert")
+        fake = FakeGitHub(legacy, legacy_runs=len(legacy))
+        self.assertIsNone(self.decide(fake, "success"))
+
+    def test_discord_era_first_failure_still_needs_a_second(self):
+        fake = FakeGitHub([("success", "skipped"), ("failure", "skipped")],
+                          legacy_runs=2)
+        self.assertEqual(self.decide(fake, "failure"), "alert")
+        fake = FakeGitHub([("success", "skipped")], legacy_runs=1)
+        self.assertIsNone(self.decide(fake, "failure"))
 
     def test_thirty_failures_no_duplicate_alert_and_recovery_on_green(self):
         fake = FakeGitHub([("success", "skipped")] + delivered_outage(30))

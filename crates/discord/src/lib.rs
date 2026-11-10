@@ -11,6 +11,7 @@ pub mod audit_mirror;
 mod automation_admission;
 pub mod automod;
 pub mod automod_activation;
+pub mod brand;
 pub mod channel_access;
 #[cfg(feature = "db")]
 pub mod channel_moderation;
@@ -33,6 +34,7 @@ pub use channel_moderation::{
     register_channel_handlers, ChannelModerationRuntime, ChannelReply, ChannelResponseError,
     ChannelRuntimeError,
 };
+pub mod help_embed_smoke;
 pub mod intents;
 pub mod interactions;
 pub mod internal_actions;
@@ -47,6 +49,7 @@ pub mod leveling_runtime;
 pub mod lfg_interactions;
 #[cfg(feature = "db")]
 mod lfg_list;
+pub mod lockdown_preview;
 pub mod member_moderation;
 mod message_safety;
 pub mod onboarding_config;
@@ -91,4 +94,5 @@ pub use pipeline::{
     build_cache, AuditEntryObserver, AuditLogObservation, ChannelClassifier, InviteSource,
     JoinObservation, JoinObserver, MemPipeline, MessageEligibility, NoClassification, NoInvites,
     Pipeline, PipelineSnapshots, ScriptedInvites, SettingsChannelClassifier,
+    VoiceTransitionObservation, VoiceTransitionObserver,
 };
