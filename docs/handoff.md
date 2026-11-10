@@ -29,23 +29,34 @@ disagree, the live queue wins and this file needs a dated update.
 - Five later-milestone ideas are retained but deferred, undecided
   (2026-11-10). No build is committed.
 - A public roadmap entry point is in review as a separate docs change
-  (one open PR at snapshot). This snapshot does not duplicate it; the
-  approved-vs-proposed summary above already names what counts as
-  scope without relying on that entry point.
+  (#2021). This snapshot does not duplicate it; the approved-vs-proposed
+  summary above already names what counts as scope without relying on
+  that entry point.
+- M2 state: lockdown preview is implemented, dark and unpublished
+  (planner #1920, executor reads #1925, dark slash #1929); `{args}`
+  build slices merged in #1970/#1974 (spec Status correction open as
+  #2002); automod preview slices #1959, #1961–#1965 are open; warning
+  history is spec-only. See the current-state plan for the per-item
+  table.
 
 ## Relevant public PRs and branches
 
-- The roadmap entry-point PR is open and in review at snapshot. Do
-  not modify its pending review from a handoff; integrate it once
+- The roadmap entry-point PR is #2021, open and in review at snapshot.
+  Do not modify its pending review from a handoff; integrate it once
   merged.
-- M2 build branches are the only build work in flight. No M3 build
-  PR has been opened.
+- M2 build branches are the only build work in flight: automod
+  preview slices #1959, #1961–#1965 (open), lockdown confirm/cancel
+  #1938 (open), and the `{args}` status correction #2002 (open;
+  builds merged in #1970/#1974). No M3 build PR has been opened.
 
 ## Blockers (public-safe summary)
 
-- M2 build items wait on staging recovery (database re-home, then
-  staging migrations, then the staging lifecycle drill). Details live
-  in the staging and cutover runbooks, not here; no incident
+- **Blocked on staging recovery:** automod preview (W3), warning
+  history (W4) and `{args}` (W5, built in a stack with merges pending
+  per its spec Status line; builds merged in #1970/#1974, status
+  correction open as #2002). Staging recovery means database re-home,
+  then staging migrations, then the staging lifecycle drill. Details
+  live in the staging and cutover runbooks, not here; no incident
   internals are reproduced.
 - A production incident with a protective hold is in progress at
   snapshot. Release holds, staging qualification and rollback proof
@@ -75,17 +86,27 @@ run on GitHub Actions; record the exact-head run links in the PR body.
 
 ## Last verification
 
+- Snapshot base: `main` at
+  `a8ca2c02cfcced654a680853b93655f898bbc51f`.
+- Candidate verification: PR #2027, `ci-ok` run
+  <https://github.com/TogetherWeOwn/two-bot-next/actions/runs/42885988083>
+  (check workflow; ci-ok job
+  `130093576599` passed at head
+  `c0a5e801b47da865fba7c8b799d7aa6abca10f07`). Re-verify at each
+  resubmitted head; the PR link resolves the current head.
 - At snapshot, accepted-spec links, relative targets and the docs
   index were checked with `python3 scripts/check_docs_index.py --json`
-  and `git diff --check`. Publish the exact head SHA and Actions run
-  links here when this snapshot is superseded.
+  and `git diff --check`.
 - No deployment, drill or production activation was performed to
   write this file.
 
 ## Next unfinished step
 
-Resume M2 builds in spec order once staging recovery lands: first
-re-check each spec's seams on current `main`, then build behind the
-spec's own gates, then stage and attach behavior evidence before any
-merge approval. Until then, keep M3 deferred and keep release holds
-in force.
+Resume the three remaining M2 items once staging recovery lands:
+automod preview (W3) first, then warning history (W4), then `{args}`
+(W5) gated release — re-checking each spec's seams on current `main`
+first, building behind the spec's own gates and staging behavior
+evidence before any merge approval. The lockdown preview is already
+implemented dark; only its publication/activation remains, behind its
+own spec §8 gates. Until then, keep M3 deferred and keep release
+holds in force.

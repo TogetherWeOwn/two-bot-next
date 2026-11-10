@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-11-10
-- **Deciders:** Owner (relayed through the Operator); recorded by Product Lead
+- **Deciders:** Owner, 2026-11-10; recorded by Product Lead
 
 ## Context
 

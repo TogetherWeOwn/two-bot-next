@@ -15,10 +15,10 @@ publication and release gates still apply before any build PR merges.
 
 | Item | Specification | Status of the spec | What remains |
 |---|---|---|---|
-| Lockdown preview | [Lockdown preview](../lockdown-preview-spec.md) | Approved — private preview and stale-checked bound confirmation for the invoking channel | Build, preview render, and gated release. Direct lockdown stays unchanged. |
+| Lockdown preview | [Lockdown preview](../lockdown-preview-spec.md) | Implemented, dark and unpublished — planner, executor snapshot/roles reads and dark slash with pending store merged (#1920, #1925, #1929) | Publication/activation behind its gates (spec §8). Direct lockdown stays unchanged. |
 | Automod verdict preview | [Automod verdict preview](../automod-preview-spec.md) | Approved — private staff preview for synthetic input, no moderation effects | Build the dry-run preview command and its rate/audit limits. Not a member-facing oracle. |
 | Warning history | [Warning history](../warning-history-spec.md) | Approved — private, bounded, metadata-only staff read, reasons withheld | Independent history-read gates still open; no historical-data grant follows from acceptance alone. |
-| Custom-command arguments | [Custom-command arguments](../custom-command-args-spec.md) | Approved — one literal, bounded, non-recursive `{args}` substitution with output-safety controls | Build slices stacked; merges pending at snapshot. Not a general template language. |
+| Custom-command arguments | [Custom-command arguments](../custom-command-args-spec.md) | Built in this stack — one literal, bounded, non-recursive `{args}` substitution with output-safety controls; build slices merged (#1970, #1974) | Gated release. The spec Status line still reads "merges pending"; open #2002 records it shipped. Not a general template language. |
 
 Acceptance of the intent is recorded in each spec's status header.
 Acceptance does not lift any no-build state inside the spec and does
@@ -46,11 +46,15 @@ it does not make a feature active.
 - **Implemented and merged:** voice-room self-service and saved-response
   editing paths listed in the parity matrix
   ([parity](../parity.md)) and publication guide
-  ([command-publish](../command-publish.md)). A merged change is not by
+  ([command-publish](../command-publish.md)); the M2 lockdown preview in
+  dark (planner #1920, executor reads #1925, dark slash #1929); and the
+  `{args}` build slices (#1970, #1974). A merged change is not by
   itself proof of production activation.
-- **Blocked on staging recovery:** M2 build work items following the
-  lockdown, automod-preview, warning-history and args specs. See
-  [handoff](../handoff.md) for the current blocker and next step.
+- **Blocked on staging recovery:** automod preview (W3), warning
+  history (W4) and `{args}` (W5, built in a stack with merges pending
+  per its spec Status line; builds merged in #1970/#1974, status
+  correction open as #2002). See [handoff](../handoff.md) for the
+  current blocker and next step.
 - **Not started:** any commissioned M3 build, because M3 items are
   deferred and undecided, and later-milestone merges are gated on M2
   (see [ADR 0002](../adr/0002-m2-m3-sequencing.md)).

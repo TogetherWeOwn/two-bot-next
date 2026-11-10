@@ -2,7 +2,10 @@
 
 - **Status:** Accepted
 - **Date:** 2026-11-09 (accepted in principle 2026-11-08, applied 2026-11-09)
-- **Deciders:** Incident and milestone reviewers; applied by the Engineering Lead
+- **Deciders:** Owner (decision D1, 2026-11-02; the binding merge rule);
+  Chief of Staff (decision D-2, 2026-11-08, accepted in principle);
+  applied by the Engineering Lead (producer vs merge-only edges split
+  before the 2026-11-09 review)
 
 ## Context
 
@@ -43,3 +46,7 @@ Inclusion in this list is not proof of implementation or production
 activation; see [plans/current-state-2026-11.md](../plans/current-state-2026-11.md).
 Reversing this decision needs a dated entry here and a matching update
 to the current-state plan in the same change.
+
+While [ADR 0003](0003-m3-deferred.md) defers the later-milestone items,
+the D1 gate is moot: nothing merges from that scope until it is
+commissioned again, at which point D1 re-applies unchanged.
