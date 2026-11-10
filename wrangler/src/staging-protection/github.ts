@@ -67,7 +67,8 @@ export class GitHub {
   private signal: AbortSignal;
   private reads = 0;
   constructor(token: string, signal: AbortSignal, fetcher: typeof fetch = fetch) {
-    this.token = token; this.signal = signal; this.fetcher = fetcher;
+    // workerd's native fetch requires the global receiver, not this client instance.
+    this.token = token; this.signal = signal; this.fetcher = fetcher.bind(globalThis);
   }
   async request(path: string, method = "GET", body?: string): Promise<Response> {
     requireEvidence(++this.reads <= 24 && path.startsWith("/") && !path.startsWith("//"));

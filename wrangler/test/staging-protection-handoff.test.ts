@@ -20,9 +20,14 @@ const PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
 
 const entry = `
 import worker, { StagingProtectionGate as Base } from "./src/staging-protection/worker.ts";
+import { GitHub } from "./src/staging-protection/github.ts";
 export class StagingProtectionGate extends Base {
   async fetch(request) {
     const path = new URL(request.url).pathname;
+    if (path === "/__transport") {
+      const api = new GitHub("synthetic-transport-token", AbortSignal.timeout(5000));
+      return api.request("/synthetic-transport");
+    }
     if (path === "/__defer") { await this.ctx.storage.put("test:defer", 1); return new Response("ok"); }
     if (path === "/__fire") { await this.ctx.storage.setAlarm(Date.now()); return new Response("ok"); }
     if (path === "/__state") {
@@ -102,6 +107,13 @@ function harness(t: { after: (fn: () => Promise<void>) => void }) {
   return { mf, seen, options, gateCall, state, ingress,
     release: () => { hold = undefined; release(); } };
 }
+
+test("workerd: GitHub transport reaches the outbound service using the native fetch receiver", async (t) => {
+  const h = harness(t);
+  h.release();
+  assert.equal((await h.gateCall("/__transport")).status, 500);
+  assert.deepEqual(h.seen, ["GET /synthetic-transport"]);
+});
 
 test("workerd: ingress acks 202 promptly while delayed GitHub I/O runs in the alarm, even for concurrent deliveries", async (t) => {
   const h = harness(t);

@@ -144,7 +144,7 @@ function harness(t) {
       if (gh.tokenStatus !== 201) return json({ message: "denied" }, gh.tokenStatus);
       gh.tokens++;
       return json({ token: `ghs_synthetic_installation_token_${gh.tokens}`,
-        expires_at: new Date(Date.now() + 3600000).toISOString() }, 201);
+        expires_at: new Date(Math.floor(Date.now() / 1000) * 1000 + 3600000).toISOString().replace(".000Z", "Z") }, 201);
     }
     if (method === "DELETE" && path === "/installation/token") {
       trace.push("github.revoke");
@@ -397,6 +397,9 @@ test("alarm expiry clears the fence but a stale delivery cannot approve again", 
   assert.deepEqual(await deliver(h.reconstructed()), { status: 503, text: "unavailable" });
   assert.deepEqual(decisionStates(h), ["approved"]);
   assert.equal(h.storage.map.size, 0, "expired run cannot recreate an approval fence");
+  assert.equal(h.gh.tokens, 2, "stale workflow evidence is checked after a fresh call-time token");
+  assert.equal(h.gh.revoked.length, 2, "both tokens are revoked, including the stale-run refusal");
+  assert.equal(h.gh.counts.run, 4, "refusal reaches the current-run freshness check");
 });
 
 test("ambiguous callback transport failure is never repeated, only fenced and revoked", async t => {
