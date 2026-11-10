@@ -86,10 +86,11 @@ class FakeGitHub:
         self.next_number = other.next_number
         return self
 
-    def add_event(self, number, event, created_at=None):
+    def add_event(self, number, event, created_at=None, **fields):
         rows = self.events.setdefault(number, [])
         event_id = 1 + sum(len(items) for items in self.events.values())
-        rows.append({"id": event_id, "event": event, "created_at": created_at or self.clock})
+        rows.append({"id": event_id, "event": event,
+                     "created_at": created_at or self.clock, **fields})
 
     def reopen(self, number, created_at):
         """A manual reopen: state, lifecycle event and updated_at all move."""
@@ -115,7 +116,9 @@ class FakeGitHub:
             number, self.next_number = self.next_number, self.next_number + 1
             self.issues[number] = {"number": number, "state": "open", "title": body["title"],
                                    "body": body["body"], "labels": body["labels"],
-                                   "updated_at": self.clock}
+                                   "created_at": self.clock, "updated_at": self.clock}
+            for label in body["labels"]:
+                self.add_event(number, "labeled", label={"name": label})
             return {"number": number}
         match = re.fullmatch(r"issues/(\d+)/comments", rest)
         if method == "GET" and match:
@@ -689,6 +692,28 @@ class MainLifecycleTests(unittest.TestCase):
         finish(gh_new, main=MAIN, promoted=MAIN, status="identical")
         return gh_new
 
+    def test_fake_creation_records_initial_label_and_creation_time(self):
+        gh = self.held_history()
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        self.assertEqual(gh.issues[1]["created_at"], gh.clock)
+        self.assertEqual(gh.events[1], [{"id": 1, "event": "labeled",
+                                       "created_at": gh.clock,
+                                       "label": {"name": "incident"}}])
+
+    def test_history_handoff_retains_events_routes_and_issue_number(self):
+        gh = self.held_history()
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        gh.event_routes[1] = paged(gh.events[1])
+        recovered = self.recovered_history("2020-01-11T00:00:00Z").share(gh)
+        self.assertIs(recovered.issues, gh.issues)
+        self.assertIs(recovered.comments, gh.comments)
+        self.assertIs(recovered.comment_times, gh.comment_times)
+        self.assertIs(recovered.events, gh.events)
+        self.assertIs(recovered.event_routes, gh.event_routes)
+        self.assertEqual(recovered.next_number, gh.next_number)
+        self.assertEqual(recovered.request("GET", f"/repos/{REPO}/issues/1/events?"
+                                           "per_page=100&page=1", "tok"), gh.events[1])
+
     def test_open_then_comment_then_close(self):
         gh = self.held_history()
         code, out = self.run_main(gh, self.alert_needs())
@@ -711,9 +736,7 @@ class MainLifecycleTests(unittest.TestCase):
 
         # Recovery after the last issue activity closes it with a comment.
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
-        recovered.issues, recovered.comments = gh.issues, gh.comments
-        recovered.comment_times = gh.comment_times
-        recovered.next_number = gh.next_number
+        recovered.share(gh)
         code, out = self.run_main(recovered, self.recovery_needs())
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["action"], "recovery")
@@ -730,8 +753,7 @@ class MainLifecycleTests(unittest.TestCase):
         gh = self.held_history()
         self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
-        recovered.issues, recovered.comments = gh.issues, gh.comments
-        recovered.comment_times = gh.comment_times
+        recovered.share(gh)
         code, out = self.run_main(recovered, {})
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["action"], "recovery")
@@ -749,8 +771,7 @@ class MainLifecycleTests(unittest.TestCase):
         install_promotion(latest, revision=MAIN, run_id=777,
                           completed_at="2020-01-11T10:00:00Z")
         finish(latest, pending_at="2020-01-10T00:00:00Z")
-        latest.issues, latest.comments = gh.issues, gh.comments
-        latest.comment_times = gh.comment_times
+        latest.share(gh)
         latest.clock = "2020-01-11T10:06:00Z"
         code, out = self.run_main(latest, self.recovery_needs())
         self.assertEqual(code, 0)
@@ -761,32 +782,46 @@ class MainLifecycleTests(unittest.TestCase):
         self.assertEqual(gh.issues[1]["state"], "open")
         self.assertNotIn("PATCH", [method for method, _ in latest.writes])
 
-    def test_watch_recovers_a_stale_alert_written_after_completion(self):
+    def test_delayed_first_creation_refutes_old_close_claim_and_remains_held(self):
         gh = self.held_history()
-        # The watch saw the old baseline before promotion, but its issue write
-        # lands after promotion completed. updated_at is NOT failure provenance.
+        # The watch saw OLD before promotion, but creates the labeled issue after G.
         gh.clock = "2020-01-11T00:05:00Z"
         self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
         self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
-        recovered = self.recovered_history("2020-01-11T00:00:00Z")
-        recovered.issues, recovered.comments = gh.issues, gh.comments
-        recovered.comment_times = gh.comment_times
+        recovered = self.recovered_history("2020-01-11T00:00:00Z").share(gh)
         code, out = self.run_main(recovered, {})
         self.assertEqual((code, json.loads(out)["action"]), (0, "recovery"))
+        # Exercise the exact former assertion before checking the accepted contract.
+        # Unexpected success or a different failure must fail this expected-negative proof.
+        with self.assertRaisesRegex(AssertionError, "^'open' != 'closed'"):
+            self.assertEqual(gh.issues[1]["state"], "closed")
+        self.assertEqual(gh.issues[1]["state"], "open")
+        self.assertEqual(len(gh.comments[1]), 1)
+        self.assertEqual(recovered.writes, [])
+
+    def test_watch_recovers_a_delayed_old_comment_on_an_older_quiet_issue(self):
+        gh = self.held_history()
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        gh.clock = "2020-01-11T00:05:00Z"
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        recovered = self.recovered_history("2020-01-11T00:00:00Z").share(gh)
+        self.assertLess(gh.events[1][0]["created_at"], "2020-01-11T00:00:00Z")
+        self.assertEqual(gh.comment_times[(1, 0)], gh.clock)
+        self.assertEqual(self.run_main(recovered, {})[0], 0)
         self.assertEqual(gh.issues[1]["state"], "closed")
+        self.assertEqual(recovered.writes, [("POST", "issues/1/comments"),
+                                           ("PATCH", "issues/1")])
 
     def test_recovery_preserves_a_genuinely_newer_generation(self):
         gh = self.held_history()
         self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
         # A second hold is observed against the recovered generation itself.
         next_hold = scenario("2020-01-11T00:00:00Z", "2020-01-12T00:00:00Z")
-        next_hold.issues, next_hold.comments = gh.issues, gh.comments
-        next_hold.comment_times = gh.comment_times
+        next_hold.share(gh)
         next_hold.clock = "2020-01-20T00:00:00Z"
         self.assertEqual(self.run_main(next_hold, self.alert_needs())[0], 0)
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
-        recovered.issues, recovered.comments = gh.issues, gh.comments
-        recovered.comment_times = gh.comment_times
+        recovered.share(gh)
         self.assertEqual(self.run_main(recovered, {})[0], 0)
         self.assertEqual(gh.issues[1]["state"], "open")
         self.assertEqual(len(gh.comments[1]), 1)
@@ -799,8 +834,7 @@ class MainLifecycleTests(unittest.TestCase):
         self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
         gh.comments[1][0] += '\n<!-- production-hold-observation: {"invalid":true} -->'
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
-        recovered.issues, recovered.comments = gh.issues, gh.comments
-        recovered.comment_times = gh.comment_times
+        recovered.share(gh)
         self.assertEqual(self.run_main(recovered, {})[0], 0)
         self.assertEqual(gh.issues[1]["state"], "open")
         self.assertEqual(recovered.writes, [])
@@ -856,25 +890,24 @@ class MainLifecycleTests(unittest.TestCase):
         for edit in (lambda text: text + "\nNew unresolved hold.",
                      lambda text: text.replace("ci-not-green", "new unresolved failure")):
             gh = self.held_history()
-            gh.clock = "2020-01-11T00:05:00Z"
             self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+            gh.clock = "2020-01-11T00:05:00Z"
             gh.issues[1]["body"] = edit(gh.issues[1]["body"])
+            gh.issues[1]["updated_at"] = gh.clock
             recovered = self.recovered_history("2020-01-11T00:00:00Z")
-            recovered.issues, recovered.comments = gh.issues, gh.comments
-            recovered.comment_times = gh.comment_times
+            recovered.share(gh)
             self.assertEqual(self.run_main(recovered, {})[0], 0)
             self.assertEqual(gh.issues[1]["state"], "open")
             self.assertEqual(recovered.writes, [])
 
     def test_newer_comment_edit_retaining_observation_is_not_stale(self):
         gh = self.held_history()
-        gh.clock = "2020-01-11T00:05:00Z"
         self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        gh.clock = "2020-01-11T00:05:00Z"
         self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
         gh.comments[1][0] += "\nNew unresolved hold."
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
-        recovered.issues, recovered.comments = gh.issues, gh.comments
-        recovered.comment_times = gh.comment_times
+        recovered.share(gh)
         self.assertEqual(self.run_main(recovered, {})[0], 0)
         self.assertEqual(gh.issues[1]["state"], "open")
         self.assertEqual(recovered.writes, [])
@@ -883,8 +916,7 @@ class MainLifecycleTests(unittest.TestCase):
         gh = self.held_history()
         self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
-        recovered.issues, recovered.comments = gh.issues, gh.comments
-        recovered.comment_times = gh.comment_times
+        recovered.share(gh)
         recovered.clock = "2020-01-11T00:05:00Z"
         request = recovered.request
 
@@ -909,8 +941,7 @@ class MainLifecycleTests(unittest.TestCase):
             gh = self.held_history()
             self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
             recovered = self.recovered_history("2020-01-11T00:00:00Z")
-            recovered.issues, recovered.comments = gh.issues, gh.comments
-            recovered.comment_times = gh.comment_times
+            recovered.share(gh)
             report = decide(recovered)
             if field:
                 report[field] = value
@@ -927,8 +958,7 @@ class MainLifecycleTests(unittest.TestCase):
         gh = self.held_history()
         self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
-        recovered.issues, recovered.comments = gh.issues, gh.comments
-        recovered.comment_times = gh.comment_times
+        recovered.share(gh)
         code, out = self.run_main(recovered, {}, ["--dry-run"])
         self.assertEqual((code, json.loads(out)["action"]), (0, "recovery"))
         self.assertEqual(gh.issues[1]["state"], "open")
@@ -940,8 +970,7 @@ class MainLifecycleTests(unittest.TestCase):
         gh.issues[1]["updated_at"] = "2020-01-20T00:00:00Z"
         gh.comments[1] = ["Unclassified newer incident activity; do not auto-close."]
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
-        recovered.issues, recovered.comments = gh.issues, gh.comments
-        recovered.comment_times = gh.comment_times
+        recovered.share(gh)
         self.assertEqual(self.run_main(recovered, self.recovery_needs())[0], 0)
         self.assertEqual(gh.issues[1]["state"], "open")
         self.assertEqual(gh.comments[1], ["Unclassified newer incident activity; do not auto-close."])
@@ -1035,15 +1064,18 @@ class IssueEventLifecycleTests(unittest.TestCase):
         recovered = self.recovered(self.alerted())
         self.assertEqual(self.run_recovery(recovered)[0], 0)
         self.assertEqual(recovered.issues[1]["state"], "closed")
-        [event] = recovered.events[1]
+        [initial, event] = recovered.events[1]
+        self.assertEqual((initial["event"], initial["label"]),
+                         ("labeled", {"name": "incident"}))
         self.assertEqual((event["id"], event["event"], event["created_at"]),
-                         (1, "closed", "2020-01-11T00:05:00Z"))
+                         (2, "closed", "2020-01-11T00:05:00Z"))
 
     def test_manual_reopen_after_a_close_for_the_same_generation_writes_nothing(self):
         recovered = self.recovered(self.alerted())
         self.assertEqual(self.run_recovery(recovered)[0], 0)
         recovered.reopen(1, "2020-01-11T01:00:00Z")
-        self.assertEqual([e["event"] for e in recovered.events[1]], ["closed", "reopened"])
+        self.assertEqual([e["event"] for e in recovered.events[1]],
+                         ["labeled", "closed", "reopened"])
         self.assertHeld(recovered, comments=1)
         # The veto is stable across repeated reporter runs.
         self.assertHeld(recovered, comments=1)
@@ -1052,7 +1084,7 @@ class IssueEventLifecycleTests(unittest.TestCase):
         gh = self.recovered(self.alerted())
         gh.issues[1]["state"] = "closed"
         gh.request("PATCH", f"/repos/{REPO}/issues/1", "tok", {"state": "open"})
-        self.assertEqual([e["event"] for e in gh.events[1]], ["reopened"])
+        self.assertEqual([e["event"] for e in gh.events[1]], ["labeled", "reopened"])
 
     def test_lost_close_response_then_manual_reopen_writes_nothing(self):
         recovered = self.recovered(self.alerted())
@@ -1060,7 +1092,7 @@ class IssueEventLifecycleTests(unittest.TestCase):
         self.assertEqual(self.run_recovery(recovered)[0], 1)
         # GitHub really closed the issue; the reporter only lost the response.
         self.assertEqual(recovered.issues[1]["state"], "closed")
-        self.assertEqual([e["event"] for e in recovered.events[1]], ["closed"])
+        self.assertEqual([e["event"] for e in recovered.events[1]], ["labeled", "closed"])
         recovered.lose_patch_response = False
         before = len(recovered.writes)
         self.assertEqual(self.run_recovery(recovered)[0], 0)
@@ -1080,10 +1112,10 @@ class IssueEventLifecycleTests(unittest.TestCase):
         with mock.patch.object(recovered, "request", side_effect=fail_close):
             self.assertEqual(self.run_recovery(recovered)[0], 1)
         self.assertEqual(recovered.issues[1]["state"], "open")
-        self.assertEqual(recovered.events, {})
+        self.assertEqual([e["event"] for e in recovered.events[1]], ["labeled"])
         self.assertEqual(self.run_recovery(recovered, run_id="1000")[0], 0)
         self.assertEqual(recovered.issues[1]["state"], "closed")
-        self.assertEqual([e["event"] for e in recovered.events[1]], ["closed"])
+        self.assertEqual([e["event"] for e in recovered.events[1]], ["labeled", "closed"])
 
     def test_reopen_exactly_at_the_cutoff_vetoes_even_with_a_same_generation_receipt(self):
         gh = self.recovered(self.alerted(), clock=CUTOFF)
@@ -1130,6 +1162,41 @@ class IssueEventLifecycleTests(unittest.TestCase):
         gh.add_event(1, "reopened", "2020-01-11T00:00:01Z")
         self.assertHeld(self.recovered(gh), comments=0)
 
+    def test_initial_label_at_or_after_cutoff_holds_even_when_creation_precedes_it(self):
+        for labeled_at in (CUTOFF, "2020-01-11T00:00:01Z"):
+            gh = self.alerted()
+            self.assertLess(gh.issues[1]["created_at"], CUTOFF)
+            # GitHub may report the initial label after the create timestamp.
+            gh.events[1][0]["created_at"] = labeled_at
+            gh.issues[1]["updated_at"] = labeled_at
+            with self.subTest(labeled_at=labeled_at):
+                self.assertHeld(self.recovered(gh), comments=0)
+
+    def test_manual_label_unlabel_relabel_and_reopen_by_same_identity_hold(self):
+        actor = {"login": "incident-automation"}
+        for names in (("labeled",), ("unlabeled",), ("unlabeled", "labeled"),
+                      ("reopened",)):
+            for at in (CUTOFF, "2020-01-11T00:00:01Z"):
+                gh = self.alerted()
+                gh.events[1][0]["actor"] = actor
+                for name in names:
+                    gh.add_event(1, name, at, actor=actor, label={"name": "incident"})
+                gh.issues[1]["updated_at"] = at
+                with self.subTest(names=names, at=at):
+                    self.assertHeld(self.recovered(gh), comments=0)
+
+    def test_later_verified_generation_can_recover_a_delayed_first_created_alert(self):
+        gh = self.runner.held_history()
+        gh.clock = "2020-01-11T00:05:00Z"
+        self.assertEqual(self.runner.run_main(gh, self.runner.alert_needs())[0], 0)
+        self.assertHeld(self.recovered(gh), comments=0)
+        later = self.recovered(gh, clock="2020-01-12T00:05:00Z",
+                               completed_at="2020-01-12T00:00:00Z")
+        self.assertEqual(self.run_recovery(later)[0], 0)
+        self.assertEqual(later.issues[1]["state"], "closed")
+        self.assertEqual(later.writes, [("POST", "issues/1/comments"),
+                                       ("PATCH", "issues/1")])
+
     def test_reopen_before_the_cutoff_does_not_veto(self):
         gh = self.alerted()
         gh.add_event(1, "reopened", "2020-01-10T23:59:59Z")
@@ -1161,7 +1228,7 @@ class IssueEventLifecycleTests(unittest.TestCase):
         self.assertEqual(self.run_recovery(later, run_id="1001")[0], 0)
         self.assertEqual(later.issues[1]["state"], "closed")
         self.assertEqual([e["event"] for e in later.events[1]],
-                         ["closed", "reopened", "closed"])
+                         ["labeled", "closed", "reopened", "closed"])
 
     def test_later_generation_with_a_newer_reopen_stays_held(self):
         gh = self.alerted()
@@ -1183,7 +1250,7 @@ class IssueEventLifecycleTests(unittest.TestCase):
 
     def test_full_last_events_page_is_followed_by_one_more_read(self):
         gh = self.alerted()
-        for i in range(hold.PAGE_SIZE):
+        for i in range(hold.PAGE_SIZE - 1):
             gh.add_event(1, "labeled", "2020-01-10T00:00:00Z")
         seen = []
         gh.event_routes[1] = lambda query: (

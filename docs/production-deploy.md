@@ -279,14 +279,20 @@ red guards/gates, soak mismatches and green skips such as `ci-not-green`.
 `scripts/production_hold_incident.py` reuses the shared incident sink to open
 one issue titled **`production held > 6h`**, labelled `incident`, under the
 stable `production-held` key. Repeated overdue evaluations comment on that
-issue; the next successful deploy-mode production job comments and closes it.
+issue; a later successful deploy-mode production job comments and closes it only
+when the content, generation and lifecycle checks below permit recovery.
 A workflow success with a skipped production job is not recovery evidence.
 Both reporters reconcile from verified deployment history, so replacement of a
-queued terminal reporter cannot permanently lose recovery. Alert bodies and
+queued terminal reporter does not itself lose recovery. Alert bodies and
 repeat comments carry the observed serving generation and a checksum of their
-exact content. A delayed, unchanged alert written after a successful deploy can
-close when its generation predates that deploy; body/comment edits retaining the
-marker, a genuinely newer hold or unclassified newer activity remain open.
+exact content. A delayed, unchanged OLD-generation comment on an older quiet
+issue can close when its generation predates the verified deploy. A delayed
+first-created alert is different: its initial incident-label event at or after
+promotion G holds the issue against G, even if creation preceded G but labeling
+arrived later. No recovery comment or close is written in either case. Without
+a genuinely later verified deploy, that stale incident can remain open
+indefinitely. Body/comment edits retaining the marker, a genuinely newer hold
+or unclassified newer activity also remain open.
 Recovery comments also bind their content to the verified producing generation,
 so a failed close after a successful comment can retry against that same generation.
 Before recovery writes, the caller exhausts bounded issue lifecycle events and
