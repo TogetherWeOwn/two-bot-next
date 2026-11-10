@@ -30,25 +30,33 @@ observed before start. There are at most 15 urgent scans and two candidate
 attempts TOTAL across those scans, not two attempts per scan. The watch ends
 one second before the supervisor's next fixed-phase ordinary slot, including
 when dispatch starts late. The bound covers in-flight scans, admission, delivery
-and the pending-event probe, not only polling sleeps. Slow ordinary work can
-shorten or eliminate the optional watch; it keeps its existing overall timeout.
-Expiry cancels the watch in place without clearing committed reminder fences.
+and the pending-event probe, not only polling sleeps. New urgent wire attempts
+stop another 500 ms earlier to reserve bounded in-place permit settlement before
+watch cancellation. Slow ordinary work can shorten or eliminate the optional
+watch; it keeps its existing overall timeout. Expiry cancels the watch in place
+without clearing committed reminder fences.
 Nonurgent events wait for the next ordinary tick. The follow-up shares the same
 activation fence, supervisor ownership, cancellation and overall deadline; it
 never reruns ordinary scheduled messages, resets the timeout or admits an event
 at or after its start. There is no unbounded drain: at most four reminder
 attempts run in one supervised invocation. Larger urgent bursts, a first RSVP
-inside a polling gap or the final one-second cadence reserve, slow delivery or
-exhausted deadlines remain best effort, not guaranteed delivery. The urgent cutoff is applied in
+inside a polling gap or the final 1.5-second wire/settlement reserve, slow delivery
+or exhausted deadlines remain best effort, not guaranteed delivery. The urgent cutoff is applied in
 the store query before attendee rosters are materialized. The pending-event
 probe reads no rosters and deliberately does not require an RSVP.
 Admission checks the clock after connection and guild-lock waits, and dispatch
-checks again after commit. The resulting absolute event-start deadline passes
-through guard and durable transport admission, headers and body. The transport
+checks again after commit. A monotonic anchor captured before that wall-clock
+sample prevents a thread suspension from extending the remaining send budget.
+The resulting absolute event-start deadline passes through guard and durable
+transport admission, headers and body. The transport
 explicitly rechecks after admission, before initiating HTTP: a timeout wrapper
 alone can poll an already-expired admitted future first. A provably unused
-transport permit is released, but the immutable reminder fence remains. A timeout
-is uncertain, not permission to retry. A request already in flight cannot be
+transport permit is released, but the immutable reminder fence remains. The
+caller allows at most 500 ms beyond the wire deadline for storage settlement,
+not HTTP or retries. A stuck or failed release retains lane occupancy rather
+than pretending completion; no cleanup task is detached. A genuinely uncertain
+mutation also retains its transport permit. A timeout is uncertain, not permission
+to retry. A request already in flight cannot be
 recalled or guaranteed to arrive before start.
 Ordinary scheduled messages run first as a separate phase: a completed
 schedule-store failure that stops their batch still permits the bounded

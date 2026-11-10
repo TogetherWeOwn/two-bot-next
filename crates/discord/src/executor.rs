@@ -99,6 +99,10 @@ pub const RESPONSE_BODY_TIMEOUT_MS: u64 = 5_000;
 /// This never extends the wire attempt or authorizes another request. If
 /// completion cannot be confirmed within the bound, admission stays occupied.
 const READ_SETTLEMENT_GRACE_MS: u64 = 1_000;
+/// Bounded in-place settlement after a deadline-limited message attempt. This
+/// never extends admission/HTTP time or releases an uncertain mutation permit.
+/// Supervisors must reserve this budget before their cancellation boundary.
+pub const MESSAGE_SETTLEMENT_GRACE_MS: u64 = 500;
 /// Wire marker for a stalled response body: headers arrived but the body never
 /// completed within [`RESPONSE_BODY_TIMEOUT_MS`]. The executor seam maps this
 /// to [`DiscordError::Timeout`] (never `Unavailable`) so the publish wire
@@ -3006,6 +3010,8 @@ impl ActionExecutor {
     /// Confirmed single-attempt delivery with an absolute caller deadline.
     /// Guard and durable admission cannot renew it; transport checks again
     /// after admission and before initiating HTTP. Expiry never grants replay.
+    /// Settlement may take up to [`MESSAGE_SETTLEMENT_GRACE_MS`] beyond the wire
+    /// deadline. No task is detached; caller cancellation still drops in place.
     pub async fn post_message_confirmed_before(
         &self,
         channel_id: &str,
@@ -3013,15 +3019,25 @@ impl ActionExecutor {
         nonce: &str,
         deadline: tokio::time::Instant,
     ) -> Result<String, DiscordError> {
-        self.send_message_components(
-            channel_id,
-            content,
-            Some(nonce.into()),
-            None,
-            false,
-            MessageCompletion::Before(deadline),
+        let deadline = deadline.min(tokio::time::Instant::now() + self.inner.moderation_timeout);
+        let settled_by = deadline + Duration::from_millis(MESSAGE_SETTLEMENT_GRACE_MS);
+        // Only the transport's original deadline controls admission/headers/body.
+        // This later watchdog lets a proven no-wire release or a confirmed
+        // receipt settle storage, but also bounds a stuck pool/UPDATE. Uncertain
+        // wire mutations still drop their permit uncompleted, never released.
+        tokio::time::timeout_at(
+            settled_by,
+            self.send_message_components(
+                channel_id,
+                content,
+                Some(nonce.into()),
+                None,
+                false,
+                MessageCompletion::Before(deadline),
+            ),
         )
         .await
+        .unwrap_or(Err(DiscordError::Timeout))
     }
 
     /// Post a rendered feature message through the shared request factory.
@@ -3325,8 +3341,6 @@ impl ActionExecutor {
             // Feature posts with selects take the paced lane; the plain
             // `post_message` path keeps main's unpaced single attempt.
             let mut res = if let MessageCompletion::Before(deadline) = completion {
-                let deadline =
-                    deadline.min(tokio::time::Instant::now() + self.inner.moderation_timeout);
                 let (res, _) = self.send_with_deadline(&req, None, deadline).await?;
                 if ![200, 201].contains(&res.status) {
                     return Err(throw_for_status(&res));

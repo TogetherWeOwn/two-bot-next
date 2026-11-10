@@ -46,6 +46,10 @@ mod tests;
 mod reminder_cadence_tests;
 
 #[cfg(test)]
+#[path = "event_reminder_settlement_tests.rs"]
+mod reminder_settlement_tests;
+
+#[cfg(test)]
 #[path = "scheduled_stale_audit_acceptance_tests.rs"]
 mod acceptance_tests;
 
@@ -171,7 +175,7 @@ pub(crate) async fn tick(
     clock: impl Fn() -> u64 + Send + Sync,
 ) -> Result<(), ErrorClass> {
     let schedule_error = run_schedule_phase(pool, rest, guild, &clock).await;
-    let reminder_error = remind_event_attendees(pool, rest, guild, &clock, None, 2)
+    let reminder_error = remind_event_attendees(pool, rest, guild, &clock, None, 2, None)
         .await
         .err();
     match (schedule_error, reminder_error) {
@@ -200,10 +204,19 @@ async fn tick_with_deadline_follow_up(
     let watch_until = reminder_watch_deadline();
     tick(pool, rest, guild, &clock).await?;
     let latest_start = clock().saturating_add(SCHEDULER_TICK_MS);
+    let wire_until = reminder_watch_wire_deadline(watch_until);
     let clock = &clock;
     watch_urgent_reminders(watch_until, |remaining| async move {
-        let inspected =
-            remind_event_attendees(pool, rest, guild, clock, Some(latest_start), remaining).await?;
+        let inspected = remind_event_attendees(
+            pool,
+            rest,
+            guild,
+            clock,
+            Some(latest_start),
+            remaining,
+            Some(wire_until),
+        )
+        .await?;
         let pending = inspected < remaining
             && has_pending_event_reminders_before(pool, guild, clock(), latest_start)
                 .await
@@ -219,6 +232,43 @@ fn reminder_watch_deadline() -> tokio::time::Instant {
     // Leave one polling interval for cancellation and supervisor bookkeeping.
     // A timeout at the slot itself would still leave the action active there.
     next_tick - Duration::from_secs(1)
+}
+
+fn reminder_settlement_grace() -> Duration {
+    Duration::from_millis(two_bot_discord::executor::MESSAGE_SETTLEMENT_GRACE_MS)
+}
+
+fn reminder_watch_wire_deadline(watch_until: tokio::time::Instant) -> tokio::time::Instant {
+    // Settlement stays in place inside the watch, not in a detached task or
+    // across the supervisor's next slot. It cannot authorize more wire time.
+    watch_until - reminder_settlement_grace()
+}
+
+fn event_reminder_deadline(
+    starts_at: &str,
+    clock: &impl Fn() -> u64,
+) -> (u64, Option<tokio::time::Instant>) {
+    // Anchor BEFORE sampling wall time: suspension after the sample must spend
+    // the remaining budget, never renew it from a later monotonic instant.
+    let anchor = tokio::time::Instant::now();
+    let now = clock();
+    let deadline = two_bot_core::scheduled::parse_iso_ms(starts_at)
+        .and_then(|starts| starts.checked_sub(now))
+        .filter(|remaining| *remaining > 0)
+        .map(|remaining| anchor + Duration::from_millis(remaining));
+    (now, deadline)
+}
+
+async fn send_event_reminder(
+    rest: &ActionExecutor,
+    channel: &str,
+    content: &str,
+    deadline: tokio::time::Instant,
+) -> Result<String, DiscordError> {
+    // Keep this production caller seam under test: a timeout at `deadline`
+    // here would cancel the executor's yielding, proven-no-wire release.
+    rest.post_message_confirmed_before(channel, content, &random_nonce(), deadline)
+        .await
 }
 
 async fn watch_urgent_reminders<F, Fut>(
@@ -314,13 +364,11 @@ async fn remind_event_attendees(
     clock: &impl Fn() -> u64,
     latest_start: Option<u64>,
     budget: usize,
+    wire_until: Option<tokio::time::Instant>,
 ) -> Result<usize, ErrorClass> {
-    use two_bot_core::{
-        event_reminder_store::{
-            begin_event_reminder_delivery_with_clock, due_event_reminders_before,
-            EVENT_REMINDER_LEAD_MS,
-        },
-        scheduled::parse_iso_ms,
+    use two_bot_core::event_reminder_store::{
+        begin_event_reminder_delivery_with_clock, due_event_reminders_before,
+        EVENT_REMINDER_LEAD_MS,
     };
 
     let now = clock();
@@ -330,6 +378,9 @@ async fn remind_event_attendees(
         .map_err(reminder_database)?;
     let inspected = events.len().min(budget);
     for event in events.into_iter().take(budget) {
+        if wire_until.is_some_and(|at| tokio::time::Instant::now() >= at) {
+            break;
+        }
         if !begin_event_reminder_delivery_with_clock(pool, guild, &event, clock)
             .await
             .map_err(reminder_database)?
@@ -339,27 +390,13 @@ async fn remind_event_attendees(
         let content = event_reminder_content(guild, &event);
         // The INSERT and commit may also wait. Keep every committed fence, but
         // refuse an expired send and bound any transport admission by the start.
-        let now = clock();
-        let remaining = parse_iso_ms(&event.starts_at)
-            .and_then(|starts| starts.checked_sub(now))
-            .filter(|remaining| *remaining > 0);
-        let (outcome, reason) = match (content, remaining) {
+        let (now, deadline) = event_reminder_deadline(&event.starts_at, clock);
+        let (outcome, reason) = match (content, deadline) {
             (_, None) => ("failed", Some("invalid_or_elapsed_event_start")),
             (None, Some(_)) => ("failed", Some("invalid_or_oversized_reminder")),
-            (Some(content), Some(remaining)) => {
-                let nonce = random_nonce();
-                let deadline = tokio::time::Instant::now() + Duration::from_millis(remaining);
-                let result = tokio::time::timeout_at(
-                    deadline,
-                    rest.post_message_confirmed_before(
-                        &event.channel_id,
-                        &content,
-                        &nonce,
-                        deadline,
-                    ),
-                )
-                .await
-                .unwrap_or(Err(DiscordError::Timeout));
+            (Some(content), Some(deadline)) => {
+                let deadline = wire_until.map_or(deadline, |at| deadline.min(at));
+                let result = send_event_reminder(rest, &event.channel_id, &content, deadline).await;
                 match result {
                     Ok(_) => ("posted", None),
                     Err(error) => (
