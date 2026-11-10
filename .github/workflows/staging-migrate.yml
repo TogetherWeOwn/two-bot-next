@@ -126,6 +126,11 @@ jobs:
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
             --expected-pending "$EXPECTED_PENDING" \
             | tee staging-migrate-manifest.json
+      - name: Confirm read-only plan dispatch
+        # Authenticated attempt-scoped job steps distinguish plan dispatches
+        # from apply dispatches, which also produce a plan-shaped manifest.
+        if: inputs.mode == 'plan'
+        run: 'true'
       - name: Upload plan manifest
         # The apply dispatch binds to this artifact by hash: the reviewer
         # reads plan_manifest_sha256/plan_run_id off this run, and the apply
@@ -203,7 +208,7 @@ jobs:
       actions: read
     # Dispatch from main only, mode=apply only, and only after a green plan.
     # The binding must be scoped to the staging-migrate-apply environment
-    # (required reviewer, main-only deployment branches) so a workflow edited
+    # (independent custom protection rule, main-only branches) so a workflow edited
     # on another branch cannot read it.
     # Required follow-up (fail-closed deploy gate): migrations create tables
     # but grant nothing. After the apply, the operator reapplies the full role

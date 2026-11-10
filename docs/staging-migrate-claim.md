@@ -2,8 +2,13 @@
 
 This is non-secret request transport for the staging migration protection rule,
 not an approval, a deployed-rule receipt or permission to apply migrations.
-Existing required reviewers, independent exact-source review, recovery/ACL
-checks and written CEO GO remain required. Production has its own mirror:
+For staging, the independent automated rule replaces a human required reviewer
+and written CEO GO under the staging-only policy decision of 2026-11-07.
+Independent exact-source review and recovery/ACL checks remain required; a
+matching hash alone is not approval. The rule must be registered and verified
+live before this transport closes the environment-gate gap. See the
+[consumer registration runbook](staging-migrate-protection.md).
+Production policy is unchanged and has its own mirror:
 `production-migrate.yml` with `scripts/ci/production_migrate_claim.py`, which
 binds the same projection hash but requires the production workflow path,
 environment, `migration_target` and
@@ -137,8 +142,12 @@ GitHub reads establish all of the following:
 - Its authenticated `staging-migrate-manifest` artifact is read-only plan mode
   and binds the exact reviewed source, target, pending set, recovery/ACL refs.
   Its projection must be recomputed losslessly and equal embedded == claimed.
-- Independent CEO GO approves this exact verified binding; hash equality or
-  a completed adverse security review is not approval.
+- The independently installed staging-only rule approves this exact verified
+  binding under the automated staging policy. No human GO receipt is fabricated.
+  Exact source reachability on reviewed `main`, both current/prior bindings,
+  configured staging pins and every check above are mandatory. An adverse
+  Security review prevents installing/enabling the rule; it is not approval.
+  Production retains its separate approval policy.
 
 The runner still downloads the producing run's manifest and repeats its
 pending/hash/provenance checks **before DDL**, after the environment gate.

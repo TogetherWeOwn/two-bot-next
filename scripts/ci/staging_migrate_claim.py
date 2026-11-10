@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Publish a non-secret apply request before its Environment can be approved.
 
-The protection-rule consumer must still authenticate both runs/artifacts and
-require independent CEO GO. This publisher is request transport, not approval.
+The independent staging protection rule must authenticate both runs/artifacts
+under the automated staging policy. This publisher is transport, not approval.
 """
 import argparse
 import hashlib
