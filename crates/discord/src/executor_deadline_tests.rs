@@ -11,6 +11,8 @@
 //! the frozen clock base synchronously, then yields), so time reaches the
 //! deadline without ever returning control to the runtime.
 
+#![cfg(test)]
+
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -147,8 +149,9 @@ async fn admission_ready_at_deadline_releases_permit_before_any_request() {
     let (executor, ledger) = executor(origin, Some(budget));
 
     let deadline = tokio::time::Instant::now() + budget;
+    let nonce = format!("deadline-{}", listener.local_addr().expect("addr").port());
     let result = executor
-        .post_message_confirmed_before(CHANNEL, "reminder", "nonce-deadline-eq", deadline)
+        .post_message_confirmed_before(CHANNEL, "reminder", &nonce, deadline)
         .await;
 
     assert_eq!(
@@ -179,6 +182,7 @@ async fn admission_ready_before_deadline_sends_and_confirms() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
+    let nonce = format!("deadline-{}", listener.local_addr().expect("addr").port());
     let origin = format!("http://{}", listener.local_addr().expect("addr"));
     let server = serve_one(listener);
     let (executor, ledger) = executor(origin, None);
@@ -186,7 +190,7 @@ async fn admission_ready_before_deadline_sends_and_confirms() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let id = tokio::time::timeout(
         Duration::from_secs(15),
-        executor.post_message_confirmed_before(CHANNEL, "reminder", "nonce-live", deadline),
+        executor.post_message_confirmed_before(CHANNEL, "reminder", &nonce, deadline),
     )
     .await
     .expect("control send finished")
@@ -200,7 +204,7 @@ async fn admission_ready_before_deadline_sends_and_confirms() {
     );
     let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
     assert_eq!(body["content"], "reminder");
-    assert_eq!(body["nonce"], "nonce-live");
+    assert_eq!(body["nonce"], nonce);
     assert_eq!(ledger.admits.load(Ordering::SeqCst), 1);
     assert_eq!(
         ledger.completions.load(Ordering::SeqCst),

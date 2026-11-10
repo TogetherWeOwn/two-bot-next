@@ -31,6 +31,7 @@ async fn seed_deadlines(pool: &PgPool, now: u64, starts: &[u64]) -> Vec<Schedule
             id: (*id).to_owned(),
             name: "Deadline admission fixture".to_owned(),
             starts_at: format_iso_ms(*starts),
+            ends_at: None,
             channel_id: Some("1546451670500642111".to_owned()),
             description: None,
             status: EventStatus::Scheduled,

@@ -1,5 +1,7 @@
 //! Inter-tick eligibility and exact deadline controls use an injected wall clock.
 
+#![cfg(test)]
+
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use tokio::sync::Notify;
@@ -19,6 +21,7 @@ async fn mirror(pool: &PgPool, starts: &[u64]) {
             id: id.to_owned(),
             name: "Inter-tick RSVP".to_owned(),
             starts_at: format_iso_ms(*starts),
+            ends_at: None,
             channel_id: Some("1546451670500642111".to_owned()),
             description: None,
             status: EventStatus::Scheduled,
