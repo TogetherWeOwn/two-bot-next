@@ -3998,7 +3998,7 @@ mod tests {
         let message = inspect_bytes(&gzip_lines(&future)).unwrap_err().to_string();
         assert!(
             message.contains(&format!(
-                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 and {DUMP_VERSION}"
+                "reads 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 and {DUMP_VERSION}"
             )),
             "unknown versions are refused with the readable list: {message}"
         );
