@@ -274,6 +274,35 @@ no-ops. These markers do not waive gates or turn a failed gate green. An actual
 rollout still needs the successful `production` job, immutable promotion
 evidence and a matching live `/readyz` revision.
 
+The final **`production hold incident`** job evaluates every outcome, including
+red guards/gates, soak mismatches and green skips such as `ci-not-green`.
+`scripts/production_hold_incident.py` reuses the shared incident sink to open
+one issue titled **`production held > 6h`**, labelled `incident`, under the
+stable `production-held` key. Repeated overdue evaluations comment on that
+issue; the next successful deploy-mode production job comments and closes it.
+A workflow success with a skipped production job cannot close it. An issue
+updated after the recovery evidence is retained rather than closed on stale
+evidence.
+
+The clock starts at the later of the last verified promotion's completed time
+and the first unpromoted main commit's committer time (main uses squash merges).
+It alerts only when main is ahead and the interval is **strictly greater than
+six hours**; an unchanged main is not an overdue deployment. Promotion history
+comes from deploy-ID production records backed by a completed successful
+`wrangler deploy + readyz gate` job in the recorded run's current attempt, not
+its workflow head SHA or overall conclusion. Rollback records and failed
+post-deploy watches do not reset the promotion clock. The issue includes the
+held-since time, last promoted SHA, current main SHA, skip/failure reason and
+promotion run URL. Missing, malformed or over-budget history fails the reporting
+job instead of inventing success. Its token can read history and write issues,
+not deploy; it has no Environment or live staging access. The daily backstop
+and completion triggers evaluate the threshold; this is not a six-hour polling
+schedule. For a read-only evaluation, run the helper with `--dry-run` and the
+same `NEEDS_JSON`, repository, run ID and read-authorized token environment;
+it prints the decision without calling the issue sink. CI's synthetic history
+and in-memory issue fixtures exercise alert, repeat and recovery without any
+production dispatch or issue write.
+
 Both completion triggers are necessary: removing `check` loses the wake when
 staging finishes first; removing `deploy-staging` loses it when CI finishes
 first. A `ci-pending` or `staging-pending` run alone does not establish a
