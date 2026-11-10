@@ -15,8 +15,11 @@ name: deploy-production
 # the latest successful staging commit. Automatic runs skip green when the
 # target is already live (production /readyz reports the SHA), when the live
 # revision already contains the target (an older build must never replace a
-# newer one), when the hold variable is still in the future, or when the
-# triggering staging run did not succeed. The guard job refuses
+# newer one), when the dedicated automatic-promotion disable is set, when the
+# hold variable is still in the future, or when the triggering staging run
+# did not succeed. Manual dispatches (deploy, rollback, live-SHA takeover)
+# ignore both the disable and the hold, so recovery never waits on them. The
+# guard job refuses
 # a SHA that is not on main with a successful full `ci-ok` verdict and
 # `worker check` from the latest check.yml run/current attempt, plus a
 # successful deploy-staging run whose exact-SHA user-flow synthetic job
@@ -42,8 +45,9 @@ name: deploy-production
 # input or execution path here; daily recovery proofs run only on staging.
 # The 30-minute
 # soak sleeps in its own `soak` job OUTSIDE the deploy-production lane, and a
-# `recheck` job re-reads the hold and the live revision immediately before
-# the deploy: a hold set, or a target gone stale, while the gates built or
+# `recheck` job re-reads the disable, the hold and the live revision
+# immediately before the deploy: a disable set, a hold set, or a target gone
+# stale, while the gates built or
 # the soak slept skips green instead of deploying through the incident. A
 # regression gate (`staging-soak-evidence` plus a step in `production`)
 # compares the soaked candidate on staging with production before any
@@ -157,6 +161,12 @@ jobs:
           # automatic runs skip green while now is before it. Empty means
           # no hold. Manual dispatch ignores it.
           HOLD_UNTIL: ${{ vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL }}
+          # Dedicated non-expiring automatic-new-build disable: exactly
+          # "true" skips every automatic run green (workflow_run and
+          # schedule). Any other value (including unset/empty) is off.
+          # Manual dispatch ignores it, so rollback and live-SHA takeover
+          # are preserved.
+          AUTO_DISABLED: ${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}
           PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
           # Exactly "true" replaces the human Environment reviewer with
           # automated evidence (latest deploy-staging run on the SHA is green).
@@ -801,9 +811,20 @@ jobs:
 
           green_at_out = ""
           if auto and mode == "deploy" and not skip:
-              held = hold_until(os.environ.get("HOLD_UNTIL", ""))
+              # The dedicated non-expiring disable wins over every timed
+              # check: with it set, no automatic run (workflow_run or
+              # schedule) promotes a new build. Manual dispatch never
+              # reaches this branch (auto is false), so rollback and
+              # live-SHA takeover stay available.
+              if os.environ.get("AUTO_DISABLED", "") == "true":
+                  skip = "auto-promote-disabled"
+                  held = None
+              else:
+                  held = hold_until(os.environ.get("HOLD_UNTIL", ""))
               now = time.time()
-              if held is not None and now < held.timestamp():
+              if skip == "auto-promote-disabled":
+                  pass
+              elif held is not None and now < held.timestamp():
                   skip = f"held until {held.isoformat()}"
               else:
                   live = live_revision()
@@ -1231,6 +1252,10 @@ jobs:
           # Promotion hold with expiry (repo/org variable, ISO-8601 UTC):
           # skip green while now is before it. Empty means no hold.
           HOLD_UNTIL: ${{ vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL }}
+          # Dedicated non-expiring automatic-new-build disable, re-read
+          # before the deploy: exactly "true" skips green without expiry.
+          # Automatic runs only (this job never runs for manual dispatch).
+          AUTO_DISABLED: ${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}
           PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
         shell: python3 {0}
         run: |
@@ -1351,9 +1376,18 @@ jobs:
                       return "active"
               return "idle"
 
-          held = recheck_hold_until(os.environ.get("HOLD_UNTIL", ""))
+          # The dedicated non-expiring disable is checked first: a disable
+          # set while gates built or the soak slept still skips green,
+          # with no expiry to outlast.
+          if os.environ.get("AUTO_DISABLED", "") == "true":
+              skip = "auto-promote-disabled"
+              held = None
+          else:
+              held = recheck_hold_until(os.environ.get("HOLD_UNTIL", ""))
           now = time.time()
-          if held is not None and now < held.timestamp():
+          if skip == "auto-promote-disabled":
+              pass
+          elif held is not None and now < held.timestamp():
               skip = f"held until {held.isoformat()}"
           else:
               dispatch = recheck_dispatch_state()

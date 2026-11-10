@@ -440,7 +440,9 @@ class StaticGuardTests(unittest.TestCase):
         self.assertIn("        id: guard", first)
         self.assertIn("        shell: python3 {0}", first)
         self.assertIn("          GH_TOKEN: ${{ github.token }}", first)
-        for check in ("[0-9a-f]{40}", "compare/{sha}...main", "check-runs", "deploy-staging.yml/runs"):
+        self.assertIn("          AUTO_DISABLED: ${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}", first)
+        for check in ("[0-9a-f]{40}", "compare/{sha}...main", "check-runs", "deploy-staging.yml/runs",
+                      'skip = "auto-promote-disabled"', 'os.environ.get("AUTO_DISABLED", "") == "true"'):
             self.assertIn(check, GUARD)
 
     def test_production_deploys_only_validated_guard_outputs(self):
@@ -791,6 +793,7 @@ class StaticGuardTests(unittest.TestCase):
                        "needs.staging-soak-evidence.outputs.skip == ''"):
             self.assertIn(needle, condition)
         self.assertIn("HOLD_UNTIL: ${{ vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL }}", recheck_job)
+        self.assertIn("AUTO_DISABLED: ${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}", recheck_job)
         self.assertIn("SHA: ${{ needs.guard.outputs.sha }}", recheck_job)
         # Entering the single-pending lane behind a recovery dispatch would
         # cancel the queued run, so the recheck skips while a dispatch is
@@ -799,7 +802,8 @@ class StaticGuardTests(unittest.TestCase):
         granted = set(children(children(JOBS["recheck"][1:], 4)["permissions"][1:], 6))
         self.assertEqual(granted, {"contents", "actions"})
         recheck = inline_script("Re-read the promotion hold and the live revision")
-        for needle in ('f"held until {held.isoformat()}"', 'skip = "live"',
+        for needle in ('f"held until {held.isoformat()}"', 'skip = "auto-promote-disabled"',
+                       'skip = "live"',
                        'skip = "older-than-live"',
                        'skip = "operator-dispatch-active"',
                        'skip = "dispatch-check-unreadable"',
