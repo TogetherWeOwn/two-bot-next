@@ -186,9 +186,20 @@ Those tests are not workerd crash/input-gate proof.
 `staging-protection-handoff.test.ts` adds Miniflare/workerd checks for prompt
 acknowledgement during delayed outbound I/O, disable-before-alarm and persisted
 queue survival across a Worker/DO reload. A reload is not a process crash.
-Record their actual exact-head Actions result, not merely their presence.
-Actual Durable Object crash/replay and live-format registration evidence remain
-prerequisites for enabling the candidate; they are not inferred from these tests.
+`staging-protection-crash.test.ts` adds hosted-CI process tests with unique
+SQLite-backed storage. They kill only their own detached Node/workerd process
+group without graceful disposal, restart against the same disk directory, and
+require the original persisted alarm to wake a cold object without a new delivery
+or manual alarm call. One case crashes after acknowledgement, before evaluation;
+the other crashes while a synthetic rejection callback response is held, then
+checks automatic recovery and redelivery never repeat that fenced callback.
+The real verifier takes its missing-producer rejection path; these cases do not
+prove a successful approval against GitHub or Cloudflare's hosted storage service.
+No signal experiment runs on the shared controller. These new crash tests are
+unexecuted until their exact-head Worker Actions result is recorded.
+Record actual exact-head Actions results, not merely test presence. Durable
+Object crash/replay and live-format registration evidence remain prerequisites
+for enabling the candidate until the corresponding proof is observed and accepted.
 CI is GitHub Actions, not a local full-suite transcript.
 
 REA angle: reuse GitHub's supported
