@@ -137,21 +137,100 @@ def make_rollback(routes, variant="staging", control=None, now=None, sleep=None,
                   expected_sha=SHA, clock=None):
     control = control or control_stub()[0]
     log = io.StringIO()
+    routes = dict(routes)
+    routes.setdefault(("GET", f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}"), version_route())
     client = FakeClient(routes)
     clock = clock or Clock()
     rb = rollback.Rollback(
         client, control, "https://two-bot-next-staging.workers.dev", variant,
         WORKER, APPLICATION, APP_ID, expected_sha, "700",
         now=now or clock.now, sleep=sleep or clock.sleep,
-        log=lambda msg: log.write(msg + "\n"))
+        log=lambda msg: log.write(msg + "\n"), staging_use=lambda action: None)
     return rb, client, log
 
 
 def version_route(version=GOOD_VERSION, message=SHA):
-    result = {"id": version}
+    result = {"id": version, "resources": {"bindings": [
+        {"name": "STAGING_RUNTIME_POLICY", "type": "plain_text", "text": "bounded"},
+        {"name": "TWO_DEPLOY_ENV", "type": "plain_text", "text": "staging"},
+        {"name": "CONTAINER_RELEASE", "type": "plain_text", "text": message},
+    ]}}
     if message is not None:
         result["annotations"] = {"workers/message": message}
     return lambda: {"success": True, "result": result}
+
+
+class StagingRestorePolicyTests(unittest.TestCase):
+    def test_policy_requires_exact_immutable_bindings_and_identity(self):
+        path = f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}"
+        valid = version_route()()["result"]
+        client = FakeClient({("GET", path): version_route()})
+        rollback.validate_staging_restore_policy(client, WORKER, GOOD_VERSION, SHA)
+        self.assertEqual(client.calls, [("GET", path)])
+        cases = [dict(valid, id=BAD_VERSION), dict(valid, resources={})]
+        for name in ("STAGING_RUNTIME_POLICY", "TWO_DEPLOY_ENV", "CONTAINER_RELEASE"):
+            bindings = valid["resources"]["bindings"]
+            row = next(row for row in bindings if row["name"] == name)
+            for altered in ([], [row, row], [dict(row, text="wrong")],
+                            [dict(row, type="secret_text")]):
+                cases.append(dict(valid, resources={"bindings": [
+                    item for item in bindings if item["name"] != name] + altered}))
+        for value in cases:
+            with self.subTest(value=value):
+                client = FakeClient({("GET", path): lambda: {"success": True, "result": value}})
+                with self.assertRaises(rollback.GateError):
+                    rollback.validate_staging_restore_policy(client, WORKER, GOOD_VERSION, SHA)
+                self.assertEqual(client.calls, [("GET", path)])
+        for sha in (None, "unknown", "f" * 40):
+            with self.subTest(sha=sha), self.assertRaises(rollback.GateError):
+                rollback.validate_staging_restore_policy(
+                    FakeClient({("GET", path): version_route()}), WORKER, GOOD_VERSION, sha)
+
+    def test_missing_or_malformed_policy_resources_are_unproved(self):
+        path = f"/workers/scripts/{WORKER}/versions/{GOOD_VERSION}"
+        cases = [{"id": GOOD_VERSION}]
+        for resources in (None, [], "must-not-echo", {}, {"bindings": None},
+                          {"bindings": {}}, {"bindings": "must-not-echo"}):
+            cases.append({"id": GOOD_VERSION, "resources": resources})
+        for value in cases:
+            with self.subTest(value=value):
+                client = FakeClient({("GET", path): lambda: {"success": True, "result": value}})
+                with self.assertRaisesRegex(rollback.GateError,
+                                            "^staging_restore_policy_unproved$"):
+                    rollback.validate_staging_restore_policy(client, WORKER, GOOD_VERSION, SHA)
+                self.assertEqual(client.calls, [("GET", path)])
+
+    def test_adapter_preserves_window_and_excludes_ambient_credentials_and_outputs(self):
+        env = {"PATH": "/usr/bin", "GITHUB_RUN_ID": "700", "GITHUB_RUN_ATTEMPT": "2",
+               "STAGING_USE_EXPIRES_AT": "1700001000000", "GITHUB_OUTPUT": "must-not-write",
+               "CLOUDFLARE_API_TOKEN": "must-not-forward", "STAGING_USE_MINUTES": "360"}
+        use = rollback.staging_restore_client(
+            env, "https://two-bot-next-staging.acct.workers.dev", "t" * 32,
+            GOOD_VERSION, SHA, "receipt.jsonl")
+        with mock.patch.object(rollback.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+            for action in ("restore-check", "rebind"):
+                use(action)
+                args, kwargs = run.call_args
+                self.assertEqual(args[0][-1], action)
+                self.assertEqual(kwargs["env"]["STAGING_USE_EXPIRES_AT"], env["STAGING_USE_EXPIRES_AT"])
+                self.assertEqual(kwargs["env"]["GITHUB_RUN_ATTEMPT"], "2")
+                self.assertEqual(kwargs["env"]["STAGING_USE_SHA"], SHA)
+                self.assertEqual(kwargs["env"]["STAGING_USE_DEPLOYMENT"], GOOD_VERSION)
+                self.assertEqual(set(kwargs["env"]), {
+                    "PATH", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "STAGING_USE_EXPIRES_AT",
+                    "STAGING_WORKER_URL", "OWNERSHIP_CONTROL_TOKEN", "STAGING_USE_DEPLOYMENT",
+                    "STAGING_USE_SHA", "STAGING_USE_RECEIPT"})
+                self.assertEqual(kwargs["timeout"], rollback.CONTROL_TIMEOUT_SECONDS)
+            run.return_value.returncode = 1
+            with self.assertRaisesRegex(rollback.GateError, "staging_restore_control_failed"):
+                use("rebind")
+            with self.assertRaisesRegex(rollback.GateError, "staging_restore_action_invalid"):
+                use("begin")
+        for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "STAGING_USE_EXPIRES_AT"):
+            for bad in ("", "0", "-1", "1e3", "secret\n", None):
+                with self.subTest(key=key, bad=bad), self.assertRaises(rollback.GateError):
+                    rollback.staging_restore_client(dict(env, **{key: bad}), "url", "token",
+                                                    GOOD_VERSION, SHA, "receipt.jsonl")
 
 
 class SnapshotTests(unittest.TestCase):
@@ -361,6 +440,52 @@ class StableGateTests(unittest.TestCase):
 
 
 class RollbackRunTests(unittest.TestCase):
+    def test_staging_restores_only_inside_retained_window_then_rebinds_before_probes(self):
+        routes, _ = self.routes()
+        rb, client, _ = make_rollback(routes)
+        events = []
+        def use(action):
+            if action == "restore-check":
+                self.assertFalse(any(call[0] in ("POST", "PROBE") for call in client.calls))
+            else:
+                self.assertTrue(rb.evidence["takeover"])
+                self.assertTrue(any(call[0] == "POST" for call in client.calls))
+                self.assertFalse(any(call[0] == "PROBE" for call in client.calls))
+            events.append(action)
+        rb.staging_use = use
+        evidence = rb.run(GOOD_VERSION, good_image())
+        self.assertEqual(events, ["restore-check", "rebind"])
+        self.assertEqual(evidence["staging_use"], "retained-window-rebound-ready")
+        self.assertEqual(evidence["gate"], "stable-200-gateway-ready")
+
+    def test_missing_or_refused_window_never_mutates_and_failed_rebind_never_probes(self):
+        for failure in ("missing", "restore-check", "rebind"):
+            routes, _ = self.routes()
+            rb, client, _ = make_rollback(routes)
+            events = []
+            def use(action):
+                events.append(action)
+                if action == failure:
+                    raise rollback.GateError("staging_restore_control_failed")
+            rb.staging_use = None if failure == "missing" else use
+            with self.subTest(failure=failure), self.assertRaises(rollback.GateError):
+                rb.run(GOOD_VERSION, good_image())
+            self.assertFalse(any(call[0] == "PROBE" for call in client.calls))
+            if failure != "rebind":
+                self.assertFalse(any(call[0] == "POST" for call in client.calls))
+            self.assertNotIn("gate", rb.evidence)
+            self.assertEqual(events, [] if failure == "missing" else
+                             ["restore-check", "rebind"] if failure == "rebind" else ["restore-check"])
+
+    def test_production_restore_never_calls_the_staging_contract(self):
+        routes, _ = self.routes()
+        rb, client, _ = make_rollback(routes, variant="production")
+        rb.staging_use = mock.Mock(side_effect=AssertionError("production must not use staging"))
+        rb.run(GOOD_VERSION, good_image())
+        rb.staging_use.assert_not_called()
+        self.assertNotIn("staging_use", rb.evidence)
+        self.assertFalse(any("/versions/" in call[1] for call in client.calls))
+
     def test_stable_gate_budget_starts_after_restore_steps(self):
         clock = Clock()
         rb, _, _ = make_rollback({}, clock=clock)
@@ -868,6 +993,8 @@ class MainProvenanceTests(unittest.TestCase):
         with (mock.patch.object(rollback, "Rollback", spy_factory),
               mock.patch.object(rollback, "control_client",
                                 lambda *args, **kwargs: control),
+              mock.patch.object(rollback, "staging_restore_client",
+                                lambda *args, **kwargs: lambda action: None),
               redirect_stdout(stdout)):
             code = rollback.main(argv, environ=self.base_env(),
                                  client_factory=lambda _a, _t: client)
@@ -974,6 +1101,19 @@ class PostStatusTests(unittest.TestCase):
     def test_other_2xx_fails_closed(self):
         with self.assertRaises(base.GateError) as raised:
             self.client(202).post("/x", {})
+        self.assertEqual(str(raised.exception), "api_http_failure")
+
+    def test_deeply_nested_error_body_fails_closed_without_a_traceback(self):
+        body = io.BytesIO(b"[" * (base.MAX_JSON_DEPTH + 1))
+        error = base.HTTPError("https://api.invalid/x", 500, "boom", {}, body)
+
+        def refuse(_self, request, timeout):
+            raise error
+
+        client = rollback.RollbackClient(ACCOUNT, "token")
+        client.opener = type("Opener", (), {"open": refuse})()
+        with self.assertRaises(base.GateError) as raised:
+            client.post("/x", {})
         self.assertEqual(str(raised.exception), "api_http_failure")
 
 

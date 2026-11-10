@@ -20,6 +20,10 @@ pub mod audit_store;
 pub mod automation_quota;
 pub mod automation_transfer;
 pub mod automod;
+pub mod automod_preview;
+pub mod automod_preview_input;
+pub mod automod_preview_limiter;
+pub mod automod_preview_report;
 pub mod automod_runtime;
 #[cfg(feature = "db")]
 pub mod automod_store;
@@ -98,8 +102,10 @@ pub mod leveling;
 #[cfg(feature = "db")]
 pub mod leveling_store;
 pub mod lfg;
+pub mod lfg_list;
 #[cfg(feature = "db")]
 pub mod lfg_store;
+pub mod lockdown_preview;
 pub mod mac;
 pub mod mee6;
 pub mod member_leave_gap;
@@ -110,8 +116,12 @@ pub mod membership;
 pub mod message_safety;
 pub mod metrics;
 pub mod moderation;
+pub mod moderation_recent;
+#[cfg(feature = "db")]
+pub mod moderation_recent_store;
 pub mod music_voice;
 pub mod onboarding;
+pub mod onboarding_destination;
 #[cfg(feature = "db")]
 pub mod onboarding_store;
 pub mod ops_fetch;
@@ -134,7 +144,10 @@ pub mod scheduled_events;
 #[cfg(feature = "db")]
 pub mod scheduled_store;
 pub mod secret;
+pub mod tempban_inventory;
 pub use secret::Secret;
+#[cfg(feature = "db")]
+pub mod event_instance_store;
 pub mod self_roles;
 pub mod send_admission;
 pub mod settings;
@@ -218,7 +231,9 @@ pub use channel_moderation_store::{
     STATEMENT_TIMEOUT_MS,
 };
 pub use clock_guard::{ClockGuard, ClockRollback, CLOCK_SKEW_TOLERANCE_MS};
-pub use commands::{merge_commands, CommandDefinition, CustomCommand, RegistryError};
+pub use commands::{
+    merge_commands, merge_registry, CommandDefinition, CustomCommand, MergedRegistry, RegistryError,
+};
 pub use community::{
     build_scorecard, classify, is_scorecard_run_time, previous_closed_week, scorecard_tick,
     week_start_ms, Classification, ClassifierConfig, ClassifyInput, FactRow, ScorecardGates,
@@ -249,9 +264,9 @@ pub use custom_command_store::{
 pub use custom_commands::{
     accepted_text_trigger, adjudicate_delete, adjudicate_put, adjudicate_run,
     builtin_command_names, check_capacity, deregister_set, error_code, format_command_list,
-    is_builtin_trigger, max_custom_commands, placeholders_in, registry_with_custom,
-    render_template, require_automations_enabled, reserved_command_names, trigger_word,
-    validate_put_input, validate_template, AuditRecord, CommandError, DeleteDecision,
+    is_builtin_trigger, max_custom_commands, placeholders_in, publishable_builtin_names,
+    registry_with_custom, render_template, require_automations_enabled, reserved_command_names,
+    trigger_word, validate_put_input, validate_template, AuditRecord, CommandError, DeleteDecision,
     PutCommandInput, PutDecision, RunOutcome, StoredCommand, TemplateContext, TemplateError,
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_RENDERED_CHARS, MAX_TEMPLATE_CHARS,
     MAX_TEXT_TRIGGER_CHARS, TEMPLATE_PLACEHOLDERS,
@@ -276,19 +291,19 @@ pub use funnel::{
 pub use giveaway::{
     adjudicate_eligibility, draw, draw_seed, eligible_hash, extend_deadline_ms, is_due,
     mint_draw_nonce, parse_requirements, parse_reroll_kind, reroll_kind_single, resume_deadline_ms,
-    single_reroll_pool, transition, validate_duration_seconds, validate_new_giveaway,
-    validate_prize, validate_winners_count, Eligibility, GiveawayError, GiveawayEvent,
-    GiveawayRequirements, GiveawayStatus, MemberStanding, NewGiveawayInput, RerollKind,
-    ValidatedGiveaway, DURATION_MAX_SECONDS, DURATION_MIN_SECONDS, EXTEND_MAX_SECONDS,
+    single_reroll_keep, single_reroll_pool, transition, validate_duration_seconds,
+    validate_new_giveaway, validate_prize, validate_winners_count, Eligibility, GiveawayError,
+    GiveawayEvent, GiveawayRequirements, GiveawayStatus, MemberStanding, NewGiveawayInput,
+    RerollKind, ValidatedGiveaway, DURATION_MAX_SECONDS, DURATION_MIN_SECONDS, EXTEND_MAX_SECONDS,
     EXTEND_MIN_SECONDS, FIRST_DRAW_NO, PRIZE_MAX_CHARS, PRIZE_MIN_CHARS, REQUIREMENT_MAX_AGE_DAYS,
     REROLL_KIND_FULL, WINNERS_MAX, WINNERS_MIN,
 };
 #[cfg(feature = "db")]
 pub use giveaway_store::{
     claim_due_giveaway, complete_draw, create_giveaway, delete_giveaway, get_draws, get_giveaway,
-    insert_draw, latest_draw_no, list_entries, mark_announced, mark_drawn, release_claim,
-    set_giveaway_status, upsert_entry, GiveawayDrawRow, GiveawayEntryRow, GiveawayRow, NewDraw,
-    NewGiveaway,
+    insert_draw, insert_reroll_draw, latest_draw_no, list_entries, mark_announced, mark_drawn,
+    release_claim, set_giveaway_status, upsert_entry, GiveawayDrawRow, GiveawayEntryRow,
+    GiveawayRow, NewDraw, NewGiveaway,
 };
 pub use handlers::{
     ChannelClass, FactsSink, FunnelHandlers, FunnelStore, GateClearedInput, HandlerOutcome,
@@ -397,23 +412,25 @@ pub use raid::{
     DEFAULT_RAID_MAX_IDS, DEFAULT_RAID_THRESHOLD, DEFAULT_RAID_WINDOW_SECONDS,
 };
 pub use router::{
-    ComponentHandler, ComponentOutcome, HandlerId, InteractionHandler, InteractionRouter,
-    RouterGates, RouterRefusal, SlashContext, SlashOutcome, SurfaceFlags,
-    ANNOUNCEMENTS_DISABLED_REPLY, AUTOMATIONS_DISABLED_REPLY, GUILD_RESTRICTED_REPLY, LFG_PREFIX,
-    MANAGE_EVENTS_REQUIRED, MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY,
-    SCORECARD_DISABLED_REPLY, SELF_ROLE_PREFIX, TICKET_CLAIM_ID, TICKET_CLOSE_ID, TICKET_OPEN_ID,
+    live_gate_announcements_slash, live_gate_announcements_slash_named, ComponentHandler,
+    ComponentOutcome, HandlerId, InteractionHandler, InteractionRouter, RouterGates, RouterRefusal,
+    SlashContext, SlashOutcome, SurfaceFlags, ANNOUNCEMENTS_DISABLED_REPLY,
+    AUTOMATIONS_DISABLED_REPLY, GUILD_RESTRICTED_REPLY, LFG_PREFIX, MANAGE_EVENTS_REQUIRED,
+    MANAGE_SERVER_REQUIRED, MODERATION_DISABLED_REPLY, SCORECARD_DISABLED_REPLY, SELF_ROLE_PREFIX,
+    TICKET_CLAIM_ID, TICKET_CLOSE_ID, TICKET_OPEN_ID,
 };
 pub use rsvp::{
     attendance_totals_text, checkin_classification, checkin_duplicate_text,
     checkin_idempotency_key, checkin_metadata_json, checkin_occurrence_full_text,
     checkin_recorded_text, checkin_source, checkin_source_event_id, is_snowflake,
-    parse_attendance_occurrence, partition_rsvps, require_manage_events, rsvp_event_full_text,
-    rsvp_rate_limited_text, rsvp_saved_text, validate_event_id, validate_occurrence_id,
-    AttendanceClassification, AttendanceOccurrence, AttendanceProof, CheckinError, RsvpAudit,
-    RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition, ATTENDANCE_EVENT_TYPE,
-    AUDIT_RETENTION_DAYS, CHECKIN_AUDIT_ACTION, CHECKIN_AUDIT_OUTCOME_RECORDED,
-    MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT, MAX_RSVP_WRITES_PER_USER_PER_MINUTE,
-    RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
+    normalize_event_link, parse_attendance_occurrence, partition_rsvps, require_manage_events,
+    rsvp_event_full_text, rsvp_rate_limited_text, rsvp_saved_text, rsvp_saved_text_for_transition,
+    rsvp_saved_text_for_transition_with_event, rsvp_saved_text_with_event, validate_event_id,
+    validate_occurrence_id, AttendanceClassification, AttendanceOccurrence, AttendanceProof,
+    CheckinError, RsvpAudit, RsvpError, RsvpRecord, RsvpStatus, RsvpTotals, RsvpTransition,
+    ATTENDANCE_EVENT_TYPE, AUDIT_RETENTION_DAYS, CHECKIN_AUDIT_ACTION,
+    CHECKIN_AUDIT_OUTCOME_RECORDED, MAX_CHECKINS_PER_OCCURRENCE, MAX_RSVPS_PER_EVENT,
+    MAX_RSVP_WRITES_PER_USER_PER_MINUTE, RSVP_AUDIT_ACTION, RSVP_RETENTION_DAYS,
 };
 pub use rsvp_conversion::{
     assign_variant, compute_conversion, reminders_due, render_report_text, AnnouncementVariant,
@@ -455,8 +472,8 @@ pub use self_roles::{
     reaction_option_key, self_role_claim_owned, self_role_custom_id, self_role_renew_after_ms,
     self_role_reply, validate_panel_roles, validate_self_role_dispatch, ChannelOverwrite,
     ChannelSnapshot, DispatchCheck, DispatchFailure, DispatchRole, PanelMode, ParsedCustomId,
-    PlanRejection, ResolvedRole, RoleOperation, SelfRoleConfigError, SelfRoleGates, SelfRoleOption,
-    SelfRolePanel, SelfRolePlan, SettledOutcome, UnsafeGrant, UnsafeGrantKind,
+    PlanRejection, ResolvedRole, RoleOperation, SafeRefusal, SelfRoleConfigError, SelfRoleGates,
+    SelfRoleOption, SelfRolePanel, SelfRolePlan, SettledOutcome, UnsafeGrant, UnsafeGrantKind,
     SELF_ROLE_ALLOWED_MASK, SELF_ROLE_ALLOWED_PERMISSIONS, SELF_ROLE_CLAIM_LEASE_MS,
 };
 pub use settings::{

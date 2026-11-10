@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import random
 import select
 import shutil
 import signal
@@ -46,16 +47,20 @@ class CacheTests(unittest.TestCase):
         self.fake.write_text('#!' + sys.executable + '\n'
                              'import os,time,pathlib\n'
                              'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
-                             '(target/"fixture").write_bytes(b"x"*4096)\n'
+                             '(target/"debug").mkdir(exist_ok=True)\n'
+                             '(target/"debug"/"fixture").write_bytes(b"x"*4096)\n'
                              'scratch=pathlib.Path(os.environ["TMPDIR"])\n'
-                             'assert scratch == target.parent/"scratch"\n'
+                             'assert scratch.name == target.name\n'
+                             'assert scratch.parent.name == "scratch"\n'
+                             'assert target.parent.name == "target"\n'
+                             'assert scratch.parent.parent == target.parent.parent\n'
                              'assert os.environ["TMP"] == os.environ["TEMP"] == str(scratch)\n'
                              '(scratch/"fixture").write_bytes(b"x"*4096)\n'
                              'assert os.environ["CARGO_INCREMENTAL"] == "0"\n'
                              'assert os.environ["CARGO_PROFILE_DEV_DEBUG"] == "0"\n'
                              'assert os.environ["CARGO_PROFILE_TEST_DEBUG"] == "0"\n'
-                             '(target/"ready").write_text("ready")\n'
-                             'while not (target/"release").exists(): time.sleep(.01)\n')
+                             '(target/"debug"/"ready").write_text("ready")\n'
+                             'while not (target/"debug"/"release").exists(): time.sleep(.01)\n')
         self.fake.chmod(0o700)
 
     def save_policy(self):
@@ -72,8 +77,10 @@ class CacheTests(unittest.TestCase):
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         def finish():
-            for slot in self.pool.glob('slot-*'):
-                (slot / 'target' / 'release').touch()
+            for parent in self.pool.glob('slot-*/target/*'):
+                if parent.is_dir():
+                    (parent / 'debug').mkdir(exist_ok=True)
+                    (parent / 'debug' / 'release').touch()
             if child.poll() is None:
                 child.terminate()
             child.communicate(timeout=5)
@@ -83,7 +90,7 @@ class CacheTests(unittest.TestCase):
 
     def wait_ready(self, count):
         deadline = time.monotonic() + 5
-        while len(list(self.pool.glob('slot-*/target/ready'))) < count:
+        while len(list(self.pool.glob('slot-*/target/*/debug/ready'))) < count:
             if time.monotonic() > deadline:
                 self.fail('fixture child did not become ready')
             time.sleep(.01)
@@ -101,19 +108,343 @@ class CacheTests(unittest.TestCase):
         self.assertIsNone(first.poll())
         self.assertIsNone(second.poll())
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
         total = sum(cache.usage(p) for p in self.pool.glob('slot-*'))
         self.assertLessEqual(total, 2 * self.policy['slot_budget_bytes'])
         print(f'concurrency receipt: 2 running slots, third refused, {total} allocated bytes')
-        for slot in self.pool.glob('slot-*'):
-            (slot / 'target' / 'release').touch()
+        for parent in self.pool.glob('slot-*/target/*'):
+            if parent.is_dir():
+                (parent / 'debug').mkdir(exist_ok=True)
+                (parent / 'debug' / 'release').touch()
         for child in (first, second):
             output, error = child.communicate(timeout=5)
             self.assertEqual(child.returncode, 0, error.decode())
         self.assertEqual(list(self.pool.glob('slot-*/lease.json')), [])
-        slot, _, fd = cache.acquire(self.pool, self.policy)
+        slot, _, fd = cache.acquire(self.pool, self.policy, self.root)
         os.close(fd)
         self.assertEqual(slot.name, 'slot-0')
+
+    def test_different_workspaces_get_isolated_target_subdirs(self):
+        # A shared slot target/ once allowed cross-worktree artifact
+        # reuse (relative dep-info + mtime-only freshness). Each worktree
+        # must get its own subdir; artifacts from A must never be visible
+        # to B, and B's acquire must evict A's subdirs to preserve budget.
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_a.mkdir()
+        work_b.mkdir()
+        slot_a, target_a, fd_a = cache.acquire(self.pool, self.policy, work_a)
+        try:
+            self.assertEqual(slot_a.name, 'slot-0')
+            self.assertTrue(cache.WS_DIR_RE.fullmatch(target_a.name))
+            self.assertEqual(target_a.parent, slot_a / 'target')
+            (target_a / 'debug').mkdir()
+            (target_a / 'debug' / 'marker-a').write_text('a')
+            ws_a = cache.workspace_subdir_name(work_a)
+            self.assertEqual(target_a.name, ws_a)
+            self.assertTrue((slot_a / 'scratch' / ws_a).is_dir())
+        finally:
+            os.close(fd_a)
+        # Same worktree re-acquiring with no intervening other worktree
+        # keeps its incremental build cache.
+        slot_a1, target_a1, fd_a1 = cache.acquire(self.pool, self.policy, work_a)
+        try:
+            self.assertEqual(slot_a1.name, 'slot-0')
+            self.assertEqual(target_a1, target_a)
+            self.assertTrue((target_a1 / 'debug' / 'marker-a').exists())
+        finally:
+            os.close(fd_a1)
+        slot_b, target_b, fd_b = cache.acquire(self.pool, self.policy, work_b)
+        try:
+            self.assertEqual(slot_b.name, 'slot-0')
+            self.assertNotEqual(target_a, target_b)
+            self.assertFalse((target_b / 'debug' / 'marker-a').exists())
+            self.assertEqual(list((slot_b / 'target').iterdir()), [target_b])
+            ws_b = cache.workspace_subdir_name(work_b)
+            self.assertEqual(target_b.name, ws_b)
+            self.assertEqual(list((slot_b / 'scratch').iterdir()),
+                             [slot_b / 'scratch' / ws_b])
+        finally:
+            os.close(fd_b)
+        # Same worktree re-acquiring the same slot reuses its subdir.
+        slot_a2, target_a2, fd_a2 = cache.acquire(self.pool, self.policy, work_a)
+        try:
+            (target_a2 / 'debug').mkdir()
+            (target_a2 / 'debug' / 'marker-a2').write_text('a2')
+            self.assertEqual(target_a2.name, ws_a)
+        finally:
+            os.close(fd_a2)
+
+    def test_legacy_shared_target_migrates_to_worktree_subdir(self):
+        # Legacy slots hold Cargo output directly under target/.
+        # First acquire migrates build-output-only legacy trees to the
+        # per-worktree layout instead of refusing all builds.
+        slot = self.pool / 'slot-0'
+        (slot / 'target' / 'debug' / 'deps').mkdir(parents=True)
+        (slot / 'target' / 'debug' / 'deps' / 'libfixture.rlib').write_bytes(b'x' * 64)
+        (slot / 'scratch' / 'tmpfile').write_bytes(b'x' * 64)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, target, fd = cache.acquire(self.pool, self.policy, self.root)
+        try:
+            self.assertEqual(got.name, 'slot-0')
+            self.assertTrue(cache.WS_DIR_RE.fullmatch(target.name))
+            self.assertEqual(list(target.iterdir()), [])
+            ws_name = cache.workspace_subdir_name(self.root)
+            self.assertEqual(target.name, ws_name)
+            self.assertEqual(list((slot / 'scratch').iterdir()),
+                             [slot / 'scratch' / ws_name])
+        finally:
+            os.close(fd)
+        self.assertIn('worktree_layout_migrated', err.getvalue())
+
+    def test_legacy_foreign_material_blocks_migration(self):
+        # Foreign/evidence material in a legacy slot must not be
+        # auto-deleted: the slot is skipped for Operator inspection.
+        slot = self.pool / 'slot-0'
+        (slot / 'target' / 'debug').mkdir(parents=True)
+        (slot / 'target' / 'debug' / 'stashed-source.rs').write_bytes(b'x' * 16)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, _, fd = cache.acquire(self.pool, self.policy, self.root)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
+        self.assertTrue((slot / 'target' / 'debug' / 'stashed-source.rs').exists())
+
+    def test_worktree_veto_checks_each_subdir(self):
+        # Retention vetoes understand the per-worktree layout: clean
+        # subdirs pass, preserved files inside any subdir veto.
+        target = self.pool / 'slot-0' / 'target'
+        scratch = self.pool / 'slot-0' / 'scratch'
+        ws_a = cache.workspace_subdir_name(self.root / 'a')
+        ws_b = cache.workspace_subdir_name(self.root / 'b')
+        (target / ws_a / 'debug').mkdir(parents=True)
+        (target / ws_b / 'debug').mkdir(parents=True)
+        (scratch / ws_a).mkdir(parents=True)
+        (scratch / ws_b).mkdir(parents=True)
+        self.assertIsNone(cache.preservation_veto(target))
+        self.assertIsNone(cache.scratch_preservation_veto(scratch))
+        (target / ws_b / 'debug' / 'stashed-source.rs').write_bytes(b'x' * 16)
+        self.assertIn('preserved', cache.preservation_veto(target))
+        (target / ws_b / 'debug' / 'stashed-source.rs').unlink()
+        (target / ws_a / 'debug' / 'backup.tar.gz').write_bytes(b'x' * 16)
+        self.assertIn('preserved', cache.preservation_veto(target))
+        (target / ws_a / 'debug' / 'backup.tar.gz').unlink()
+        (scratch / ws_a / 'backup.tar.gz').write_bytes(b'x' * 16)
+        # backup stem is protected even under an arbitrary temp name
+        self.assertIn('preserved', cache.scratch_preservation_veto(scratch))
+        (scratch / ws_a / 'backup.tar.gz').unlink()
+        (scratch / ws_a / 'backup').mkdir()
+        self.assertIn('preserved', cache.scratch_preservation_veto(scratch))
+
+    def test_evict_refuses_worktree_subdir_with_protected_content(self):
+        # Eviction runs the preservation veto first: another worktree's
+        # subdir holding protected material is left for Operator
+        # inspection instead of being deleted as build output.
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_a.mkdir()
+        work_b.mkdir()
+        ws_a = cache.workspace_subdir_name(work_a)
+        slot = self.pool / 'slot-0'
+        (slot / 'target' / ws_a / 'debug').mkdir(parents=True)
+        stashed = slot / 'target' / ws_a / 'debug' / 'stashed-source.rs'
+        stashed.write_bytes(b'x' * 16)
+        (slot / 'scratch' / ws_a).mkdir(parents=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, _, fd = cache.acquire(self.pool, self.policy, work_b)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
+        self.assertTrue(stashed.exists())
+        self.assertEqual(list((slot / 'target').iterdir()), [slot / 'target' / ws_a])
+
+    def test_refused_scratch_leaves_target_unevicted(self):
+        # Both parents preflight before either mutates: when scratch
+        # refuses, target eviction must not have happened (a refused
+        # slot is left unchanged, never partially evicted).
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_a.mkdir()
+        work_b.mkdir()
+        ws_a = cache.workspace_subdir_name(work_a)
+        slot = self.pool / 'slot-0'
+        kept = slot / 'target' / ws_a / 'debug' / 'libfixture.rlib'
+        kept.parent.mkdir(parents=True)
+        kept.write_bytes(b'x' * 64)
+        backup = slot / 'scratch' / ws_a / 'backup'
+        backup.mkdir(parents=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, _, fd = cache.acquire(self.pool, self.policy, work_b)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
+        self.assertTrue(kept.exists())
+        self.assertTrue(backup.is_dir())
+        self.assertEqual(list((slot / 'target').iterdir()), [slot / 'target' / ws_a])
+        self.assertEqual(list((slot / 'scratch').iterdir()), [slot / 'scratch' / ws_a])
+
+    def test_mixed_worktree_legacy_layout_vetoes(self):
+        # An old/new script rollout leaves target/ holding one ws-*
+        # subdir plus a legacy debug/ tree. Both vetoes must flag the
+        # mixed provenance for Operator inspection instead of scanning
+        # it as pure legacy output.
+        target = self.pool / 'slot-0' / 'target'
+        scratch = self.pool / 'slot-0' / 'scratch'
+        ws_a = cache.workspace_subdir_name(self.root / 'a')
+        (target / ws_a / 'debug').mkdir(parents=True)
+        (target / 'debug' / 'deps').mkdir(parents=True)
+        (target / 'debug' / 'deps' / 'libfixture.rlib').write_bytes(b'x' * 64)
+        self.assertIn('preserved', cache.preservation_veto(target))
+        (scratch / ws_a).mkdir(parents=True)
+        (scratch / 'tmpfile').write_bytes(b'x' * 64)
+        self.assertIn('preserved', cache.scratch_preservation_veto(scratch))
+
+    def test_over_budget_other_worktree_output_reuses_slot_after_eviction(self):
+        # The post-eviction re-measure restores a slot that was over
+        # budget only because of another worktree's subdirs: eviction
+        # frees the bytes, then acquire re-measures before the budget
+        # gate instead of refusing until Operator inspection.
+        work_other = self.root / 'work-other'
+        work_new = self.root / 'work-new'
+        work_other.mkdir()
+        work_new.mkdir()
+        ws_other = cache.workspace_subdir_name(work_other)
+        slot = self.pool / 'slot-0'
+        big = slot / 'target' / ws_other / 'debug' / 'libbig.rlib'
+        big.parent.mkdir(parents=True)
+        big.write_bytes(b'x' * (512 * 1024))
+        (slot / 'scratch' / ws_other).mkdir(parents=True)
+        self.assertGreaterEqual(cache.usage(slot), self.policy['slot_budget_bytes'])
+        got, target, fd = cache.acquire(self.pool, self.policy, work_new)
+        try:
+            self.assertEqual(got.name, 'slot-0')
+            ws_new = cache.workspace_subdir_name(work_new)
+            self.assertEqual(target, slot / 'target' / ws_new)
+            self.assertEqual(list(target.iterdir()), [])
+        finally:
+            os.close(fd)
+
+    def test_eviction_io_error_skips_slot_instead_of_aborting(self):
+        # A filesystem error while evicting one slot refuses that slot
+        # so acquire tries the next one instead of aborting the pool
+        # scan with a raw OSError.
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_a.mkdir()
+        work_b.mkdir()
+        ws_a = cache.workspace_subdir_name(work_a)
+        slot = self.pool / 'slot-0'
+        (slot / 'target' / ws_a / 'debug').mkdir(parents=True)
+        (slot / 'target' / ws_a / 'debug' / 'libfixture.rlib').write_bytes(b'x' * 64)
+        (slot / 'scratch' / ws_a).mkdir(parents=True)
+        real_rmtree = shutil.rmtree
+
+        def fail_slot0(path, *args, **kwargs):
+            if slot in Path(path).parents:
+                raise PermissionError('injected eviction failure')
+            return real_rmtree(path, *args, **kwargs)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with patch.object(cache.shutil, 'rmtree', side_effect=fail_slot0):
+                got, _, fd = cache.acquire(self.pool, self.policy, work_b)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
+
+    def test_unreadable_slot_listing_skips_slot_instead_of_aborting(self):
+        # An unreadable target/ listing refuses that slot (not the pool).
+        work = self.root / 'work'
+        work.mkdir()
+        slot = self.pool / 'slot-0'
+        real_iterdir = Path.iterdir
+
+        def fail_slot0_target(path):
+            if path == slot / 'target':
+                raise PermissionError('injected unreadable target')
+            return real_iterdir(path)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), patch.object(Path, 'iterdir', fail_slot0_target):
+            got, _, fd = cache.acquire(self.pool, self.policy, work)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
+
+    def test_unmeasurable_slot_skipped_with_finding(self):
+        # A deep symlink in the requester's own kept subdir makes usage()
+        # refuse after preparation; acquire must skip the slot, not abort.
+        work = self.root / 'work'
+        work.mkdir()
+        ws = cache.workspace_subdir_name(work)
+        slot = self.pool / 'slot-0'
+        link = slot / 'target' / ws / 'debug' / 'link'
+        link.parent.mkdir(parents=True)
+        link.symlink_to(self.root)
+        (slot / 'scratch' / ws).mkdir(parents=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, _, fd = cache.acquire(self.pool, self.policy, work)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_unmeasurable', err.getvalue())
+
+    def test_symlinked_own_subdir_refuses_without_evicting_others(self):
+        # The requester's own ws-* entry being a symlink must refuse the
+        # slot in preflight, before another worktree's subdir is evicted.
+        work_a = self.root / 'work-a'
+        work_b = self.root / 'work-b'
+        work_a.mkdir()
+        work_b.mkdir()
+        ws_a = cache.workspace_subdir_name(work_a)
+        ws_b = cache.workspace_subdir_name(work_b)
+        slot = self.pool / 'slot-0'
+        other = slot / 'target' / ws_a / 'debug' / 'libfixture.rlib'
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b'x' * 64)
+        (slot / 'target' / ws_b).symlink_to(self.root)
+        (slot / 'scratch' / ws_a).mkdir(parents=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got, _, fd = cache.acquire(self.pool, self.policy, work_b)
+        try:
+            self.assertEqual(got.name, 'slot-1')
+        finally:
+            os.close(fd)
+        self.assertIn('slot_worktree_unpreparable', err.getvalue())
+        self.assertEqual(other.read_bytes(), b'x' * 64)
+
+    def test_lease_rewrite_tmp_never_at_scratch_top_level(self):
+        # A crash between the tmp write and os.replace must not leave a
+        # top-level scratch entry that wedges the slot as mixed contents.
+        real_replace = os.replace
+
+        def crash(src, dst):
+            self.assertEqual(Path(src).parent.parent.name, 'scratch')
+            raise OSError('injected crash before replace')
+
+        with patch.object(cache.os, 'replace', crash):
+            with self.assertRaises(OSError):
+                cache.run_cargo(self.pool, ['check'], cargo=str(self.fake), interval=.01)
+        scratch = self.pool / 'slot-0' / 'scratch'
+        self.assertTrue(all(cache.WS_DIR_RE.fullmatch(p.name) for p in scratch.iterdir()))
+        self.assertFalse(list(scratch.glob('lease.json.tmp')))
 
     def test_guard_stops_growth_and_retains_lease(self):
         self.assert_growth_stopped('target', sampler_delay=0)
@@ -125,7 +456,7 @@ class CacheTests(unittest.TestCase):
         for slot in self.pool.glob('slot-*'):
             (slot / 'lease.json').write_text('{"wrapper_pid": 99999999}')
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
 
     def dead_pgid(self):
         terminated = subprocess.Popen(['true'])
@@ -140,7 +471,7 @@ class CacheTests(unittest.TestCase):
         (slot / 'lease.json').write_text(json.dumps(lease))
         out = io.StringIO()
         with contextlib.redirect_stderr(out):
-            got, _, fd = cache.acquire(self.pool, self.policy)
+            got, _, fd = cache.acquire(self.pool, self.policy, self.root)
         os.close(fd)
         self.assertEqual(got.name, 'slot-0')
         self.assertFalse((slot / 'lease.json').exists())
@@ -158,7 +489,7 @@ class CacheTests(unittest.TestCase):
         held = os.open(slot / 'lock', os.O_RDWR | os.O_NOFOLLOW)
         self.addCleanup(os.close, held)
         fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        got, _, fd = cache.acquire(self.pool, self.policy)
+        got, _, fd = cache.acquire(self.pool, self.policy, self.root)
         os.close(fd)
         self.assertEqual(got.name, 'slot-1')
         self.assertTrue((slot / 'lease.json').exists())
@@ -172,7 +503,7 @@ class CacheTests(unittest.TestCase):
                 {'workspace': str(self.root), 'wrapper_pid': 99999999,
                  'started_at': 0, 'cargo_pgid': dead}))
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
         self.assertEqual(len(list(self.pool.glob('slot-*/lease.json'))), 2)
 
     def test_live_recorded_group_is_still_refused(self):
@@ -193,13 +524,13 @@ class CacheTests(unittest.TestCase):
                 {'workspace': str(self.root), 'wrapper_pid': 99999999,
                  'started_at': 0, 'cargo_pgid': live.pid}))
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
         self.assertEqual(len(list(self.pool.glob('slot-*/lease.json'))), 2)
 
     def test_over_budget_idle_slots_are_not_reused(self):
         self.policy['slot_budget_bytes'] = 1
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
 
     def test_absent_quota_attestation_refuses_admission(self):
         del self.policy['quota_receipt']
@@ -226,7 +557,10 @@ class CacheTests(unittest.TestCase):
         self.fake.write_text('#!' + sys.executable + '\n'
                              'import os,pathlib,tempfile\n'
                              'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
-                             'scratch=target.parent/"scratch"\n'
+                             'scratch=pathlib.Path(os.environ["TMPDIR"])\n'
+                             'assert scratch.name == target.name\n'
+                             'assert scratch.parent.name == "scratch"\n'
+                             'assert target.parent.name == "target"\n'
                              'assert os.environ["CARGO_BUILD_TARGET_DIR"] == str(target)\n'
                              'assert os.environ["CARGO_BUILD_BUILD_DIR"] == str(target)\n'
                              'assert os.environ["TMPDIR"] == os.environ["TMP"] == os.environ["TEMP"]\n'
@@ -254,10 +588,12 @@ class CacheTests(unittest.TestCase):
         # a sampled guard promises termination, not a hard overshoot ceiling.
         growth_env = {'target': 'CARGO_TARGET_DIR', 'scratch': 'TMPDIR'}[growth_area]
         idle_area = 'scratch' if growth_area == 'target' else 'target'
+        # Seeded noise stays reproducible without compressing to a few blocks.
+        payload = random.Random(0).randbytes(65536)
         self.policy['slot_budget_bytes'] = 32 * 1024
         self.save_policy()
         self.fake.write_text('#!' + sys.executable + '\n'
-                             'import os,pathlib,select,signal,subprocess,sys\n'
+                             'import os,pathlib,random,select,signal,subprocess,sys\n'
                              'if "--writer" not in sys.argv:\n'
                              ' signal.signal(signal.SIGTERM, lambda *_: None)\n'
                              ' writer=subprocess.Popen([sys.executable,__file__,"--writer"])\n'
@@ -269,7 +605,7 @@ class CacheTests(unittest.TestCase):
                              ' command=sys.stdin.readline().strip()\n'
                              ' if command == "grow":\n'
                              '  with p.open("wb", buffering=0) as f:\n'
-                             '   f.write(b"x"*65536); os.fsync(f.fileno())\n'
+                             '   f.write(random.Random(0).randbytes(65536)); os.fsync(f.fileno())\n'
                              '  print("grown", flush=True)\n'
                              ' elif command == "after-stop":\n'
                              '  with p.open("ab", buffering=0) as f:\n'
@@ -327,16 +663,23 @@ class CacheTests(unittest.TestCase):
             with self.assertRaisesRegex(cache.Refusal, 'sampled byte budget'):
                 cache.run_cargo(self.pool, ['check'], cargo=str(self.fake), interval=.01)
         slot = self.pool / 'slot-0'
-        growing = slot / growth_area / 'growing'
+        ws_name = cache.workspace_subdir_name(Path.cwd())
+        growth_dir = slot / growth_area / ws_name
+        idle_dir = slot / idle_area / ws_name
+        self.assertEqual(list((slot / growth_area).iterdir()), [growth_dir])
+        self.assertEqual(list((slot / idle_area).iterdir()), [idle_dir])
+        self.assertTrue(cache.WS_DIR_RE.fullmatch(ws_name))
+        growing = growth_dir / 'growing'
         self.assertTrue(grew, f'refusal must follow real {growth_area} growth, not admission')
-        self.assertEqual(growing.read_bytes(), b'x' * 65536)
+        self.assertEqual(growing.read_bytes(), payload)
         allocated = growing.stat().st_blocks * 512
         self.assertGreaterEqual(allocated, 65536)
+        self.assertGreaterEqual(cache.usage(growth_dir), allocated)
         self.assertGreaterEqual(cache.usage(slot / growth_area), allocated)
         self.assertGreaterEqual(cache.usage(slot), allocated)
         self.assertGreater(cache.usage(slot), self.policy['slot_budget_bytes'] - 1)
         self.assertTrue((slot / 'lease.json').exists())
-        self.assertEqual(list((slot / idle_area).iterdir()), [])
+        self.assertEqual(list(idle_dir.iterdir()), [])
         child = children[0]
         # Both leader and descendant hold these pipes. A surviving writer can
         # accept this command and append another block even if Cargo is dead.
@@ -345,23 +688,27 @@ class CacheTests(unittest.TestCase):
             child.stdin.flush()
         self.assertEqual(read_reply(child), b'')
         self.assertIsNotNone(child.poll(), 'Cargo leader survived budget refusal')
-        self.assertEqual(growing.read_bytes(), b'x' * 65536)
+        self.assertEqual(growing.read_bytes(), payload)
         self.assertEqual(growing.stat().st_blocks * 512, allocated)
 
     def test_missing_or_symlink_scratch_refuses_admission(self):
         scratch = self.pool / 'slot-0' / 'scratch'
         scratch.rmdir()
         with self.assertRaisesRegex(cache.Refusal, 'real directory'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
         scratch.symlink_to(self.root)
         with self.assertRaisesRegex(cache.Refusal, 'real directory'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
 
     def test_retained_scratch_prevents_reusing_over_budget_slots(self):
+        ws_name = cache.workspace_subdir_name(self.root)
         for slot in self.pool.glob('slot-*'):
-            (slot / 'scratch' / 'retained').write_bytes(b'x' * self.policy['slot_budget_bytes'])
+            (slot / 'target' / ws_name).mkdir()
+            work_scratch = slot / 'scratch' / ws_name
+            work_scratch.mkdir()
+            (work_scratch / 'retained').write_bytes(b'x' * self.policy['slot_budget_bytes'])
         with self.assertRaisesRegex(cache.Refusal, 'no idle'):
-            cache.acquire(self.pool, self.policy)
+            cache.acquire(self.pool, self.policy, self.root)
 
     def test_signal_stops_build_and_leaves_crash_sentinel(self):
         child = self.start_fake()
@@ -381,8 +728,9 @@ class CacheTests(unittest.TestCase):
                              'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
                              'signal.signal(signal.SIGINT, signal.SIG_IGN)\n'
                              'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
-                             '(target/"ready").write_text("ready")\n'
-                             'while not (target/"release").exists(): time.sleep(.01)\n')
+                             '(target/"debug").mkdir(exist_ok=True)\n'
+                             '(target/"debug"/"ready").write_text("ready")\n'
+                             'while not (target/"debug"/"release").exists(): time.sleep(.01)\n')
         child = self.start_fake()
         self.wait_ready(1)
         child.terminate()
@@ -411,13 +759,14 @@ class CacheTests(unittest.TestCase):
                              'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
                              'signal.signal(signal.SIGINT, signal.SIG_IGN)\n'
                              'target=pathlib.Path(os.environ["CARGO_TARGET_DIR"])\n'
-                             '(target/"ready").write_text("ready")\n'
-                             'while not (target/"release").exists(): time.sleep(.01)\n')
+                             '(target/"debug").mkdir(exist_ok=True)\n'
+                             '(target/"debug"/"ready").write_text("ready")\n'
+                             'while not (target/"debug"/"release").exists(): time.sleep(.01)\n')
 
         def send_after_ready():
             deadline = time.monotonic() + 10
-            while not any((slot / 'ready').exists()
-                          for slot in self.pool.glob('slot-*/target')):
+            while not any((slot / 'debug' / 'ready').exists()
+                          for slot in self.pool.glob('slot-*/target/*')):
                 if time.monotonic() > deadline:
                     return
                 time.sleep(.01)
@@ -474,7 +823,7 @@ class CacheTests(unittest.TestCase):
 
     def assert_slots_reusable(self):
         self.assertEqual(list(self.pool.glob('slot-*/lease.json')), [])
-        slot, _, fd = cache.acquire(self.pool, self.policy)
+        slot, _, fd = cache.acquire(self.pool, self.policy, self.root)
         os.close(fd)
         self.assertEqual(slot.name, 'slot-0')
 
@@ -996,6 +1345,470 @@ class SharedPoolRetainTests(unittest.TestCase):
             self.assertEqual((after.st_dev, after.st_ino),
                              (locks_before[number].st_dev, locks_before[number].st_ino))
         self.assertEqual((self.pool / 'policy.json').read_bytes(), policy_before)
+
+    def test_blocked_idle_stale_exact_slot_preserves_excluded_slot_and_lease_evidence(self):
+        slot = self.pool / 'slot-1'
+        (slot / 'scratch' / 'retained').write_bytes(b'x' * self.policy['slot_budget_bytes'])
+        self.assertGreater(cache.usage(slot), self.policy['slot_budget_bytes'])
+        row = self.row('slot-1') | {'status': 'blocked', 'idle_stale': True}
+        self.inventory['slots'] = [row]
+        excluded = self.pool / 'slot-0'
+        excluded_lease = (excluded / 'lease.json').read_bytes()
+        excluded_bytes = cache.usage(excluded)
+        original = (slot / 'lease.json').read_bytes()
+        archive = self.root / 'original-lease.json'
+        archive.write_bytes(original)
+        digest = cache.hashlib.sha256(original).hexdigest()
+        evidence = self.root / 'receipt.json'
+        receipt = cache.retain_with_evidence(self.pool, self.inventory, self.proc, evidence)
+        self.assertTrue(self.by_slot(receipt)['slot-1']['eligible'])
+        self.assertFalse(self.by_slot(receipt)['slot-0']['eligible'])
+        self.assertEqual(row['status'], 'blocked')
+        self.assertEqual((excluded / 'lease.json').read_bytes(), excluded_lease)
+        self.assertEqual(cache.usage(excluded), excluded_bytes)
+        self.assertFalse((slot / 'lease.json').exists())
+        self.assertEqual(archive.read_bytes(), original)
+        self.assertEqual(cache.hashlib.sha256(archive.read_bytes()).hexdigest(), digest)
+        self.assertEqual(json.loads(evidence.read_text()), receipt)
+
+    def test_blocked_without_true_idle_stale_keeps_output_and_lease(self):
+        self.inventory['slots'] = [self.row('slot-1') | {'status': 'blocked'}]
+        slot = self.pool / 'slot-1'
+        original = (slot / 'lease.json').read_bytes()
+        for flag in ({}, {'idle_stale': False}):
+            with self.subTest(flag=flag):
+                self.inventory['slots'][0].update(flag)
+                row = self.by_slot(self.retain())['slot-1']
+                self.assertFalse(row['eligible'])
+                self.assertIn('nonterminal', row['reason'])
+                self.assertEqual((slot / 'lease.json').read_bytes(), original)
+                self.assertTrue((slot / 'target' / 'debug' / 'fixture').exists())
+
+    def test_ownership_modes_and_original_lock_held_until_lease_unlink(self):
+        self.inventory['slots'] = [self.row('slot-1')]
+        slot = self.pool / 'slot-1'
+        lock_identity = cache._lock_path_identity(slot / 'lock')
+        expected = {}
+        for name, mode in (('target', 0o2770), ('scratch', 0o1770)):
+            path = slot / name
+            if os.geteuid() == 0:
+                os.chown(path, 1001, 1002)
+            path.chmod(mode)
+            expected[path] = cache.directory_metadata(path)
+        calls = []
+
+        def check_lock():
+            self.assertEqual(cache._lock_path_identity(slot / 'lock'), lock_identity)
+            probe = os.open(slot / 'lock', os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+
+        real_rmtree, real_restore, real_unlink = shutil.rmtree, cache.recreate_output_directory, Path.unlink
+
+        def remove(path):
+            check_lock()
+            self.assertTrue((slot / 'lease.json').exists())
+            calls.append(f'remove:{path.name}')
+            return real_rmtree(path)
+
+        def restore(path, metadata):
+            check_lock()
+            self.assertTrue((slot / 'lease.json').exists())
+            result = real_restore(path, metadata)
+            self.assertEqual(cache.directory_metadata(path), expected[path])
+            calls.append(f'restore:{path.name}')
+            return result
+
+        def unlink(path, *args, **kwargs):
+            if path == slot / 'lease.json':
+                check_lock()
+                self.assertEqual(calls, ['remove:target', 'remove:scratch',
+                                         'restore:target', 'restore:scratch'])
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(cache.shutil, 'rmtree', side_effect=remove), \
+                patch.object(cache, 'recreate_output_directory', side_effect=restore), \
+                patch.object(Path, 'unlink', unlink):
+            result = self.by_slot(self.retain())['slot-1']
+        self.assertTrue(result['directory_metadata_preserved'])
+        for path in expected:
+            self.assertEqual(cache.directory_metadata(path), expected[path])
+
+    def test_restrictive_umask_restores_metadata_under_original_lock(self):
+        self.inventory['slots'] = [self.row('slot-1')]
+        slot = self.pool / 'slot-1'
+        lock_identity = cache._lock_path_identity(slot / 'lock')
+        original_lease = (slot / 'lease.json').read_bytes()
+        expected = {}
+        for name, mode in (('target', 0o2770), ('scratch', 0o1770)):
+            path = slot / name
+            path.chmod(mode)
+            expected[path] = cache.directory_metadata(path)
+        real_restore = cache.recreate_output_directory
+        restored = []
+
+        def restore(path, metadata):
+            self.assertEqual(cache._lock_path_identity(slot / 'lock'), lock_identity)
+            probe = os.open(slot / 'lock', os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+            self.assertEqual((slot / 'lease.json').read_bytes(), original_lease)
+            real_restore(path, metadata)
+            self.assertEqual(cache.directory_metadata(path), expected[path])
+            restored.append(path.name)
+
+        old_umask = os.umask(0o400)
+        try:
+            with patch.object(cache, 'recreate_output_directory', side_effect=restore):
+                result = self.by_slot(self.retain())['slot-1']
+        finally:
+            os.umask(old_umask)
+        self.assertTrue(result['eligible'], result)
+        self.assertTrue(result['directory_metadata_preserved'])
+        self.assertTrue(result['lock_held_through_mutation'])
+        self.assertEqual(restored, ['target', 'scratch'])
+        self.assertFalse((slot / 'lease.json').exists())
+        self.assertEqual(cache._lock_path_identity(slot / 'lock'), lock_identity)
+        for path, metadata in expected.items():
+            self.assertEqual(cache.directory_metadata(path), metadata)
+            self.assertEqual(list(path.iterdir()), [])
+
+    def test_blocked_idle_stale_still_vetoes_live_references_and_foreign_output(self):
+        slot = self.pool / 'slot-1'
+        (slot / 'scratch' / 'retained').write_bytes(b'x' * self.policy['slot_budget_bytes'])
+        row = self.row('slot-1') | {'status': 'blocked', 'idle_stale': True}
+        self.inventory['slots'] = [row]
+        original = (slot / 'lease.json').read_bytes()
+        for kind in ('running', 'queued', 'retry', 'exact-slot-alias'):
+            with self.subTest(kind=kind):
+                key = 'referenced' if kind == 'exact-slot-alias' else 'live_run'
+                row[key] = True
+                try:
+                    self.assertFalse(self.by_slot(self.retain())['slot-1']['eligible'])
+                finally:
+                    row[key] = False
+                self.assertEqual((slot / 'lease.json').read_bytes(), original)
+        for name in ('target', 'scratch'):
+            with self.subTest(name=name):
+                foreign = slot / name / 'source.rs'
+                foreign.write_text('preserve this source')
+                try:
+                    self.assertFalse(self.by_slot(self.retain())['slot-1']['eligible'])
+                    self.assertEqual(foreign.read_text(), 'preserve this source')
+                    self.assertEqual((slot / 'lease.json').read_bytes(), original)
+                finally:
+                    foreign.unlink()
+        row['target_provenance'] = 'mixed'
+        self.assertFalse(self.by_slot(self.retain())['slot-1']['eligible'])
+        self.assertEqual((slot / 'lease.json').read_bytes(), original)
+
+    def test_owner_restore_is_attempted_before_mode_without_root(self):
+        path = self.root / 'replacement'
+        initial = self.root.stat()
+        metadata = (initial.st_uid + 1, initial.st_gid + 1, 0o2770)
+        fields = list(initial)
+        fields[0], fields[4], fields[5] = 0o42770, metadata[0], metadata[1]
+        restored = os.stat_result(fields)
+        order = []
+        with patch.object(cache.os, 'fstat', side_effect=[initial, restored]), \
+                patch.object(cache.os, 'fchown', side_effect=lambda *a: order.append('owner')), \
+                patch.object(cache.os, 'fchmod', side_effect=lambda *a: order.append('mode')):
+            cache.recreate_output_directory(path, metadata)
+        self.assertEqual(order, ['owner', 'mode'])
+
+    def test_invalid_or_unreadable_metadata_stops_before_either_removal(self):
+        slot = self.pool / 'slot-0'
+        scratch = slot / 'scratch'
+        real_metadata = cache.directory_metadata
+        for failure in ('invalid', 'unreadable'):
+            with self.subTest(failure=failure):
+                def metadata(path):
+                    if path == scratch and failure == 'unreadable':
+                        raise PermissionError('synthetic metadata denial')
+                    return real_metadata(path)
+
+                if failure == 'invalid':
+                    scratch.chmod(0o500)
+                try:
+                    with patch.object(cache, 'directory_metadata', side_effect=metadata):
+                        row = self.by_slot(self.retain())['slot-0']
+                finally:
+                    scratch.chmod(0o700)
+                self.assertFalse(row['mutation_started'])
+                self.assertTrue((slot / 'target' / 'debug' / 'fixture').exists())
+                self.assertTrue((slot / 'lease.json').exists())
+                self.assertFalse(row['lease_removed'])
+
+    def test_unrestorable_owner_or_group_refuses_before_either_removal(self):
+        real_metadata = cache.directory_metadata
+        originals = {name: (self.pool / name / 'lease.json').read_bytes()
+                     for name in ('slot-0', 'slot-1')}
+        for root in ('target', 'scratch'):
+            for failure in ('owner', 'group'):
+                with self.subTest(root=root, failure=failure):
+                    def metadata(path):
+                        _uid, _gid, mode = real_metadata(path)
+                        uid = 1002 if path.name == root and failure == 'owner' else 1001
+                        gid = 1004 if path.name == root and failure == 'group' else 1003
+                        return uid, gid, mode
+
+                    with patch.object(cache.os, 'geteuid', return_value=1001), \
+                            patch.object(cache.os, 'getegid', return_value=1003), \
+                            patch.object(cache.os, 'getgroups', return_value=[]), \
+                            patch.object(cache, 'directory_metadata', side_effect=metadata), \
+                            patch.object(cache.shutil, 'rmtree') as remove:
+                        receipt = self.retain()
+                    remove.assert_not_called()
+                    row = self.by_slot(receipt)['slot-0']
+                    self.assertFalse(row['eligible'])
+                    self.assertTrue(row['mutation_failed'])
+                    self.assertFalse(row['mutation_started'])
+                    self.assertEqual(row['completed_steps'], [])
+                    self.assertFalse(row['lease_removed'])
+                    self.assertIn(f'cannot restore {failure}', row['reason'])
+                    self.assertIn('no mutation; lease kept', row['reason'])
+                    for name, original in originals.items():
+                        slot = self.pool / name
+                        self.assertEqual((slot / 'lease.json').read_bytes(), original)
+                        self.assertTrue((slot / 'target' / 'debug' / 'fixture').exists())
+                        self.assertTrue((slot / 'scratch').is_dir())
+
+    def test_nonroot_group_membership_and_parent_inheritance_preflight(self):
+        self.inventory['slots'] = [self.row('slot-1')]
+        slot = self.pool / 'slot-1'
+        inherited_gid = slot.stat().st_gid
+        for membership in ('effective', 'supplementary', 'inherited'):
+            with self.subTest(membership=membership):
+                slot.chmod(0o2770 if membership == 'inherited' else 0o770)
+                metadata = (1001, inherited_gid, 0o770)
+                with patch.object(cache.os, 'geteuid', return_value=1001), \
+                        patch.object(cache.os, 'getegid', return_value=(
+                            inherited_gid if membership == 'effective' else inherited_gid + 1)), \
+                        patch.object(cache.os, 'getgroups', return_value=(
+                            [inherited_gid] if membership == 'supplementary' else [])), \
+                        patch.object(cache, 'directory_metadata', return_value=metadata), \
+                        patch.object(cache, 'recreate_output_directory') as restore, \
+                        patch.object(cache.shutil, 'rmtree') as remove:
+                    row = self.by_slot(self.retain())['slot-1']
+                self.assertTrue(row['eligible'], row)
+                self.assertEqual(remove.call_count, 2)
+                self.assertEqual(restore.call_args_list,
+                                 [unittest.mock.call(slot / root, metadata)
+                                  for root in ('target', 'scratch')])
+
+    def test_inherited_nonmember_group_cannot_restore_setgid_mode(self):
+        slot = self.pool / 'slot-0'
+        slot.chmod(0o2770)
+        gid = slot.stat().st_gid
+        with patch.object(cache.os, 'geteuid', return_value=1001), \
+                patch.object(cache.os, 'getegid', return_value=gid + 1), \
+                patch.object(cache.os, 'getgroups', return_value=[]), \
+                patch.object(cache, 'directory_metadata', return_value=(1001, gid, 0o2770)), \
+                patch.object(cache.shutil, 'rmtree') as remove:
+            row = self.by_slot(self.retain())['slot-0']
+        remove.assert_not_called()
+        self.assertFalse(row['mutation_started'])
+        self.assertIn('cannot restore setgid', row['reason'])
+
+    def test_restore_failure_reports_partial_mutation_and_keeps_lease(self):
+        slot = self.pool / 'slot-0'
+        original = (slot / 'lease.json').read_bytes()
+        with patch.object(cache.os, 'fchmod', side_effect=PermissionError('synthetic chmod denial')):
+            receipt = self.retain()
+        row = self.by_slot(receipt)['slot-0']
+        self.assertFalse(row['eligible'])
+        self.assertTrue(row['mutation_started'])
+        self.assertTrue(row['mutation_failed'])
+        self.assertIn('partially mutated', row['reason'])
+        self.assertEqual(row['completed_steps'], ['target_removed', 'scratch_removed'])
+        self.assertFalse(row['lease_removed'])
+        self.assertEqual((slot / 'lease.json').read_bytes(), original)
+        self.assertFalse((slot / 'target' / 'debug' / 'fixture').exists())
+        self.assertFalse(self.by_slot(receipt)['slot-1']['eligible'])
+        self.assertTrue((self.pool / 'slot-1' / 'target' / 'debug' / 'fixture').exists())
+
+    def test_owner_restore_denial_and_ineffective_mode_fail_closed(self):
+        for failure in ('chown', 'mode-not-restored'):
+            with self.subTest(failure=failure):
+                path = self.root / failure
+                uid = self.root.stat().st_uid
+                gid = self.root.stat().st_gid
+                if failure == 'chown':
+                    with patch.object(cache.os, 'fchown', side_effect=PermissionError('denied')):
+                        with self.assertRaises(PermissionError):
+                            cache.recreate_output_directory(path, (uid + 1, gid + 1, 0o770))
+                else:
+                    with patch.object(cache.os, 'fchmod'):
+                        with self.assertRaisesRegex(cache.Refusal, 'did not persist'):
+                            cache.recreate_output_directory(path, (uid, gid, 0o770))
+
+    def test_cli_partial_failure_is_nonzero_and_receipt_is_honest(self):
+        inventory = self.root / 'inventory.json'
+        inventory.write_text(json.dumps(self.inventory))
+        evidence = self.root / 'receipt.json'
+        argv = [str(SCRIPT), 'retain', '--pool', str(self.pool), '--inventory', str(inventory),
+                '--proc-root', str(self.proc), '--evidence', str(evidence)]
+        stdout = io.StringIO()
+        with patch.object(sys, 'argv', argv), contextlib.redirect_stdout(stdout), \
+                patch.object(cache.os, 'fchmod', side_effect=PermissionError('denied')):
+            self.assertEqual(cache.main(), 75)
+        receipt = json.loads(stdout.getvalue())
+        self.assertTrue(self.by_slot(receipt)['slot-0']['mutation_started'])
+        self.assertEqual(json.loads(evidence.read_text()), receipt)
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_evidence_prepared_and_synced_before_mutation(self):
+        evidence = self.root / 'receipt.json'
+        real_remove, real_fsync = shutil.rmtree, os.fsync
+        fsyncs = []
+
+        def fsync(fd):
+            fsyncs.append(fd)
+            real_fsync(fd)
+
+        def remove(path):
+            self.assertEqual(json.loads(evidence.read_text())['state'], 'prepared')
+            self.assertGreaterEqual(len(fsyncs), 2)  # file and parent directory durable
+            return real_remove(path)
+
+        with patch.object(cache.os, 'fsync', side_effect=fsync), \
+                patch.object(cache.shutil, 'rmtree', side_effect=remove):
+            cache.retain_with_evidence(self.pool, self.inventory, self.proc, evidence)
+        self.assertEqual(len(fsyncs), 3)
+        self.assertTrue(json.loads(evidence.read_text())['retain'])
+
+    def test_failed_evidence_preflight_never_calls_retain(self):
+        for evidence in (self.pool / 'slot-0' / 'scratch' / 'receipt.json',
+                         self.root / 'missing' / 'receipt.json', self.pool / 'policy.json'):
+            with self.subTest(evidence=evidence), patch.object(cache, 'shared_pool_retain') as retain:
+                with self.assertRaises((cache.Refusal, OSError)):
+                    cache.retain_with_evidence(self.pool, self.inventory, self.proc, evidence)
+                retain.assert_not_called()
+        for failure_call in (1, 2):
+            evidence = self.root / f'failed-{failure_call}.json'
+            calls = 0
+
+            def fsync(_fd):
+                nonlocal calls
+                calls += 1
+                if calls == failure_call:
+                    raise OSError('synthetic evidence fsync failure')
+
+            with patch.object(cache.os, 'fsync', side_effect=fsync), \
+                    patch.object(cache, 'shared_pool_retain') as retain:
+                with self.assertRaises(OSError):
+                    cache.retain_with_evidence(self.pool, self.inventory, self.proc, evidence)
+                retain.assert_not_called()
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_final_evidence_failure_does_not_claim_no_mutation(self):
+        evidence = self.root / 'receipt.json'
+        calls = 0
+
+        def fsync(_fd):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError('synthetic final evidence failure')
+
+        stderr = io.StringIO()
+        with patch.object(cache.os, 'fsync', side_effect=fsync), \
+                contextlib.redirect_stderr(stderr):
+            with self.assertRaisesRegex(cache.Refusal, 'may have mutated') as raised:
+                cache.retain_with_evidence(self.pool, self.inventory, self.proc, evidence)
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertEqual(str(raised.exception.__cause__), 'synthetic final evidence failure')
+        receipt = json.loads(stderr.getvalue())
+        self.assertEqual(receipt, json.loads(evidence.read_text()))
+        self.assertTrue(self.by_slot(receipt)['slot-0']['eligible'])
+        self.assertTrue(self.by_slot(receipt)['slot-0']['directory_metadata_preserved'])
+        self.assertFalse((self.pool / 'slot-0' / 'lease.json').exists())
+
+    def test_final_evidence_io_failure_survives_secondary_close_failure(self):
+        receipt = {'version': 1, 'slots': [{'slot': 'slot-0', 'mutation_failed': True,
+                   'completed_steps': ['target_removed'], 'lease_removed': False}]}
+        real_fdopen = os.fdopen
+        for operation in ('write', 'flush'):
+            with self.subTest(operation=operation):
+                original = OSError(errno.ENOSPC, f'synthetic final {operation} failure')
+                cleanup = OSError(errno.EIO, 'synthetic secondary close failure')
+
+                class FailingStream:
+                    def __init__(self, fd, mode):
+                        self.stream = real_fdopen(fd, mode)
+                        self.writes = self.flushes = 0
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        self.stream.close()
+                        raise cleanup
+
+                    def __getattr__(self, name):
+                        return getattr(self.stream, name)
+
+                    def write(self, data):
+                        self.writes += 1
+                        if operation == 'write' and self.writes == 2:
+                            raise original
+                        return self.stream.write(data)
+
+                    def flush(self):
+                        self.flushes += 1
+                        if operation == 'flush' and self.flushes == 2:
+                            raise original
+                        return self.stream.flush()
+
+                stderr = io.StringIO()
+                with patch.object(cache.os, 'fdopen', side_effect=FailingStream), \
+                        patch.object(cache, 'shared_pool_retain', return_value=receipt), \
+                        contextlib.redirect_stderr(stderr):
+                    with self.assertRaisesRegex(cache.Refusal, 'may have mutated') as raised:
+                        cache.retain_with_evidence(self.pool, self.inventory, self.proc,
+                                                   self.root / f'{operation}-receipt.json')
+                self.assertIs(raised.exception.__cause__, original)
+                self.assertIn(str(original), str(raised.exception))
+                self.assertEqual(json.loads(stderr.getvalue()), receipt)
+
+    def test_cli_final_evidence_failure_exposes_actual_partial_result(self):
+        inventory = self.root / 'inventory.json'
+        inventory.write_text(json.dumps(self.inventory))
+        evidence = self.root / 'receipt.json'
+        argv = [str(SCRIPT), 'retain', '--pool', str(self.pool), '--inventory', str(inventory),
+                '--proc-root', str(self.proc), '--evidence', str(evidence)]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        calls = 0
+
+        def fsync(_fd):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError('synthetic final evidence failure')
+
+        with patch.object(sys, 'argv', argv), contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr), \
+                patch.object(cache.os, 'fsync', side_effect=fsync), \
+                patch.object(cache.os, 'fchmod', side_effect=PermissionError('denied')):
+            self.assertEqual(cache.main(), 75)
+        self.assertEqual(stdout.getvalue(), '')
+        receipt, refusal = map(json.loads, stderr.getvalue().splitlines())
+        row = self.by_slot(receipt)['slot-0']
+        self.assertTrue(row['mutation_started'])
+        self.assertTrue(row['mutation_failed'])
+        self.assertEqual(row['completed_steps'], ['target_removed', 'scratch_removed'])
+        self.assertFalse(row['lease_removed'])
+        self.assertTrue((self.pool / 'slot-0' / 'lease.json').exists())
+        self.assertFalse(self.by_slot(receipt)['slot-1']['eligible'])
+        self.assertEqual(refusal['finding'], 'refused')
+        self.assertIn('may have mutated', refusal['reason'])
+        self.assertIn('synthetic final evidence failure', refusal['reason'])
 
     def test_lock_held_through_mutation(self):
         seen = {}

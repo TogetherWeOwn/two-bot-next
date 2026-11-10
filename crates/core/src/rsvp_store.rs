@@ -278,7 +278,7 @@ pub async fn write_audit(pool: &Pool<Postgres>, audit: &RsvpAudit) -> Result<boo
 /// The audit append shared by [`write_audit`] and [`put_rsvp_with_audit`]:
 /// same row SQL and bindings on either a pool or an open transaction, so the
 /// standalone and atomic paths can never drift apart.
-async fn insert_audit_row<'e, E>(exec: E, audit: &RsvpAudit) -> Result<bool, sqlx::Error>
+pub(crate) async fn insert_audit_row<'e, E>(exec: E, audit: &RsvpAudit) -> Result<bool, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {

@@ -57,13 +57,21 @@ job-container service isolation, per-job grants and nonpersistent checkouts.
 
 The active job retains GitHub environment `staging`. **A YAML environment
 name alone does not create protection rules or scope repository-level secrets.**
-The environment scoping stays in place, and secret placement must remain
-environment-scoped with no unintended fallback:
+The environment scoping stays in place, and secret placement is
+environment-scoped with no repository-level fallback:
 
 - The `staging` environment keeps its approved deployment approval and branch
   restrictions (only approved staging code, normally `main`).
-- `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are environment-scoped, with no
-  unintended repository/organization fallback exposing them to other jobs.
+- `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are stored only as
+  Environment secrets, in `staging` and in `production`; there are no
+  repository-scope copies, so only jobs running in those Environments can
+  read them. The offline regression rejects any job that references the pair
+  without declaring one of those Environments.
+- As an in-file backstop behind the Environment branch policy, each
+  `deploy-staging` Environment job (`schema-gate`, `roles-gate`, `deploy`)
+  fails closed when its workflow ref is not `main`. The refusal is a step in
+  the existing SHA check, not a job condition, so a wrong-ref run goes red
+  instead of skipping silently.
 - The existing deployment/approval principal can still deploy and the
   `STAGING_WORKER_URL` variable resolves in that environment.
 
@@ -112,9 +120,10 @@ fall back to raw `max_connections` and label the ceiling as such.
 [Worker-version rollback](runbook.md#worker-version-rollback) option. The daily
 proof is described in [production-deploy.md](production-deploy.md#daily-staging-proof):
 only the fixed staging dispatch gets `actions: write`; the dispatcher has no
-Cloudflare or ownership credentials. Failed proofs alert through the existing
-`synthetic-alerts` environment. An independent daily read-only watcher catches
-missing/stale scheduled proof; healthy checks post nothing.
+Cloudflare or ownership credentials. Failed proofs open the `staging-rollback-proof`
+GitHub issue labelled `incident` with the job-scoped `GITHUB_TOKEN`
+(`issues: write`). An independent daily read-only watcher catches
+missing/stale scheduled proof; a healthy check closes any open issue.
 
 For the manual Worker-only option, pass a named, previously served
 `target_version` (never "latest"). It is an optional string with empty default:
@@ -135,7 +144,7 @@ Cloudflare deployment request, hands ownership to it, times the first `/readyz`
 The deployment request never sends `force`, so a target whose secrets changed
 since it was deployed is refused; Wrangler's non-interactive rollback would
 answer yes to that prompt. The request sets `code_update_strategy` to
-`immediate` because Wrangler 4.151's default is `deferred` with a 300 s maximum
+`immediate` because Wrangler 4.152's default is `deferred` with a 300 s maximum
 delay, which would keep the old Durable Object code serving for up to five
 minutes. A 401/403 stops the run and skips the restore; it never retries with
 another credential. Recovery then is a `deploy-staging` dispatch with

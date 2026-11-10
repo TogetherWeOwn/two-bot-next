@@ -55,9 +55,10 @@ Browse the [documentation map](docs/README.md) for every guide, contract and evi
   Discord permissions, rendered from the compiled all-enabled registry.
 - [Event help and attendee reminders](docs/event-reminders.md): fixed 15-minute,
   channel-only reminders, delivery limits and restart-safe failure behavior.
-- [Proposed RSVP seats and waitlist](docs/rsvp-capacity-spec.md): design only;
-  optional Going capacity, explicit queue consent, race/privacy contracts and
-  unresolved existing-post assumptions. Not an enabled feature.
+- [Proposed RSVP seats and waitlist](docs/rsvp-capacity-spec.md): deferred to
+  2026-12; the single RSVP-policy spec. Optional Going capacity, explicit queue
+  consent, race/privacy contracts and unresolved existing-post assumptions. Not
+  an enabled feature.
 - [Sticky delivery recovery](docs/sticky-debounce-acceptance.md#uncertain-delivery-recovery):
   inspect uncertain re-posts before resetting the durable delivery fence.
 - [Configuration](docs/configuration.md): all catalog keys/classes, known parsed
@@ -88,8 +89,9 @@ Browse the [documentation map](docs/README.md) for every guide, contract and evi
   generation fencing, atomic audit and preserved lockdown recovery.
 - [Command registry drift](docs/command-publish.md): dry-run-first
   `two-bot commands diff|publish` and opt-in boot publication for cutover.
-- [Game-activity aggregate report](docs/game-activity-report.md): on-demand
-  read-only per-game play/in-voice/session JSON for one guild.
+- [Game-activity aggregate report](docs/game-activity-report.md): private staff
+  `/game-mix` and read-only per-game play/in-voice/session CLI JSON for one guild;
+  Discord reads remain unavailable in the live guild.
 - [Automod operator guide](docs/automod-operator-guide.md): filter/effect
   semantics, repeat expiry, corpus management, failure signals and triage.
 
@@ -133,30 +135,49 @@ catalog has no descriptions; its checked supplement lives in
 key requires updating that supplement. Defaults without a typed-loader mapping
 are explicitly marked **Not specified in Next**, not guessed from legacy.
 
-On the persistent controller, after the bounded pool is admitted:
+The command rows are no longer committed. The authored
+[command-reference landing page](docs/commands.md) points to the ignored
+`docs/generated/commands.md` and the **command-reference** artifact on each
+Rust-selected check run. Generate explicitly before compiling workspace tests or
+all-targets Clippy. The generator validates tracked configuration first and
+never rewrites it or the saved publication fixtures.
+
+On the persistent controller, after bounded pool admission (the pool policy
+selects controller mode automatically; `--controller` still forces it):
 
 ```sh
-python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs regenerate_reference_docs -- --ignored
+python3 scripts/generate_command_reference.py --controller
 python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs
 ```
 
-On ephemeral/local developer machines outside the controller, the equivalent is
-`cargo test -p two-bot-core --test reference_docs regenerate_reference_docs -- --ignored`,
-then `cargo test -p two-bot-core --test reference_docs`. Ordinary tests compare
-committed files byte-for-byte and never regenerate them silently. CI discovers
-these tests in its existing integration-test step.
+Outside the controller, use `python3 scripts/generate_command_reference.py`, then
+`cargo test -p two-bot-core --test reference_docs --locked`. The script builds the
+small core example that reuses the canonical renderer; no database, deployment
+or live environment values are needed.
+
+Configuration remains tracked. When deliberately changing its catalog or
+supplement, explicitly regenerate both references with
+`cargo test -p two-bot-core --test reference_docs regenerate_reference_docs -- --ignored`
+(put the Cargo arguments through `scripts/cargo_cache.py` on the controller).
+Review and commit only the configuration change, never generated command rows.
+Ordinary reference tests compare bytes and never regenerate silently: absent,
+stale or malformed generated output fails, and configuration drift remains a
+failure. CI generates before consumers, then runs these read-only tests.
 
 ## Contributing
 
 Squash-merge only; PR titles follow Conventional Commits and the body follows the
 [PR template](.github/pull_request_template.md). This repo is public, so keep
 internal tracker IDs out of titles, bodies, commits and branch names. The rulesets
-require `ci-ok`, `gitleaks` and `pr-lint` on the exact head commit. The single
+require `ci-ok`, `gitleaks`, `pr-lint`, `CodeRabbit` and `Devin Review` on the exact
+head commit, with no approving review. The single
 `ci-ok` aggregate gates both selectors, lint (`check`: fmt, clippy -D warnings,
 cargo-deny), all selected `rust tests` and `ignored db` lanes, and `worker check`
-(including the runbook command-drift test). The approving non-author reviewer
-squash-merges. See [Contributing](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). The
-workspace toolchain is pinned in `rust-toolchain.toml`.
+(including the runbook command-drift test). See
+[Production merge evidence](CONTRIBUTING.md#production-merge-evidence) for merge
+ownership, exact-head Release Manager confirmation and staging requirements, and
+[AGENTS.md](AGENTS.md) for contributor guidance. The workspace toolchain is pinned
+in `rust-toolchain.toml`.
 
 Persistent-controller Rust builds use the [bounded Cargo cache wrapper](docs/build-cache.md),
 not a new `target/` in each worktree. The runbook includes offline cache tests,

@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected test-only saved-but-pending custom-command registry handoff; the builder owns the combined implementation PR.",
+  "baseCommit": "b5776432c5c1df36f14af5843c17140aae07b5f7",
+  "branch": "test/custom-command-resync-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/discord/tests/custom_command_resync_acceptance.rs",
+      "sha256": "4ea1e3b4f424d25c62ca58fa9a09812be716159025e263ffe294aa5b7fd876d7",
+      "tests": 11
+    }
+  ],
+  "registration": {
+    "integrationTarget": "custom_command_resync_acceptance",
+    "automaticDiscovery": true,
+    "productionBehaviorChanged": false
+  },
+  "commands": {
+    "acceptance": "python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test custom_command_resync_acceptance -- --test-threads=1 --nocapture",
+    "clippy": "python3 scripts/cargo_cache.py run -- clippy -p two-bot-discord --features db --test custom_command_resync_acceptance -- -D warnings",
+    "format": "cargo fmt --all -- --check"
+  },
+  "database": {
+    "environment": "TWO_TEST_DATABASE_URL",
+    "guard": "two_bot_testsupport::TestDatabase",
+    "missingEnvironment": "A missing bootstrap URL fails fixture setup; a feature-disabled zero-test binary is not evidence.",
+    "ciRoute": "check.yml rust-tests integration step discovers this non-ignored target with the db feature and guarded disposable Postgres service.",
+    "fixtures": "A unique migrated database per fixture, an independent read pool for durable observations, and loopback Discord only. Never application credentials, staging or production."
+  },
+  "contract": {
+    "pendingObservation": "A table OR view named public.automation_command_registry_resync exposes one text guild_id row per pending guild. Other columns and physical storage are unconstrained. The baseline lacks this relation and therefore observes zero pending rows, without skipping the required assertion.",
+    "mutations": "Define, disable and enable each commit their saved state and exactly one mutation audit fact even when the registry PUT is refused. The prior confirmed publication snapshot remains unchanged; one durable pending row appears, visible through an independent database pool.",
+    "reply": "Private mention-suppressed completion names the saved state and pending registry synchronization, never restart/delete/retry-the-mutation advice or a false successful publication.",
+    "recovery": "The existing sync_registry publication opportunity runs on the SAME runtime after the one-failure HTTP double recovers. It republishes the full set, advances the confirmed snapshot, and clears pending work without changing any definition field or mutation audit row. No job name, cadence or additional runtime API is prescribed.",
+    "idempotence": "A second refused publication retains exactly one pending row; a later confirmed publication clears it. Repairing one guild leaves another guild pending.",
+    "controls": "Clean define/disable/enable publication leaves no pending work. Fresh-runtime boot resync still publishes saved commands without replaying mutations."
+  },
+  "handoff": "Do not edit the protected acceptance file. Return oracle corrections to its author. Consume these tests unchanged in the implementation PR; do not merge deliberately RED tests alone. Required exact-head checks, independent review and squash auto-merge apply to the combined GREEN implementation PR."
+}

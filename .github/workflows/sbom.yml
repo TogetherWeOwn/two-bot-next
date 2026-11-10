@@ -21,6 +21,7 @@ jobs:
     env:
       # Runners share a Docker daemon; never scan or remove a sibling's tag.
       IMAGE: two-bot-next:scan-${{ github.run_id }}-${{ github.run_attempt }}
+      TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db:2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -37,6 +38,9 @@ jobs:
           python3 scripts/test-runtime-image-evidence.py
           python3 scripts/test_runtime_image_inspect_acceptance.py
           python3 scripts/test-vulnerability-preflight.py
+      - name: Install verified pinned Trivy
+        id: trivy
+        run: bash scripts/install-trivy.sh
       # Keep the workflow's validation tools while inventorying a historical
       # release tag that may predate those tools.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -68,6 +72,7 @@ jobs:
           version: v0.69.3
           cache: false
           cache-dir: ${{ runner.temp }}/trivy-cache
+          skip-setup-trivy: true
           scan-type: fs
           scan-ref: ${{ runner.temp }}/rust-workspace
           scanners: vuln
@@ -109,7 +114,7 @@ jobs:
       # gates are still attempted even if the first fails (`!cancelled()`),
       # and `verify` still validates/retains even when a gate fails.
       - name: Gate runtime image (HIGH/CRITICAL, including unfixed)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.trivy.outcome == 'success' }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           version: v0.69.3
@@ -187,14 +192,14 @@ jobs:
       - name: Validate SBOM inventories and record checksums
         id: inventory
         run: |
-          python3 scripts/validate-sbom.py sbom/Cargo.lock sbom
+          python3 scripts/validate-sbom.py sbom/Cargo.lock sbom --check-runtime
           rm sbom/Cargo.lock
           (cd sbom && sha256sum *.cdx.json source-sha.txt image-id.txt > SHA256SUMS)
       - name: Collect exact-image applicability evidence
         if: ${{ !cancelled() && steps.inventory.outcome == 'success' }}
         run: |
           status=0
-          python3 scripts/runtime-image-evidence.py "$IMAGE" sbom || status=$?
+          python3 scripts/runtime-image-evidence.py "$IMAGE" sbom --check-runtime || status=$?
           (cd sbom && sha256sum runtime-image-evidence.json > runtime-image-evidence.sha256)
           exit "$status"
       - name: Bind findings to exact installed tuples (no acceptance, no suppression)

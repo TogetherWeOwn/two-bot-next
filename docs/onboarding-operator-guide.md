@@ -80,6 +80,35 @@ anchor-welcome and session channel ids in `FORWARDED_DISCORD_IDS`
 (`wrangler/src/container-env.ts`). Adding a Worker var alone does not
 configure the container (see [runbook.md](runbook.md#logs-and-keepalive)).
 
+## Private welcome preview
+
+Run `/welcome-preview` in the configured server with **Manage Server**. It is
+always discoverable, even when welcome delivery is off, and takes no options.
+The response is private and starts with **Preview — not a delivery**, the mode,
+and fixture identity. It renders the current welcome body and picker through
+the same renderer as a newcomer join, with the current stored channel overrides
+and deployment mode. It does not edit configuration or send a test welcome.
+
+The fixture is the fixed synthetic, roleless newcomer `765432109876543210`.
+Its display name is never resolved or rendered; its mention is inert because the
+response disables all mentions. No real member (including the invoker) is fetched.
+There are no role grants, channel posts, prompt/funnel records, invite reads,
+voice moves or audit-store writes. Preview menus are visual samples only; their
+submissions must not run the live picker. Use the ordinary newcomer menu for
+real selections.
+
+A dry-run legacy/anchor preview explains the skip; session mode still renders,
+matching its live dry-run behavior. A missing landing slot shows an explicit
+marker instead of a blank response. Invalid or unavailable settings return a
+private retry message without echoing stored values. Fix configuration through
+the existing admin path, then try again. An unconfirmed initial acknowledgement
+is never retried.
+
+This is a **configuration preview**, not a permission probe: it does not fetch
+channels, check current bot posting permissions or prove that a configured
+channel still exists. Use [preflight](preflight.md) for those checks. No live
+Discord or staging/production database test is needed to preview rendering.
+
 ## Prompt decisions
 
 `decide_prompt` (`crates/core/src/onboarding.rs:157`) runs in legacy check

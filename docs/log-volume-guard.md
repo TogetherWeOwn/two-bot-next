@@ -20,7 +20,7 @@ high-rate event without a cap row fails the suite.
   guild/member/channel ID, token, query string, body or message content ever
   becomes a label or a log field.
 
-## Cardinality budget: 776 samples
+## Cardinality budget: 800 samples
 
 `GET /metrics` renders this many non-comment samples from process start,
 before any traffic. Adding any series fails the pinned count until this
@@ -37,8 +37,8 @@ table and the test are updated together.
 | `two_bot_voice_join_to_move_seconds` | 11 | label-free; 8 buckets + `+Inf` + sum + count |
 | `two_bot_rest_requests_total{route,result}` | 180 | 30 route templates x 6 results |
 | `two_bot_rest_guard_*` | 11 | Fixed, label-free shared admission-guard counters and gauges |
-| job runs, timestamps, failure streaks | 64 | 16 jobs x (2 outcomes + timestamp + streak) |
-| `two_bot_job_last_error_class{job,class}` | 112 | 16 jobs x 7 classes (`database`, `rest`, `configuration`, `timeout`, `panic`, `feed`, `recovery_required`) |
+| job runs, timestamps, failure streaks | 68 | 17 jobs x (2 outcomes + timestamp + streak) |
+| `two_bot_job_last_error_class{job,class}` | 119 | 17 jobs x 7 classes (`database`, `rest`, `configuration`, `timeout`, `panic`, `feed`, `recovery_required`) |
 | voice ops, reconcile, dead-letters, state | 60 | 3x6 ops + 4 reconcile + 9 dead-letter + tracked + compensation + orphans + 7 join-refused reasons + 2 queue lanes + halted + oldest-age + live-not-ready age + live self-heals + rest-age + creator-map generation + creator-map age + backoff-capped + dispatch-timeouts + watchdog-stucks + halt-recoveries + inbox-turn bound + inbox turns + dispatch turns + inbox-overflow drops + opt-in queue-overflow drops |
 | `two_bot_voice_join_occupancy_total{occupancy}` | 8 | seeding-TEST occupancy buckets `0`-`6` + `7+`; fixed vocabulary, no per-channel/member labels |
 | pool gauges | 4 | configured, size, idle, max |
@@ -54,7 +54,7 @@ table and the test are updated together.
 | `two_bot_voice_names_total{outcome}` | 16 | 1 create + 5 template-render outcomes + 9 dispatch outcomes (including `name_blocked` for rename or custom-override refusal) + `other` |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | 2 | `pre_commit`, `commit` |
 | `two_bot_drop_poison_total{guard}` | 7 | `command_dispatch_guard`, `schedule_run`, `user_slot`, `in_flight_guard`, `ticket_supervisor`, `response_accounting`, `voice_connection_guard`; fixed vocabulary, each recovery logs one warn |
-| `two_bot_internal_actions_total{family,outcome}` | 72 | 6 families x 12 outcomes (`announcement`, `event`, `settings`, `moderation`, `membership`, `other` x `executed` + 11 refusal classes) |
+| `two_bot_internal_actions_total{family,outcome}` | 84 | 7 families x 12 outcomes (`announcement`, `event`, `settings`, `moderation`, `membership`, `voice`, `other` x `executed` + 11 refusal classes) |
 | `two_bot_moderation_enforcements_total{verb,outcome}` | 45 | 9 verbs (`ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`, `slowmode`, `lockdown`, `unlock`) x 5 outcomes (`success`, `refused`, `discord_error`, `storage_error`, `other`) |
 | `two_bot_community_facts_drain_failures_total{reason}` | 3 | `error`, `timeout`, `other` |
 | `two_bot_presence_capture_total{outcome}` | 3 | `inserted`, `duplicate`, `rejected` |
@@ -69,10 +69,11 @@ table and the test are updated together.
 | `two_bot_eventsub_reconcile_errors_total{error_class}` | 5 | `reconcile_action_failed`, `reconcile_prior_failed`, `reconcile_unhealthy`, `reconcile_failed`, `other`; no status, body or response bytes in labels |
 | `two_bot_feed_fetches_total{outcome}` | 4 | `success`, `invalid_source`, `refused_redirect`, `failure`; per-outcome, never per-feed |
 | `two_bot_feed_fetch_errors_total{error_class}` | 12 | 11 named classes + `other` (`invalid_source`, `non_public_address`, `redirect_refused`, `too_large`, `invalid_encoding`, `unsupported_content_type`, `unsupported_encoding`, `resolve`, `transport`, `deadline`, `http_error`); successes record nothing here |
+| `two_bot_gateway_drain_skips_total` | 1 | label-free counter: auxiliary leveling drains skipped for missing tables or grants; no SQLSTATE, member id or error text labels; resets on process restart |
 | `two_bot_retention_replay_needed_total` | 1 | label-free counter: skipped retention purges needing Operator replay (one per real guild removal whose purge-queue write hit the schema gap); resets on process restart |
 | `two_bot_ticket_lifecycle_total{event,outcome}` | 22 | per-event subsets (2 `retire` + 3 `abandon` + 13 `purge` + 2 `claim` + 2 `close`): each event renders its success outcomes plus the `query` collapse trapdoor, and `purge` adds the 12 `db_cause` classes; closed vocabulary, no `other` row, no member text, channel names, ticket ids or error strings in labels |
 | `two_bot_ticket_component_drops_total` | 1 | label-free counter: ticket components refused before spawning (runtime or per-member saturated); resets on process restart |
-| `# HELP` / `# TYPE` headers | 172 | 86 families x 2 |
+| `# HELP` / `# TYPE` headers | 174 | 87 families x 2 |
 
 ## Per-event caps (gateway metric labels)
 
@@ -131,7 +132,7 @@ So shedding means doing less work per dispatch, in this order:
 5. Voice reconcile detail (plan counts only; outcomes stay counted).
 6. Never shed: session lifecycle lines, checkpoint commits, disconnect and
    missed-events counters, failure classes, or the `other` catchall. `feeds`,
-   `self_role_recovery`, `member_unban_sweep` and `automod_expiry` completion
+   `self_role_recovery`, `member_unban_sweep`, `automod_expiry` and `lfg_sweep` completion
    metrics also never shed; park these jobs only through their existing
    feature configuration, not the log guard.
 
@@ -155,7 +156,7 @@ Website-action receiver executions (TOG-20119, roadmap M4.23) follow the same
 shape: every signed-receiver request increments
 `two_bot_internal_actions_total{family,outcome}` exactly once, while refusal
 `warn!` summaries stay sampled. A burst is O(1) log lines with N counter
-increments. The six families and twelve outcomes are class steady and never
+increments. The seven families and twelve outcomes are class steady and never
 shed; unknown verbs collapse to `other` and unknown outcomes to `internal`,
 so growth means a real family or refusal class arrived and needs the M2.1
 alert rule, not a new label.

@@ -16,12 +16,13 @@ use std::collections::BTreeSet;
 // them to. The message string (last argument to the `tracing` macro) is the
 // event name; fields such as `sequence` or `guild_id` are context, not names.
 
-/// `crates/bot/src/gateway.rs`: all twenty-three traced in the file are cataloged.
-const GATEWAY_RS_EVENTS: [&str; 23] = [
+/// `crates/bot/src/gateway.rs`: all twenty-five traced in the file are cataloged.
+const GATEWAY_RS_EVENTS: [&str; 25] = [
     "cold resume committed; requesting voice snapshot via identify",
     "gateway reconnect failed; Twilight will retry",
     "gateway shard loop started",
     "gateway leveling dispatch failed",
+    "gateway leveling dispatch skipped; schema gap",
     "gateway leveling collect failed",
     "gateway community facts dispatch failed",
     "gateway community facts dispatch timed out",
@@ -41,6 +42,7 @@ const GATEWAY_RS_EVENTS: [&str; 23] = [
     "READY identity differs from boot token; ordered identity not armed",
     "retention lifecycle skipped; schema gap, nothing to cancel",
     "retention purge skipped; schema gap, operator replay required",
+    "live interaction cache full; evicted the oldest, its claim recovers from the durable job",
 ];
 
 /// `crates/bot/src/main.rs`: the twelve cataloged `tracing` messages.
@@ -166,12 +168,14 @@ const FAILURE_CLASSES: [&str; 12] = [
 /// Startup `error_class` values logged before fatal exits (see
 /// `docs/startup-diagnostics.md`): inline literals in `main.rs`, so pinned by
 /// presence, not by an enum.
-const STARTUP_ERROR_CLASSES: [&str; 8] = [
+const STARTUP_ERROR_CLASSES: [&str; 10] = [
     "listener_bind_failed",
     "gateway_override_invalid",
     "database_connect_failed",
     "receiver_config_invalid",
     "receiver_prerequisites_invalid",
+    "receiver_token_missing",
+    "receiver_store_missing",
     "receiver_bind_failed",
     "moderation_disable_unknown",
     "container_service_failed",
@@ -455,10 +459,26 @@ fn catalog_entries_appear_at_their_documented_files() {
             "catalog drain outcome missing from main.rs: {error}"
         );
     }
+    let catalog = observability_catalog_doc();
     for class in STARTUP_ERROR_CLASSES {
         assert!(
             main.contains(class),
             "startup error class missing from main.rs: {class}"
+        );
+        assert!(
+            catalog.contains(&format!("`{class}`")),
+            "startup error class missing from the catalog: {class}"
+        );
+    }
+    let delivery = include_str!("eventsub_delivery.rs");
+    for class in EVENTSUB_DELIVERY_ERROR_CLASSES {
+        assert!(
+            delivery.contains(&format!("\"{class}\"")),
+            "startup error class missing from eventsub_delivery.rs: {class}"
+        );
+        assert!(
+            catalog.contains(&format!("`{class}`")),
+            "startup error class missing from the catalog: {class}"
         );
     }
 }
@@ -523,19 +543,19 @@ fn voice_event_values_are_bounded_by_the_catalog() {
     );
 }
 
-/// `crates/bot/src/eventsub_http.rs`: the Twitch EventSub receiver messages,
-/// in file order. The receiver file is not one of the six `SCOPED_SOURCES`
-/// (it lands with the receiver slice, after this pin), so it is read from
-/// disk at test time instead of via `include_str!`: a missing file must fail
-/// this one test, not break compilation of the whole suite. Once the file
-/// is permanent, fold it into `SCOPED_SOURCES` and drop the disk read.
-const EVENTSUB_RS_EVENTS: [&str; 6] = [
+/// `crates/bot/src/eventsub_http.rs`: the unique Twitch EventSub receiver
+/// messages. Read from disk so a missing receiver fails this test without
+/// breaking compilation of the whole suite.
+const EVENTSUB_RS_EVENTS: [&str; 9] = [
     "eventsub delivery refused",
     "eventsub delivery classification failed",
     "challenge answered",
     "notification acknowledged",
     "revocation acknowledged",
     "delivery ignored",
+    "delivery child failed; durable claim fences retain uncertainty",
+    "receiver shutdown deadline exhausted with delivery children unfinished",
+    "receiver shutdown deadline exhausted; unfinished delivery claims remain fenced",
 ];
 
 /// Test-only emissions inside the receiver file's `#[cfg(test)]` module,
@@ -552,6 +572,14 @@ const EVENTSUB_TEST_ONLY_EMISSIONS: [&str; 1] = [
 /// The receiver's startup diagnostic in `main.rs` (also in
 /// `MAIN_RS_ADJACENT` for the scanned-source pin above).
 const EVENTSUB_STARTUP_EVENT: &str = "eventsub startup refused";
+
+/// Dependency-construction classes propagated unchanged to the fatal startup
+/// event; unlike the token/store literals, these live outside `main.rs`.
+const EVENTSUB_DELIVERY_ERROR_CLASSES: [&str; 3] = [
+    "receiver_identity_refused",
+    "receiver_admission_rejected",
+    "receiver_proxy_invalid",
+];
 
 /// Bounded `event` field value every receiver emission carries.
 const EVENTSUB_EVENT_FIELD: &str = "eventsub_receiver";
@@ -630,6 +658,15 @@ fn eventsub_receiver_emissions_match_the_catalog() {
         fielded, receiver_callsites,
         "every eventsub receiver log callsite carries event = \"eventsub_receiver\" \
          ({fielded} fielded of {receiver_callsites} receiver callsites)"
+    );
+}
+
+#[test]
+fn eventsub_delivery_child_logs_do_not_format_join_errors() {
+    let source = eventsub_receiver_source();
+    assert!(
+        !source.contains("error = %error"),
+        "JoinError formatting can expose panic payloads; log only bounded failure state"
     );
 }
 

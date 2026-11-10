@@ -6,9 +6,9 @@ no secret access. Static rows come from the `Dockerfile` at sample source SHA
 that main head, described under Measured sample image.
 
 - Baseline inventory commit: `7797b1e166d2aa7b28725cdddc1b8f0c097a5ed5` (2026-10-03)
-- Builder-row refresh (2026-10-04): [`Dockerfile:10` at `723663df9c74fd24734170a981cf59908aadd33a`](https://github.com/TogetherWeOwn/two-bot-next/blob/723663df9c74fd24734170a981cf59908aadd33a/Dockerfile#L10).
+- Builder-row refresh (2026-11-01): [`Dockerfile:10` at `e403836cec544d6a1c4f74c6fa0c8daebcf91734`](https://github.com/TogetherWeOwn/two-bot-next/blob/e403836cec544d6a1c4f74c6fa0c8daebcf91734/Dockerfile#L10).
   The baseline used `rust:1.94-trixie`; only the builder row now records the
-  Rust 1.98 tag and digest. Runtime, layer, SBOM and size notes below are measured on a CI-built
+  Rust 1.99 tag and digest. Runtime, layer, SBOM and size notes below are measured on a CI-built
   main-head sample, not the cutover candidate and not the baseline estimate.
 - Source files: `Dockerfile`, `.github/workflows/sbom.yml`,
   `docs/supply-chain.md`, `scripts/container-smoke.py`, `.trivyignore.yaml`
@@ -20,25 +20,43 @@ that main head, described under Measured sample image.
 
 | Stage | Reference (pinned) | OS | Purpose |
 |---|---|---|---|
-| builder | `rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546` | Debian 13 (trixie) | Full toolchain; compiles the release binary, then discarded |
-| runtime | `gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2` | Debian 13, distroless `cc` | Ships glibc, libgcc, CA trust data and the `nonroot` account (uid/gid 65532); carries only the release binary |
+| builder | `rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137` | Debian 13 (trixie) | Full toolchain; compiles the release binary, then discarded |
+| runtime (selected, unmeasured) | `gcr.io/distroless/base-nossl-debian13:nonroot@sha256:e6b0f82595aa1edde72c8054de7a9dca30f0f8f54820c37a167c0ddfc21c5c67` | Debian 13, distroless `base-nossl` | Ships glibc, CA trust data and the `nonroot` account (uid/gid 65532); carries the release binary plus official Trixie `libgcc-s1`/`gcc-14-base` files (below) |
+| runtime (prior, measured sample) | `gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2` | Debian 13, distroless `cc` | Replaced by the row above; every measurement below is of this image |
 
 Both stages are Debian 13, so the binary links against the glibc it runs on.
 Tags stay readable for automated Docker updates while the digests make both
 stages immutable. There is no build-arg override for either base.
 
+Selected runtime package set: base-files, ca-certificates, media-types,
+netbase, tzdata, tzdata-legacy and libc6 from the base, plus `libgcc-s1` and
+`gcc-14-base` (9 packages). The Dockerfile copies only `libgcc_s.so.1`, both
+copyright files and truthful `dpkg-query -s` records into
+`/var/lib/dpkg/status.d/<package>`, with no apt installation and no zlib, sid or
+forky package. There is no `zlib1g`, `libz.so*`, `libssl`, `libzstd`,
+`libstdc++` or `libgomp`. The trusted `verify` job is to require a `DT_NEEDED`
+subset of `libc.so.6`, `libm.so.6` and `libgcc_s.so.1` resolved in the image, no
+`libz`, and the required package records and SBOM entries. The Trivy gates and
+empty `.trivyignore.yaml` are unchanged. Full CI, scan, container smoke and
+staging have not run on this candidate; this is not a pass or production
+acceptance, and security review and the staging drill / Release Manager gates
+remain.
+
 ## Runtime layer breakdown (measured)
 
 The shipped image is the `runtime` stage only. Builder layers are cache
 scaffolding and never ship. Byte counts are measured from the CI-built
-sample image named under Measured sample image.
+sample image named under Measured sample image, which used the prior
+`cc-debian13` base. The `base-nossl` candidate adds `libgcc-s1`/`gcc-14-base`
+copy layers and has no layer or size measurement yet; rows R1 and the
+14-package notes describe the `cc` sample only.
 
 | # | Dockerfile step | Ships a layer? | Notes |
 |---|---|---|---|
 | R1 | `FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792…` | 21 base layers, 29,128,192 bytes (27.78 MiB) as saved-tar blobs | Debian trust bundle plus 14 documented OS packages; no shell, package manager, or OpenSSL CLI |
 | R2 | `LABEL org.opencontainers.image.revision`, `com.togetherweown.build-id` | Metadata only | Non-secret build provenance; zero bytes |
 | R3 | `USER 65532:65532`, `WORKDIR /home/nonroot` | One empty layer (no tar entries), 1,024 bytes as saved-tar blob; `USER` is config-only | Config; the layer is empty because `/home/nonroot` already exists in base layer 7 |
-| R4 | `COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot` | Yes, one file layer, 16,065,536 bytes (15.32 MiB) as saved-tar blob; file itself 16,062,800 bytes (15.32 MiB) | The only added file content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 17 MiB per `scripts/container-smoke.py` (recalibrated 2026-10-17; the 2026-10-11 sample below predates it) |
+| R4 | `COPY --from=builder --chown=65532:65532 /app/target/release/two-bot ./two-bot` | Yes, one file layer, 16,065,536 bytes (15.32 MiB) as saved-tar blob; file itself 16,062,800 bytes (15.32 MiB) | The only added file content: the stripped release binary (`opt-level=z`, LTO, stripped). Budget: 18 MiB per `scripts/container-smoke.py` (recalibrated 2026-10-24; the 2026-10-11 sample below predates it) |
 | R5 | `EXPOSE 8080`, `ENV LISTEN_ADDR=0.0.0.0:8080 LOG_FORMAT=json` | Metadata only | Liveness/readiness port, bind address and JSON log format |
 | R6 | `HEALTHCHECK CMD ["/home/nonroot/two-bot", "--healthcheck"]` | Metadata only | Exec-form probe; needs no shell |
 | R7 | `ENTRYPOINT ["/home/nonroot/two-bot"]` | Metadata only | Exec form so PID 1 receives SIGTERM |
@@ -75,7 +93,7 @@ a sample of main, not the pinned cutover candidate.
   `16,777,216` bytes (16 MiB) — PASS. Headroom `714,416` bytes (0.68 MiB,
   4.3%). The binary exceeds the old 15 MiB ceiling by `334,160` bytes, so the
   16 MiB tripwire in `scripts/container-smoke.py` was required at the time
-  (recalibrated to 17 MiB on 2026-10-17).
+  (recalibrated to 18 MiB on 2026-10-24).
 - Cross-check: `sbom/runtime-image-evidence.json` (schema 2, `complete: true`)
   records the same source SHA, image ID, and binary size `16,062,800` with
   SHA-256 `4d41c4fb7fbfa1d7d6752a0503491a2b6672407a1d4488107fb8ead9b764116a`,
@@ -147,14 +165,18 @@ or the current PR diff.
 - The distroless runtime is now the default image in `Dockerfile`; its
   provenance arguments and labels are part of the cutover image build. Earlier
   trial measurements remain historical evidence, not a separate build path.
-- Runtime is Debian 13 distroless (`cc-debian13:nonroot`); the older Bookworm
+- Runtime is Debian 13 distroless (`base-nossl-debian13:nonroot` selected,
+  `cc-debian13:nonroot` in the measured sample); the older Bookworm
   notes and conditional dispositions in `docs/supply-chain.md` do not carry
   over. Automated Docker updates track both pinned references; the unversioned
   `nonroot` tag needs a manual digest refresh if no bump arrives after a
   Debian point release.
-- Trust data is the base image's own `ca-certificates` bundle; nothing is
-  installed or copied into the runtime except the release binary. The bot runs
-  as `nonroot` and its only in-image exec is its own `--healthcheck`.
+- Trust data is the base image's own `ca-certificates` bundle. The measured
+  `cc-debian13` sample copied only the release binary; the selected base-nossl
+  composition also copies the official GCC runtime library, copyright files,
+  installed package records and matching file-checksum manifests. Nothing is
+  installed in the runtime stage. The bot runs as `nonroot` and its only
+  in-image exec is its own `--healthcheck`.
 
 ## What remains for cutover readiness
 
@@ -168,7 +190,7 @@ Before the deployment digest is pinned:
    names, `SHA256SUMS`, and both gate results under the Releases receipt of
    the B4 evidence manifest (`docs/cutover.md` B4). That receipt does not list
    SBOMs yet, so add them there.
-3. Re-measure on the candidate's image ID, and confirm the 112 MiB / 17 MiB
+3. Re-measure on the candidate's image ID, and confirm the 112 MiB / 18 MiB
    budgets pass. CI keeps the candidate image only as the
    `sbom-partial-<run_id>-<attempt>` artifact (`image.tar`, 1-day retention),
    so download it within that window. R1 and R4 are saved-tar layer-blob

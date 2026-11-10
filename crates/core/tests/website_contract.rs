@@ -182,6 +182,7 @@ fn raw_event(id: &str, start: &str, status: i64) -> RawScheduledEvent {
         id: Some(id.to_owned()),
         name: Some(format!("Event {id}")),
         scheduled_start_time: Some(start.to_owned()),
+        scheduled_end_time: None,
         channel_id: Some("voice-1".to_owned()),
         description: None,
         status: Some(status),
@@ -739,6 +740,7 @@ async fn events_mirror_swaps_atomically_and_keeps_last_good_on_failure() {
             raw_event("good", "2026-09-06T18:00:00.000Z", 1),
             RawScheduledEvent {
                 scheduled_start_time: None,
+                scheduled_end_time: None,
                 ..raw_event("bad", "2026-09-06T18:00:00.000Z", 1)
             },
         ])
@@ -854,6 +856,7 @@ async fn event_mirror_keeps_newer_rows_across_mutation_and_poller_writes() {
             id: id.to_owned(),
             name: name.to_owned(),
             starts_at: "2026-09-06T17:30:00.000Z".to_owned(),
+            ends_at: None,
             channel_id: Some("voice-1".to_owned()),
             description: None,
             status,
@@ -1046,6 +1049,7 @@ async fn event_mirror_applies_writes_in_call_site_stamp_order() {
             id: id.to_owned(),
             name: name.to_owned(),
             starts_at: "2026-09-06T17:30:00.000Z".to_owned(),
+            ends_at: None,
             channel_id: Some("voice-1".to_owned()),
             description: None,
             status,
@@ -1552,6 +1556,7 @@ async fn event_status_round_trips() {
         id: "e".to_owned(),
         name: "E".to_owned(),
         starts_at: "2026-09-06T17:30:00.000Z".to_owned(),
+        ends_at: None,
         channel_id: None,
         description: None,
         status: EventStatus::Active,

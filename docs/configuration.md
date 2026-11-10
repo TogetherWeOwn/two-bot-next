@@ -14,9 +14,9 @@ a required value or an implemented consumer. Secret defaults are never rendered.
 - `env_only`: never dashboard-stored. Unknown names and `TWO_INTERNAL_*` fail closed.
 - `cold` / `hot`: legacy-catalog storage classes, not application promises.
 The Container registers a `guild_settings` poll job
-(`crates/bot/src/website_jobs.rs:207`) that polls every 15 s and publishes a
+(`crates/bot/src/website_jobs.rs`, `settings_jobs::job`) that polls every 15 s and publishes a
 `SettingsCache` snapshot only when the revision or row count changes
-(`crates/bot/src/settings_jobs.rs:146-160`), exposed through `settings_jobs::live`
+(`crates/bot/src/settings_jobs.rs` `poll_once`), exposed through `settings_jobs::live`
 (`crates/bot/src/settings_jobs.rs:53`). Every consumer reads store-first:
 a stored row wins and an absent row falls back to the boot value, except
 the invite responder, which falls back to the live vanity code; a live /ops override wins over the stored row while the container polls an ops record, falling back to the row on clear or expiry; a malformed
@@ -30,21 +30,23 @@ Keys in
 legacy `HOT_WIRED` are labeled “reload-report hot” (the `RefreshReport::hot`
 partition in `settings.rs`); every other storable key reports cold.
 
-Live snapshot consumers at `1643438` (canonical table; nine `live()` call
-sites total: eight across the six non-voice rows below, plus the voice
-gateway closure):
+Live snapshot consumers (canonical table; gateway facts and attendance share
+`community_classifier.rs::classifier_config_from_live`):
 
 | Runtime | Call sites | Reads | When |
 | --- | --- | --- | --- |
 | automod | `automod_gateway.rs:211-223`, `:328` | 10 live lists, thresholds, enforce flag (`:116-127`) | every message delivery |
-| feed | `feed_jobs.rs:235-237` | `TWO_FEED_POLL_SECONDS` (`:207`) | supervisor cadence + per-tick gate (`:246-289`) |
-| audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`:60-63`) | every record (`:483`) and sweep (`:497`), once installed |
-| ticket | `ticket_runtime.rs:457`, `:981` | 3 ticket destinations (`:172-175`) | every execute/recovery and purge |
-| gateway classifier | `gateway.rs:834-853`, `:978` | human/welcome channel sets (`:860-877`) | every guild message; classifier + facts sink swap together (`leveling_runtime.rs:908-911`) |
-| community | `community_jobs.rs:181-183` | 5 scorecard/presence/inactivity keys (`:170-176`) | every tick: probe (`:396`), scorecard (`:548`), sweep (`:634`) |
-| voice | `gateway.rs:2204-2206` closure | empty grace (`voice_rooms.rs:9932`), invite code (`:9980`) | spawn (`:8097-8099`), maintenance (`:3421-3423`), `/invite` (`:13942-13943`) |
+| feed | `feed_jobs.rs:235-237`, `:266` | `TWO_FEED_POLL_SECONDS` (`:207`), `TWO_ANNOUNCEMENTS` (`:244`) | supervisor cadence + per-tick gates (`:276-327`, `:385-419`) |
+| audit | `audit_runtime.rs:308`, `:438` | 3 mirror destinations (`CHANNEL_KEYS`) | every record (`:483`) and sweep (`:497`), once installed |
+| ticket | `ticket_runtime.rs:749-752`, `:1491` | 3 destinations + cooldown (`:311-339`, `:719-744`) | every execute/recovery and purge; effective ops changes included |
+| self-role | `self_role_handlers.rs:213-219`, `:419-441` | `TWO_SELF_ROLE_PANELS` (`:53`) | every dispatch (`:224`, `:309`, `:377`, `:419`) and sweep (`:472-473`); retirement waits for durable work |
+| command dispatch | `command_runtime.rs::on_interaction_with_live` | `TWO_ANNOUNCEMENTS` (`feed_jobs.rs::live_announcements_with`, `feed_jobs.rs::live_announcements_on`) | every feed invocation through `router.rs::live_gate_announcements_slash`; RSVP prepare reuses the same resolver (`gateway.rs` RSVP admission, `interactions.rs::prepare`, `rsvp.rs::prepare_rsvp_interaction`) |
+| gateway classifier | `gateway.rs::refresh_channel_classifier_from_poller`, `gateway.rs::apply_dispatch` | seven channel + exclusion sets through `community_classifier.rs::classifier_config_from_live` | guild `MessageCreate`, `VoiceStateUpdate`, `MemberAdd`, `MemberUpdate`, `MemberRemove`, before fact collection/drain; classifier + facts sink swap together |
+| attendance | `community_classifier.rs::LiveClassifier`, `rsvp.rs::execute`; installed by `main.rs::build_interaction_runtime` and `command_runtime.rs::CommandRuntime::build` | same seven channel + exclusion sets | execution-time read in both `handle` and `prepare`/`complete`, after successful acknowledgement and live membership reads, immediately before target classification |
+| community | `community_jobs.rs:185-187` | 5 scorecard/presence/inactivity keys (`:174-180`) | every tick: probe (`:400`), scorecard (`:552`), sweep (`:638`) |
+| voice | `gateway.rs` `build_voice_runtime` closure | empty grace (`voice_rooms.rs` `stored_empty_grace_with`), invite code (`stored_invite_code_with`) | spawn (`ensure_actor`), maintenance (`refresh_empty_grace_with`), `/invite` (`handle_received`) |
 
-The forty-one keys in `STORE_READ_KEYS`
+The forty-nine keys in `STORE_READ_KEYS`
 (`crates/core/tests/reference_docs.rs`) say “applied live by runtime refresh”
 instead of “stored unwired”: containment applies `TWO_ANTI_NUKE_WINDOW_SECONDS`,
 `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS`, `TWO_ANTI_NUKE_HEAT_THRESHOLD` and
@@ -69,10 +71,10 @@ on every delivery (`crates/bot/src/automod_gateway.rs:116-127`, `:211-223`, `:32
 the feed poller applies `TWO_FEED_POLL_SECONDS` from the snapshot to the
 supervisor cadence and its per-tick schedule gate, so a changed interval
 reschedules the next run to last-run + new interval without a restart
-(`crates/bot/src/feed_jobs.rs:235-287`); the audit mirror applies
+(`crates/bot/src/feed_jobs.rs:235-237`, `:276-327`); the audit mirror applies
 `DISCORD_AUDIT_LOG_CHANNEL_ID`, `DISCORD_VOICE_LOG_CHANNEL_ID` and
 `DISCORD_MODERATION_LOG_CHANNEL_ID` from the snapshot on every record and
-sweep (`crates/bot/src/audit_runtime.rs:60-63`, `:308`, `:438`), where blanking
+sweep (`crates/bot/src/audit_runtime.rs` `CHANNEL_KEYS`, `:308`, `:438`), where blanking
 all three parks the mirror live and a malformed row keeps the last good
 destinations; with no destination at boot, registration installs neither the
 mirror handle nor the retry job, so a later stored destination cannot activate
@@ -80,25 +82,75 @@ that parked runtime (`crates/bot/src/audit_runtime.rs:137-161`); ticket
 operations apply
 `DISCORD_TICKET_CATEGORY_ID`, `DISCORD_TICKET_PANEL_CHANNEL_ID` and
 `DISCORD_TICKET_STAFF_ROLE_ID` from the snapshot on every execute, recovery
-and purge (`crates/bot/src/ticket_runtime.rs:172-175`, `:457`, `:981`), where a
-malformed row keeps the last good destinations like the audit mirror; the gateway funnel applies
-`TWO_COMMUNITY_HUMAN_CHANNEL_IDS` and `TWO_COMMUNITY_WELCOME_CHANNEL_IDS`
-from the snapshot on every guild message, refreshing the channel classifier
-and the community-facts sink together before the message's channel class is
-stamped (`crates/bot/src/gateway.rs:834-853`, `:978`, `crates/discord/src/leveling_runtime.rs:908-911`), with malformed entries filtered silently so a wholly-malformed row applies as the empty set (`crates/core/src/community.rs:252-260`); the voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs:8097-8099`, `:3421-3423`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs:13942-13943`), falling back to the live vanity code when the row is absent or invalid (`:9985-9990`); the community jobs apply `TWO_COMMUNITY_SCORECARD`, `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`, `TWO_PRESENCE_PROBE` and `TWO_INACTIVITY_DAYS` from the snapshot on every tick, layering stored rows over the boot gates with boot fallback for absent or unparsable counts (`crates/bot/src/community_jobs.rs:170-268`), where a stored `0` on either enable gate skips that tick while the sweep re-reads its horizon per run. Five boot-only edges
+and purge (`crates/bot/src/ticket_runtime.rs:778`, `:896`, `:1317`, `:1491`), where a
+malformed row keeps the last good destinations like the audit mirror, and the same
+refresh resolves `TWO_TICKET_COOLDOWN_SECONDS` from the effective layered values,
+including ops apply, clearing and expiry without a database revision change, with
+last-good fallback (`crates/bot/src/ticket_runtime.rs:719-744`); the feed poller
+re-checks `TWO_ANNOUNCEMENTS` from the snapshot on every tick and skips while
+a stored `0` stands (`crates/bot/src/feed_jobs.rs:250-267`, `:385-419`); feed
+and RSVP command dispatch re-check the same gate on every invocation and
+refuse with the disabled reply while a stored `0` stands
+(`crates/bot/src/command_runtime.rs:1305-1323`, `crates/bot/src/gateway.rs:1498-1501`,
+`crates/discord/src/rsvp.rs:86`, `crates/core/src/router.rs:308-341`); self-role
+dispatch and recovery resolve `TWO_SELF_ROLE_PANELS` from the snapshot on every
+interaction and sweep, falling back to the boot catalogue on absent or unparsable
+rows (`crates/bot/src/self_role_handlers.rs:59-83`, `:224`, `:309`, `:377`, `:419`).
+Catalogue edits and deletes refuse while processing, terminal repair or unknown
+exchanges remain; admission rechecks the same snapshot revision under the settings
+writer lock. Drain first, then retry through the settings API. Do not bypass the
+boundary with SQL or change boot catalogues before draining. The independently
+expiring ops overlay cannot set `TWO_SELF_ROLE_PANELS`;
+the gateway funnel applies
+`TWO_COMMUNITY_HUMAN_CHANNEL_IDS`, `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` and
+the five actor/staging exclusion sets (`TWO_COMMUNITY_AUTOMATION_ACTOR_IDS`,
+`TWO_COMMUNITY_RAID_ACTOR_IDS`, `TWO_COMMUNITY_STAGING_ACTOR_IDS`,
+`TWO_COMMUNITY_STAGING_GUILD_IDS`, `TWO_COMMUNITY_TEST_ACTOR_IDS`) from the
+snapshot before collecting or draining facts for guild `MessageCreate`,
+`VoiceStateUpdate`, `MemberAdd`, `MemberUpdate` and `MemberRemove` dispatches
+(`crates/bot/src/gateway.rs::refresh_channel_classifier_from_poller`,
+`gateway.rs::apply_dispatch`). The classifier and community-facts sink refresh
+together; message channel stamping uses that refreshed configuration. The
+shared seven-key overlay is
+`crates/bot/src/community_classifier.rs::classifier_config_from_live`.
+Attendance uses the same overlay through the stateless `LiveClassifier`
+provider installed with `InteractionRuntime::with_classifier_provider` by both
+`main.rs::build_interaction_runtime` and `command_runtime.rs::CommandRuntime::build`.
+Both `handle` and `prepare`/`complete` resolve `settings_jobs::live` inside
+`rsvp.rs::execute` after successful acknowledgement and live membership reads,
+immediately before target classification, not at runtime construction. Static
+callers continue using `ClassifierConfig`. Each refresh/execution uses one
+guild-scoped snapshot: stored sets replace boot sets, explicit empty clears a
+set, and deleting a row restores boot fallback. Malformed entries are filtered
+silently, so a wholly-malformed row applies as the empty set
+(`crates/core/src/community.rs:252-260`). `TWO_COMMUNITY_CLASSIFIER_VERSION`
+remains boot-only. The voice sweep applies `TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS` from the snapshot on spawn and every maintenance refresh, so a stored per-guild grace reaches the deletion sweep without a restart (`crates/bot/src/voice_rooms.rs` `ensure_actor`, `refresh_empty_grace_with`), and the invite responder applies `TWO_GUILD_INVITE_CODE` per `/invite` interaction (`crates/bot/src/voice_rooms.rs` `handle_received`), falling back to the live vanity code when the row is absent or invalid (`stored_invite_code_with`); the community jobs apply `TWO_COMMUNITY_SCORECARD`, `TWO_COMMUNITY_RECOMMENDATIONS`, `TWO_COMMUNITY_CORRECTION_CYCLES`, `TWO_PRESENCE_PROBE` and `TWO_INACTIVITY_DAYS` from the snapshot on every tick, layering stored rows over the boot gates with boot fallback for absent or unparsable counts (`crates/bot/src/community_jobs.rs:170-268`), where a stored `0` on either enable gate skips that tick while the sweep re-reads its horizon per run. Five boot-only edges
 remain: the voice room-name policy is
 built once at boot from the process environment
-(`crates/bot/src/gateway.rs:2203`); gateway intents plus ticket command
+(`crates/bot/src/gateway.rs` `build_voice_runtime`); gateway intents plus ticket command
 publication read the ticket destination keys once at boot
-(`crates/bot/src/gateway.rs:150`, `crates/bot/src/command_runtime.rs:448`), so a stored ticket
+(`crates/bot/src/gateway.rs` `intents_from_env`, `crates/bot/src/command_runtime.rs` `CommandRuntime::from_env`), so a stored ticket
 destination reaches already-published commands only through the per-operation
 refresh above; the community-facts sink arms once at boot
-(`crates/bot/src/main.rs:697-698`), so a live scorecard `0` stops scoring but
+(`crates/bot/src/main.rs` `run`), so a live scorecard `0` stops scoring but
 not capture; the scorecard command surface publishes at boot
-(`crates/bot/src/main.rs:1004`, `crates/bot/src/command_runtime.rs:440`); and
+(`crates/bot/src/main.rs` `build_interaction_runtime`, `crates/bot/src/command_runtime.rs` `CommandRuntime::from_env`); and
 a boot-parked community job needs a restart to start ticking, like the parked
 audit runtime. Every other
 storable row's stored value is unwired.
+
+The five existing onboarding destination keys validate before settings writes:
+`DISCORD_ANCHOR_WELCOME_CHANNEL_ID`, `DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID`
+and `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID` accept optional nonzero u64 IDs;
+`DISCORD_LANDING_CHANNEL_IDS` and `DISCORD_GOODBYE_CHANNEL_IDS` accept CSV IDs,
+trimming whitespace and omitting empty segments. Validation shares the runtime
+parsers and existing JSON-to-env rendering (including booleans, integral numbers
+and flat arrays). Stored JSON null is refused; explicit row deletion restores
+boot fallback. Repair invalid values or delete the override. Empty syntax does
+not satisfy mode-required destinations. Syntax proves no channel existence or
+permission and does not change hot wiring or dry-run behavior. See
+[settings actions](internal-action-settings.md#onboarding-destinations) for
+rendering, typed refusal and no-effect guarantees.
 
 Gateway boot reads process environment only, through a fixed set of loaders:
 `Config::from_env` (`DISCORD_TOKEN`, `DATABASE_URL`, `LISTEN_ADDR`, `GUILD_ID`),
@@ -120,10 +172,11 @@ for delete protection, not creator provisioning. Its empty grace is fixed at
 Automod and scorecard typed loaders exist but are not
 called during boot; their defaults below come from empty-map calls.
 Onboarding gates are validated at boot (`OnboardingGates::from_env`,
-`crates/bot/src/main.rs:563`): an invalid `TWO_ONBOARDING_MODE` fails startup. The
+`crates/core/src/onboarding.rs`): an invalid `TWO_ONBOARDING_MODE` fails startup. The
 classifier loader runs when the ordered pipeline is built and again when
-community-facts capture is armed, then refreshes live per guild message as
-above. The separate
+community-facts capture is armed, then refreshes live for the guild
+fact-producing dispatches above. Attendance resolves its live classifier at
+execution time in both interaction paths. The separate
 `preflight` operator CLI validates further catalog keys from the environment
 (channel references, panels, onboarding mode) as a read-only pre-deploy check;
 it applies nothing to the running gateway.
@@ -164,7 +217,7 @@ gates (`feature_commands.rs`), moderation (`moderation.rs`), onboarding
 (`onboarding.rs`), automod (`automod.rs`), scorecard and classifier
 (`community.rs`). An empty ID list never contains a live ID.
 
-Catalog entries: 136.
+Catalog entries: 137.
 
 | Key | Class | Parsed default | Application | Description |
 | --- | --- | --- | --- | --- |
@@ -189,7 +242,7 @@ Catalog entries: 136.
 | `DISCORD_VOICE_LOG_CHANNEL_ID` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Destination for voice-session logs. |
 | `LOG_LEVEL` | cold | Not specified in Next | stored unwired | Container two_bot tracing level when RUST_LOG is unset (info default); RUST_LOG overrides. |
 | `TEMP_VOICE_ENABLED` | cold | Not specified in Next | stored unwired | Legacy temporary-voice enable flag; classification does not imply runtime wiring. |
-| `TWO_ANNOUNCEMENTS` | cold | `false` | env at boot; stored unwired | Enable announcement command publication and routing. |
+| `TWO_ANNOUNCEMENTS` | hot | `false` | stored, applied live by runtime refresh (reload-report hot) | Enable announcement command publication and routing; stored rows apply live to the feed poller and feed/RSVP command dispatch while publication and LFG stay boot-gated. |
 | `TWO_ANTI_NUKE` | cold | Not specified in Next | stored unwired | Enable anti-nuke protection. |
 | `TWO_ANTI_NUKE_DRY_RUN` | cold | Not specified in Next | stored unwired | Observe anti-nuke decisions without executing protective writes. |
 | `TWO_ANTI_NUKE_EVENT_MAX_AGE_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh | Maximum age of anti-nuke events considered for action. |
@@ -220,16 +273,16 @@ Catalog entries: 136.
 | `TWO_BACKUP_S3_REGION` | env_only | Not specified in Next | environment only | Backup object-store region; environment-only destination boundary. |
 | `TWO_BACKUP_S3_SECRET_ACCESS_KEY` | env_only | Not rendered (secret) | environment only | Backup object-store secret credential; never rendered. |
 | `TWO_BULK_JOIN_WINDOW_UNTIL` | hot | Not specified in Next | stored, applied live by runtime refresh | End of the temporary bulk-join window. |
-| `TWO_COMMUNITY_AUTOMATION_ACTOR_IDS` | hot | `[]` | stored unwired | Automation actors excluded from human community activity. |
+| `TWO_COMMUNITY_AUTOMATION_ACTOR_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Automation actors excluded from human community activity. |
 | `TWO_COMMUNITY_CLASSIFIER_VERSION` | hot | `"community-v1"` | stored unwired | Version label for community classification. |
 | `TWO_COMMUNITY_CORRECTION_CYCLES` | hot | `0` | stored, applied live by runtime refresh (reload-report hot) | Non-negative count of operator scorecard corrections. |
 | `TWO_COMMUNITY_HUMAN_CHANNEL_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Channels considered for human community activity. |
-| `TWO_COMMUNITY_RAID_ACTOR_IDS` | hot | `[]` | stored unwired | Known raid actors excluded from human activity classification. |
+| `TWO_COMMUNITY_RAID_ACTOR_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Known raid actors excluded from human activity classification. |
 | `TWO_COMMUNITY_RECOMMENDATIONS` | hot | `true` | stored, applied live by runtime refresh (reload-report hot) | Permit scorecard recommendations unless explicitly disabled with 0. |
 | `TWO_COMMUNITY_SCORECARD` | hot | `false` | stored, applied live by runtime refresh (reload-report hot) | Enable the weekly scorecard job. Live fact capture covers event_attended, voice_session_started, voice_session_ended, message_created, rules_accepted and member_joined. |
-| `TWO_COMMUNITY_STAGING_ACTOR_IDS` | hot | `[]` | stored unwired | Staging actors excluded from human community activity. |
-| `TWO_COMMUNITY_STAGING_GUILD_IDS` | hot | `[]` | stored unwired | Staging guilds excluded from human community activity. |
-| `TWO_COMMUNITY_TEST_ACTOR_IDS` | hot | `[]` | stored unwired | Test actors excluded from human community activity. |
+| `TWO_COMMUNITY_STAGING_ACTOR_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Staging actors excluded from human community activity. |
+| `TWO_COMMUNITY_STAGING_GUILD_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Staging guilds excluded from human community activity. |
+| `TWO_COMMUNITY_TEST_ACTOR_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Test actors excluded from human community activity. |
 | `TWO_COMMUNITY_WELCOME_CHANNEL_IDS` | hot | `[]` | stored, applied live by runtime refresh (reload-report hot) | Welcome-channel classification for community analytics. |
 | `TWO_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Administrative/shared admission database credential required for live preflight, cutover and guild-config; must reach the same database as Container DATABASE_URL for the same token. |
 | `TWO_DB_POOL_MAX` | env_only | Not specified in Next | environment only | Legacy database pool maximum read before the settings store exists. |
@@ -252,6 +305,7 @@ Catalog entries: 136.
 | `TWO_INTERNAL_ALLOW_EVENT_READ` | env_only | Not specified in Next | environment only | Capability gate for event reads. |
 | `TWO_INTERNAL_ALLOW_MODERATION` | env_only | Not specified in Next | environment only | Capability gate for internal moderation actions. |
 | `TWO_INTERNAL_ALLOW_SETTINGS` | env_only | Not specified in Next | environment only | Capability gate for internal settings actions. |
+| `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | env_only | Not specified in Next | environment only | Capability gate for voice snapshot reads. |
 | `TWO_INTERNAL_BIND` | env_only | Not specified in Next | environment only | Canonical combined IP:port for receiver configuration; a wildcard bind requires the Worker-set container marker (TOG-16851). |
 | `TWO_INTERNAL_BIND_HOST` | env_only | Not specified in Next | environment only | Legacy split internal-action listener interface; receiver configuration uses TWO_INTERNAL_BIND instead. |
 | `TWO_INTERNAL_CALLERS` | env_only | Not specified in Next | environment only | Signing-key-to-stable-caller mappings for receiver configuration; environment-only identity boundary, not loaded by Container bootstrap. |
@@ -280,7 +334,7 @@ Catalog entries: 136.
 | `TWO_REDIRECT_PORT` | env_only | Not specified in Next | environment only | Legacy redirect listener port; environment-only network bind. |
 | `TWO_REDIRECT_TRUSTED_PROXIES` | env_only | Not specified in Next | environment only | Trusted proxy boundaries for redirect request attribution. |
 | `TWO_SELF_ROLE_DRY_RUN` | hot | Not specified in Next | stored unwired | Observe self-role plans without writing roles. |
-| `TWO_SELF_ROLE_PANELS` | cold | Not specified in Next | stored unwired | Self-role panel catalog; preflight runs the same strict parser as gateway boot, which parks self-roles on invalid catalogues. |
+| `TWO_SELF_ROLE_PANELS` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Self-role panel catalog; preflight runs the same strict parser as gateway boot, which parks self-roles on invalid catalogues. |
 | `TWO_STAGING_DATABASE_URL` | env_only | Not rendered (secret) | environment only | Staging database connection secret; never rendered. |
 | `TWO_STAGING_RESTART_CONTAINMENT` | env_only | Not specified in Next | environment only | Staging restart containment gate; legacy boot input with no Next reader. |
 | `TWO_STAGING_RESTART_SYNTHETIC_ACTORS` | env_only | Not specified in Next | environment only | Synthetic-actor allowlist for staging restart containment; legacy input with no Next reader. |
@@ -298,7 +352,7 @@ Catalog entries: 136.
 | `TWO_TEMP_VOICE_SWEEP_SECONDS` | cold | Not specified in Next | stored unwired | Temporary-room cleanup sweep interval. |
 | `TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS` | env_only | Not specified in Next | environment only | Staging synthetic voice-test bots counted as human occupants; ignored for the live guild. |
 | `TWO_TEXT_COMMANDS` | cold | `false` | env at boot; stored unwired | Enable optional text triggers only while automations are enabled. |
-| `TWO_TICKET_COOLDOWN_SECONDS` | cold | Not specified in Next | stored unwired | Cooldown between ticket openings. |
+| `TWO_TICKET_COOLDOWN_SECONDS` | hot | Not specified in Next | stored, applied live by runtime refresh (reload-report hot) | Cooldown between ticket openings. |
 | `TWO_TWITCH_BROADCASTERS` | env_only | Not specified in Next | environment only | Comma-separated Twitch broadcaster_user_ids the startup reconcile subscribes to on the bot callback; empty parks reconcile without mutations. Operator-provisioned and never dashboard-stored. |
 | `TWO_TWITCH_CALLBACK_URL` | env_only | Not specified in Next | environment only | Public HTTPS callback Twitch posts EventSub deliveries to; reconcile only touches subscriptions on this URL. Operator-provisioned and never dashboard-stored. |
 | `TWO_TWITCH_CLIENT_ID` | env_only | Not specified in Next | environment only | Twitch application client id for Helix calls; Operator-provisioned and never dashboard-stored. |

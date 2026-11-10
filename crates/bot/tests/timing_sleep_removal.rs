@@ -13,8 +13,8 @@
 //! 1. `alive.rs`: three 10 ms polls (`wait_http`, `checkpoint`, first-boot
 //!    events tick) each under the STEP deadline, plus a 200 ms post-ready
 //!    settle window that polls liveness on a 10 ms backoff before SIGTERM.
-//! 2. `ops_backfill.rs`: 20 ms blocking backoff in the `spawn_bot` health
-//!    poll under its 15 s deadline.
+//! 2. `ops_backfill.rs`: 20 ms blocking backoff in the `spawn_bot_at` health
+//!    poll under its 15 s deadline (`spawn_bot` only owns the port lease).
 //! 3. `preflight.rs`: the 429 / `retry_after` lane-hold tests, sleep-free;
 //!    the guard below locks that property plus the exact
 //!    one-attempt-no-retry pins.
@@ -399,7 +399,7 @@ fn assert_sleep_inventory(source: &str, expected: usize, context: &str) {
 
 const OPS_DEADLINE_ASSERT: &str = r#"assert!(
             Instant::now() < deadline,
-            "bot did not serve health on the configured port"
+            "bot did not serve health on the configured port; child logs: {recent:?}"
         );"#;
 const OPS_DEADLINE_BINDING: &str = "let deadline = Instant::now() + Duration::from_secs(15);";
 const ALIVE_STEP_BINDING: &str = "const STEP: Duration = Duration::from_secs(5);";
@@ -503,35 +503,41 @@ fn assert_ops_backfill_deadline(source: &str) {
     assert_code_contains(
         source,
         OPS_DEADLINE_ASSERT,
-        "spawn_bot health poll must retain its exact deadline assertion",
+        "spawn_bot_at health poll must retain its exact deadline assertion",
     );
     let code = code_only(source);
     assert_eq!(
         declaration_count(&code, "let", "deadline"),
         1,
-        "spawn_bot must retain exactly one deadline binding"
+        "spawn_bot_at must retain exactly one deadline binding"
     );
     assert_eq!(
         code.matches(OPS_DEADLINE_BINDING).count(),
         1,
-        "spawn_bot deadline must remain exactly 15 s"
+        "spawn_bot_at deadline must remain exactly 15 s"
     );
     assert_direct_statement_at_depth(
         source,
         OPS_DEADLINE_BINDING,
         1,
-        "spawn_bot 15 s deadline must be a direct helper-body statement before the health-poll loop",
+        "spawn_bot_at 15 s deadline must be a direct helper-body statement before the health-poll loop",
     );
     let code = code_only(source);
     let deadline_pos = code
         .find(OPS_DEADLINE_BINDING)
-        .expect("spawn_bot must retain its 15 s deadline");
+        .expect("spawn_bot_at must retain its 15 s deadline");
     let loop_pos = code
         .find("loop {")
-        .expect("spawn_bot must retain its health-poll loop");
+        .expect("spawn_bot_at must retain its health-poll loop");
+    assert_direct_statement_at_depth(
+        source,
+        "loop {",
+        1,
+        "spawn_bot_at health-poll loop must be a direct reachable helper-body statement",
+    );
     assert!(
         deadline_pos < loop_pos,
-        "spawn_bot 15 s deadline must be bound before the health-poll loop"
+        "spawn_bot_at 15 s deadline must be bound before the health-poll loop"
     );
     // Placement: the deadline assertion must be a direct statement of the
     // health-poll loop body. A copy moved above the loop or wrapped in
@@ -541,7 +547,7 @@ fn assert_ops_backfill_deadline(source: &str) {
     assert_direct_loop_statement(
         &body,
         OPS_DEADLINE_ASSERT,
-        "spawn_bot deadline assertion must be a direct statement inside the health-poll loop body",
+        "spawn_bot_at deadline assertion must be a direct statement inside the health-poll loop body",
     );
 }
 
@@ -792,12 +798,12 @@ fn alive_polling_uses_bounded_backoff_under_deadline() {
 
 #[test]
 fn ops_backfill_spawn_uses_bounded_backoff_under_deadline() {
-    let spawn_bot = function_body(OPS_BACKFILL, "spawn_bot");
-    assert_poll_site(&spawn_bot, "loop", 20);
-    assert_ops_backfill_deadline(&spawn_bot);
+    let spawn_bot_at = function_body(OPS_BACKFILL, "spawn_bot_at");
+    assert_poll_site(&spawn_bot_at, "loop", 20);
+    assert_ops_backfill_deadline(&spawn_bot_at);
     assert_sleep_inventory(OPS_BACKFILL, 1, "ops_backfill.rs sleep inventory");
     assert_no_code_contains(
-        &spawn_bot,
+        &spawn_bot_at,
         "yield_now",
         "ops_backfill.rs must not busy-spin on bare scheduler yields",
     );
@@ -995,16 +1001,52 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
 
 #[test]
 fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
-    let spawn_bot = function_body(OPS_BACKFILL, "spawn_bot");
-    assert_ops_backfill_deadline(&spawn_bot);
-    let changed_backoff = spawn_bot.replace("from_millis(20)", "from_millis(50)");
+    let spawn_bot_at = function_body(OPS_BACKFILL, "spawn_bot_at");
+    assert_ops_backfill_deadline(&spawn_bot_at);
+    let changed_backoff = spawn_bot_at.replace("from_millis(20)", "from_millis(50)");
+    assert_ne!(changed_backoff, spawn_bot_at, "backoff mutant must apply");
     assert!(std::panic::catch_unwind(|| {
         assert_poll_site(&changed_backoff, "loop", 20);
     })
     .is_err());
-    let without_deadline_check = spawn_bot.replace(
-        "assert!(\n            Instant::now() < deadline,\n            \"bot did not serve health on the configured port\"\n        );",
-        "// deadline check removed",
+    let sleep = "thread::sleep(Duration::from_millis(20));";
+    for replacement in [
+        String::new(),
+        format!("/* {sleep} */"),
+        "thread::sleep(Duration::from_secs(1));".to_owned(),
+        "thread::sleep(Duration::from_millis(backoff_ms));".to_owned(),
+        format!("{sleep}\n        {sleep}"),
+        format!("if false {{ {sleep} }}"),
+        format!("if true {{ continue; }}\n        {sleep}"),
+    ] {
+        let mutant = spawn_bot_at.replace(sleep, &replacement);
+        assert_ne!(mutant, spawn_bot_at, "backoff mutant must apply");
+        assert!(std::panic::catch_unwind(|| {
+            assert_poll_site(&mutant, "loop", 20);
+        })
+        .is_err());
+    }
+    let moved_sleep =
+        spawn_bot_at
+            .replace(sleep, "")
+            .replacen("loop {", &format!("{sleep}\n    loop {{"), 1);
+    assert_ne!(moved_sleep, spawn_bot_at, "backoff move must apply");
+    assert!(std::panic::catch_unwind(|| {
+        assert_poll_site(&moved_sleep, "loop", 20);
+    })
+    .is_err());
+    let stray_sleep = format!("{OPS_BACKFILL}\nfn stray_backoff() {{ {sleep} }}");
+    assert_ne!(stray_sleep, OPS_BACKFILL, "stray backoff mutant must apply");
+    assert!(std::panic::catch_unwind(|| {
+        assert_sleep_inventory(&stray_sleep, 1, "ops_backfill.rs sleep inventory");
+    })
+    .is_err());
+
+    let without_deadline_check =
+        spawn_bot_at.replace(OPS_DEADLINE_ASSERT, "// deadline check removed");
+    assert_ne!(
+        without_deadline_check, spawn_bot_at,
+        "deadline mutant must apply"
     );
     assert!(without_deadline_check.contains("deadline"));
     assert!(std::panic::catch_unwind(|| {
@@ -1046,10 +1088,13 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
 
     // Block-commenting a pinned assertion must not satisfy its pin: the
     // raw text is still present, but it is no longer code.
-    let deadline_assert = "assert!(\n            Instant::now() < deadline,\n            \"bot did not serve health on the configured port\"\n        );";
     let commented_deadline =
-        spawn_bot.replace(deadline_assert, &format!("/* {deadline_assert} */"));
-    assert!(commented_deadline.contains(deadline_assert));
+        spawn_bot_at.replace(OPS_DEADLINE_ASSERT, &format!("/* {OPS_DEADLINE_ASSERT} */"));
+    assert_ne!(
+        commented_deadline, spawn_bot_at,
+        "deadline comment must apply"
+    );
+    assert!(commented_deadline.contains(OPS_DEADLINE_ASSERT));
     assert!(std::panic::catch_unwind(|| {
         assert_ops_backfill_deadline(&commented_deadline);
     })
@@ -1164,7 +1209,9 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
 
     // The 15 s deadline literal must be pinned: stretching it to a day
     // keeps every other assertion present while the health poll hangs.
-    let long_deadline = spawn_bot.replace("Duration::from_secs(15)", "Duration::from_secs(86400)");
+    let long_deadline =
+        spawn_bot_at.replace("Duration::from_secs(15)", "Duration::from_secs(86400)");
+    assert_ne!(long_deadline, spawn_bot_at, "deadline stretch must apply");
     assert!(long_deadline.contains("86400"));
     assert!(std::panic::catch_unwind(|| {
         assert_ops_backfill_deadline(&long_deadline);
@@ -1173,19 +1220,24 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
 
     // A shadow binding inside the loop preserves the original top-level
     // deadline while restarting the timeout on every poll iteration.
-    let shadow_deadline = spawn_bot.replacen(
+    let shadow_deadline = spawn_bot_at.replacen(
         "loop {",
         "loop {\n            let deadline = Instant::now() + Duration::from_secs(15);",
         1,
     );
+    assert_ne!(shadow_deadline, spawn_bot_at, "deadline shadow must apply");
     assert!(std::panic::catch_unwind(|| {
         assert_ops_backfill_deadline(&shadow_deadline);
     })
     .is_err());
-    let stretched_shadow_deadline = spawn_bot.replacen(
+    let stretched_shadow_deadline = spawn_bot_at.replacen(
         "loop {",
         "loop {\n            let deadline = Instant::now() + Duration::from_secs(86400);",
         1,
+    );
+    assert_ne!(
+        stretched_shadow_deadline, spawn_bot_at,
+        "deadline shadow must apply"
     );
     assert!(std::panic::catch_unwind(|| {
         assert_ops_backfill_deadline(&stretched_shadow_deadline);
@@ -1244,12 +1296,16 @@ fn polling_guard_pins_exact_ops_deadline_and_preflight_attempt_assertions() {
 fn polling_guard_rejects_misplaced_deadline_and_liveness_checks() {
     // The ops_backfill deadline text stays present but moves above the poll
     // loop: the poll then hangs past its deadline instead of failing at it.
-    let spawn_bot = function_body(OPS_BACKFILL, "spawn_bot");
-    assert_ops_backfill_deadline(&spawn_bot);
-    let moved_above = spawn_bot.replace(OPS_DEADLINE_ASSERT, "").replacen(
+    let spawn_bot_at = function_body(OPS_BACKFILL, "spawn_bot_at");
+    assert_ops_backfill_deadline(&spawn_bot_at);
+    let moved_above = spawn_bot_at.replace(OPS_DEADLINE_ASSERT, "").replacen(
         "loop {",
         &format!("{OPS_DEADLINE_ASSERT}\n        loop {{"),
         1,
+    );
+    assert_ne!(
+        moved_above, spawn_bot_at,
+        "deadline assertion move must apply"
     );
     assert!(moved_above.contains("Instant::now() < deadline"));
     assert!(std::panic::catch_unwind(|| {
@@ -1257,13 +1313,28 @@ fn polling_guard_rejects_misplaced_deadline_and_liveness_checks() {
     })
     .is_err());
 
-    let deadline_binding = "let deadline = Instant::now() + Duration::from_secs(15);";
-    let moved_inside_loop = spawn_bot.replace(deadline_binding, "").replacen(
+    for replacement in [
+        String::new(),
+        format!("/* {OPS_DEADLINE_BINDING} */"),
+        format!("if false {{ {OPS_DEADLINE_BINDING} }}"),
+    ] {
+        let mutant = spawn_bot_at.replace(OPS_DEADLINE_BINDING, &replacement);
+        assert_ne!(mutant, spawn_bot_at, "deadline binding mutant must apply");
+        assert!(std::panic::catch_unwind(|| {
+            assert_ops_backfill_deadline(&mutant);
+        })
+        .is_err());
+    }
+    let moved_inside_loop = spawn_bot_at.replace(OPS_DEADLINE_BINDING, "").replacen(
         "loop {",
-        &format!("loop {{\n            {deadline_binding}"),
+        &format!("loop {{\n            {OPS_DEADLINE_BINDING}"),
         1,
     );
-    assert!(moved_inside_loop.contains(deadline_binding));
+    assert_ne!(
+        moved_inside_loop, spawn_bot_at,
+        "deadline binding move must apply"
+    );
+    assert!(moved_inside_loop.contains(OPS_DEADLINE_BINDING));
     assert!(std::panic::catch_unwind(|| {
         assert_ops_backfill_deadline(&moved_inside_loop);
     })
@@ -1271,12 +1342,36 @@ fn polling_guard_rejects_misplaced_deadline_and_liveness_checks() {
 
     // The deadline text stays present but is wrapped in a never-taken
     // branch: the loop body no longer executes it while health hangs.
-    let if_false_deadline = spawn_bot.replace(
+    let if_false_deadline = spawn_bot_at.replace(
         OPS_DEADLINE_ASSERT,
         &format!("if false {{ {OPS_DEADLINE_ASSERT} }}"),
     );
+    assert_ne!(if_false_deadline, spawn_bot_at, "deadline gate must apply");
     assert!(std::panic::catch_unwind(|| {
         assert_ops_backfill_deadline(&if_false_deadline);
+    })
+    .is_err());
+    let weakened_deadline = spawn_bot_at.replace(
+        "Instant::now() < deadline,",
+        "Instant::now() < deadline || listening,",
+    );
+    assert_ne!(
+        weakened_deadline, spawn_bot_at,
+        "deadline weakening must apply"
+    );
+    assert!(std::panic::catch_unwind(|| {
+        assert_ops_backfill_deadline(&weakened_deadline);
+    })
+    .is_err());
+    let loop_open = code_only(&spawn_bot_at).find("loop {").unwrap() + "loop ".len();
+    let poll_loop = braced_block(&spawn_bot_at, loop_open);
+    let gated_poll = spawn_bot_at.replace(
+        &format!("loop {poll_loop}"),
+        &format!("if false {{ loop {poll_loop} }}"),
+    );
+    assert_ne!(gated_poll, spawn_bot_at, "poll-loop gate must apply");
+    assert!(std::panic::catch_unwind(|| {
+        assert_ops_backfill_deadline(&gated_poll);
     })
     .is_err());
 

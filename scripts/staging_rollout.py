@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed staging gate for Wrangler 4.151.0's rolling Containers API.
+"""Fail-closed staging gate for Wrangler 4.156.0's rolling Containers API.
 
 Only allowlisted provenance is persisted/printed. API configurations and error
 bodies can contain secrets: never print them, including in exception messages.
@@ -22,7 +22,7 @@ from build_identity import is_deploy_id_shape, parse_deploy_id
 WORKER = "two-bot-next-staging"
 APPLICATION = "two-bot-next-twobotcontainer-staging"
 CLASS = "TwoBotContainer"
-WRANGLER = "4.151.0"
+WRANGLER = "4.156.0"
 VERSION_PROBES = (["--version"], ["-v"])
 LIMIT = 100
 MAX_BODY = 2 * 1024 * 1024
@@ -70,6 +70,35 @@ MAX_TIMEOUT_DIAGNOSTIC_SECONDS = 3600
 TOKEN = re.compile(r"[a-z0-9_]{1,32}")
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 IMAGE = rf"registry\.cloudflare\.com/[^/@\s]+/{APPLICATION}@sha256:[0-9a-f]{{64}}"
+
+
+# Strings are skipped whole, so brackets inside them never count. An
+# unterminated string runs to the end, which keeps the scan linear.
+JSON_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
+# CPython's old default recursion limit, which bounded the C JSON decoder.
+MAX_JSON_DEPTH = 1000
+
+
+def _loads_bounded(raw, **kwargs):
+    """json.loads with a lexical nesting bound that raises RecursionError.
+
+    Newer CPython sizes the decoder's recursion guard from the real C stack
+    and decodes 10,000 levels, so the bound no longer depends on the
+    interpreter: existing RecursionError refusals keep working unchanged.
+    """
+    # Decode bytes exactly as json.loads would, then scan and parse that text.
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode(json.detect_encoding(raw), "surrogatepass")
+    depth = 0
+    for match in JSON_TOKEN.finditer(raw):
+        token = match.group()
+        if token in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise RecursionError("JSON nesting exceeds the decoder bound")
+        elif token in "]}":
+            depth -= 1
+    return json.loads(raw, **kwargs)
 
 
 class GateError(Exception):
@@ -208,7 +237,7 @@ def _reject_duplicate_keys(pairs):
 
 def decode(body):
     try:
-        return json.loads(body, object_pairs_hook=_reject_duplicate_keys)
+        return _loads_bounded(body, object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, UnicodeError, RecursionError):
         # Excessively nested input exhausts the decoder's recursion budget
         # below MAX_BODY; classify it as invalid_json like any malformed body.

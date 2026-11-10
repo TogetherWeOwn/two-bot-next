@@ -11,11 +11,14 @@ pub mod audit_mirror;
 mod automation_admission;
 pub mod automod;
 pub mod automod_activation;
+pub mod brand;
 pub mod channel_access;
 #[cfg(feature = "db")]
 pub mod channel_moderation;
 pub mod command_identity;
 pub mod command_registry;
+#[cfg(any(test, feature = "db"))]
+mod custom_command_prefix_render;
 #[cfg(feature = "db")]
 pub mod custom_commands;
 #[cfg(test)]
@@ -23,12 +26,15 @@ mod drop_poison_test_serial;
 pub mod executor;
 mod executor_metrics;
 pub mod funnel_invites;
+#[cfg(feature = "db")]
+pub mod giveaway;
 
 #[cfg(feature = "db")]
 pub use channel_moderation::{
     register_channel_handlers, ChannelModerationRuntime, ChannelReply, ChannelResponseError,
     ChannelRuntimeError,
 };
+pub mod help_embed_smoke;
 pub mod intents;
 pub mod interactions;
 pub mod internal_actions;
@@ -41,6 +47,9 @@ pub mod internal_member_moderation;
 pub mod leveling_runtime;
 #[cfg(feature = "db")]
 pub mod lfg_interactions;
+#[cfg(feature = "db")]
+mod lfg_list;
+pub mod lockdown_preview;
 pub mod member_moderation;
 mod message_safety;
 pub mod onboarding_config;
@@ -58,6 +67,7 @@ mod test_clock;
 #[path = "../tests/common/mod.rs"]
 pub mod test_wire;
 pub mod voice_rooms;
+pub mod voice_rooms_board;
 
 #[cfg(feature = "db")]
 pub use leveling_runtime::{
@@ -68,19 +78,21 @@ pub use leveling_runtime::{
 pub use adapter::event_to_core;
 pub use executor::{
     is_definitive_rejection, lockdown_masks, pace_delay_ms, paced_step, throw_for_status,
-    timeout_until_iso, unlock_masks, ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordCall,
-    DiscordError, EveryoneOverwrite, PacedStep, RawResponse, RewardRoleReport, KICK_INTERVAL_MS,
-    MAX_AUDIT_REASON_CHARS, MAX_MESSAGE_CHARS, MODERATION_TIMEOUT_MS, PACE_INTERVAL_MS,
+    timeout_until_iso, unlock_masks, ActionExecutor, ChannelCall, ChannelCallOutcome,
+    CloseRefreshEdit, DiscordCall, DiscordError, EveryoneOverwrite, PacedStep, RawResponse,
+    RewardRoleReport, KICK_INTERVAL_MS, MAX_AUDIT_REASON_CHARS, MAX_MESSAGE_CHARS,
+    MODERATION_TIMEOUT_MS, PACE_INTERVAL_MS,
 };
 pub use intents::{cache_resource_types, gateway_intents, needs_message_content};
 pub use interactions::{
-    command_to_twilight, deferred_response, dispatch_interaction, help_response, publish_commands,
-    refusal_response, response_for_slash, route_interaction, text_response, DispatchOptions,
-    InteractionReplyTransport, RoutedInteraction,
+    command_to_twilight, deferred_response, dispatch_interaction, help_detail_response,
+    help_response, publish_commands, refusal_response, response_for_slash, route_interaction,
+    text_response, DispatchOptions, InteractionReplyTransport, RoutedInteraction,
 };
 pub use internal_events::{event_status_name, scheduled_event_body, EventActionError, EventCall};
 pub use pipeline::{
     build_cache, AuditEntryObserver, AuditLogObservation, ChannelClassifier, InviteSource,
     JoinObservation, JoinObserver, MemPipeline, MessageEligibility, NoClassification, NoInvites,
     Pipeline, PipelineSnapshots, ScriptedInvites, SettingsChannelClassifier,
+    VoiceTransitionObservation, VoiceTransitionObserver,
 };

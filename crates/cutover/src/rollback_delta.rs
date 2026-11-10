@@ -77,6 +77,10 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "assistant_monthly_builds", measure: TableMeasure::Columns(&["updated_at"]) },
     TableSpec { table: "audit_kill_switch", measure: TableMeasure::Columns(&["engaged_at"]) },
     TableSpec { table: "automation_audit_log", measure: TableMeasure::Columns(&["created_at"]) },
+    // Pending-publication marker (0468): requested_at is stamped once at the
+    // first failed publication and the row is deleted on the next confirmed
+    // one, so it is the row's only write time.
+    TableSpec { table: "automation_command_registry_resync", measure: TableMeasure::Columns(&["requested_at"]) },
     TableSpec { table: "automation_commands", measure: TableMeasure::Columns(&["updated_at"]) },
     // Flag flips (matched/mutation_started/counted/released) happen inside the
     // claim's lifetime, so a delta claim shows up via claimed_at/completed_at.
@@ -105,6 +109,13 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "containment_incidents", measure: TableMeasure::Columns(&["started_at"]) },
     // Same shape as guild_counters: one read-time per count, no updated_at.
     TableSpec { table: "counter_snapshots", measure: TableMeasure::Columns(&["human_member_count_at", "online_count_at"]) },
+    // Event instance windows (0472): durable lifecycle, order and revocation
+    // evidence for accepted Discord event observations. Confirmed lifecycle
+    // writes stamp observed_at/revoked_at; status-only omissions stamp omitted_at
+    // without masking delayed terminal evidence. All three are canonical UTC
+    // text, cast like scheduled_events_claim.epoch; their maximum covers each
+    // write. The fences carry no member column.
+    TableSpec { table: "event_instance_windows", measure: TableMeasure::Columns(&["observed_at", "omitted_at", "revoked_at"]) },
     TableSpec { table: "event_rsvps", measure: TableMeasure::Columns(&["responded_at"]) },
     // Append-only event-store capture (0427 voice + 0428 presence + 0429 thread
     // lifecycle + 0430 message/reaction + 0431 stage/interaction/audit + 0432

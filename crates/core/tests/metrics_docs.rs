@@ -325,6 +325,7 @@ const KNOWN_COUNTERS: &[&str] = &[
     "two_bot_feed_fetches_total",
     "two_bot_feed_fetch_errors_total",
     "two_bot_retention_replay_needed_total",
+    "two_bot_gateway_drain_skips_total",
     "two_bot_ticket_lifecycle_total",
     "two_bot_ticket_component_drops_total",
 ];

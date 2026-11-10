@@ -10,6 +10,96 @@ use two_bot_core::voice_text_channel::{
     PERMISSION_BIT_MANAGE_CHANNELS,
 };
 
+#[test]
+fn textchannels_reset_controls_are_published_without_broadening_the_surface() {
+    use two_bot_core::commands::CommandOptionType;
+
+    let command = two_bot_core::voice_rooms::voice_commands()
+        .into_iter()
+        .find(|command| command.name == "textchannels")
+        .expect("existing textchannels command");
+    assert_eq!(command.default_member_permissions.as_deref(), Some("16"));
+    assert!(!command.dm_permission);
+    let names: BTreeSet<_> = command
+        .options
+        .iter()
+        .map(|option| option.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "channel",
+            "enabled",
+            "name",
+            "viewer-role",
+            "reset-name",
+            "reset-viewer-role",
+        ])
+    );
+    assert_eq!(command.options.len(), 6, "no duplicate published options");
+    for (name, kind, required) in [
+        ("channel", CommandOptionType::Channel, true),
+        ("enabled", CommandOptionType::Boolean, false),
+        ("name", CommandOptionType::String, false),
+        ("viewer-role", CommandOptionType::Role, false),
+        ("reset-name", CommandOptionType::Boolean, false),
+        ("reset-viewer-role", CommandOptionType::Boolean, false),
+    ] {
+        let option = command
+            .options
+            .iter()
+            .find(|option| option.name == name)
+            .expect("published option");
+        assert_eq!(option.kind, kind.as_u8(), "{name}");
+        assert_eq!(option.required.unwrap_or(false), required, "{name}");
+    }
+    assert_eq!(
+        command
+            .options
+            .iter()
+            .find(|option| option.name == "name")
+            .expect("name")
+            .max_length,
+        Some(MAX_TEXT_CHANNEL_NAME_CHARS as u32)
+    );
+}
+
+#[test]
+fn textchannels_reset_help_explains_defaults_and_preserve_semantics() {
+    let command = two_bot_core::voice_rooms::voice_commands()
+        .into_iter()
+        .find(|command| command.name == "textchannels")
+        .expect("textchannels");
+    let help = command.help_detail_text().to_lowercase();
+    assert!(help.encode_utf16().count() <= 6000);
+    for token in ["reset-name", "reset-viewer-role", "voice-chat"] {
+        assert!(help.contains(token), "missing {token} in help: {help}");
+    }
+    for name in ["reset-name", "reset-viewer-role"] {
+        let option = command
+            .options
+            .iter()
+            .find(|option| option.name == name)
+            .expect("reset control help");
+        let description = option.description.to_lowercase();
+        assert!(
+            description.contains("reset") || description.contains("default"),
+            "{description}"
+        );
+        assert!(!description.is_empty());
+    }
+    let enabled = command
+        .options
+        .iter()
+        .find(|option| option.name == "enabled")
+        .expect("enabled");
+    let description = enabled.description.to_lowercase();
+    assert!(
+        description.contains("keep") || description.contains("preserv"),
+        "omitted toggle must stay unchanged"
+    );
+}
+
 fn settings(enabled: bool) -> TextChannelSettings {
     TextChannelSettings {
         enabled,

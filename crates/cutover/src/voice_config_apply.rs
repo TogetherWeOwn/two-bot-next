@@ -13,8 +13,9 @@
 
 use twilight_model::channel::{Channel, ChannelType};
 use two_bot_core::voice_config::{
-    decode_configuration, validate_configuration, validate_time_zone_change, ChannelKind,
-    ChannelReference, GuildInventory, VoiceConfigError, VoiceConfiguration, MAX_IMPORT_BYTES,
+    decode_configuration, validate_command_role_change, validate_configuration,
+    validate_time_zone_change, ChannelKind, ChannelReference, GuildInventory, VoiceConfigError,
+    VoiceConfiguration, MAX_IMPORT_BYTES,
 };
 use two_bot_core::voice_config_diff::{
     diff_configuration, diff_content_hash, render_preview, skip_unknown_channels,
@@ -82,6 +83,7 @@ pub fn plan_apply(
     let (remaining, skipped) = skip_unknown_channels(&incoming, inventory);
     if let Err(error) = validate_configuration(&remaining, inventory)
         .and_then(|()| validate_time_zone_change(&current.settings.time_zone, &remaining))
+        .and_then(|()| validate_command_role_change(current, &remaining))
     {
         return ApplyPlan::Refuse {
             message: format!("{error} nothing was changed"),
@@ -289,6 +291,42 @@ mod tests {
         let bytes = serde_json::to_vec(&document).unwrap();
         assert!(!matches!(
             plan_apply(&empty_config(), &bytes, &inventory()),
+            ApplyPlan::Refuse { .. }
+        ));
+    }
+
+    #[test]
+    fn a_new_or_changed_global_command_role_is_refused() {
+        let document_with = |role: Option<u64>| {
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&empty_document(GUILD)).unwrap();
+            document["settings"]["command_role_id"] =
+                serde_json::json!(role.map(|id| id.to_string()));
+            serde_json::to_vec(&document).unwrap()
+        };
+        let current_with =
+            |role: Option<u64>| decode_configuration(&document_with(role)).expect("decodes");
+        // The role exists in the inventory, so only the change guard refuses.
+        assert!(matches!(
+            plan_apply(&empty_config(), &document_with(Some(GUILD)), &inventory()),
+            ApplyPlan::Refuse { message }
+                if message.contains("settings.command_role_id") && message.contains("not enforced")
+        ));
+        // The stored role re-imports unchanged, and clearing it is always allowed.
+        let mut kept: serde_json::Value =
+            serde_json::from_slice(&document_with(Some(GUILD))).unwrap();
+        kept["settings"]["creation_enabled"] = serde_json::json!(false);
+        let kept = serde_json::to_vec(&kept).unwrap();
+        assert!(!matches!(
+            plan_apply(&current_with(Some(GUILD)), &kept, &inventory()),
+            ApplyPlan::Refuse { .. }
+        ));
+        assert!(!matches!(
+            plan_apply(
+                &current_with(Some(GUILD)),
+                &document_with(None),
+                &inventory()
+            ),
             ApplyPlan::Refuse { .. }
         ));
     }

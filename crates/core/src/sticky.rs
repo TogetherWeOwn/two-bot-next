@@ -103,6 +103,50 @@ pub fn normalize_debounce(value: Option<i64>) -> Result<u64, StickyError> {
     }
 }
 
+/// Pure proposed configuration shared by preview and save. Keep the original
+/// body for persistence; rendering is bounded separately, never before validation.
+pub struct StickySetup<'a> {
+    pub body: &'a str,
+    pub debounce_seconds: u64,
+}
+
+impl<'a> StickySetup<'a> {
+    pub fn validate(body: &'a str, debounce: Option<i64>) -> Result<Self, StickyError> {
+        validate_body(body)?;
+        Ok(Self {
+            body,
+            debounce_seconds: normalize_debounce(debounce)?,
+        })
+    }
+
+    /// Proposed delivery text, not a live channel message. Use delivery's
+    /// sanitizer first, then break mention pills for this private management view.
+    /// Reserve all framing before truncation so disclosures cannot be lost.
+    #[must_use]
+    pub fn preview_reply(&self) -> String {
+        use crate::message_safety::{content, text_len, truncate, CONTENT_LIMIT};
+
+        let header = format!(
+            "Preview — not saved\nProposed debounce: {}s\n\
+             Delivery permissions and state are not verified. This private rendering is not a live channel message.\n\
+             To save, run /sticky with the same body and debounce, without preview (or preview:false). A later save revalidates.\n\
+             Proposed content:\n",
+            self.debounce_seconds
+        );
+        let body = content(self.body).replace("<@", "<\u{200b}@");
+        let marker = "\n[Content truncated for preview]";
+        let budget = CONTENT_LIMIT.saturating_sub(text_len(&header));
+        if text_len(&body) > budget {
+            format!(
+                "{header}{}{marker}",
+                truncate(&body, budget.saturating_sub(text_len(marker)))
+            )
+        } else {
+            format!("{header}{body}")
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reply text (legacy `discord.ts` ephemeral confirmations)
 // ---------------------------------------------------------------------------

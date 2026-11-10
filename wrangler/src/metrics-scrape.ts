@@ -1,9 +1,9 @@
-import { processIncarnation, type Sample } from "./alert-rules.ts";
+import { JOB_RUNS_JOBS, processIncarnation, type Sample } from "./alert-rules.ts";
 
 /** Required inputs consumed by alert rules; pinned to metrics.rs in tests. */
 export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
-  two_bot_job_last_success_timestamp_seconds: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"] },
-  two_bot_job_consecutive_failures: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"] },
+  two_bot_job_last_success_timestamp_seconds: { job: JOB_RUNS_JOBS },
+  two_bot_job_consecutive_failures: { job: JOB_RUNS_JOBS },
   two_bot_rest_requests_total: {
     route: ["GET /channels/:channel", "GET /channels/:channel/messages", "GET /guilds/:guild", "GET /guilds/:guild/members", "GET /guilds/:guild/scheduled-events", "DELETE /guilds/:guild/bans/:member", "DELETE /channels/:channel/permissions/:overwrite", "PUT /applications/:application/commands", "PUT /applications/:application/guilds/:guild/commands", "POST /interactions/:interaction/:token/callback", "POST /channels/:channel/messages", "DELETE /channels/:channel/messages/:message", "DELETE /guilds/:guild/members/:member", "PUT /guilds/:guild/bans/:member", "PATCH /guilds/:guild/members/:member", "PATCH /channels/:channel", "PUT /channels/:channel/voice-status", "PUT /channels/:channel/permissions/:overwrite", "POST /channels/:channel/messages/bulk-delete", "PUT /guilds/:guild/members/:member/roles/:role", "DELETE /guilds/:guild/members/:member/roles/:role", "POST /guilds/:guild/scheduled-events", "PATCH /guilds/:guild/scheduled-events/:event", "DELETE /guilds/:guild/scheduled-events/:event", "POST /guilds/:guild/channels", "DELETE /channels/:channel", "GET /guilds/:guild/members/:member", "GET /users/@me", "PATCH /webhooks/:application/:token/messages/@original", "other"],
     result: ["2xx", "3xx", "4xx", "429", "5xx", "transport"],
@@ -27,7 +27,7 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
   two_bot_gateway_checkpoint_failures_total: { stage: ["pre_commit", "commit"] },
   two_bot_dispatch_drops_total: { lane: ["messages", "interactions", "registry", "privileged", "busy", "reactions"] },
   two_bot_internal_actions_total: {
-    family: ["announcement", "event", "settings", "moderation", "membership", "other"],
+    family: ["announcement", "event", "settings", "moderation", "membership", "voice", "other"],
     outcome: ["executed", "auth_failure", "unknown_key", "clock_skew", "nonce_replay", "rate_limit", "unknown_action", "action_disabled", "malformed_body", "conflict", "upstream", "internal"],
   },
   // Gateway transport and job-run family. Always emitted on the same render
@@ -40,7 +40,7 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
   two_bot_gateway_latency_seconds: {},
   two_bot_gateway_reconnects_total: {},
   two_bot_handler_duration_seconds_bucket: { le: ["0.001", "0.005", "0.01", "0.05", "0.1", "0.5", "1", "5", "+Inf"] },
-  two_bot_job_runs_total: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"], outcome: ["success", "failure"] },
+  two_bot_job_runs_total: { job: JOB_RUNS_JOBS, outcome: ["success", "failure"] },
 };
 
 /**
@@ -78,7 +78,9 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
  */
 export const ALERT_OPTIONAL_INPUT_LABELS: Record<string, Record<string, readonly string[]>> = {
   two_bot_gateway_prefix_trigger_refused_total: { reason: ["verdict", "other"] },
-  two_bot_job_last_error_class: { job: ["invite_snapshot", "session_checkpoint", "counter", "rank", "scheduled_events", "settings", "presence_probe", "community_scorecard", "inactivity", "audit_retry", "scheduled_messages", "feeds", "self_role_recovery", "member_unban_sweep", "automod_expiry", "other"], class: ["database", "rest", "configuration", "timeout", "panic", "feed", "recovery_required"] },
+  // Rollback containers predate this counter; validate it only when present.
+  two_bot_gateway_drain_skips_total: {},
+  two_bot_job_last_error_class: { job: JOB_RUNS_JOBS, class: ["database", "rest", "configuration", "timeout", "panic", "feed", "recovery_required"] },
   two_bot_voice_creator_map_generation: {},
   two_bot_voice_creator_map_age_seconds: {},
   two_bot_rest_guard_breaker_open: {},
@@ -139,8 +141,27 @@ function combinations(axes: Record<string, readonly string[]>): Record<string, s
   return rows;
 }
 
+// The `voice` internal-actions family postdates older containers: a
+// rolled-back container emits the other six families but no `voice` rows.
+// Requiring them would turn every otherwise-valid scrape into a failure and
+// starve all alert rules until the newer container returns, so the `voice`
+// rows validate when present but are never required. Every other required
+// combination keeps its fail-closed shape: exactly one row per combination.
+// A partially present `voice` family is still a failure (see below): a
+// missing outcome row would undercount refusals and clear a rising streak,
+// so the family is all-or-nothing — absent entirely, or complete.
 const REQUIRED_INPUTS = new Set(Object.entries(ALERT_INPUT_LABELS).flatMap(([name, axes]) =>
-  combinations(axes).map((labels) => identity(name, labels))));
+  combinations(axes)
+    .filter((labels) => !(name === "two_bot_internal_actions_total" && labels["family"] === "voice"))
+    .map((labels) => identity(name, labels))));
+
+// Every `voice`-family combination. When a scrape carries any of these rows
+// it must carry all of them; when it carries none the older container is
+// accepted as-is.
+const VOICE_INTERNAL_ACTIONS_INPUTS = new Set(
+  combinations(ALERT_INPUT_LABELS["two_bot_internal_actions_total"]!)
+    .filter((labels) => labels["family"] === "voice")
+    .map((labels) => identity("two_bot_internal_actions_total", labels)));
 
 // Prometheus numbers, not JavaScript's empty/hexadecimal/Infinity coercions.
 const NUMBER = "(?:[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?|NaN|[+-]?Inf)";
@@ -196,5 +217,7 @@ export function parseAlertScrape(text: string): Sample[] | null {
   }
   const incarnation = samples.filter((sample) => sample.name === "two_bot_process_incarnation");
   if (incarnation.length > 0 && processIncarnation(incarnation) === undefined) return null;
-  return [...REQUIRED_INPUTS].every((key) => seen.has(key)) ? samples : null;
+  const voiceSeen = [...VOICE_INTERNAL_ACTIONS_INPUTS].some((key) => seen.has(key));
+  const voiceComplete = !voiceSeen || [...VOICE_INTERNAL_ACTIONS_INPUTS].every((key) => seen.has(key));
+  return [...REQUIRED_INPUTS].every((key) => seen.has(key)) && voiceComplete ? samples : null;
 }

@@ -22,6 +22,10 @@ use two_bot_core::backup::dump_file::{
     DumpTableInfo, SequenceMark, DESTINATION_OWNED_COLUMNS, DUMP_TABLES, DUMP_VERSION,
     EXCLUDED_TABLES, OPTIONAL_LEGACY_TABLES,
 };
+use two_bot_core::voice_access::{
+    may_create_room, may_use_command, AccessControls, AccessDecision, AccessDenyReason,
+    AccessMember,
+};
 use two_bot_testsupport::TestDatabase;
 
 // Frozen released v13: the voice pair and token registry, before starboard.
@@ -229,6 +233,32 @@ async fn seed(pool: &PgPool) {
     .execute(pool)
     .await
     .unwrap();
+}
+
+/// Simulate a backup source that had not applied 0469 (and so not 0470
+/// either). The seed's legacy voice rows are the pre-0469/0470 shape, so the
+/// dump must record pre-0469 migration evidence; with the migrations
+/// recorded, restore (correctly) treats the archive as post-cutover and
+/// restores both voice stores verbatim instead of replaying the
+/// translations.
+async fn forget_voice_authority_migration(pool: &PgPool) {
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version >= 469")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// The creation switch and guild-wide command role in
+/// `voice_access_controls`, by guild: the columns the 0470 replay merges
+/// (and the 0469 replay must not touch).
+async fn voice_control_fields(pool: &PgPool) -> Vec<(String, bool, Option<String>)> {
+    sqlx::query_as(
+        "SELECT guild_id, room_creation_enabled, required_role_id \
+         FROM voice_access_controls ORDER BY guild_id COLLATE \"C\"",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -993,6 +1023,8 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     };
     let pool = db.pool();
     seed(pool).await;
+    forget_voice_authority_migration(pool).await;
+    let control_fields_before = voice_control_fields(pool).await;
     let tables = covered_tables(pool).await;
     let before = snapshot(pool, &tables).await;
     let ledgers = vec![
@@ -1009,6 +1041,10 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     assert_eq!(
         manifest.schema_migrations,
         vec!["legacy-ledger-diagnostic", "target-ledger"]
+    );
+    assert!(
+        !manifest.cutover_migrations.is_empty() && !manifest.applied_cutover(469),
+        "the simulated pre-0469 source records pre-0469 cutover evidence"
     );
     let contents = inspect(&original).unwrap();
     assert_archive_matches(&contents, &before);
@@ -1045,7 +1081,242 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         report.quarantined_unbans, 0,
         "terminal expiries stay terminal"
     );
-    assert_eq!(snapshot(pool, &tables).await, before);
+    // The seed's legacy voice rows are the pre-0469/0470 shape: restore
+    // replays both translations instead of round-tripping them into stores
+    // nothing reads. Every other table matches the archive exactly; the
+    // four voice tables get the translated state asserted below, and that
+    // state is the baseline for the restores that follow.
+    assert_eq!(report.translated_voice_command_roles, 4);
+    assert_eq!(report.translated_voice_command_role_members, 3);
+    assert_eq!(report.translated_voice_creation_gates, 3);
+    assert_eq!(report.voice_access_controls_added, 2);
+    let command_roles: Vec<(String, String)> = sqlx::query_as(
+        "SELECT guild_id, command_roles::text FROM voice_access_controls \
+         ORDER BY guild_id COLLATE \"C\"",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let command_roles: Vec<(String, Value)> = command_roles
+        .into_iter()
+        .map(|(guild, roles)| (guild, serde_json::from_str(&roles).unwrap()))
+        .collect();
+    assert_eq!(
+        command_roles,
+        vec![
+            (
+                "100000000000000001".to_owned(),
+                // 'kick' keeps the enforced list over the legacy one,
+                // 'limit' moves across empty, 'notavoicecommand' is dropped,
+                // 'template' was only ever in the enforced store.
+                json!({"kick": ["100000000000000041", "100000000000000042"],
+                       "limit": [], "template": []}),
+            ),
+            ("100000000000000002".to_owned(), json!({})),
+            (
+                "100000000000000003".to_owned(),
+                json!({"private": ["100000000000000044"]}),
+            ),
+            ("100000000000000004".to_owned(), json!({})),
+        ],
+        "0469 replay merges legacy restrictions into the enforced store"
+    );
+    // The 0470 replay then merges the legacy creation switch and command
+    // role into the same store, tighten only: guild ...001's enforced
+    // values were already tighter than its legacy row and win unchanged,
+    // ...002 turns creation off and gains the imported role, ...003 gains
+    // the imported role on the row the 0469 replay inserted (which starts
+    // from the column defaults, hence creation on), and ...004 has its
+    // enforced row inserted with creation off.
+    let control_fields_after = voice_control_fields(pool).await;
+    assert_eq!(
+        control_fields_after[0], control_fields_before[0],
+        "guild ...001's enforced gates were already tighter than the legacy row"
+    );
+    assert_eq!(
+        control_fields_after,
+        vec![
+            (
+                "100000000000000001".to_owned(),
+                false,
+                Some("100000000000000040".to_owned()),
+            ),
+            (
+                "100000000000000002".to_owned(),
+                false,
+                Some("100000000000000045".to_owned()),
+            ),
+            (
+                "100000000000000003".to_owned(),
+                true,
+                Some("100000000000000046".to_owned()),
+            ),
+            ("100000000000000004".to_owned(), false, None),
+        ],
+        "0470 replay merges the legacy creation switch and command role, tighten only"
+    );
+    let mirror_fields: Vec<(String, bool, Option<String>)> = sqlx::query_as(
+        "SELECT guild_id, creation_enabled, command_role_id FROM voice_guild_settings \
+         ORDER BY guild_id COLLATE \"C\"",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        mirror_fields, control_fields_after,
+        "the replay syncs the legacy mirror columns to the enforced values"
+    );
+    // Gate decisions, not row equality: decode every restored row in full —
+    // creation switch, required role and per-command restrictions — and run
+    // non-admin members through the runtime gates, for all four merge cases.
+    let gate_controls = |guild: &str| AccessControls {
+        room_creation_enabled: control_fields_after
+            .iter()
+            .find(|(g, ..)| g == guild)
+            .unwrap()
+            .1,
+        required_role: control_fields_after
+            .iter()
+            .find(|(g, ..)| g == guild)
+            .unwrap()
+            .2
+            .as_deref()
+            .map(|id| id.parse().unwrap()),
+        command_roles: command_roles
+            .iter()
+            .find(|(g, _)| g == guild)
+            .unwrap()
+            .1
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(command, ids)| {
+                (
+                    command.clone(),
+                    ids.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|id| id.as_str().unwrap().parse::<u64>().unwrap())
+                        .collect(),
+                )
+            })
+            .collect(),
+    };
+    let member = |roles: &[u64]| AccessMember {
+        is_admin: false,
+        roles: roles.to_vec(),
+    };
+    let roleless = member(&[]);
+    // ...001: the enforced values were already tighter, so the displaced
+    // legacy command role admits nobody and the enforced one still does.
+    let enforced = gate_controls("100000000000000001");
+    assert!(
+        !may_create_room(&enforced),
+        "guild ...001's enforced creation switch stays off"
+    );
+    assert_eq!(
+        may_use_command(&enforced, &member(&[100_000_000_000_000_040]), "create"),
+        AccessDecision::Allow,
+        "holders of guild ...001's enforced role pass the gate"
+    );
+    assert_eq!(
+        may_use_command(&enforced, &member(&[100_000_000_000_000_043]), "create"),
+        AccessDecision::Deny(AccessDenyReason::RequiredRole),
+        "guild ...001's displaced legacy role is not let back in"
+    );
+    assert_eq!(
+        may_use_command(&enforced, &member(&[100_000_000_000_000_040]), "limit"),
+        AccessDecision::Deny(AccessDenyReason::CommandRestricted),
+        "a legacy restriction with no member roles denies every non-admin"
+    );
+    // ...002: the imported switch and role land on a permissive row.
+    let merged = gate_controls("100000000000000002");
+    assert!(
+        !may_create_room(&merged),
+        "the imported creation switch is off after restore"
+    );
+    assert_eq!(
+        may_use_command(&merged, &roleless, "create"),
+        AccessDecision::Deny(AccessDenyReason::RequiredRole),
+        "the imported command role gates after restore"
+    );
+    assert_eq!(
+        may_use_command(&merged, &member(&[100_000_000_000_000_045]), "create"),
+        AccessDecision::Allow,
+        "holders of the imported role still pass the gate"
+    );
+    // ...003: the imported role lands on the row the 0469 replay inserted,
+    // on top of the translated 'private' restriction, so a member needs
+    // both roles: either one alone is denied by the other gate.
+    let inserted = gate_controls("100000000000000003");
+    assert!(
+        may_create_room(&inserted),
+        "guild ...003 created no legacy switch, so creation stays on"
+    );
+    assert_eq!(
+        may_use_command(&inserted, &roleless, "private"),
+        AccessDecision::Deny(AccessDenyReason::RequiredRole),
+        "the imported role gates before the per-command restriction"
+    );
+    assert_eq!(
+        may_use_command(&inserted, &member(&[100_000_000_000_000_044]), "private"),
+        AccessDecision::Deny(AccessDenyReason::RequiredRole),
+        "the per-command role alone does not clear the imported role gate"
+    );
+    assert_eq!(
+        may_use_command(&inserted, &member(&[100_000_000_000_000_046]), "private"),
+        AccessDecision::Deny(AccessDenyReason::CommandRestricted),
+        "the imported role alone does not clear the per-command restriction"
+    );
+    assert_eq!(
+        may_use_command(
+            &inserted,
+            &member(&[100_000_000_000_000_044, 100_000_000_000_000_046]),
+            "private",
+        ),
+        AccessDecision::Allow,
+        "holders of both roles pass both gates"
+    );
+    // ...004: the translation inserts the enforced row with creation off;
+    // the switch gates creation only, never commands on existing rooms.
+    let switched_off = gate_controls("100000000000000004");
+    assert!(
+        !may_create_room(&switched_off),
+        "guild ...004's inserted row carries the imported creation switch"
+    );
+    assert_eq!(
+        may_use_command(&switched_off, &roleless, "limit"),
+        AccessDecision::Allow,
+        "the creation switch is not a command gate"
+    );
+    for legacy in ["voice_command_roles", "voice_command_role_members"] {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(legacy)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "the replay empties legacy {legacy}");
+    }
+    let restored_snapshot = snapshot(pool, &tables).await;
+    for (table, expected) in &before {
+        if [
+            "voice_access_controls",
+            "voice_command_roles",
+            "voice_command_role_members",
+            "voice_guild_settings",
+        ]
+        .contains(&table.as_str())
+        {
+            continue;
+        }
+        assert_eq!(
+            &restored_snapshot[table], expected,
+            "{table} round-trips exactly"
+        );
+    }
+    let before = restored_snapshot;
     assert_fresh_cas_tokens(pool, cas_before).await;
     assert_eq!(triggers(pool).await, guard_before);
     assert_eq!(snapshot(pool, &ledgers).await, ledger_before);
@@ -1087,6 +1358,10 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
             .await
             .expect("restore must ignore manifest and row block order");
         assert!(report.ok);
+        assert_eq!(report.translated_voice_command_roles, 4);
+        assert_eq!(report.translated_voice_command_role_members, 3);
+        assert_eq!(report.translated_voice_creation_gates, 3);
+        assert_eq!(report.voice_access_controls_added, 2);
         assert!(report.dropped_columns.is_empty());
         assert!(report.initialized_tables.is_empty());
         assert_eq!(
@@ -1134,6 +1409,294 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     ] {
         assert_sqlstate(&sqlx::query(audited(statement.to_owned())).execute(pool).await.unwrap_err(), "23505");
     }
+    target.close().await.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn post_0469_archive_restores_voice_stores_verbatim() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    // The post-0469 import -> unrestrict shape: /import mirrored a 'kick'
+    // restriction into the legacy tables, then /access unrestrict removed
+    // it from the gate's store only. The gate's empty map is authoritative;
+    // the legacy row is a stale backout mirror that restore must not
+    // resurrect. The ledger still records 0469, unlike the pre-0469 seed.
+    sqlx::raw_sql(
+        "INSERT INTO voice_access_controls (guild_id, room_creation_enabled, required_role_id, \
+             command_roles) \
+         VALUES ('100000000000000001', FALSE, '100000000000000040', '{}'::jsonb); \
+         INSERT INTO voice_command_roles (guild_id, command) \
+         VALUES ('100000000000000001', 'kick'); \
+         INSERT INTO voice_command_role_members (guild_id, command, role_id) \
+         VALUES ('100000000000000001', 'kick', '100000000000000043');",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let directory = ArchiveDirectory::new();
+    let path = directory.path("post-0469.ndjson.gz");
+    let manifest = dump(pool, &path).await.unwrap();
+    assert!(
+        manifest.applied_cutover(469),
+        "a migrated source records that 0469 was applied"
+    );
+
+    let target = database().await.expect("test bootstrap already configured");
+    let pool = target.pool();
+    let report = restore(pool, &path).await.unwrap();
+    assert!(report.ok);
+    assert_eq!(report.translated_voice_command_roles, 0);
+    assert_eq!(report.translated_voice_command_role_members, 0);
+    assert_eq!(report.translated_voice_creation_gates, 0);
+    assert_eq!(report.voice_access_controls_added, 0);
+    // Both stores restore verbatim: the lifted restriction stays lifted and
+    // the backout mirror survives untouched.
+    let controls: (bool, Option<String>, String) = sqlx::query_as(
+        "SELECT room_creation_enabled, required_role_id, command_roles::text \
+         FROM voice_access_controls WHERE guild_id = '100000000000000001'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(!controls.0, "creation switch round-trips");
+    assert_eq!(controls.1.as_deref(), Some("100000000000000040"));
+    let parsed: BTreeMap<String, Vec<String>> = serde_json::from_str(&controls.2).unwrap();
+    assert!(
+        parsed.is_empty(),
+        "the lifted kick restriction is not resurrected from the mirror: {parsed:?}"
+    );
+    let gate = AccessControls {
+        room_creation_enabled: controls.0,
+        required_role: controls.1.as_deref().map(|id| id.parse().unwrap()),
+        command_roles: parsed
+            .into_iter()
+            .map(|(command, ids)| (command, ids.iter().map(|id| id.parse().unwrap()).collect()))
+            .collect(),
+    };
+    assert_eq!(
+        may_use_command(
+            &gate,
+            &AccessMember {
+                is_admin: false,
+                // Holds the guild-wide required role but not the lifted
+                // restriction's old role.
+                roles: vec![100_000_000_000_000_040],
+            },
+            "kick",
+        ),
+        AccessDecision::Allow,
+        "a member without the old role can use the lifted command after restore"
+    );
+    let mirror: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.command, m.role_id FROM voice_command_roles c \
+         JOIN voice_command_role_members m \
+           ON m.guild_id = c.guild_id AND m.command = c.command \
+         WHERE c.guild_id = '100000000000000001'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        mirror,
+        vec![("kick".to_owned(), "100000000000000043".to_owned())],
+        "the legacy backout mirror restores verbatim"
+    );
+    target.close().await.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn between_0469_and_0470_archive_replays_only_the_0470_translation() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    // A source that applied 0469 but not 0470: a 'kick' restriction was
+    // lifted in the gate's store after 0469 (its legacy mirror row is
+    // stale), while /import's creation switch and command role still sit
+    // only in voice_guild_settings, never enforced. Restore must replay
+    // 0470 and only 0470: the switch and role land in the gate's store,
+    // the lifted restriction stays lifted.
+    sqlx::raw_sql(
+        "INSERT INTO voice_access_controls (guild_id, room_creation_enabled, required_role_id, \
+             command_roles) \
+         VALUES ('100000000000000001', TRUE, NULL, '{}'::jsonb); \
+         INSERT INTO voice_command_roles (guild_id, command) \
+         VALUES ('100000000000000001', 'kick'); \
+         INSERT INTO voice_command_role_members (guild_id, command, role_id) \
+         VALUES ('100000000000000001', 'kick', '100000000000000043'); \
+         INSERT INTO voice_guild_settings (guild_id, creation_enabled, unique_names, \
+             no_game_label, force_single_game, count_members_without_activity, time_zone, \
+             text_channel_name, text_viewer_role_id, command_role_id) \
+         VALUES ('100000000000000001', FALSE, TRUE, 'General', FALSE, TRUE, 'Europe/London', \
+             'voice-chat', NULL, '100000000000000047'); \
+         DELETE FROM _sqlx_migrations WHERE version >= 470;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let directory = ArchiveDirectory::new();
+    let path = directory.path("between-0469-0470.ndjson.gz");
+    let manifest = dump(pool, &path).await.unwrap();
+    assert!(
+        manifest.applied_cutover(469) && !manifest.applied_cutover(470),
+        "the simulated source records 0469 applied and 0470 not"
+    );
+
+    let target = database().await.expect("test bootstrap already configured");
+    let pool = target.pool();
+    let report = restore(pool, &path).await.unwrap();
+    assert!(report.ok);
+    assert_eq!(report.translated_voice_command_roles, 0);
+    assert_eq!(report.translated_voice_command_role_members, 0);
+    assert_eq!(report.translated_voice_creation_gates, 1);
+    assert_eq!(report.voice_access_controls_added, 0);
+    let controls: (bool, Option<String>, String) = sqlx::query_as(
+        "SELECT room_creation_enabled, required_role_id, command_roles::text \
+         FROM voice_access_controls WHERE guild_id = '100000000000000001'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(!controls.0, "the imported creation switch lands off");
+    assert_eq!(controls.1.as_deref(), Some("100000000000000047"));
+    let parsed: BTreeMap<String, Vec<String>> = serde_json::from_str(&controls.2).unwrap();
+    assert!(
+        parsed.is_empty(),
+        "the lifted kick restriction is not resurrected: {parsed:?}"
+    );
+    let gate = AccessControls {
+        room_creation_enabled: controls.0,
+        required_role: controls.1.as_deref().map(|id| id.parse().unwrap()),
+        command_roles: parsed
+            .into_iter()
+            .map(|(command, ids)| (command, ids.iter().map(|id| id.parse().unwrap()).collect()))
+            .collect(),
+    };
+    assert!(
+        !may_create_room(&gate),
+        "creation is off for the guild after restore"
+    );
+    let roleless = AccessMember {
+        is_admin: false,
+        roles: Vec::new(),
+    };
+    assert_eq!(
+        may_use_command(&gate, &roleless, "create"),
+        AccessDecision::Deny(AccessDenyReason::RequiredRole),
+        "the imported command role gates after restore"
+    );
+    assert_eq!(
+        may_use_command(
+            &gate,
+            &AccessMember {
+                is_admin: false,
+                // Holds the imported guild-wide role but not the lifted
+                // restriction's old role.
+                roles: vec![100_000_000_000_000_047],
+            },
+            "kick",
+        ),
+        AccessDecision::Allow,
+        "the lifted command restriction stays lifted for role holders"
+    );
+    let mirror: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.command, m.role_id FROM voice_command_roles c \
+         JOIN voice_command_role_members m \
+           ON m.guild_id = c.guild_id AND m.command = c.command \
+         WHERE c.guild_id = '100000000000000001'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        mirror,
+        vec![("kick".to_owned(), "100000000000000043".to_owned())],
+        "the post-0469 legacy mirror restores verbatim"
+    );
+    target.close().await.unwrap();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn post_0470_archive_restores_creation_gates_verbatim() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    // The post-0470 import -> lift shape: /import wrote the creation switch
+    // and command role to both stores, then /access lifted both in the
+    // gate's store only. The permissive gate row is authoritative; the
+    // voice_guild_settings columns are a stale backout mirror that restore
+    // must not resurrect. The ledger still records 0470.
+    sqlx::raw_sql(
+        "INSERT INTO voice_access_controls (guild_id, room_creation_enabled, required_role_id, \
+             command_roles) \
+         VALUES ('100000000000000001', TRUE, NULL, '{}'::jsonb); \
+         INSERT INTO voice_guild_settings (guild_id, creation_enabled, unique_names, \
+             no_game_label, force_single_game, count_members_without_activity, time_zone, \
+             text_channel_name, text_viewer_role_id, command_role_id) \
+         VALUES ('100000000000000001', FALSE, TRUE, 'General', FALSE, TRUE, 'Europe/London', \
+             'voice-chat', NULL, '100000000000000047');",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let directory = ArchiveDirectory::new();
+    let path = directory.path("post-0470.ndjson.gz");
+    let manifest = dump(pool, &path).await.unwrap();
+    assert!(
+        manifest.applied_cutover(470),
+        "a migrated source records that 0470 was applied"
+    );
+
+    let target = database().await.expect("test bootstrap already configured");
+    let pool = target.pool();
+    let report = restore(pool, &path).await.unwrap();
+    assert!(report.ok);
+    assert_eq!(report.translated_voice_creation_gates, 0);
+    assert_eq!(report.voice_access_controls_added, 0);
+    // Both stores restore verbatim: the lifted gates stay lifted and the
+    // backout mirror survives untouched (no mirror sync either).
+    let controls: Vec<(String, bool, Option<String>)> = voice_control_fields(pool).await;
+    assert_eq!(
+        controls,
+        vec![("100000000000000001".to_owned(), true, None)],
+        "the lifted creation switch and role stay lifted"
+    );
+    let mirror: (bool, Option<String>) = sqlx::query_as(
+        "SELECT creation_enabled, command_role_id FROM voice_guild_settings \
+         WHERE guild_id = '100000000000000001'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        mirror,
+        (false, Some("100000000000000047".to_owned())),
+        "the legacy backout mirror restores verbatim"
+    );
+    let gate = AccessControls {
+        room_creation_enabled: controls[0].1,
+        required_role: controls[0].2.as_deref().map(|id| id.parse().unwrap()),
+        command_roles: BTreeMap::new(),
+    };
+    assert!(may_create_room(&gate), "creation stays on after restore");
+    assert_eq!(
+        may_use_command(
+            &gate,
+            &AccessMember {
+                is_admin: false,
+                roles: Vec::new(),
+            },
+            "create",
+        ),
+        AccessDecision::Allow,
+        "a roleless member is not gated by the lifted command role"
+    );
     target.close().await.unwrap();
     db.close().await.unwrap();
 }
@@ -1575,10 +2138,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     for name in [
         "game_activity_guild_aggregates",
         "assistant_monthly_builds",
@@ -1593,6 +2156,7 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1619,7 +2183,8 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1640,6 +2205,7 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1666,10 +2232,10 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     for name in [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
@@ -1682,6 +2248,7 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1706,7 +2273,8 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1725,6 +2293,7 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1751,10 +2320,10 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
     // epoch-claim guard but predates the delete tombstones, token registry
     // event voice pair and starboard tables.
@@ -1769,6 +2338,7 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1792,7 +2362,8 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1810,6 +2381,7 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1844,10 +2416,10 @@ async fn v11_archive_restores_and_clears_newer_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     // Frozen tombstone-only v11 shape: the merged v11 writer carried the
     // delete tombstones but predates the token registry event voice pair and starboard tables.
     for name in [
@@ -1860,6 +2432,7 @@ async fn v11_archive_restores_and_clears_newer_registry() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -1882,7 +2455,8 @@ async fn v11_archive_restores_and_clears_newer_registry() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1899,6 +2473,7 @@ async fn v11_archive_restores_and_clears_newer_registry() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -1933,10 +2508,10 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     for table in [
         "event_voice_channels",
         "event_voice_presence",
@@ -1946,6 +2521,7 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let rows = old.buffers.remove(table).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {table}");
@@ -1967,7 +2543,8 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     // This test deliberately replaces a reused isolated rehearsal target.
@@ -1983,6 +2560,7 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2017,10 +2595,10 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     // Frozen registry-present v12 shape: the released writer carried the
     // token registry but predates the event voice pair and starboard tables.
     for name in [
@@ -2032,6 +2610,7 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -2059,7 +2638,8 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     assert_eq!(
@@ -2095,6 +2675,7 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2141,10 +2722,10 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
+    assert_eq!(old.manifest.version, 16);
     for name in [
         "starboard_config",
         "starboard_starrers",
@@ -2152,6 +2733,7 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         assert!(
             !old.buffers.remove(name).unwrap().is_empty(),
@@ -2185,7 +2767,8 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
             "starboard_posts",
             "giveaways",
             "giveaway_entries",
-            "giveaway_draws"
+            "giveaway_draws",
+            "event_instance_windows"
         ]
     );
     for name in &restored_tables {
@@ -2234,6 +2817,7 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
+        "event_instance_windows",
     ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
@@ -2270,11 +2854,16 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v15-source.ndjson.gz");
+    let current_path = directory.path("v16-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 15);
-    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+    assert_eq!(old.manifest.version, 16);
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "event_instance_windows",
+    ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
         old.manifest.tables.retain(|table| table.name != name);
@@ -2293,7 +2882,12 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
     assert_eq!(inspected.manifest.version, 14);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["giveaways", "giveaway_entries", "giveaway_draws"]
+        [
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
+            "event_instance_windows"
+        ]
     );
     sqlx::query("DELETE FROM starboard_starrers")
         .execute(pool)
@@ -2335,7 +2929,12 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         archived,
         "v14 restores starboard, voice and registry data"
     );
-    for name in ["giveaways", "giveaway_entries", "giveaway_draws"] {
+    for name in [
+        "giveaways",
+        "giveaway_entries",
+        "giveaway_draws",
+        "event_instance_windows",
+    ] {
         let count: i64 = sqlx::query_scalar(audited(format!(
             "SELECT COUNT(*) FROM {}",
             identifier(name)
@@ -2368,6 +2967,72 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         .await
         .unwrap();
     assert!(members > 0, "older covered data is restored, not discarded");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v15_archive_restores_and_clears_newer_event_instance_windows_without_backfill() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let preserved = vec![
+        "giveaways".to_owned(),
+        "giveaway_entries".to_owned(),
+        "giveaway_draws".to_owned(),
+        "scheduled_events".to_owned(),
+        "event_voice_channels".to_owned(),
+    ];
+    let archived = snapshot(pool, &preserved).await;
+    for name in &preserved {
+        assert!(
+            !archived[name].rows.is_empty(),
+            "v15 fixture must populate {name}"
+        );
+    }
+    let directory = ArchiveDirectory::new();
+    let current_path = directory.path("v16-source.ndjson.gz");
+    dump(pool, &current_path).await.unwrap();
+    let mut old = inspect(&current_path).unwrap();
+    assert_eq!(old.manifest.version, 16);
+    let windows = old.buffers.remove("event_instance_windows").unwrap();
+    assert_eq!(
+        windows.len(),
+        2,
+        "fixture must populate the instance windows"
+    );
+    old.manifest
+        .tables
+        .retain(|table| table.name != "event_instance_windows");
+    old.manifest.version = 15;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let old_path = directory.path("pre-instance-windows-v15.ndjson.gz");
+    write_archive(&old_path, &old);
+    let inspected = inspect(&old_path).expect("released v15 archive remains readable");
+    assert_eq!(inspected.manifest.version, 15);
+    assert_eq!(
+        inspected.manifest.missing_tables(),
+        ["event_instance_windows"]
+    );
+    // The v15 archive carries no windows. A destination window must not
+    // survive, and no window may be invented from the restored bindings.
+    forget_moderation_history(pool).await;
+    let report = restore(pool, &old_path).await.unwrap();
+    assert!(report.ok);
+    assert_eq!(
+        snapshot(pool, &preserved).await,
+        archived,
+        "v15 restores giveaways, mirror and voice claims"
+    );
+    let windows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_instance_windows")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        windows, 0,
+        "a pre-v16 restore clears the windows and never backfills liveness"
+    );
     db.close().await.unwrap();
 }
 
@@ -2695,6 +3360,8 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     };
     let source = db.pool();
     seed(source).await;
+    forget_voice_authority_migration(source).await;
+    let control_fields_before = voice_control_fields(source).await;
     let tables = covered_tables(source).await;
     let before = snapshot(source, &tables).await;
     let version = schema_version(source).await;
@@ -2741,6 +3408,10 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     let contents = inspect(archive).unwrap();
     assert_archive_matches(&contents, &before);
     assert_eq!(contents.manifest.events_sequence, 107);
+    assert!(
+        !contents.manifest.applied_cutover(469),
+        "the shipped backup records the simulated pre-0469 source evidence"
+    );
 
     // Each run allocates a NEW migrated scratch database and retains its
     // evidence, as the drill unit does. Nothing restores into a reused target.
@@ -2827,6 +3498,26 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
             json!(false),
             "month {month}: ban ownership evidence present"
         );
+        assert_eq!(
+            receipt["translated_voice_command_roles"],
+            json!(4),
+            "month {month}: legacy restrictions translated"
+        );
+        assert_eq!(
+            receipt["translated_voice_command_role_members"],
+            json!(3),
+            "month {month}: legacy restriction members translated"
+        );
+        assert_eq!(
+            receipt["translated_voice_creation_gates"],
+            json!(3),
+            "month {month}: legacy creation gates tightened for three guilds"
+        );
+        assert_eq!(
+            receipt["voice_access_controls_added"],
+            json!(2),
+            "month {month}: translations inserted two guild controls rows"
+        );
         assert!(
             receipt["restored"].as_object().is_some(),
             "month {month}: receipt reports per-table restored counts"
@@ -2857,7 +3548,89 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
                 }
             }
         }
-        assert_eq!(after, expected, "month {month}: every archived row");
+        assert_eq!(
+            after["voice_command_roles"].rows.len(),
+            0,
+            "month {month}: the 0469 replay empties the legacy tables"
+        );
+        assert_eq!(after["voice_command_role_members"].rows.len(), 0);
+        let controls_before = before["voice_access_controls"].rows.len();
+        assert_eq!(
+            after["voice_access_controls"].rows.len(),
+            controls_before + 2,
+            "month {month}: the voice replays add the legacy-only guilds"
+        );
+        let command_roles: Vec<(String, String)> = sqlx::query_as(
+            "SELECT guild_id, command_roles::text FROM voice_access_controls \
+             ORDER BY guild_id COLLATE \"C\"",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let command_roles: Vec<(String, Value)> = command_roles
+            .into_iter()
+            .map(|(guild, roles)| (guild, serde_json::from_str(&roles).unwrap()))
+            .collect();
+        assert_eq!(
+            command_roles,
+            vec![
+                (
+                    "100000000000000001".to_owned(),
+                    json!({"kick": ["100000000000000041", "100000000000000042"],
+                           "limit": [], "template": []}),
+                ),
+                ("100000000000000002".to_owned(), json!({})),
+                (
+                    "100000000000000003".to_owned(),
+                    json!({"private": ["100000000000000044"]}),
+                ),
+                ("100000000000000004".to_owned(), json!({})),
+            ],
+            "month {month}: the 0469 replay merges legacy restrictions"
+        );
+        let control_fields_after = voice_control_fields(&pool).await;
+        assert_eq!(
+            control_fields_after[0], control_fields_before[0],
+            "month {month}: guild ...001's enforced gates were already tighter"
+        );
+        assert_eq!(
+            control_fields_after,
+            vec![
+                (
+                    "100000000000000001".to_owned(),
+                    false,
+                    Some("100000000000000040".to_owned()),
+                ),
+                (
+                    "100000000000000002".to_owned(),
+                    false,
+                    Some("100000000000000045".to_owned()),
+                ),
+                (
+                    "100000000000000003".to_owned(),
+                    true,
+                    Some("100000000000000046".to_owned()),
+                ),
+                ("100000000000000004".to_owned(), false, None),
+            ],
+            "month {month}: the 0470 replay merges the legacy creation gates"
+        );
+        for (table, expected_table) in &expected {
+            if [
+                "voice_access_controls",
+                "voice_command_roles",
+                "voice_command_role_members",
+                "voice_guild_settings",
+            ]
+            .contains(&table.as_str())
+            {
+                continue;
+            }
+            assert_eq!(
+                &after[table], expected_table,
+                "month {month}: every archived row in {table}"
+            );
+        }
         assert_fresh_cas_tokens(&pool, cas_before).await;
         assert_eq!(
             triggers(&pool).await,

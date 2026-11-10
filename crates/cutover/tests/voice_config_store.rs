@@ -6,9 +6,14 @@ use serde_json::json;
 use sqlx::{postgres::PgConnectOptions, postgres::PgPoolOptions, PgPool, Postgres, QueryBuilder};
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use two_bot_core::voice_access::{
+    may_create_room, may_use_command, AccessControls, AccessDecision, AccessDenyReason,
+    AccessMember, VOICE_COMMANDS,
+};
 use two_bot_core::voice_config::{
     export_configuration, import_configuration, ChannelKind, ChannelReference, ChannelTemplates,
-    CreatorConfiguration, GuildInventory, PermissionSource, RoomPosition, VoiceConfiguration,
+    CommandRoles, CreatorConfiguration, GuildInventory, PermissionSource, RoomPosition,
+    VoiceConfiguration,
 };
 use two_bot_core::voice_rooms::{CreatorChannel, TextCompanion, VoiceRoom};
 use two_bot_core::voice_text_channel::TextChannelSettings;
@@ -184,8 +189,7 @@ async fn config_rows(pool: &PgPool, guild: &str) -> Result<i64, sqlx::Error> {
               + (SELECT count(*) FROM voice_logging_mention_members WHERE guild_id = $1)
               + (SELECT count(*) FROM voice_logging_mention_roles WHERE guild_id = $1)
               + (SELECT count(*) FROM voice_guild_settings WHERE guild_id = $1)
-              + (SELECT count(*) FROM voice_command_roles WHERE guild_id = $1)
-              + (SELECT count(*) FROM voice_command_role_members WHERE guild_id = $1)",
+              + (SELECT count(*) FROM voice_access_controls WHERE guild_id = $1)",
     )
     .bind(guild)
     .fetch_one(pool)
@@ -251,6 +255,224 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     assert_eq!(again, stored);
     assert_eq!(export_configuration(&again, &inventory)?, exported);
 
+    // The imported gates are the ones the runtime enforces: the gates read
+    // `PgRoomStore::access_controls`, the store adapter behind
+    // `RoomPersistence::access_controls`. The fixture imports creation on
+    // and a guild-wide command role of 201 alongside its restrictions.
+    let gated = rooms.access_controls(GUILD).await?;
+    assert!(gated.room_creation_enabled);
+    assert_eq!(gated.required_role, Some(201));
+    assert_eq!(
+        gated.command_roles,
+        BTreeMap::from([
+            ("kick".to_owned(), vec![201, 2010]),
+            ("limit".to_owned(), vec![]),
+        ])
+    );
+    let member = |roles: Vec<u64>| AccessMember {
+        is_admin: false,
+        roles,
+    };
+    let restricted = AccessDecision::Deny(AccessDenyReason::CommandRestricted);
+    let role_required = AccessDecision::Deny(AccessDenyReason::RequiredRole);
+    assert!(may_create_room(&gated));
+    assert_eq!(
+        may_use_command(&gated, &member(vec![999]), "kick"),
+        role_required,
+        "the imported guild-wide role gate runs first"
+    );
+    assert_eq!(
+        may_use_command(&gated, &member(vec![201]), "kick"),
+        AccessDecision::Allow
+    );
+    assert_eq!(
+        may_use_command(&gated, &member(vec![201, 2010]), "limit"),
+        restricted
+    );
+    assert_eq!(
+        may_use_command(&gated, &member(vec![999]), "unlimit"),
+        role_required
+    );
+
+    // An import that turns creation off and names a different command role
+    // lands in the same store: creation stops and the new role gates.
+    let mut shut = config.clone();
+    shut.guild_id = "47".to_owned();
+    shut.settings.creation_enabled = false;
+    shut.settings.command_role_id = Some("2010".to_owned());
+    let shut_expected = store.snapshot(47).await?;
+    store.apply(47, &shut, &shut_expected).await?;
+    assert_eq!(store.snapshot(47).await?, shut);
+    let shut_controls = rooms.access_controls(47).await?;
+    assert!(!may_create_room(&shut_controls));
+    assert_eq!(shut_controls.required_role, Some(2010));
+    assert_eq!(
+        may_use_command(&shut_controls, &member(vec![201]), "kick"),
+        role_required
+    );
+    assert_eq!(
+        may_use_command(&shut_controls, &member(vec![2010]), "kick"),
+        AccessDecision::Allow
+    );
+
+    // `/access` writes the same store: its creation switch, guild-wide role
+    // and restriction all export, and an import round trip keeps them.
+    let mut controls = gated.clone();
+    controls.required_role = Some(2010);
+    controls.room_creation_enabled = false;
+    controls
+        .command_roles
+        .insert("unlimit".to_owned(), vec![2010, 201]);
+    rooms.save_access_controls(GUILD, &gated, &controls).await?;
+    let with_access = store.snapshot(GUILD).await?;
+    assert!(!with_access.settings.creation_enabled);
+    assert_eq!(
+        with_access.settings.command_role_id.as_deref(),
+        Some("2010")
+    );
+    let unlimit = with_access
+        .settings
+        .command_roles
+        .iter()
+        .find(|entry| entry.command == "unlimit")
+        .expect("an /access restriction is exported");
+    assert_eq!(unlimit.role_ids, ["201", "2010"]);
+    let reimported =
+        import_configuration(&export_configuration(&with_access, &inventory)?, &inventory)?;
+    store.apply(GUILD, &reimported, &with_access).await?;
+    assert_eq!(store.snapshot(GUILD).await?, with_access);
+    let mut sorted = controls.clone();
+    sorted
+        .command_roles
+        .insert("unlimit".to_owned(), vec![201, 2010]);
+    assert_eq!(rooms.access_controls(GUILD).await?, sorted);
+    // An `/access` save from a read taken before that import refuses
+    // instead of reverting it: same advisory lock, compare-and-swap.
+    assert!(matches!(
+        rooms.save_access_controls(GUILD, &controls, &gated).await,
+        Err(sqlx::Error::RowNotFound)
+    ));
+    assert_eq!(rooms.access_controls(GUILD).await?, sorted);
+    // Restore the fixture's restrictions (and the default switches).
+    rooms.save_access_controls(GUILD, &sorted, &gated).await?;
+    assert_eq!(store.snapshot(GUILD).await?, stored);
+
+    // 0469 backfill: a legacy-only restriction moves into the gate's store,
+    // an enforced one keeps its roles, a name the gate refuses is dropped
+    // (else the whole guild's row would fail to decode), and the legacy
+    // tables keep every row for the previous binary (expand/contract).
+    sqlx::query(
+        "INSERT INTO voice_command_roles (guild_id, command) VALUES
+           ('44','kick'), ('44','limit'), ('44','retired'), ('45','transfer'),
+           ('46','retired')",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO voice_command_role_members (guild_id, command, role_id) VALUES
+           ('44','kick','2010'), ('44','kick','201'), ('44','retired','3'),
+           ('45','transfer','7'), ('46','retired','3')",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO voice_access_controls (guild_id, required_role_id, command_roles)
+         VALUES ('44', '9', '{\"kick\": [\"5\"]}'::jsonb)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0469_voice_command_roles_authority.sql"
+    ))
+    .execute(pool)
+    .await?;
+    let backfilled = rooms.access_controls(44).await?;
+    assert_eq!(backfilled.required_role, Some(9));
+    assert_eq!(
+        backfilled.command_roles,
+        BTreeMap::from([("kick".to_owned(), vec![5]), ("limit".to_owned(), vec![])])
+    );
+    assert_eq!(
+        rooms.access_controls(45).await?.command_roles,
+        BTreeMap::from([("transfer".to_owned(), vec![7])])
+    );
+    assert_eq!(rooms.access_controls(46).await?, AccessControls::default());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT (SELECT count(*) FROM voice_command_roles
+                      WHERE guild_id IN ('44', '45', '46'))
+                  + (SELECT count(*) FROM voice_command_role_members
+                      WHERE guild_id IN ('44', '45', '46'))"
+        )
+        .fetch_one(pool)
+        .await?,
+        10
+    );
+
+    // 0470 backfill: an imported-only switch and role move into the gates'
+    // store; where both stores disagree the enforced value wins (creation
+    // off beats on, an enforced role beats the imported one), so nothing
+    // enforced today gets looser. The `voice_guild_settings` mirror is
+    // synced to the merged values for the previous binary's `/export`.
+    sqlx::query(
+        "INSERT INTO voice_guild_settings
+           (guild_id, creation_enabled, unique_names, no_game_label,
+            force_single_game, count_members_without_activity, time_zone,
+            text_channel_name, command_role_id)
+         VALUES ('50', FALSE, FALSE, 'General', FALSE, FALSE, 'UTC', 'voice-chat', '201'),
+                ('51', TRUE, FALSE, 'General', FALSE, FALSE, 'UTC', 'voice-chat', '202'),
+                ('52', FALSE, FALSE, 'General', FALSE, FALSE, 'UTC', 'voice-chat', NULL)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO voice_access_controls
+           (guild_id, room_creation_enabled, required_role_id, command_roles)
+         VALUES ('51', FALSE, '9', '{\"kick\": [\"5\"]}'::jsonb),
+                ('52', TRUE, NULL, '{}'::jsonb),
+                ('53', FALSE, '7', '{}'::jsonb)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../migrations/0470_voice_creation_gates_authority.sql"
+    ))
+    .execute(pool)
+    .await?;
+    let imported_only = rooms.access_controls(50).await?;
+    assert!(!may_create_room(&imported_only));
+    assert_eq!(imported_only.required_role, Some(201));
+    assert!(imported_only.command_roles.is_empty());
+    let enforced_wins = rooms.access_controls(51).await?;
+    assert!(!enforced_wins.room_creation_enabled);
+    assert_eq!(enforced_wins.required_role, Some(9));
+    assert_eq!(
+        enforced_wins.command_roles,
+        BTreeMap::from([("kick".to_owned(), vec![5])])
+    );
+    let mirror: (bool, Option<String>) = sqlx::query_as(
+        "SELECT creation_enabled, command_role_id FROM voice_guild_settings
+         WHERE guild_id = '51'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(mirror, (false, Some("9".to_owned())));
+    let imported_off = rooms.access_controls(52).await?;
+    assert!(!imported_off.room_creation_enabled);
+    assert_eq!(imported_off.required_role, None);
+    let access_only = rooms.access_controls(53).await?;
+    assert!(!access_only.room_creation_enabled);
+    assert_eq!(access_only.required_role, Some(7));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM voice_guild_settings WHERE guild_id = '53'"
+        )
+        .fetch_one(pool)
+        .await?,
+        0,
+        "the backfill invents no settings row"
+    );
+
     // Another guild is independent of this one.
     let mut neighbour = config.clone();
     neighbour.guild_id = "42".to_owned();
@@ -263,6 +485,11 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     let smaller_expected = store.snapshot(GUILD).await?;
     store.apply(GUILD, &smaller, &smaller_expected).await?;
     assert_eq!(store.snapshot(GUILD).await?, smaller);
+    assert_eq!(
+        legacy_rows(pool, GUILD_ID).await?,
+        Vec::new(),
+        "lifted restrictions leave the legacy mirror"
+    );
     assert_eq!(
         store.snapshot(42).await?,
         neighbour,
@@ -294,6 +521,25 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     store.apply(GUILD, &config, &restore_expected).await?;
     let before = store.snapshot(GUILD).await?;
     assert_eq!(before, config);
+    // Apply mirrors the restrictions into the legacy tables, so the previous
+    // binary's `/export` shows the same after a backout.
+    let mirrored: Vec<(String, Option<String>)> = config
+        .settings
+        .command_roles
+        .iter()
+        .flat_map(|restriction| {
+            let roles: Vec<Option<String>> = if restriction.role_ids.is_empty() {
+                vec![None]
+            } else {
+                restriction.role_ids.iter().cloned().map(Some).collect()
+            };
+            roles
+                .into_iter()
+                .map(move |role| (restriction.command.clone(), role))
+        })
+        .collect();
+    assert!(!mirrored.is_empty(), "fixture restricts a command");
+    assert_eq!(legacy_rows(pool, GUILD_ID).await?, mirrored);
     let rows_before = config_rows(pool, GUILD_ID).await?;
     let mut bad_creator = alternate(&config);
     bad_creator.creators[0].first_number = 0; // CHECK first_room_number >= 1
@@ -330,6 +576,25 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
         .mention_member_ids = vec!["0301".to_owned()];
     let mut bad_settings = alternate(&config);
     bad_settings.settings.time_zone = "  ".to_owned(); // CHECK non-blank
+                                                       // The store refuses what the gate cannot read, even from a caller that
+                                                       // skipped the planner: an unknown command, or one command twice (the
+                                                       // JSON map would keep only the later entry).
+    let mut bad_command = alternate(&config);
+    bad_command.settings.command_roles = vec![CommandRoles {
+        command: "retired".to_owned(),
+        role_ids: vec!["201".to_owned()],
+    }];
+    let mut duplicate_command = alternate(&config);
+    duplicate_command.settings.command_roles = vec![
+        CommandRoles {
+            command: "kick".to_owned(),
+            role_ids: vec!["201".to_owned()],
+        },
+        CommandRoles {
+            command: "kick".to_owned(),
+            role_ids: Vec::new(),
+        },
+    ];
     let mut wrong_guild = alternate(&config);
     wrong_guild.guild_id = "43".to_owned();
     let mut wrong_version = alternate(&config);
@@ -342,6 +607,8 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
         ("list blank choice", &bad_list),
         ("logging snowflake", &bad_logging),
         ("settings time zone", &bad_settings),
+        ("unknown command restriction", &bad_command),
+        ("duplicate command restriction", &duplicate_command),
         ("guild mismatch", &wrong_guild),
         ("version", &wrong_version),
     ] {
@@ -381,6 +648,23 @@ async fn verify_store(pool: &PgPool, schema: &str) -> TestResult {
     assert_eq!(store.snapshot(77).await?, concurrent);
     assert_eq!(rooms.creator_for(77, 7).await?, Some(creator));
     Ok(())
+}
+
+/// 0469 moves only names the gate accepts; its literal list must be
+/// `VOICE_COMMANDS` as of that migration.
+#[test]
+fn backfill_moves_exactly_the_gate_commands() {
+    let sql = include_str!("../migrations/0469_voice_command_roles_authority.sql");
+    let list = sql
+        .split_once("WHERE c.command IN (")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .expect("0469 filters by command")
+        .0;
+    let named: Vec<&str> = list
+        .split(',')
+        .map(|name| name.trim().trim_matches('\''))
+        .collect();
+    assert_eq!(named, VOICE_COMMANDS);
 }
 
 #[tokio::test]
@@ -592,4 +876,23 @@ async fn verify_inherit_edges(pool: &PgPool, schema: &str) -> TestResult {
     store.apply(79, &imported, &imported_expected).await?;
     assert_eq!(store.snapshot(79).await?, fresh);
     Ok(())
+}
+
+/// The legacy 0229 command-role rows, in the order `config.settings` lists
+/// them: one `(command, None)` for a command with no roles.
+async fn legacy_rows(
+    pool: &PgPool,
+    guild: &str,
+) -> Result<Vec<(String, Option<String>)>, sqlx::Error> {
+    sqlx::query_as(
+        r#"SELECT c.command, m.role_id
+             FROM voice_command_roles c
+             LEFT JOIN voice_command_role_members m
+               ON m.guild_id = c.guild_id AND m.command = c.command
+            WHERE c.guild_id = $1
+            ORDER BY c.command COLLATE "C", length(m.role_id), m.role_id"#,
+    )
+    .bind(guild)
+    .fetch_all(pool)
+    .await
 }

@@ -357,7 +357,7 @@ class TrackerIntakeAcceptanceTests(unittest.TestCase):
 
     def test_deep_fixture_reaches_the_json_recursion_guard(self):
         with self.assertRaises(RecursionError):
-            json.loads(nested_json())
+            tracker._loads_bounded(nested_json())
 
     def test_deep_driver_json_is_a_track_error(self):
         self.expect_track_error(lambda: self.driver_answer(nested_json()), "burn evaluation failed:")

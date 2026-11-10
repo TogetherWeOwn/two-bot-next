@@ -36,6 +36,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `cold resume committed; requesting voice snapshot via identify` | `crates/bot/src/gateway.rs` (`run_shard`) | Cold voice RESUME committed; reception IDENTIFies for a fresh voice snapshot |
 | `gateway ready; checkpoint committed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Dispatch committed and shard marked Connected |
 | `gateway leveling dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Leveling funnel drain failed inside the checkpoint deadline |
+| `gateway leveling dispatch skipped; schema gap` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Auxiliary XP drain hit `42P01`/`42501`; warns with `drain=leveling`, bounded cause and SQLSTATE, counts `two_bot_gateway_drain_skips_total`, and permits checkpoint advance without promising award replay |
 | `gateway leveling collect failed` | `crates/bot/src/gateway.rs` (`requests_or_hold_cursor`) | Leveling funnel collection refused (poisoned deferred buffer); checkpoint cursor held so the worker stops and the supervisor restarts |
 | `gateway community facts dispatch failed` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain failed; worker continues and the scorecard fails closed on missing coverage |
 | `gateway community facts dispatch timed out` | `crates/bot/src/gateway.rs` (`apply_dispatch`) | Community facts drain missed the checkpoint deadline; worker continues and the scorecard fails closed on missing coverage |
@@ -49,6 +50,7 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `READY identity differs from boot token; ordered identity not armed` | `crates/bot/src/gateway.rs` (`run_shard`) | READY application id differs from the boot/REST pin; ordered identity stays disarmed and its fence keeps refusing |
 | `retention lifecycle skipped; schema gap, nothing to cancel` | `crates/bot/src/gateway.rs` (`retention_lifecycle`) | Rejoin-cancel hit a schema gap (missing table/permission, SQLSTATE only); skipped, nothing to cancel, gateway survives a database behind the binary |
 | `retention purge skipped; schema gap, operator replay required` | `crates/bot/src/gateway.rs` (`retention_lifecycle`) | Real guild removal hit a schema gap; gateway acked past the only purge-queue write, Operator must replay it per privacy.md once the migration lands |
+| `live interaction cache full; evicted the oldest, its claim recovers from the durable job` | `crates/bot/src/gateway.rs` (`LiveCache::insert`) | Live-interaction cache hit its 1024-entry cap; the oldest arrival was evicted (`job_id`, `evicted_total`) and its claim falls back to the durable `OnboardingJob::recover` path |
 | `gateway prerequisites missing; gateway parked, /readyz reports down` | `crates/bot/src/main.rs` (`run`) | Token, database URL or guild ID missing; shard never starts |
 | `gateway readiness failure injection active; /readyz reports gateway down for the staging rollback drill` | `crates/bot/src/main.rs` (`run`) | Staging-fenced rollback-drill injection is on; `/readyz` reports the gateway component down so the staging gate fails and rolls back. The fence refuses outside staging, so this line never appears in production |
 | `feature gates invalid; ordered interaction surface parked` | `crates/bot/src/main.rs` (`build_interaction_runtime`) | Feature-gate parsing failed; gateway still boots, only the ordered interaction surface stays off |
@@ -80,7 +82,10 @@ name. Fields such as `sequence`, `resume`, `error`, `job_id` or
 | `notification acknowledged` | `crates/bot/src/eventsub_http.rs` (`handle_notification`, two sites) | Notification verified and acknowledged; when delivery dependencies are injected, the durable claim → send → settle flow has settled (or deduped) before the ack |
 | `revocation acknowledged` | `crates/bot/src/eventsub_http.rs` (`receive`) | Revocation verified and acknowledged; boot/periodic reconcile owns re-subscription; bounded `reason` (`user_removed` / `authorization_revoked` / `notification_failures_exceeded` / `version_removed` / `other`) answers counts by reason |
 | `delivery ignored` | `crates/bot/src/eventsub_http.rs` (`receive`, one info site) | Unknown message type acknowledged with 2xx; deterministic planning errors warn sampled with their `error_variant` instead, and unknown/future classification errors record their variant label and are refused with retryable 503 |
-| `event = "eventsub_receiver"` | `crates/bot/src/eventsub_http.rs` (`refuse`, `sampled_classify_warn`, `receive`, `handle_notification`) | Bounded `event` field value every receiver emission carries; no header, token or body leaves the process |
+| `delivery child failed; durable claim fences retain uncertainty` | `crates/bot/src/eventsub_http.rs` (`report_child_failure`) | Warn, emitted from the failing child's own request span when it ends by panic or cancellation (`panicked` / `cancelled` booleans only; no join error or panic payload is logged); any started durable claim remains uncertain and fenced |
+| `receiver shutdown deadline exhausted with delivery children unfinished` | `crates/bot/src/eventsub_http.rs` (`join_children`) | Warn; joining children exceeded the receiver's HTTP-drain shutdown budget (`pending` count); children detach instead of aborting and started claims stay fenced |
+| `receiver shutdown deadline exhausted; unfinished delivery claims remain fenced` | `crates/bot/src/eventsub_http.rs` (`serve`) | Warn; the receiver exhausted its HTTP-drain shutdown budget, reports failure to its caller, and leaves unfinished claim state fenced |
+| `event = "eventsub_receiver"` | `crates/bot/src/eventsub_http.rs` (`serve`, `join_children`, `report_child_failure`, `refuse`, `sampled_classify_warn`, `receive`, `handle_notification`) | Bounded `event` field value every receiver emission carries; no header, token or body leaves the process |
 | `eventsub reconcile parked: TWO_EVENTSUB is not exactly 1` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`, `spawn_if_enabled`) | Info; gate dark at spawn or per pass, no subscription is listed or mutated (`status = "parked"`, `reason = "flag_dark"`) |
 | `eventsub reconcile parked: the EventSub receiver is dark, no shared secret snapshot` | `crates/bot/src/eventsub_reconcile.rs` (`spawn_if_enabled`) | Info; enabled but no receiver snapshot at spawn, so no task and no pass (`status = "parked"`, `reason = "receiver_dark"`) |
 | `eventsub reconcile refused: callback configuration is invalid` | `crates/bot/src/eventsub_reconcile.rs` (`startup_reconcile`) | Error; `TWO_TWITCH_CALLBACK_URL` missing or not an https callback, no Helix call (`error_class = "reconcile_config_invalid"`) |
@@ -136,6 +141,7 @@ Scalar gateway series pair with the labels above:
 | `two_bot_gateway_reconnects_total` | New HELLOs after the first in the running loop |
 | `two_bot_gateway_resumes_total` | Received RESUMED dispatches |
 | `two_bot_gateway_disconnects_total` | Transport losses through the shard supervisor; each must pair with a later RESUME or fresh READY |
+| `two_bot_gateway_drain_skips_total` | Label-free auxiliary leveling drain skips for missing tables/grants; the `gateway_drain_skips` ticket consumes any increase. First sample and resets baseline, missing/invalid family is no window; see [bounded response](runbook.md#alert-gateway-drain-skips). No deployment is claimed |
 | `two_bot_gateway_missed_events_total` | Sequence gaps inside one session; any nonzero increase fails the zero-missed-events acceptance |
 | `two_bot_gateway_rsvp_refused_total` | RSVP interactions refused at reception because the in-flight RSVP bound (32) was exhausted: no prepare task spawned and nothing entered the serial drain. Non-RSVP interactions bypass admission and never increment it |
 | `two_bot_gateway_latency_seconds` | Last heartbeat ACK round-trip; `NaN` until measured |
@@ -333,8 +339,9 @@ Each label owns independent `two_bot_job_runs_total{job,outcome}`,
 `two_bot_job_consecutive_failures{job}` and
 `two_bot_job_last_error_class{job,class}` series (see the job allowlist
 `JOBS` in `metrics.rs`). Success in one label never clears another label's
-streak. None of these four has a `JOB_INTERVAL_SECONDS` cadence entry, so
-staleness tickets via `job_unknown_stale` below instead of `job_stale`.
+streak. The first four labels below have no `JOB_INTERVAL_SECONDS` cadence
+entry, so staleness tickets via `job_unknown_stale` instead of `job_stale`.
+`lfg_sweep` has a 60-second cadence entry and uses `job_stale`.
 
 | Job label | Producer (stable anchor) | Meaning |
 | --- | --- | --- |
@@ -342,6 +349,7 @@ staleness tickets via `job_unknown_stale` below instead of `job_stale`.
 | `self_role_recovery` | `self_role_handlers.rs` (`recovery_job`) | Self-role repair sweep every 30 s; a successful sweep need not settle every pending repair; failure-only alerting, no `job_stale` paging |
 | `member_unban_sweep` | `member_runtime.rs` (`sweep_job`) | Member unban sweep every 30 s with an attempt timeout that may outlive its cadence; a successful sweep need not complete any unban; failure-only alerting |
 | `automod_expiry` | `automod_gateway.rs` (`expiry_job`) | Automod repeat-history expiry tick every 60 s; a gateway without built activation is a no-op success, and real expiry work runs only with the automod gate on; failure-only alerting |
+| `lfg_sweep` | `lfg_jobs.rs` (`register`) | Bounded LFG lifecycle sweep every 60 s under announcement/identity gates; at most 20 candidates, row-local failures continue, and success does not prove every row or message refresh settled; 60 s `job_stale` cadence |
 
 ## Alert rules
 
@@ -374,6 +382,7 @@ is the single shared spelling also pinned in `evidence.rs`
 | `voice_live_self_heal` | `two_bot_voice_live_self_heal_total` | Ticket, not page: any increase between valid samples (one covered fault, already repaired); first sample is baseline-only, restarts re-baseline, a missing family is no window |
 | `voice_live_not_ready` | `two_bot_voice_live_not_ready_seconds` | Pages past 120 s, promoting the host-watchdog bound into the standard pipeline (joins are dropped while above 0); at or below clears, missing/invalid holds; the sibling keeps the age climbing through a hang |
 | `voice_queue_stall` | `two_bot_voice_queue_oldest_age_seconds` | Ticket, not page: oldest-wait past 120 s (matches the in-process stuck horizon; the sibling keeps the age climbing through a hang); at or below clears, missing/invalid holds |
+| `gateway_drain_skips` | `two_bot_gateway_drain_skips_total` (label-free counter; optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any increase between valid samples; each skip represents one auxiliary leveling drain with SQLSTATE `42P01` or `42501`. First samples and resets establish a baseline silently. Missing or invalid samples preserve prior state and baseline without judging a window; a flat valid sample resolves. See the [bounded response](runbook.md#alert-gateway-drain-skips); rule code only, no deployment claimed |
 | `retention_replay_needed` | `two_bot_retention_replay_needed_total` (label-free counter; optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any increase between valid samples (one ticket per skipped purge); the first valid sample only stores the baseline, restarts re-baseline, and a missing or malformed family is no window |
 | `voice_dispatch_timeouts` | `two_bot_voice_dispatch_timeouts_total` (label-free counter; optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any increase between valid samples (one ticket per over-budget turn); the turn ran to completion and the queue keeps its retries; baseline, restart and gap semantics mirror `retention_replay_needed` |
 | `voice_watchdog_stucks` | `two_bot_voice_watchdog_stucks_total` (label-free counter; optional scrape input, so older containers without it hold the previous state) | Ticket, not page: any increase between valid samples (one ticket per 120 s stuck window); baseline, restart and gap semantics mirror `retention_replay_needed` |
@@ -443,7 +452,34 @@ Startup `error_class` values logged before fatal exits (see
 `gateway_override_invalid`, `database_connect_failed`,
 `receiver_config_invalid`, `receiver_prerequisites_invalid`,
 `receiver_bind_failed`, `moderation_disable_unknown`,
-`container_service_failed`, plus the twelve classes above.
+`container_service_failed`, plus the twelve classes above and the five
+EventSub delivery classes below. `receiver_prerequisites_invalid` remains
+only for internal-action startup prerequisites, not EventSub delivery.
+
+### EventSub startup classes
+
+With delivery enabled, each prerequisite refusal emits one
+`eventsub startup refused` event with the scalar `error_class` below and
+exits 1. No token, URL or underlying error text is logged. Token presence
+is checked before the store because a missing token also prevents pool
+construction. Identity permission is checked before key derivation, and
+key derivation before proxy construction; with multiple invalid inputs,
+the first failing check wins.
+
+| Class | Meaning | Next action |
+| --- | --- | --- |
+| `receiver_token_missing` | `DISCORD_TOKEN` is absent or empty | Provision the correct bot token secret; never paste it into logs or tickets |
+| `receiver_store_missing` | No shared bot database pool exists for delivery | Check that `DATABASE_URL` and `GUILD_ID` are present and nonempty; database connection failures have their own `database_connect_failed` class |
+| `receiver_identity_refused` | The boot identity is not permitted to use Announcements for go-live delivery | Verify the staging bot/guild identity and activation policy; do not bypass the fence or enable delivery for an uncleared identity |
+| `receiver_admission_rejected` | Send-admission key derivation rejected the token format | Correct the token format or whitespace through secret provisioning without printing its value |
+| `receiver_proxy_invalid` | REST executor construction failed, normally from an unusable `DISCORD_API_BASE` override | Correct or remove the API override; it must be a supported origin without userinfo, path, query or fragment. If the override is valid or unset, check platform TLS verifier setup, which can also fail this constructor |
+
+The token/store classes originate in `crates/bot/src/main.rs` (`run`);
+the identity/admission/proxy classes originate in
+`crates/bot/src/eventsub_delivery.rs` (`build_delivery_deps`) and propagate
+unchanged to the same fatal log. Receiver/delivery configuration parsing
+continues to use `receiver_config_invalid`; private listener bind failures
+continue to use `receiver_bind_failed`.
 
 ## Voice responder overload
 

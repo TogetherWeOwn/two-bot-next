@@ -17,6 +17,12 @@ name: supply-chain
 #   * PR body follows .github/pull_request_template.md: Linked Issues or Issue Description
 #     (non-light types) and Verification are required; the rest is optional. The rules live in
 #     .github/scripts/pr_standards.py with tests beside it; this job runs both.
+#     A PR touching a T0 path (migrations/sql/db, auth words, .github/workflows/deploy*,
+#     the pr-lint gate itself, crates/cutover/**, wrangler config) must carry `risk_tier: T0`
+#     with checked D1–D8 and no leftover placeholders. That floor is always an error, even in
+#     warn mode; the changed paths arrive from the PR files API via the List changed files step.
+#     The floor itself runs from the base branch (Check out base-branch gate), so a PR cannot
+#     weaken its own gate unattested.
 #   * This repo is public. No card reference is required (`REQUIRE_CARD_REF: "false"`), and an
 #     internal tracker ID (a `TOG-` or `PAP-` prefix followed by digits) must not appear in a
 #     title, body, commit subject or branch name. The strict title/body subset (tracker id,
@@ -201,8 +207,53 @@ jobs:
               delimiter = uuid.uuid4().hex
               output.write(f"body_file<<{delimiter}\n{body_path}\n{delimiter}\n")
 
-      - name: Unit-test the lint
-        run: python3 -m unittest discover -s .github/scripts -p 'test_pr_standards.py'
+      # Changed paths feed the T0 attestation floor in pr_standards.py. Read-only:
+      # the PR files API under the job's pull-requests: read grant. Renames emit
+      # both the new and the previous name (deleting or moving a T0 file stays
+      # T0); deletes arrive with status removed and are included like any other
+      # change. An empty or missing list fails the job, so a PR cannot reach
+      # the gate without one. Push and merge_group runs skip this step: a push
+      # carries no PR number (the step would fail every main commit) and the
+      # check step lints the commit subjects instead.
+      - name: List changed files
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+        id: changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          case "${PR_NUMBER}" in
+            ''|*[!0-9]*)
+              echo "Expected a numeric PR number" >&2
+              exit 1
+              ;;
+          esac
+          files_path="${RUNNER_TEMP}/changed-files.txt"
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            --paginate \
+            -q '.[] | [.filename, .previous_filename] | map(select(. != null and . != "")) | .[]' \
+            > "${files_path}"
+          test -s "${files_path}" || { echo "Changed-file list is empty" >&2; exit 1; }
+          echo "changed_files_file=${files_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check out base-branch gate
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The already-merged policy, never the PR head: the working-tree
+          # checkout above is the PR merge ref, so importing pr_standards.py
+          # from it would let a PR weaken its own floor (drop a T0 pattern or
+          # neuter attestation_findings) and pass itself with no attestation.
+          # Same shape as the gitleaks base-branch policy below: a weakened
+          # gate merges first as its own small reviewed PR carrying a T0
+          # attestation, and only then judges others. Dispatch runs validate a
+          # PR targeting main, so an empty base SHA falls back to main.
+          ref: ${{ github.event.pull_request.base.sha || 'main' }}
+          path: base-gate
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: true
+          persist-credentials: false
 
       - name: Check title, body, branch and commits
         if: github.event_name != 'merge_group'
@@ -214,6 +265,7 @@ jobs:
           HEAD_REF: ${{ steps.pr.outputs.head_ref }}
           REPO_PRIVATE: ${{ github.event.repository.private }}
           COMMITS: ${{ toJSON(github.event.commits) }}
+          CHANGED_FILES_FILE: ${{ steps.changed.outputs.changed_files_file }}
         shell: python3 {0}
         run: |
           import os, sys
@@ -222,15 +274,41 @@ jobs:
           # release notes can exceed the per-string execve limit (E2BIG) that
           # would otherwise keep this process from starting at all. The gate
           # reads env, so bridge the two in-process, where no such limit
-          # applies.
+          # applies. The changed-file list travels the same way.
           root = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
-          sys.path.insert(0, os.path.join(root, ".github/scripts"))
+          # Base-branch gate (see "Check out base-branch gate" above): the
+          # working tree is the PR merge ref, so the PR's own pr_standards.py
+          # must never decide its own floor. Import the merged copy instead
+          # and fail closed when it is missing. Push runs lint already-merged
+          # main commits, so they keep the working-tree copy.
+          if os.environ.get("EVENT") == "pull_request":
+              gate_dir = os.path.join(root, "base-gate", ".github", "scripts")
+              if not os.path.isdir(gate_dir):
+                  print("::error title=PR standards::Base-branch gate checkout is missing; "
+                        "refusing to lint with the PR's copy")
+                  raise SystemExit(1)
+              sys.path.insert(0, gate_dir)
+          else:
+              sys.path.insert(0, os.path.join(root, ".github/scripts"))
           import pr_standards
 
           if os.environ.get("EVENT") == "pull_request":
               with open(os.environ["BODY_FILE"], encoding="utf-8") as handle:
                   os.environ["BODY"] = handle.read()
+              files_path = os.environ.get("CHANGED_FILES_FILE") or ""
+              if files_path:
+                  with open(files_path, encoding="utf-8") as handle:
+                      os.environ["CHANGED_FILES"] = handle.read()
           sys.exit(pr_standards.main())
+
+      # The lint's own unit tests execute the PR head's files
+      # (test_pr_standards.py imports the head's pr_standards.py), so they run
+      # only after the base-branch gate above has consumed its inputs. An
+      # earlier slot would let a PR rewrite the resolved body file or poison
+      # the step environment and have the trusted gate validate substituted
+      # input; scripts/ci/test_workflows.py pins this ordering.
+      - name: Unit-test the lint
+        run: python3 -m unittest discover -s .github/scripts -p 'test_pr_standards.py'
 
       # release-please silently drops a commit its strict parser rejects, so the
       # squash commit this PR becomes (title + body) must parse. Same library

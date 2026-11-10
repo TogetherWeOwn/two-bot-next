@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected failing-first tests for inert untrusted LFG, custom-command and feed reply echoes",
+  "baseCommit": "b5776432c5c1df36f14af5843c17140aae07b5f7",
+  "branch": "test/untrusted-reply-echoes-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/core/tests/untrusted_lfg_echo_acceptance.rs",
+      "sha256": "29e4a852a1c71ebc74fcbad82008246e8390ea1946bfb60cb795aaab99e27160",
+      "tests": 5
+    },
+    {
+      "path": "crates/core/tests/untrusted_feed_echo_acceptance.rs",
+      "sha256": "2a66e18c430cce7d67c4414b19f0c6a10c50064af333323b3c8d0a03a301f057",
+      "tests": 6
+    },
+    {
+      "path": "crates/discord/tests/untrusted_custom_command_echo_acceptance.rs",
+      "sha256": "6c695cffa2aaba418cf1d6f0c5049eb7121ab6b0c0cee208e14e990085d98ee1",
+      "tests": 4
+    }
+  ],
+  "commands": {
+    "core": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test untrusted_lfg_echo_acceptance --test untrusted_feed_echo_acceptance --no-fail-fast -- --nocapture",
+    "custom": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test untrusted_custom_command_echo_acceptance -- --nocapture --test-threads=1",
+    "controls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test --workspace --features two-bot-discord/db --test untrusted_lfg_echo_acceptance --test untrusted_feed_echo_acceptance --test untrusted_custom_command_echo_acceptance --no-fail-fast ordinary_ -- --nocapture --test-threads=1",
+    "hostedFullSweep": "gh workflow run nightly.yml --ref test/untrusted-reply-echoes-acceptance -R TogetherWeOwn/two-bot-next",
+    "format": "cargo fmt --all -- --check",
+    "floor": "python3 scripts/ci/check-floor-guard.py --base-ref origin/main",
+    "inventory": "python3 scripts/ci/check-test-inventory.py"
+  },
+  "contract": {
+    "lfg": "Parse rejected role keys through the real public parser; preserve BadKey classification, the 128-raw-character echo bound, ordinary copy, valid roles, and BadSlots/DuplicateKey/ReservedKey distinctions. Fold newlines; do not display hostile Markdown/backticks as active syntax.",
+    "feeds": "All four pause/resume confirmation renderers, including already-paused/already-enabled, keep stable-ID controls byte-identical. Hostile IDs must not break out of inline-code framing. An escaped backtick inside a single-backtick code span is NOT an accepted fix.",
+    "custom": "Actual Twilight interaction/router/service/store/executor replies: hostile absent-delete names, mention-shaped composite input, and valid __forged__ names across save/delete/missing/changed/unchanged toggle outcomes. Preserve management authority, private acknowledgement, neutral mentions, bounded content, existing absent-delete audit code/reason, and registry publication/no-public-send behavior.",
+    "oraclePolicy": "Literal golden fixtures accept existing inspect-style backslash escaping or existing inert-style punctuation removal where both are safe. Feed inspect-style output must be outside inline code; stripped output may retain trusted code framing. Underscore command names require escaping because inert does not remove underscores. Core mention pills may remain literal; actual Discord custom replies require empty allowed_mentions and neutralized mass mentions.",
+    "bounds": "LFG bounded hostile prefix and stable raw ASCII prefix; feed exact 128-UTF16-unit emoji ID; all captured custom replies and feed fixtures <=2000 UTF-16 units. No new sanitizer or policy implementation in tests.",
+    "controls": "Five baseline-compatible tests: two LFG controls, two feed controls and one routed custom-command control. Expected hostile failures are three LFG, four feed and three custom tests; these counts are expectations until verified execution.",
+    "safety": "Only test files and this manifest change. Disposable TestDatabase fixture with explicit teardown; local Discord double only. No real Discord, production/staging DB, migration, source change, weakening of gates, or log escaping. No implementation diff was read before fixture authoring."
+  },
+  "existingRawLfgPin": {
+    "path": "crates/core/src/lfg.rs:964-973",
+    "test": "role_key_errors_echo_only_a_bounded_raw_prefix",
+    "notes": "This pin asserts BadKey contains 128 raw k characters and Display echoes them. Its current all-k fixture is compatible with escaping: leave its bound and enum assertions intact. New protected hostile-key goldens supersede any inference that raw hostile punctuation should be displayed. If a Builder design requires changing the existing pin, request an author-controlled correction on the acceptance card; never silently edit it. This tests-only handoff does not write a source file merely to rename a compatible unit test."
+  },
+  "ciRoute": "Core tests run in the existing workspace integration lane; custom target needs two-bot-discord/db (enabled by the bot workspace dependency in the check matrix). An isolated core-only invocation does not establish custom coverage. Nightly all-features --no-fail-fast sweep reaches all three targets despite intended RED. Require a nonzero four-case custom test receipt, not a zero-test binary.",
+  "handoff": [
+    "Consume the exact pushed SHA recorded in the issue handoff document. Verify every protected file SHA-256 before and after implementation. Never edit protected acceptance files; return oracle corrections to the Test Author.",
+    "These are deliberately failing-first tests, not a standalone implementation PR. Do not merge a RED tests-only branch. The Builder ships implementation and unchanged tests together with exact-head CI, independent review and verified squash auto-merge.",
+    "Bounded Cargo refusal exit 75 is not RED, a compile pass or a test pass. Execution evidence is recorded separately in the issue document.",
+    "Reuse existing escape helpers; preserve refusal codes/reasons and ordinary-input bytes. Review the three named sites and same-shape siblings. Builder owns implementation, evidence inventory in PR body, review fixes, GREEN and delivery."
+  ]
+}

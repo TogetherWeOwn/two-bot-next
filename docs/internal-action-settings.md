@@ -43,6 +43,42 @@ contains no submitted value. A literal backslash-u escape is not a decoded NUL.
 or `1`; any other value is refused before SQL with a non-retryable
 `malformed`/400 result (`settings_value_invalid`) that names no submitted value.
 
+## Onboarding destinations
+
+Before SQL, CAS, settings audit or snapshot changes, `validate_write` checks
+these existing keys with the same pure parsers as `OnboardingConfig`:
+
+- Single optional ID: `DISCORD_ANCHOR_WELCOME_CHANNEL_ID`,
+  `DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID`,
+  `DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID`.
+- CSV IDs: `DISCORD_LANDING_CHANNEL_IDS`, `DISCORD_GOODBYE_CHANNEL_IDS`.
+
+Each nonempty ID must parse as a nonzero `u64`; whitespace is trimmed. Lists
+omit empty segments and preserve order and duplicates. Empty optional values
+remain valid syntax; the runtime still requires destinations for anchor/session
+modes. All five keys are validated even if the current mode does not read them.
+
+Validation uses the existing `to_env_string` rendering, not a new JSON schema:
+strings stay literal, `true` becomes `1`, integral numbers render without a
+fraction, and integer IDs above 2^53 retain precision. Flat arrays join with
+commas (null entries become empty segments). Thus `[42]` works for either
+format, but `[42, null]` works only for lists. Objects, nested arrays, zero,
+negative/fractional/overflow IDs and mixed valid-invalid lists are refused.
+A stored JSON null (`Some(Value::Null)`) is ignored by rendering and is refused;
+explicit deletion (`None`, or signed `settings.set` with `value: null`) remains
+the audited undo path to boot fallback.
+
+The typed `InvalidOnboardingDestination` refusal returns non-retryable
+`malformed`/400 with `settings_value_invalid`. It names only the allowlisted
+key and advises repair or deletion to fallback, never echoing the supplied
+value or a private channel identity. Invalid input wins over a stale CAS token
+without changing the prior row, actor, timestamp, CAS token, audit or live Arc.
+Valid writes and deletion retain existing attribution and concurrency behavior.
+
+Syntax is not proof of channel existence, type, visibility, permissions or
+confirmed delivery. No key class, hot consumer, mode requirement, dry-run,
+receiver grant or staging-guild fence changes here; saved is not live-applied.
+
 ## Execution and optimistic concurrency
 
 `two_bot_core::internal_settings::SettingsCommand::parse` produces a validated

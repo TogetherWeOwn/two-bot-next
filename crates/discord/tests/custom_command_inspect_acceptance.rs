@@ -5,8 +5,9 @@
 //! Boundary contract: `/command-inspect name:<name>` defaults to `summary`;
 //! `view:template` and `view:preview` are separate private responses. Optional
 //! `arguments` is a UTF-16-bounded (500-unit) sample of ordinary invocation
-//! arguments. The existing four-variable language ignores arguments: accepting
-//! a sample MUST NOT introduce `{args}` or a second interpolation pass.
+//! arguments. The five-variable language renders the sample as the preview
+//! `{args}` input, dry-run only: slash and prefix runs substitute solely
+//! captured invocation text, and no path rescans substituted output.
 //!
 //! Visible view headings are `Summary /name`, `Saved template /name`, and
 //! `Preview /name`. The body is plain, markdown-escaped untrusted text; headings
@@ -44,8 +45,14 @@ use two_bot_discord::{
 };
 use two_bot_testsupport::TestDatabase;
 
+#[path = "support/custom_command_trigger_eligibility.rs"]
+mod trigger_eligibility;
+
 const MANAGEMENT: &str = "command-inspect";
 const TOKEN: &str = "inspect-acceptance-fixture";
+
+#[path = "support/custom_command_draft_acceptance.rs"]
+mod draft_acceptance;
 
 fn gates(enabled: bool) -> RouterGates {
     RouterGates {
@@ -287,14 +294,28 @@ fn inspect_is_a_guild_only_management_command_with_three_bounded_views() {
             .dm_permission
     );
     let options = definition["options"].as_array().expect("options");
-    assert_eq!(options.len(), 3, "one workflow, no enable/disable policy");
+    assert_eq!(
+        options.len(),
+        4,
+        "one workflow with exclusive saved/draft input"
+    );
     let name = options
         .iter()
         .find(|value| value["name"] == "name")
         .unwrap();
     assert_eq!(name["type"], 3);
-    assert_eq!(name["required"], true);
+    assert_ne!(
+        name["required"], true,
+        "draft input must not require a saved name"
+    );
     assert_eq!(name["max_length"], 32);
+    let draft = options
+        .iter()
+        .find(|value| value["name"] == "draft")
+        .expect("discover unsaved preview on the existing inspection surface");
+    assert_eq!(draft["type"], 3);
+    assert_ne!(draft["required"], true);
+    assert_eq!(draft["max_length"], 2000);
     let view = options
         .iter()
         .find(|value| value["name"] == "view")
@@ -420,6 +441,76 @@ async fn inspect_lookup_outage_is_not_a_missing_definition_or_a_run() {
     assert!(content.contains("try again"), "{content}");
     assert!(!content.contains("No command") && !content.contains("not found"));
     assert!(!content.contains("PoolClosed") && !content.contains("agent-testdb"));
+}
+
+// Removing the draft-only view guard must not turn a saved-only view into a
+// successful draft preview, even though both view names pass option parsing.
+async fn draft_saved_only_view_refuses_without_sql_or_effects(view: &str) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind SQL-access tripwire");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(100))
+        .connect_lazy_with(
+            PgConnectOptions::new()
+                .host("127.0.0.1")
+                .port(listener.local_addr().expect("tripwire address").port())
+                .username("preview_fixture")
+                .database("preview_fixture")
+                .ssl_mode(sqlx::postgres::PgSslMode::Disable),
+        );
+    let mock = discord().await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    let observed = observe(
+        &runtime,
+        &mock,
+        &interaction(
+            490,
+            32,
+            vec![option("draft", "Hello"), option("view", view)],
+        ),
+        Some("TWO"),
+    )
+    .await;
+    let publication = runtime.published_commands();
+    pool.close().await;
+    mock.shutdown().await;
+    let listener = listener.into_std().expect("nonblocking SQL tripwire");
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "draft {view} refusal attempted storage access"
+    );
+    assert!(publication.is_none(), "refusal never republishes commands");
+    let content = private_content(&observed);
+    assert_eq!(
+        content,
+        "Invalid draft view: only preview is available for unsaved text. Use /command-inspect draft:Hello view:preview",
+        "draft {view} must reach the saved-only view refusal"
+    );
+    assert!(!content.contains("Draft preview"));
+    for request in &observed.requests {
+        let wire: Value = serde_json::from_slice(&request.body).expect("private response JSON");
+        let data = if request.method == "POST" {
+            &wire["data"]
+        } else {
+            &wire
+        };
+        assert!(
+            data["components"].is_null() || data["components"] == json!([]),
+            "refusal must not expose mutation controls"
+        );
+    }
+}
+
+#[tokio::test]
+async fn draft_summary_view_refuses_without_sql_or_effects() {
+    draft_saved_only_view_refuses_without_sql_or_effects("summary").await;
+}
+
+#[tokio::test]
+async fn draft_template_view_refuses_without_sql_or_effects() {
+    draft_saved_only_view_refuses_without_sql_or_effects("template").await;
 }
 
 #[tokio::test]
@@ -723,7 +814,7 @@ async fn inspect_missing_other_guild_only_and_deleted_definitions_are_truthful_m
 }
 
 #[tokio::test]
-async fn inspect_preview_preserves_the_four_variable_single_pass_language_with_sample_arguments() {
+async fn inspect_preview_preserves_the_five_variable_single_pass_language_with_sample_arguments() {
     let db = database().await;
     seed(db.pool(), "2222", "faq", "literal {User} {}", true).await;
     seed(
@@ -938,7 +1029,7 @@ async fn inspect_invalid_saved_templates_refuse_without_rendering_or_running() {
     // the shared input validator correctly refuses their 2002 UTF-16 units.
     for (index, template) in [
         "Hello {unknown}".to_owned(),
-        "{args}".to_owned(),
+        "{guild}".to_owned(),
         "😀".repeat(1001),
     ]
     .into_iter()
@@ -1079,4 +1170,74 @@ async fn inspect_preview_does_not_spend_text_cooldown_or_claim_and_ordinary_pref
     assert!(facts
         .iter()
         .all(|fact| fact["id"] != "custom:run:480" && fact["id"] != "custom:run:481"));
+}
+
+#[tokio::test]
+async fn inspect_preview_renders_sample_as_args_input_without_sending_or_auditing() {
+    // ARG-14/15: the validated `arguments` sample is the preview `{args}`
+    // input — substituted literally in one pass, escaped like any other
+    // rendered text — while an over-long sample keeps the existing
+    // correction. Previews never send and never record `command.run`.
+    let db = database().await;
+    seed(db.pool(), "2222", "faq", "Says {args}", true).await;
+    let before = definitions(db.pool()).await;
+    let mock = discord().await;
+    let runtime = runtime(db.pool().clone(), &mock, true);
+    let substituted = observe(
+        &runtime,
+        &mock,
+        &inspect(500, "faq", Some("preview"), Some("one two")),
+        Some("TWO"),
+    )
+    .await;
+    assert_eq!(
+        view_body(&private_content(&substituted), "Preview /faq"),
+        "Says one two"
+    );
+    let literal = observe(
+        &runtime,
+        &mock,
+        &inspect(501, "faq", Some("preview"), Some("{user} @everyone")),
+        Some("TWO"),
+    )
+    .await;
+    assert_eq!(
+        view_body(&private_content(&literal), "Preview /faq"),
+        "Says {user} @everyone",
+        "sample braces never rescan and grant no mention"
+    );
+    let draft = interaction(
+        502,
+        32,
+        vec![
+            option("draft", "Echo {args}"),
+            option("view", "preview"),
+            option("arguments", "dry"),
+        ],
+    );
+    let draft = observe(&runtime, &mock, &draft, Some("TWO")).await;
+    assert_eq!(
+        view_body(
+            &private_content(&draft),
+            "Draft preview — not saved or published"
+        ),
+        "Echo dry"
+    );
+    let overflow = observe(
+        &runtime,
+        &mock,
+        &inspect(503, "faq", Some("preview"), Some(&"a".repeat(501))),
+        Some("TWO"),
+    )
+    .await;
+    assert!(
+        private_content(&overflow).contains("sample arguments must be at most 500 characters"),
+        "existing sample bound and correction are unchanged"
+    );
+    let after = definitions(db.pool()).await;
+    let facts = execution_facts(db.pool()).await;
+    mock.shutdown().await;
+    db.close().await.expect("fixture teardown");
+    assert_eq!(after, before);
+    assert!(facts.is_empty(), "previews never audit");
 }

@@ -51,7 +51,7 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_job_runs_total{job,outcome}` | Completed attempts; outcome is `success` or `failure` (including returned errors, timeouts and isolated panics) |
 | `two_bot_job_last_success_timestamp_seconds{job}` | Last successful completion time in Unix seconds; zero means no success recorded |
 | `two_bot_job_consecutive_failures{job}` | Failed completions since the last success; resets to zero on success |
-| `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 16 × 7 = 112 series |
+| `two_bot_job_last_error_class{job,class}` | One-hot class of the last failed completion; clears on success; fixed 17 × 7 = 119 series |
 | `two_bot_voice_operations_total{op,outcome}` | Finished room create/move/delete outcomes; `op` is `create`, `move` or `delete`, `outcome` is `success`, `category_full`, `discord`, `persistence`, `cancelled` or `refused` (create admission refused: cap or rolling burst); retries and 429 backoffs are not outcomes |
 | `two_bot_voice_reconcile_actions_total{action}` | Reconcile changes: newly queued deletes/ownership handoffs and actual access-state transitions; `action` is `delete_enqueued`, `suspended`, `resumed` or `succession_enqueued`. Repeated unchanged passes do not increment these counters |
 | `two_bot_voice_dead_letters_total{action}` | Queue writes that exhausted `QUEUE_MAX_ATTEMPTS` (10); `action` is `create`, `move`, `delete`, `companion`, `ownership`, `kick`, `rename`, `limit` or `other` |
@@ -85,8 +85,9 @@ DB reachability; size/idle can change between reads under concurrent traffic.
 | `two_bot_raid_dropped_joins_total{reason}` | Joins not enqueued for raid observation; `reason` is exactly `queue_full` or `queue_closed`. Counts once per dropped join, not per alert. Both series start at zero and reset on process restart. No guild/member/error-text labels |
 | `two_bot_join_risk_dropped_joins_total{reason}` | Joins not enqueued for risk scoring; the same two reasons and reset semantics as the raid counter. These observer drops do not undo gateway persistence. No automatic retry or new alert rule; see [queue triage](runbook-observability.md#raid-and-join-risk-queue-drops) |
 | `two_bot_gateway_checkpoint_failures_total{stage}` | Failed gateway checkpoint commits from `apply_dispatch` and failed checkpoint clears: every failure stops the dispatch worker and is recorded on `operation`. `stage` is `pre_commit` (commit skipped after a funnel/leveling/acknowledgement failure) or `commit` (the durable store write itself failed); failure causes are never labels. Alert rule `gateway_checkpoint_failures` fires on any increase summed over every `stage` between consecutive keepalive samples (the first sample is baseline-only; the failing process lingers 75 s so a scrape lands before the restart resets the counter); unlike bursty dispatch drops, a single checkpoint failure stops the worker, so there is no benign-singleton case |
+| `two_bot_gateway_drain_skips_total` | Auxiliary leveling drains skipped on SQLSTATE `42P01` (missing table) or `42501` (missing grant); once per failed drain, not per award. A skipped drain permits checkpoint advance and may lose XP; it does not promise replay. Other failures still hold the cursor, retaining the database code or bounded deadline reason. Label-free, zero on a fresh process; no SQLSTATE, member id or error text is a label. The `gateway_drain_skips` rule tickets on any increase (first sample is baseline-only, resets re-baseline, missing/invalid family is no window). This documents rule code, not alert deployment |
 | `two_bot_drop_poison_total{guard}` | Poisoned locks recovered by drop guards instead of panicking inside `drop` (which aborts the process when the drop runs during unwinding). `guard` is one of `command_dispatch_guard`, `schedule_run`, `user_slot`, `in_flight_guard`, `ticket_supervisor`, `response_accounting` or `voice_connection_guard` (see label allowlists below). Each poisoned drop counts once and logs one `drop guard recovered a poisoned lock` warn with the guard name; the drop still releases its state from the recovered guard. A `ResponseAccounting` drop taking both the bare and global header paths counts twice, once per recovered lock. Any increase is a fault worth a look in the container logs. Poison stays sticky on the mutex, so later non-drop lock sites still panic until the broad lock-poison conversion lands; those panics unwind to task boundaries instead of aborting. Counted scope is the seven named guards, recovered only on their drop paths through drop-only variants; the shared live paths (`stop_tasks`, `finish_global`/`observe_bare_retry_after`, `VoiceRuntime::disconnect`) fail loud with no counter, so non-drop callers are never miscounted |
-| `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
+| `two_bot_internal_actions_total{family,outcome}` | Signed website-action receiver executions by bounded family and outcome. `family` is one of `announcement`, `event`, `settings`, `moderation`, `membership`, `voice` or `other` (see label allowlists below). `outcome` is `executed` or the refusal class (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`, `conflict`, `upstream` or `internal`). Every request counts once; replays count on each serve. Refusal warn-summaries stay sampled; this counter is the alertable signal. Alert rule `receiver_refusals:<family>` fires when a family's refused outcomes rise in 3 consecutive keepalive samples (first sample and restarts clear the streak; one forged pre-auth probe in `other` stays silent) |
 | `two_bot_moderation_enforcements_total{verb,outcome}` | Moderation enforcement terminal outcomes. `verb` is one of `ban`, `tempban`, `kick`, `timeout`, `warn`, `purge`, `slowmode`, `lockdown` or `unlock` (see label allowlists below). `outcome` is `success`, `refused`, `discord_error`, `storage_error` or `other`. Each terminal member/channel enforcement counts once; retries and rate-limit backoffs are not outcomes. The `moderation_enforcement_failures` rule tickets on any summed `discord_error`/`storage_error` increase (first sample is baseline-only, restarts re-baseline, missing family is no window); `success`, `refused` and `other` stay quiet |
 | `two_bot_community_facts_drain_failures_total{reason}` | Warn-and-continue community-facts drain failures in the gateway dispatch worker. `reason` is `error` (the facts writer returned an error) or `timeout` (the drain missed the dispatch deadline), or `other` (see label allowlists below). Each failed dispatch counts once; a committed drain counts nothing. The worker never stalls on this, and the scorecard fails closed on missing coverage. Alert rule `community_facts_drain_failures` raises a ticket after summed growth in 3 consecutive completed keepalive sample windows; the first valid sample only establishes a baseline. A flat sample or counter reset clears the streak; missing/invalid samples break growth but never falsely resolve an active ticket. A single failed drain never pages |
 | `two_bot_retention_replay_needed_total` | Skipped retention purges needing Operator replay: one per real guild removal whose purge-queue write hit the schema gap. Successful queue writes and rejoin-cancel skips never increment it. Label-free counter; resets on process restart, so pair it with the error log line. The `retention_replay_needed` rule tickets on any increase (first sample is baseline-only, restarts re-baseline, missing family is no window). No guild id, SQLSTATE or error text ever becomes a label |
@@ -166,9 +167,9 @@ The supervisor records all three job metrics centrally after each completed
 attempt. Individual periodic jobs need no instrumentation. The current scheduled
 labels are `counter`, `rank`, `scheduled_events`, `presence_probe`,
 `community_scorecard`, `inactivity`, `audit_retry`, `self_role_recovery`, `feeds`,
-`member_unban_sweep`, `automod_expiry`, `settings` and `scheduled_messages`
+`member_unban_sweep`, `automod_expiry`, `lfg_sweep`, `settings` and `scheduled_messages`
 (the two 15 s tickers). The community, audit, recovery, feed, unban-sweep,
-automod-expiry and ticker names may be parked by configuration.
+automod-expiry, LFG lifecycle and ticker names may be parked by configuration.
 All allowlisted series are exposed from process startup at zero, even before the
 first run. A zero success timestamp does not distinguish a parked, never-started,
 still-running or always-failing job; use `/readyz` job status for that distinction.
@@ -190,13 +191,13 @@ not a scheduled-job count and its failures are not instrumented here.
 job names share the `other` counters, timestamp and failure streak; an unknown
 success resets that shared streak, and `other` is now an unknown-name-only
 fallback: every registered producer has its own label.
-`feeds`, `self_role_recovery`, `member_unban_sweep` and `automod_expiry` have
+`feeds`, `self_role_recovery`, `member_unban_sweep`, `automod_expiry` and `lfg_sweep` have
 independent counters, timestamps and streaks: success in any one cannot clear
 failures or change last-success in another or in `other`. Add new scheduled
 names to the compile-time allowlist, never to a dynamic label map. The
 supervisor fixture checks the current website/community, audit,
-scheduled-message, feed, self-role recovery, unban-sweep and automod-expiry
-names against that allowlist.
+scheduled-message, feed, self-role recovery, unban-sweep, automod-expiry and
+LFG lifecycle names against that allowlist.
 
 No scheduler or registration gate changes are implied by these labels. Feed
 supervisor cadence follows the live interval (boot default 300 s, range
@@ -308,16 +309,19 @@ as dynamic labels.
   `invite_snapshot`, `session_checkpoint`, `counter`, `rank`,
   `scheduled_events`, `settings`, `presence_probe`, `community_scorecard`,
   `inactivity`, `audit_retry`, `scheduled_messages`, `feeds`, `self_role_recovery`,
-  `member_unban_sweep`, `automod_expiry`, `other`; `outcome` is `success` or `failure`.
+  `member_unban_sweep`, `automod_expiry`, `lfg_sweep`, `other`; `outcome` is `success` or `failure`.
   `session_checkpoint` records successful durable gateway commits; zero means
   never run. `audit_retry` is the audit supervisor's 30 s retry sweep.
   `member_unban_sweep` is the 30 s unban sweep. `automod_expiry` is the 60 s
   repeat-history expiry tick (real work only when `TWO_AUTOMOD=1`).
+  `lfg_sweep` is the 60 s bounded LFG lifecycle pass (at most 20 candidates,
+  announcements and boot identity gates required); row failures continue the
+  batch with a warning. See [LFG lifecycle](lfg-port.md#bounded-lifecycle-maintenance).
   `settings` is the DB-only 15 s `guild_settings` version poll.
 - `two_bot_job_last_error_class{job,class}` — `job` uses the list above;
   `class` is one of `database`, `rest`, `configuration`, `timeout`, `panic`,
   `feed` or `recovery_required` (the fixed `ErrorClass` variants). Each of the
-  16 jobs has one series per class (112 total); exactly the latest failure's class
+  17 jobs has one series per class (119 total); exactly the latest failure's class
   is `1`, and every class is `0` before a failure or after success. Unknown job
   names fold into `other`; class labels are fixed enum names, never error text.
 - `two_bot_voice_operations_total{op,outcome}` — `op` is `create`, `move`
@@ -423,12 +427,12 @@ as dynamic labels.
   drop still releases its state from the recovered guard. Panic payloads
   are never labels.
 - `two_bot_internal_actions_total{family,outcome}` — `family` is one of
-  `announcement`, `event`, `settings`, `moderation`, `membership` or
-  `other`, mapped from the signed `action` verb in
+  `announcement`, `event`, `settings`, `moderation`, `membership`, `voice`
+  or `other`, mapped from the signed `action` verb in
   `crates/bot/src/internal_action_http.rs` (`announcement.post` →
   `announcement`, `event.*` → `event`, `settings.*` → `settings`,
   `moderation.*` → `moderation`, `role.assign`/`guild.add_member` →
-  `membership`, everything else → `other`). `outcome` is `executed` or one
+  `membership`, `voice.snapshot` → `voice`, everything else → `other`). `outcome` is `executed` or one
   of the bounded refusal classes (`auth_failure`, `unknown_key`,
   `clock_skew`, `nonce_replay`, `rate_limit`, `unknown_action`,
   `action_disabled`, `malformed_body`, `conflict`, `upstream`, `internal`).
@@ -635,7 +639,10 @@ labels reach exposition. REST paths are matched to templates, never copied as
 labels: no guild/member/channel IDs, tokens, query strings, visitor data or message
 content. Unknown routes/events/jobs collapse to `other`. Histograms have eight
 fixed finite buckets and `+Inf`, sum and count. A scrape allocates a bounded-size
-text response; observations retain no input string.
+text response; observations retain no input string. Wire `HELP` descriptions stay
+concise to preserve the 64 KiB scrape budget as fixed series are added; the catalog
+above retains the detailed semantics. Shortening `HELP` prose does not change
+metric names, types, labels, values or series counts.
 
 `crates/core/examples/metrics_rss.rs` fills every series, submits 100,000 unique
 unknown labels, then renders 10,000 scrapes. It reports Linux `/proc/self/status`
@@ -775,11 +782,12 @@ exposition proxy, and ownership and bearer controls are unchanged.
 | `rest_global_responses_stuck` | `two_bot_rest_guard_pending_global_responses` nonzero for 3 consecutive valid samples (stuck bodies hold admission even at zero remaining); a valid zero resolves, missing/invalid samples and failed scrapes break the streak but preserve a firing page (the paused/remaining gauges stay rule-free by design: a live deadline is healthy backpressure and the countdown cannot wedge) | [REST global responses stuck](runbook.md#alert-rest-global-responses-stuck) |
 | `audit_delivery_halt` | **ticket**, not page: label-free halt gauge `1` for 3 consecutive valid samples with no current `audit_retry` failure; valid `0` recovers once, missing/invalid data holds an active ticket | [audit delivery halt](runbook.md#alert-audit-delivery-halt) |
 | `eventsub_tampered` | `two_bot_eventsub_classified_total{kind="tampered"}` rises in 3 consecutive samples (first sample is baseline-only, flat resolves, resets rebaseline, missing/invalid preserves firing alerts) | [EventSub tampered](runbook.md#alert-eventsub-tampered) |
-| `eventsub_reconcile_failed` | **ticket**, not page: `two_bot_eventsub_reconcile_passes_total{outcome="failed"}` rises between samples (one ticket per failed pass however many error sites moved; first sample is baseline-only, a restart sample re-baselines and fires when the new process already counted a failed pass (failed startup pass) else holds a firing ticket, a healthy-pass increase with no failed increase resolves, flat/pending-only growth and missing/invalid samples hold) | [eventsub reconcile failed](runbook.md#alert-eventsub-reconcile-failed) |
+| `eventsub_reconcile_failed` | **ticket**, not page: `two_bot_eventsub_reconcile_passes_total{outcome="failed"}` rises between samples (one alert state per evaluation window, even if several passes failed; first sample is baseline-only, a restart sample re-baselines and fires when the new process already counted a failed pass (failed startup pass) else holds a firing ticket, a healthy-pass increase with no failed increase resolves, flat/pending-only growth and missing/invalid samples hold) | [eventsub reconcile failed](runbook.md#alert-eventsub-reconcile-failed) |
 | `voice_worker_halted` | `two_bot_voice_worker_halted` reads 1 (any guild actor halted); a valid 0 clears at once, missing/invalid holds | [voice worker halted](runbook.md#alert-voice-worker-halted) |
 | `voice_live_self_heal` | **ticket**, not page: `two_bot_voice_live_self_heal_total` rises between valid samples (first sample is baseline-only, restarts re-baseline, a missing family is no window) | [voice live self-heal](runbook.md#alert-voice-live-self-heal) |
 | `voice_live_not_ready` | `two_bot_voice_live_not_ready_seconds` past 120 s on a connected gateway (promotes the host-watchdog bound; the sibling keeps the age climbing through a hang); at or below clears, missing/invalid holds | [voice live not ready](runbook.md#alert-voice-live-not-ready) |
 | `voice_queue_stall` | **ticket**, not page: `two_bot_voice_queue_oldest_age_seconds` past 120 s (matches the in-process stuck horizon; the sibling keeps the age climbing through a hang); at or below clears, missing/invalid holds | [voice queue stall](runbook.md#alert-voice-queue-stall) |
+| `gateway_drain_skips` | **ticket**, not page: any increase of `two_bot_gateway_drain_skips_total` between valid samples; first sample and resets baseline, missing/invalid family retains the baseline without a window verdict. A flat sample resolves; forwarding/deployment is outside this slice | [gateway drain skips](runbook.md#alert-gateway-drain-skips) |
 | `retention_replay_needed` | **ticket**, not page: any increase of `two_bot_retention_replay_needed_total` between samples (first sample is baseline-only, restarts re-baseline, missing family is no window) | [retention replay needed](runbook.md#alert-retention-replay-needed) |
 | `voice_dispatch_timeouts` | **ticket**, not page: any increase of `two_bot_voice_dispatch_timeouts_total` between samples (first sample is baseline-only, restarts re-baseline, missing family is no window) | [voice dispatch timeouts](runbook.md#alert-voice-dispatch-timeouts) |
 | `voice_watchdog_stucks` | **ticket**, not page: any increase of `two_bot_voice_watchdog_stucks_total` between samples (first sample is baseline-only, restarts re-baseline, missing family is no window) | [voice watchdog stucks](runbook.md#alert-voice-watchdog-stucks) |

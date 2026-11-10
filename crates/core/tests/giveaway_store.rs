@@ -22,14 +22,17 @@
 //! boot runner applies, so neither copy can silently lose the constraint.
 
 use sqlx::types::time::OffsetDateTime;
+use two_bot_core::giveaway::MemberStanding;
 use two_bot_core::giveaway_store as store;
-use two_bot_core::giveaway_store::{NewDraw, NewGiveaway};
+use two_bot_core::giveaway_store::{EntryAdmission, NewDraw, NewGiveaway};
 use two_bot_testsupport::TestDatabase;
 
 const GUILD: &str = "1545644954272137297";
 const CHANNEL: &str = "200000000000000001";
 const MESSAGE: &str = "200000000000000002";
 const MOD: &str = "100000000000000099";
+const BUDGET_USER: &str = "100000000000000021";
+const BUDGET_OTHER: &str = "100000000000000022";
 const NONCE: &str = "9f2c4a7e1b5d8f03a6c9e2b4d7f1a83c";
 const SEED_0: &str = "fdab72cb4823dbf292f0ed3fea3abef20dc268169a90f6aea0a1cd4c1a8c15ab";
 const SEED_1: &str = "16688231019cd5f768dcb0e2a604881b365c0ba7b242433b3e7ff96bde0bdf88";
@@ -669,5 +672,451 @@ async fn store_chain_enforces_the_giveaway_foreign_keys() -> Result<(), sqlx::Er
     assert_sqlstate(&refused, "23503");
     assert!(store::delete_giveaway(&pool, GUILD, "gw01h455k").await?);
     fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_admitted_refuses_the_11th_active_giveaway() -> Result<(), sqlx::Error> {
+    let Some(fixture) = connect("create_admitted_refuses_the_11th_active_giveaway").await else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    for n in 0..10 {
+        let id = format!("gw_quota_{n:02}");
+        assert!(
+            store::create_admitted(&pool, &new_giveaway(&id, at(3_600)))
+                .await?
+                .is_some(),
+            "control create {n} of 10 succeeds"
+        );
+    }
+    assert_eq!(
+        store::create_admitted(&pool, &new_giveaway("gw_quota_11th", at(3_600))).await?,
+        None,
+        "the 11th active giveaway is refused"
+    );
+    let definitions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM giveaways WHERE guild_id = $1")
+        .bind(GUILD)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        definitions, 10,
+        "the refused create inserts no definition row"
+    );
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM automation_audit_log WHERE guild_id = $1 AND action = 'giveaway.create'",
+    )
+    .bind(GUILD)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(audits, 10, "the refused create writes no audit row");
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_entry_budget_refuses_the_11th_write_without_the_runtime() -> Result<(), sqlx::Error>
+{
+    let Some(fixture) =
+        connect("durable_entry_budget_refuses_the_11th_write_without_the_runtime").await
+    else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    // Direct store calls only: no runtime exists here, so the in-process
+    // budget cannot mask the durable arm. Removing the `writes >= 10` check
+    // must turn the refusal below red.
+    let now = at(100);
+    let standing = MemberStanding {
+        role_ids: Vec::new(),
+        account_age_days: 400,
+        guild_age_days: 400,
+    };
+    for n in 0..10 {
+        let id = format!("gw_budget_{n:02}");
+        assert!(
+            store::create_admitted(&pool, &new_giveaway(&id, at(3_600)))
+                .await?
+                .is_some(),
+            "setup create {n} of 10 succeeds"
+        );
+    }
+    for n in 0..10 {
+        let id = format!("gw_budget_{n:02}");
+        assert_eq!(
+            store::admit_entry(&pool, GUILD, &id, BUDGET_USER, &standing, now).await?,
+            EntryAdmission::Entered,
+            "entry {n} of 10 is admitted"
+        );
+    }
+    // The 11th attempt needs an 11th definition, past the 10-open quota:
+    // cancelling one giveaway frees a slot while its entry row still counts
+    // toward the durable per-user budget (entries outlive cancels).
+    assert!(
+        store::cancel_audited(&pool, GUILD, "gw_budget_00", MOD)
+            .await?
+            .is_some(),
+        "a cancel frees one quota slot"
+    );
+    assert!(
+        store::create_admitted(&pool, &new_giveaway("gw_budget_10", at(3_600)))
+            .await?
+            .is_some(),
+        "the freed slot admits one more definition"
+    );
+    assert_eq!(
+        store::admit_entry(&pool, GUILD, "gw_budget_10", BUDGET_USER, &standing, now).await?,
+        EntryAdmission::RateLimited,
+        "the 11th write in the minute is refused by the durable budget"
+    );
+    let writes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM giveaway_entries WHERE guild_id = $1 AND user_id = $2",
+    )
+    .bind(GUILD)
+    .bind(BUDGET_USER)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(writes, 10, "the refused entry inserts no row");
+    assert_eq!(
+        store::admit_entry(&pool, GUILD, "gw_budget_10", BUDGET_OTHER, &standing, now).await?,
+        EntryAdmission::Entered,
+        "a different member is unaffected by the per-user budget"
+    );
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_resume_extend_move_the_lifecycle() -> Result<(), sqlx::Error> {
+    let Some(fixture) = connect("pause_resume_extend_move_the_lifecycle").await else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    store::create_giveaway(&pool, &new_giveaway("gw_pause_01", at(3_600))).await?;
+    assert!(store::pause_giveaway(&pool, GUILD, "gw_pause_01", at(100)).await?);
+    assert!(
+        !store::pause_giveaway(&pool, GUILD, "gw_pause_01", at(101)).await?,
+        "a paused row does not pause twice"
+    );
+    assert!(
+        !store::pause_giveaway(&pool, GUILD, "gw_pause_missing", at(101)).await?,
+        "an unknown id does not pause"
+    );
+    let paused = store::get_giveaway(&pool, GUILD, "gw_pause_01")
+        .await?
+        .expect("paused row");
+    assert_eq!(paused.status, "paused");
+    assert_eq!(paused.paused_at, Some(at(100)));
+    let resumed = store::resume_giveaway(&pool, GUILD, "gw_pause_01", at(100 + 1_800))
+        .await?
+        .expect("resume extends the deadline");
+    assert_eq!(
+        resumed.unix_timestamp(),
+        at(3_600 + 1_800).unix_timestamp(),
+        "resume adds the paused span to the deadline"
+    );
+    let reopened = store::get_giveaway(&pool, GUILD, "gw_pause_01")
+        .await?
+        .expect("resumed row");
+    assert_eq!(reopened.status, "open");
+    assert_eq!(reopened.paused_at, None);
+    assert!(
+        store::resume_giveaway(&pool, GUILD, "gw_pause_01", at(2_000))
+            .await?
+            .is_none(),
+        "an open row does not resume"
+    );
+    let extended = store::extend_giveaway(&pool, GUILD, "gw_pause_01", 600, at(2_000))
+        .await?
+        .expect("extend adds seconds");
+    assert_eq!(
+        extended.unix_timestamp(),
+        at(3_600 + 1_800 + 600).unix_timestamp()
+    );
+    assert!(
+        store::extend_giveaway(&pool, GUILD, "gw_pause_01", 0, at(2_001))
+            .await?
+            .is_none(),
+        "an out-of-bounds extension changes nothing"
+    );
+    assert!(
+        store::cancel_audited(&pool, GUILD, "gw_pause_01", MOD)
+            .await?
+            .is_some(),
+        "cancel the control row"
+    );
+    assert!(
+        store::extend_giveaway(&pool, GUILD, "gw_pause_01", 600, at(2_002))
+            .await?
+            .is_none(),
+        "a cancelled row does not extend"
+    );
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn claim_specific_leases_one_named_giveaway() -> Result<(), sqlx::Error> {
+    let Some(fixture) = connect("claim_specific_leases_one_named_giveaway").await else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    store::create_giveaway(&pool, &new_giveaway("gw_end_01", at(3_600))).await?;
+    store::create_giveaway(&pool, &new_giveaway("gw_end_02", at(3_600))).await?;
+    assert!(store::pause_giveaway(&pool, GUILD, "gw_end_02", at(10)).await?);
+    let open = store::claim_specific(&pool, GUILD, "gw_end_01", at(100), at(0), "claim-open")
+        .await?
+        .expect("open giveaway claims");
+    assert_eq!(open.claim_token.as_deref(), Some("claim-open"));
+    let paused = store::claim_specific(&pool, GUILD, "gw_end_02", at(100), at(0), "claim-paused")
+        .await?
+        .expect("paused giveaway claims for draw-now");
+    assert_eq!(paused.status, "paused");
+    assert_eq!(
+        store::claim_specific(&pool, GUILD, "gw_end_01", at(101), at(0), "claim-race").await?,
+        None,
+        "a live claim is not stolen"
+    );
+    assert_eq!(
+        store::claim_specific(
+            &pool,
+            GUILD,
+            "gw_end_missing",
+            at(101),
+            at(0),
+            "claim-missing"
+        )
+        .await?,
+        None,
+        "an unknown id does not claim"
+    );
+    let reclaimed =
+        store::claim_specific(&pool, GUILD, "gw_end_01", at(800), at(700), "claim-reclaim")
+            .await?
+            .expect("an expired lease reclaims");
+    assert_eq!(reclaimed.claim_token.as_deref(), Some("claim-reclaim"));
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_draw_from_commits_paused_and_rolls_back_on_guard() -> Result<(), sqlx::Error> {
+    let Some(fixture) = connect("commit_draw_from_commits_paused_and_rolls_back_on_guard").await
+    else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    store::create_giveaway(&pool, &new_giveaway("gw_commit_01", at(3_600))).await?;
+    assert!(store::pause_giveaway(&pool, GUILD, "gw_commit_01", at(10)).await?);
+    assert!(
+        store::claim_specific(&pool, GUILD, "gw_commit_01", at(100), at(0), "claim-commit")
+            .await?
+            .is_some()
+    );
+    let draw = store::commit_draw_from(
+        &pool,
+        &new_draw("gw_commit_01", 0, None, SEED_0),
+        "claim-commit",
+        at(101),
+        "paused",
+    )
+    .await?
+    .expect("paused draw commits");
+    assert_eq!(draw.draw_no, 0);
+    let settled = store::get_giveaway(&pool, GUILD, "gw_commit_01")
+        .await?
+        .expect("drawn row");
+    assert_eq!(settled.status, "drawn");
+    assert_eq!(settled.paused_at, None);
+    assert_eq!(settled.claim_token, None);
+    store::create_giveaway(&pool, &new_giveaway("gw_commit_02", at(3_600))).await?;
+    assert!(
+        store::claim_specific(&pool, GUILD, "gw_commit_02", at(100), at(0), "claim-stale")
+            .await?
+            .is_some()
+    );
+    assert!(
+        store::cancel_audited(&pool, GUILD, "gw_commit_02", MOD)
+            .await?
+            .is_some(),
+        "a cancel between claim and commit clears the claim"
+    );
+    assert_eq!(
+        store::commit_draw_from(
+            &pool,
+            &new_draw("gw_commit_02", 0, None, SEED_0),
+            "claim-stale",
+            at(101),
+            "open",
+        )
+        .await?,
+        None,
+        "a stale claim commits nothing"
+    );
+    assert!(
+        store::get_draws(&pool, GUILD, "gw_commit_02")
+            .await?
+            .is_empty(),
+        "the rolled-back insert leaves no orphan draw row"
+    );
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn unannounced_sweep_lists_drawn_until_marked() -> Result<(), sqlx::Error> {
+    let Some(fixture) = connect("unannounced_sweep_lists_drawn_until_marked").await else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    store::create_giveaway(&pool, &new_giveaway("gw_sweep_01", at(3_600))).await?;
+    assert!(
+        store::claim_specific(&pool, GUILD, "gw_sweep_01", at(100), at(0), "claim-sweep")
+            .await?
+            .is_some()
+    );
+    assert!(store::complete_draw(
+        &pool,
+        &new_draw("gw_sweep_01", 0, None, SEED_0),
+        "claim-sweep",
+        at(101)
+    )
+    .await?
+    .is_some());
+    let pending = store::list_unannounced(&pool, GUILD, 25).await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, "gw_sweep_01");
+    assert!(store::mark_announced(&pool, GUILD, "gw_sweep_01", at(102)).await?);
+    assert!(
+        store::list_unannounced(&pool, GUILD, 25).await?.is_empty(),
+        "a marked row leaves the sweep"
+    );
+    assert!(store::unmark_announced(&pool, GUILD, "gw_sweep_01", at(103)).await?);
+    assert_eq!(
+        store::list_unannounced(&pool, GUILD, 25).await?.len(),
+        1,
+        "reopening the marker rejoins the sweep"
+    );
+    assert!(
+        !store::unmark_announced(&pool, GUILD, "gw_sweep_missing", at(104)).await?,
+        "an unknown id does not reopen"
+    );
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn insert_reroll_draw_reopens_the_unannounced_marker_atomically() -> Result<(), sqlx::Error> {
+    let Some(fixture) =
+        connect("insert_reroll_draw_reopens_the_unannounced_marker_atomically").await
+    else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    store::create_giveaway(&pool, &new_giveaway("gw_reroll_reopen_01", at(3_600))).await?;
+    assert!(store::claim_specific(
+        &pool,
+        GUILD,
+        "gw_reroll_reopen_01",
+        at(100),
+        at(0),
+        "claim-reopen"
+    )
+    .await?
+    .is_some());
+    assert!(store::complete_draw(
+        &pool,
+        &new_draw("gw_reroll_reopen_01", 0, None, SEED_0),
+        "claim-reopen",
+        at(101)
+    )
+    .await?
+    .is_some());
+    assert!(store::mark_announced(&pool, GUILD, "gw_reroll_reopen_01", at(102)).await?);
+    assert!(
+        store::list_unannounced(&pool, GUILD, 25).await?.is_empty(),
+        "a marked row leaves the sweep"
+    );
+    let reroll = store::insert_reroll_draw(
+        &pool,
+        &new_draw("gw_reroll_reopen_01", 1, Some("full"), SEED_1),
+    )
+    .await?;
+    assert_eq!(reroll.draw_no, 1);
+    let pending = store::list_unannounced(&pool, GUILD, 25).await?;
+    assert_eq!(
+        pending.len(),
+        1,
+        "the reroll round rejoins the sweep before any announce runs, \
+         so a crash after the insert can never lose it behind round 0's stamp"
+    );
+    assert_eq!(pending[0].id, "gw_reroll_reopen_01");
+    let draws = store::get_draws(&pool, GUILD, "gw_reroll_reopen_01").await?;
+    assert_eq!(draws.len(), 2, "reroll appends; the first row is intact");
+    assert_eq!(draws[0].draw_no, 0);
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn draw_and_reroll_audits_carry_round_ids_idempotently() -> Result<(), sqlx::Error> {
+    let Some(fixture) = connect("draw_and_reroll_audits_carry_round_ids_idempotently").await else {
+        return Ok(());
+    };
+    let pool = fixture.pool().clone();
+    store::create_giveaway(&pool, &new_giveaway("gw_audit_01", at(3_600))).await?;
+    store::audit_draw(&pool, GUILD, "gw_audit_01", 0, None, at(100)).await?;
+    store::audit_reroll(&pool, GUILD, "gw_audit_01", 1, Some(MOD), at(200)).await?;
+    store::audit_draw(&pool, GUILD, "gw_audit_01", 0, None, at(101)).await?;
+    let audits: Vec<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT action::text, target_key::text, outcome::text FROM automation_audit_log \
+         WHERE guild_id = $1 AND action IN ('giveaway.draw', 'giveaway.reroll') ORDER BY id",
+    )
+    .bind(GUILD)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(audits.len(), 2, "the rewrite is a no-op, not a duplicate");
+    assert_eq!(
+        audits[0],
+        (
+            "giveaway.draw".to_owned(),
+            Some("gw_audit_01".to_owned()),
+            "ok".to_owned()
+        )
+    );
+    assert_eq!(audits[1].0, "giveaway.reroll");
+    assert_eq!(audits[1].1.as_deref(), Some("gw_audit_01"));
+    assert!(
+        !format!("{audits:?}").contains("Two game keys"),
+        "audit rows carry ids, never prize text"
+    );
+    fixture.close().await.expect("drop test database");
+    Ok(())
+}
+
+#[tokio::test]
+async fn paused_at_column_exists_on_both_chains() -> Result<(), sqlx::Error> {
+    let Some(cutover) = connect("paused_at_column_exists_on_both_chains").await else {
+        return Ok(());
+    };
+    let Some(stored) = connect_store("paused_at_column_exists_on_both_chains").await else {
+        cutover.close().await.expect("drop test database");
+        return Ok(());
+    };
+    for pool in [cutover.pool(), stored.pool()] {
+        let nullable: Option<String> = sqlx::query_scalar(
+            "SELECT is_nullable FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'giveaways' AND column_name = 'paused_at'",
+        )
+        .fetch_optional(pool)
+        .await?;
+        assert_eq!(
+            nullable.as_deref(),
+            Some("YES"),
+            "paused_at is a nullable column on this chain"
+        );
+    }
+    cutover.close().await.expect("drop test database");
+    stored.close().await.expect("drop test database");
     Ok(())
 }

@@ -2,7 +2,9 @@
 
 import importlib
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -19,6 +21,17 @@ NODE = shutil.which("node")
 DRIVER = Path(__file__).resolve().parent.parent / "wrangler" / "scripts" / "slow-burn-decide.mjs"
 
 
+def setUpModule():
+    # main() defaults its ring, coverage and evidence paths to the cwd. Run
+    # the module from private scratch so the suite never writes into the
+    # checkout it was started from.
+    scratch = tempfile.TemporaryDirectory(prefix="slow-burn-tracker-cwd-")
+    previous = Path.cwd()
+    os.chdir(scratch.name)
+    unittest.addModuleCleanup(scratch.cleanup)
+    unittest.addModuleCleanup(os.chdir, previous)
+
+
 def base_env(extra=None):
     env = {"GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "1",
            "GITHUB_SERVER_URL": "https://github.com", "GH_TOKEN": "test-token"}
@@ -32,10 +45,14 @@ class FakeGh:
     def __init__(self, issues=None):
         self.issues = issues if issues is not None else []
         self.calls = []
+        self.bodies = []
         self.next_number = max([issue["number"] for issue in self.issues] + [0]) + 1
 
     def __call__(self, argv, **kwargs):
         self.calls.append(argv)
+        if "--body-file" in argv:
+            body_file = Path(argv[argv.index("--body-file") + 1])
+            self.bodies.append(body_file.read_text(encoding="utf-8"))
         verb = argv[2]
         if verb == "list":
             return mock.Mock(returncode=0, stdout=json.dumps(self.issues), stderr="")
@@ -231,6 +248,79 @@ class TrackerUnitTests(unittest.TestCase):
         writes = [call for call in fake.calls if call[2] != "list"]
         self.assertEqual(writes, [])
 
+    def test_reconcile_writes_no_body_files_to_the_working_directory(self):
+        # Regression: create, refresh and close used to write
+        # tracker-*-body.md into the cwd, dirtying the checkout per run.
+        now = 1_700_000_000
+        cwd = self.dir / "cwd"
+        cwd.mkdir()
+        previous = Path.cwd()
+        os.chdir(cwd)
+        self.addCleanup(os.chdir, previous)
+        stale = tracker.with_marker("firing", now - 7 * 3600)
+        cases = [
+            (FakeGh(), True, "created"),
+            (FakeGh([{"number": 7, "title": tracker.issue_title(tracker.TITLE_PREFIX),
+                      "body": stale}]), True, "refreshed"),
+            (FakeGh([{"number": 7, "title": tracker.issue_title(tracker.TITLE_PREFIX),
+                      "body": stale}]), False, "closed"),
+        ]
+        for fake, slow, expected in cases:
+            with self.subTest(expected), mock.patch("subprocess.run", fake):
+                action, _ = tracker.reconcile(
+                    repo=REPO, token="t", label="slow-burn",
+                    prefix=tracker.TITLE_PREFIX, origin="fixture:fire",
+                    run_url=RUN_URL, now=now,
+                    slow=slow, fast_also=False, dry_run=False)
+                self.assertEqual(action, expected)
+                self.assertTrue(fake.bodies)
+                self.assertTrue(all(RUN_URL in body or "slow-burn-tracker" in body
+                                    for body in fake.bodies))
+                self.assertEqual(sorted(os.listdir(cwd)), [])
+
+    def test_body_scratch_io_failure_is_a_track_error(self):
+        # Scratch setup or write faults must reach main()'s TrackError path,
+        # which writes the failure receipt, not escape as a raw OSError.
+        faults = {
+            "setup": mock.patch.object(tracker.tempfile, "TemporaryDirectory",
+                                       side_effect=OSError("no space")),
+            "write": mock.patch.object(tracker.Path, "write_text",
+                                       side_effect=OSError("no space")),
+        }
+        for name, fault in faults.items():
+            fake = FakeGh()
+            with self.subTest(name), mock.patch("subprocess.run", fake), fault:
+                with self.assertRaises(tracker.TrackError) as caught:
+                    tracker.gh_with_body(["comment", "7"], "body", REPO, "t")
+                self.assertEqual(str(caught.exception),
+                                 "issue reconcile failed: body scratch I/O failed")
+                self.assertEqual(fake.calls, [])
+
+    def test_body_scratch_cleanup_failure_keeps_the_completed_write(self):
+        # gh has already accepted the write; a cleanup fault must not turn
+        # that into a failure with no receipt for the completed action.
+        fake = FakeGh()
+        with mock.patch("subprocess.run", fake), \
+                mock.patch.object(tracker.tempfile.TemporaryDirectory, "cleanup",
+                                  side_effect=OSError("busy")):
+            tracker.gh_with_body(["comment", "7"], "body", REPO, "t")
+        self.assertEqual(fake.bodies, ["body"])
+
+    def test_ignored_runtime_outputs_are_not_tracked(self):
+        # A tracked copy of an ignored runtime output is rewritten by every
+        # run, and a tracked coverage seed defeats the cache-miss warm-up.
+        root = Path(__file__).resolve().parent.parent
+        names = ["slow-burn-ring.json", "slow-burn-coverage.json",
+                 "slow-burn-ring-prev.json", "slow-burn-tracker-evidence.json",
+                 "slow-burn-exposition.prom", "tracker-refresh-body.md",
+                 "tracker-issue-body.md", "tracker-resolve-body.md"]
+        # No skip on a git failure: an unrunnable guard must fail, not pass.
+        listed = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", *names],
+            capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(listed.stdout.split(), [])
+        self.assertIn("did not match any file", listed.stderr)
+
     def test_held_verdict_decides_nothing(self):
         evidence = str(self.dir / "evidence.json")
         held = {"slow": False, "fast": False, "held": True, "ring": [],
@@ -246,6 +336,74 @@ class TrackerUnitTests(unittest.TestCase):
         stored = json.loads(Path(evidence).read_text())
         self.assertEqual(stored["verdict"], "held")
         self.assertEqual(stored["action"], "none")
+
+    def test_ring_input_is_unique_temp_file_beside_exposition(self):
+        # The driver input must be a per-invocation temp file beside the
+        # exposition output, never the shared cwd sidecar: two runs see
+        # different paths and leave no sidecar behind.
+        evidence = str(self.dir / "evidence.json")
+        expo = self.dir / "expo.prom"
+        held = {"slow": False, "fast": False, "held": True, "ring": [],
+                "slowCovered": False}
+        sidecar = Path("slow-burn-ring-prev.json")
+        sidecar_before = sidecar.read_bytes() if sidecar.exists() else None
+        seen = []
+
+        def capture(node, driver, exposition_path, ring_path, now):
+            seen.append(Path(ring_path))
+            self.assertTrue(Path(ring_path).is_file())
+            return held
+
+        argv = ["--fixture", "fire", "--evidence-out", evidence,
+                "--exposition-out", str(expo)]
+        with mock.patch.object(tracker, "run_driver", side_effect=capture):
+            with mock.patch("subprocess.run",
+                             side_effect=AssertionError("gh must not run")):
+                self.assertEqual(tracker.main(list(argv), base_env()), 0)
+                self.assertEqual(tracker.main(list(argv), base_env()), 0)
+        self.assertEqual(len(seen), 2)
+        self.assertNotEqual(seen[0], seen[1])
+        for ring_path in seen:
+            self.assertEqual(ring_path.parent.parent.resolve(),
+                             expo.resolve().parent)
+            self.assertTrue(
+                ring_path.parent.name.startswith("slow-burn-ring-"))
+            self.assertFalse(ring_path.exists())
+            self.assertFalse(ring_path.parent.exists())
+        leftovers = [p for p in expo.parent.iterdir()
+                     if p.name.startswith("slow-burn-ring-")]
+        self.assertEqual(leftovers, [])
+        # The old shared-input path clobbered this tracked file mid-suite.
+        if sidecar_before is None:
+            self.assertFalse(sidecar.exists())
+        else:
+            self.assertEqual(sidecar.read_bytes(), sidecar_before)
+
+    def test_ring_temp_input_cleaned_up_after_driver_error(self):
+        evidence = str(self.dir / "evidence.json")
+        expo = self.dir / "expo.prom"
+        sidecar = Path("slow-burn-ring-prev.json")
+        sidecar_before = sidecar.read_bytes() if sidecar.exists() else None
+        seen = []
+
+        def failing(node, driver, exposition_path, ring_path, now):
+            seen.append(Path(ring_path))
+            raise tracker.TrackError("burn evaluation failed: driver did not run")
+
+        with mock.patch.object(tracker, "run_driver", side_effect=failing):
+            code = tracker.main(
+                ["--fixture", "fire", "--evidence-out", evidence,
+                 "--exposition-out", str(expo)],
+                base_env())
+        self.assertEqual(code, 1)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].parent.name.startswith("slow-burn-ring-"))
+        self.assertFalse(seen[0].exists())
+        self.assertFalse(seen[0].parent.exists())
+        if sidecar_before is None:
+            self.assertFalse(sidecar.exists())
+        else:
+            self.assertEqual(sidecar.read_bytes(), sidecar_before)
 
     def test_main_without_argv_reads_process_arguments(self):
         # A bare main() must read sys.argv: with `argv or []` a fixture
@@ -849,6 +1007,7 @@ class TrackerCacheDuplicateKeyTests(unittest.TestCase):
 
 # Keep protected intake acceptance tests in the existing CI entrypoint.
 from test_slow_burn_tracker_intake_acceptance import TrackerIntakeAcceptanceTests
+from test_slow_burn_tracker_scratch_acceptance import TrackerScratchAcceptanceTests
 
 
 if __name__ == "__main__":

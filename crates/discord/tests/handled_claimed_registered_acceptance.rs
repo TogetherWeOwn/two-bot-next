@@ -26,7 +26,7 @@
 //! where `production_router` carries the full production registration set
 //! (including the three RSVP ids) and `intentional_registration_exceptions`
 //! is the single place blessing any id that intentionally stays unregistered
-//! (today: the five member verbs while no member consumer exists). The
+//! (today: five member verbs and one private read while no member consumer exists). The
 //! `baseline_mirror_keeps_the_adapter_trait_live` control keeps this trait
 //! used in both states via explicit qualified calls.
 //!
@@ -66,12 +66,12 @@ impl InteractionHandler for Stub {
 /// - `router_with_commands` (`command_runtime.rs`): channel handlers while
 ///   `moderation`, sticky `AutomationAdmin` + custom commands while
 ///   `automations`, feeds while `announcements`, rank/leaderboard/help/
-///   privacy always. The channel and custom registrations below call the
+///   privacy/game-mix always. The channel and custom registrations below call the
 ///   real public functions; the rest are marker ids, as in production.
 /// - `CommandRuntime::build` member verbs (`command_runtime.rs`): the five
-///   member moderation ids while a member consumer exists.
+///   member moderation ids and saved-expiry read while a member consumer exists.
 /// - `InteractionRuntime::with_router` (`interactions.rs`, public, ungated):
-///   the `Lfg`/`LfgClose` pair.
+///   the `Lfg`/`LfgClose`/`LfgEdit` handlers.
 /// - Missing on the baseline: `Rsvp`, `RsvpAttendance`,
 ///   `ScorecardAttendance` — the RED this file pins.
 trait ProductionRegistrations {
@@ -94,6 +94,7 @@ impl ProductionRegistrations for InteractionRouter {
                 HandlerId::FeedAdd,
                 HandlerId::FeedRemove,
                 HandlerId::FeedList,
+                HandlerId::FeedInspect,
             ] {
                 router.register(Box::new(Stub(id)));
             }
@@ -103,10 +104,12 @@ impl ProductionRegistrations for InteractionRouter {
             HandlerId::Leaderboard,
             HandlerId::Help,
             HandlerId::Privacy,
+            HandlerId::GameMix,
         ] {
             router.register(Box::new(Stub(id)));
         }
         if member_present {
+            router.register(Box::new(Stub(HandlerId::TempbanList)));
             for action in [
                 ModerationAction::Ban,
                 ModerationAction::TempBan,
@@ -119,17 +122,33 @@ impl ProductionRegistrations for InteractionRouter {
         }
         router.register(Box::new(Stub(HandlerId::Lfg)));
         router.register(Box::new(Stub(HandlerId::LfgClose)));
+        router.register(Box::new(Stub(HandlerId::LfgEdit)));
+        // Next-only `/lfg-list`: name-based so the baseline still compiles
+        // before the production `HandlerId::LfgList` arm lands. Resolve the
+        // handler from the routing table when the builder lands it instead of
+        // naming the enum.
+        if let SlashOutcome::Handled { handler } =
+            InteractionRouter::new(gates).route_slash(&SlashContext {
+                name: "lfg-list",
+                guild_id: gates.configured_guild,
+                actor_permissions: Some(u64::MAX),
+                custom_row: None,
+            })
+        {
+            router.register(Box::new(Stub(handler)));
+        }
         router
     }
 
     fn intentional_registration_exceptions(member_present: bool) -> Vec<HandlerId> {
-        // Member verbs register only while the member consumer exists; without
+        // Member verbs and the private read register only with a consumer; without
         // it the gap is intentional and the owner map drops them to the
         // unavailable reply in the same shape.
         if member_present {
             Vec::new()
         } else {
             vec![
+                HandlerId::TempbanList,
                 HandlerId::Moderation(ModerationAction::Ban),
                 HandlerId::Moderation(ModerationAction::TempBan),
                 HandlerId::Moderation(ModerationAction::Kick),
@@ -171,14 +190,17 @@ fn ctx(name: &str, custom_row: Option<bool>) -> SlashContext<'_> {
 fn owner_map(name: &str, member_present: bool) -> Option<HandlerId> {
     match name {
         "privacy" => Some(HandlerId::Privacy),
+        "game-mix" => Some(HandlerId::GameMix),
         "sticky" | "sticky-remove" | "schedule" | "schedule-remove" | "schedule-list" => {
             Some(HandlerId::AutomationAdmin)
         }
         "feed-add" => Some(HandlerId::FeedAdd),
         "feed-remove" => Some(HandlerId::FeedRemove),
         "feed-list" => Some(HandlerId::FeedList),
+        "feed-inspect" => Some(HandlerId::FeedInspect),
         "ban" if member_present => Some(HandlerId::Moderation(ModerationAction::Ban)),
         "tempban" if member_present => Some(HandlerId::Moderation(ModerationAction::TempBan)),
+        "tempban-list" if member_present => Some(HandlerId::TempbanList),
         "kick" if member_present => Some(HandlerId::Moderation(ModerationAction::Kick)),
         "timeout" if member_present => Some(HandlerId::Moderation(ModerationAction::Timeout)),
         "warn" if member_present => Some(HandlerId::Moderation(ModerationAction::Warn)),
@@ -189,7 +211,10 @@ fn owner_map(name: &str, member_present: bool) -> Option<HandlerId> {
 fn is_channel_claim(name: &str, handler: HandlerId) -> bool {
     ModerationAction::ALL.into_iter().any(|a| {
         !a.targets_member() && a.command_name() == name && handler == HandlerId::Moderation(a)
-    })
+    }) || matches!(
+        (name, handler),
+        ("purge-preview", HandlerId::PurgePreview) | ("channel-inspect", HandlerId::ChannelInspect)
+    )
 }
 
 /// Surfaces claiming one `Handled` outcome, in production dispatch order. A
@@ -221,7 +246,12 @@ fn claiming_surfaces(
     if is_channel_claim(name, handler) && admitted {
         claims.push("channel");
     }
-    if matches!(handler, HandlerId::Lfg | HandlerId::LfgClose) && admitted {
+    if (matches!(
+        handler,
+        HandlerId::Lfg | HandlerId::LfgClose | HandlerId::LfgEdit
+    ) || name == "lfg-list")
+        && admitted
+    {
         claims.push("lfg");
     }
     if matches!(handler, HandlerId::Rank | HandlerId::Leaderboard) && admitted {
@@ -236,8 +266,13 @@ fn claiming_surfaces(
     let earlier_arm_matches = is_channel_claim(name, handler)
         || matches!(
             handler,
-            HandlerId::Lfg | HandlerId::LfgClose | HandlerId::Rank | HandlerId::Leaderboard
+            HandlerId::Lfg
+                | HandlerId::LfgClose
+                | HandlerId::LfgEdit
+                | HandlerId::Rank
+                | HandlerId::Leaderboard
         )
+        || name == "lfg-list"
         || (name == "help" && handler == HandlerId::Help)
         || owner_map(name, member_present) == Some(handler);
     if !is_rsvp_command(name) && custom_row.is_none() && !earlier_arm_matches {
@@ -368,8 +403,8 @@ fn baseline_mirror_keeps_the_adapter_trait_live() {
         <InteractionRouter as ProductionRegistrations>::intentional_registration_exceptions(false);
     assert_eq!(
         exceptions.len(),
-        5,
-        "five member-verb exceptions without a consumer"
+        6,
+        "five member verbs and one private read without a consumer"
     );
     let none =
         <InteractionRouter as ProductionRegistrations>::intentional_registration_exceptions(true);

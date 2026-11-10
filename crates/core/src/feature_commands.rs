@@ -11,7 +11,7 @@
 //!   (`automationCommandData`) — all eight `ManageGuild`-gated.
 //! - announcements (#24–#30): `src/announcements/discord.ts`
 //!   (`announcementCommandData`) — `/rsvp` + RSVP totals open to everyone,
-//!   `/lfg` pair `ManageEvents`, `/feed-*` trio `ManageGuild`.
+//!   `/lfg` pair `ManageEvents`, `/feed-*` sextet `ManageGuild`.
 //! - scorecard (#12): `src/analytics/communityAttendance.ts`
 //!   (`COMMUNITY_ATTENDANCE_COMMAND`) — keeps the `attendance` name.
 //!
@@ -35,8 +35,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::commands::{
-    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, MAX_RESOURCE_ID_CHARS,
-    OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
+    CommandChoice, CommandDefinition, CommandOption, CommandOptionType, EVENT_REFERENCE_MAX_CHARS,
+    MAX_RESOURCE_ID_CHARS, OCCURRENCE_ID_MAX_CHARS, PERM_MANAGE_EVENTS, PERM_MANAGE_GUILD,
 };
 use super::custom_commands::{
     MAX_COMMAND_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_INSPECT_ARGUMENT_UNITS, MAX_TEMPLATE_CHARS,
@@ -44,7 +44,7 @@ use super::custom_commands::{
 };
 use super::feeds_http::MAX_FEED_SOURCE_BYTES;
 use super::lfg::{MAX_ROLE_SPEC_CHARS, MAX_TITLE_CHARS};
-use super::scheduled::MAX_BODY_CHARS;
+use super::scheduled::{MAX_AT_CHARS, MAX_BODY_CHARS};
 
 /// Scorecard check-in command (parity #12). Keeps the `attendance` name; the
 /// RSVP-totals variant is the one that renames.
@@ -58,7 +58,7 @@ pub fn scorecard_attendance_command() -> CommandDefinition {
     .options(vec![
         CommandOption::new(
             "event-occurrence",
-            "Bare event id binds that event; else {event_id}:{label}. Bare slugs refuse, e.g. 12345:weekly",
+            "Event id, event link or {event_id}:{label}; bare slugs refuse, e.g. 12345:weekly",
             CommandOptionType::String,
         )
         .required()
@@ -125,26 +125,23 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::Integer,
             )
             .min_value(1)]),
-        // Next-only saved-response inspection (parity row 33): one bounded
-        // management workflow with three private views, no enable/disable
-        // policy. Published after `command-list`; automation-gated and
-        // `ManageGuild`-gated like the other admin commands.
+        // Private saved inspection or unsaved preview; runtime requires exactly
+        // one name/draft. Automation- and ManageGuild-gated like other admin commands.
         CommandDefinition::new(
             "command-inspect",
-            "Inspect or privately preview a saved custom command",
+            "Inspect saved state and text-trigger eligibility, or preview an unsaved draft",
         )
         .permissions(PERM_MANAGE_GUILD)
         .options(vec![
             CommandOption::new(
                 "name",
-                "Saved command name, a-z 0-9 _ -",
+                "Saved command name, a-z 0-9 _ - (choose name or draft)",
                 CommandOptionType::String,
             )
-            .required()
             .max_length(MAX_COMMAND_NAME_CHARS as u32),
             CommandOption::new(
                 "view",
-                "Private view (summary by default)",
+                "Private view (saved: summary by default; draft: preview only)",
                 CommandOptionType::String,
             )
             .choices(vec![
@@ -167,6 +164,102 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::String,
             )
             .max_length(MAX_INSPECT_ARGUMENT_UNITS as u32),
+            CommandOption::new(
+                "draft",
+                "Proposed template to preview without saving (choose name or draft)",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_TEMPLATE_CHARS as u32),
+        ]),
+        CommandDefinition::new(
+            "command-clone",
+            "Clone a saved custom command under a new name",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "source",
+                "Saved source command name, a-z 0-9 _ -",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32),
+            CommandOption::new(
+                "destination",
+                "New absent destination name, a-z 0-9 _ -",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32),
+        ]),
+        // Next-only saved-response lifecycle (parity rows 40-41): pause and
+        // resume one definition without deleting it. Published immediately
+        // after `command-clone`; automation-gated and `ManageGuild`-gated
+        // like the other admin commands. Reserved builtin names, never
+        // dynamic fallthrough: a stored row under either name can neither
+        // execute nor be re-enabled, and `/command` cannot write them.
+        CommandDefinition::new(
+            "command-disable",
+            "Pause a saved custom command without deleting it",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "name",
+            "Saved command name, a-z 0-9 _ -",
+            CommandOptionType::String,
+        )
+        .required()
+        .max_length(MAX_COMMAND_NAME_CHARS as u32)]),
+        CommandDefinition::new("command-enable", "Resume a saved custom command")
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![CommandOption::new(
+                "name",
+                "Saved command name, a-z 0-9 _ -",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32)]),
+        // Next-only in-place correction (parity row 49): PATCH-like, so an
+        // omitted `template`, `description` or `text-trigger` keeps its saved
+        // value. `clear-trigger:true` is the only way to remove a trigger.
+        // `/command` stays full replacement. Published after `command-enable`;
+        // a reserved builtin name, so a stored row can never execute under it.
+        CommandDefinition::new(
+            "command-edit",
+            "Correct one saved custom command, keeping omitted fields",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "name",
+                "Saved command name, a-z 0-9 _ -",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_COMMAND_NAME_CHARS as u32),
+            CommandOption::new(
+                "template",
+                "New response text (omit to keep the saved text)",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_TEMPLATE_CHARS as u32),
+            CommandOption::new(
+                "description",
+                "New command-picker description (omit to keep it)",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_DESCRIPTION_CHARS as u32),
+            CommandOption::new(
+                "text-trigger",
+                "New !trigger (omit to keep it)",
+                CommandOptionType::String,
+            )
+            .max_length(MAX_TEXT_TRIGGER_CHARS as u32),
+            CommandOption::new(
+                "clear-trigger",
+                "True removes the !trigger (not with text-trigger)",
+                CommandOptionType::Boolean,
+            ),
         ]),
         CommandDefinition::new("schedule", "Schedule a message, once or recurring")
             .permissions(PERM_MANAGE_GUILD)
@@ -186,6 +279,23 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::Integer,
                 )
                 .int_range(60, 525600),
+                CommandOption::new(
+                    "at",
+                    "One-off RFC3339 time with Z or offset; cannot combine with other timing",
+                    CommandOptionType::String,
+                )
+                .max_length(MAX_AT_CHARS as u32),
+                CommandOption::new(
+                    "preview",
+                    "Preview the proposed post and its first firing without saving it",
+                    CommandOptionType::Boolean,
+                ),
+            ])
+            .examples(vec![
+                "/schedule body:Meeting reminder at:2027-01-15T18:30:00+05:30".to_owned(),
+                "/schedule body:Meeting reminder at:2027-01-15T13:00:00Z".to_owned(),
+                "/schedule body:Meeting reminder in-minutes:30".to_owned(),
+                "/schedule body:Hourly reminder every-minutes:60".to_owned(),
             ]),
         CommandDefinition::new("schedule-remove", "Cancel a scheduled message")
             .permissions(PERM_MANAGE_GUILD)
@@ -216,26 +326,177 @@ pub fn automation_commands() -> Vec<CommandDefinition> {
                     CommandOptionType::Integer,
                 )
                 .int_range(1, 300),
+                CommandOption::new(
+                    "preview",
+                    "Privately preview without saving",
+                    CommandOptionType::Boolean,
+                ),
+            ])
+            .examples(vec![
+                "/sticky body:Read the rules debounce:5 preview:true".to_owned(),
+                "/sticky body:Read the rules debounce:5 preview:false".to_owned(),
             ]),
         CommandDefinition::new("sticky-remove", "Remove this channel's sticky message")
             .permissions(PERM_MANAGE_GUILD),
+        giveaway_command(),
     ]
+}
+
+/// Manage-Server-only giveaway administration; entry buttons remain open to members.
+#[must_use]
+pub fn giveaway_command() -> CommandDefinition {
+    CommandDefinition::new("giveaway", "Create, draw, reroll or cancel a giveaway")
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![
+            CommandOption::new(
+                "create",
+                "Create a giveaway in this channel",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new(
+                    "prize",
+                    "Prize text (up to 200 characters)",
+                    CommandOptionType::String,
+                )
+                .required()
+                .max_length(200),
+                CommandOption::new(
+                    "duration",
+                    "Entry window in minutes (1–43200)",
+                    CommandOptionType::Integer,
+                )
+                .required()
+                .int_range(1, 43200),
+                CommandOption::new("winners", "Number of winners", CommandOptionType::Integer)
+                    .required()
+                    .int_range(1, 100),
+                CommandOption::new(
+                    "required-role",
+                    "Role every entrant must hold",
+                    CommandOptionType::Role,
+                ),
+                CommandOption::new(
+                    "min-account-age-days",
+                    "Minimum account age in days",
+                    CommandOptionType::Integer,
+                )
+                .int_range(0, 3650),
+                CommandOption::new(
+                    "min-server-age-days",
+                    "Minimum time in this server in days",
+                    CommandOptionType::Integer,
+                )
+                .int_range(0, 3650),
+            ]),
+            CommandOption::new("list", "List open giveaways", CommandOptionType::SubCommand),
+            CommandOption::new(
+                "cancel",
+                "Cancel an open or paused giveaway",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "id",
+                "Giveaway id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(64)]),
+            CommandOption::new(
+                "end",
+                "Draw now, before the deadline",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "id",
+                "Giveaway id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(64)]),
+            CommandOption::new(
+                "pause",
+                "Pause entry without drawing",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "id",
+                "Giveaway id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(64)]),
+            CommandOption::new(
+                "resume",
+                "Resume a paused giveaway",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "id",
+                "Giveaway id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(64)]),
+            CommandOption::new(
+                "extend",
+                "Add minutes to the deadline",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new("id", "Giveaway id", CommandOptionType::String)
+                    .required()
+                    .max_length(64),
+                CommandOption::new(
+                    "duration-minutes",
+                    "Minutes to add (1–43200)",
+                    CommandOptionType::Integer,
+                )
+                .required()
+                .int_range(1, 43200),
+            ]),
+            CommandOption::new(
+                "reroll",
+                "Redraw the winners",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![
+                CommandOption::new("id", "Giveaway id", CommandOptionType::String)
+                    .required()
+                    .max_length(64),
+                CommandOption::new("user", "Replace only this winner", CommandOptionType::User),
+            ]),
+            CommandOption::new(
+                "inspect",
+                "Privately inspect saved giveaway details in this channel",
+                CommandOptionType::SubCommand,
+            )
+            .sub_options(vec![CommandOption::new(
+                "id",
+                "Giveaway id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(64)]),
+        ])
 }
 
 /// Announcement commands (parity #24–#30): RSVP, LFG signups, feed relays.
 ///
-/// `/rsvp` and `/rsvp-attendance` are open to everyone; `/lfg` pair requires
-/// `ManageEvents`; `/feed-*` trio requires `ManageGuild`. All guild-only.
+/// `/rsvp` and `/rsvp-attendance` are open to everyone; `/lfg` management
+/// requires `ManageEvents`; the six `/feed-*` commands require `ManageGuild`.
+/// All guild-only.
 #[must_use]
 pub fn announcement_commands() -> Vec<CommandDefinition> {
     vec![
         CommandDefinition::new("rsvp", "RSVP to a Discord scheduled event").options(vec![
             CommandOption::new(
                 "event-id",
-                "Discord scheduled event id (number in the event URL), e.g. 12345",
+                "Scheduled event id or pasted event link, e.g. 12345",
                 CommandOptionType::String,
             )
-            .required(),
+            .required()
+            .max_length(EVENT_REFERENCE_MAX_CHARS as u32),
             CommandOption::new("status", "Your response", CommandOptionType::String)
                 .required()
                 .choices(vec![
@@ -261,10 +522,11 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
         )
         .options(vec![CommandOption::new(
             "event-id",
-            "Discord scheduled event id (number in the event URL), e.g. 12345",
+            "Scheduled event id or pasted event link, e.g. 12345",
             CommandOptionType::String,
         )
-        .required()]),
+        .required()
+        .max_length(EVENT_REFERENCE_MAX_CHARS as u32)]),
         CommandDefinition::new("lfg", "Post a raid/LFG signup with role slots")
             .permissions(PERM_MANAGE_EVENTS)
             .options(vec![
@@ -284,6 +546,11 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 )
                 .required()
                 .max_length(MAX_ROLE_SPEC_CHARS as u32),
+                CommandOption::new(
+                    "preview",
+                    "Privately preview without posting",
+                    CommandOptionType::Boolean,
+                ),
             ]),
         CommandDefinition::new("lfg-close", "Close a raid/LFG signup")
             .permissions(PERM_MANAGE_EVENTS)
@@ -294,6 +561,50 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             )
             .required()
             .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
+        CommandDefinition::new(
+            "lfg-edit",
+            "Update LFG metadata or increase one role's seats",
+        )
+        .permissions(PERM_MANAGE_EVENTS)
+        .options(vec![
+            CommandOption::new(
+                "id",
+                "LFG id from the posted signup",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32),
+            CommandOption::new("title", "Event or group title", CommandOptionType::String)
+                .max_length(MAX_TITLE_CHARS as u32),
+            CommandOption::new(
+                "starts-at",
+                "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+                CommandOptionType::String,
+            ),
+            CommandOption::new(
+                "role",
+                "Existing signup role key (use with seats)",
+                CommandOptionType::String,
+            )
+            .max_length(crate::lfg::MAX_ROLE_KEY_CHARS as u32),
+            CommandOption::new(
+                "seats",
+                "Absolute seat target, increase only (1-99; use with role)",
+                CommandOptionType::Integer,
+            )
+            .int_range(1, i64::from(crate::lfg::MAX_ROLE_SLOTS)),
+        ]),
+        CommandDefinition::new("lfg-list", "List open game posts in this channel")
+            .permissions(PERM_MANAGE_EVENTS)
+            .options(vec![CommandOption {
+                required: Some(false),
+                ..CommandOption::new(
+                    "cursor",
+                    "Continue a current-channel list",
+                    CommandOptionType::String,
+                )
+                .max_length(crate::lfg_list::MAX_CURSOR_LEN as u32)
+            }]),
         CommandDefinition::new(
             "feed-add",
             "Relay an RSS, YouTube, or Twitch feed into this channel",
@@ -333,6 +644,27 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
             )
             .required()
             .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
+        CommandDefinition::new(
+            "feed-pause",
+            "Pause a feed relay without deleting its history",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "id",
+            "Feed id",
+            CommandOptionType::String,
+        )
+        .required()
+        .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
+        CommandDefinition::new("feed-resume", "Resume a paused feed relay")
+            .permissions(PERM_MANAGE_GUILD)
+            .options(vec![CommandOption::new(
+                "id",
+                "Feed id",
+                CommandOptionType::String,
+            )
+            .required()
+            .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
         CommandDefinition::new("feed-list", "List this server's feed relays")
             .permissions(PERM_MANAGE_GUILD)
             .options(vec![CommandOption::new(
@@ -341,6 +673,18 @@ pub fn announcement_commands() -> Vec<CommandDefinition> {
                 CommandOptionType::Integer,
             )
             .min_value(1)]),
+        CommandDefinition::new(
+            "feed-inspect",
+            "Show a saved feed relay's source and last attempt",
+        )
+        .permissions(PERM_MANAGE_GUILD)
+        .options(vec![CommandOption::new(
+            "id",
+            "Feed id",
+            CommandOptionType::String,
+        )
+        .required()
+        .max_length(MAX_RESOURCE_ID_CHARS as u32)]),
     ]
 }
 
@@ -461,6 +805,7 @@ mod tests {
 
     #[test]
     fn slice2_names_match_legacy_in_order() {
+        assert_eq!(automation_commands().len(), 14);
         assert_eq!(
             names(&feature_commands()),
             [
@@ -469,18 +814,28 @@ mod tests {
                 "command-remove",
                 "command-list",
                 "command-inspect",
+                "command-clone",
+                "command-disable",
+                "command-enable",
+                "command-edit",
                 "schedule",
                 "schedule-remove",
                 "schedule-list",
                 "sticky",
                 "sticky-remove",
+                "giveaway",
                 "rsvp",
                 "rsvp-attendance",
                 "lfg",
                 "lfg-close",
+                "lfg-edit",
+                "lfg-list",
                 "feed-add",
                 "feed-remove",
+                "feed-pause",
+                "feed-resume",
                 "feed-list",
+                "feed-inspect",
             ]
         );
     }
@@ -488,11 +843,20 @@ mod tests {
     #[test]
     fn no_collision_with_leveling_core_or_within_slice() {
         let merged = merge_commands(&[feature_commands()], &[]).expect("slice 2 merges cleanly");
-        // 4 core + 1 scorecard + 9 automation + 7 announcement.
-        assert_eq!(merged.len(), 21);
+        // 7 core + 1 scorecard + 14 automation + 12 announcements.
+        assert_eq!(merged.len(), 34);
         assert_eq!(
-            &names(&merged)[..5],
-            ["rank", "leaderboard", "help", "privacy", "attendance"]
+            &names(&merged)[..8],
+            [
+                "rank",
+                "leaderboard",
+                "help",
+                "privacy",
+                "reopen",
+                "welcome-preview",
+                "game-mix",
+                "attendance"
+            ]
         );
         assert!(!merged.iter().any(|d| d.dm_permission));
     }
@@ -515,17 +879,31 @@ mod tests {
             "command-remove",
             "command-list",
             "command-inspect",
+            "command-clone",
+            "command-disable",
+            "command-enable",
+            "command-edit",
             "schedule",
             "schedule-remove",
             "schedule-list",
             "sticky",
             "sticky-remove",
+            "giveaway",
         ] {
             assert_eq!(is(&auto, name), manage_guild, "{name} gates ManageGuild");
         }
         assert_eq!(is(&ann, "lfg"), manage_events);
         assert_eq!(is(&ann, "lfg-close"), manage_events);
-        for name in ["feed-add", "feed-remove", "feed-list"] {
+        assert_eq!(is(&ann, "lfg-edit"), manage_events);
+        assert_eq!(is(&ann, "lfg-list"), manage_events);
+        for name in [
+            "feed-add",
+            "feed-remove",
+            "feed-pause",
+            "feed-resume",
+            "feed-list",
+            "feed-inspect",
+        ] {
             assert_eq!(is(&ann, name), manage_guild, "{name} gates ManageGuild");
         }
         // Open to everyone: no permission gate.
@@ -553,6 +931,14 @@ mod tests {
             ("command-remove", 0, 32),
             ("command-inspect", 0, 32),
             ("command-inspect", 2, 500),
+            ("command-clone", 0, 32),
+            ("command-clone", 1, 32),
+            ("command-disable", 0, 32),
+            ("command-enable", 0, 32),
+            ("command-edit", 0, 32),
+            ("command-edit", 1, 2000),
+            ("command-edit", 2, 100),
+            ("command-edit", 3, 33),
             ("schedule", 0, 2000),
             ("schedule-remove", 0, 128),
             ("sticky", 0, 2000),
@@ -589,8 +975,16 @@ mod tests {
             ("lfg", 0, 100),
             ("lfg", 2, 2339),
             ("lfg-close", 0, 128),
+            ("lfg-edit", 0, 128),
+            ("lfg-edit", 1, 100),
+            ("lfg-list", 0, 512),
             ("feed-add", 1, 2048),
             ("feed-remove", 0, 128),
+            ("feed-pause", 0, 128),
+            ("feed-resume", 0, 128),
+            ("feed-inspect", 0, 128),
+            ("rsvp", 0, 128),
+            ("rsvp-attendance", 0, 128),
         ] {
             assert_eq!(
                 get(&ann, command).options[option].max_length,
@@ -606,12 +1000,13 @@ mod tests {
         let kind = get(&ann, "feed-add").options[0].clone();
         let values: Vec<_> = kind.choices.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, ["rss", "youtube", "twitch"]);
-        // /command-inspect: one required name, three bounded optional views,
+        // /command-inspect: exclusive optional name/draft, three saved views,
         // one bounded optional sample. No enable/disable policy option.
         let inspect = get(&auto, "command-inspect").options.clone();
-        assert_eq!(inspect.len(), 3);
-        assert_eq!(inspect[0].required, Some(true));
-        assert!(inspect[1].required.is_none() && inspect[2].required.is_none());
+        assert_eq!(inspect.len(), 4);
+        assert!(inspect.iter().all(|option| option.required.is_none()));
+        assert_eq!(inspect[3].name, "draft");
+        assert_eq!(inspect[3].max_length, Some(2000));
         let values: Vec<_> = inspect[1]
             .choices
             .iter()
@@ -628,6 +1023,48 @@ mod tests {
         assert_eq!(
             score.options[0].max_length,
             Some(OCCURRENCE_ID_MAX_CHARS as u32)
+        );
+        // event-id advertises the shared pasted-reference bound (pinned
+        // literal: a const change must update docs/parity.md and commands.md).
+        for command in ["rsvp", "rsvp-attendance"] {
+            assert_eq!(
+                get(&ann, command).options[0].max_length,
+                Some(EVENT_REFERENCE_MAX_CHARS as u32),
+                "{command} event-id bound"
+            );
+        }
+    }
+
+    #[test]
+    fn lfg_edit_advertises_bounded_metadata_and_seat_options_in_publish_order() {
+        let announcements = announcement_commands();
+        let close = announcements
+            .iter()
+            .position(|command| command.name == "lfg-close")
+            .expect("existing close command");
+        let edit = announcements
+            .get(close + 1)
+            .expect("metadata companion follows close");
+        assert_eq!(
+            serde_json::to_value(edit).expect("command serializes"),
+            serde_json::json!({
+                "name": "lfg-edit",
+                "description": "Update LFG metadata or increase one role's seats",
+                "dm_permission": false,
+                "default_member_permissions": "8589934592",
+                "options": [
+                    {"name": "id", "description": "LFG id from the posted signup", "type": 3,
+                     "required": true, "max_length": 128},
+                    {"name": "title", "description": "Event or group title", "type": 3,
+                     "max_length": 100},
+                    {"name": "starts-at", "description": "ISO-8601 start time, e.g. 2026-10-04T18:00:00Z",
+                     "type": 3},
+                    {"name": "role", "description": "Existing signup role key (use with seats)",
+                     "type": 3, "max_length": 32},
+                    {"name": "seats", "description": "Absolute seat target, increase only (1-99; use with role)",
+                     "type": 4, "min_value": 1, "max_value": 99}
+                ]
+            })
         );
     }
 
@@ -683,6 +1120,13 @@ mod tests {
             option(&auto, "command-remove", "name").max_length,
             Some(MAX_COMMAND_NAME_CHARS as u32)
         );
+        for lifecycle in ["command-disable", "command-enable"] {
+            assert_eq!(
+                option(&auto, lifecycle, "name").max_length,
+                Some(MAX_COMMAND_NAME_CHARS as u32)
+            );
+            assert_eq!(option(&auto, lifecycle, "name").required, Some(true));
+        }
         // Pinned wire values: a silent advertisement change trips here too.
         assert_eq!(option(&auto, "command", "name").max_length, Some(32));
         assert_eq!(option(&auto, "command", "template").max_length, Some(2000));
@@ -695,6 +1139,9 @@ mod tests {
             Some(33)
         );
         assert_eq!(option(&auto, "command-remove", "name").max_length, Some(32));
+        for lifecycle in ["command-disable", "command-enable"] {
+            assert_eq!(option(&auto, lifecycle, "name").max_length, Some(32));
+        }
 
         // Runtime agrees at the boundary: name shape, trigger shape, template
         // ceiling and description bounds.
@@ -755,13 +1202,33 @@ mod tests {
         assert_eq!(json[0]["default_member_permissions"], "8589934592");
         assert_eq!(json[0]["options"][0]["name"], "event-occurrence");
         assert_eq!(json[0]["options"][0]["max_length"], 128);
-        // Saved-response inspection publishes after `command-list`, shifting
-        // the announcement slice one index later.
+        // Saved-response inspection publishes after `command-list`, the
+        // clone immediately after inspection, then pause/resume, in-place
+        // editing after resume, and giveaway after sticky-remove.
         assert_eq!(json[4]["name"], "command-inspect");
         assert_eq!(json[4]["options"][2]["max_length"], 500);
-        assert_eq!(json[11]["name"], "rsvp-attendance");
-        assert!(json[11].get("default_member_permissions").is_none());
-        assert_eq!(json[11]["options"][0]["name"], "event-id");
+        assert_eq!(json[5]["name"], "command-clone");
+        assert_eq!(json[6]["name"], "command-disable");
+        assert_eq!(json[6]["default_member_permissions"], "32");
+        assert_eq!(json[6]["options"].as_array().expect("options").len(), 1);
+        assert_eq!(json[7]["name"], "command-enable");
+        assert_eq!(json[7]["default_member_permissions"], "32");
+        assert_eq!(json[7]["options"].as_array().expect("options").len(), 1);
+        assert_eq!(json[8]["name"], "command-edit");
+        assert_eq!(json[8]["default_member_permissions"], "32");
+        let edit_options = json[8]["options"].as_array().expect("options");
+        assert_eq!(edit_options.len(), 5);
+        assert_eq!(edit_options[0]["required"], true);
+        for option in &edit_options[1..] {
+            assert!(option.get("required").is_none_or(|r| r == false));
+        }
+        assert_eq!(edit_options[4]["name"], "clear-trigger");
+        assert_eq!(edit_options[4]["type"], 5);
+        assert_eq!(json[14]["name"], "giveaway");
+        assert_eq!(json[14]["default_member_permissions"], "32");
+        assert_eq!(json[16]["name"], "rsvp-attendance");
+        assert!(json[16].get("default_member_permissions").is_none());
+        assert_eq!(json[16]["options"][0]["name"], "event-id");
     }
 
     #[test]

@@ -36,7 +36,9 @@ This is the **unexecuted** B4 coverage plan for [TOG-9699](/TOG/issues/TOG-9699)
 
 JSON is authoritative; each `parity.section` + `parity.row` copies every source table cell except Map. Repeated ClientReady, attendance and member-event surfaces remain separate. Only DROP-prefixed Maps without an S/B/NEW slice or TOG owner are excluded; mixed mapped/DROP rows remain covered in either order, including mapped replacement work. §7 is prose: one explicit catalogue entry covers env_only/cold/hot. Adding a table there also requires entries. §12 copies every cell of its addition and Redirect tables except the disposition, under the same DROP rule. §13 covers each `ported`/`carded`/`gap` ledger row (commit link, area, change and status); `dropped` rows, including every history-rewrite replay, are excluded because their features stay mapped in §§1–8. Each §12/§13 entry lists `owner`: exactly the TOG cards its disposition names, in order (a `ported` row without a card names its owning slice); a changed status, row or owner card is stale until the entry is updated.
 
-Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v`. CI runs both offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, missing or stale owner cards, empty steps/evidence, invalid statuses, waivers missing reason or approver, missing automated commands, automated Cargo commands naming an unknown `-p` package, a missing test target or no matching test (read offline from source, never run), operative `scripts/` paths in checklist evidence that do not exist (unless the entry lists them under `historical` with a reason), missing voice links or Markdown drift fail the gate.
+Run `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v` and `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist_noexec_acceptance.py' -v`. CI runs all three offline before Cargo. After editing JSON, regenerate Markdown with `PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_soak_checklist.py --render > docs/soak-checklist.md`. Source drift, missing/stale/duplicate rows, missing or stale owner cards, empty steps/evidence, invalid statuses, waivers missing reason or approver, missing automated commands, automated Cargo commands naming an unknown `-p` package, a missing test target, no matching test or no effective selected test (read offline from source, never run), operative `scripts/` paths in checklist evidence that do not exist (unless the entry lists them under `historical` with a reason), missing voice links or Markdown drift fail the gate.
+
+Supported automated verification is `python3 scripts/cargo_cache.py run -- test -p <package> [--lib | --test <target>] [filter] [-- <libtest>]`: the supported vocabulary is Cargo `-p`/`--package`, `--test`, `--lib`, `--tests`, `--all-targets`, `--features` and, after `--`, libtest `--exact`, `--ignored`, `--include-ignored`, `--skip <pattern>` (repeatable), `--test-threads <n>`. Cargo `--no-run` and libtest `--list` never execute tests and are refused as coverage; unknown flags, missing or invalid values, and known options in the wrong position fail the gate. Cargo accepts at most one positional filter before `--`; pass additional filters after `--` where libtest accepts several. Effective selection (positive filters under ignore-mode filtering minus `--skip`) must name real executable tests: default excludes `#[ignore]`, `--ignored` selects only ignored, `--include-ignored` selects all matched; a fully skipped or ignore-excluded selection cannot satisfy coverage. Example: `python3 scripts/cargo_cache.py run -- test -p two-bot-core --test backup_transport guild_config_capture -- --skip plan_v2`.
 
 ## Existing fixture entry points
 
@@ -137,8 +139,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-13: 14 — `/command`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /command name:soak-faq template:"{user} {username} {server} {channel}" description:soak text-trigger:soakfaq as manager; repeat as normal member.
-- **Expected:** Template stored and published only for manager; unsupported tokens/names rejected; runtime covered separately.
+- **Action:** Invoke /command name:soak-faq template:"{user} {username} {server} {channel} {args}" description:soak text-trigger:soakfaq as manager; repeat as normal member.
+- **Expected:** Template stored and published only for manager; unsupported tokens/names rejected; `{args}` accepted as the fifth token; runtime covered separately.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-14: 15 — `/command-remove`
@@ -158,8 +160,8 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s1-16: 17 — `/schedule`
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** Invoke /schedule body:soak-once in-minutes:1; also create body:soak-repeat every-minutes:60; try neither option and below-minimum intervals.
-- **Expected:** Valid messages are queued for invoking channel, one-shot fires once; invalid cadence rejected; recurring schedule removed after evidence.
+- **Action:** On staging only, invoke /schedule body:soak-once in-minutes:1 and body:soak-repeat every-minutes:60. Create future at times in Z and a numeric offset naming the same instant; list/remove their IDs. Try malformed/no-offset/past/out-of-horizon at, at plus in-minutes/every-minutes, neither timing and below-minimum intervals. Through the approved restart contract, verify a not-yet-due and an already delivered one-off.
+- **Expected:** Offset-equivalent inputs persist the same canonical UTC millisecond instant; set/list show that instant, localized time, stable ID and uncertain delivery timing. Every invalid time/conflict has zero schedule/audit/channel effects. Relative and recurring semantics, body safety and quota remain intact; restart retains the due instant without a second occurrence. No exact-second SLO. Remove fixture schedules after evidence.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
 ### s1-17: 18 — `/schedule-remove`
@@ -773,14 +775,15 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Owen/1.0 UA, public-IP SSRF guard and MAX_FEED_BYTES enforced; one relay per item.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
-### s6-05: Website → bot `POST /internal/actions` (HMAC-SHA256 `sha256=` over `POST\npath\nts\nnonce\nsha256(body)`; `TWO_INTERNAL_KEYS`; skew+nonce replay guard; buckets 20 burst/1/s, `guild.add_member` 10/0.5s; 19 actions: `role.assign`, `guild.add_member`, `announcement.post`, `event.upsert/cancel/read`, `automations.import/export`, `settings.get/set` (`settings.set` carries compare-and-set via `expected_version`), `moderation.*` ×9) — web callbacks incl. `identify guilds.join` auto-join path
+### s6-05: Website → bot `POST /internal/actions` (HMAC-SHA256 `sha256=` over `POST\npath\nts\nnonce\nsha256(body)`; `TWO_INTERNAL_KEYS`; skew+nonce replay guard; buckets 20 burst/1/s, `guild.add_member` 10/0.5s; 20 actions: `role.assign`, `guild.add_member`, `announcement.post`, `event.upsert/cancel/read`, `automations.import/export`, `settings.get/set` (`settings.set` carries compare-and-set via `expected_version`), `moderation.*` ×9, `voice.snapshot`) — web callbacks incl. `identify guilds.join` auto-join path
 
 - **Method:** `waived` (not an execution verdict).
-- **Action:** In local mock/CI replay all 19 signed internal actions plus bad signature, stale timestamp, reused nonce and rate-bound fixtures; do not call live mutation endpoints.
+- **Action:** In local mock/CI replay all 20 signed internal actions plus bad signature, stale timestamp, reused nonce and rate-bound fixtures; do not call live mutation endpoints.
 - **Expected:** POST canonical HMAC, replay/skew rejection, durable idempotency; 20 burst/1s and add_member 10/0.5s buckets; nine moderation actions keep protection.
 - **Evidence:** Attach the owning slice’s exact-head CI/local-fixture command, sanitized result, expected/actual fixture counts or signature digest and test-container guard receipt. Record waiver decision/reason on [TOG-9699](/TOG/issues/TOG-9699); no staging/production SQL or credentials.
 - **Reason:** Proposed staging-execution waiver: agent tests/probes may use only agent-testdb/agent-testredis or CI services, never staging/production databases; this data-plane/operator path needs an isolated fixture receipt from its owning slice. B4 must record acceptance with receipt or keep NEEDS WORK; this checklist is not approval or completed evidence.
 - **Approver:** pending — CEO/DoE acceptance on [TOG-9699](/TOG/issues/TOG-9699) (proposed, not approved)
+- **Reference:** [TOG-10119](/TOG/issues/TOG-10119) — attach its exact-SHA evidence; shared non-voice assertions remain on this row.
 
 ### s6-06: `go.two.gg` redirect (`GET /<slug>` → `invite_click` → 302; unknown → fallback code) — ~450-line server + campaigns
 
@@ -839,7 +842,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 ### s7-01: Config / env catalogue
 
 - **Method:** `manual` (not an execution verdict).
-- **Action:** With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD or TWO_FEED_POLL_SECONDS), a cold key (TWO_TICKET_COOLDOWN_SECONDS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.
+- **Action:** With approved synthetic configs, attempt an attributed dashboard write to a wired hot key (TWO_RAID_JOIN_THRESHOLD or TWO_FEED_POLL_SECONDS), a cold key (TWO_AUTOMATIONS), an env_only key and an unknown key. Observe the hot change after the 15s poll; cold and hot-but-unwired changes wait for an approved restart. Never display secret values.
 - **Expected:** Catalogued hot and cold keys are writable, versioned and audited; wired hot keys apply live, cold and hot-but-unwired keys are marked next-restart and do not apply live. Env_only and unknown writes are refused before persistence/audit; env-only values remain private.
 - **Evidence:** Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table.
 
@@ -1255,7 +1258,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 
 - **Method:** `automated` (not an execution verdict).
 - **Action:** Run the voice publish pins: the router merge and yield tests in `crates/core/src/router.rs`, the staging manifest drift tests in `crates/core/tests/staging_publish_manifest.rs`, and the generated command reference check in `crates/core/tests/reference_docs.rs`.
-- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 30 builtins then the 21 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` unpublished in every gate state until its slice lands, names and default permissions equal the manifest, and none publish with the gate off.
+- **Expected:** With `TWO_VOICE=1` the merged publish set carries the 47 builtins then the 23 voice names (voice `kick` loses first-wins to moderation `/kick`), `/templateassistant` unpublished in every gate state until its slice lands, names and default permissions equal the manifest, and none publish with the gate off.
 - **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result; fixture proof only. Deployed `/voice` registry read-back and the temp-voice staging scenario stay on [TOG-10119](/TOG/issues/TOG-10119) and are not covered by this row.
 - **Owner:** [TOG-10093](/TOG/issues/TOG-10093), [TOG-10119](/TOG/issues/TOG-10119)
 - **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::voice && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib router::tests::templateassistant && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test staging_publish_manifest && python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs committed_references_match_compiled_metadata
@@ -1412,7 +1415,7 @@ Run compiling commands on the controller through `python3 scripts/cargo_cache.py
 - **Expected:** Rerun-identical ladders, zero-scan zeros, malformed rows counted and never laddered; empty automod export valid with null/scalar refused and validation repeat-identical with extra fields passing through; legacy/session/anchor welcome bytes and Post content byte-identical; empty-window sweep writes zero events; second write pass over the same ladder inserts zero events while an older re-scan pulls the milestone back.
 - **Evidence:** Attach exact-head fixture commands and PASS/NEEDS WORK result with fixture counts; the `#[ignore]` DB scenarios need the disposable agent-testdb URL and run in the `check.yml` cutover-reward-ladder lib step and the community-db inactivity step. Fixture proof only, not a deployed-network soak receipt.
 - **Owner:** [TOG-15759](/TOG/issues/TOG-15759)
-- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib message_scan::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib message_scan_write_tests -- --ignored && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib automod::tests::export && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib welcome_copy_is_byte_identical_to_the_pure_renderers welcome_effects_post_the_renderer_bytes_unchanged && python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --lib inactivity_store
+- **Verification:** python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib message_scan::tests && python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --lib message_scan_write_tests -- --ignored && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib automod::tests::export && python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib -- welcome_copy_is_byte_identical_to_the_pure_renderers welcome_effects_post_the_renderer_bytes_unchanged && python3 scripts/cargo_cache.py run -- test -p two-bot-core --features db --lib inactivity_store
 
 ### s13-b948b89: b948b89 — fix(onboarding): dedupe repeated keys in legacy planSelection (#269)
 

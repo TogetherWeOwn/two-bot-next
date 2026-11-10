@@ -10,10 +10,13 @@ use sqlx::PgPool;
 use crate::automation_transfer::{diff_import, ImportOutcome, ParsedImport};
 use crate::custom_command_store as store;
 use crate::custom_commands::{
-    adjudicate_delete, adjudicate_put, check_capacity, error_code, require_automations_enabled,
-    reserved_command_names, validate_put_input, AuditRecord, CommandError, DeleteDecision,
-    PutCommandInput, PutDecision, StoredCommand,
+    adjudicate_delete, adjudicate_edit, adjudicate_put, adjudicate_toggle, builtin_command_names,
+    check_capacity, error_code, publishable_builtin_names, require_automations_enabled,
+    reserved_command_names, validate_edit, validate_put_input, validate_toggle_enable, AuditRecord,
+    CloneCommandInput, CommandError, DeleteDecision, EditDecision, EditOutcome, EditPatch,
+    PutCommandInput, PutDecision, StoredCommand, ToggleDecision, TriggerPatch,
 };
+use crate::leveling::valid_command_name;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -21,6 +24,10 @@ pub enum ServiceError {
     Validation(#[from] CommandError),
     #[error("That text trigger is already assigned to another command.")]
     TriggerInUse,
+    #[error("No saved source command found in this server.")]
+    SourceNotFound,
+    #[error("Destination command already exists. Choose a new name; cloning never overwrites.")]
+    DestinationExists,
     #[error("Custom-command storage failed.")]
     Storage(#[from] sqlx::Error),
 }
@@ -38,13 +45,26 @@ pub async fn put(
     at: &str,
 ) -> Result<PutDecision, ServiceError> {
     require_automations_enabled(enabled)?;
-    let builtins = reserved_command_names();
+    let mut builtins = reserved_command_names();
     let mut tx = pool.begin().await?;
     store::lock_command_capacity(&mut tx, guild).await?;
     let existing = store::get_command(&mut *tx, guild, &input.name).await?;
+    // The additive voice surface must not strand a pre-existing saved myroom.
+    // Same-name maintenance cannot create a collision; voice slash dispatch
+    // still takes precedence when enabled. Fresh writes stay reserved.
+    if existing.is_some() && input.name == "myroom" {
+        builtins.remove("myroom");
+    }
     let rows = store::list_commands(&mut *tx, guild).await?;
-    let validation = validate_put_input(input, &builtins)
-        .and_then(|()| check_capacity(rows.len(), existing.is_none(), builtins.len()));
+    // Capacity counts publication slots, not the wider write-reservation set:
+    // `templateassistant` and dark names block writes but occupy no slot.
+    let validation = validate_put_input(input, &builtins).and_then(|()| {
+        check_capacity(
+            rows.len(),
+            existing.is_none(),
+            publishable_builtin_names().len(),
+        )
+    });
     if let Err(err) = validation {
         let record = AuditRecord::put_rejected(guild, actor, &input.name, existing.is_some(), &err);
         store::audit(&mut *tx, &record, audit_id, at).await?;
@@ -82,6 +102,77 @@ pub async fn put(
     Ok(decision)
 }
 
+/// Clone into a new same-guild name. The source and its execution history are
+/// read-only; the unique trigger is deliberately omitted. All checks, the
+/// create-only INSERT and content-free audit share the existing guild lock.
+pub async fn clone_command(
+    pool: &PgPool,
+    enabled: bool,
+    guild: &str,
+    actor: &str,
+    input: &CloneCommandInput,
+    audit_id: &str,
+    at: &str,
+) -> Result<StoredCommand, ServiceError> {
+    require_automations_enabled(enabled)?;
+    let builtins = reserved_command_names();
+    let source = normalized_clone_name(&input.source, &builtins)?;
+    let destination = normalized_clone_name(&input.destination, &builtins)?;
+    let mut tx = pool.begin().await?;
+    store::lock_command_capacity(&mut tx, guild).await?;
+    let source = store::get_command(&mut *tx, guild, &source)
+        .await?
+        .ok_or(ServiceError::SourceNotFound)?;
+    if store::get_command(&mut *tx, guild, &destination)
+        .await?
+        .is_some()
+    {
+        return Err(ServiceError::DestinationExists);
+    }
+    let rows = store::list_commands(&mut *tx, guild).await?;
+    let definition = PutCommandInput {
+        name: destination.clone(),
+        description: source.description.clone(),
+        template: source.template.clone(),
+        text_trigger: None,
+    };
+    validate_put_input(&definition, &builtins)?;
+    check_capacity(rows.len(), true, builtins.len())?;
+    let row = StoredCommand {
+        guild_id: guild.to_owned(),
+        name: destination,
+        description: source.description,
+        template: source.template,
+        text_trigger: None,
+        enabled: source.enabled,
+    };
+    // An old writer may not honor the guild lock. Never fall back to the put
+    // upsert when it wins the destination key after our absent-name check.
+    if !store::create_command(&mut *tx, &row, actor, at).await? {
+        return Err(ServiceError::DestinationExists);
+    }
+    store::audit(
+        &mut *tx,
+        &AuditRecord::put(guild, actor, &row.name, true),
+        audit_id,
+        at,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+fn normalized_clone_name(name: &str, reserved: &HashSet<String>) -> Result<String, CommandError> {
+    let name = name.to_lowercase();
+    if !crate::leveling::valid_command_name(&name) {
+        return Err(CommandError::InvalidName);
+    }
+    if reserved.contains(&name) {
+        return Err(CommandError::ReservedName(name));
+    }
+    Ok(name)
+}
+
 pub async fn delete(
     pool: &PgPool,
     enabled: bool,
@@ -97,6 +188,169 @@ pub async fn delete(
     let deleted = store::delete_command(&mut *tx, guild, name).await?;
     let decision = adjudicate_delete(guild, actor, name, deleted);
     store::audit(&mut *tx, &decision.audit, audit_id, at).await?;
+    tx.commit().await?;
+    Ok(decision)
+}
+
+/// One pause/resume request: the lowercased admin name, the target state,
+/// and the audit identity the caller supplies (one interaction ID and one
+/// timestamp, like `put`).
+pub struct ToggleRequest<'a> {
+    pub guild: &'a str,
+    pub actor: &'a str,
+    pub name: &'a str,
+    pub enabled: bool,
+    pub audit_id: &'a str,
+    pub at: &'a str,
+}
+
+/// Pause (`enabled = false`) or resume (`enabled = true`) one saved
+/// definition without deleting it. Only the enabled flag and update metadata
+/// change, and only on a real flip. Missing rows and current-state requests
+/// are zero-write: no audit fact, no timestamp touch, no republish. Unlike
+/// `put`, validation refusals write no rejection audit — a malformed toggle
+/// must not mint facts about a definition it never touched. Only the flip
+/// and its content-free audit fact commit together, so a failed audit rolls
+/// the flip back. Callers publish after commit; a Discord failure must not
+/// claim the write rolled back.
+pub async fn set_enabled(
+    pool: &PgPool,
+    automations: bool,
+    request: &ToggleRequest<'_>,
+) -> Result<ToggleDecision, ServiceError> {
+    require_automations_enabled(automations)?;
+    if !valid_command_name(request.name) {
+        return Err(CommandError::InvalidName.into());
+    }
+    let mut tx = pool.begin().await?;
+    store::lock_command_capacity(&mut tx, request.guild).await?;
+    let existing = store::get_command(&mut *tx, request.guild, request.name).await?;
+    let Some(row) = existing.as_ref() else {
+        tx.rollback().await?;
+        return Ok(adjudicate_toggle(
+            request.guild,
+            request.actor,
+            request.name,
+            None,
+            request.enabled,
+        ));
+    };
+    if row.enabled == request.enabled {
+        tx.rollback().await?;
+        return Ok(adjudicate_toggle(
+            request.guild,
+            request.actor,
+            request.name,
+            Some(row),
+            request.enabled,
+        ));
+    }
+    if request.enabled {
+        // Resuming republishes the definition, so the stored row must still
+        // pass the write rules. Pausing only removes it from the set and
+        // needs no content check. Refusals stay zero-write: no audit fact.
+        let mut reserved = reserved_command_names();
+        if row.name == "myroom" {
+            reserved.remove("myroom");
+        }
+        validate_toggle_enable(row, &reserved, &builtin_command_names())?;
+    }
+    store::set_command_enabled(
+        &mut *tx,
+        request.guild,
+        request.name,
+        request.enabled,
+        request.actor,
+        request.at,
+    )
+    .await?;
+    let decision = adjudicate_toggle(
+        request.guild,
+        request.actor,
+        request.name,
+        Some(row),
+        request.enabled,
+    );
+    // The guards above prove a real flip, which always audits.
+    let audit = decision.audit.as_ref().expect("changed toggle audits");
+    store::audit(&mut *tx, audit, request.audit_id, request.at).await?;
+    tx.commit().await?;
+    Ok(decision)
+}
+
+/// One `/command-edit` request: the lowercased admin name, the patch, and
+/// the audit identity the caller supplies (one interaction ID and one
+/// timestamp, like `put`).
+pub struct EditRequest<'a> {
+    pub guild: &'a str,
+    pub actor: &'a str,
+    pub name: &'a str,
+    pub patch: &'a EditPatch,
+    pub audit_id: &'a str,
+    pub at: &'a str,
+}
+
+/// Patch one saved definition in place. The row is read under the guild
+/// lock, so omitted fields, creator, enabled state and concurrent changes
+/// are preserved from the freshly committed row, never from a stale read.
+/// The complete merged definition passes the `/command` write rules and
+/// trigger ownership (disabled siblings still own theirs) before any write.
+/// Like `set_enabled`, refusals, misses and no-ops are zero-write: no audit
+/// fact, no timestamp touch, no republish. Only a real change and its
+/// content-free audit fact commit together, so a failed audit rolls the patch
+/// back. Callers publish after commit; a Discord failure must not claim the
+/// write rolled back.
+pub async fn edit(
+    pool: &PgPool,
+    automations: bool,
+    request: &EditRequest<'_>,
+) -> Result<EditDecision, ServiceError> {
+    require_automations_enabled(automations)?;
+    if !valid_command_name(request.name) {
+        return Err(CommandError::InvalidName.into());
+    }
+    let mut tx = pool.begin().await?;
+    store::lock_command_capacity(&mut tx, request.guild).await?;
+    let existing = store::get_command(&mut *tx, request.guild, request.name).await?;
+    // The additive voice surface must not strand a pre-existing saved myroom.
+    // Same-name maintenance cannot create a collision; voice slash dispatch
+    // still takes precedence when enabled. Fresh writes stay reserved.
+    let mut reserved = reserved_command_names();
+    if existing.is_some() && request.name == "myroom" {
+        reserved.remove("myroom");
+    }
+    if reserved.contains(request.name) {
+        return Err(CommandError::ReservedName(request.name.to_owned()).into());
+    }
+    let decision = adjudicate_edit(
+        request.guild,
+        request.actor,
+        request.name,
+        existing.as_ref(),
+        request.patch,
+    );
+    let (EditOutcome::Changed, Some(row)) = (decision.outcome, existing.as_ref()) else {
+        tx.rollback().await?;
+        return Ok(decision);
+    };
+    let merged = request.patch.apply(row);
+    validate_edit(&merged, request.patch, &reserved, &builtin_command_names())?;
+    if let TriggerPatch::Set(trigger) = &request.patch.text_trigger {
+        let rows = store::list_commands(&mut *tx, request.guild).await?;
+        if rows.iter().any(|other| {
+            other.name != request.name
+                && other
+                    .text_trigger
+                    .as_ref()
+                    .is_some_and(|held| held.eq_ignore_ascii_case(trigger))
+        }) {
+            return Err(ServiceError::TriggerInUse);
+        }
+    }
+    store::update_command_fields(&mut *tx, &merged, request.actor, request.at).await?;
+    // The guards above prove a real change, which always audits.
+    let audit = decision.audit.as_ref().expect("changed edit audits");
+    store::audit(&mut *tx, audit, request.audit_id, request.at).await?;
     tx.commit().await?;
     Ok(decision)
 }

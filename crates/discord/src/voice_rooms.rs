@@ -602,10 +602,26 @@ impl RoomHttp {
                 _ => break,
             }
         }
+        // Attachment-bearing Twilight requests carry a multipart form, not a
+        // JSON body: send the built form with its declared boundary, the
+        // same conversion the upstream client performs. JSON-only requests
+        // keep the previous content type and body. Request-supplied headers
+        // still apply last, after this default.
+        let (content_type, body) = match request.form() {
+            Some(form) => {
+                let content_type = HeaderValue::from_bytes(&form.content_type())
+                    .map_err(|_| RoomHttpError::InvalidRequest)?;
+                (content_type, Bytes::from(form.clone().build()))
+            }
+            None => (
+                HeaderValue::from_static("application/json"),
+                Bytes::copy_from_slice(request.body().unwrap_or_default()),
+            ),
+        };
         let mut wire = Request::builder()
             .method(request.method().name())
             .uri(format!("{}/{}", self.origin, request.path()))
-            .header(CONTENT_TYPE, "application/json");
+            .header(CONTENT_TYPE, content_type);
         if bot_authenticated {
             wire = wire.header(AUTHORIZATION, self.authorization.clone());
         }
@@ -615,9 +631,7 @@ impl RoomHttp {
             }
         }
         let wire = wire
-            .body(Full::new(Bytes::copy_from_slice(
-                request.body().unwrap_or_default(),
-            )))
+            .body(Full::new(body))
             .map_err(|_| RoomHttpError::InvalidRequest)?;
         // One adapter-visible REST attempt per wire send, shared with the
         // executor's accounting: template only, never IDs, tokens or bodies.

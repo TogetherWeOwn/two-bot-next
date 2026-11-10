@@ -17,6 +17,7 @@ use std::sync::{
     Arc,
 };
 
+use crate::community_classifier::classifier_config_from_live;
 use crate::onboarding::OnboardingJob;
 
 use futures_util::StreamExt as _;
@@ -249,7 +250,70 @@ struct LiveInteraction {
     generation: u64,
 }
 
-type LiveInteractions = Arc<std::sync::Mutex<HashMap<i64, LiveInteraction>>>;
+// Upper bound on committed interactions awaiting a worker claim. Claims
+// queue behind `ONBOARDING_WORKER_LIMIT` workers (90 s each), so a sustained
+// burst would otherwise grow the map without limit. An evicted entry is not
+// lost: its claim falls back to the durable `OnboardingJob::recover` path.
+const LIVE_INTERACTION_CAP: usize = 1024;
+
+/// Arrival-ordered live-interaction cache: at most `LIVE_INTERACTION_CAP`
+/// entries, evicting the oldest arrival on insert. Eviction drops the
+/// interaction and its ACK ticket receiver.
+#[derive(Default)]
+struct LiveCache {
+    entries: HashMap<i64, LiveInteraction>,
+    arrival: std::collections::VecDeque<i64>,
+    evicted: u64,
+}
+
+impl LiveCache {
+    fn insert(&mut self, id: i64, live: LiveInteraction) -> Option<LiveInteraction> {
+        let replaced = self.remove(&id);
+        while self.entries.len() >= LIVE_INTERACTION_CAP {
+            let Some(oldest) = self.arrival.pop_front() else {
+                break;
+            };
+            if self.entries.remove(&oldest).is_some() {
+                self.evicted += 1;
+                tracing::warn!(
+                    event = "live_interaction_evicted",
+                    job_id = oldest,
+                    cap = LIVE_INTERACTION_CAP,
+                    evicted_total = self.evicted,
+                    "live interaction cache full; evicted the oldest, its claim recovers from the durable job"
+                );
+            }
+        }
+        self.arrival.push_back(id);
+        self.entries.insert(id, live);
+        replaced
+    }
+
+    fn remove(&mut self, id: &i64) -> Option<LiveInteraction> {
+        let live = self.entries.remove(id)?;
+        if let Some(position) = self.arrival.iter().position(|queued| queued == id) {
+            self.arrival.remove(position);
+        }
+        Some(live)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, id: &i64) -> bool {
+        self.entries.contains_key(id)
+    }
+}
+
+type LiveInteractions = Arc<std::sync::Mutex<LiveCache>>;
 
 async fn generation_changed(generation: &AtomicU64, wake: &tokio::sync::Notify, expected: u64) {
     loop {
@@ -455,12 +519,27 @@ impl Drop for RsvpPermit {
 
 /// Dispatch-worker failures are recorded errors, never worker panics: the
 /// worker stops, already-accepted commands drain, and the runner surfaces
-/// these typed errors instead of a bare "dispatch worker failed". Each
-/// message names its stage. Pre-commit failures keep the
+/// these typed errors instead of a bare "dispatch worker failed". Database
+/// causes pass through without formatting; non-database messages name their
+/// stage. Synthesized pre-commit failures keep the
 /// `; checkpoint unchanged` suffix; the missing-ticket error is raised after
 /// a successful commit, so it says `; checkpoint committed` instead.
-fn leveling_dispatch_failure() -> sqlx::Error {
-    sqlx::Error::InvalidArgument("leveling gateway dispatch failed; checkpoint unchanged".into())
+fn leveling_dispatch_failure(
+    error: two_bot_discord::leveling_runtime::LevelingRuntimeError,
+) -> sqlx::Error {
+    use two_bot_core::leveling_store::LevelingStoreError;
+    use two_bot_discord::leveling_runtime::{LevelingRuntimeError, RoleApplicationError};
+
+    match error {
+        LevelingRuntimeError::Store(LevelingStoreError::Db(error))
+        | LevelingRuntimeError::RoleApplication {
+            cause: RoleApplicationError::Store(LevelingStoreError::Db(error)),
+            ..
+        } => error,
+        _ => sqlx::Error::InvalidArgument(
+            "leveling gateway dispatch failed; checkpoint unchanged".into(),
+        ),
+    }
 }
 
 fn leveling_poison_failure() -> sqlx::Error {
@@ -815,7 +894,7 @@ fn requests_or_hold_cursor(
                     LevelingRuntimeError::CommunityFactsPoisoned => {
                         community_facts_poison_failure()
                     }
-                    _ => leveling_dispatch_failure(),
+                    _ => leveling_dispatch_failure(error),
                 });
             }
             Vec::new()
@@ -936,19 +1015,24 @@ fn event_guild_id(event: &Event) -> String {
     }
 }
 
-/// Per-message channel-classifier refresh from the poller-published
-/// snapshot: the deployment environment is the base, stored human/welcome
-/// channel sets overlay it (both are `HOT_WIRED`, so only they can arrive
-/// from the snapshot). Parked or pre-first-poll readers layer nothing and
-/// the refresh is a no-op once the config compares equal.
+/// Per-fact classifier refresh from the poller-published snapshot: the
+/// deployment environment is the base, stored channel and exclusion sets
+/// overlay it (all seven are `HOT_WIRED`, so only they can arrive from the
+/// snapshot). Parked or pre-first-poll readers layer nothing and the
+/// refresh is a no-op once the config compares equal.
 fn refresh_channel_classifier_from_poller<I: InviteSource>(
     pipeline: &GatewayPipeline<I>,
     event: &Event,
 ) {
-    let Event::MessageCreate(msg) = event else {
-        return;
+    let guild_id = match event {
+        Event::MessageCreate(message) => message.guild_id,
+        Event::VoiceStateUpdate(update) => update.guild_id,
+        Event::MemberAdd(member) => Some(member.guild_id),
+        Event::MemberUpdate(member) => Some(member.guild_id),
+        Event::MemberRemove(member) => Some(member.guild_id),
+        _ => None,
     };
-    let Some(guild_id) = msg.guild_id else {
+    let Some(guild_id) = guild_id else {
         return;
     };
     let Some(live) = crate::settings_jobs::live() else {
@@ -964,30 +1048,6 @@ fn refresh_channel_classifier_from_poller<I: InviteSource>(
         &guild_id.get().to_string(),
         &live,
     ));
-}
-
-/// Classifier config with one guild's stored channel sets layered over
-/// the deployment environment: stored rows win, deleted rows fall back
-/// to the boot value (the automod `layered_vars` shape). Only the two
-/// channel keys overlay, so the paired facts-sink config keeps its
-/// environment values for every other field.
-fn classifier_config_from_live(
-    deployment: &HashMap<String, String>,
-    guild_id: &str,
-    live: &two_bot_core::settings::LiveSettings,
-) -> two_bot_core::ClassifierConfig {
-    let mut vars = deployment.clone();
-    vars.extend(
-        live.env_snapshot(Some(guild_id))
-            .into_iter()
-            .filter(|(key, _)| {
-                matches!(
-                    key.as_str(),
-                    "TWO_COMMUNITY_HUMAN_CHANNEL_IDS" | "TWO_COMMUNITY_WELCOME_CHANNEL_IDS"
-                )
-            }),
-    );
-    two_bot_core::ClassifierConfig::from_map(&vars)
 }
 
 /// One blocking-worker dispatch step: run the funnel/leveling drain, await the
@@ -1087,8 +1147,8 @@ fn apply_dispatch<I: InviteSource>(
             &dispatch.observed_at,
             checkpoint.sequence,
         );
-        // Stored human/welcome channel sets reclassify live: refresh
-        // before the funnel stamps this message's channel class.
+        // Stored channel and exclusion sets reclassify live: refresh
+        // before the funnel and deferred writers classify this dispatch's facts.
         refresh_channel_classifier_from_poller(pipeline, &dispatch.event);
         // Exactly one funnel call per dispatch, then drain deferred
         // XP awards through the leveling runtime under the
@@ -1161,23 +1221,43 @@ fn apply_dispatch<I: InviteSource>(
                 failures,
                 deadline,
                 async {
-                    pipeline.drain(requests).await.map(drop).map_err(|error| {
-                        // Runtime Display is sanitized; never
-                        // log its SQL/HTTP source.
-                        tracing::warn!(
-                            error = %error,
-                            committed_awards = error.committed_awards().len(),
-                            "gateway leveling dispatch failed"
-                        );
-                        leveling_dispatch_failure()
-                    })
+                    match pipeline.drain(requests).await {
+                        Ok(_) => Ok(()),
+                        Err(error) => {
+                            let committed_awards = error.committed_awards().len();
+                            let cause = crate::db_log::leveling_class(&error);
+                            let error = leveling_dispatch_failure(error);
+                            let code = crate::db_log::error_code(&error);
+                            if crate::gateway_failure::is_schema_gap(&error) {
+                                tracing::warn!(
+                                    drain = "leveling",
+                                    cause,
+                                    error_code = code.as_deref().unwrap_or("none"),
+                                    committed_awards,
+                                    "gateway leveling dispatch skipped; schema gap"
+                                );
+                                two_bot_core::metrics::global().gateway_drain_skip();
+                                Ok(())
+                            } else {
+                                tracing::warn!(
+                                    drain = "leveling",
+                                    cause,
+                                    error_code = code.as_deref().unwrap_or("none"),
+                                    committed_awards,
+                                    "gateway leveling dispatch failed"
+                                );
+                                Err(error)
+                            }
+                        }
+                    }
                 },
             ));
-            if drain_outcome.is_err() {
-                // A failed drain or its checkpoint deadline
-                // holds the cursor via `dispatch_error`
-                // instead of panicking away accepted work.
-                dispatch_error = Some(leveling_dispatch_failure());
+            if let Err(error) = drain_outcome {
+                // Non-gap errors and checkpoint deadlines still hold the
+                // cursor. Preserve both the source and any earlier failure.
+                if dispatch_error.is_none() {
+                    dispatch_error = Some(error);
+                }
             }
         }
         // Community facts: drain buffered voice_session_started/ended,
@@ -1420,7 +1500,8 @@ pub async fn run_shard<I: InviteSource + 'static>(
     // slash rows until a later management republish. Resolve the token
     // identity once through the shared executor, arm the ordered fence from
     // the same lookup, then publish the merged set. READY/RESUMED dispatch
-    // stays publication-free, so this boot sync is the single writer.
+    // stays publication-free unless a pending resync marker says the picker
+    // is stale, so this boot sync is otherwise the single writer.
     // Without the command runtime, keep the ordered builtins-only sync.
     match (interactions.as_ref(), runtime.as_ref()) {
         (Some(ordered), Some(commands)) => {
@@ -1715,7 +1796,22 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                     Some(permit) => {
                                         let interaction = interaction.0.clone();
                                         let runtime = Arc::clone(runtime);
-                                        let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction).await });
+                                        // Per-invocation live announcements bit for the
+                                        // ordered RSVP path (self-role per-dispatch
+                                        // pattern): a stored `0` refuses RSVP commands
+                                        // with the disabled reply before any defer.
+                                        // The runtime's installed test source wins;
+                                        // production reads the poller snapshot.
+                                        let guild = interaction.guild_id.map(|id| id.get().to_string()).unwrap_or_default();
+                                        let boot = runtime.router.gates().announcements;
+                                        let live = runtime
+                                            .live_settings_override()
+                                            .or_else(crate::settings_jobs::live);
+                                        let announcements_live =
+                                            crate::feed_jobs::live_announcements_with(
+                                                &guild, boot, live.as_ref(),
+                                            );
+                                        let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction, announcements_live).await });
                                         // Track owned acknowledgement work so the bounded
                                         // completion policy can cancel it on timeout or
                                         // shard cancellation instead of detaching it.
@@ -1747,26 +1843,31 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         // The only onboarding effect at reception is a bounded
                         // initial ACK via the shared executor; the memory-only
                         // ticket is consumed after the ordered COMMIT.
-                        let acknowledgement = match (onboarding.as_ref(), dispatch.as_deref()) {
-                            (Some(runtime), Some(ReceivedDispatch { event: Event::InteractionCreate(interaction), .. }))
-                                if runtime.accepts_interaction(&interaction.0) =>
-                            {
-                                // The permit is a drop guard held by the spawned
-                                // task: a panicking `acknowledge` releases it
-                                // during unwind instead of leaking capacity.
-                                let permit = match AckPermit::try_acquire(&in_flight_acks) {
-                                    Some(permit) => permit,
-                                    None => return Err(ingress_capacity_failure()),
-                                };
-                                let (send, receive) = tokio::sync::oneshot::channel();
-                                let runtime = Arc::clone(runtime);
-                                let interaction = interaction.0.clone();
-                                tokio::spawn(async move {
-                                    let _permit = permit;
-                                    let confirmed = runtime.acknowledge(&interaction, received_at).await;
-                                    let _ = send.send(confirmed);
-                                });
-                                Some(receive)
+                        let acknowledgement = match (onboarding.as_ref(), dispatch.as_deref_mut()) {
+                            (Some(runtime), Some(ReceivedDispatch { event: Event::InteractionCreate(interaction), .. })) => {
+                                match runtime.resolve_interaction(&interaction.0).map(|resolved| resolved.into_owned()) {
+                                    Some(resolved) => {
+                                        // Preserve registered slash identity in the
+                                        // post-commit job as well as this ACK task.
+                                        interaction.0 = resolved.clone();
+                                        // The permit is a drop guard held by the spawned
+                                        // task: a panicking `acknowledge` releases it
+                                        // during unwind instead of leaking capacity.
+                                        let permit = match AckPermit::try_acquire(&in_flight_acks) {
+                                            Some(permit) => permit,
+                                            None => return Err(ingress_capacity_failure()),
+                                        };
+                                        let (send, receive) = tokio::sync::oneshot::channel();
+                                        let runtime = Arc::clone(runtime);
+                                        tokio::spawn(async move {
+                                            let _permit = permit;
+                                            let confirmed = runtime.acknowledge(&resolved, received_at).await;
+                                            let _ = send.send(confirmed);
+                                        });
+                                        Some(receive)
+                                    }
+                                    None => None,
+                                }
                             }
                             _ => None,
                         };
@@ -2287,11 +2388,15 @@ pub async fn build_persistent_pipeline(
     guild_id: Snowflake,
     token: String,
     leveling: Option<LevelingRuntime>,
+    cache: Arc<twilight_cache_inmemory::DefaultInMemoryCache>,
 ) -> Result<GatewayPipeline<HttpInvites>, sqlx::Error> {
     tokio::time::timeout(CHECKPOINT_IO_MAX, async {
         let buffer = GatewayFunnelBuffer::from_milestones(store.milestones().await?);
         buffer.seed_snapshots(guild_id, store.invite_snapshots().await?);
-        Ok(OrderedLevelingPipeline::with_snapshots(
+        // The shared gateway cache: the same handle the internal-actions
+        // receiver projects `voice.snapshot` from, so the read sees the live
+        // voice states this pipeline feeds.
+        Ok(OrderedLevelingPipeline::with_shared_cache(
             buffer.clone(),
             leveling,
             HttpInvites {
@@ -2299,6 +2404,7 @@ pub async fn build_persistent_pipeline(
                 handle: tokio::runtime::Handle::current(),
             },
             buffer,
+            cache,
         ))
     })
     .await
@@ -2312,10 +2418,15 @@ pub async fn build_persistent_pipeline(
 /// Anything missing — or any construction failure — degrades to voice-off
 /// with a warn; the gateway and /readyz keep working. Secrets never appear
 /// in the logs.
+///
+/// The returned handle is the game-activity flush loop. The caller latches
+/// `drained` once the gateway task has joined, so no producer is left, and
+/// then joins the handle so the trailing flush finishes before exit.
 pub async fn build_voice_runtime(
     config: &Config,
     voice_enabled: bool,
-) -> Option<Arc<dyn VoiceEventSink>> {
+    drained: tokio::sync::watch::Receiver<bool>,
+) -> Option<(Arc<dyn VoiceEventSink>, tokio::task::JoinHandle<()>)> {
     if !voice_enabled {
         return None;
     }
@@ -2361,14 +2472,16 @@ pub async fn build_voice_runtime(
         Ok(runtime) => {
             info!("voice rooms enabled; gateway sink attached");
             // Hourly guild-aggregate persist for the game-activity collector
-            // fed by the presence/voice frames below. Detached: each tick
-            // persists at most once per interval, so a deploy boundary drops
-            // at worst the current partial interval, never double-counts.
-            tokio::spawn(two_bot::voice_rooms::game_activity::flush_loop(
+            // fed by the presence/voice frames below. The caller latches
+            // `drained` after the gateway joins; the loop then runs one
+            // trailing flush of the buffered partial interval, never
+            // double-counting.
+            let flush = tokio::spawn(two_bot::voice_rooms::game_activity::flush_loop(
                 db.pool().clone(),
                 runtime.runtime().game_activity_collector().clone(),
+                drained,
             ));
-            Some(Arc::new(runtime))
+            Some((Arc::new(runtime), flush))
         }
         Err(err) => {
             warn!(error = %err, "voice HTTP setup failed; voice rooms disabled");
@@ -2391,6 +2504,10 @@ mod drop_poison_acceptance_tests;
 #[cfg(test)]
 #[path = "gateway_drop_poison_counter_acceptance_tests.rs"]
 mod drop_poison_counter_acceptance_tests;
+
+#[cfg(test)]
+#[path = "gateway_live_exclusions_acceptance_tests.rs"]
+mod live_exclusions_acceptance_tests;
 
 #[cfg(test)]
 #[path = "gateway_deferred_poison_acceptance_tests.rs"]
@@ -2435,12 +2552,13 @@ mod tests {
     }
 
     #[test]
-    fn stored_channel_sets_overlay_env_for_the_classifier() {
+    fn stored_classifier_sets_overlay_env_for_the_classifier() {
         use two_bot_core::settings::{live_channel, SettingRow, SettingsSnapshot};
         use two_bot_core::ChannelClass;
 
         const HUMAN: u64 = 200_000_000_000_000_001;
         const WELCOME: u64 = 300_000_000_000_000_001;
+        const TESTER: &str = "tester-1";
         let deployment: HashMap<String, String> = [(
             "TWO_COMMUNITY_HUMAN_CHANNEL_IDS".to_owned(),
             WELCOME.to_string(),
@@ -2453,9 +2571,11 @@ mod tests {
         let boot = classifier_config_from_live(&deployment, "22", &live);
         assert_eq!(boot.channel_class(WELCOME), ChannelClass::Human);
         assert_eq!(boot.channel_class(HUMAN), ChannelClass::Other);
+        assert!(boot.test_actor_ids.is_empty());
 
         // Stored rows win over the boot value for the same key, and a
         // stored welcome set classifies welcome (winning over human).
+        // The stored exclusion row exercises the exclusion overlay arms.
         writer.publish(&SettingsSnapshot {
             revision: 1,
             rows: vec![
@@ -2471,16 +2591,27 @@ mod tests {
                     value: serde_json::json!([WELCOME.to_string()]),
                     version: 1,
                 },
+                SettingRow {
+                    guild_id: "22".to_owned(),
+                    key: "TWO_COMMUNITY_TEST_ACTOR_IDS".to_owned(),
+                    value: serde_json::json!([TESTER]),
+                    version: 1,
+                },
             ],
         });
         let stored = classifier_config_from_live(&deployment, "22", &live);
         assert_eq!(stored.channel_class(HUMAN), ChannelClass::Human);
         assert_eq!(stored.channel_class(WELCOME), ChannelClass::Welcome);
+        assert_eq!(
+            stored.test_actor_ids,
+            std::collections::HashSet::from([TESTER.to_owned()])
+        );
 
         // Another guild's stored rows never layer onto this guild.
         let other = classifier_config_from_live(&deployment, "23", &live);
         assert_eq!(other.channel_class(HUMAN), ChannelClass::Other);
         assert_eq!(other.channel_class(WELCOME), ChannelClass::Human);
+        assert!(other.test_actor_ids.is_empty());
     }
 
     #[test]
@@ -3122,22 +3253,92 @@ mod tests {
         }
     }
 
+    fn live_entry() -> (LiveInteraction, tokio::sync::oneshot::Sender<bool>) {
+        let interaction: twilight_model::application::interaction::Interaction =
+            serde_json::from_value(serde_json::json!({
+                "id": "9", "application_id": "1111", "type": 2,
+                "token": "synthetic-interaction-token", "version": 1,
+                "guild_id": "22",
+                "channel": {"id": "4444", "type": 0, "name": "commands"},
+                "authorizing_integration_owners": {"0": "22"}, "entitlements": [],
+                "member": {
+                    "permissions": "0", "roles": [], "joined_at": null,
+                    "deaf": false, "mute": false, "flags": 0,
+                    "user": {"id": "3333", "username": "tester",
+                             "discriminator": "0000", "avatar": null}
+                },
+                "data": {"id": "5555", "name": "fixture", "type": 1, "options": []}
+            }))
+            .expect("synthetic interaction");
+        let (sender, ticket) = tokio::sync::oneshot::channel();
+        (
+            LiveInteraction {
+                interaction: Box::new(interaction),
+                ticket,
+                generation: 1,
+            },
+            sender,
+        )
+    }
+
+    #[test]
+    fn live_cache_evicts_oldest_arrival_once_past_the_cap() {
+        let mut cache = LiveCache::default();
+        let mut tickets = Vec::new();
+        for id in 0..=LIVE_INTERACTION_CAP as i64 {
+            let (live, sender) = live_entry();
+            cache.insert(id, live);
+            tickets.push(sender);
+        }
+        assert_eq!(cache.len(), LIVE_INTERACTION_CAP);
+        assert!(!cache.contains_key(&0), "oldest arrival must be evicted");
+        assert!(cache.contains_key(&1) && cache.contains_key(&(LIVE_INTERACTION_CAP as i64)));
+        assert!(
+            tickets.remove(0).send(true).is_err(),
+            "evicted ticket freed"
+        );
+        // A claim frees its slot, so the next insert evicts nothing.
+        assert!(cache.remove(&1).is_some());
+        let (live, _sender) = live_entry();
+        cache.insert(-1, live);
+        assert_eq!(cache.len(), LIVE_INTERACTION_CAP);
+        assert!(cache.contains_key(&2));
+        // Re-inserting an id replaces it instead of consuming a second slot.
+        let (live, _sender) = live_entry();
+        assert!(cache.insert(2, live).is_some());
+        assert_eq!(cache.len(), LIVE_INTERACTION_CAP);
+        assert_eq!(cache.arrival.len(), LIVE_INTERACTION_CAP);
+        assert!(!cache.is_empty());
+    }
+
     #[tokio::test]
     async fn voice_runtime_off_without_gate() {
         let config = voice_config(Some("token"), Some("postgres://localhost/unused"));
-        assert!(build_voice_runtime(&config, false).await.is_none());
+        assert!(
+            build_voice_runtime(&config, false, tokio::sync::watch::channel(false).1)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn voice_runtime_off_without_token() {
         let config = voice_config(None, Some("postgres://localhost/unused"));
-        assert!(build_voice_runtime(&config, true).await.is_none());
+        assert!(
+            build_voice_runtime(&config, true, tokio::sync::watch::channel(false).1)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn voice_runtime_off_without_database() {
         let config = voice_config(Some("token"), None);
-        assert!(build_voice_runtime(&config, true).await.is_none());
+        assert!(
+            build_voice_runtime(&config, true, tokio::sync::watch::channel(false).1)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3168,7 +3369,11 @@ mod tests {
         // remain useful without exposing the rejected credential-bearing value.
         let url = "fixture-invalid-scheme://fixture-user:fixture-db-password@agent-testdb/db";
         let config = voice_config(Some("fixture-discord-token"), Some(url));
-        assert!(build_voice_runtime(&config, true).await.is_none());
+        assert!(
+            build_voice_runtime(&config, true, tokio::sync::watch::channel(false).1)
+                .await
+                .is_none()
+        );
         let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert!(output.contains("voice database unavailable; voice rooms disabled"));
         for secret in [
@@ -3285,7 +3490,9 @@ mod tests {
     /// never a bare worker panic: the message carries the checkpoint contract.
     #[test]
     fn gateway_leveling_drain_failure_holds_checkpoint_as_typed_error() {
-        let error = leveling_dispatch_failure();
+        let error = leveling_dispatch_failure(
+            two_bot_discord::leveling_runtime::LevelingRuntimeError::InvalidInteraction,
+        );
         assert!(
             matches!(
                 &error,
@@ -3293,6 +3500,39 @@ mod tests {
                     if message.as_str() == "leveling gateway dispatch failed; checkpoint unchanged"
             ),
             "leveling failure must stay typed, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn gateway_leveling_drain_preserves_direct_and_post_award_store_causes() {
+        use two_bot_core::leveling_store::LevelingStoreError;
+        use two_bot_discord::leveling_runtime::{LevelingRuntimeError, RoleApplicationError};
+
+        let direct = LevelingRuntimeError::Store(LevelingStoreError::Db(sqlx::Error::PoolClosed));
+        assert!(matches!(
+            leveling_dispatch_failure(direct),
+            sqlx::Error::PoolClosed
+        ));
+        let post_award = LevelingRuntimeError::RoleApplication {
+            cause: RoleApplicationError::Store(LevelingStoreError::Db(sqlx::Error::RowNotFound)),
+            awards: vec![],
+        };
+        assert!(matches!(
+            leveling_dispatch_failure(post_award),
+            sqlx::Error::RowNotFound
+        ));
+        let failure = crate::gateway_failure::step_failure(
+            crate::gateway_failure::FailureClass::GatewayRuntimeFailed,
+            "gateway_run",
+            leveling_dispatch_failure(LevelingRuntimeError::Store(LevelingStoreError::Db(
+                sqlx::Error::PoolTimedOut,
+            ))),
+        );
+        assert!(matches!(failure.error, sqlx::Error::PoolTimedOut));
+        assert_eq!(crate::db_log::error_code(&failure.error), None);
+        assert_eq!(
+            crate::db_log::failure_reason(&failure.error),
+            "pool_timeout"
         );
     }
 
@@ -3341,7 +3581,9 @@ mod tests {
             crate::db_log::failure_reason(held.as_ref().expect("non-poison failure holds cursor")),
             "leveling gateway dispatch failed; checkpoint unchanged"
         );
-        let mut held = Some(leveling_dispatch_failure());
+        let mut held = Some(leveling_dispatch_failure(
+            LevelingRuntimeError::InvalidInteraction,
+        ));
         let requests =
             requests_or_hold_cursor(Err(LevelingRuntimeError::LevelingPoisoned), &mut held);
         assert!(requests.is_empty());
@@ -3388,7 +3630,9 @@ mod tests {
             "store failures must keep warn-and-continue"
         );
         assert!(held.is_none());
-        let mut held = Some(leveling_dispatch_failure());
+        let mut held = Some(leveling_dispatch_failure(
+            LevelingRuntimeError::InvalidInteraction,
+        ));
         assert!(hold_cursor_on_facts_poison(
             &CommunityFactsError::Poisoned,
             &mut held
@@ -3769,7 +4013,7 @@ mod tests {
             matches!(
                 &outcome,
                 Err(sqlx::Error::InvalidArgument(message))
-                    if message.as_str() == "leveling gateway dispatch failed; checkpoint unchanged"
+                    if message.as_str() == "gateway checkpoint deadline exceeded"
             ),
             "worker must record a typed error, got {outcome:?}"
         );
@@ -4520,7 +4764,9 @@ mod tests {
     #[test]
     fn gateway_dispatch_worker_failures_are_distinct_typed_errors() {
         let messages = [
-            leveling_dispatch_failure(),
+            leveling_dispatch_failure(
+                two_bot_discord::leveling_runtime::LevelingRuntimeError::InvalidInteraction,
+            ),
             interaction_drain_failure(),
             invalid_onboarding_job_failure(),
             missing_ingress_ticket_failure(),

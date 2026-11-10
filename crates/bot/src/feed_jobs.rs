@@ -236,6 +236,41 @@ pub(crate) fn live_poll_seconds(guild: &str, fallback: u64) -> u64 {
     live_poll_seconds_with(guild, fallback, crate::settings_jobs::live().as_ref())
 }
 
+/// The announcements gate key served from the live settings snapshot. Job
+/// existence stays boot-gated (registration and the live-identity fence read
+/// the boot value); each tick re-checks the live value, so storing `0` parks
+/// a boot-enabled poller within one poll while enabling from a boot-off
+/// deployment needs a restart (no job exists to tick).
+pub(crate) const ANNOUNCEMENTS_KEY: &str = "TWO_ANNOUNCEMENTS";
+
+/// Effective announcements gate: the live snapshot wins over the boot value,
+/// an absent row falls back to boot, and any rendering other than exactly
+/// `"1"` reads off (fail-closed, like `FeatureGates::from_map`). A stored JSON
+/// null renders to `None` and falls through like an absent row (the shared
+/// `to_env_string` contract: unrenderable values never mask the boot value).
+/// Pure for tests via `live`.
+pub(crate) fn live_announcements_with(
+    guild: &str,
+    boot_on: bool,
+    live: Option<&two_bot_core::settings::LiveSettings>,
+) -> bool {
+    let Some(live) = live else {
+        return boot_on;
+    };
+    let Some(value) = live.get(guild, ANNOUNCEMENTS_KEY) else {
+        return boot_on;
+    };
+    match two_bot_core::settings::to_env_string(&value) {
+        None => boot_on,
+        Some(rendered) => rendered == "1",
+    }
+}
+
+/// Production reader: the poller-published snapshot, if any.
+pub(crate) fn live_announcements_on(guild: &str, boot_on: bool) -> bool {
+    live_announcements_with(guild, boot_on, crate::settings_jobs::live().as_ref())
+}
+
 /// Live-aware job: the supervisor's own cadence follows the live interval,
 /// and the non-overlapping schedule gate re-reads the same interval before
 /// every tick. A stored change reschedules the next run to last-run + new
@@ -301,6 +336,8 @@ pub(crate) fn scheduled_job_dynamic(
 /// The poll interval reads the live settings snapshot (TOG-19027): the
 /// supervisor cadence and the per-tick schedule gate both follow the stored
 /// value, so a changed interval reschedules the next run without a restart.
+/// Each tick also re-checks the announcements gate against the live snapshot,
+/// so storing `0` parks a boot-enabled poller within one poll.
 pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Option<Job> {
     let gates = match FeatureGates::from_env() {
         Ok(gates) => gates,
@@ -312,32 +349,35 @@ pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Op
             return None;
         }
     };
-    let poller = Arc::new(FeedPoller::default());
-    let guild = context.guild.clone();
-    let action: JobAction = Arc::new(move || {
-        let context = context.clone();
-        let poller = poller.clone();
-        Box::pin(async move {
-            poller
-                .run_once(
-                    context.pool().await?,
-                    &context.rest,
-                    &context.guild,
-                    &PublicFeedFetch,
-                )
-                .await
-        })
-    });
-    register_fenced(gates, activation, action, guild)
+    Arc::new(FeedPoller::default()).registered_job(
+        context,
+        gates,
+        activation,
+        None,
+        Arc::new(PublicFeedFetch),
+    )
 }
 
 /// Identity can only narrow the env gate: the poller posts under the token's
 /// identity, exactly like the announcement verbs the router refuses there.
+/// Production [`register`] goes through [`FeedPoller::registered_job`];
+/// this stays as the test-only fenced-registration convenience.
+#[cfg(test)]
 pub(crate) fn register_fenced(
     gates: FeatureGates,
     activation: &BootActivation,
     action: JobAction,
     guild: String,
+) -> Option<Job> {
+    register_fenced_with_live(gates, activation, action, guild, None)
+}
+
+fn register_fenced_with_live(
+    gates: FeatureGates,
+    activation: &BootActivation,
+    action: JobAction,
+    guild: String,
+    live: Option<two_bot_core::settings::LiveSettings>,
 ) -> Option<Job> {
     let fenced = activation.constrain_features(gates);
     if gates.announcements && !fenced.announcements {
@@ -347,14 +387,95 @@ pub(crate) fn register_fenced(
             "feed poller parked: live activation refused"
         );
     }
-    register_gated(fenced, action, guild)
+    register_gated_with_live(fenced, action, guild, live)
 }
 
+/// Test-only ungated-registration convenience over [`register_gated_with_live`].
+#[cfg(test)]
 fn register_gated(gates: FeatureGates, action: JobAction, guild: String) -> Option<Job> {
+    register_gated_with_live(gates, action, guild, None)
+}
+
+/// Shared per-tick announcements gate: `None` reads the poller-published
+/// snapshot, `Some` reads the injected per-instance source through the SAME
+/// resolver. Production and consumer acceptance never fork the policy.
+fn register_gated_with_live(
+    gates: FeatureGates,
+    action: JobAction,
+    guild: String,
+    live: Option<two_bot_core::settings::LiveSettings>,
+) -> Option<Job> {
     if !gates.announcements {
         return None;
     }
-    scheduled_job_live(gates.feed_poll_seconds, action, guild).ok()
+    let gate_guild = guild.clone();
+    register_gated_with(
+        gates.feed_poll_seconds,
+        action,
+        guild,
+        Arc::new(move || match &live {
+            Some(live) => live_announcements_with(&gate_guild, true, Some(live)),
+            None => live_announcements_on(&gate_guild, true),
+        }),
+    )
+}
+
+/// [`register_gated_with_live`] over an injectable per-tick gate. The
+/// production gate reads the live announcements snapshot store-first over the
+/// boot value; a closed gate skips the tick without error (like the schedule
+/// gate below it), silently so a parked poller does not log every interval.
+fn register_gated_with(
+    feed_poll_seconds: u64,
+    action: JobAction,
+    guild: String,
+    gate: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Option<Job> {
+    let gated: JobAction = Arc::new(move || {
+        let inner = action.clone();
+        let gate = gate.clone();
+        Box::pin(async move {
+            if !gate() {
+                return Ok(());
+            }
+            inner().await
+        })
+    });
+    scheduled_job_live(feed_poll_seconds, gated, guild).ok()
+}
+
+impl FeedPoller {
+    /// Shared registration factory: the actual registration gate, schedule,
+    /// per-tick announcements gate and real poller action in one composition.
+    /// Production [`register`] delegates with `None` (the poller-published
+    /// snapshot); consumer acceptance injects `Some` per-instance source plus
+    /// an explicit fetch boundary. Never fork this composition: a second
+    /// registration path would let the gate and the job disagree.
+    pub(crate) fn registered_job(
+        self: Arc<Self>,
+        context: Arc<Context>,
+        gates: FeatureGates,
+        activation: &BootActivation,
+        live: Option<two_bot_core::settings::LiveSettings>,
+        fetch: Arc<dyn FeedFetch>,
+    ) -> Option<Job> {
+        let guild = context.guild.clone();
+        let action: JobAction = Arc::new(move || {
+            let context = context.clone();
+            let poller = self.clone();
+            let fetch = fetch.clone();
+            Box::pin(async move {
+                poller
+                    .run_once(
+                        context.pool().await?,
+                        &context.rest,
+                        &context.guild,
+                        fetch.as_ref(),
+                    )
+                    .await
+            })
+        });
+        register_fenced_with_live(gates, activation, action, guild, live)
+    }
 }
 
 #[derive(Default)]
@@ -373,6 +494,20 @@ async fn poll_relay(
     feed: &FeedRelay,
     fetch: &dyn FeedFetch,
 ) -> Result<(), ErrorClass> {
+    // A paused or removed relay stays silent even when this pass polled a
+    // stale enabled snapshot: re-read live lifecycle state before any fetch,
+    // recovery, high-water or audit write. Claim admission revalidates too,
+    // so a fetch admitted before a racing pause still cannot post after it.
+    let live: Option<bool> =
+        sqlx::query_scalar("SELECT enabled FROM feed_relays WHERE guild_id = $1 AND id = $2")
+            .bind(&feed.guild_id)
+            .bind(&feed.id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| ErrorClass::Database)?;
+    if live != Some(true) {
+        return Ok(());
+    }
     let mut error = None;
     let mut stats = PollStats::default();
     let mut recovery = RecoveryBudget {

@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected test-only handoff for private proposed game-role changes; the builder owns the combined implementation PR.",
+  "baseCommit": "0b8f8c6427859a606c4be710224dc68649fabe00",
+  "branch": "test/game-role-preview-acceptance",
+  "protectedFiles": [
+    {
+      "path": "crates/bot/src/onboarding_game_role_preview_acceptance_tests.rs",
+      "sha256": "8d7efd1fa9fd820996c65c9358abe313aa21cbe01c9a2b0e6de4856f4c36239b",
+      "tests": 16
+    }
+  ],
+  "registration": {
+    "path": "crates/bot/src/onboarding_tests.rs",
+    "module": "game_role_preview_acceptance",
+    "productionBehaviorChanged": false,
+    "integration": "Keep the two-line child-module registration when incorporating the protected file. This existing shared registration file is not frozen against unrelated additions."
+  },
+  "commands": {
+    "runtime": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot --bin two-bot onboarding_tests::game_role_preview_acceptance:: -- --nocapture --test-threads=1",
+    "existingPolicyControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test onboarding_unknown_only_picker_acceptance --test onboarding_effects -- --nocapture",
+    "format": "cargo fmt --all -- --check"
+  },
+  "database": {
+    "guard": "two_bot_testsupport::TestDatabase with the cutover migration chain, isolated database per test and explicit teardown on panic",
+    "missingEnvironment": "Outside GitHub Actions an absent TWO_TEST_DATABASE_URL prints SKIP and verifies no behavior. In GitHub Actions a missing variable fails. A configured admission/connection/migration error fails, never skips. Only a run with the guarded disposable database counts as behavioral evidence.",
+    "ciRoute": "check.yml rust tests workspace lib/bins supplies TWO_TEST_DATABASE_URL; the existing onboarding_ ignored-runtime selector also discovers these non-ignored tests.",
+    "writeObserver": "BEFORE STATEMENT triggers on every public fixture table advance a non-transactional sequence for INSERT/UPDATE/DELETE/TRUNCATE. A positive control detects rolled-back zero-row DML. REST recorder independently rejects any mutation except one private ACK and response edit. SQL receipts additionally reject DML."
+  },
+  "expectedBaseline": {
+    "behaviorRed": 13,
+    "controlsGreen": 3,
+    "reason": "The ordinary reopened games menu has no separate self-only Preview entry. Each preview scenario must first prove this entry exists, then exercise its dispatched choices and no-effect oracles.",
+    "observedResults": "Recorded separately in the immutable-head handoff document. These expected counts are not a claim that tests compiled or ran."
+  },
+  "contract": {
+    "entry": "Discover one Preview-labelled text select in /reopen games, or one Preview-labelled button opening a separate text select. IDs are discovered from responses, not prescribed. Existing ordinary game selection remains available and preselected.",
+    "choices": "Only stable current game-menu keys, never arbitrary role IDs or hidden platform choices. Zero minimum supports a deliberately empty proposed answer. Unknown-only, mixed-invalid, forged, duplicate and oversized input never mutates; malformed input has private recovery guidance.",
+    "projection": "Preview — roles not changed; Additions / Removals / Unchanged sections derived from fresh member roles and current role availability. Already-held selected roles are unchanged, not additions. No applied-choice success copy.",
+    "privacy": "One ephemeral defer before HTTP reads; exactly one mention-suppressed private completion, at most 2000 characters, no reflected mentions, role mutations, public sends or database writes (including rollback-only attempts).",
+    "safety": "Re-read roles after opening; recognize member 404/403/503, wrong identity, malformed role evidence, roles-read 403, deleted catalog role, managed role, role above bot and missing Manage Roles. Foreign guild/bot/memberless interactions are silent. Unconfirmed ACK is not retried and never evaluates choices.",
+    "laterApply": "A separate ordinary operation re-reads current roles rather than applying the preview's stale delta. The valid apply control still writes the known subset of mixed known/stale input and records one real choice."
+  },
+  "remainingBuilderVerification": [
+    "Make all protected runtime assertions GREEN; preserve the existing core unknown-only and independent-choice controls.",
+    "Review that the preview reuses pure role-choice policy rather than mutating process_selection or the empty-effect dry-run result; this is not asserted by source-text matching.",
+    "Update and verify discoverable help, command definitions and generated reference documentation. This test-only handoff changes none of them.",
+    "Verify gateway-worker integration and same-head CI/review on the combined implementation. The fixture exercises actual onboarding ingress eligibility, ACK and worker handling, not the entire durable gateway queue.",
+    "No live Discord, deployment, production activation, new role authority or migration is authorized by these tests."
+  ],
+  "handoff": "Consume the exact immutable head named in the handoff document. Never edit protected files; return corrections to the test author. Do not merge a deliberately RED test-only PR."
+}

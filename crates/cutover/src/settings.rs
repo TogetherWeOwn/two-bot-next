@@ -208,6 +208,37 @@ impl<'a> SettingsStore<'a> {
             return Err(SettingsWriteError::VersionConflict);
         }
 
+        // A retired catalogue must not strand admitted work. The shared
+        // revision lock orders this check with fresh self-role admission;
+        // active leases count too, not just work currently due for discovery.
+        let catalogue_changed = key == "TWO_SELF_ROLE_PANELS"
+            && match &validated.action {
+                WriteAction::Upsert(next) => {
+                    previous.as_ref().map(|(value, _)| value) != Some(next)
+                }
+                WriteAction::Delete => previous.is_some(),
+            };
+        if catalogue_changed {
+            let (unfinished,): (bool,) = sqlx::query_as(
+                "SELECT EXISTS (SELECT 1 FROM self_role_audit a WHERE guild_id=$1 AND (
+                 outcome='processing' OR exchange_pending
+                 OR (outcome='rejected' AND code='superseded_by_later_event' AND NOT repair_complete
+                     AND (added_role_ids <> '[]' OR removed_role_ids <> '[]'
+                          OR attempted_added_role_ids <> '[]' OR attempted_removed_role_ids <> '[]'
+                          OR compensated_added_role_ids <> '[]' OR compensated_removed_role_ids <> '[]'
+                          OR unresolved_added_role_ids <> '[]' OR unresolved_removed_role_ids <> '[]'))
+                 OR EXISTS (SELECT 1 FROM self_role_exchanges e WHERE e.event_id=a.event_id AND e.retired_at IS NULL)
+                 OR EXISTS (SELECT 1 FROM self_role_exchange_baselines b WHERE b.event_id=a.event_id AND b.legacy_pending)))",
+            )
+            .bind(guild_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if unfinished {
+                tx.rollback().await?;
+                return Err(SettingsWriteError::SelfRoleRecoveryPending);
+            }
+        }
+
         let version = match &validated.action {
             WriteAction::Delete => {
                 sqlx::query("DELETE FROM guild_settings WHERE guild_id = $1 AND key = $2")
@@ -262,6 +293,8 @@ impl<'a> SettingsStore<'a> {
 /// A settings write failure: refused before SQL vs database error.
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsWriteError {
+    #[error("self-role work must drain before changing TWO_SELF_ROLE_PANELS")]
+    SelfRoleRecoveryPending,
     #[error("settings version conflict")]
     VersionConflict,
     #[error("{0}")]

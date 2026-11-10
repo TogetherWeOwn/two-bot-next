@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Protected tests-only handoff for rejecting invalid saved response templates at both existing execution boundaries",
+  "baseCommit": "e1868d97d3519cae3f2ed91726e83e98f77dff0d",
+  "branch": "test/saved-template-boundary-acceptance",
+  "matrixSource": "crates/discord/tests/support/invalid_saved_templates_acceptance.rs::Case, INVALID, VALID",
+  "protectedFiles": [
+    {
+      "path": "crates/discord/tests/support/invalid_saved_templates_acceptance.rs",
+      "sha256": "f9b11a4dfd205cd4727b1ef6e49fe15078db2ecd1ccaca685ee49d8b98d216a9",
+      "tests": 19
+    },
+    {
+      "path": "crates/discord/tests/custom_command_runtime.rs",
+      "sha256": "5a10333196e5f91b0c91af5edb708e62c939658fbb2bcab063f865daa4a2053e",
+      "change": "Add only the protected child-module registration; all existing tests and assertions remain unchanged"
+    }
+  ],
+  "preservedOracles": [
+    {
+      "path": "crates/core/tests/custom_command_template_acceptance.rs",
+      "sha256": "ed15d919fa9c23608591adc28f180a61971ebd51036587908169edea46e6b8dd"
+    },
+    {
+      "path": "fuzz/fuzz_targets/custom_command_template.rs",
+      "sha256": "fa4a3e2409211cb7bec883564ddc1cbae6fb2b0c3565f8d834e7a1b66f65724d"
+    }
+  ],
+  "commands": {
+    "verifyBytes": "python3 -c 'import hashlib,json,pathlib; m=json.loads(pathlib.Path(\"tests/acceptance/saved_template_boundaries.manifest.json\").read_text()); rows=m[\"protectedFiles\"]+m[\"preservedOracles\"]; assert all(hashlib.sha256(pathlib.Path(r[\"path\"]).read_bytes()).hexdigest()==r[\"sha256\"] for r in rows); print(\"verified\",len(rows),\"protected/preserved files\")'",
+    "acceptance": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test custom_command_runtime invalid_saved_templates_acceptance:: -- --nocapture --test-threads=1",
+    "runtimeAndDeliveryControls": "TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local python3 scripts/cargo_cache.py run -- test -p two-bot-discord --features db --test custom_command_runtime --test custom_command_uncertain_delivery_acceptance --test custom_command_slash_replay --test custom_command_inspect_acceptance -- --include-ignored --test-threads=1",
+    "pureControls": "python3 scripts/cargo_cache.py run -- test -p two-bot-core --test custom_command_template_acceptance -- --nocapture",
+    "format": "cargo fmt --all -- --check",
+    "floor": "python3 scripts/ci/check-floor-guard.py --base-ref origin/main",
+    "inventory": "python3 scripts/ci/check-test-inventory.py"
+  },
+  "database": {
+    "fixture": "TestDatabase::create with cutover migrations and explicit teardown; loopback Discord double only",
+    "environment": "TWO_TEST_DATABASE_URL must name an authorized disposable bootstrap. Only when absent and both CI=true and TWO_CUSTOM_COMMAND_TEST_CI=1, select the exact credential-free two_bot_test_ci bootstrap already prepared by the legacy CI lane. A configured failure never selects another URL; all other absent/invalid configuration fails and never silently skips.",
+    "corruptRows": "Seed via the existing low-level store only. Empty and ASCII-overlength cases remove the named length check only inside their newly owned disposable fixture DB. No production schema, migration, validated writer or application database changes.",
+    "ciRoute": "Workspace integration enables discord/db through the bot dependency and supplies TWO_TEST_DATABASE_URL. The existing custom_command_runtime target also runs in check.yml ignored db (stores), with CI and TWO_CUSTOM_COMMAND_TEST_CI opt-ins and a pre-created two_bot_test_ci bootstrap. No workflow edits or new ignores."
+  },
+  "outcomeContract": {
+    "invalidExecution": "No template body/expansion; bounded content-free slash availability completion; zero prefix HTTP sends; failed/render_failed run fact; preserve every definition column",
+    "slashOwnership": "A completed safe fallback may return owned=true or the existing local Render error; do not invent an API merely for these tests",
+    "acknowledgement": "Definitive refused defer remains Delivery/delivery_failed; ambiguous defer remains DeliveryUnknown without a fact; explicit re-entry keeps first-write-wins",
+    "completion": "Definitive fallback rejection remains Delivery; ambiguous fallback remains DeliveryUnknown. Its local render_failed fact survives either wire outcome and must never become delivery_failed",
+    "replay": "Fresh runtime on the same DB preserves all original slash audit columns; prefix keeps one durable attempt/result pair and sends nothing on replay",
+    "controls": "Valid four-variable rendering, literal nonmatching braces, UTF-16 ceiling, disabled rows, absent context, preview parity and existing prefix admission/scope/feature gates",
+    "contextCompatibility": "Preserve existing slash render_failed versus prefix context_unavailable reasons for absent context",
+    "language": "Pure renderer unknown-key fallback and existing fuzz oracle remain literal; no args variable or brace-language expansion"
+  },
+  "observedLocalEvidence": {
+    "rustExecution": "Not observed: one existing-core-control attempt and two focused runtime attempts were refused by bounded cache admission, exit 75: no idle, below-budget slot; no per-worktree fallback. No compilation or behavioral RED is claimed from these refusals.",
+    "staticChecks": "cargo fmt, whitespace, floor guard and test inventory passed; required offline pre-push control chain passed",
+    "notRun": "Full workspace Cargo suite, clippy, fuzz campaign, live Discord, staging/production tests and deploys",
+    "remoteEvidence": "Exact head, CI outcome and any baseline RED are recorded separately in the acceptance task handoff; this manifest never implies they passed"
+  },
+  "handoff": [
+    "Consume the immutable pushed commit recorded on the acceptance task. Verify all hashes before and after integration; the manifest's own hash is recorded externally to avoid a self-referential digest.",
+    "Do not edit protected files or preserved pure-render/fuzz oracles. Return precise test corrections to the test author.",
+    "Do not merge this deliberately failing-first test-only branch independently. A diagnostic draft PR is not an implementation approval and must not auto-merge.",
+    "The paired Builder owns product guards, concise troubleshooting guidance, GREEN, exact-head required CI, independent review and normal controller-driven squash merge in one combined implementation PR."
+  ]
+}

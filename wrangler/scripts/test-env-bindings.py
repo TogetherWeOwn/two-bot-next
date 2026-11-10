@@ -18,7 +18,7 @@ spec.loader.exec_module(checker)
 # in our synthetic fixtures or change the omitted-binding test's meaning.
 def fixture_base(content):
     return re.sub(
-        r"^[ \t]*(?:UNREADY_ALERT_FAILURES|OPS_ALERT_WEBHOOK_URL)[ \t]*=.*(?:\n|$)",
+        r"^[ \t]*(?:UNREADY_ALERT_FAILURES|OPS_ALERT_WEBHOOK_URL|STAGING_RUNTIME_POLICY)[ \t]*=.*(?:\n|$)",
         "",
         content,
         flags=re.MULTILINE,
@@ -213,6 +213,49 @@ class AlertBindingTests(unittest.TestCase):
             with self.subTest(value=value):
                 config = BASE.replace('TWO_DEPLOY_ENV = "staging"', f"TWO_DEPLOY_ENV = {value}")
                 self.assertTrue(any('must be exactly "staging"' in e for e in self.check_config(config)))
+
+    def test_deployed_staging_config_enables_bounded_policy_only_in_staging(self):
+        path = Path(__file__).parents[1] / "wrangler.toml"
+        config = checker.tomllib.loads(path.read_text())
+        self.assertEqual(checker.check(path), [])
+        staging_vars = config["env"]["staging"]["vars"]
+        self.assertEqual(staging_vars["STAGING_RUNTIME_POLICY"], "bounded")
+        self.assertEqual(staging_vars["TWO_DEPLOY_ENV"], "staging")
+        self.assertNotIn("STAGING_RUNTIME_POLICY", config.get("vars", {}))
+        self.assertNotIn("STAGING_RUNTIME_POLICY", config["env"]["production"]["vars"])
+
+    def test_staging_runtime_policy_is_opt_in_and_staging_only(self):
+        self.assertNotIn("STAGING_RUNTIME_POLICY", BASE)
+        self.assertEqual(self.check_config(BASE), [])
+        config = BASE.replace("[env.staging.vars]", '[env.staging.vars]\nSTAGING_RUNTIME_POLICY = "bounded"', 1)
+        self.assertEqual(self.check_config(config), [])
+        for section in ["vars", "env.production.vars", "env.preview.vars"]:
+            with self.subTest(section=section):
+                if section == "env.preview.vars":
+                    candidate = BASE + '\n[env.preview]\nworkers_dev = false\n[env.preview.vars]\nTWO_GUILD_NAME = "Preview"\nSTAGING_RUNTIME_POLICY = "bounded"\n'
+                else:
+                    candidate = BASE.replace(f"[{section}]", f'[{section}]\nSTAGING_RUNTIME_POLICY = "bounded"', 1)
+                errors = self.check_config(candidate)
+                self.assertTrue(any(f"[{section}]: STAGING_RUNTIME_POLICY is staging-only" in e for e in errors), errors)
+
+    def test_staging_runtime_policy_refuses_unknown_values_and_missing_marker(self):
+        for value in ['"always-on"', '"Bounded"', '"bounded "', '""', '"synthetic-secret"', "1", "false", "[]"]:
+            with self.subTest(value=value):
+                candidate = BASE.replace("[env.staging.vars]", f"[env.staging.vars]\nSTAGING_RUNTIME_POLICY = {value}", 1)
+                errors = self.check_config(candidate)
+                self.assertTrue(any('STAGING_RUNTIME_POLICY must be exactly "bounded" or absent' in e for e in errors), errors)
+                self.assertFalse(any("synthetic-secret" in e for e in errors))
+        config = BASE.replace("[env.staging.vars]", '[env.staging.vars]\nSTAGING_RUNTIME_POLICY = "bounded"', 1)
+        errors = self.check_config(config.replace('TWO_DEPLOY_ENV = "staging"\n', ""))
+        self.assertTrue(any('STAGING_RUNTIME_POLICY requires TWO_DEPLOY_ENV exactly "staging"' in e for e in errors), errors)
+
+    def test_ownership_control_token_is_never_a_plain_var(self):
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nOWNERSHIP_CONTROL_TOKEN = "synthetic-secret"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("OWNERSHIP_CONTROL_TOKEN must be an optional Worker secret" in e for e in errors), errors)
+                self.assertFalse(any("synthetic-secret" in e for e in errors))
 
     def test_gateway_failure_injection_is_never_a_committed_var(self):
         # Even staging must not commit it: only the generated per-deploy

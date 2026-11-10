@@ -6,6 +6,9 @@
 #[allow(dead_code)]
 mod common;
 
+#[path = "support/invalid_saved_templates_acceptance.rs"]
+mod invalid_saved_templates_acceptance;
+
 use std::sync::Arc;
 
 use common::{MockRest, ScriptedResponse};
@@ -1077,7 +1080,7 @@ async fn manage_save_remove_absent_replies_are_pinned() {
 #[tokio::test]
 #[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn manage_registry_publish_failure_suffix_is_pinned() {
-    const SUFFIX: &str = "Registry publication failed; the command picker is not yet synchronized.";
+    const SUFFIX: &str = "Registry publication failed; the command picker is not yet synchronized. Synchronization is pending and will resync automatically on the next publication; no further action is needed.";
     let pool = test_pool().await;
     let mock = MockRest::start(
         vec![
@@ -1363,5 +1366,264 @@ async fn successful_slash_run_audit_row_is_unchanged() {
         )
     );
     assert_eq!(command_run_row_count(&pool).await, 1);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn slash_empty_args_only_template_refuses_as_render_failed() {
+    // ARG-20 (slash): an `{args}`-only template with no arguments renders no
+    // message text, so the run takes the existing unavailable completion and
+    // `render_failed` fact — never an empty edit or `delivery_failed`.
+    let pool = test_pool().await;
+    seed_text_command(&pool, "{args}").await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),                      // defer
+            ScriptedResponse::json(200, json!({"id": "9000"})), // edit
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    assert!(runtime
+        .handle_interaction(&slash(154, "faq", 0, &[]), Some("Test guild"))
+        .await
+        .unwrap());
+    assert_eq!(mock.requests().len(), 2, "defer plus edit, nothing else");
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 1);
+    assert_eq!(
+        patches[0]["content"],
+        "Custom-command context or template is unavailable."
+    );
+    assert_eq!(patches[0]["allowed_mentions"]["parse"], json!([]));
+    mock.shutdown().await;
+
+    let row = run_audit_row(&pool, 154)
+        .await
+        .expect("the refused run audits its render failure");
+    assert_eq!(
+        row,
+        (
+            "2222".to_owned(),
+            Some("3333".to_owned()),
+            "command.run".to_owned(),
+            Some("faq".to_owned()),
+            "failed".to_owned(),
+            Some("render_failed".to_owned()),
+        )
+    );
+    assert_eq!(command_run_row_count(&pool).await, 1);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn prefix_empty_args_only_template_refuses_as_render_failed() {
+    // ARG-20 (prefix): an `{args}`-only template with no remainder (or only
+    // whitespace) renders no message text, so the claimed attempt resolves
+    // as `render_failed` with no POST — never `delivery_failed`.
+    use AutomationMessageAcceptance::Unmatched;
+    let pool = test_pool().await;
+    seed_text_command(&pool, "{args}").await;
+    let mock = MockRest::start(vec![], ScriptedResponse::status(500)).await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    for id in [162u64, 163] {
+        expire_actor_window().await;
+        let content = if id == 162 { "!faq" } else { "!faq   " };
+        assert!(matches!(
+            runtime
+                .handle_message(&message(id, content), Unmatched, true, Some("Test guild"))
+                .await,
+            Err(two_bot_discord::custom_commands::CustomCommandError::Render)
+        ));
+        let failed: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT action, outcome, reason FROM automation_audit_log WHERE id = $1",
+        )
+        .bind(format!("custom:text:result:{id}"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            failed,
+            (
+                "command.run".to_owned(),
+                "failed".to_owned(),
+                Some("render_failed".to_owned())
+            )
+        );
+    }
+    assert_eq!(mock.requests().len(), 0, "refusals send nothing");
+    mock.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn slash_args_option_substitutes_literally_and_audits_ok() {
+    // ARG-01/02/04: a known enabled row renders the validated `arguments`
+    // option through `{args}`; templates without it stay byte-identical.
+    let pool = test_pool().await;
+    seed_text_command(&pool, "Says {args}").await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204),                      // defer
+            ScriptedResponse::json(200, json!({"id": "9000"})), // edit
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    assert!(runtime
+        .handle_interaction(
+            &slash(150, "faq", 0, &[("arguments", "hello  world")]),
+            Some("Test guild")
+        )
+        .await
+        .unwrap());
+    assert_eq!(mock.requests().len(), 2, "defer plus edit, nothing else");
+    let patches = patch_contents(&mock);
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0]["content"], "Says hello  world");
+    assert_eq!(patches[0]["allowed_mentions"]["parse"], json!([]));
+    mock.shutdown().await;
+
+    let row = run_audit_row(&pool, 150)
+        .await
+        .expect("the args run audits its delivery");
+    assert_eq!(
+        row,
+        (
+            "2222".to_owned(),
+            Some("3333".to_owned()),
+            "command.run".to_owned(),
+            Some("faq".to_owned()),
+            "ok".to_owned(),
+            None,
+        )
+    );
+    assert_eq!(command_run_row_count(&pool).await, 1);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn slash_args_validation_refuses_before_defer_with_no_audit() {
+    // ARG-03/05/19: malformed or over-long `arguments` on a known enabled
+    // row refuses with one direct ephemeral correction — no defer, no audit —
+    // while unknown rows stay silent even with malformed arguments.
+    let pool = test_pool().await;
+    seed_text_command(&pool, "Says {args}").await;
+    let mock = MockRest::start(
+        vec![
+            ScriptedResponse::status(204), // malformed correction
+            ScriptedResponse::status(204), // overflow correction
+        ],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    assert!(runtime
+        .handle_interaction(
+            &slash(151, "faq", 0, &[("arguments", "a"), ("arguments", "b")]),
+            Some("Test guild")
+        )
+        .await
+        .unwrap());
+    assert!(runtime
+        .handle_interaction(
+            &slash(152, "faq", 0, &[("arguments", &"x".repeat(501))]),
+            Some("Test guild")
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "two direct corrections, no defer and no edit"
+    );
+    for (request, expected) in mock.requests().iter().zip([
+        "Invalid arguments: expected a single text value. Example: /quote arguments:hello",
+        "Arguments must be at most 500 UTF-16 units. Shorten them and retry.",
+    ]) {
+        assert!(request.path.ends_with("/callback"), "direct answer");
+        let body: Value = serde_json::from_slice(&request.body).expect("callback JSON");
+        assert_eq!(body["type"], 4, "immediate channel message, not a defer");
+        assert_eq!(body["data"]["content"], expected);
+        assert_eq!(body["data"]["flags"], 64, "ephemeral correction");
+        assert_eq!(body["data"]["allowed_mentions"]["parse"], json!([]));
+    }
+    // Unknown rows never read arguments: malformed input on a miss stays
+    // silent with no correction and no audit row.
+    assert!(!runtime
+        .handle_interaction(
+            &slash(153, "nope", 0, &[("arguments", "a"), ("arguments", "b")]),
+            Some("Test guild")
+        )
+        .await
+        .unwrap());
+    assert_eq!(mock.requests().len(), 2, "the miss sends nothing");
+    mock.shutdown().await;
+
+    assert!(run_audit_row(&pool, 151).await.is_none());
+    assert!(run_audit_row(&pool, 152).await.is_none());
+    assert_eq!(command_run_row_count(&pool).await, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn prefix_remainder_substitutes_and_overflow_audits_without_send() {
+    // ARG-11/12: the remainder after the trigger token renders through
+    // `{args}`; an over-long remainder audits one failed `args_too_long`
+    // result against the claimed attempt and sends nothing.
+    use AutomationMessageAcceptance::Unmatched;
+    let pool = test_pool().await;
+    seed_text_command(&pool, "Says {args}").await;
+    let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id": "9000"}))).await;
+    let runtime = runtime(pool.clone(), &mock, true);
+    expire_actor_window().await;
+    assert_eq!(
+        runtime
+            .handle_message(
+                &message(160, "!faq  hello  world "),
+                Unmatched,
+                true,
+                Some("Test guild")
+            )
+            .await
+            .unwrap(),
+        TextCommandOutcome::Delivered
+    );
+    let calls = bodies(&mock);
+    assert_eq!(calls.len(), 1, "one channel POST");
+    assert_eq!(calls[0]["content"], "Says hello  world ");
+    assert_eq!(calls[0]["allowed_mentions"]["parse"], json!([]));
+    expire_actor_window().await;
+    let overflow = message(161, &format!("!faq {}", "x".repeat(501)));
+    assert!(matches!(
+        runtime
+            .handle_message(&overflow, Unmatched, true, Some("Test guild"))
+            .await,
+        Err(two_bot_discord::custom_commands::CustomCommandError::Render)
+    ));
+    assert_eq!(mock.requests().len(), 1, "overflow sends nothing");
+    mock.shutdown().await;
+
+    let failed: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT action, outcome, reason FROM automation_audit_log WHERE id = 'custom:text:result:161'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        failed,
+        (
+            "command.run".to_owned(),
+            "failed".to_owned(),
+            Some("args_too_long".to_owned())
+        )
+    );
     pool.close().await;
 }

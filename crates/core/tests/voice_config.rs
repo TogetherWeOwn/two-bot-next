@@ -65,9 +65,9 @@ proptest! {
 use two_bot_core::voice_access::VOICE_COMMANDS;
 use two_bot_core::voice_alias::MAX_ALIASES_PER_GUILD;
 use two_bot_core::voice_config::{
-    decode_configuration, export_configuration, import_configuration, validate_configuration,
-    ChannelKind, ChannelReference, GuildInventory, VoiceConfigError, VoiceConfiguration, MAX_LISTS,
-    MAX_LIST_CHOICES, MAX_LIST_TEXT_CHARS,
+    decode_configuration, drop_deleted_command_roles, export_configuration, import_configuration,
+    validate_configuration, ChannelKind, ChannelReference, GuildInventory, VoiceConfigError,
+    VoiceConfiguration, MAX_LISTS, MAX_LIST_CHOICES, MAX_LIST_TEXT_CHARS,
 };
 
 // Synthetic IDs only. Exercise every version-1 field without Discord or a DB.
@@ -611,6 +611,71 @@ fn duplicates_and_creator_standalone_overlap_are_rejected() {
 }
 
 #[test]
+fn export_drops_deleted_command_roles_and_keeps_the_restriction() {
+    let (config, inventory) = fixture();
+    let mut stale = config.clone();
+    stale.settings.command_roles[0].role_ids.push("999".into());
+    assert!(export_configuration(&stale, &inventory).is_err());
+    assert_eq!(
+        drop_deleted_command_roles(&mut stale, &inventory, u64::MAX),
+        1
+    );
+    assert_eq!(stale, config);
+    // Every role deleted: the command stays restricted to admins.
+    let mut emptied = config.clone();
+    let command = emptied.settings.command_roles[0].command.clone();
+    emptied.settings.command_roles[0].role_ids = vec!["999".into(), "998".into()];
+    assert_eq!(
+        drop_deleted_command_roles(&mut emptied, &inventory, u64::MAX),
+        2
+    );
+    assert_eq!(emptied.settings.command_roles[0].command, command);
+    assert!(emptied.settings.command_roles[0].role_ids.is_empty());
+    assert!(export_configuration(&emptied, &inventory).is_ok());
+}
+
+#[test]
+fn export_keeps_command_roles_when_the_role_cache_is_not_loaded() {
+    let (config, mut inventory) = fixture();
+    // No @everyone role: the cache has not loaded the guild's roles, so a
+    // missing role may be live. Nothing is pruned and export still refuses.
+    inventory.roles.clear();
+    let mut unloaded = config.clone();
+    assert_eq!(
+        drop_deleted_command_roles(&mut unloaded, &inventory, u64::MAX),
+        0
+    );
+    assert_eq!(unloaded, config);
+    assert!(export_configuration(&unloaded, &inventory).is_err());
+    // A partial set without @everyone is treated the same way.
+    inventory
+        .roles
+        .insert("999".to_owned(), inventory.guild_id.clone());
+    assert_eq!(
+        drop_deleted_command_roles(&mut unloaded, &inventory, u64::MAX),
+        0
+    );
+    assert_eq!(unloaded, config);
+}
+
+#[test]
+fn export_keeps_command_roles_created_after_the_inventory_snapshot() {
+    let (config, inventory) = fixture();
+    // Role 999 is absent from the snapshot taken for interaction 999: it may
+    // have been created and saved by /access after the snapshot, so it stays
+    // and export refuses instead of dropping a live role.
+    let mut newer = config.clone();
+    newer.settings.command_roles[0].role_ids.push("999".into());
+    let expected = newer.clone();
+    assert_eq!(drop_deleted_command_roles(&mut newer, &inventory, 999), 0);
+    assert_eq!(newer, expected);
+    assert!(export_configuration(&newer, &inventory).is_err());
+    // The same role is pruned once a later interaction proves it is gone.
+    assert_eq!(drop_deleted_command_roles(&mut newer, &inventory, 1000), 1);
+    assert_eq!(newer, config);
+}
+
+#[test]
 fn late_failure_never_returns_partial_config_or_mutates_inputs() {
     let (config, inventory) = fixture();
     let saved_inventory = inventory.clone();
@@ -886,6 +951,16 @@ fn lists_are_bounded_in_count_choices_and_text() {
 
 #[test]
 fn command_roles_accept_only_restrictable_voice_commands() {
+    // Config import and runtime enforcement use different stores: config writes
+    // `voice_command_roles` while the runtime reads `voice_access_controls`.
+    // `/myroom` carries no per-command role policy at all, so it is outside the
+    // restrictable `VOICE_COMMANDS` vocabulary and config import must refuse
+    // it too. Otherwise a guild would believe `myroom` is gated while it stays
+    // unrestricted. This pins both sides: runtime excludes, config excludes.
+    assert!(
+        !VOICE_COMMANDS.contains(&"myroom"),
+        "precondition: myroom is not restrictable"
+    );
     let (config, inventory) = fixture();
     let original = serde_json::to_value(&config).unwrap();
     for bad in [
@@ -896,6 +971,8 @@ fn command_roles_accept_only_restrictable_voice_commands() {
         "kick ",
         "not-a-command",
         "setup\u{0}",
+        // A published voice command with no per-command role policy.
+        "myroom",
     ] {
         let mut value = original.clone();
         *value
@@ -908,10 +985,17 @@ fn command_roles_accept_only_restrictable_voice_commands() {
             &format!("{bad:?}"),
         );
     }
+    // Config-supported commands are the runtime allowlist, which excludes
+    // `myroom`. Established valid commands still import.
     let roles: Vec<Value> = VOICE_COMMANDS
         .iter()
+        .filter(|command| **command != "myroom")
         .map(|command| json!({"command": command, "role_ids": ["201"]}))
         .collect();
+    assert!(
+        !roles.is_empty(),
+        "precondition: config supports established commands"
+    );
     let mut value = original;
     *value.pointer_mut("/settings/command_roles").unwrap() = Value::Array(roles);
     import_value(&value, &inventory).unwrap();

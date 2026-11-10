@@ -135,6 +135,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_INTERNAL_ALLOW_EVENT_READ", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_MODERATION", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_SETTINGS", SettingClass::EnvOnly),
+    ("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT", SettingClass::EnvOnly),
     // Combined `IP:port` socket; the split HOST/PORT pair below is legacy.
     ("TWO_INTERNAL_BIND", SettingClass::EnvOnly),
     ("TWO_INTERNAL_BIND_HOST", SettingClass::EnvOnly),
@@ -188,7 +189,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_TEMP_VOICE_SYNTHETIC_HUMAN_IDS", SettingClass::EnvOnly),
     // --- cold: read once at boot ---
     ("TWO_AUTOMOD", SettingClass::Cold),
-    ("TWO_ANNOUNCEMENTS", SettingClass::Cold),
+    ("TWO_ANNOUNCEMENTS", SettingClass::Hot),
     ("TWO_AUTOMATIONS", SettingClass::Cold),
     ("TWO_TEXT_COMMANDS", SettingClass::Cold),
     ("TEMP_VOICE_ENABLED", SettingClass::Cold),
@@ -205,8 +206,8 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     ("TWO_TEMP_VOICE_DISABLED_CONTROLS", SettingClass::Cold),
     ("TWO_ANTI_NUKE", SettingClass::Cold),
     ("TWO_ANTI_NUKE_DRY_RUN", SettingClass::Cold),
-    ("TWO_SELF_ROLE_PANELS", SettingClass::Cold),
-    ("TWO_TICKET_COOLDOWN_SECONDS", SettingClass::Cold),
+    ("TWO_SELF_ROLE_PANELS", SettingClass::Hot),
+    ("TWO_TICKET_COOLDOWN_SECONDS", SettingClass::Hot),
     ("LOG_LEVEL", SettingClass::Cold),
     // --- hot: channel/role ids, thresholds, lists, dry-runs ---
     ("DISCORD_ANCHOR_WELCOME_CHANNEL_ID", SettingClass::Hot),
@@ -299,8 +300,16 @@ pub const HOT_WIRED: &[&str] = &[
     "TWO_FEED_POLL_SECONDS",
     "TWO_COMMUNITY_HUMAN_CHANNEL_IDS",
     "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
+    "TWO_COMMUNITY_AUTOMATION_ACTOR_IDS",
+    "TWO_COMMUNITY_RAID_ACTOR_IDS",
+    "TWO_COMMUNITY_STAGING_ACTOR_IDS",
+    "TWO_COMMUNITY_STAGING_GUILD_IDS",
+    "TWO_COMMUNITY_TEST_ACTOR_IDS",
     "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
     "TWO_GUILD_INVITE_CODE",
+    "TWO_TICKET_COOLDOWN_SECONDS",
+    "TWO_ANNOUNCEMENTS",
+    "TWO_SELF_ROLE_PANELS",
     "TWO_COMMUNITY_SCORECARD",
     "TWO_COMMUNITY_RECOMMENDATIONS",
     "TWO_COMMUNITY_CORRECTION_CYCLES",
@@ -352,12 +361,17 @@ pub fn is_storable_key(key: &str) -> bool {
 }
 
 /// True for keys the live reader serves: hot AND hot-wired. Cold,
-/// hot-but-unwired, env-only and unknown keys never reach live readers,
-/// whether they arrive as guild rows or /ops overrides (Slice 0a filters
-/// the override layer with this same predicate).
+/// hot-but-unwired, env-only and unknown keys never reach live readers.
+/// The independently expiring ops layer additionally excludes catalogues
+/// whose retirement must synchronize with durable work in Postgres.
 #[must_use]
 pub fn is_live_key(key: &str) -> bool {
     classify_key(key) == Some(SettingClass::Hot) && HOT_WIRED.contains(&key)
+}
+
+fn is_ops_key(key: &str) -> bool {
+    // An expiring overlay cannot participate in the catalogue's DB drain lock.
+    is_live_key(key) && key != "TWO_SELF_ROLE_PANELS"
 }
 
 /// A refused settings write: the key must stay in the environment.
@@ -589,7 +603,7 @@ impl SettingsCache {
         if !is_storable_key(key) {
             return None;
         }
-        if let Some(value) = self.ops.get(key).filter(|_| is_live_key(key)) {
+        if let Some(value) = self.ops.get(key).filter(|_| is_ops_key(key)) {
             return Some(value);
         }
         self.entries.get(&(guild_id.to_owned(), key.to_owned()))
@@ -616,7 +630,7 @@ impl SettingsCache {
         }
         // Global /ops overrides win over the guild row, verbatim strings.
         for (key, value) in &self.ops {
-            if !is_live_key(key) {
+            if !is_ops_key(key) {
                 continue;
             }
             if let Some(rendered) = to_env_string(value) {
@@ -889,7 +903,7 @@ impl LiveSettingsWriter {
     fn apply_fresh_record(&mut self, record: &OpsRecord, now: Instant) -> OpsApplyOutcome {
         let mut live = HashMap::with_capacity(record.overrides.len());
         for (key, value) in &record.overrides {
-            if is_live_key(key) {
+            if is_ops_key(key) {
                 live.insert(key.to_owned(), Value::String(value.to_owned()));
             }
         }
@@ -999,6 +1013,10 @@ pub enum WriteRefusal {
     NullCharacter,
     #[error("refused: {0} accepts only a boolean, 0 or 1")]
     InvalidGateValue(String),
+    #[error("refused: {0} accepts only a non-negative integer number of seconds")]
+    InvalidCooldownValue(String),
+    #[error("refused: {0} accepts only a JSON array of self-role panels")]
+    InvalidPanelsValue(String),
     #[error(
         "refused: {0} accepts only a non-negative integer correction count; \
          store a plain count or delete the row to fall back to the boot value"
@@ -1009,6 +1027,11 @@ pub enum WriteRefusal {
          store a plain count or delete the row to fall back to the boot value"
     )]
     InvalidInactivityDays(String),
+    #[error(
+        "refused: {0} requires nonzero Discord IDs in its single-ID or CSV format; \
+         repair the destination or delete the row to fall back to the boot value"
+    )]
+    InvalidOnboardingDestination(String),
 }
 
 /// Dry-run gates the env parsers accept only as `0` or `1`; a stored value
@@ -1018,6 +1041,7 @@ pub enum WriteRefusal {
 const ZERO_ONE_GATE_KEYS: &[&str] = &[
     "TWO_ONBOARDING_DRY_RUN",
     "TWO_SELF_ROLE_DRY_RUN",
+    "TWO_ANNOUNCEMENTS",
     "TWO_COMMUNITY_SCORECARD",
     "TWO_COMMUNITY_RECOMMENDATIONS",
     "TWO_PRESENCE_PROBE",
@@ -1067,6 +1091,27 @@ pub fn validate_write(
     if value.as_ref().is_some_and(contains_json_nul) {
         return Err(WriteRefusal::NullCharacter);
     }
+    // Render exactly as snapshots do, then use the runtime's syntax parsers.
+    // Stored JSON null is ignored by rendering, not an explicit deletion.
+    // Optional emptiness is valid here; mode-specific requiredness stays in
+    // the runtime, even for currently unwired destination keys.
+    if let Some(value) = value.as_ref() {
+        let valid = match key {
+            "DISCORD_ANCHOR_WELCOME_CHANNEL_ID"
+            | "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID"
+            | "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID" => to_env_string(value).is_some_and(|v| {
+                crate::onboarding_destination::parse_optional_id(Some(&v)).is_ok()
+            }),
+            "DISCORD_LANDING_CHANNEL_IDS" | "DISCORD_GOODBYE_CHANNEL_IDS" => to_env_string(value)
+                .is_some_and(|v| {
+                    crate::onboarding_destination::parse_channel_ids(Some(&v)).is_ok()
+                }),
+            _ => true,
+        };
+        if !valid {
+            return Err(WriteRefusal::InvalidOnboardingDestination(key.to_owned()));
+        }
+    }
     if ZERO_ONE_GATE_KEYS.contains(&key)
         && value
             .as_ref()
@@ -1074,6 +1119,28 @@ pub fn validate_write(
             .is_some_and(|rendered| rendered != "0" && rendered != "1")
     {
         return Err(WriteRefusal::InvalidGateValue(key.to_owned()));
+    }
+    // The ticket cooldown renders exactly what the boot reader parses, so a
+    // stored value that does not parse as u64 would never apply live: refuse
+    // it with the key named rather than storing an inert row.
+    if key == "TWO_TICKET_COOLDOWN_SECONDS"
+        && value
+            .as_ref()
+            .and_then(to_env_string)
+            .is_some_and(|rendered| rendered.parse::<u64>().is_err())
+    {
+        return Err(WriteRefusal::InvalidCooldownValue(key.to_owned()));
+    }
+    // The panel catalogue renders as compact JSON, the shape the strict boot
+    // parser accepts, so run that same parser here: a stored catalogue the
+    // loader refuses would silently fall back to boot on every read.
+    if key == "TWO_SELF_ROLE_PANELS"
+        && value
+            .as_ref()
+            .and_then(to_env_string)
+            .is_some_and(|rendered| crate::parse_self_role_panels(&rendered).is_err())
+    {
+        return Err(WriteRefusal::InvalidPanelsValue(key.to_owned()));
     }
     // Correction cycles and inactivity days validate through their real
     // readers: a stored value the tick cannot parse is refused before any
@@ -1169,17 +1236,18 @@ mod tests {
         "TWO_FEED_POLL_SECONDS",
         "TWO_TEMP_VOICE_EMPTY_GRACE_SECONDS",
         "TWO_GUILD_INVITE_CODE",
+        "TWO_ANNOUNCEMENTS",
+        "TWO_SELF_ROLE_PANELS",
+        "TWO_TICKET_COOLDOWN_SECONDS",
     ];
 
     const EXPECTED_COLD: &[&str] = &[
         "LOG_LEVEL",
         "TEMP_VOICE_ENABLED",
-        "TWO_ANNOUNCEMENTS",
         "TWO_ANTI_NUKE",
         "TWO_ANTI_NUKE_DRY_RUN",
         "TWO_AUTOMATIONS",
         "TWO_AUTOMOD",
-        "TWO_SELF_ROLE_PANELS",
         "TWO_TEMP_VOICE",
         "TWO_TEMP_VOICE_CATEGORY_ID",
         "TWO_TEMP_VOICE_CREATE_COOLDOWN_SECONDS",
@@ -1192,7 +1260,6 @@ mod tests {
         "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
         "TWO_TEMP_VOICE_SWEEP_SECONDS",
         "TWO_TEXT_COMMANDS",
-        "TWO_TICKET_COOLDOWN_SECONDS",
     ];
 
     const EXPECTED_ENV_ONLY: &[&str] = &[
@@ -1233,6 +1300,7 @@ mod tests {
         "TWO_INTERNAL_ALLOW_EVENT_READ",
         "TWO_INTERNAL_ALLOW_MODERATION",
         "TWO_INTERNAL_ALLOW_SETTINGS",
+        "TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT",
         "TWO_INTERNAL_BIND",
         "TWO_INTERNAL_BIND_HOST",
         "TWO_INTERNAL_CALLERS",
@@ -1276,7 +1344,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 136, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 137, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,
@@ -1318,7 +1386,7 @@ mod tests {
 
     #[test]
     fn hot_wired_is_a_hot_subset() {
-        assert_eq!(HOT_WIRED.len(), 31);
+        assert_eq!(HOT_WIRED.len(), 39);
         for key in HOT_WIRED {
             assert_eq!(classify_key(key), Some(SettingClass::Hot), "{key}");
         }

@@ -37,7 +37,7 @@ binding = "CF_VERSION_METADATA"
 
 # Default-environment bindings. Named environments do NOT inherit these —
 # every [env.*] below repeats the full Container/DO wiring explicitly.
-# Verified against wrangler 4.151.0 (`deploy --dry-run --env <name>` warns on
+# Verified against wrangler 4.152.0 (`deploy --dry-run --env <name>` warns on
 # any omission); enforced in CI by scripts/check-env-bindings.py, which also
 # requires both [env.staging] and [env.production] to be declared.
 [[containers]]
@@ -135,8 +135,9 @@ REDIRECT_MAPPINGS_JSON = "[]"
 OPS_ALERT_FORWARDING = "off"
 # Container HTTP port (must match the Rust LISTEN_ADDR port).
 BOT_PORT = "8080"
-# Keepalive tick: renews the activity timeout so the gateway WebSocket
-# (outbound-only, invisible to Container idle billing) never sleeps.
+# Keepalive renews activity only inside the original finite-use window.
+# First activation is roll-forward only; see docs/staging-rollout-gate.md.
+STAGING_RUNTIME_POLICY = "bounded"
 KEEPALIVE_SECONDS = "60"
 TWO_GUILD_NAME = "TWO Staging"
 # Deployment-environment marker for the staging rollback-drill fence

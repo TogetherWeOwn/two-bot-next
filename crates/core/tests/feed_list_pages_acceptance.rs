@@ -184,18 +184,19 @@ fn feed_pages_exact_boundary_counts_utf16_and_moves_only_whole_rows() {
             ..relay(2, "https://example.org/🦀b".into())
         },
     ];
-    let first = "`boundary-a` rss → <#123456789012345678> https://example.org/🦀a";
-    let second = "`boundary-b` rss → <#123456789012345678> https://example.org/🦀b";
-    // Each row has 64 UTF-16 units, plus one joining newline.
-    assert_eq!(first.encode_utf16().count(), 64);
-    assert_eq!(second.encode_utf16().count(), 64);
+    let first = "`boundary-a` rss enabled → <#123456789012345678> https://example.org/🦀a";
+    let second = "`boundary-b` rss enabled → <#123456789012345678> https://example.org/🦀b";
+    // Each row has 72 UTF-16 units (64 legacy + 8 for the `enabled` state
+    // word), plus one joining newline.
+    assert_eq!(first.encode_utf16().count(), 72);
+    assert_eq!(second.encode_utf16().count(), 72);
     assert_eq!(
-        FeedRelay::list_pages(&rows, 129),
+        FeedRelay::list_pages(&rows, 145),
         [format!("{first}\n{second}")]
     );
-    let pages = FeedRelay::list_pages(&rows, 128);
+    let pages = FeedRelay::list_pages(&rows, 144);
     assert_eq!(pages, [first, second]);
-    assert_whole_rows(&pages, &rows, 128);
+    assert_whole_rows(&pages, &rows, 144);
 }
 
 #[test]

@@ -1,5 +1,8 @@
 #![cfg(test)]
 //! Regression coverage for queued defers, accepted-work drain and RESUMED sync.
+#[path = "live_ordered_rsvp_consumer_acceptance_tests.rs"]
+mod live_ordered_rsvp_consumer_acceptance_tests;
+
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use two_bot_core::{
@@ -551,7 +554,10 @@ async fn queued_commands(
     assert_eq!(requests.len(), 14);
     for (token, content) in [
         ("mock-rsvp-2", "RSVP saved: going."),
-        ("mock-rsvp-3", "RSVP saved: interested."),
+        (
+            "mock-rsvp-3",
+            "RSVP saved: interested (changed from going).",
+        ),
     ] {
         let edits: Vec<_> = requests
             .iter()
@@ -854,7 +860,7 @@ async fn receipt_callback_waits_out_brief_lane_occupancy() {
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&edits[1].body).unwrap()["content"],
-        "RSVP saved: interested."
+        "RSVP saved: interested (changed from going)."
     );
     let status: String = tokio::time::timeout(
         Duration::from_secs(60),

@@ -1557,18 +1557,24 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         CommandDefinition::new(
             "setup",
             "Show voice-room status, health and creator channels",
-        ),
+        )
+        .options(vec![CommandOption::new(
+            "page",
+            "Page of creator channels to show (starts at 1)",
+            CommandOptionType::Integer,
+        )
+        .min_value(1)]),
         CommandDefinition::new("ping", "Show the bot's response latency"),
         CommandDefinition::new("invite", "Show this server's invite link"),
         CommandDefinition::new(
             "textchannels",
-            "Toggle companion text channels for one creator channel",
+            "Toggle companion text channels for one creator channel; channel alone shows current settings",
         )
         .permissions(PERM_MANAGE_CHANNELS)
         .options(vec![
             CommandOption::new(
                 "channel",
-                "Creator voice channel to configure",
+                "Creator voice channel to configure (alone: show current settings)",
                 CommandOptionType::Channel,
             )
             .required(),
@@ -1588,6 +1594,16 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 "Extra role that may view companions (@everyone for all)",
                 CommandOptionType::Role,
             ),
+            CommandOption::new(
+                "reset-name",
+                "Reset the companion name to the default voice-chat (false or empty keeps it)",
+                CommandOptionType::Boolean,
+            ),
+            CommandOption::new(
+                "reset-viewer-role",
+                "Reset to the default audience, occupants and admins only (false or empty keeps it)",
+                CommandOptionType::Boolean,
+            ),
         ]),
         CommandDefinition::new(
             "access",
@@ -1599,7 +1615,13 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
                 "show",
                 "Show the current voice-room access settings",
                 CommandOptionType::SubCommand,
-            ),
+            )
+            .sub_options(vec![CommandOption::new(
+                "page",
+                "Page of access settings to show (starts at 1)",
+                CommandOptionType::Integer,
+            )
+            .min_value(1)]),
             CommandOption::new(
                 "creation",
                 "Turn temporary room creation on or off",
@@ -1741,13 +1763,13 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         .required()]),
         CommandDefinition::new(
             "position",
-            "Set where new rooms appear and the first room number",
+            "Set where new rooms appear and the first room number; channel alone shows current settings",
         )
         .permissions(PERM_MANAGE_CHANNELS)
         .options(vec![
             CommandOption::new(
                 "channel",
-                "Creator voice channel to configure",
+                "Creator voice channel to configure (alone: show current settings)",
                 CommandOptionType::Channel,
             )
             .required(),
@@ -1775,19 +1797,19 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         ]),
         CommandDefinition::new(
             "group",
-            "Toggle shared numbering per category for one creator channel",
+            "Toggle shared numbering per category for one creator channel; channel alone shows current settings",
         )
         .permissions(PERM_MANAGE_CHANNELS)
         .options(vec![
             CommandOption::new(
                 "channel",
-                "Creator voice channel to configure",
+                "Creator voice channel to configure (alone: show current settings)",
                 CommandOptionType::Channel,
             )
             .required(),
             CommandOption::new(
                 "enabled",
-                "Share numbering across the category (required: choose on or off)",
+                "Share numbering across the category (leave empty to show current settings)",
                 CommandOptionType::Boolean,
             ),
         ]),
@@ -1905,6 +1927,17 @@ pub fn voice_commands() -> Vec<CommandDefinition> {
         )
         .int_range(0, MAX_USER_LIMIT)]),
         CommandDefinition::new("unlimit", "Remove your room's user limit"),
+        CommandDefinition::new("myroom", "Show the live temporary voice rooms you own"),
+        CommandDefinition::new(
+            "room-access-inspect",
+            "See who is blocked, granted and waiting to join your voice room",
+        )
+        .options(vec![CommandOption::new(
+            "page",
+            "Page of a long list (starting at 1)",
+            CommandOptionType::Integer,
+        )
+        .min_value(1)]),
     ]
 }
 
@@ -3065,7 +3098,9 @@ mod tests {
                 "private",
                 "public",
                 "limit",
-                "unlimit"
+                "unlimit",
+                "myroom",
+                "room-access-inspect"
             ]
         );
         // `/create` is admin-gated (Manage Channels) with a required name.
@@ -3076,16 +3111,22 @@ mod tests {
         assert_eq!(defs[0].options.len(), 1);
         assert_eq!(defs[0].options[0].name, "name");
         assert!(defs[0].options[0].required == Some(true));
-        // `/setup` is viewable by anyone; handler actions need admin.
+        // `/setup` is viewable by anyone; handler actions need admin. It
+        // takes one optional 1-based creator page.
         assert_eq!(defs[1].default_member_permissions, None);
-        assert!(defs[1].options.is_empty());
+        assert_eq!(defs[1].options.len(), 1);
+        assert_eq!(defs[1].options[0].name, "page");
+        assert_eq!(defs[1].options[0].kind, CommandOptionType::Integer.as_u8());
+        assert_eq!(defs[1].options[0].required, None);
+        assert_eq!(defs[1].options[0].min_value, Some(1));
+        assert_eq!(defs[1].options[0].max_value, None);
         // `/ping` and `/invite` are open to everyone and take no options.
         for def in &defs[2..4] {
             assert_eq!(def.default_member_permissions, None);
             assert!(def.options.is_empty());
         }
         // `/textchannels` is admin-gated like `/create`: a required creator
-        // channel plus optional toggle, name and viewer role.
+        // channel plus optional toggle, name, viewer role and their two resets.
         assert_eq!(
             defs[4].default_member_permissions,
             Some(PERM_MANAGE_CHANNELS.to_string())
@@ -3108,6 +3149,12 @@ mod tests {
                 ("enabled", CommandOptionType::Boolean.as_u8(), false),
                 ("name", CommandOptionType::String.as_u8(), false),
                 ("viewer-role", CommandOptionType::Role.as_u8(), false),
+                ("reset-name", CommandOptionType::Boolean.as_u8(), false),
+                (
+                    "reset-viewer-role",
+                    CommandOptionType::Boolean.as_u8(),
+                    false
+                ),
             ]
         );
         assert_eq!(
@@ -3130,6 +3177,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["show", "creation", "role", "restrict", "unrestrict"]
         );
+        // `/access show` takes one optional 1-based settings page.
+        assert_eq!(access.options[0].name, "show");
+        assert_eq!(access.options[0].options.len(), 1);
+        assert_eq!(access.options[0].options[0].name, "page");
+        assert_eq!(
+            access.options[0].options[0].kind,
+            CommandOptionType::Integer.as_u8()
+        );
+        assert_eq!(access.options[0].options[0].required, None);
+        assert_eq!(access.options[0].options[0].min_value, Some(1));
+        assert_eq!(access.options[0].options[0].max_value, None);
         assert_eq!(
             logging.default_member_permissions,
             Some(PERM_MANAGE_CHANNELS.to_string())
@@ -3233,6 +3291,12 @@ mod tests {
         let unlimit = defs.iter().find(|def| def.name == "unlimit").unwrap();
         assert_eq!(unlimit.default_member_permissions, None);
         assert!(unlimit.options.is_empty());
+        // `/myroom` is a read-only member listing: open in the definition,
+        // no options (the caller is the authenticated invoker), and the
+        // worker filters to their currently owned live rooms.
+        let myroom = defs.iter().find(|def| def.name == "myroom").unwrap();
+        assert_eq!(myroom.default_member_permissions, None);
+        assert!(myroom.options.is_empty());
         // `/name` is open to every member with no options: the panel and modal
         // carry the name, and the worker refuses everyone but the owner or an
         // admin.
@@ -3274,6 +3338,21 @@ mod tests {
             assert_eq!(def.default_member_permissions, None);
             assert!(def.options.is_empty());
         }
+        // `/room-access-inspect` is owner-gated at the handler like
+        // `/private`, so it carries no staff default gate. It publishes
+        // exactly one option, an optional 1-based Integer page: removing
+        // the selector or shifting its minimum must fail here, independent
+        // of the rendered reference docs.
+        let inspect = defs
+            .iter()
+            .find(|def| def.name == "room-access-inspect")
+            .unwrap();
+        assert_eq!(inspect.default_member_permissions, None);
+        assert_eq!(inspect.options.len(), 1);
+        assert_eq!(inspect.options[0].name, "page");
+        assert_eq!(inspect.options[0].kind, CommandOptionType::Integer.as_u8());
+        assert_eq!(inspect.options[0].required, None);
+        assert_eq!(inspect.options[0].min_value, Some(1));
         // Merges cleanly alongside the other slices, first-wins.
         // Moderation's `kick` sorts before the voice one, so the shared
         // merge keeps the moderation definition; runtime dispatch (not the
