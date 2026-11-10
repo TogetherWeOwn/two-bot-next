@@ -7,6 +7,9 @@
 #[path = "event_reminder_deadline_review_tests.rs"]
 mod review_gaps;
 
+#[path = "event_reminder_inter_tick_tests.rs"]
+mod inter_tick;
+
 use std::{process::Command, sync::Arc, time::Duration};
 
 use serde_json::json;

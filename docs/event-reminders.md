@@ -22,16 +22,22 @@ fallback counts as the event's one delivery attempt.
 
 The existing activation-fenced automation scheduler must be enabled; its normal
 15-second cadence also handles these reminders, at most two events in the
-ordinary pass. After a healthy tick, one immediate **urgent follow-up** may
-attempt at most two more events whose starts fall within the next 15 seconds.
-This avoids stranding a third event that first receives an eligible RSVP just
-before its start. Nonurgent events wait for the next ordinary tick. The
-follow-up shares the same activation fence, supervisor ownership, cancellation
-and overall deadline; it never reruns ordinary scheduled messages, resets the
-timeout or admits an event after its start. There is no unbounded drain: at
-most four reminder attempts run in one supervised invocation. Larger urgent
-bursts, slow delivery or exhausted deadlines remain best effort. The urgent
-cutoff is applied in the store query before attendee rosters are materialized.
+ordinary pass. After a healthy tick, an **urgent follow-up** may attempt at most
+two more events whose starts fall within the next 15 seconds. It rereads once
+per second while an unfenced urgent event remains, even if that event initially
+has no attendees: a first RSVP committed between ordinary ticks can then be
+observed before start. There are at most 15 urgent scans and two candidate
+attempts TOTAL across those scans, not two attempts per scan. The watch ends
+before the next ordinary cadence; slow work can shorten or eliminate it.
+Nonurgent events wait for the next ordinary tick. The follow-up shares the same
+activation fence, supervisor ownership, cancellation and overall deadline; it
+never reruns ordinary scheduled messages, resets the timeout or admits an event
+at or after its start. There is no unbounded drain: at most four reminder
+attempts run in one supervised invocation. Larger urgent bursts, a first RSVP
+inside the final subsecond polling gap, slow delivery or exhausted deadlines
+remain best effort, not guaranteed delivery. The urgent cutoff is applied in
+the store query before attendee rosters are materialized. The pending-event
+probe reads no rosters and deliberately does not require an RSVP.
 Admission checks the clock after connection and guild-lock waits, and dispatch
 checks again after commit. An event-start timeout also bounds transport
 admission and the POST; a timeout retains the immutable fence and is uncertain,

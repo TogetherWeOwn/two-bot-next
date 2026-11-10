@@ -81,6 +81,31 @@ pub async fn due_event_reminders_before(
     .await
 }
 
+/// Whether an unfenced event can still receive its first RSVP before the next
+/// ordinary tick. Do not require attendees here: an empty roster is precisely
+/// why the urgent watcher must remain alive. This reads no attendee rosters.
+pub async fn has_pending_event_reminders_before(
+    pool: &PgPool,
+    guild: &str,
+    now: u64,
+    latest_start: u64,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM scheduled_events e
+          WHERE e.guild_id = $1 AND e.status = 'scheduled'
+            AND e.channel_id IS NOT NULL AND e.starts_at > $2 AND e.starts_at <= $3
+            AND NOT EXISTS (SELECT 1 FROM automation_audit_log d
+                             WHERE d.id = 'event:reminder:' || e.guild_id || ':' || e.event_id))",
+    )
+    .bind(guild)
+    .bind(format_iso_ms(now))
+    .bind(format_iso_ms(
+        latest_start.min(now.saturating_add(EVENT_REMINDER_LEAD_MS)),
+    ))
+    .fetch_one(pool)
+    .await
+}
+
 /// Revalidate the mirror, attendees and time at dispatch, then atomically arm a
 /// per-(guild,event) fence in the existing automation audit log. ONLY a committed
 /// new claim authorizes POST; an unknown commit result authorizes nothing.

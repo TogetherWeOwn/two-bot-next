@@ -167,7 +167,7 @@ pub(crate) async fn tick(
     clock: impl Fn() -> u64 + Send + Sync,
 ) -> Result<(), ErrorClass> {
     let schedule_error = run_schedule_phase(pool, rest, guild, &clock).await;
-    let reminder_error = remind_event_attendees(pool, rest, guild, &clock, None)
+    let reminder_error = remind_event_attendees(pool, rest, guild, &clock, None, 2)
         .await
         .err();
     match (schedule_error, reminder_error) {
@@ -179,21 +179,44 @@ pub(crate) async fn tick(
     }
 }
 
-/// A healthy ordinary tick may leave a tail that expires before the next 15 s
-/// tick. Give only that urgent tail one immediate, separately bounded reminder
-/// pass. Each read still selects at most two events: at most four attempts per
-/// supervised invocation, never an unbounded drain or an ordinary-message rerun.
-/// This future remains inside the existing activation fence, cancellation and
-/// 120 s supervisor deadline; dispatch still rejects events after their start.
+/// Keep watching already-mirrored urgent events even when the initial roster
+/// is empty: their first RSVP may commit between ordinary ticks. At most 15
+/// scans, one second apart, share TWO candidate attempts in total, not per scan.
+/// The watch ends before the next ordinary cadence, or sooner when all urgent
+/// events are fenced/expired. Scheduled messages never rerun in this watch.
+/// Everything stays inside the owning supervisor's cancellation and deadline.
 async fn tick_with_deadline_follow_up(
     pool: &PgPool,
     rest: &ActionExecutor,
     guild: &str,
     clock: impl Fn() -> u64 + Send + Sync,
 ) -> Result<(), ErrorClass> {
+    use two_bot_core::event_reminder_store::has_pending_event_reminders_before;
+
+    let watch_until = tokio::time::Instant::now() + Duration::from_millis(SCHEDULER_TICK_MS);
     tick(pool, rest, guild, &clock).await?;
     let latest_start = clock().saturating_add(SCHEDULER_TICK_MS);
-    remind_event_attendees(pool, rest, guild, &clock, Some(latest_start)).await
+    let mut remaining = 2;
+    for scan in 0..15 {
+        if scan > 0 {
+            let next = tokio::time::Instant::now() + Duration::from_secs(1);
+            if next >= watch_until {
+                break;
+            }
+            tokio::time::sleep_until(next).await;
+        }
+        remaining -=
+            remind_event_attendees(pool, rest, guild, &clock, Some(latest_start), remaining)
+                .await?;
+        if remaining == 0
+            || !has_pending_event_reminders_before(pool, guild, clock(), latest_start)
+                .await
+                .map_err(reminder_database)?
+        {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Claim and run due scheduled occurrences, stopping the batch on the first
@@ -252,7 +275,8 @@ async fn remind_event_attendees(
     guild: &str,
     clock: &impl Fn() -> u64,
     latest_start: Option<u64>,
-) -> Result<(), ErrorClass> {
+    budget: usize,
+) -> Result<usize, ErrorClass> {
     use two_bot_core::{
         event_reminder_store::{
             begin_event_reminder_delivery_with_clock, due_event_reminders_before,
@@ -263,10 +287,11 @@ async fn remind_event_attendees(
 
     let now = clock();
     let latest_start = latest_start.unwrap_or_else(|| now.saturating_add(EVENT_REMINDER_LEAD_MS));
-    for event in due_event_reminders_before(pool, guild, now, latest_start)
+    let events = due_event_reminders_before(pool, guild, now, latest_start)
         .await
-        .map_err(reminder_database)?
-    {
+        .map_err(reminder_database)?;
+    let inspected = events.len().min(budget);
+    for event in events.into_iter().take(budget) {
         if !begin_event_reminder_delivery_with_clock(pool, guild, &event, clock)
             .await
             .map_err(reminder_database)?
@@ -318,7 +343,7 @@ async fn remind_event_attendees(
             .await
             .map_err(reminder_database)?;
     }
-    Ok(())
+    Ok(inspected)
 }
 
 fn event_reminder_content(
