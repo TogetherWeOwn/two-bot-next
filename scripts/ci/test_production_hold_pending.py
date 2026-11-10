@@ -22,6 +22,13 @@ import production_hold_pending as pending
 BASE_TS = 1_800_000_000
 
 
+def git_env():
+    """Fixture git environment: no inherited GIT_* routing/config, no global/system config."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+    return env
+
+
 class Repo:
     def __init__(self, path):
         self.path = Path(path)
@@ -30,8 +37,7 @@ class Repo:
         self.git("init", "-q", "-b", "main")
 
     def git(self, *args, check=True, input=None):
-        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
-               "GIT_CONFIG_NOSYSTEM": "1"}
+        env = git_env()
         return subprocess.run(
             ["git", "-C", str(self.path), "-c", "user.name=t",
              "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
@@ -200,10 +206,11 @@ class PendingSinceTest(unittest.TestCase):
             clone = Path(tmp) / "c"
             subprocess.run(["git", "clone", "-q", "--depth=1",
                             f"file://{self.repo.path}", str(clone)],
-                           check=True, capture_output=True)
+                           check=True, capture_output=True, env=git_env(),
+                           timeout=30)
             head = subprocess.run(["git", "-C", str(clone), "rev-parse", "HEAD"],
-                                  check=True, capture_output=True,
-                                  text=True).stdout.strip()
+                                  check=True, capture_output=True, env=git_env(),
+                                  text=True, timeout=30).stdout.strip()
             with self.assertRaises(incident_issue.IncidentError):
                 pending.pending_since(self.base, head, clone)
 
@@ -276,6 +283,64 @@ class PendingSinceTest(unittest.TestCase):
         with mock.patch.object(pending, "_git", side_effect=fake):
             with self.assertRaises(incident_issue.IncidentError):
                 self.pend(main=head)
+
+
+class InheritedGitEnvTest(unittest.TestCase):
+    """Inherited GIT_* variables must not reach fixture git; only sentinel repos are used."""
+
+    def snapshot(self, repo):
+        gitdir = repo.path / ".git"
+        objects = sorted(str(p.relative_to(gitdir)) for p in (gitdir / "objects").rglob("*")
+                         if p.is_file())
+        index = gitdir / "index"
+        return (repo.git("rev-parse", "HEAD"), index.read_bytes(), objects,
+                sorted(p.name for p in repo.path.iterdir()))
+
+    def test_inherited_git_routing_cannot_touch_sentinel(self):
+        with tempfile.TemporaryDirectory() as sentinel_tmp, \
+                tempfile.TemporaryDirectory() as fixture_tmp, \
+                tempfile.TemporaryDirectory() as extra_tmp:
+            sentinel = Repo(sentinel_tmp)
+            sentinel.commit({"keep.txt": "sentinel"})
+            before = self.snapshot(sentinel)
+            gitdir = str(sentinel.path / ".git")
+            poisoned = {
+                "GIT_DIR": gitdir,
+                "GIT_WORK_TREE": str(sentinel.path),
+                "GIT_INDEX_FILE": gitdir + "/index",
+                "GIT_OBJECT_DIRECTORY": gitdir + "/objects",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": extra_tmp,
+                "GIT_COMMON_DIR": gitdir,
+                "GIT_NAMESPACE": "poison",
+                "GIT_CEILING_DIRECTORIES": fixture_tmp,
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.worktree",
+                "GIT_CONFIG_VALUE_0": str(sentinel.path),
+                "GIT_AUTHOR_NAME": "poison",
+                "GIT_COMMITTER_DATE": "1 +0000",
+            }
+            with mock.patch.dict(os.environ, poisoned):
+                env = git_env()
+                self.assertEqual(
+                    {k for k in env if k.startswith("GIT_")},
+                    {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"})
+                self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+                self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+                fixture = Repo(fixture_tmp)
+                fixture.commit({"src/a.rs": "1"})
+                fixture.commit({"src/b.rs": "2"})
+                fixture_head = fixture.git("rev-parse", "HEAD")
+                self.assertEqual(
+                    fixture.git("rev-parse", "--absolute-git-dir"),
+                    str(Path(fixture_tmp, ".git").resolve()))
+                clone = Path(fixture_tmp) / "clone"
+                subprocess.run(["git", "clone", "-q", "--depth=1",
+                                f"file://{fixture.path}", str(clone)],
+                               check=True, capture_output=True, env=git_env(),
+                               timeout=30)
+            self.assertTrue((clone / ".git").is_dir())
+            self.assertEqual(self.snapshot(sentinel), before)
+            self.assertNotEqual(fixture_head, before[0])
 
 
 if __name__ == "__main__":

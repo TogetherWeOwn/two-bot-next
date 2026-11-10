@@ -9,6 +9,7 @@ a green workflow whose production job skipped is never promotion evidence.
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 import re
@@ -181,7 +182,11 @@ def reason(needs):
 
 
 def decide(history, needs, now, run_url):
-    main = sha(history.get("commits/main").get("sha"))
+    ref = history.get("git/ref/heads/main")
+    obj = ref.get("object") if isinstance(ref, dict) else None
+    if not isinstance(obj, dict) or obj.get("type") != "commit":
+        raise incident_issue.IncidentError("production hold main ref is unreadable")
+    main = sha(obj.get("sha"))
     promotion = history.last_promotion()
     # Local metadata has no patch payload, unlike the first compare API page.
     # Missing objects (e.g. a newer main arriving after checkout) fail the report;
@@ -203,21 +208,67 @@ def decide(history, needs, now, run_url):
 
 
 OBSERVATION = re.compile(r"<!-- production-hold-observation: (\{[^\n]*\}) -->")
+RECOVERY = re.compile(r"<!-- production-hold-recovery: (\{[^\n]*\}) -->")
+GENERATION_FIELDS = ("last_promoted_sha", "last_promoted_at", "promotion_run_id",
+                     "promotion_attempt", "promotion_mode")
+
+
+def content_digest(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def observation(report):
-    fields = ("last_promoted_sha", "last_promoted_at", "promotion_run_id",
-              "promotion_attempt", "promotion_mode", "main_sha", "observed_at", "held_since")
+    fields = (*GENERATION_FIELDS, "main_sha", "observed_at", "held_since")
     value = {key: report[key] for key in fields}
+    value["content_sha256"] = content_digest(body(report))
     return "<!-- production-hold-observation: " + json.dumps(value, sort_keys=True) + " -->"
 
 
-def stale_observation(text, report):
-    matches = OBSERVATION.findall(text or "")
+def verified_content(text, pattern):
+    # This checksum detects edits, not hostile authorship. Only the exact sink
+    # envelopes are removable; unknown content before/after a marker stays fenced.
+    matches = list(pattern.finditer(text or ""))
     if len(matches) != 1:
+        return None
+    match = matches[0]
+    content, suffix = text[:match.start()], text[match.end():]
+    if content.startswith("Still failing.\n\n") and pattern is OBSERVATION:
+        content = content[len("Still failing.\n\n"):]
+        if suffix:
+            return None
+    elif suffix and (pattern is not OBSERVATION
+                     or suffix != "\n\n" + incident_issue.marker(KEY) + "\n"):
+        return None
+    if not content.endswith("\n"):
+        return None
+    try:
+        value = json.loads(match[1], object_pairs_hook=incident_issue._reject_duplicate_keys)
+        return value if value.get("content_sha256") == content_digest(content[:-1]) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def recovery_body(report, repo):
+    text = ("Production promotion recovered.\n\n" + body(report)
+            + f"- Successful deployment run: https://github.com/"
+              f"{repo}/actions/runs/{report['promotion_run_id']}"
+              f"/attempts/{report['promotion_attempt']}\n")
+    value = {key: report[key] for key in GENERATION_FIELDS}
+    value["content_sha256"] = content_digest(text)
+    return text + "\n<!-- production-hold-recovery: " + json.dumps(value, sort_keys=True) + " -->"
+
+
+def recovery_receipt(text, report):
+    value = verified_content(text, RECOVERY)
+    return (value is not None and report["promotion_mode"] == "deploy"
+            and all(value.get(key) == report[key] for key in GENERATION_FIELDS))
+
+
+def stale_observation(text, report):
+    value = verified_content(text, OBSERVATION)
+    if value is None:
         return False
     try:
-        value = json.loads(matches[0], object_pairs_hook=incident_issue._reject_duplicate_keys)
         sha(value["last_promoted_sha"])
         sha(value["main_sha"])
         if (not re.fullmatch(r"[1-9][0-9]*", value["promotion_run_id"])
@@ -243,7 +294,9 @@ def stale_activity(history, issue, report):
     cutoff = moment(report["last_promoted_at"])
     for comment in history.pages(f"issues/{issue['number']}/comments"):
         updated = incident_issue._updated(comment)
-        if updated is None or (updated > cutoff and not stale_observation(comment.get("body"), report)):
+        if updated is None or (updated > cutoff
+                               and not stale_observation(comment.get("body"), report)
+                               and not recovery_receipt(comment.get("body"), report)):
             return False
     return True
 
@@ -281,7 +334,7 @@ def main():
                 incident_issue.open_incident(env, KEY, TITLE, body(report) + "\n" + observation(report))
             elif report["action"] == "recovery":
                 incident_issue.close_incident(
-                    env, KEY, "Production promotion recovered.\n\n" + body(report),
+                    env, KEY, recovery_body(report, history.repo),
                     quiet_since=moment(report["last_promoted_at"]),
                     activity_is_stale=lambda issue: stale_activity(history, issue, report))
         print(json.dumps(report, sort_keys=True))

@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import unittest
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -55,6 +56,7 @@ class FakeGitHub:
         self.routes = {}
         self.issues = {}
         self.comments = {}
+        self.comment_times = {}
         self.clock = "2020-01-10T00:00:00Z"
         self.writes = []
         self.next_number = 1
@@ -94,12 +96,15 @@ class FakeGitHub:
             return {"number": number}
         match = re.fullmatch(r"issues/(\d+)/comments", rest)
         if method == "GET" and match:
-            rows = [{"body": text, "updated_at": self.issues[int(match[1])]["updated_at"]}
-                    for text in self.comments.get(int(match[1]), [])]
+            number = int(match[1])
+            rows = [{"body": text, "updated_at": self.comment_times.get(
+                        (number, i), self.issues[number]["updated_at"])}
+                    for i, text in enumerate(self.comments.get(number, []))]
             return paged(rows)(query)
         if method == "POST" and match:
             number = int(match[1])
             self.comments.setdefault(number, []).append(body["body"])
+            self.comment_times[(number, len(self.comments[number]) - 1)] = self.clock
             self.issues[number]["updated_at"] = self.clock
             return {}
         match = re.fullmatch(r"issues/(\d+)", rest)
@@ -163,7 +168,7 @@ def install_promotion(gh, deployment_id=11, revision=OLD, run_id=501,
 
 def finish(gh, main=MAIN, promoted=OLD, status="ahead", pending_at=None):
     """Register main head and the compare result, then wrap lists for paging."""
-    gh.routes["commits/main"] = {"sha": main}
+    gh.routes["git/ref/heads/main"] = {"object": {"type": "commit", "sha": main}}
     comparison = {"status": status}
     if pending_at is not None:
         comparison["commits"] = [{"commit": {"committer": {"date": pending_at}}}]
@@ -597,8 +602,16 @@ class EvidenceBoundTests(unittest.TestCase):
     def test_malformed_main_revision_fails_closed(self):
         for revision in (None, "main", "B" * 40, "b" * 39, 5):
             gh = scenario("2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z")
-            gh.routes["commits/main"] = {"sha": revision}
+            gh.routes["git/ref/heads/main"] = {"object": {"type": "commit", "sha": revision}}
             with self.subTest(revision=revision), self.assertRaises(incident_issue.IncidentError):
+                decide(gh)
+
+    def test_malformed_or_non_commit_main_ref_fails_closed(self):
+        for ref in (None, [], {}, {"object": None}, {"object": []},
+                    {"object": {"type": "tag", "sha": MAIN}}):
+            gh = scenario("2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z")
+            gh.routes["git/ref/heads/main"] = lambda query, value=ref: value
+            with self.subTest(ref=ref), self.assertRaises(incident_issue.IncidentError):
                 decide(gh)
 
     def test_moment_requires_an_aware_timestamp(self):
@@ -612,8 +625,8 @@ class EvidenceBoundTests(unittest.TestCase):
 class MainLifecycleTests(unittest.TestCase):
     """main() against the in-memory GitHub with the real shared issue sink."""
 
-    def run_main(self, gh, needs, args=()):
-        env = {"GITHUB_TOKEN": "tok", "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "777",
+    def run_main(self, gh, needs, args=(), run_id="777"):
+        env = {"GITHUB_TOKEN": "tok", "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": run_id,
                "NEEDS_JSON": json.dumps(needs)}
         out = io.StringIO()
         with mock.patch.dict(os.environ, env, clear=True), \
@@ -663,6 +676,7 @@ class MainLifecycleTests(unittest.TestCase):
         # Recovery after the last issue activity closes it with a comment.
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
         recovered.issues, recovered.comments = gh.issues, gh.comments
+        recovered.comment_times = gh.comment_times
         recovered.next_number = gh.next_number
         code, out = self.run_main(recovered, self.recovery_needs())
         self.assertEqual(code, 0)
@@ -681,6 +695,7 @@ class MainLifecycleTests(unittest.TestCase):
         self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
         recovered.issues, recovered.comments = gh.issues, gh.comments
+        recovered.comment_times = gh.comment_times
         code, out = self.run_main(recovered, {})
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["action"], "recovery")
@@ -699,6 +714,7 @@ class MainLifecycleTests(unittest.TestCase):
                           completed_at="2020-01-11T10:00:00Z")
         finish(latest, pending_at="2020-01-10T00:00:00Z")
         latest.issues, latest.comments = gh.issues, gh.comments
+        latest.comment_times = gh.comment_times
         latest.clock = "2020-01-11T10:06:00Z"
         code, out = self.run_main(latest, self.recovery_needs())
         self.assertEqual(code, 0)
@@ -718,6 +734,7 @@ class MainLifecycleTests(unittest.TestCase):
         self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
         recovered.issues, recovered.comments = gh.issues, gh.comments
+        recovered.comment_times = gh.comment_times
         code, out = self.run_main(recovered, {})
         self.assertEqual((code, json.loads(out)["action"]), (0, "recovery"))
         self.assertEqual(gh.issues[1]["state"], "closed")
@@ -728,10 +745,12 @@ class MainLifecycleTests(unittest.TestCase):
         # A second hold is observed against the recovered generation itself.
         next_hold = scenario("2020-01-11T00:00:00Z", "2020-01-12T00:00:00Z")
         next_hold.issues, next_hold.comments = gh.issues, gh.comments
+        next_hold.comment_times = gh.comment_times
         next_hold.clock = "2020-01-20T00:00:00Z"
         self.assertEqual(self.run_main(next_hold, self.alert_needs())[0], 0)
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
         recovered.issues, recovered.comments = gh.issues, gh.comments
+        recovered.comment_times = gh.comment_times
         self.assertEqual(self.run_main(recovered, {})[0], 0)
         self.assertEqual(gh.issues[1]["state"], "open")
         self.assertEqual(len(gh.comments[1]), 1)
@@ -745,15 +764,135 @@ class MainLifecycleTests(unittest.TestCase):
         gh.comments[1][0] += '\n<!-- production-hold-observation: {"invalid":true} -->'
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
         recovered.issues, recovered.comments = gh.issues, gh.comments
+        recovered.comment_times = gh.comment_times
         self.assertEqual(self.run_main(recovered, {})[0], 0)
         self.assertEqual(gh.issues[1]["state"], "open")
         self.assertEqual(recovered.writes, [])
+
+    def test_large_main_patch_alerts_through_bounded_transport_and_real_git(self):
+        from test_production_hold_pending import Repo
+        import production_hold_pending
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(tmp)
+            base = repo.commit({"src/main.rs": "old"})
+            head = repo.commit({"src/main.rs": "x" * (incident_issue.MAX_RESPONSE_BYTES + 1)})
+            gh = FakeGitHub()
+            install_promotion(gh, revision=base, completed_at="2020-01-01T00:00:00Z")
+            finish(gh, main=head, promoted=base)
+            gh.routes["git/ref/heads/main"] = {"object": {"type": "commit", "sha": head}}
+            gh.routes["commits/main"] = {
+                "sha": head, "files": [{"patch": "x" * incident_issue.MAX_RESPONSE_BYTES}]}
+            seen = []
+
+            def serve(request, timeout):
+                parsed = urllib.parse.urlparse(request.full_url)
+                path = parsed.path + ("?" + parsed.query if parsed.query else "")
+                seen.append(path)
+                data = json.loads(request.data) if request.data else None
+                payload = gh.request(request.method, path, "tok", data)
+                return io.BytesIO(json.dumps(payload).encode())
+
+            def read_pending(promoted, main):
+                return production_hold_pending.pending_since(promoted, main, repo.path)
+
+            env = {"GITHUB_TOKEN": "tok", "GITHUB_REPOSITORY": REPO,
+                   "GITHUB_RUN_ID": "777", "NEEDS_JSON": json.dumps(self.alert_needs())}
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(sys, "argv", ["production_hold_incident.py"]), \
+                    mock.patch.object(incident_issue.urllib.request, "build_opener") as opener, \
+                    mock.patch.object(hold, "pending_since", side_effect=read_pending), \
+                    mock.patch.object(hold, "datetime", wraps=datetime) as clock, \
+                    contextlib.redirect_stdout(out):
+                clock.now.return_value = (datetime.fromtimestamp(repo.times[2], timezone.utc)
+                                          + timedelta(hours=7))
+                opener.return_value.open.side_effect = serve
+                code = hold.main()
+            self.assertEqual(code, 0, out.getvalue())
+            self.assertEqual(json.loads(out.getvalue())["action"], "alert")
+            self.assertEqual(gh.issues[1]["state"], "open")
+            self.assertTrue(any("git/ref/heads/main" in path for path in seen))
+            self.assertFalse(any("commits/" in path or "compare/" in path for path in seen))
+            self.assertEqual(incident_issue.MAX_RESPONSE_BYTES, 1 << 20)
+
+    def test_newer_body_edit_retaining_markers_is_not_stale(self):
+        for edit in (lambda text: text + "\nNew unresolved hold.",
+                     lambda text: text.replace("ci-not-green", "new unresolved failure")):
+            gh = self.held_history()
+            gh.clock = "2020-01-11T00:05:00Z"
+            self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+            gh.issues[1]["body"] = edit(gh.issues[1]["body"])
+            recovered = self.recovered_history("2020-01-11T00:00:00Z")
+            recovered.issues, recovered.comments = gh.issues, gh.comments
+            recovered.comment_times = gh.comment_times
+            self.assertEqual(self.run_main(recovered, {})[0], 0)
+            self.assertEqual(gh.issues[1]["state"], "open")
+            self.assertEqual(recovered.writes, [])
+
+    def test_newer_comment_edit_retaining_observation_is_not_stale(self):
+        gh = self.held_history()
+        gh.clock = "2020-01-11T00:05:00Z"
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        gh.comments[1][0] += "\nNew unresolved hold."
+        recovered = self.recovered_history("2020-01-11T00:00:00Z")
+        recovered.issues, recovered.comments = gh.issues, gh.comments
+        recovered.comment_times = gh.comment_times
+        self.assertEqual(self.run_main(recovered, {})[0], 0)
+        self.assertEqual(gh.issues[1]["state"], "open")
+        self.assertEqual(recovered.writes, [])
+
+    def test_recovery_retries_after_comment_succeeds_but_close_fails(self):
+        gh = self.held_history()
+        self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+        recovered = self.recovered_history("2020-01-11T00:00:00Z")
+        recovered.issues, recovered.comments = gh.issues, gh.comments
+        recovered.comment_times = gh.comment_times
+        recovered.clock = "2020-01-11T00:05:00Z"
+        request = recovered.request
+
+        def fail_close(method, path, token, body=None):
+            if method == "PATCH":
+                raise incident_issue.IncidentError("incident issue PATCH failed (transport)")
+            return request(method, path, token, body)
+
+        with mock.patch.object(recovered, "request", side_effect=fail_close):
+            self.assertEqual(self.run_main(recovered, {})[0], 1)
+        self.assertEqual(gh.issues[1]["state"], "open")
+        self.assertEqual(len(gh.comments[1]), 1)
+        self.assertIn(f"{REPO}/actions/runs/501/attempts/1", gh.comments[1][0])
+        self.assertEqual(self.run_main(recovered, {}, run_id="999")[0], 0)
+        self.assertEqual(gh.issues[1]["state"], "closed")
+
+    def test_edited_or_wrong_generation_recovery_receipt_remains_fenced(self):
+        for field, value in ((None, None), ("promotion_run_id", "999"),
+                             ("promotion_attempt", 2), ("last_promoted_sha", OLDER),
+                             ("last_promoted_at", "2020-01-12T00:00:00Z"),
+                             ("promotion_mode", "rollback")):
+            gh = self.held_history()
+            self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
+            recovered = self.recovered_history("2020-01-11T00:00:00Z")
+            recovered.issues, recovered.comments = gh.issues, gh.comments
+            recovered.comment_times = gh.comment_times
+            report = decide(recovered)
+            if field:
+                report[field] = value
+            receipt = hold.recovery_body(report, REPO)
+            if not field:
+                receipt += "\nUnresolved new activity."
+            gh.comments[1] = [receipt]
+            gh.issues[1]["updated_at"] = "2020-01-11T00:05:00Z"
+            self.assertEqual(self.run_main(recovered, {})[0], 0)
+            self.assertEqual(gh.issues[1]["state"], "open")
+            self.assertEqual(recovered.writes, [])
 
     def test_dry_run_recovery_does_not_close_an_open_issue(self):
         gh = self.held_history()
         self.assertEqual(self.run_main(gh, self.alert_needs())[0], 0)
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
         recovered.issues, recovered.comments = gh.issues, gh.comments
+        recovered.comment_times = gh.comment_times
         code, out = self.run_main(recovered, {}, ["--dry-run"])
         self.assertEqual((code, json.loads(out)["action"]), (0, "recovery"))
         self.assertEqual(gh.issues[1]["state"], "open")
@@ -766,6 +905,7 @@ class MainLifecycleTests(unittest.TestCase):
         gh.comments[1] = ["Unclassified newer incident activity; do not auto-close."]
         recovered = self.recovered_history("2020-01-11T00:00:00Z")
         recovered.issues, recovered.comments = gh.issues, gh.comments
+        recovered.comment_times = gh.comment_times
         self.assertEqual(self.run_main(recovered, self.recovery_needs())[0], 0)
         self.assertEqual(gh.issues[1]["state"], "open")
         self.assertEqual(gh.comments[1], ["Unclassified newer incident activity; do not auto-close."])

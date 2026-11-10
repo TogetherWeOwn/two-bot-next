@@ -283,17 +283,21 @@ issue; the next successful deploy-mode production job comments and closes it.
 A workflow success with a skipped production job is not recovery evidence.
 Both reporters reconcile from verified deployment history, so replacement of a
 queued terminal reporter cannot permanently lose recovery. Alert bodies and
-repeat comments carry the observed serving generation. A delayed alert written
-after a successful deploy can close when its generation predates that deploy;
-a genuinely newer hold or unclassified newer activity remains open. Legacy
-alerts without generation metadata retain the conservative timestamp fence.
+repeat comments carry the observed serving generation and a checksum of their
+exact content. A delayed, unchanged alert written after a successful deploy can
+close when its generation predates that deploy; body/comment edits retaining the
+marker, a genuinely newer hold or unclassified newer activity remain open.
+Recovery comments also bind their content to the verified producing generation,
+so a failed close after a successful comment can retry against that same generation.
+The checksum detects edits, not hostile authorship. Legacy alerts without
+content-bound generation metadata retain the conservative timestamp fence.
 
 The clock starts at the later of the last verified promotion's completed time
 and the first unpromoted runtime-affecting main commit's committer time (main uses
 squash merges). Commits touching only staging's `paths-ignore` paths do not start
 the clock; a failed or missing staging run for runtime changes still does. The
-reporters use full-depth local Git ancestry, commit times and path names, never
-comparison patches. Missing objects, non-linear ancestry and bounded-reader
+reporters resolve main through the metadata-only Git ref API, then use full-depth
+local Git ancestry, commit times and path names, never commit/comparison patches. Missing objects, non-linear ancestry and bounded-reader
 limits fail the report for a later retry rather than inventing a result.
 It alerts only when deployable work is pending and the interval is **strictly
 greater than six hours**; unchanged or ignored-path-only main is not overdue. Promotion history
