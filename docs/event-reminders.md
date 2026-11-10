@@ -28,14 +28,18 @@ per second while an unfenced urgent event remains, even if that event initially
 has no attendees: a first RSVP committed between ordinary ticks can then be
 observed before start. There are at most 15 urgent scans and two candidate
 attempts TOTAL across those scans, not two attempts per scan. The watch ends
-before the next ordinary cadence; slow work can shorten or eliminate it.
+one second before the supervisor's next fixed-phase ordinary slot, including
+when dispatch starts late. The bound covers in-flight scans, admission, delivery
+and the pending-event probe, not only polling sleeps. Slow ordinary work can
+shorten or eliminate the optional watch; it keeps its existing overall timeout.
+Expiry cancels the watch in place without clearing committed reminder fences.
 Nonurgent events wait for the next ordinary tick. The follow-up shares the same
 activation fence, supervisor ownership, cancellation and overall deadline; it
 never reruns ordinary scheduled messages, resets the timeout or admits an event
 at or after its start. There is no unbounded drain: at most four reminder
 attempts run in one supervised invocation. Larger urgent bursts, a first RSVP
-inside the final subsecond polling gap, slow delivery or exhausted deadlines
-remain best effort, not guaranteed delivery. The urgent cutoff is applied in
+inside a polling gap or the final one-second cadence reserve, slow delivery or
+exhausted deadlines remain best effort, not guaranteed delivery. The urgent cutoff is applied in
 the store query before attendee rosters are materialized. The pending-event
 probe reads no rosters and deliberately does not require an RSVP.
 Admission checks the clock after connection and guild-lock waits, and dispatch

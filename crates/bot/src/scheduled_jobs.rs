@@ -42,6 +42,10 @@ const ORPHAN_REASON: &str = "Scheduled message run was not recorded";
 mod tests;
 
 #[cfg(test)]
+#[path = "event_reminder_cadence_tests.rs"]
+mod reminder_cadence_tests;
+
+#[cfg(test)]
 #[path = "scheduled_stale_audit_acceptance_tests.rs"]
 mod acceptance_tests;
 
@@ -193,30 +197,64 @@ async fn tick_with_deadline_follow_up(
 ) -> Result<(), ErrorClass> {
     use two_bot_core::event_reminder_store::has_pending_event_reminders_before;
 
-    let watch_until = tokio::time::Instant::now() + Duration::from_millis(SCHEDULER_TICK_MS);
+    let watch_until = reminder_watch_deadline();
     tick(pool, rest, guild, &clock).await?;
     let latest_start = clock().saturating_add(SCHEDULER_TICK_MS);
-    let mut remaining = 2;
-    for scan in 0..15 {
-        if scan > 0 {
-            let next = tokio::time::Instant::now() + Duration::from_secs(1);
-            if next >= watch_until {
+    let clock = &clock;
+    watch_urgent_reminders(watch_until, |remaining| async move {
+        let inspected =
+            remind_event_attendees(pool, rest, guild, clock, Some(latest_start), remaining).await?;
+        let pending = inspected < remaining
+            && has_pending_event_reminders_before(pool, guild, clock(), latest_start)
+                .await
+                .map_err(reminder_database)?;
+        Ok((inspected, pending))
+    })
+    .await
+}
+
+fn reminder_watch_deadline() -> tokio::time::Instant {
+    let next_tick = jobs::next_cadence_deadline()
+        .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_millis(SCHEDULER_TICK_MS));
+    // Leave one polling interval for cancellation and supervisor bookkeeping.
+    // A timeout at the slot itself would still leave the action active there.
+    next_tick - Duration::from_secs(1)
+}
+
+async fn watch_urgent_reminders<F, Fut>(
+    watch_until: tokio::time::Instant,
+    mut scan: F,
+) -> Result<(), ErrorClass>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<(usize, bool), ErrorClass>>,
+{
+    if tokio::time::Instant::now() >= watch_until {
+        return Ok(());
+    }
+    let watch = async {
+        let mut remaining = 2;
+        for index in 0..15 {
+            if index > 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            // Check explicitly too: timeout_at may poll an expired future first.
+            if tokio::time::Instant::now() >= watch_until {
                 break;
             }
-            tokio::time::sleep_until(next).await;
+            let (inspected, pending) = scan(remaining).await?;
+            remaining -= inspected;
+            if remaining == 0 || !pending {
+                break;
+            }
         }
-        remaining -=
-            remind_event_attendees(pool, rest, guild, &clock, Some(latest_start), remaining)
-                .await?;
-        if remaining == 0
-            || !has_pending_event_reminders_before(pool, guild, clock(), latest_start)
-                .await
-                .map_err(reminder_database)?
-        {
-            break;
-        }
-    }
-    Ok(())
+        Ok(())
+    };
+    // Bound scans, admission, delivery and the pending probe, not just sleeps.
+    // Expiry drops optional work in place; any committed fence stays immutable.
+    tokio::time::timeout_at(watch_until, watch)
+        .await
+        .unwrap_or(Ok(()))
 }
 
 /// Claim and run due scheduled occurrences, stopping the batch on the first
