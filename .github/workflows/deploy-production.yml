@@ -812,10 +812,10 @@ jobs:
           green_at_out = ""
           if auto and mode == "deploy" and not skip:
               # The dedicated non-expiring disable wins over every timed
-              # check: with it set, no automatic run (workflow_run or
-              # schedule) promotes a new build. Manual dispatch never
-              # reaches this branch (auto is false), so rollback and
-              # live-SHA takeover stay available.
+              # check: with it set, an automatic run (workflow_run or
+              # schedule) that otherwise passes the guard promotes no new
+              # build. Manual dispatch never reaches this branch (auto is
+              # false), so rollback and live-SHA takeover stay available.
               if os.environ.get("AUTO_DISABLED", "") == "true":
                   skip = "auto-promote-disabled"
                   held = None

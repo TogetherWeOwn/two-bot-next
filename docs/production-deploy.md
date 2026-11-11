@@ -335,12 +335,19 @@ live revision already contains, and a rolled-back target is newer than live).
 Non-expiring disable: the repository variable
 `PRODUCTION_AUTO_PROMOTE_DISABLED` is the durable replacement for an
 expiry-only hold. Only the exact value `true` disables automatic promotion;
-any other value (including unset/empty) is off. With it set, every
-automatic run — both the `workflow_run` completions (`deploy-staging`,
-`check`) and the daily schedule backstop — skips green before the soak with
-reason `auto-promote-disabled`, and the pre-deploy `recheck` re-reads it
-after the gates/soak so a disable set mid-run still skips instead of
-deploying. The workflow and its triggers stay enabled (no scheduled/
+any other value (including unset/empty) is off. With it set, an automatic
+run that otherwise passes the guard — both the `workflow_run` completions
+(`deploy-staging`, `check`) and the daily schedule backstop — skips green
+before the soak with reason `auto-promote-disabled` (a guard refusal stays
+red and deploys nothing, as before), and the pre-deploy `recheck` re-reads
+it after the gates/soak so a disable set before that checkpoint still
+skips instead of deploying. The `production` job consumes the recheck
+outputs and does not re-read the variable: the residual window between the
+recheck checkpoint and production start is the same one the timed hold
+already has. The live `production` Environment currently has no
+`required_reviewers`, so there is no approval-wait window today; if
+reviewers are ever added, an automatic-only fresh re-read at production
+start must be added before relying on this control. The workflow and its triggers stay enabled (no scheduled/
 backstop entry point is removed, no shared credential is touched), and
 manual dispatches ignore the disable entirely: deploy, rollback and
 live-SHA takeover with `takeover` keep working, and every QA/RM and
