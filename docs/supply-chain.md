@@ -291,16 +291,17 @@ gh run download <run-id> -n supply-chain -D <run-owned-scratch-directory>
 gh workflow run release.yml --ref main -f release_tag=vX.Y.Z
 ```
 
-Repair works only for a tag built at or after `9d064fa38` (#2004) whose
-Dockerfile builds the binary with cargo-auditable metadata (that is, a tag
-built from the commit that landed #1990 or later). `verify` runs
+Repair works only for a tag whose source ancestry includes `9d064fa38` and
+whose own Dockerfile builds the binary with `cargo auditable build` — that
+is, both `git merge-base --is-ancestor 9d064fa38 <tag>` passes and
+`git show <tag>:Dockerfile` contains `cargo auditable build`. `verify` runs
 `--check-runtime` on every ref, so an older tag fails the zlib-free
 composition check at the inventory step by design, with no per-tag waiver.
-Repair rebuilds the tag with its own Dockerfile, so a tag built at or after
-`9d064fa38` but before cargo-auditable builds landed rebuilds without the
-metadata and fails native inventory validation by design, with no per-tag
-waiver. Such tags stay without SBOM assets; `v0.2.0` stays without SBOM
-assets; see `docs/releases.md`.
+Repair rebuilds the tag with its own Dockerfile, so a tag whose ancestry
+includes `9d064fa38` but whose Dockerfile has no `cargo auditable build`
+rebuilds without the metadata and fails native inventory validation by design,
+with no per-tag waiver. Such tags stay without SBOM assets; `v0.2.0` stays
+without SBOM assets; see `docs/releases.md`.
 
 On a selected PR, the dry-run inventories the exact PR head SHA and records
 source SHA and image ID before scanning; `verify` then validates lockfile
