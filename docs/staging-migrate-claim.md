@@ -144,6 +144,14 @@ GitHub reads establish all of the following:
   Its projection must be recomputed losslessly and equal embedded == claimed.
 - The independently installed staging-only rule approves this exact verified
   binding under the automated staging policy. No human GO receipt is fabricated.
+  The callback that records the decision is run-scoped and cannot be made
+  attempt-atomic; the consumer therefore revalidates run/attempt/head as the
+  last read before the callback and fails closed on any change observed up
+  to it. A rerun landing after that final read but before the callback POST
+  takes effect outside the consumer's control, bounded to the single final
+  request; the runner's pre-DDL hash/provenance recheck does not recheck the
+  claim attempt and does not close that remainder. See the
+  [consumer rule](staging-migrate-protection.md).
   Exact source reachability on reviewed `main`, both current/prior bindings,
   configured staging pins and every check above are mandatory. An adverse
   Security review prevents installing/enabling the rule; it is not approval.

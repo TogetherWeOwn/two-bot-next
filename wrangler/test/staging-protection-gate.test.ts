@@ -448,7 +448,7 @@ test("alarm expiry clears the fence but a stale delivery cannot approve again", 
   assert.equal(h.storage.map.size, 0, "expired run cannot recreate an approval fence");
   assert.equal(h.gh.tokens, 2, "stale workflow evidence is checked after a fresh call-time token");
   assert.equal(h.gh.revoked.length, 2, "both tokens are revoked, including the stale-run refusal");
-  assert.equal(h.gh.counts.run, 4, "refusal reaches the current-run freshness check");
+  assert.equal(h.gh.counts.run, 5, "refusal reaches the current-run freshness check");
 });
 
 test("ambiguous callback transport failure is never repeated, only fenced and revoked", async t => {
@@ -559,6 +559,39 @@ test("rerun attempt change between verification and the final read: no callback,
   assert.equal(stored(h, 2), "evaluating");
   assert.equal(h.gh.decisions.length, 1);
   assert.equal((await deliver(h.reconstructed())).text, "duplicate");
+});
+
+test("rerun attempt change at the post-verification pending check: no callback on the old attempt", async t => {
+  const h = harness(t);
+  // Post-final-read interleaving: attempt 3's gate lands at pending call #2,
+  // after verification. Pending alone cannot bind the attempt, so the
+  // reordered final run read must observe the new attempt and refuse.
+  h.gh.before = (key, n) => { if (key === "pending" && n === 2) h.gh.attempt = 3; };
+  assert.deepEqual(await deliver(h.gate()), { status: 503, text: "unavailable" });
+  assert.deepEqual(h.gh.decisions, []);
+  assert.equal(stored(h, 2), "evaluating");
+  assert.equal(stored(h, 3), undefined);
+  assert.equal(h.gh.revoked.length, 1);
+  h.gh.before = () => {};
+  // The attempt-3 delivery has its own fence and verifies independently.
+  assert.equal((await deliver(h.reconstructed())).text, "approved");
+  assert.equal(stored(h, 3), "approved");
+  assert.equal(h.gh.decisions.length, 1);
+});
+
+test("rerun attempt change at the last pre-callback re-read: no callback", async t => {
+  const h = harness(t);
+  // Reads of the current run: 1 gate, 2 verifyBinding, 3 final, 4 last
+  // pre-callback. Attempt 3 lands just before the final re-read.
+  h.gh.before = (key, n) => { if (key === "run" && n === 4) h.gh.attempt = 3; };
+  assert.deepEqual(await deliver(h.gate()), { status: 503, text: "unavailable" });
+  assert.deepEqual(h.gh.decisions, []);
+  assert.equal(stored(h, 2), "approving", "write-ahead fence persists; no callback was sent");
+  assert.equal(h.gh.revoked.length, 1);
+  h.gh.before = () => {};
+  assert.equal((await deliver(h.reconstructed())).text, "approved");
+  assert.equal(stored(h, 3), "approved");
+  assert.equal(h.gh.decisions.length, 1);
 });
 
 test("a rerun that finished attempt 2 does not let attempt 3 inherit its approval", async t => {

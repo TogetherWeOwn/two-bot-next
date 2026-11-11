@@ -53,8 +53,18 @@ Fresh GitHub reads must establish:
    exponent syntax; those tokens remain floating-point values and cannot satisfy
    any integer evidence field. Source ancestry uses `main...source` with zero
    ahead commits and the source as merge base, avoiding forward diff payloads.
-6. Immediately before the callback, the current run/attempt/head and pending
-   gate are re-read. Any change invalidates the decision.
+6. Immediately before the callback, the pending gate is re-read and the current
+   run/attempt/head is re-read and re-validated after it, with a second
+   run/attempt/head re-read immediately before the callback POST. Any
+   attempt/head change observed at either re-read, or a pending-gate change,
+   invalidates the decision and leaves the gate pending. GitHub's review
+   endpoint is run-scoped with no attempt selector, so the callback itself
+   cannot be made attempt-atomic: a rerun whose new gate lands after the
+   final pre-callback read but before the POST takes effect outside the
+   worker's control. The worker fails closed on every change observed up to
+   that read, bounding the residual window to the single final request; the
+   runner's pre-DDL hash/provenance recheck (which does not recheck the
+   claim attempt) is the compensating control for that remainder.
 
 Missing, ambiguous, stale, malformed or failed reads reject; an inability to
 make a safe callback leaves the gate pending, never approved. No API error body,

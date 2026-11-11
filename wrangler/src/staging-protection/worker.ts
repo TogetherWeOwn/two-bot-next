@@ -120,10 +120,24 @@ export class StagingProtectionGate extends DurableObject<ProtectionEnv> {
       } catch { /* Every missing, stale, mismatched or failed read rejects. */ }
       // Re-read immediately before either decision. A rerun/gate transition invalidates it.
       api.startDecision();
-      const latest = await api.run(identity.runId, config, Date.now(), false);
-      requireEvidence(id(latest.run_attempt) === attempt && latest.head_sha === identity.sha);
+      // Pending alone cannot bind an attempt: it sees only the environment
+      // name, and the run-scoped callback cannot select an attempt. Read the
+      // pending gate first so the run/attempt/head read below follows it and a
+      // rerun landing during the pending check is observed before any fence.
       await api.pending(identity.runId);
+      let latest = await api.run(identity.runId, config, Date.now(), false);
+      requireEvidence(id(latest.run_attempt) === attempt && latest.head_sha === identity.sha);
       await this.ctx.storage.put(key, { state: approved ? "approving" : "rejecting", at: now });
+      // Re-read and re-validate attempt/head immediately before the callback.
+      // GitHub's review endpoint is run-scoped with no attempt selector, so
+      // the callback cannot be made attempt-atomic: a rerun whose new gate
+      // lands after this read but before the POST takes effect outside this
+      // worker's control. Failing closed on every change observed up to this
+      // read bounds that residual window to the single final request; the
+      // runner's pre-DDL hash/provenance recheck is the compensating control
+      // for it. See docs/staging-migrate-protection.md.
+      latest = await api.run(identity.runId, config, Date.now(), false);
+      requireEvidence(id(latest.run_attempt) === attempt && latest.head_sha === identity.sha);
       await api.decide(identity.runId, approved);
       outcome = approved ? "approved" : "rejected";
       await this.ctx.storage.put(key, { state: outcome, at: now });
