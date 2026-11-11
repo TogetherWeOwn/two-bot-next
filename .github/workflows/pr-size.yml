@@ -64,8 +64,8 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''
     permissions:
       contents: read
-      issues: write
-      pull-requests: write
+      issues: write # Shared size labeller adds labels and maintains its advisory comment.
+      pull-requests: write # Shared size labeller reads the PR diff and writes its advisory comment.
     uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964
     with:
       pr-number: ${{ inputs.pr_number || '' }}
@@ -83,8 +83,8 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''
     permissions:
       contents: read
-      issues: write
-      pull-requests: write
+      issues: write # Required gate ensures the size-exception label (fails closed without it).
+      pull-requests: write # Required gate posts the split comment before failing an over-gate PR.
     uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964
     with:
       pr-number: ${{ inputs.pr_number || '' }}
@@ -97,6 +97,6 @@ jobs:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')
     permissions:
       contents: read
-      issues: read
-      pull-requests: read
+      issues: read # Shared weekly tally reads size labels from merged PRs.
+      pull-requests: read # Shared weekly tally enumerates merged PRs.
     uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964
