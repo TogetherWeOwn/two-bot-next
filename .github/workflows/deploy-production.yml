@@ -1474,7 +1474,7 @@ jobs:
     concurrency:
       group: production-hold-incident
       cancel-in-progress: false
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'promotion-hold-watch') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -1491,6 +1491,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           NEEDS_JSON: '{}'
+          # Same non-expiring disable the guard/recheck re-read: exactly
+          # "true" classifies the hold explicitly instead of a generic
+          # pending reason. Any other value (including unset) is off.
+          AUTO_DISABLED: ${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}
         run: python3 scripts/production_hold_incident.py
 
   # Reporting only: a green skipped workflow is not a production promotion.
@@ -1502,7 +1506,7 @@ jobs:
     concurrency:
       group: production-hold-incident
       cancel-in-progress: false
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'promotion-hold-incident') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read # current main and first unpromoted main commit
@@ -1519,6 +1523,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           NEEDS_JSON: ${{ toJSON(needs) }}
+          # Same non-expiring disable the guard/recheck re-read: exactly
+          # "true" wins over any timed hold when classifying the report.
+          AUTO_DISABLED: ${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}
         run: python3 scripts/production_hold_incident.py
 
   production:

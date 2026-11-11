@@ -225,10 +225,10 @@ def history(gh):
     return hold.History(env)
 
 
-def decide(gh, needs=None, now=NOW):
+def decide(gh, needs=None, now=NOW, disabled=False):
     with mock.patch.object(incident_issue, "_request", gh.request), \
             mock.patch.object(hold, "pending_since", gh.pending_since):
-        return hold.decide(history(gh), needs or {}, now, RUN_URL)
+        return hold.decide(history(gh), needs or {}, now, RUN_URL, disabled=disabled)
 
 
 def scenario(promoted_at, pending_at, **extra):
@@ -355,6 +355,42 @@ class ReasonTests(unittest.TestCase):
         report = decide(gh, needs)
         self.assertEqual((report["action"], report["reason"]), ("alert", "ci-not-green"))
         self.assertIn("Skip/failure reason: ci-not-green", hold.body(report))
+
+    def test_auto_disabled_setting_is_exact_true_only(self):
+        # Mirrors the guard/recheck rule: only exactly "true" holds.
+        self.assertTrue(hold.auto_disabled("true"))
+        for raw in ("", "false", "TRUE", "1", "yes", None):
+            with self.subTest(raw=raw):
+                self.assertFalse(hold.auto_disabled(raw))
+
+    def test_auto_promote_disabled_skip_reason_is_reported(self):
+        for job in ("guard", "recheck"):
+            with self.subTest(job=job):
+                needs = {job: {"result": "success",
+                               "outputs": {"skip": hold.AUTO_PROMOTE_DISABLED}}}
+                self.assertEqual(hold.reason(needs), hold.AUTO_PROMOTE_DISABLED)
+
+    def test_auto_promote_disabled_wins_over_a_timed_hold(self):
+        # A disable re-read while the timed hold is still in the future
+        # classifies as the non-expiring disable, as in guard/recheck.
+        needs = {"guard": {"result": "success",
+                           "outputs": {"skip": "held until 2999-01-01T00:00:00+00:00"}}}
+        self.assertEqual(hold.reason(needs, disabled=True), hold.AUTO_PROMOTE_DISABLED)
+        self.assertEqual(hold.reason({}), "no successful production promotion")
+        self.assertEqual(hold.reason({}, disabled=True), hold.AUTO_PROMOTE_DISABLED)
+
+    def test_auto_promote_disabled_alert_names_the_non_expiring_class(self):
+        gh = scenario("2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z")
+        needs = {"guard": {"result": "success", "outputs": {"skip": "auto-promote-disabled"}}}
+        report = decide(gh, needs, disabled=True)
+        self.assertEqual((report["action"], report["reason"]),
+                         ("alert", hold.AUTO_PROMOTE_DISABLED))
+        text = hold.body(report)
+        self.assertIn("Skip/failure reason: auto-promote-disabled", text)
+        self.assertIn("intentional non-expiring auto-promote disable", text)
+        self.assertNotIn("Hold class", hold.body(
+            decide(scenario("2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z"),
+                   {"guard": {"outputs": {"skip": "ci-not-green"}}})))
 
 
 class RecoveryTests(unittest.TestCase):
@@ -664,9 +700,10 @@ class EvidenceBoundTests(unittest.TestCase):
 class MainLifecycleTests(unittest.TestCase):
     """main() against the in-memory GitHub with the real shared issue sink."""
 
-    def run_main(self, gh, needs, args=(), run_id="777"):
+    def run_main(self, gh, needs, args=(), run_id="777", extra=None):
         env = {"GITHUB_TOKEN": "tok", "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": run_id,
                "NEEDS_JSON": json.dumps(needs)}
+        env.update(extra or {})
         out = io.StringIO()
         with mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(sys, "argv", ["production_hold_incident.py", *args]), \
@@ -1447,6 +1484,25 @@ class PendingReasonTests(unittest.TestCase):
         self.assertEqual(len(gh.issues), 1)
         self.assertEqual(len(gh.comments[1]), 1)
 
+    def test_watch_with_auto_promote_disabled_keeps_the_explicit_reason(self):
+        # No active-runs route: a pending lookup would raise, so the
+        # disabled watch must classify from AUTO_DISABLED alone.
+        gh = scenario("2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
+        runner = MainLifecycleTests()
+        code, out = runner.run_main(gh, {}, extra={"AUTO_DISABLED": "true"})
+        self.assertEqual(code, 0)
+        report = json.loads(out)
+        self.assertEqual((report["action"], report["reason"]),
+                         ("alert", hold.AUTO_PROMOTE_DISABLED))
+        self.assertIn("intentional non-expiring auto-promote disable", gh.issues[1]["body"])
+        # Any other value is off: the generic pending fallback applies.
+        gh2 = scenario("2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
+        install_active(gh2, [{"id": 888, "run_attempt": 1}],
+                       {888: [job(name="schema-gate", conclusion="failure")]})
+        code, out = runner.run_main(gh2, {}, extra={"AUTO_DISABLED": "TRUE"})
+        self.assertEqual(code, 0)
+        self.assertIn("not green", json.loads(out)["reason"])
+
     def test_pending_lookup_runs_only_for_an_empty_needs_alert(self):
         runner = MainLifecycleTests()
         gh = scenario("2020-01-01T00:00:00Z", "2020-01-02T00:00:00Z")
@@ -1526,6 +1582,23 @@ class WorkflowContractTests(unittest.TestCase):
             text = self.extract(name)
             self.assertIn("fetch-depth: 0", text)
             self.assertIn("persist-credentials: false", text)
+
+    def test_reporters_use_explicit_public_hosted_runners(self):
+        # scripts/test-runner-routing.py bans dormant self-hosted/overflow
+        # routing in every workflow; the reporters must not reintroduce it.
+        for name in ("promotion-hold-watch", "promotion-hold-incident"):
+            text = self.extract(name)
+            self.assertRegex(text, r"(?m)^    runs-on: ubuntu-latest$")
+            for legacy in ("self-hosted", "two-selfhosted", "CI_OVERFLOW_"):
+                self.assertNotIn(legacy, text)
+
+    def test_reporters_reread_the_non_expiring_disable(self):
+        # Both lanes pass the same variable the guard/recheck read, so the
+        # scheduled watch classifies a disabled hold explicitly too.
+        for name in ("promotion-hold-watch", "promotion-hold-incident"):
+            text = self.extract(name)
+            self.assertIn(
+                "AUTO_DISABLED: ${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}", text)
 
     def test_helper_constants_match_the_workflow(self):
         text = WORKFLOW_FILE.read_text()

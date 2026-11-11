@@ -31,6 +31,12 @@ class Promotion:
 
 KEY = "production-held"
 TITLE = "production held > 6h"
+# The guard/recheck skip reason for the non-expiring automatic-promotion
+# disable (PRODUCTION_AUTO_PROMOTE_DISABLED, exactly "true"). It is an
+# intentional hold with no expiry to outlast: only an operator re-enable or
+# a manual promotion ends it. The reporter still treats it as held
+# production, but classifies it explicitly instead of a generic reason.
+AUTO_PROMOTE_DISABLED = "auto-promote-disabled"
 WORKFLOW = ".github/workflows/deploy-production.yml"
 PRODUCTION_JOB = "wrangler deploy + readyz gate"
 MAX_PAGES = 10
@@ -167,7 +173,23 @@ class History:
         raise incident_issue.IncidentError("no verified production promotion in bounded history")
 
 
-def reason(needs):
+def auto_disabled(raw):
+    """Whether the raw disable setting holds, mirroring guard/recheck.
+
+    Only the exact value "true" holds; any other value (including unset,
+    empty, "TRUE" or "1") is off. Manual dispatches ignore the disable in
+    the guard, and this reporter is automatic-only: a manual deploy-mode
+    promotion still recovers the incident through the usual generation
+    checks.
+    """
+    return raw == "true"
+
+
+def reason(needs, disabled=False):
+    # The non-expiring disable wins over every timed check, exactly as the
+    # guard and pre-deploy recheck skip with it before parsing the hold.
+    if disabled:
+        return AUTO_PROMOTE_DISABLED
     for job in ("guard", "staging-soak-evidence", "soak", "recheck"):
         skip = needs.get(job, {}).get("outputs", {}).get("skip")
         if skip:
@@ -181,7 +203,7 @@ def reason(needs):
     return ", ".join(failed) + " not green" if failed else "no successful production promotion"
 
 
-def decide(history, needs, now, run_url):
+def decide(history, needs, now, run_url, disabled=False):
     ref = history.get("git/ref/heads/main")
     obj = ref.get("object") if isinstance(ref, dict) else None
     if not isinstance(obj, dict) or obj.get("type") != "commit":
@@ -196,7 +218,7 @@ def decide(history, needs, now, run_url):
               "last_promoted_at": stamp(promotion.completed_at), "run_url": run_url,
               "promotion_run_id": promotion.run_id, "promotion_attempt": promotion.attempt,
               "promotion_mode": promotion.mode, "observed_at": stamp(now),
-              "reason": reason(needs)}
+              "reason": reason(needs, disabled=disabled)}
     if pending_at is not None:
         held_since = max(promotion.completed_at, pending_at)
         report["held_since"] = stamp(held_since)
@@ -323,12 +345,18 @@ def stale_activity(history, issue, report):
 
 
 def body(report):
-    return (f"- Held since: {report.get('held_since', 'recovered')}\n"
+    text = (f"- Held since: {report.get('held_since', 'recovered')}\n"
             f"- Last promoted SHA: `{report['last_promoted_sha']}`\n"
             f"- Last promotion completed: {report['last_promoted_at']}\n"
             f"- Current main SHA: `{report['main_sha']}`\n"
-            f"- Skip/failure reason: {report['reason']}\n"
-            f"- Promotion run: {report['run_url']}\n")
+            f"- Skip/failure reason: {report['reason']}\n")
+    if report["reason"] == AUTO_PROMOTE_DISABLED:
+        # Intentional and non-expiring: name the class so nobody waits for
+        # a timed hold to lapse. Only an operator re-enable or a manual
+        # promotion ends it, mirroring the guard/recheck semantics.
+        text += ("- Hold class: intentional non-expiring auto-promote disable; "
+                 "an operator re-enable or manual promotion ends it\n")
+    return text + f"- Promotion run: {report['run_url']}\n"
 
 
 def main():
@@ -345,8 +373,12 @@ def main():
             raise ValueError()
         history = History(env)
         run_url = f"https://github.com/{history.repo}/actions/runs/{run_id}"
-        report = decide(history, needs, datetime.now(timezone.utc), run_url)
-        if not needs and report["action"] == "alert":
+        disabled = auto_disabled(env.get("AUTO_DISABLED", ""))
+        report = decide(history, needs, datetime.now(timezone.utc), run_url, disabled=disabled)
+        # The scheduled watch has no needs of its own: without the disable
+        # it falls back to the active-run lookup, but the explicit
+        # non-expiring class must not be clobbered by that generic reason.
+        if not needs and report["action"] == "alert" and not disabled:
             report["reason"], pending_url = history.pending_reason(run_id)
             if pending_url:
                 report["run_url"] = pending_url
