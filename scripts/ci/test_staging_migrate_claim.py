@@ -61,6 +61,28 @@ class ClaimTests(unittest.TestCase):
         self.assertEqual(expected["store_plan_manifest_sha256"], ENV["STORE_PLAN_MANIFEST_SHA256"])
         self.assertNotEqual(expected["workflow_head_sha"], expected["source_sha"])
 
+    def test_apply_attempt_rejects_older_claim_before_migration(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as directory:
+            marker = Path(directory) / "migration-ran"
+            verifier = ROOT / "scripts/ci/staging_migrate_claim.py"
+            command = ['bash', '-ec', 'python3 "$1" --manifest "$2" --verify "$3"; touch "$4"',
+                       'test', str(verifier), str(PLAN), str(CLAIM), str(marker)]
+            stale = subprocess.run(command, env={**os.environ, **ENV, "GITHUB_RUN_ATTEMPT": "3"},
+                                   capture_output=True, text=True)
+            self.assertEqual(stale.returncode, 2, stale.stderr)
+            self.assertFalse(marker.exists())
+            current = subprocess.run(command, env={**os.environ, **ENV}, capture_output=True, text=True)
+            self.assertEqual(current.returncode, 0, current.stderr)
+            self.assertTrue(marker.exists())
+            altered = json.loads(CLAIM.read_text())
+            altered["target"]["database"] = "different"
+            changed_claim = Path(directory) / "changed-claim.json"
+            changed_claim.write_text(json.dumps(altered))
+            changed = subprocess.run(["python3", str(verifier), "--manifest", str(PLAN),
+                                      "--verify", str(changed_claim)],
+                                     env={**os.environ, **ENV}, capture_output=True, text=True)
+            self.assertEqual(changed.returncode, 2, changed.stderr)
+
     def test_digest_is_exact_rust_projection_not_document_or_zip_bytes(self):
         digest = projection_hash(self.plan)
         self.assertEqual(digest, ENV["PLAN_MANIFEST_SHA256"])
@@ -299,6 +321,11 @@ class ClaimWorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["claim"]["steps"][3].update({"if": "always()"}),
             lambda w: w["jobs"]["claim"]["steps"][3]["with"].update({"compression-level": "6"}),
             lambda w: w["jobs"]["plan"]["steps"][-1]["with"].pop("compression-level"),
+            lambda w: w["jobs"]["apply"]["steps"][0]["with"].update(ref="${{ inputs.source_sha }}"),
+            lambda w: w["jobs"]["apply"]["steps"][2]["with"].update({"run-id": "123"}),
+            lambda w: w["jobs"]["apply"]["steps"][3].update({"if": "always()"}),
+            lambda w: w["jobs"]["apply"]["steps"][3].update({"continue-on-error": True}),
+            lambda w: w["jobs"]["apply"]["steps"][3]["env"].update(PLAN_RUN_ID="0"),
         ]
         for index, change in enumerate(changes):
             with self.subTest(change=index):

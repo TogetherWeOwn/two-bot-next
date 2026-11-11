@@ -72,7 +72,7 @@ class RequiredChecksReportTests(unittest.TestCase):
         agg = self.workflows["check.yml"]["jobs"]["ci-ok"]
         self.assertEqual(agg["name"], "ci-ok")
         self.assertIn("always()", agg["if"])
-        for job in ("job-inputs", "container-inputs", "supply-chain", "check", "rust-tests",
+        for job in ("job-inputs", "container-inputs", "supply-chain", "check", "staging-migrate-python", "rust-tests",
                     "coverage-plan", "coverage-shard", "patch-coverage",
                     "ignored-db-stores", "ignored-db-runtime", "worker",
                     "parity-docs", "self-role-store", "community-db",
@@ -84,7 +84,7 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertIn("ci-ok", agg["runs-on"])
         body = "\n".join(step.get("run", "") for step in agg["steps"])
         for marker in ("JOB_INPUTS_RESULT", "CONTAINER_INPUTS_RESULT", "SUPPLY_CHAIN_RESULT",
-                       "CHECK_RESULT", "WORKER_RESULT", "PARITY_DOCS_RESULT",
+                       "CHECK_RESULT", "STAGING_MIGRATE_PYTHON_RESULT", "WORKER_RESULT", "PARITY_DOCS_RESULT",
                        "SELF_ROLE_RESULT", "COMMUNITY_DB_RESULT",
                        "FEEDS_DB_RESULT", "TICKETS_RESULT",
                        "MODERATION_DB_RESULT", "RUST_TESTS_RESULT",
@@ -93,6 +93,14 @@ class RequiredChecksReportTests(unittest.TestCase):
                        "IGNORED_DB_STORES_RESULT", "IGNORED_DB_RUNTIME_RESULT",
                        "FUZZ_COMPILE_RESULT", "NEXTEST_RESULT"):
             self.assertIn(marker, body, marker)
+
+    def test_staging_migrate_python_uses_apply_container(self):
+        check = self.workflows["check.yml"]["jobs"]["staging-migrate-python"]
+        apply = self.workflows["staging-migrate.yml"]["jobs"]["apply"]
+        self.assertEqual(check["container"]["image"], apply["container"]["image"])
+        self.assertEqual(check["steps"][0]["run"], "python3 --version")
+        self.assertNotIn("if", check)
+        self.assertNotIn("continue-on-error", check["steps"][0])
 
     def test_legacy_duplicate_aggregate_is_removed(self):
         self.assertNotIn("required-checks", self.workflows["check.yml"]["jobs"])

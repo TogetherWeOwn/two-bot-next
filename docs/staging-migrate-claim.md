@@ -149,9 +149,11 @@ GitHub reads establish all of the following:
   last read before the callback and fails closed on any change observed up
   to it. A rerun landing after that final read but before the callback POST
   takes effect outside the consumer's control, bounded to the single final
-  request; the runner's pre-DDL hash/provenance recheck does not recheck the
-  claim attempt and does not close that remainder. See the
-  [consumer rule](staging-migrate-protection.md).
+  request. After the gate opens, workflow-head tooling recomputes the claim
+  from the current dispatch's plan and inputs and refuses unless the downloaded
+  claim matches this job's run and attempt before exposing the migration
+  credential. An apply-only rerun with only an older claim therefore refuses.
+  See the [consumer rule](staging-migrate-protection.md).
   Exact source reachability on reviewed `main`, both current/prior bindings,
   configured staging pins and every check above are mandatory. An adverse
   Security review prevents installing/enabling the rule; it is not approval.

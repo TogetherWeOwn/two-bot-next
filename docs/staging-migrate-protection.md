@@ -62,9 +62,10 @@ Fresh GitHub reads must establish:
    cannot be made attempt-atomic: a rerun whose new gate lands after the
    final pre-callback read but before the POST takes effect outside the
    worker's control. The worker fails closed on every change observed up to
-   that read, bounding the residual window to the single final request; the
-   runner's pre-DDL hash/provenance recheck does not recheck the claim
-   attempt and does not close that remainder.
+   that read, bounding the residual window to the single final request. Before
+   accessing the migration credential, the apply job separately recomputes the
+   claim with workflow-head tooling and refuses an attempt or material mismatch.
+   This is a runner-side enforcement control, not an attempt-atomic callback.
 
 Missing, ambiguous, stale, malformed or failed reads reject; an inability to
 make a safe callback leaves the gate pending, never approved. No API error body,
