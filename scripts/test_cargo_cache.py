@@ -275,6 +275,20 @@ class CacheTests(unittest.TestCase):
                               cache.preservation_veto(target))
                 stray.unlink()
                 self.assertIsNone(cache.preservation_veto(target))
+                # The licence exception is target-only: the same path under
+                # scratch (whose temp names are arbitrary) must still veto.
+                scratch = self.root / f'{layout}-scratch'
+                s_output = scratch
+                if layout == 'worktree':
+                    s_output = scratch / cache.workspace_subdir_name(self.root)
+                s_static = s_output / 'doc' / 'static.files'
+                s_static.mkdir(parents=True)
+                self.assertIsNone(cache.scratch_preservation_veto(scratch))
+                (s_static / 'SourceSerif4-LICENSE-a2cfd9d5.md').write_text('licence')
+                self.assertIn('preserved',
+                              cache.scratch_preservation_veto(scratch))
+                (s_static / 'SourceSerif4-LICENSE-a2cfd9d5.md').unlink()
+                self.assertIsNone(cache.scratch_preservation_veto(scratch))
 
     def test_evict_refuses_worktree_subdir_with_protected_content(self):
         # Eviction runs the preservation veto first: another worktree's

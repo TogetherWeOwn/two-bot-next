@@ -668,14 +668,19 @@ CARGO_TARGET_TOP_LEVEL = frozenset(
 # File kinds that must never be treated as regenerable build output.
 PROTECTED_SUFFIXES = frozenset(
     {'.rs', '.md', '.markdown', '.toml', '.bak', '.orig', '.rej', '.pem', '.key'})
-# rustdoc copies its bundled font licences into doc/static.files/ as
-# *-LICENSE-*.md. That directory is rustdoc output, so those licence
-# files are build output; every other protected-suffix file vetoes.
+# rustdoc copies its bundled font licences into target's doc/static.files/
+# as *-LICENSE-*.md. That directory is rustdoc output, so those licence
+# files are build output in target scans; every other protected-suffix
+# file vetoes. The exception never applies to scratch scans, whose temp
+# names are arbitrary and never hold rustdoc output.
 RUSTDOC_STATIC_FILES = ('doc', 'static.files')
 
 
 def _is_rustdoc_static_license(base, target, name, suffix):
-    """True for rustdoc's generated font licences under doc/static.files/."""
+    """True for rustdoc-generated font licences under target doc/static.files/.
+
+    Target-only helper: callers in scratch scans must not use it.
+    """
     if suffix != '.md' or '-license-' not in name.lower():
         return False
     try:
@@ -794,8 +799,8 @@ def _veto_scan_names(base, target, dirs, files, check_top_level, first):
         if suffix in PROTECTED_SUFFIXES:
             if suffix == '.rs' and under_codegen_out:
                 continue  # build-script codegen output, not stashed source
-            if _is_rustdoc_static_license(base, target, name, suffix):
-                continue  # rustdoc font licence, not stashed docs
+            # No rustdoc licence exception here: rustdoc writes to target,
+            # never scratch, whose temp names are arbitrary.
             return f'preserved file in target: {name}'
     return None
 
