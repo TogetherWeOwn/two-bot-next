@@ -121,9 +121,12 @@ JOB_INVENTORY = {
     # Shared nextest lane, called by check.yml; org-level home is
     # TogetherWeOwn/.github with a pinned SHA like test-guard.
     "reusable-rust-nextest.yml": {"nextest"},
-    # Advisory PR-size labels (org reusable, advisory only, never required):
-    # thin caller to the central labeller + weekly tally.
-    "pr-size.yml": {"pr-size", "pr-size-weekly"},
+    # PR-size labels + required size gate (org reusable): thin caller to
+    # the central labeller, the required gate and the weekly tally. The
+    # advisory `pr-size` job is never required; `pr-size-gate` fails PRs
+    # too large for the automated reviewer and is added to the ruleset
+    # only after it reports on the default branch.
+    "pr-size.yml": {"pr-size", "pr-size-gate", "pr-size-weekly"},
     # Weekly DORA delivery metrics (docs/dora-metrics.md): the read-only
     # compute job reads 30 days of production Deployments; the main-only
     # publish job commits one JSON file plus a markdown summary to
@@ -147,10 +150,12 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    # caller to the shared nextest lane (local path until
                    # the central move).
                    ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
-                   # Advisory PR-size labels: thin caller to the central
-                   # reusable, pinned SHA (repin both refs together).
-                   ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2",
-                   ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2"}
+                   # PR-size labels + required size gate: thin caller to
+                   # the central reusables, pinned SHA (repin all three
+                   # refs together).
+                   ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
+                   ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
+                   ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964"}
 # Every ordinary job in this public repository selects standard free hosted
 # Ubuntu directly. A private conversion needs fresh runner/cost qualification.
 PUBLIC_RUNNER = "ubuntu-latest"
@@ -10425,7 +10430,14 @@ class WorkflowTests(unittest.TestCase):
 
     def test_minimal_grants_and_no_persisted_checkout_credentials(self):
         for name, workflow in self.workflows.items():
-            self.assertEqual(workflow["permissions"], {})
+            if name == "pr-size.yml":
+                # The org caller template ships an explicit top-level
+                # `contents: read` (its header instructs a byte-exact
+                # copy); every job below still overrides with its own
+                # least-privilege grant, pinned under this test.
+                self.assertEqual(workflow["permissions"], {"contents": "read"})
+            else:
+                self.assertEqual(workflow["permissions"], {})
             for job_id, job in workflow["jobs"].items():
                 with self.subTest(workflow=name, job=job_id):
                     expected = {"contents": "read"}
@@ -10493,9 +10505,12 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("release.yml", "attach-sbom"):
                         # TOG-10893: uploads verified SBOMs to the published tag.
                         expected = {"contents": "write"}
-                    elif (name, job_id) == ("pr-size.yml", "pr-size"):
-                        # Advisory labeller: writes the size/* label and keeps
-                        # the one advisory comment on the caller's PR.
+                    elif (name, job_id) in (("pr-size.yml", "pr-size"),
+                                            ("pr-size.yml", "pr-size-gate")):
+                        # Labeller writes the size/* label and keeps the
+                        # one advisory comment; the required gate posts
+                        # the split comment and ensures the exception
+                        # label. Both measure the caller's PR the same way.
                         expected = {"contents": "read", "issues": "write",
                                     "pull-requests": "write"}
                     elif (name, job_id) == ("pr-size.yml", "pr-size-weekly"):

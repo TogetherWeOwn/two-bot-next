@@ -29,7 +29,7 @@ use two_bot_core::{
     SlashOutcome,
 };
 
-use crate::brand::brand_embed;
+use crate::brand::{brand_embed, EmbedKind};
 
 /// A routed interaction: what the core router decided, with the wire
 /// identity the executor needs to answer.
@@ -144,21 +144,24 @@ pub fn help_response(defs: &[CommandDefinition]) -> InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
             allowed_mentions: Some(Default::default()),
-            embeds: Some(vec![brand_embed(Embed {
-                author: None,
-                color: None,
-                description: Some(text),
-                fields: Vec::new(),
-                footer: None,
-                image: None,
-                kind: "rich".to_owned(),
-                provider: None,
-                thumbnail: None,
-                timestamp: None,
-                title: None,
-                url: None,
-                video: None,
-            })]),
+            embeds: Some(vec![brand_embed(
+                EmbedKind::Default,
+                Embed {
+                    author: None,
+                    color: None,
+                    description: Some(text),
+                    fields: Vec::new(),
+                    footer: None,
+                    image: None,
+                    kind: "rich".to_owned(),
+                    provider: None,
+                    thumbnail: None,
+                    timestamp: None,
+                    title: None,
+                    url: None,
+                    video: None,
+                },
+            )]),
             flags: Some(MessageFlags::EPHEMERAL),
             ..Default::default()
         }),
@@ -190,21 +193,24 @@ pub fn help_detail_response(detail: String) -> InteractionResponse {
         kind: InteractionResponseType::ChannelMessageWithSource,
         data: Some(InteractionResponseData {
             allowed_mentions: Some(Default::default()),
-            embeds: Some(vec![brand_embed(Embed {
-                author: None,
-                color: None,
-                description: Some(description),
-                fields: Vec::new(),
-                footer: None,
-                image: None,
-                kind: "rich".to_owned(),
-                provider: None,
-                thumbnail: None,
-                timestamp: None,
-                title: None,
-                url: None,
-                video: None,
-            })]),
+            embeds: Some(vec![brand_embed(
+                EmbedKind::Default,
+                Embed {
+                    author: None,
+                    color: None,
+                    description: Some(description),
+                    fields: Vec::new(),
+                    footer: None,
+                    image: None,
+                    kind: "rich".to_owned(),
+                    provider: None,
+                    thumbnail: None,
+                    timestamp: None,
+                    title: None,
+                    url: None,
+                    video: None,
+                },
+            )]),
             flags: Some(MessageFlags::EPHEMERAL),
             ..Default::default()
         }),
@@ -1309,7 +1315,7 @@ mod help_response_tests {
             let embed = &wire["data"]["embeds"][0];
             assert_eq!(
                 embed["color"].as_u64(),
-                Some(crate::brand::BRAND_EMBED_COLOR as u64),
+                Some(crate::brand::EmbedKind::Default.color() as u64),
                 "help embed carries the brand color"
             );
             assert_eq!(embed["footer"]["text"], crate::brand::BRAND_FOOTER_TEXT);
@@ -1394,7 +1400,7 @@ mod help_response_tests {
             assert_eq!(wire["data"]["embeds"][0]["description"], detail);
             assert_eq!(
                 wire["data"]["embeds"][0]["color"].as_u64(),
-                Some(crate::brand::BRAND_EMBED_COLOR as u64),
+                Some(crate::brand::EmbedKind::Default.color() as u64),
                 "detail embed carries the brand color"
             );
             assert_eq!(

@@ -197,6 +197,8 @@ def up(fresh=False):
         docker("run", "-d", "--name", DB, "--network", NETWORK, "--network-alias", "agent-testdb",
                "-e", "POSTGRES_USER=agent_test", "-e", "POSTGRES_DB=agent_test",
                "-e", "POSTGRES_HOST_AUTH_METHOD=trust",
+               "-e", "POSTGRES_INITDB_ARGS=-c logging_collector=on -c log_destination=jsonlog "
+               "-c log_rotation_age=0 -c log_rotation_size=0",
                "--tmpfs", f"/var/lib/postgresql:rw,size={tmpfs}",
                "--memory", str(memory), "--memory-swap", str(memory), postgres, capture=True)
     if not running(RUNNER):

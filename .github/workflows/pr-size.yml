@@ -1,17 +1,33 @@
-# Advisory pull-request size labels (TogetherWeOwn standard; see
-# CI-STANDARD.md in TogetherWeOwn/.github, "Advisory PR-size labels").
+# Pull-request size labels + required size gate (TogetherWeOwn standard;
+# see STANDARD.md in TogetherWeOwn/.github, "Advisory PR-size labels" and
+# "PR size gate").
 #
 # Thin caller: all logic lives once in the org `.github` repository
-# (`.github/workflows/pr-size.yml`, `.github/workflows/pr-size-weekly.yml`
-# and `.github/scripts/pr_size.py`) and runs from that repository at the
-# pinned ref - this repo keeps no copy of the script, so a pull request
-# cannot run its own modified labeller or silence its label by deleting
-# the script. Repin both `uses:` refs together to the current
-# TogetherWeOwn/.github `main` SHA to pick up central fixes.
+# (`.github/workflows/pr-size.yml`, `.github/workflows/pr-size-weekly.yml`,
+# `.github/workflows/pr-size-gate.yml` and `.github/scripts/pr_size.py`) and
+# runs from that repository at the pinned ref - this repo keeps no copy of
+# the script. To adopt: copy this file to `.github/workflows/pr-size.yml`,
+# repin all three `uses:` refs to the current TogetherWeOwn/.github `main`
+# SHA, and set `exclude-extra` to this repo's generated paths.
 #
-# ADVISORY ONLY: never make `pr-size` a required check and never add it to
+# ADVISORY PART: never make `pr-size` a required check and never add it to
 # a ruleset's required-workflows list. The labeller exits 0 on any API
 # failure, and fork pull requests (read-only token) warn and skip.
+#
+# REQUIRED PART: `pr-size-gate` is the deliberate exception to that
+# invariant - it FAILS pull requests too large for the automated reviewer
+# and MUST be added to this repo's ruleset required-workflows list. Ship it
+# in two steps (STANDARD.md: never require a check before its workflow
+# exists on the default branch): first merge this caller and confirm the
+# gate reports on the default branch, then add the check to the required
+# list. The gate fails closed on measurement; fork pull requests within
+# the gate pass (their warning comment is best-effort), while over-gate
+# forks ERR (they cannot post the split comment or ensure the exception
+# label) - that is intentional. The gate job also runs when the
+# `size-exception` label is applied or removed or a review is submitted
+# or dismissed, so granting an exception re-evaluates the check without
+# a manual re-run - and revoking it re-runs and fails the gate, instead
+# of leaving a stale passing check on the pull request.
 #
 # The weekly tally's schedule lives here, in the caller, because the tally
 # is per-repository. It calls a SEPARATE reusable file so this job can stay
@@ -23,19 +39,20 @@ name: pr-size
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
   schedule:
     - cron: '17 7 * * 1'
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "Optional PR number to label now (blank runs the weekly tally)"
+        description: "Optional PR number to label and gate now (blank runs the weekly tally)"
         required: false
         type: string
 
-# Repo policy (scripts/ci/test_workflows.py): top-level permissions stay
-# empty; the least-privilege grant lives on the job instead.
-permissions: {}
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.event_name }}
@@ -44,18 +61,35 @@ concurrency:
 jobs:
   pr-size:
     name: pr-size
-    if: github.event_name == 'pull_request' || inputs.pr_number != ''
+    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''
     permissions:
       contents: read
       issues: write # Shared size labeller adds labels and maintains its advisory comment.
       pull-requests: write # Shared size labeller reads the PR diff and writes its advisory comment.
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964
     with:
       pr-number: ${{ inputs.pr_number || '' }}
-      # This repo's generated inventory (regenerated from the migration
-      # files by scripts/check-migrations.py), excluded on top of the
-      # script's built-in lockfile/generated/fixture list. The hand-written
-      # migration SQL under crates/*/migrations/ stays counted.
+      # This repo's generated paths, excluded on top of the script's
+      # built-in lockfile/generated/fixture list: the generated
+      # migration inventory (regenerated from the migration files; the
+      # hand-written migration SQL stays counted).
+      exclude-extra: "migrations.lock"
+
+  # REQUIRED: fails pull requests too large for the automated reviewer.
+  # Add this check to the ruleset's required-workflows list after it has
+  # reported on this repo's default branch (two-step ship, STANDARD.md).
+  pr-size-gate:
+    name: pr-size-gate
+    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''
+    permissions:
+      contents: read
+      issues: write # Required gate ensures the size-exception label (fails closed without it).
+      pull-requests: write # Required gate posts the split comment before failing an over-gate PR.
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964
+    with:
+      pr-number: ${{ inputs.pr_number || '' }}
+      # Same generated path as the labeller, so the gate measures the
+      # same diff the labels report.
       exclude-extra: "migrations.lock"
 
   pr-size-weekly:
@@ -65,4 +99,4 @@ jobs:
       contents: read
       issues: read # Shared weekly tally reads size labels from merged PRs.
       pull-requests: read # Shared weekly tally enumerates merged PRs.
-    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2
+    uses: TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964

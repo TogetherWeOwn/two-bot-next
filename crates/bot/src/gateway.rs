@@ -2954,6 +2954,68 @@ mod tests {
             assert_eq!(failures.load(Ordering::Acquire), 0);
             assert_eq!(state.read().await.status(), ComponentStatus::Ready);
         }
+
+        #[tokio::test]
+        async fn checkpoint_io_pending_reports_starting_then_restores_ready_on_success() {
+            let state = RwLock::new(GatewayState::Connected);
+            let generation = AtomicU64::new(0);
+            let failures = AtomicU64::new(0);
+            let (entered, entering) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let operation =
+                checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
+                    entered.send(()).unwrap();
+                    released.await.unwrap();
+                    Ok(())
+                });
+            let observe = async {
+                entering.await.unwrap();
+                // Pending IO: readiness is withdrawn and reports Starting.
+                assert_eq!(*state.read().await, GatewayState::Armed);
+                assert_eq!(state.read().await.status(), ComponentStatus::Starting);
+                release.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+                tokio::join!(operation, observe)
+            })
+            .await
+            .expect("bounded pending checkpoint coordination");
+            result.expect("healthy IO completes");
+            assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(failures.load(Ordering::Acquire), 0);
+            assert_eq!(*state.read().await, GatewayState::Connected);
+            assert_eq!(state.read().await.status(), ComponentStatus::Ready);
+        }
+
+        #[tokio::test]
+        async fn checkpoint_io_pending_failure_never_restores_ready() {
+            let state = RwLock::new(GatewayState::Connected);
+            let generation = AtomicU64::new(0);
+            let failures = AtomicU64::new(0);
+            let (entered, entering) = tokio::sync::oneshot::channel();
+            let (fail, failed) = tokio::sync::oneshot::channel();
+            let operation =
+                checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
+                    entered.send(()).unwrap();
+                    failed.await.unwrap();
+                    Err::<(), _>(sqlx::Error::InvalidArgument("test failure".into()))
+                });
+            let observe = async {
+                entering.await.unwrap();
+                assert_eq!(state.read().await.status(), ComponentStatus::Starting);
+                fail.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+                tokio::join!(operation, observe)
+            })
+            .await
+            .expect("bounded pending checkpoint failure coordination");
+            assert!(result.is_err());
+            assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(failures.load(Ordering::Acquire), 1);
+            assert_eq!(*state.read().await, GatewayState::Armed);
+            assert_eq!(state.read().await.status(), ComponentStatus::Starting);
+        }
     }
 
     #[tokio::test]
