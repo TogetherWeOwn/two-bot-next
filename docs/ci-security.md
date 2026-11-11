@@ -413,11 +413,14 @@ branch protection. The existing advisory ownership policy is unchanged.
 
 ## Static audit exceptions
 
-The `release-please@17.6.0` commit-parser fixture install (commit-parse guard)
-has one inline `adhoc-packages` suppression. The direct package is pinned; lifecycle scripts are disabled and its check job has
-no write grant. Transitive dependencies remain unlocked. A future fixture
-lockfile can remove this exception; it is not an exception for deployment
-package installation.
+Both commit-parser consumers stage the reviewed manifest and lockfile from
+`scripts/fixtures/commit-parser/` into their own `RUNNER_TEMP` directories and run
+`npm ci --ignore-scripts --no-audit --no-fund`. The exact `release-please` version
+remains 17.6.0; transitive registry tarballs carry integrity hashes. The fixture
+has no lifecycle scripts or application dependencies, and the PR-lint sparse
+checkout includes both fixture files. The existing fixture-only `adhoc-packages`
+suppressions and read-only job grants are unchanged. This installation is not a
+dependency audit or an exception for deployment package installation.
 
 `deploy-production.yml` carries two inline suppressions for its automatic
 promotion trigger. `dangerous-triggers` on the `workflow_run` notifier: the
