@@ -27,6 +27,91 @@ class SoakChecklistTests(unittest.TestCase):
         self.assertEqual(set(counts), set(range(1, 9)) | {12, 13})
         self.assertEqual((ROOT / "docs/soak-checklist.md").read_text(), render(self.checklist))
 
+    def test_timing_contract_survives_regeneration(self):
+        instructions = "\n".join(self.checklist["instructions"])
+        rendered = render(self.checklist)
+        for requirement in (
+            "B2 remains **NOT VERIFIED**, **T unset**, and B4 **NO-GO**",
+            "120 distinct mature minute-spaced temporal samples",
+            "Sample every minute from entry through completion",
+            "No grant means no start",
+            "40min automatic holder does not authorize B2",
+            "Gap, expiry or incomplete evidence at the boundary means INSUFFICIENT/FAIL",
+            "fresh continuous 30min baseline-to-final coverage",
+            "at least 10 judged requests",
+            ">max(1.5×production ratio,5%) with at least 3 staging 5xx",
+            "production below 10 requests retains the 5% fallback",
+            "Startup≤5min, original non-renewing grant≤40min and job≤50min",
+            "B4 48h is the maximum initial watch",
+            "At T0+48h incomplete stays INCOMPLETE",
+            "≥49/50 audible joins, no4017, both rekeys and actual sustained playback",
+            "2h is a maximum investigation, never endurance proof",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, instructions)
+                self.assertIn(requirement, rendered)
+        self.assertIn("[Evidence-bounded timing exits](#evidence-bounded-timing-exits)", rendered)
+
+    def test_promotion_policy_discloses_warning_only_enforcement(self):
+        instructions = "\n".join(self.checklist["instructions"])
+        for requirement in (
+            "at least 10 judged requests",
+            "same exact build/process incarnation",
+            "not a claim of current gate enforcement",
+            "`insufficient_data` for fewer than 10 judged requests",
+            "changed process incarnation with a clean post-restart window",
+            "overall `pass`, warns and exits zero",
+            "workflow consumes that exit",
+            "separate error-rate gate also treats insufficient data as warning-only",
+            "unsupported enforcement/qualification gap remains held",
+            "workflow green alone is not the required proof",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, instructions)
+                self.assertIn(requirement, render(self.checklist))
+
+    def test_b4_early_close_and_timeout_contract_survives_regeneration(self):
+        instructions = "\n".join(self.checklist["instructions"])
+        for requirement in (
+            "Record actual close UTC and complete receipt links",
+            "only checkpoints due while open require observations",
+            "later checkpoints/comparisons are N/A with the close UTC and reason",
+            "never fabricated evidence",
+            "At T0+48h incomplete stays INCOMPLETE",
+            "cutover lead, Release Manager and data lead decide hold/incident/rollback",
+            "Any continuation needs its own bounded decision, never automatic extension",
+            "prescribed actual timer/workload coverage, independent B2",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, instructions)
+                self.assertIn(requirement, render(self.checklist))
+
+    def test_timer_rows_require_receipts_not_idle_holds(self):
+        entries = {entry["id"]: entry for entry in self.checklist["entries"]}
+        for entry_id, retained_cadences in (
+            ("s1-04", ("60s expiry", "30s sweep")),
+            ("s4-10", ("60s expiry", "30s unban sweeps")),
+            ("s2-05", ("5min recovery", "60min purge")),
+            ("s4-11", ("5min recovery", "60min purge")),
+            ("s4-12", ("15s poll",)),
+        ):
+            with self.subTest(entry=entry_id):
+                action = entries[entry_id]["action"]
+                for cadence in retained_cadences:
+                    self.assertIn(cadence, action)
+                self.assertIn("receipts", action)
+                self.assertIn("attempt maximum", action)
+                self.assertNotIn("wait at least", action)
+        self.assertIn("unexpired item retained", entries["s4-10"]["expected"])
+        self.assertIn("only policy-expired", entries["s4-11"]["expected"])
+
+    def test_b2_planned_outages_keep_default_classification(self):
+        staging = " ".join((ROOT / "docs/staging-soak.md").read_text().split())
+        self.assertNotIn("Classification remains unresolved", staging)
+        acceptance = staging.split("## Acceptance", 1)[1]
+        self.assertIn("Interrupting planned redeploys count as actual outages by default", acceptance)
+        self.assertIn("measurement/source gap remains unresolved", acceptance)
+
     def test_unnumbered_section_ends_parity_table_scope(self):
         heading = "## 2. Non-command interactions"
         changed = self.parity.replace(heading,
