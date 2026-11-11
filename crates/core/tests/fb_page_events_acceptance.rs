@@ -76,6 +76,7 @@ fn discord_event(id: &str, status: i64) -> ScheduledEvent {
         id: Some(id.to_owned()),
         name: Some("Sunday Squad".to_owned()),
         scheduled_start_time: Some(START.to_owned()),
+        scheduled_end_time: None,
         channel_id: Some("voice-1".to_owned()),
         description: Some("Join the weekly games night.".to_owned()),
         status: Some(status),

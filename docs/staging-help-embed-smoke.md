@@ -26,7 +26,7 @@ post and read-back unchanged.
    [the slash smoke doc](staging-slash-smoke.md#why-it-is-not-a-github-workflow).
 3. For each post, it reads `GET /channels/{channel_id}/messages/{message_id}`
    and asserts on that read-back—never the POST response—that:
-   - `embeds[0].color == 16715346` (`0xFF0E52`);
+   - `embeds[0].color == 16751670` (`0xFF9C36`, kit ember default);
    - `embeds[0].footer.text == "Together We Own"`;
    - `embeds[0].footer.icon_url == BRAND_ICON_URL`.
 4. It deletes both messages, pass or fail, and writes evidence containing
@@ -42,12 +42,59 @@ detail, matching the Rust builder tests. Short `/help` and short
 carry an embed footer; this smoke exercises the embed path of both builders,
 rather than simulating staging's current registry size.
 
+## Token source and updates
+
+`crates/discord/src/brand.rs` maps `EmbedKind` onto generated Rust constants
+from `TogetherWeOwn/two-design-kit` `v0.2.0`. The kit's
+`dist/rust/brand_tokens.rs` is vendored byte-exact at
+`crates/discord/src/brand_tokens.rs`; `BRAND_KIT_TAG` records the release.
+The upstream generated header stays unchanged, with the tag recorded in the
+enclosing module's documentation instead. `/help` uses `EmbedKind::Default`,
+the kit ember action colour. Live, echo, ok, warn, danger and neutral kinds
+share the same helper. Icon 1 and the `Together We Own` footer are unchanged;
+`brand_footer_for` provides the kit's suffixed form for future surfaces.
+
+The Rust drift test and `scripts/vendor_brand_tokens.py --check` recompute
+the pinned digest offline. Python fixtures prove a hand-edited colour fails
+without rewriting files or accessing the network. `--check-upstream` compares
+the pinned upstream bytes without writing. The smoke payload gets its expected
+colour from the same helper, and its Python fixtures check the generated
+default constant, so renderer and smoke cannot drift silently.
+
+To update (bump tag → re-vendor → drift green):
+
+```sh
+python3 scripts/vendor_brand_tokens.py --tag v0.3.0
+python3 scripts/vendor_brand_tokens.py --check
+python3 scripts/vendor_brand_tokens.py --check-upstream
+cargo test -p two-bot-discord --lib brand
+cargo test -p two-bot-discord --lib help_embed_smoke
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_vendor_brand_tokens.py'
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_staging_help_embed_smoke.py'
+```
+
+On the controller, use the [bounded Cargo wrapper](build-cache.md) for both
+compiling commands. Update the tag in module documentation and this guide,
+and update the smoke fixture colour only when the kit default moves. Record
+the test results in the PR. Never hand-edit `brand_tokens.rs`.
+
 ## CI gate and provisioning
 
 `.github/workflows/help-embed-synthetic.yml` runs only from `main`, by manual
 dispatch or as the `help-embed-synthetic` job called by `deploy-staging` after
 the deploy. Failed assertions fail that staging run and prevent
 `certify-promotion` from certifying it.
+
+Before consumption, a separate main-only `staging-window` job in the existing
+`staging` environment checks the [finite-use grant and exact readiness](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
+The smoke job needs that job and keeps only its test-bot credential. A called run
+uses the deploy's exact SHA/deployment/expiry under a disjoint nested group and
+never acquires or releases the parent's grant. A standalone run owns the canonical
+workflow lock, acquires at most 45 minutes, and releases after smoke success or
+failure. Start/assert and cleanup receipts are retained for 14 days. Re-run all
+jobs, not only failed jobs; the latter changes the attempt and fails binding.
+This source wiring is not activation: the linked inventory, rollback and
+live-acceptance holds still apply.
 
 No new credential is created or copied for this smoke. Only an operator or
 staging guild admin may place the bindings; agents must never receive, copy

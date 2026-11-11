@@ -205,8 +205,8 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(inputs.classify(path), {WORKER}, path)
 
     def test_rust_docs_select_rust_only(self):
-        # Content reads only; existence-only docs (staging-soak/
-        # preflight) fall through to the worker-only docs rule.
+        # Content reads only; existence-only preflight falls through to
+        # the worker-only docs rule. The soak regression reads staging-soak.
         # docs/backup.md reads content in the voice owner-grant journal
         # regression, so it selects rust despite the preconditions
         # existence check. docs/tickets.md is embedded by the ticket
@@ -215,6 +215,7 @@ class SelectionTests(unittest.TestCase):
                      "docs/commands.md", "docs/configuration.md",
                      "docs/voice-rooms.md",
                      "docs/soak-checklist.json", "docs/soak-checklist.md",
+                     "docs/staging-soak.md",
                      "docs/privacy.md", "docs/database-roles.md",
                      "docs/rollback-delta.md", "docs/backup.md",
                      "docs/tickets.md"]
@@ -428,9 +429,9 @@ class ReaderCoverageTests(unittest.TestCase):
     # content read and must select the rust job. docs/backup.md left this
     # set: the voice owner-grant journal regression reads its content, so a
     # content edit must select rust (the preconditions is_file check still
-    # holds alongside the content read).
+    # holds alongside the content read). staging-soak also left this set:
+    # the soak checklist planned-outage regression reads its content.
     EXISTENCE_ONLY_DOCS = frozenset({
-        "docs/staging-soak.md",
         "docs/preflight.md",
         "docs/runbook.md",
     })

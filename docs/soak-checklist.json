@@ -18,13 +18,20 @@
     "",
     "## Safety and execution contract",
     "",
-    "- Follow [staging-soak.md](staging-soak.md) for lifecycle and rollback mechanics: B2 acceptance is four ACTIVE hours with zero missed events across joins, voice, messages and slash; actual outage-start-to-verified-recovery must be under 60s. Hours 3–4 require 120 expected one-minute samples. Deploy-finish-to-first-ready is a separate workflow interval, not outage recovery. B4 separately requires its 48h watch log; neither substitutes for the other. [gateway-recovery.md](gateway-recovery.md) is the current session-persistence reference. Verify the deployed SHA, staging guild allowlist, permitted disposable accounts/channels and enabled slice before any Discord action. A missing slice, unapproved destructive scenario or missing fixture is NEEDS WORK, not a silent waiver.",
-    "- B2 cannot be accepted on the current documentation: the policy does not define an operational ACTIVE hour, the source/shape for the 120 expected one-minute samples in hours 3–4, or a sample cadence for hours 1–2. The existing evidence seam is offline, not wired into the running bot, and omits slash; no verified live route establishes the required four-family evidence or samples. Keep the 120-sample requirement mandatory, leave B2 NOT VERIFIED and T unset, and do not infer a collector or measurement method.",
+    "- Follow [staging-soak.md](staging-soak.md) for lifecycle and rollback mechanics: B2 acceptance is four ACTIVE hours with zero missed events across joins, voice, messages and slash; actual outage-start-to-verified-recovery must be under 60s. Hours 3–4 require 120 expected one-minute samples. Deploy-finish-to-first-ready is a separate workflow interval, not outage recovery. B4 separately retains its evidence-complete watch log with a 48h maximum initial watch; neither substitutes for the other. Interrupting planned redeploys count as actual outages by default; historical 92–139s warnings are not waivers. Destructive/reconnect/redeploy/429 exercises still need separate stop/restore and budget authority; none is granted here. [gateway-recovery.md](gateway-recovery.md) is the current session-persistence reference. Verify the deployed SHA, staging guild allowlist, permitted disposable accounts/channels and enabled slice before any Discord action. A missing slice, unapproved destructive scenario or missing fixture is NEEDS WORK, not a silent waiver.",
+    "- B2 remains **NOT VERIFIED**, **T unset**, and B4 **NO-GO**. Four ACTIVE hours is the conservative retained envelope pending a justified replacement, never clock acceptance. ACTIVE requires the exact qualified build/process/environment and actual representative expected-versus-processed joins, voice, messages and slash, affirmative all-family coverage and zero loss; empty, idle or health-only denominators cannot pass. Sample every minute from entry through completion; hours 3–4 still require 120 distinct mature minute-spaced temporal samples, never rapid-poll substitution. Each sample identifies build/process/environment, UTC bounds, expected/processed/no activity per family, readiness/gaps/outages, RSS/errors/reset semantics and reviewed provenance. The offline seam omits slash and is not a verified live producer. Numeric memory/RSS growth/headroom/error-spike criteria, an approved all-family live sample producer/fixture executor and a startup/cleanup-inclusive long-use B2 grant remain unsupported. Engineering Lead owns technical disposition; Chief of Staff owns continuation, not live qualification execution. No grant means no start; the 40min automatic holder does not authorize B2. Predeclare T+4h as the stop for an incomplete current attempt only within that separate grant. Gap, expiry or incomplete evidence at the boundary means INSUFFICIENT/FAIL: safely release or expire, retain the hold and route the exact missing proof.",
     "- **No tests, SQL, probes, migrations, imports, backup or restore against staging/production databases.** Only agent-testdb/agent-testredis or ephemeral CI service containers may be used for data assertions. No alternate credential after an auth failure: stop, record the exact error and owner; never log credentials. Discord fixture actions require the separate soak authorization and must never target real members/live guilds.",
     "- Negative/destructive/retry/clock/SSRF scenarios use local mock fixtures. Do not change the host clock, manufacture raids, delete real roles/channels, change live enforcement, or call live internal-action mutation endpoints. Restore approved disposable configuration through its normal UI/API after evidence; no database reset.",
     "- Voice is owned by [TOG-10119](/TOG/issues/TOG-10119): consume its exact-SHA receipt, do not duplicate voice join/leave/restart steps here. Mixed rows still require their non-voice assertions.",
     "- A `waived` entry is a **proposed waiver of staging execution**, not removal of parity or authority to approve it. B4 records the reason and accepting actor plus the owning slice’s isolated fixture evidence; until then the row is unresolved/NEEDS WORK. Backup/config/import evidence belongs to [TOG-9881](/TOG/issues/TOG-9881)/[TOG-9882](/TOG/issues/TOG-9882). No new spend, buckets, secret handling or host jobs is authorized here.",
     "- Evidence table columns: checklist ID; deployed/reviewed SHA; actual command/action and fixture IDs; UTC window; expected vs actual; redacted screenshot/log/CI receipt URL; PASS/NEEDS WORK or accepted waiver with reason/actor; cleanup/rollback result. Attach it to B4 before its verdict. A CI unit result alone does not prove a staging Discord effect.",
+    "",
+    "## Evidence-bounded timing exits",
+    "",
+    "- Automatic promotion retains fresh continuous 30min baseline-to-final coverage on the same exact build/process incarnation, at least 10 judged requests, final pinned user-flow/readiness/original-grant/release proof. Idle, queue and old-green age count zero. Breach remains >max(1.5×production ratio,5%) with at least 3 staging 5xx; production below 10 requests retains the 5% fallback. Insufficient count, reset/restart, no bearer, changed build or unknown release is not rate PASS. These are required qualification conditions, not a claim of current gate enforcement: `scripts/promotion_regression_gate.py` reports `insufficient_data` for fewer than 10 judged requests or changed process incarnation with a clean post-restart window, but with healthy journeys returns overall `pass`, warns and exits zero; the workflow consumes that exit. The separate error-rate gate also treats insufficient data as warning-only. This unsupported enforcement/qualification gap remains held: workflow green alone is not the required proof and does not authorize promotion without it. See [production-deploy.md](production-deploy.md) for the operative policy/enforcement distinction; no runtime or pipeline repair is made here. Startup≤5min, original non-renewing grant≤40min and job≤50min are maxima, not extra runtime authorization. No shorter equivalence is supported.",
+    "- Every applicable timer row needs actual due-action plus negative/idempotency receipts: 15s automation/settings, 30s audit/unbans, 60s counters, 5min feeds/ticket recovery, 10min rank/events and hourly presence/inactivity/ticket purge. Stop as soon as its complete receipts and prescribed workload/temporal coverage exist, not after extra idle sleep. Before execution the authorized owning slice records UTC bounds and a finite attempt maximum within its grant; missing receipts at that maximum mean INSUFFICIENT/FAIL and safe cleanup/hold, never automatic acceptance or renewal. Weekly Monday06:15, 24h bot-floor, daily backup and monthly restore retain their existing prescribed reviewed fixture-clock/backup method; do not wait a week/month where approved fixtures apply, or replace required live evidence with fixtures. No executor, clock change or live action is authorized here.",
+    "- B4 48h is the maximum initial watch, not mandatory idle calendar or automatic acceptance. Earliest completion requires all approved checklist/feature/voice/production receipts, prescribed actual timer/workload coverage, independent B2, no unexplained loss/resource/recovery gaps, singleton/data/job writer fences, migration/watermark/permission/rollback proof and a warm reverse-reconciliation manifest. Record actual close UTC and complete receipt links in [watch-run-record.md](watch-run-record.md); only checkpoints due while open require observations, and later checkpoints/comparisons are N/A with the close UTC and reason, never fabricated evidence. At T0+48h incomplete stays INCOMPLETE: cutover lead, Release Manager and data lead decide hold/incident/rollback. Any continuation needs its own bounded decision, never automatic extension. Neither completion nor timeout retires Coolify/recovery points or disables normal monitoring. See [cutover.md](cutover.md).",
+    "- Voice retains ≥49/50 audible joins, no4017, both rekeys and actual sustained playback; 2h is a maximum investigation, never endurance proof. Consume the dedicated voice receipt, not duplicate live exercises. Unban exits on negative/due/idempotent receipts, not extra sleep; keep real 60s expiry/30s sweep and retention. Ticket 5min recovery/60min purge are maintenance cadences, not arbitrary holds; preserve retention and require actual due-action and negative/idempotency receipts. Missing evidence at the authorized attempt maximum stays NEEDS WORK with safe cleanup and the owning slice's disposition.",
     "",
     "## Maintaining coverage",
     "",
@@ -105,7 +112,7 @@
         ]
       },
       "status": "manual",
-      "action": "Invoke /tempban target:<disposable-member> duration_seconds:60 reason:soak; wait for the 30s unban sweep after expiry.",
+      "action": "Invoke /tempban target:<disposable-member> duration_seconds:60 reason:soak under separate fixture authorization. Retain the real 60s expiry and 30s sweep: record no early unban, the actual due unban and a subsequent idempotent sweep. Exit once all three receipts exist; apply the evidence-bounded attempt maximum above, not extra sleep.",
       "expected": "Target is banned once and unbanned after expiry; no duplicate action on retry.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
@@ -489,7 +496,7 @@
         ]
       },
       "status": "manual",
-      "action": "Invoke /feed-remove id:<fixture-relay-id>; wait one configured poll interval.",
+      "action": "Invoke /feed-remove id:<fixture-relay-id> under separate authorization; observe the next actual configured poll with due fixture content and confirm no removed-source delivery or duplicate effect. Exit on the removal and negative/idempotency receipts within the predeclared attempt maximum above; an idle interval alone is insufficient.",
       "expected": "Relay disappears and no new posts are delivered for the removed source.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
@@ -575,7 +582,7 @@
         ]
       },
       "status": "manual",
-      "action": "Open, claim and close a disposable ticket; restart with an open ticket, then wait 5m recovery and 60m purge.",
+      "action": "Open, claim and close a disposable ticket; consume a separately authorized restart receipt with an open ticket. Observe actual due 5min recovery and 60min purge runs, retained unexpired transcripts, eligible-only purge and idempotent repeats. These are maintenance cadences, not fixed holds or shortened retention; exit on complete receipts within the predeclared attempt maximum above.",
       "expected": "Single lifecycle/channel ownership survives restart; transcript retained/purged per policy; no leaked content outside fixture channel.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
@@ -1040,7 +1047,7 @@
         ]
       },
       "status": "manual",
-      "action": "After command-04 observe successive 30s unban sweeps across expiry.",
+      "action": "After s1-04, collect negative-before-expiry, actual due-action and idempotent-repeat receipts from successive real 30s unban sweeps. Preserve the 60s expiry; stop on complete receipts, not blind extra sleep, and use the predeclared attempt maximum above.",
       "expected": "Only expired tempban is unbanned once; unexpired item retained.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
@@ -1054,7 +1061,7 @@
         ]
       },
       "status": "manual",
-      "action": "Restart with open/closed disposable tickets, observe recovery at 5m and purge at 60m.",
+      "action": "Consume the separately authorized restart receipt with open/closed disposable tickets; observe actual due 5min recovery and 60min purge, no premature transcript deletion and idempotent repeats. Retain policy expiry/retention; exit on complete receipts within the predeclared attempt maximum above, not arbitrary 5min/60min holds.",
       "expected": "Recovery is idempotent, only policy-expired fixture transcripts purged.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },
@@ -1068,7 +1075,7 @@
         ]
       },
       "status": "manual",
-      "action": "Change one permitted hot guild setting via dashboard, then wait at least 15s.",
+      "action": "Change one permitted hot guild setting via dashboard under separate authorization; observe its actual 15s poll applying the revision and a subsequent unchanged-revision no-op. Exit on both receipts within the predeclared attempt maximum above; cadence is not an additional minimum hold.",
       "expected": "Version advances and runtime uses new setting without restart; unchanged version not reloaded.",
       "evidence": "Record exact deployed head SHA, UTC start/end, fixture guild/channel/actor IDs (no tokens), sanitized request/result or screenshot and correlated log IDs; attach per-row PASS/NEEDS WORK and cleanup receipt to the B4 evidence table."
     },

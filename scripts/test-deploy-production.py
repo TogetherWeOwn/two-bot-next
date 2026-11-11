@@ -374,18 +374,23 @@ class StaticGuardTests(unittest.TestCase):
         conc = children(JOBS["production"][1:], 4).get("concurrency", [])
         self.assertIn("group: deploy-production", "\n".join(conc))
         self.assertIn("cancel-in-progress: false", "\n".join(conc))
-        for job in ("guard", "schema-gate", "roles-gate", "soak", "staging-soak-evidence", "recheck"):
+        for job in ("guard", "schema-gate", "roles-gate", "staging-soak-evidence", "recheck"):
             self.assertNotIn("concurrency", children(JOBS[job][1:], 4))
+        # The soak is the one job that holds the canonical staging lifecycle
+        # lock (never the production lane), queueing rather than cancelling.
+        soak_conc = "\n".join(children(JOBS["soak"][1:], 4)["concurrency"])
+        self.assertIn("group: staging-lifecycle", soak_conc)
+        self.assertIn("cancel-in-progress: false", soak_conc)
+        self.assertNotIn("deploy-production", soak_conc)
 
-    def test_every_job_uses_the_shared_runner_routing(self):
-        # scripts/test-runner-routing.py pins the full expression (TOG-12339).
+    def test_every_job_uses_explicit_public_hosted_runner(self):
+        # scripts/test-runner-routing.py also rejects dormant/indirect routes.
         self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "soak",
                                       "staging-soak-evidence", "recheck",
                                       "promotion-skipped", "production"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
-            self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
-            self.assertIn(f"vars.CI_OVERFLOW_JOBS || '[]'), '{name}')", runs_on)
+            self.assertEqual(runs_on, "ubuntu-latest", name)
 
     def test_permissions_are_least_privilege(self):
         self.assertEqual(value(TOP["permissions"]), "{}")
@@ -434,7 +439,9 @@ class StaticGuardTests(unittest.TestCase):
         self.assertIn("        id: guard", first)
         self.assertIn("        shell: python3 {0}", first)
         self.assertIn("          GH_TOKEN: ${{ github.token }}", first)
-        for check in ("[0-9a-f]{40}", "compare/{sha}...main", "check-runs", "deploy-staging.yml/runs"):
+        self.assertIn("          AUTO_DISABLED: ${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}", first)
+        for check in ("[0-9a-f]{40}", "compare/{sha}...main", "check-runs", "deploy-staging.yml/runs",
+                      'skip = "auto-promote-disabled"', 'os.environ.get("AUTO_DISABLED", "") == "true"'):
             self.assertIn(check, GUARD)
 
     def test_production_deploys_only_validated_guard_outputs(self):
@@ -669,41 +676,101 @@ class StaticGuardTests(unittest.TestCase):
         production_if = value(children(JOBS["production"][1:], 4)["if"])
         self.assertIn("needs.guard.outputs.skip == ''", production_if)
 
-    def test_soak_runs_outside_the_production_lane_and_recomputes_the_remainder(self):
-        # The soak sleeps in its own job with no concurrency group, so a
-        # sleeping promotion never holds the deploy-production lane behind
-        # which a rollback would queue. The remainder is recomputed here
-        # from the staging-green timestamp, not carried from guard time.
+    def soak_step(self, name):
+        return next(step for step in steps(JOBS["soak"]) if step[0].strip() == f"- name: {name}")
+
+    def test_soak_is_the_bounded_staging_lifecycle_holder_with_a_fresh_full_interval(self):
+        # The soak runs outside the deploy-production lane, so a promotion
+        # never queues a rollback. It holds the canonical staging lifecycle
+        # lock across begin, baseline, a fresh live interval, final evidence
+        # and a confirmed release. Staging-green age is never soak credit.
         soak_job = "\n".join(JOBS["soak"])
-        self.assertIn("needs: guard", soak_job)
-        condition = value(children(JOBS["soak"][1:], 4)["if"])
+        job = children(JOBS["soak"][1:], 4)
+        self.assertEqual(value(job["needs"]), "guard")
+        condition = value(job["if"])
         for needle in ("needs.guard.outputs.skip == ''",
                        "needs.guard.outputs.mode == 'deploy'",
-                       "needs.guard.outputs.allow_unstaged != 'true'",
-                       "needs.guard.outputs.soak_seconds != '0'"):
+                       "needs.guard.outputs.allow_unstaged != 'true'"):
             self.assertIn(needle, condition)
-        self.assertNotIn("concurrency", children(JOBS["soak"][1:], 4))
-        self.assertIn("GREEN_AT: ${{ needs.guard.outputs.green_at }}", soak_job)
-        # The judged soak window starts at the baseline sample the soak job
-        # records before sleeping, through the staging Environment bearer.
-        self.assertIn("baseline: ${{ steps.baseline.outputs.receipt }}", soak_job)
-        self.assertIn("name: staging", soak_job)
-        self.assertIn("deployment: false", soak_job)
-        baseline = inline_script("Record the soak-baseline REST counters")
-        for needle in ("set -euo pipefail", "wrangler/scripts/rest-5xx-counters.mjs",
-                       'METRICS_SCRAPE_TOKEN', "receipt=$(cat "):
-            self.assertIn(needle, soak_job if needle in ("METRICS_SCRAPE_TOKEN", "receipt=$(cat ") else baseline)
-        self.assertNotIn("${{", baseline)
-        soak = inline_script("Wait out the remainder of the 30-minute post-staging soak")
-        self.assertIn("SOAK_SECONDS - int(time.time() - green_at)", soak)
-        self.assertIn("time.sleep(remaining)", soak)
-        # An unreadable timestamp soaks the full window, never zero.
-        self.assertIn("remaining = SOAK_SECONDS", soak)
-        # Never interpolate the expression into the script text.
-        self.assertNotIn("${{", soak)
+        # No remainder arithmetic: the interval is fresh, so a zero or aged
+        # staging-green time can no longer skip the job.
+        for stale in ("soak_seconds", "green_at", "GREEN_AT", "time.sleep", "SOAK_SECONDS",
+                      "Wait out the remainder", "steps.baseline.outputs"):
+            self.assertNotIn(stale, soak_job)
+        self.assertEqual([line.strip() for line in job["concurrency"][1:]],
+                         ["group: staging-lifecycle", "cancel-in-progress: false"])
+        self.assertEqual("\n".join(job["environment"]),
+                         "    environment:\n      name: staging\n      deployment: false")
+        self.assertEqual(set(children(job["permissions"][1:], 6)), {"contents", "actions"})
+        # Keep ten minutes of cleanup headroom beyond the unchanged 40-minute
+        # grant pinned below; the job ceiling is not runtime authority.
+        self.assertEqual(int(value(job["timeout-minutes"])), 50)
+        outputs = "\n".join(job["outputs"])
+        self.assertIn("skip: ${{ steps.judge.outputs.skip }}", outputs)
+        self.assertIn("evidence: ${{ steps.judge.outputs.evidence }}", outputs)
+        # Ordering: begin -> baseline -> interval -> judge -> recheck -> release -> upload.
+        names = [step[0].split("name: ", 1)[-1] for step in steps(JOBS["soak"]) if "name:" in step[0]]
+        order = ["Acquire and ready the guarded staging candidate",
+                 "Record the soak-baseline REST counters",
+                 "Measure a fresh live staging interval",
+                 "Read the candidate's staging journeys and soak REST counters",
+                 "Recheck the original grant after final sampling",
+                 "Release the original staging soak window",
+                 "Retain staging soak lifecycle and measurement evidence"]
+        self.assertEqual([name for name in names if name in order], order)
+        begin = "\n".join(self.soak_step(order[0]))
+        self.assertIn("node wrangler/scripts/staging-use-pipeline.mjs begin", begin)
+        self.assertIn("STAGING_USE_EXPECTED_SHA: ${{ needs.guard.outputs.sha }}", begin)
+        self.assertIn("STAGING_USE_MINUTES: '40'", begin)
+        self.assertIn("id: staging-use-begin", begin)
+        baseline = "\n".join(self.soak_step(order[1]))
+        self.assertIn("wrangler/scripts/rest-5xx-counters.mjs", baseline)
+        self.assertIn("METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}", baseline)
+        self.assertIn("set -euo pipefail", baseline)
+        self.assertNotIn("OWNERSHIP_CONTROL_TOKEN", baseline)
+        interval = "\n".join(self.soak_step(order[2]))
+        self.assertIn("node wrangler/scripts/staging-soak-window.mjs", interval)
+        # Automatic runs measure the full 30 minutes; manual runs add no delay.
+        self.assertIn("AUTO: ${{ needs.guard.outputs.auto }}", interval)
+        # Every consumer is bound to the exact original grant from begin.
+        for text in (interval, "\n".join(self.soak_step(order[4])), "\n".join(self.soak_step(order[5]))):
+            self.assertIn("STAGING_USE_EXPIRES_AT: ${{ steps.staging-use-begin.outputs.expires_at }}", text)
+            self.assertIn("STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-soak-use.ndjson", text)
+            self.assertIn("OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}", text)
+        for text in (interval, "\n".join(self.soak_step(order[4]))):
+            self.assertIn("STAGING_USE_SHA: ${{ needs.guard.outputs.sha }}", text)
+            self.assertIn("STAGING_USE_DEPLOYMENT: ${{ steps.staging-use-begin.outputs.deployment_id }}", text)
+        self.assertIn("node wrangler/scripts/staging-use-pipeline.mjs consume", "\n".join(self.soak_step(order[4])))
+        # The judge reads the baseline of this same bounded job and holds no ownership bearer.
+        judge = "\n".join(self.soak_step(order[3]))
+        self.assertIn("id: judge", judge)
+        self.assertIn("staging-soak-baseline.json", judge)
+        self.assertNotIn("OWNERSHIP_CONTROL_TOKEN", judge)
+        # Release is unconditional on failure but only once a grant was published.
+        release = self.soak_step(order[5])
+        self.assertEqual([line.strip() for line in release if line.strip().startswith("if:")],
+                         ["if: always() && steps.staging-use-begin.outputs.expires_at != ''"])
+        self.assertIn("node wrangler/scripts/staging-use-pipeline.mjs finish", "\n".join(release))
+        # Lifecycle and measurement evidence is retained even on failure.
+        upload = self.soak_step(order[6])
+        upload_text = "\n".join(upload)
+        self.assertEqual([line.strip() for line in upload if line.strip().startswith("if:")], ["if: always()"])
+        for needle in ("name: staging-soak-${{ github.run_id }}-${{ github.run_attempt }}",
+                       "${{ runner.temp }}/staging-soak-use.ndjson", "${{ runner.temp }}/staging-soak-*.json",
+                       "if-no-files-found: error", "retention-days: 7"):
+            self.assertIn(needle, upload_text)
+        # The ownership bearer reaches only lifecycle steps; run scripts never interpolate expressions.
+        for name in ("Record the soak-baseline REST counters",
+                     "Read the candidate's staging journeys and soak REST counters"):
+            self.assertNotIn("STAGING_OWNERSHIP_CONTROL_TOKEN", "\n".join(self.soak_step(name)))
+        for block in run_blocks():
+            self.assertNotIn("${{", block)
+        # Production neither holds the staging lock nor carries any soak wait.
         production = "\n".join(JOBS["production"])
+        self.assertNotIn("staging-lifecycle", production)
         self.assertNotIn("Soak past the staging-green time", production)
         self.assertNotIn("needs.guard.outputs.soak_seconds", production)
+        self.assertNotIn("staging-use-pipeline", production)
 
     def test_recheck_rereads_hold_and_live_before_the_deploy(self):
         # The guard's hold/live verdict goes stale while gates build and the
@@ -725,6 +792,7 @@ class StaticGuardTests(unittest.TestCase):
                        "needs.staging-soak-evidence.outputs.skip == ''"):
             self.assertIn(needle, condition)
         self.assertIn("HOLD_UNTIL: ${{ vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL }}", recheck_job)
+        self.assertIn("AUTO_DISABLED: ${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}", recheck_job)
         self.assertIn("SHA: ${{ needs.guard.outputs.sha }}", recheck_job)
         # Entering the single-pending lane behind a recovery dispatch would
         # cancel the queued run, so the recheck skips while a dispatch is
@@ -733,7 +801,8 @@ class StaticGuardTests(unittest.TestCase):
         granted = set(children(children(JOBS["recheck"][1:], 4)["permissions"][1:], 6))
         self.assertEqual(granted, {"contents", "actions"})
         recheck = inline_script("Re-read the promotion hold and the live revision")
-        for needle in ('f"held until {held.isoformat()}"', 'skip = "live"',
+        for needle in ('f"held until {held.isoformat()}"', 'skip = "auto-promote-disabled"',
+                       'skip = "live"',
                        'skip = "older-than-live"',
                        'skip = "operator-dispatch-active"',
                        'skip = "dispatch-check-unreadable"',
@@ -760,12 +829,24 @@ class StaticGuardTests(unittest.TestCase):
         condition = value(job["if"])
         for needle in ("!cancelled()", "needs.guard.result == 'success'", "needs.guard.outputs.skip == ''",
                        "needs.guard.outputs.mode == 'deploy'", "needs.guard.outputs.allow_unstaged != 'true'",
-                       "(needs.soak.result == 'success' || needs.soak.result == 'skipped')"):
+                       "needs.soak.result == 'success'"):
             self.assertIn(needle, condition)
-        # The staging bearer through the existing Environment, no deployment record.
-        self.assertEqual("\n".join(job["environment"]),
-                         "    environment:\n      name: staging\n      deployment: false")
-        text = "\n".join(JOBS["staging-soak-evidence"])
+        # The soak is mandatory evidence on this path: a skipped, failed or
+        # cancelled soak (including an unconfirmed release) publishes nothing.
+        self.assertNotIn("skipped", condition)
+        # A pure verdict publisher: no Environment, no secrets, no staging
+        # reads, no checkout, no deployment or lock authority.
+        self.assertNotIn("environment", job)
+        self.assertNotIn("concurrency", job)
+        publisher = "\n".join(JOBS["staging-soak-evidence"])
+        for forbidden in ("secrets.", "environment", "actions/checkout", "wrangler", "STAGING_WORKER_URL",
+                          "TOKEN", "gh api", "staging-use-pipeline"):
+            self.assertNotIn(forbidden, publisher)
+        self.assertEqual({key: value(block) for key, block in children(job["permissions"][1:], 6).items()},
+                         {"contents": "read"})
+        self.assertEqual(len(steps(JOBS["staging-soak-evidence"])), 1)
+        # The live reads moved into the soak job, where the baseline lives.
+        text = "\n".join(JOBS["soak"])
         self.assertIn("METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}", text)
         self.assertNotIn("PRODUCTION_", text)
         staging = inline_script("Read the candidate's staging journeys and soak REST counters")
@@ -776,14 +857,23 @@ class StaticGuardTests(unittest.TestCase):
                        'promotion_regression_gate.py staging', '--auto "$AUTO"',
                        '--run-id "$RUN_ID"', '--attempt "$RUN_ATTEMPT"',
                        '--staging-runs "$RUNNER_TEMP/staging-runs.json"',
-                       '"${baseline_args[@]}"'):
+                       '--baseline-counters "$RUNNER_TEMP/staging-soak-baseline.json"',
+                       '--out "$RUNNER_TEMP/staging-soak-evidence.json"'):
             self.assertIn(needle, staging)
-        # The run binding, the runs listing and the baseline all arrive here.
+        # The run binding and runs listing arrive here; the baseline is a
+        # file written earlier by this same bounded job, never an output.
         for needle in ("RUN_ID: ${{ needs.guard.outputs.staging_run_id }}",
                        "RUN_ATTEMPT: ${{ needs.guard.outputs.staging_attempt }}",
-                       "BASELINE: ${{ needs.soak.outputs.baseline }}"):
+                       "AUTO: ${{ needs.guard.outputs.auto }}"):
             self.assertIn(needle, text)
+        self.assertNotIn("BASELINE:", text)
         self.assertIn("actions: read # deploy-staging runs", text)
+        # Baseline and judge run in the soak job with the live interval between them.
+        soak_names = [step[0].split("name: ", 1)[-1] for step in steps(JOBS["soak"]) if "name:" in step[0]]
+        self.assertLess(soak_names.index("Record the soak-baseline REST counters"),
+                        soak_names.index("Measure a fresh live staging interval"))
+        self.assertLess(soak_names.index("Measure a fresh live staging interval"),
+                        soak_names.index("Read the candidate's staging journeys and soak REST counters"))
         # Production leg: before the artifact admission and the deploy, ordinary promotions only.
         names = [step[0].split("name: ", 1)[-1] for step in steps(JOBS["production"])]
         gate = names.index("Gate on regression against the production baseline")
@@ -805,6 +895,34 @@ class StaticGuardTests(unittest.TestCase):
         production_if = value(children(JOBS["production"][1:], 4)["if"])
         self.assertIn("needs.staging-soak-evidence.result == 'success' && "
                       "needs.staging-soak-evidence.outputs.skip == ''", production_if)
+
+    def test_soak_evidence_publisher_is_a_pure_single_line_verdict_relay(self):
+        step = next(iter(steps(JOBS["staging-soak-evidence"])))
+        text = "\n".join(step)
+        self.assertIn("SKIP: ${{ needs.soak.outputs.skip }}", text)
+        self.assertIn("EVIDENCE: ${{ needs.soak.outputs.evidence }}", text)
+        script = inline_script("Publish the completed bounded staging verdict")
+        self.assertNotIn("${{", script)
+        self.assertNotRegex(script, r"urllib|subprocess|socket|requests|gh api")
+
+        def publish(evidence, skip=""):
+            with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+                output = Path(tmp) / "output"
+                env = {"SKIP": skip, "EVIDENCE": evidence, "GITHUB_OUTPUT": str(output)}
+                with patch.dict(os.environ, env, clear=True):
+                    exec(script, {})
+                return output.read_text()
+
+        evidence = json.dumps({"verdict": "ok", "insufficient_data": False})
+        self.assertEqual(publish(evidence), f"skip=\nevidence={evidence}\n")
+        self.assertEqual(publish(evidence, "staging-superseded"), f"skip=staging-superseded\nevidence={evidence}\n")
+        # Absent, non-object, multi-line or injected evidence/skip never becomes an output.
+        for bad in ("", "not json", "[]", "null", '"text"', "{\n}", '{"a": 1}\r', '{"a": 1}\nskip='):
+            with self.subTest(evidence=bad), self.assertRaises((SystemExit, ValueError)):
+                publish(bad)
+        for bad_skip in ("a\nevidence={}", "a\rb"):
+            with self.subTest(skip=bad_skip), self.assertRaises(SystemExit):
+                publish(evidence, bad_skip)
 
     def test_production_error_rate_gate_uses_reviewed_tooling_and_production_bindings(self):
         production = "\n".join(JOBS["production"])
@@ -857,7 +975,7 @@ class StaticGuardTests(unittest.TestCase):
 class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
               ref="refs/heads/main", auto="", resolved_sha=None, event="workflow_dispatch",
-              run_sha="", run_conclusion="", run_updated="", hold="", spike="",
+              run_sha="", run_conclusion="", run_updated="", hold="", auto_disabled="", spike="",
               run_path="", run_event="", cutover_hold="", **responses):
         if image is None:
             image = IMAGE if rollback else ""
@@ -981,6 +1099,7 @@ class GuardBehaviourTests(unittest.TestCase):
                 "EVENT_NAME": event,
                 "WORKFLOW_RUN_SHA": run_sha, "WORKFLOW_RUN_CONCLUSION": run_conclusion,
                 "WORKFLOW_RUN_UPDATED_AT": run_updated, "HOLD_UNTIL": hold,
+                "AUTO_DISABLED": auto_disabled,
                 "WORKFLOW_RUN_PATH": run_path, "WORKFLOW_RUN_EVENT": run_event,
                 "INJECT_ERROR_RATE_SPIKE": spike, "CUTOVER_HOLD": cutover_hold,
                 "PRODUCTION_WORKER_URL": "https://production.example.test",
@@ -1008,7 +1127,7 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("::error::Refusing production", stdout)
         self.assertIn(reason, stdout)
 
-    def recheck(self, sha=SHA, hold="", **responses):
+    def recheck(self, sha=SHA, hold="", auto_disabled="", **responses):
         api = {"production-readyz": {"status": 200, "build_revision": "f" * 40},
                "compare-live": {"status": "behind"},
                "dispatch-runs": {"workflow_runs": []}, **responses}
@@ -1035,6 +1154,7 @@ class GuardBehaviourTests(unittest.TestCase):
             output, summary = Path(tmp) / "output", Path(tmp) / "summary"
             env = {
                 "GITHUB_REPOSITORY": REPO, "SHA": sha, "HOLD_UNTIL": hold,
+                "AUTO_DISABLED": auto_disabled,
                 "PRODUCTION_WORKER_URL": "https://production.example.test",
                 "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
             }
@@ -2094,6 +2214,34 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(outputs["skip"], "")
 
+    def test_disable_skips_automatic_runs_green(self):
+        # Behavioral: exact "true" skips the automatic run green with the
+        # dedicated reason, mirroring the hold behavioral tests above.
+        code, outputs, summary, _, _ = self.guard(
+            event="schedule", sha="", auto_disabled="true")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["skip"], "auto-promote-disabled")
+        self.assertIn("nothing is deployed", summary)
+        # Any other value (including unset/empty) is off: the run proceeds
+        # to the normal timed checks.
+        for disabled in ("", "false", "TRUE", "1", "yes"):
+            with self.subTest(auto_disabled=disabled):
+                code, outputs, _, _, _ = self.guard(
+                    event="schedule", sha="", auto_disabled=disabled,
+                    **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
+                       "staging": {"total_count": 1, "workflow_runs": [
+                           {"conclusion": "success"}]}})
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs["skip"], "")
+
+    def test_manual_dispatch_ignores_the_disable(self):
+        # Recovery preserved: an explicit operator dispatch never reaches
+        # the automatic disable branch, so deploy/rollback/takeover proceed.
+        code, outputs, _, _, _ = self.guard(auto_disabled="true")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["skip"], "")
+        self.assertEqual(outputs["soak_seconds"], "0")
+
     def test_hold_without_a_zone_or_shape_is_refused(self):
         for hold in ("tomorrow", "2026-10-20T07:42:00", "2026-13-01T00:00:00Z"):
             with self.subTest(hold=hold):
@@ -2124,6 +2272,20 @@ class GuardBehaviourTests(unittest.TestCase):
         code, outputs, _, _, _ = self.recheck(hold="2020-01-01T00:00:00Z")
         self.assertEqual(code, 0)
         self.assertEqual(outputs, {"skip": ""})
+
+    def test_recheck_skips_when_the_disable_flips_after_the_guard(self):
+        # Behavioral: a disable set while the gates build or the soak
+        # sleeps is re-read by the pre-deploy recheck and skips green,
+        # so the promotion stops instead of deploying through it.
+        code, outputs, summary, _, _ = self.recheck(auto_disabled="true")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, {"skip": "auto-promote-disabled"})
+        self.assertIn("nothing is deployed", summary)
+        for disabled in ("", "false", "TRUE"):
+            with self.subTest(auto_disabled=disabled):
+                code, outputs, _, _, _ = self.recheck(auto_disabled=disabled)
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs, {"skip": ""})
 
     def test_recheck_skips_live_and_older_than_live(self):
         code, outputs, _, _, _ = self.recheck(

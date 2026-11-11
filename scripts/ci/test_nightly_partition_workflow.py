@@ -33,9 +33,8 @@ COMPILING = ("sweep-plan", "sweep-partition", "sweep-guarded", "sweep-docs")
 TESTING = ("sweep-partition", "sweep-guarded", "sweep-docs")
 SWEEP_NEEDS = {"changes", "sweep-plan", "sweep-partition", "sweep-guarded", "sweep-docs"}
 BROAD_STEP = "Full workspace sweep including ignored tests"
-# Deliberately the original logical overflow key: it preserves the runner
-# allow-list behavior, so the new job ids are not separate routing keys.
-ROUTE_KEY = "contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'sweep')"
+# All split legs use the same explicit standard public-hosted runner.
+PUBLIC_RUNNER = "ubuntu-latest"
 
 TIMEOUT_EXPR = "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}"
 CONTAINER_IMAGE = 'rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137'
@@ -44,10 +43,7 @@ REQUIRED_ENV = {'TWO_LFG_TESTDB_CI': '1',
  'TWO_GATEWAY_TEST_DATABASE_URL': 'postgresql://agent_test@localhost:5432/agent_test',
  'TWO_DATABASE_TLS': 'local-only',
  'CARGO_INCREMENTAL': '0'}
-SELECTOR_RUNS_ON = ('${{ fromJSON((!github.event.repository.private && \'["ubuntu-latest"]\') || '
- "(contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'changes') && "
- "contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && "
- 'vars.CI_OVERFLOW_RUNNER) || \'["self-hosted","two-selfhosted"]\') }}')
+SELECTOR_RUNS_ON = PUBLIC_RUNNER
 SELECTOR_OUTPUTS = {'rust': '${{ steps.select.outputs.rust }}', 'supply': '${{ steps.select.outputs.supply }}'}
 SELECTOR_RUN = ('set -euo pipefail\n'
  'rust=true supply=true\n'
@@ -411,9 +407,9 @@ class NightlyPartitionWorkflow(unittest.TestCase):
             job = self.job(name)
             self.assertEqual(job["timeout-minutes"], TIMEOUT_EXPR, name)
             self.assertEqual(job["container"]["image"], CONTAINER_IMAGE, name)
-            self.assertIn(ROUTE_KEY, job["runs-on"], name)
-            self.assertIn("!github.event.repository.private", job["runs-on"], name)
-            self.assertNotIn("runs-on: ubuntu-latest", job["runs-on"], name)
+            self.assertEqual(job["runs-on"], PUBLIC_RUNNER, name)
+            self.assertNotIn("CI_OVERFLOW_", job["runs-on"], name)
+            self.assertNotIn("self-hosted", job["runs-on"], name)
             self.assertEqual(job["permissions"], {"contents": "read"}, name)
             for key, value in REQUIRED_ENV.items():
                 self.assertEqual(job["env"].get(key), value, f"{name} {key}")

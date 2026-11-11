@@ -29,9 +29,9 @@ Coupling notes (verified 2026-10-02, enforced by test_job_inputs.py):
   privacy/database-roles/rollback-delta/backup by the voice owner-grant
   journal regression, plus community-jobs/README by the exclusion
   live-keys acceptance): those docs select
-  ``rust``. staging-soak/preflight/runbook are existence-only inputs
-  to the preconditions binary (is_file, never content), so a content edit
-  cannot break Rust and they fall through to the worker rule below; any
+  ``rust``. The soak checklist regression also reads staging-soak by content.
+  preflight/runbook are existence-only inputs to the preconditions binary
+  (is_file, never content), so they fall through to the worker rule below; any
   deletion forces all jobs via the deletion rule. Every other doc has no
   file reader in PR-run code, so docs-only PRs skip the Rust matrix -- but
   ANY docs/ change still selects ``worker`` because
@@ -152,9 +152,10 @@ WORKER_PREFIX = "wrangler/"
 # by the custom command lookup outage acceptance
 # (crates/discord/tests/custom_command_lookup_outage_acceptance.rs), and
 # cutover-migration-ledger by the admin token registry acceptance
-# (crates/core/tests/admin_token_registry_acceptance.rs).
+# (crates/core/tests/admin_token_registry_acceptance.rs), and staging-soak
+# by the planned-outage classification regression in test_soak_checklist.py.
 # parity.md and the baseline also gate parity-docs. Existence-only docs
-# (staging-soak/preflight: the preconditions binary checks is_file,
+# (preflight: the preconditions binary checks is_file,
 # never content) and runbook/container-readiness (worker tests only) fall
 # through to the worker-only docs rule below; their absence is covered by
 # the deletion rule in selection().
@@ -168,6 +169,7 @@ RUST_DOCS = frozenset({
     "docs/voice-conditions-core.md",
     "docs/soak-checklist.json",
     "docs/soak-checklist.md",
+    "docs/staging-soak.md",
     "docs/staging-e2e-command-matrix.md",
     "docs/smoke-expected-responses.md",
     "docs/smoke-run-record.md",

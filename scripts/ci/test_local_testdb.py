@@ -92,6 +92,18 @@ class LocalTestDbParity(unittest.TestCase):
 
 
 class RunnerProvisioning(unittest.TestCase):
+    def test_database_collector_matches_normal_integration_service(self):
+        harness = load_harness()
+        with mock.patch.object(harness, "docker", return_value=subprocess.CompletedProcess([], 0)) as docker, \
+                mock.patch.object(harness, "running", side_effect=lambda name: name == harness.RUNNER), \
+                mock.patch.object(harness, "exists", return_value=True), \
+                mock.patch.object(harness, "psql", return_value=" ".join(harness.DATABASES)):
+            harness.up()
+        start = next(call.args for call in docker.call_args_list if call.args[0] == "run")
+        env = dict(start[i + 1].split("=", 1) for i, arg in enumerate(start) if arg == "-e")
+        expected = rust_tests_job()["services"]["agent-testdb"]["env"]
+        self.assertEqual(env, {key: words(value) for key, value in expected.items()})
+
     def test_failed_provisioning_removes_the_runner(self):
         harness = load_harness()
         calls = []

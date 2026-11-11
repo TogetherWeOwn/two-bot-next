@@ -52,6 +52,983 @@ async fn db_now_secs(pool: &PgPool) -> i64 {
         .unwrap()
 }
 
+const SNAPSHOT_GUILD: &str = "100000000000000001";
+const SNAPSHOT_EVENT: &str = "200000000000000001";
+const SNAPSHOT_CHANNEL: &str = "300000000000000001";
+
+async fn snapshot_time(pool: &PgPool, relative: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT to_char((NOW() + $1::text::interval) AT TIME ZONE 'UTC', \
+         'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')",
+    )
+    .bind(relative)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn snapshot_event_fixture(
+    db: &TestDb,
+    status: two_bot_core::scheduled_events::EventStatus,
+) -> two_bot_core::scheduled_events::ScheduledEvent {
+    let starts_at: String = sqlx::query_scalar(
+        "SELECT to_char((NOW() - INTERVAL '1 hour') AT TIME ZONE 'UTC', \
+         'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let ends_at = if status == two_bot_core::scheduled_events::EventStatus::Completed {
+        Some(snapshot_time(&db.pool, "-5 minutes").await)
+    } else {
+        None
+    };
+    let event = two_bot_core::scheduled_events::ScheduledEvent {
+        id: SNAPSHOT_EVENT.to_owned(),
+        name: "fixture".to_owned(),
+        starts_at,
+        ends_at,
+        channel_id: Some(SNAPSHOT_CHANNEL.to_owned()),
+        description: None,
+        status,
+    };
+    two_bot_core::website_store::upsert_event(
+        &db.pool,
+        SNAPSHOT_GUILD,
+        "2026-11-03T10:00:00.000Z",
+        &event,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO event_voice_channels \
+         (event_id, instance_starts_at, starts_at, ends_at, voice_channel_id) \
+         VALUES ($1, $2::text::timestamptz, $2::text::timestamptz, \
+                 NOW() + INTERVAL '1 hour', $3)",
+    )
+    .bind(SNAPSHOT_EVENT)
+    .bind(&event.starts_at)
+    .bind(SNAPSHOT_CHANNEL)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.store()
+        .put_event_key(SNAPSHOT_GUILD, "launch", SNAPSHOT_EVENT)
+        .await
+        .unwrap();
+    event
+}
+
+#[tokio::test]
+async fn voice_snapshot_event_key_tracks_mutation_reschedules_both_directions() {
+    use two_bot_core::{scheduled_events::EventStatus, website_store::upsert_event};
+
+    let db = TestDb::new().await;
+    let mut event = snapshot_event_fixture(&db, EventStatus::Scheduled).await;
+    let original_start = event.starts_at.clone();
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .get(SNAPSHOT_CHANNEL),
+        Some(&"launch".to_owned())
+    );
+    event.starts_at = sqlx::query_scalar(
+        "SELECT to_char((NOW() + INTERVAL '2 hours') AT TIME ZONE 'UTC', \
+         'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &event)
+        .await
+        .unwrap();
+    assert!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .is_empty(),
+        "event.upsert must move the linked room out of the live window"
+    );
+    event.starts_at = original_start;
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:02:00.000Z", &event)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .get(SNAPSHOT_CHANNEL),
+        Some(&"launch".to_owned()),
+        "rescheduling back into the window restores the link"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_event_key_retains_completed_grace_across_real_mirror_replacement() {
+    use two_bot_core::{scheduled_events::EventStatus, website_store::replace_events};
+
+    let db = TestDb::new().await;
+    snapshot_event_fixture(&db, EventStatus::Completed).await;
+    sqlx::query(
+        "UPDATE event_voice_channels SET ends_at = NOW() - INTERVAL '5 minutes' \
+         WHERE event_id = $1",
+    )
+    .bind(SNAPSHOT_EVENT)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let before = db
+        .store()
+        .windowed_event_voice_keys(SNAPSHOT_GUILD)
+        .await
+        .unwrap();
+    assert_eq!(before.get(SNAPSHOT_CHANNEL), Some(&"launch".to_owned()));
+    assert_eq!(
+        replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &[])
+            .await
+            .unwrap(),
+        None
+    );
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM scheduled_events WHERE guild_id = $1")
+            .bind(SNAPSHOT_GUILD)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, 0, "the mirror must remain an exact replacement");
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap(),
+        before,
+        "mirror omission must not cut short the known finite completed grace"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_event_key_refuses_ambiguous_aliases() {
+    use two_bot_core::scheduled_events::EventStatus;
+
+    let db = TestDb::new().await;
+    snapshot_event_fixture(&db, EventStatus::Active).await;
+    db.store()
+        .put_event_key(SNAPSHOT_GUILD, "another-site-event", SNAPSHOT_EVENT)
+        .await
+        .unwrap();
+    assert!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .is_empty(),
+        "two site keys must not become one arbitrary room link"
+    );
+    db.store()
+        .put_event_key(SNAPSHOT_GUILD, "another-site-event", "200000000000000002")
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .get(SNAPSHOT_CHANNEL),
+        Some(&"launch".to_owned()),
+        "a unique mapping remains usable after alias removal"
+    );
+    assert!(
+        db.store()
+            .windowed_event_voice_keys("100000000000000002")
+            .await
+            .unwrap()
+            .is_empty(),
+        "guild isolation survives reverse lookup"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_event_key_accepted_end_changes_and_omission_do_not_invent_grace() {
+    use two_bot_core::{
+        scheduled_events::EventStatus,
+        website_store::{replace_events, upsert_event},
+    };
+
+    let db = TestDb::new().await;
+    let mut event = snapshot_event_fixture(&db, EventStatus::Active).await;
+    event.ends_at = Some(snapshot_time(&db.pool, "-16 minutes").await);
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &event)
+        .await
+        .unwrap();
+    assert!(db
+        .store()
+        .windowed_event_voice_keys(SNAPSHOT_GUILD)
+        .await
+        .unwrap()
+        .is_empty());
+    event.ends_at = Some(snapshot_time(&db.pool, "+5 minutes").await);
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:02:00.000Z", &event)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:03:00.000Z", &[])
+        .await
+        .unwrap();
+    assert!(db
+        .store()
+        .windowed_event_voice_keys(SNAPSHOT_GUILD)
+        .await
+        .unwrap()
+        .is_empty());
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM event_instance_windows WHERE guild_id = $1")
+            .bind(SNAPSHOT_GUILD)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "missing", "omission is not positive completion");
+    // A same-time mutation retains the mirror's compatibility behavior, but
+    // cannot turn omitted evidence into a newly live window.
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:03:00.000Z", &event)
+        .await
+        .unwrap();
+    assert!(db
+        .store()
+        .windowed_event_voice_keys(SNAPSHOT_GUILD)
+        .await
+        .unwrap()
+        .is_empty());
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_event_key_completed_deadline_is_finite_and_not_extended_by_polls() {
+    use two_bot_core::{
+        scheduled_events::EventStatus,
+        website_store::{replace_events, upsert_event},
+    };
+
+    let db = TestDb::new().await;
+    let mut event = snapshot_event_fixture(&db, EventStatus::Completed).await;
+    event.ends_at = Some(snapshot_time(&db.pool, "-16 minutes").await);
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &event)
+        .await
+        .unwrap();
+    for stamp in ["2026-11-03T10:02:00.000Z", "2026-11-03T10:03:00.000Z"] {
+        replace_events(&db.pool, SNAPSHOT_GUILD, stamp, &[])
+            .await
+            .unwrap();
+        assert!(db
+            .store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    let end: String = sqlx::query_scalar(
+        "SELECT to_char(ends_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM event_instance_windows WHERE guild_id = $1",
+    ).bind(SNAPSHOT_GUILD).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(
+        Some(end),
+        event.ends_at,
+        "polls cannot reset the original grace deadline"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_event_key_terminal_fences_survive_mirror_and_tombstone_removal() {
+    use two_bot_core::{
+        scheduled_events::EventStatus,
+        website_store::{replace_events, upsert_event},
+    };
+
+    for deleted in [false, true] {
+        let db = TestDb::new().await;
+        let mut event = snapshot_event_fixture(&db, EventStatus::Completed).await;
+        replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            db.store()
+                .windowed_event_voice_keys(SNAPSHOT_GUILD)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        if deleted {
+            two_bot_core::event_instance_store::confirm_deleted(
+                &db.pool,
+                SNAPSHOT_GUILD,
+                SNAPSHOT_EVENT,
+                "2026-11-03T10:02:00.000Z",
+            )
+            .await
+            .unwrap();
+        } else {
+            event.status = EventStatus::Cancelled;
+            upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:02:00.000Z", &event)
+                .await
+                .unwrap();
+        }
+        assert!(db
+            .store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .is_empty());
+        // Hygiene removes the old mirror tombstone; a binding/key pins the
+        // independent terminal fence. No local SQL deletes the fence itself.
+        replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-05T10:00:00.000Z", &[])
+            .await
+            .unwrap();
+        replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-07T10:00:00.000Z", &[])
+            .await
+            .unwrap();
+        let tombstones: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM scheduled_events_tombstone WHERE guild_id = $1",
+        )
+        .bind(SNAPSHOT_GUILD)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(tombstones, 0);
+        event.status = EventStatus::Active;
+        event.ends_at = None;
+        for stamp in [
+            "2026-11-03T10:01:00.000Z",
+            "2026-11-03T10:02:00.000Z",
+            "2026-11-07T10:00:00.000Z",
+        ] {
+            upsert_event(&db.pool, SNAPSHOT_GUILD, stamp, &event)
+                .await
+                .unwrap();
+            replace_events(&db.pool, SNAPSHOT_GUILD, stamp, &[event.clone()])
+                .await
+                .unwrap();
+            assert!(
+                db.store()
+                    .windowed_event_voice_keys(SNAPSHOT_GUILD)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "terminal fence survives {stamp}, deleted={deleted}"
+            );
+        }
+        db.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn voice_snapshot_event_key_delayed_terminal_observations_revoke_omitted_grace() {
+    use two_bot_core::{
+        event_instance_store::confirm_deleted,
+        scheduled_events::EventStatus,
+        website_store::{replace_events, upsert_event},
+    };
+
+    for deleted in [false, true] {
+        let db = TestDb::new().await;
+        let mut event = snapshot_event_fixture(&db, EventStatus::Completed).await;
+        replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:02:00.000Z", &[])
+            .await
+            .unwrap();
+        event.status = EventStatus::Active;
+        upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:30.000Z", &event)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.store()
+                .windowed_event_voice_keys(SNAPSHOT_GUILD)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a compatibility-only mirror replay does not change confirmed grace"
+        );
+        // Terminal evidence older than the last confirmed lifecycle observation
+        // still loses; a newer mirror replay must not mask accepted revocation.
+        for stamp in ["2026-11-03T09:59:00.000Z", "2026-11-03T10:01:00.000Z"] {
+            if deleted {
+                confirm_deleted(&db.pool, SNAPSHOT_GUILD, SNAPSHOT_EVENT, stamp)
+                    .await
+                    .unwrap();
+            } else {
+                event.status = EventStatus::Cancelled;
+                upsert_event(&db.pool, SNAPSHOT_GUILD, stamp, &event)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                db.store()
+                    .windowed_event_voice_keys(SNAPSHOT_GUILD)
+                    .await
+                    .unwrap()
+                    .len(),
+                usize::from(stamp == "2026-11-03T09:59:00.000Z"),
+                "terminal evidence respects confirmed order, deleted={deleted}, stamp={stamp}"
+            );
+        }
+        let fences: (String, String, String, String) = sqlx::query_as(
+            "SELECT w.observed_at, w.revoked_at, w.omitted_at, c.epoch
+             FROM event_instance_windows w JOIN scheduled_events_claim c USING (guild_id)
+             WHERE w.guild_id = $1 AND w.event_id = $2",
+        )
+        .bind(SNAPSHOT_GUILD)
+        .bind(SNAPSHOT_EVENT)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            fences,
+            (
+                "2026-11-03T10:01:00.000Z".to_owned(),
+                "2026-11-03T10:01:00.000Z".to_owned(),
+                "2026-11-03T10:02:00.000Z".to_owned(),
+                "2026-11-03T10:02:00.000Z".to_owned(),
+            ),
+            "revocation must not roll back the newer guild omission fence"
+        );
+        event.status = EventStatus::Active;
+        for stamp in ["2026-11-03T10:02:00.000Z", "2026-11-03T10:03:00.000Z"] {
+            upsert_event(&db.pool, SNAPSHOT_GUILD, stamp, &event)
+                .await
+                .unwrap();
+            assert!(db
+                .store()
+                .windowed_event_voice_keys(SNAPSHOT_GUILD)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        db.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn voice_snapshot_first_observation_respects_snapshot_absence_without_a_tombstone() {
+    use two_bot_core::{
+        scheduled_events::{EventStatus, ScheduledEvent},
+        website_store::{replace_events, upsert_event},
+    };
+
+    let db = TestDb::new().await;
+    sqlx::query(
+        "INSERT INTO event_voice_channels (event_id, instance_starts_at, starts_at, voice_channel_id)
+         VALUES ($1, NOW() - INTERVAL '2 days', NOW() - INTERVAL '1 hour', $2)",
+    )
+    .bind(SNAPSHOT_EVENT)
+    .bind(SNAPSHOT_CHANNEL)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.store()
+        .put_event_key(SNAPSHOT_GUILD, "launch", SNAPSHOT_EVENT)
+        .await
+        .unwrap();
+    let event = ScheduledEvent {
+        id: SNAPSHOT_EVENT.to_owned(),
+        name: "legacy".to_owned(),
+        starts_at: snapshot_time(&db.pool, "-1 hour").await,
+        ends_at: None,
+        channel_id: Some(SNAPSHOT_CHANNEL.to_owned()),
+        description: None,
+        status: EventStatus::Active,
+    };
+    replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:02:00.000Z", &[])
+        .await
+        .unwrap();
+    let tombstones: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM scheduled_events_tombstone WHERE guild_id = $1")
+            .bind(SNAPSHOT_GUILD)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(tombstones, 0, "the event has never appeared in the mirror");
+    for stamp in ["2026-11-03T10:01:00.000Z", "2026-11-03T10:02:00.000Z"] {
+        upsert_event(&db.pool, SNAPSHOT_GUILD, stamp, &event)
+            .await
+            .unwrap();
+        let mirrored: String = sqlx::query_scalar(
+            "SELECT updated_at FROM scheduled_events WHERE guild_id = $1 AND event_id = $2",
+        )
+        .bind(SNAPSHOT_GUILD)
+        .bind(SNAPSHOT_EVENT)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(mirrored, stamp, "legacy mirror acceptance is unchanged");
+        let evidence: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM event_instance_windows WHERE guild_id = $1 AND event_id = $2",
+        )
+        .bind(SNAPSHOT_GUILD)
+        .bind(SNAPSHOT_EVENT)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            evidence, 0,
+            "stale/equal mutation cannot establish liveness"
+        );
+    }
+    let mut unproven_completion = event.clone();
+    unproven_completion.status = EventStatus::Completed;
+    unproven_completion.ends_at = Some(snapshot_time(&db.pool, "-5 minutes").await);
+    upsert_event(
+        &db.pool,
+        SNAPSHOT_GUILD,
+        "2026-11-03T10:02:00.000Z",
+        &unproven_completion,
+    )
+    .await
+    .unwrap();
+    assert!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .is_empty(),
+        "completion cannot establish an unproven initial instance behind the absence fence"
+    );
+    replace_events(
+        &db.pool,
+        SNAPSHOT_GUILD,
+        "2026-11-03T10:02:00.000Z",
+        std::slice::from_ref(&event),
+    )
+    .await
+    .unwrap();
+    assert!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .is_empty(),
+        "equal snapshot replay cannot defeat the absence fence"
+    );
+    replace_events(
+        &db.pool,
+        SNAPSHOT_GUILD,
+        "2026-11-03T10:03:00.000Z",
+        std::slice::from_ref(&event),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a genuinely newer snapshot can adopt the legacy identity"
+    );
+    replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:04:00.000Z", &[])
+        .await
+        .unwrap();
+    for stamp in ["2026-11-03T10:03:30.000Z", "2026-11-03T10:04:00.000Z"] {
+        upsert_event(&db.pool, SNAPSHOT_GUILD, stamp, &event)
+            .await
+            .unwrap();
+        assert!(
+            db.store()
+                .windowed_event_voice_keys(SNAPSHOT_GUILD)
+                .await
+                .unwrap()
+                .is_empty(),
+            "stale/equal mutation cannot revive missing evidence"
+        );
+    }
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:05:00.000Z", &event)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a genuinely newer mutation can restore live evidence"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_delayed_completion_establishes_grace_despite_a_newer_mirror_replay() {
+    use two_bot_core::{
+        scheduled_events::EventStatus,
+        website_store::{replace_events, upsert_event},
+    };
+
+    let db = TestDb::new().await;
+    let mut event = snapshot_event_fixture(&db, EventStatus::Active).await;
+    replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:03:00.000Z", &[])
+        .await
+        .unwrap();
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:02:00.000Z", &event)
+        .await
+        .unwrap();
+    assert!(db
+        .store()
+        .windowed_event_voice_keys(SNAPSHOT_GUILD)
+        .await
+        .unwrap()
+        .is_empty());
+    event.status = EventStatus::Completed;
+    event.ends_at = Some(snapshot_time(&db.pool, "-5 minutes").await);
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &event)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a positively confirmed completion newer than the last lifecycle stamp proves finite grace"
+    );
+    let stamps: (String, String, String) = sqlx::query_as(
+        "SELECT s.updated_at, w.observed_at, c.epoch
+         FROM scheduled_events s
+         JOIN event_instance_windows w USING (guild_id, event_id)
+         JOIN scheduled_events_claim c USING (guild_id)
+         WHERE s.guild_id = $1 AND s.event_id = $2",
+    )
+    .bind(SNAPSHOT_GUILD)
+    .bind(SNAPSHOT_EVENT)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stamps,
+        (
+            "2026-11-03T10:02:00.000Z".to_owned(),
+            "2026-11-03T10:01:00.000Z".to_owned(),
+            "2026-11-03T10:03:00.000Z".to_owned(),
+        ),
+        "terminal evidence must not rewrite the mirror or guild epoch"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_equal_completion_closes_live_evidence_but_cannot_restamp_confirmed_grace() {
+    use two_bot_core::{
+        scheduled_events::EventStatus,
+        website_store::{replace_events, upsert_event},
+    };
+
+    let db = TestDb::new().await;
+    let mut event = snapshot_event_fixture(&db, EventStatus::Active).await;
+    replace_events(
+        &db.pool,
+        SNAPSHOT_GUILD,
+        "2026-11-03T10:01:00.000Z",
+        std::slice::from_ref(&event),
+    )
+    .await
+    .unwrap();
+    event.status = EventStatus::Completed;
+    event.ends_at = Some(snapshot_time(&db.pool, "-5 minutes").await);
+    let completed_end = event.ends_at.clone();
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &event)
+        .await
+        .unwrap();
+    replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:02:00.000Z", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "same-time completion beats positively observed live evidence"
+    );
+    // A replay of the same confirmed completion cannot lengthen its known end.
+    event.ends_at = Some(snapshot_time(&db.pool, "+2 hours").await);
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &event)
+        .await
+        .unwrap();
+    let stamp: String = sqlx::query_scalar(
+        "SELECT observed_at FROM event_instance_windows WHERE guild_id = $1 AND event_id = $2",
+    )
+    .bind(SNAPSHOT_GUILD)
+    .bind(SNAPSHOT_EVENT)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stamp, "2026-11-03T10:01:00.000Z");
+    let end: String = sqlx::query_scalar(
+        "SELECT to_char(ends_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+         FROM event_instance_windows WHERE guild_id = $1 AND event_id = $2",
+    )
+    .bind(SNAPSHOT_GUILD)
+    .bind(SNAPSHOT_EVENT)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(Some(end), completed_end, "omission does not extend grace");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_equal_completion_is_independent_of_omission_arrival_order() {
+    use two_bot_core::{
+        scheduled_events::EventStatus,
+        website_store::{replace_events, upsert_event},
+    };
+
+    for omit_first in [false, true] {
+        let db = TestDb::new().await;
+        let mut event = snapshot_event_fixture(&db, EventStatus::Active).await;
+        replace_events(
+            &db.pool,
+            SNAPSHOT_GUILD,
+            "2026-11-03T10:01:00.000Z",
+            std::slice::from_ref(&event),
+        )
+        .await
+        .unwrap();
+        event.status = EventStatus::Completed;
+        event.ends_at = Some(snapshot_time(&db.pool, "-5 minutes").await);
+        if omit_first {
+            replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:02:00.000Z", &[])
+                .await
+                .unwrap();
+        }
+        upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &event)
+            .await
+            .unwrap();
+        if !omit_first {
+            replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:02:00.000Z", &[])
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            db.store()
+                .windowed_event_voice_keys(SNAPSHOT_GUILD)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "equal-stamp confirmed completion retains finite grace; omit_first={omit_first}"
+        );
+        db.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn voice_snapshot_equal_completion_cannot_add_an_end_after_unknown_end_omission() {
+    use two_bot_core::{
+        scheduled_events::EventStatus,
+        website_store::{replace_events, upsert_event},
+    };
+
+    let db = TestDb::new().await;
+    let mut event = snapshot_event_fixture(&db, EventStatus::Active).await;
+    event.status = EventStatus::Completed;
+    event.ends_at = None;
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &event)
+        .await
+        .unwrap();
+    replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:02:00.000Z", &[])
+        .await
+        .unwrap();
+    event.ends_at = Some(snapshot_time(&db.pool, "-5 minutes").await);
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &event)
+        .await
+        .unwrap();
+    assert!(db
+        .store()
+        .windowed_event_voice_keys(SNAPSHOT_GUILD)
+        .await
+        .unwrap()
+        .is_empty());
+    let end: Option<time::OffsetDateTime> = sqlx::query_scalar(
+        "SELECT ends_at FROM event_instance_windows WHERE guild_id = $1 AND event_id = $2",
+    )
+    .bind(SNAPSHOT_GUILD)
+    .bind(SNAPSHOT_EVENT)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        end.is_none(),
+        "equal completion cannot fabricate a finite end"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_event_evidence_failure_rolls_back_each_mirror_writer() {
+    use two_bot_core::{
+        scheduled_events::EventStatus,
+        website_store::{replace_events, upsert_event},
+    };
+
+    let db = TestDb::new().await;
+    let mut event = snapshot_event_fixture(&db, EventStatus::Active).await;
+    sqlx::query("ALTER TABLE event_instance_windows ADD CONSTRAINT reject_test_window CHECK (status <> 'completed')")
+        .execute(&db.pool).await.unwrap();
+    event.status = EventStatus::Completed;
+    event.ends_at = Some(snapshot_time(&db.pool, "-5 minutes").await);
+    assert!(
+        upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:01:00.000Z", &event)
+            .await
+            .is_err()
+    );
+    assert!(replace_events(
+        &db.pool,
+        SNAPSHOT_GUILD,
+        "2026-11-03T10:02:00.000Z",
+        &[event]
+    )
+    .await
+    .is_err());
+    let statuses: (String, String) = sqlx::query_as(
+        "SELECT s.status, w.status FROM scheduled_events s JOIN event_instance_windows w USING (guild_id, event_id) WHERE s.guild_id = $1",
+    ).bind(SNAPSHOT_GUILD).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(statuses, ("active".to_owned(), "active".to_owned()));
+    let epochs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM scheduled_events_claim WHERE guild_id = $1")
+            .bind(SNAPSHOT_GUILD)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(epochs, 0, "failed swap also rolls back its epoch claim");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_event_evidence_adopts_only_unambiguous_legacy_instance() {
+    use two_bot_core::{scheduled_events::EventStatus, website_store::upsert_event};
+
+    let db = TestDb::new().await;
+    // Only a fresh accepted observation can adopt the legacy immutable id;
+    // neither an old binding nor a site-key registration asserts liveness.
+    sqlx::query(
+        "INSERT INTO event_voice_channels (event_id, instance_starts_at, starts_at, voice_channel_id)
+         VALUES ($1, NOW() - INTERVAL '2 days', NOW() - INTERVAL '1 hour', $2)",
+    ).bind(SNAPSHOT_EVENT).bind(SNAPSHOT_CHANNEL).execute(&db.pool).await.unwrap();
+    db.store()
+        .put_event_key(SNAPSHOT_GUILD, "launch", SNAPSHOT_EVENT)
+        .await
+        .unwrap();
+    assert!(db
+        .store()
+        .windowed_event_voice_keys(SNAPSHOT_GUILD)
+        .await
+        .unwrap()
+        .is_empty());
+    let event = two_bot_core::scheduled_events::ScheduledEvent {
+        id: SNAPSHOT_EVENT.to_owned(),
+        name: "legacy".to_owned(),
+        starts_at: snapshot_time(&db.pool, "-1 hour").await,
+        ends_at: None,
+        channel_id: Some(SNAPSHOT_CHANNEL.to_owned()),
+        description: None,
+        status: EventStatus::Active,
+    };
+    upsert_event(&db.pool, SNAPSHOT_GUILD, "2026-11-03T10:00:00.000Z", &event)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    sqlx::query(
+        "INSERT INTO event_voice_channels (event_id, instance_starts_at, starts_at, voice_channel_id)
+         VALUES ($1, NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 hour', '300000000000000002')",
+    ).bind(SNAPSHOT_EVENT).execute(&db.pool).await.unwrap();
+    assert!(
+        db.store()
+            .windowed_event_voice_keys(SNAPSHOT_GUILD)
+            .await
+            .unwrap()
+            .is_empty(),
+        "competing legacy instances never select an arbitrary binding"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_snapshot_instance_maintenance_is_bounded_and_keeps_referenced_fences() {
+    use two_bot_core::{scheduled_events::EventStatus, website_store::replace_events};
+
+    let db = TestDb::new().await;
+    snapshot_event_fixture(&db, EventStatus::Completed).await;
+    sqlx::query(
+        "INSERT INTO event_instance_windows
+         (guild_id, event_id, instance_starts_at, starts_at, status, observed_at)
+         SELECT $1, 'unreferenced-' || n,
+                TIMESTAMPTZ '2026-11-01T10:00:00.000Z', TIMESTAMPTZ '2026-11-01T10:00:00.000Z',
+                'missing', '2026-11-01T10:00:00.000Z' FROM generate_series(1, 30) n",
+    )
+    .bind(SNAPSHOT_GUILD)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-05T10:00:00.000Z", &[])
+        .await
+        .unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM event_instance_windows WHERE guild_id = $1")
+            .bind(SNAPSHOT_GUILD)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 6, "one poll removes at most 25 unreferenced rows");
+    let pinned: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM event_instance_windows WHERE guild_id = $1 AND event_id = $2",
+    )
+    .bind(SNAPSHOT_GUILD)
+    .bind(SNAPSHOT_EVENT)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pinned, 1,
+        "binding/key keeps the fence despite old observation age"
+    );
+    replace_events(&db.pool, SNAPSHOT_GUILD, "2026-11-05T10:01:00.000Z", &[])
+        .await
+        .unwrap();
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM event_instance_windows WHERE guild_id = $1")
+            .bind(SNAPSHOT_GUILD)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining, 1,
+        "omission high-water does not postpone cleanup"
+    );
+    db.cleanup().await;
+}
+
 // Public cross-implementation signing fixture, never runtime key material.
 fn signing_key() -> two_bot_core::internal_actions::SigningKey {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

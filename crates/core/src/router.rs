@@ -85,6 +85,12 @@ pub const TICKET_CLOSE_ID: &str = "two:tickets:close";
 pub const LFG_PREFIX: &str = "two:lfg:";
 /// Self-role button/select prefix (`src/selfRoles/plan.ts`).
 pub const SELF_ROLE_PREFIX: &str = "two:self-role:";
+/// `/lockdown-preview` Confirm button prefix (spec section 3 step 3). The
+/// suffix is `<actor>:<digest32>`; ownership is checked in the channel slice,
+/// never from the id alone.
+pub const LOCKDOWN_PREVIEW_CONFIRM_PREFIX: &str = "lockdown-preview:confirm:";
+/// `/lockdown-preview` Cancel button prefix, same suffix shape as confirm.
+pub const LOCKDOWN_PREVIEW_CANCEL_PREFIX: &str = "lockdown-preview:cancel:";
 
 // --- refusal texts ------------------------------------------------------------
 // Actionable denials: every refusal names the Discord permission, who to ask,
@@ -174,6 +180,11 @@ pub enum ComponentHandler {
     Tickets,
     LfgSignup,
     GiveawayEntry,
+    /// `/lockdown-preview` Confirm / Cancel buttons. Routed on the same
+    /// `ManageChannels` disclosure basis as the preview slash (spec section 5):
+    /// the moderator gate runs in the channel slice, which re-runs the slash
+    /// adjudication on the pressing member before any read.
+    LockdownPreview,
 }
 
 /// Contract feature slices implement so the router can hand a routed
@@ -347,6 +358,87 @@ pub enum SlashOutcome {
     Refuse { refusal: RouterRefusal },
     Unknown,
     Ignore,
+}
+
+/// Per-dispatch live overlay for the announcements command surface: while the
+/// resolved announcements bit is off, the eight live-gated commands (feed add,
+/// remove, pause, resume, list and inspect, RSVP and RSVP totals) refuse with
+/// the same disabled reply the boot-off router produces. Callers pass the
+/// already-resolved bit (live snapshot store-first over boot), so an absent row
+/// executes through the boot value before this helper ever runs. Refuse-only:
+/// boot-off rows were already refused upstream and pass through, so enabling
+/// from a boot-off deployment still needs a restart (no registration exists to
+/// dispatch through).
+///
+/// LFG stays boot-gated by design: `/lfg` and `/lfg-close` share their
+/// execution arm with the LFG signup buttons, which answer boot-off with
+/// silence rather than a refusal, so live-gating the slash half alone would
+/// split one surface across two semantics. Scorecard `attendance` answers to
+/// its own gate, not this one.
+#[must_use]
+pub fn live_gate_announcements_slash(
+    outcome: SlashOutcome,
+    announcements_live: bool,
+) -> SlashOutcome {
+    match outcome {
+        SlashOutcome::Handled {
+            handler:
+                HandlerId::FeedAdd
+                | HandlerId::FeedRemove
+                | HandlerId::FeedPause
+                | HandlerId::FeedResume
+                | HandlerId::FeedList
+                | HandlerId::FeedInspect
+                | HandlerId::Rsvp
+                | HandlerId::RsvpAttendance,
+        } if !announcements_live => SlashOutcome::Refuse {
+            refusal: RouterRefusal::AnnouncementsDisabled,
+        },
+        other => other,
+    }
+}
+
+/// Slash-command names under the per-dispatch live overlay: the six feed verbs
+/// plus RSVP and RSVP totals. Keep in sync with the `RowGate::Announcements`
+/// rows in [`InteractionRouter::route_slash`] and the `Handled` match in
+/// [`live_gate_announcements_slash`]; `live_gated_names_match_routed_rows`
+/// routes every name here to catch drift.
+const LIVE_GATED_ANNOUNCEMENT_COMMANDS: &[&str] = &[
+    "feed-add",
+    "feed-remove",
+    "feed-pause",
+    "feed-resume",
+    "feed-list",
+    "feed-inspect",
+    "rsvp",
+    "rsvp-attendance",
+];
+
+/// [`live_gate_announcements_slash`] over a routed slash-command name. While
+/// live-off, a permission refusal for a live-gated command becomes the
+/// disabled reply: boot-off routing checks the feature gate before permissions
+/// in `route_slash`, so an unprivileged member hears the actionable state
+/// instead of a permission fetch-quest that cannot help while live-off.
+/// Live-on, foreign-guild (`Ignore`), unknown and unrelated outcomes pass
+/// through untouched, so permission checks still run once live.
+#[must_use]
+pub fn live_gate_announcements_slash_named(
+    name: &str,
+    outcome: SlashOutcome,
+    announcements_live: bool,
+) -> SlashOutcome {
+    if announcements_live || !LIVE_GATED_ANNOUNCEMENT_COMMANDS.contains(&name) {
+        return outcome;
+    }
+    match outcome {
+        SlashOutcome::Handled { .. } => live_gate_announcements_slash(outcome, false),
+        SlashOutcome::Refuse {
+            refusal: RouterRefusal::ManageServerRequired,
+        } => SlashOutcome::Refuse {
+            refusal: RouterRefusal::AnnouncementsDisabled,
+        },
+        other => other,
+    }
 }
 
 /// Component / modal-submit routing outcome.
@@ -890,6 +982,21 @@ impl InteractionRouter {
                 return ComponentOutcome::Ignore;
             }
             ComponentHandler::GiveawayEntry
+        } else if custom_id
+            .strip_prefix(LOCKDOWN_PREVIEW_CONFIRM_PREFIX)
+            .is_some()
+            || custom_id
+                .strip_prefix(LOCKDOWN_PREVIEW_CANCEL_PREFIX)
+                .is_some()
+        {
+            // Same disclosure basis as the `/lockdown-preview` slash: the
+            // moderation gate and guild fence run here; the `ManageChannels`
+            // check on the pressing member re-runs in the channel slice
+            // before any read (spec sections 3 step 5 and 5).
+            if !self.gates.moderation || !self.guild_ok(guild_id) {
+                return ComponentOutcome::Ignore;
+            }
+            ComponentHandler::LockdownPreview
         } else {
             return if self.guild_ok(guild_id) {
                 ComponentOutcome::Unknown
@@ -1314,6 +1421,168 @@ mod tests {
                 handler: HandlerId::Rank
             }
         );
+    }
+
+    #[test]
+    fn live_gate_refuses_only_the_live_announcement_surface() {
+        // The per-dispatch live overlay: a stored `0` refuses the eight
+        // live-gated announcement commands with the same disabled reply the
+        // boot-off router produces; LFG (slash and signup share one arm) and
+        // the scorecard surface stay boot-gated.
+        for handler in [
+            HandlerId::FeedAdd,
+            HandlerId::FeedRemove,
+            HandlerId::FeedPause,
+            HandlerId::FeedResume,
+            HandlerId::FeedList,
+            HandlerId::FeedInspect,
+            HandlerId::Rsvp,
+            HandlerId::RsvpAttendance,
+        ] {
+            assert_eq!(
+                live_gate_announcements_slash(SlashOutcome::Handled { handler }, false),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::AnnouncementsDisabled
+                },
+                "{handler:?} refuses while live-off"
+            );
+            assert_eq!(
+                live_gate_announcements_slash(SlashOutcome::Handled { handler }, true),
+                SlashOutcome::Handled { handler },
+                "{handler:?} executes while live-on"
+            );
+        }
+        // Boot-gated surface passes through untouched either way.
+        for handler in [
+            HandlerId::Lfg,
+            HandlerId::LfgClose,
+            HandlerId::ScorecardAttendance,
+            HandlerId::Rank,
+        ] {
+            for live in [false, true] {
+                assert_eq!(
+                    live_gate_announcements_slash(SlashOutcome::Handled { handler }, live),
+                    SlashOutcome::Handled { handler },
+                    "{handler:?} ignores the live bit"
+                );
+            }
+        }
+        // Non-handled outcomes pass through: the router already refused
+        // boot-off rows, and silence/unknown are not announcements business.
+        for outcome in [
+            SlashOutcome::Refuse {
+                refusal: RouterRefusal::AnnouncementsDisabled,
+            },
+            SlashOutcome::Unknown,
+            SlashOutcome::Ignore,
+        ] {
+            for live in [false, true] {
+                assert_eq!(
+                    live_gate_announcements_slash(outcome, live),
+                    outcome,
+                    "{outcome:?} passes through"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_gated_names_match_routed_rows() {
+        // Drift catch for `LIVE_GATED_ANNOUNCEMENT_COMMANDS`: every listed
+        // name must still be a `RowGate::Announcements` row. Feed verbs are
+        // permission-gated, so a permissionless boot-on dispatch refuses with
+        // the permission refusal; RSVP rows carry no permission refusal and
+        // route straight through.
+        let r = InteractionRouter::new(all_on());
+        for name in [
+            "feed-add",
+            "feed-remove",
+            "feed-pause",
+            "feed-resume",
+            "feed-list",
+            "feed-inspect",
+        ] {
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(GUILD), Some(0))),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::ManageServerRequired
+                },
+                "{name} stays a permission-gated announcements row"
+            );
+        }
+        for (name, handler) in [
+            ("rsvp", HandlerId::Rsvp),
+            ("rsvp-attendance", HandlerId::RsvpAttendance),
+        ] {
+            assert_eq!(
+                r.route_slash(&ctx(name, Some(GUILD), Some(0))),
+                SlashOutcome::Handled { handler },
+                "{name} stays a permission-free announcements row"
+            );
+        }
+    }
+
+    #[test]
+    fn live_gate_named_reports_disabled_before_permissions() {
+        // Live-off permissionless dispatch on a gated name hears the disabled
+        // reply, matching boot-off gate-before-permission order; live-on keeps
+        // the permission refusal, and ungated names pass through either way.
+        for name in LIVE_GATED_ANNOUNCEMENT_COMMANDS {
+            assert_eq!(
+                live_gate_announcements_slash_named(
+                    name,
+                    SlashOutcome::Refuse {
+                        refusal: RouterRefusal::ManageServerRequired
+                    },
+                    false
+                ),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::AnnouncementsDisabled
+                },
+                "{name} converts the permission refusal while live-off"
+            );
+            assert_eq!(
+                live_gate_announcements_slash_named(
+                    name,
+                    SlashOutcome::Refuse {
+                        refusal: RouterRefusal::ManageServerRequired
+                    },
+                    true
+                ),
+                SlashOutcome::Refuse {
+                    refusal: RouterRefusal::ManageServerRequired
+                },
+                "{name} keeps the permission refusal while live-on"
+            );
+        }
+        for name in ["lfg", "rank", "no-such-command"] {
+            for live in [false, true] {
+                let outcome = SlashOutcome::Refuse {
+                    refusal: RouterRefusal::ManageServerRequired,
+                };
+                assert_eq!(
+                    live_gate_announcements_slash_named(name, outcome, live),
+                    outcome,
+                    "{name} ignores the live bit"
+                );
+            }
+        }
+        // Already-refused, silent and unknown outcomes are not rewritten.
+        for outcome in [
+            SlashOutcome::Refuse {
+                refusal: RouterRefusal::AnnouncementsDisabled,
+            },
+            SlashOutcome::Unknown,
+            SlashOutcome::Ignore,
+        ] {
+            for live in [false, true] {
+                assert_eq!(
+                    live_gate_announcements_slash_named("feed-resume", outcome, live),
+                    outcome,
+                    "{outcome:?} passes through"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1760,6 +2029,34 @@ mod tests {
             assert_eq!(r.route_component(id, Some(9999)), ComponentOutcome::Ignore);
             assert_eq!(r.route_component(id, None), ComponentOutcome::Ignore);
         }
+        for id in [
+            "lockdown-preview:confirm:3333:0123456789abcdef0123456789abcdef",
+            "lockdown-preview:cancel:3333:0123456789abcdef0123456789abcdef",
+        ] {
+            assert_eq!(
+                r.route_component(id, Some(GUILD)),
+                ComponentOutcome::Handled {
+                    handler: ComponentHandler::LockdownPreview
+                },
+                "{id} routes to the lockdown-preview slice"
+            );
+        }
+        // The guild fence holds for the preview buttons: a foreign guild or
+        // no guild is silent, never an unknown-command reply.
+        assert_eq!(
+            r.route_component(
+                "lockdown-preview:confirm:3333:0123456789abcdef0123456789abcdef",
+                Some(9999)
+            ),
+            ComponentOutcome::Ignore
+        );
+        assert_eq!(
+            r.route_component(
+                "lockdown-preview:cancel:3333:0123456789abcdef0123456789abcdef",
+                None
+            ),
+            ComponentOutcome::Ignore
+        );
         // Modal submits share the table.
         assert_eq!(
             r.route_modal("two:lfg:abc123", Some(GUILD)),
@@ -1796,6 +2093,19 @@ mod tests {
                 "{id} ignored while disabled"
             );
         }
+        // The preview buttons need the moderation gate, not the ticket /
+        // self-role surfaces above: with `TWO_MODERATION=0` they stay silent.
+        let moderation_off = InteractionRouter::new(RouterGates {
+            moderation: false,
+            ..all_on()
+        });
+        assert_eq!(
+            moderation_off.route_component(
+                "lockdown-preview:confirm:3333:0123456789abcdef0123456789abcdef",
+                Some(GUILD)
+            ),
+            ComponentOutcome::Ignore
+        );
         // Guild fence on the fenced components.
         let r = router();
         assert_eq!(

@@ -1089,6 +1089,7 @@ mod tests {
             id: id.to_owned(),
             name: "Sunday Squad".to_owned(),
             starts_at: TEST_START.to_owned(),
+            ends_at: None,
             channel_id: Some("voice-1".to_owned()),
             description: Some("Join the weekly games night.".to_owned()),
             status: EventStatus::Scheduled,

@@ -269,6 +269,11 @@ impl ActionExecutor {
             id: Some(id.to_owned()),
             name: string("name"),
             scheduled_start_time: string("scheduled_start_time"),
+            scheduled_end_time: match body.get("scheduled_end_time") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(end)) => Some(end.clone()),
+                Some(_) => return Err(EventActionError::InvalidResponse),
+            },
             channel_id,
             description: string("description"),
             status: body.get("status").and_then(Value::as_i64),
