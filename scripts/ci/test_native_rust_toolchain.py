@@ -6,11 +6,14 @@ else, so no test touches a real toolchain or the network.
 
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
 import tempfile
 import unittest
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".github/scripts/install-rust-toolchain.sh"
@@ -162,6 +165,59 @@ class NativeRustToolchainTest(unittest.TestCase):
         self.assertNotIn("GITHUB_OUTPUT", text)
         self.assertNotIn("GITHUB_PATH", text)
         self.assertNotIn("GITHUB_STATE", text)
+
+    def test_all_installers_keep_their_components_and_checkout_order(self):
+        expected = {
+            "check.yml": {
+                "check": "rustfmt, clippy", "rust-tests": "rustfmt, clippy", "coverage-plan": "",
+                "coverage-shard": "rustfmt, clippy", "ignored-db-stores": "rustfmt, clippy",
+                "ignored-db-runtime": "rustfmt, clippy", "moderation-db": "clippy", "self-role-store": "",
+                "community-db": "clippy", "feeds-db": "clippy", "tickets-postgres": "", "fuzz-compile": "rust-src",
+            },
+            "helix-token-fuzz-smoke.yml": {"helix-token-smoke": "rust-src"},
+            "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke": "rust-src"},
+            "help-embed-synthetic.yml": {"help-embed-smoke": ""},
+            "nightly.yml": {"sweep-plan": "", "sweep-partition": "", "sweep-guarded": "", "sweep-docs": ""},
+            "pipeline-benchmark.yml": {"benchmark": ""},
+            "reusable-rust-nextest.yml": {"nextest": ""},
+        }
+        actual = {}
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            doc = yaml.safe_load(path.read_text())
+            for job_id, job in doc["jobs"].items():
+                for index, step in enumerate(job.get("steps", [])):
+                    self.assertNotIn("dtolnay/rust-toolchain@", step.get("uses", ""))
+                    if step.get("run") != "bash .github/scripts/install-rust-toolchain.sh":
+                        continue
+                    with self.subTest(workflow=path.name, job=job_id):
+                        self.assertNotIn(job_id, actual.get(path.name, {}))
+                        actual.setdefault(path.name, {})[job_id] = step["env"]["RUST_COMPONENTS"]
+                        self.assertEqual(step["shell"], "bash")
+                        self.assertNotIn("with", step)
+                        self.assertTrue(any(s.get("uses", "").startswith("actions/checkout@")
+                                            for s in job["steps"][:index]))
+        self.assertEqual(actual, expected)
+
+    def test_no_workflow_consumes_installer_outputs(self):
+        # The action exposed cachekey/name/... outputs; the native installer
+        # has none, so no step may read outputs from an installer step.
+        workflows = sorted((ROOT / ".github/workflows").glob("*.yml"))
+        self.assertTrue(workflows)
+        for path in workflows:
+            doc = yaml.safe_load(path.read_text()) or {}
+            for job_id, job in (doc.get("jobs") or {}).items():
+                steps = job.get("steps") or []
+                ids = {
+                    step["id"] for step in steps
+                    if "install-rust-toolchain.sh" in str(step.get("run", "")) and "id" in step
+                }
+                if not ids:
+                    continue
+                body = yaml.safe_dump(job)
+                for step_id in ids:
+                    with self.subTest(workflow=path.name, job=job_id, step=step_id):
+                        refs = re.findall(rf"steps\.{re.escape(step_id)}\.outputs\.\w+", body)
+                        self.assertEqual(refs, [])
 
 
 if __name__ == "__main__":
