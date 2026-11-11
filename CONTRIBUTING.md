@@ -207,12 +207,12 @@ once in the org
 here is a thin caller pinned to a central SHA and passes only this repo's
 generated paths. The labels are advisory only: the `pr-size` job is never a
 required check and never blocks a merge. The separate `pr-size-gate` job in
-the same workflow is required once added to the repository ruleset and fails
+the same workflow is in the `protect-main` ruleset's required list and fails
 pull requests too large for the automated reviewer (warn from 200 counted
-lines, fail over 400 lines or 20 files, hard stop at 1000); it is promoted to
-the ruleset only after it has reported on the default branch (two-step
-ship). A Monday run of the same workflow prints the weekly tally of merged
-pull requests per size; the labels are the durable record behind it.
+lines, fail over 400 lines or 20 files, hard stop at 1000); it was promoted to
+the ruleset after it reported on the default branch (two-step ship). A Monday
+run of the same workflow prints the weekly tally of merged pull requests per
+size; the labels are the durable record behind it.
 
 ### Issues
 
