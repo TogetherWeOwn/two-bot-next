@@ -248,6 +248,12 @@ class CacheTests(unittest.TestCase):
                 (output / 'doc' / 'index.html').write_text('<html></html>')
                 fingerprint = output / '.rustdoc_fingerprint.json'
                 fingerprint.write_text('{}')
+                static = output / 'doc' / 'static.files'
+                static.mkdir()
+                for name in ('SourceSerif4-LICENSE-a2cfd9d5.md',
+                             'FiraSans-LICENSE-a2cfd9d5.md',
+                             'NanumBarunGothic-LICENSE-a2cfd9d5.md'):
+                    (static / name).write_text('licence')
                 self.assertIsNone(cache.preservation_veto(target))
                 foreign = output / 'foreign.json'
                 foreign.write_text('{}')
@@ -255,6 +261,20 @@ class CacheTests(unittest.TestCase):
                               cache.preservation_veto(target))
                 self.assertEqual(foreign.read_text(), '{}')
                 self.assertEqual(fingerprint.read_text(), '{}')
+                foreign.unlink()
+                self.assertIsNone(cache.preservation_veto(target))
+                stashed = output / 'debug' / 'stashed.md'
+                stashed.parent.mkdir(exist_ok=True)
+                stashed.write_text('stashed docs')
+                self.assertIn('preserved file in target: stashed.md',
+                              cache.preservation_veto(target))
+                stashed.unlink()
+                stray = static / 'stashed.md'
+                stray.write_text('not a rustdoc licence')
+                self.assertIn('preserved file in target: stashed.md',
+                              cache.preservation_veto(target))
+                stray.unlink()
+                self.assertIsNone(cache.preservation_veto(target))
 
     def test_evict_refuses_worktree_subdir_with_protected_content(self):
         # Eviction runs the preservation veto first: another worktree's
