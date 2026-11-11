@@ -40,6 +40,17 @@ pub async fn due_event_reminders(
     guild: &str,
     now: u64,
 ) -> Result<Vec<EventReminder>, sqlx::Error> {
+    due_event_reminders_before(pool, guild, now, now.saturating_add(EVENT_REMINDER_LEAD_MS)).await
+}
+
+/// Apply an earlier start cutoff before reading any candidate's attendee roster.
+/// The cutoff cannot widen the ordinary lead window or the two-event batch.
+pub async fn due_event_reminders_before(
+    pool: &PgPool,
+    guild: &str,
+    now: u64,
+    latest_start: u64,
+) -> Result<Vec<EventReminder>, sqlx::Error> {
     sqlx::query_as(
         "SELECT e.event_id, e.name, e.starts_at, e.channel_id,
                 ARRAY(SELECT r.user_id FROM event_rsvps r
@@ -61,10 +72,36 @@ pub async fn due_event_reminders(
     )
     .bind(guild)
     .bind(format_iso_ms(now))
-    .bind(format_iso_ms(now.saturating_add(EVENT_REMINDER_LEAD_MS)))
+    .bind(format_iso_ms(
+        latest_start.min(now.saturating_add(EVENT_REMINDER_LEAD_MS)),
+    ))
     .bind(EVENT_REMINDER_BATCH_LIMIT)
     .bind(MAX_RSVPS_PER_EVENT + 1)
     .fetch_all(pool)
+    .await
+}
+
+/// Whether an unfenced event can still receive its first RSVP before the next
+/// ordinary tick. This does not require or read attendee rosters.
+pub async fn has_pending_event_reminders_before(
+    pool: &PgPool,
+    guild: &str,
+    now: u64,
+    latest_start: u64,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM scheduled_events e
+          WHERE e.guild_id = $1 AND e.status = 'scheduled'
+            AND e.channel_id IS NOT NULL AND e.starts_at > $2 AND e.starts_at <= $3
+            AND NOT EXISTS (SELECT 1 FROM automation_audit_log d
+                             WHERE d.id = 'event:reminder:' || e.guild_id || ':' || e.event_id))",
+    )
+    .bind(guild)
+    .bind(format_iso_ms(now))
+    .bind(format_iso_ms(
+        latest_start.min(now.saturating_add(EVENT_REMINDER_LEAD_MS)),
+    ))
+    .fetch_one(pool)
     .await
 }
 
@@ -73,17 +110,31 @@ pub async fn due_event_reminders(
 /// new claim authorizes POST; an unknown commit result authorizes nothing.
 /// Serializing guild admission also makes the retained-fence cap race-safe.
 /// NULL actor and event-only target contain no member data to erase.
+/// This variant uses a supplied reference time; live dispatch must use
+/// [`begin_event_reminder_delivery_with_clock`] to account for admission waits.
 pub async fn begin_event_reminder_delivery(
     pool: &PgPool,
     guild: &str,
     event: &EventReminder,
     now: u64,
 ) -> Result<bool, sqlx::Error> {
+    begin_event_reminder_delivery_with_clock(pool, guild, event, &|| now).await
+}
+
+/// Sample the clock after acquiring the connection and guild lock. Callers must
+/// also recheck after commit, which can itself outlast the event start.
+pub async fn begin_event_reminder_delivery_with_clock(
+    pool: &PgPool,
+    guild: &str,
+    event: &EventReminder,
+    clock: &impl Fn() -> u64,
+) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('event_reminders:' || $1, 0))")
         .bind(guild)
         .execute(&mut *tx)
         .await?;
+    let now = clock();
     let inserted = sqlx::query(
         "INSERT INTO automation_audit_log
            (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)
