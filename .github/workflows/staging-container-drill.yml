@@ -57,7 +57,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: deploy-staging
+  group: staging-lifecycle
   cancel-in-progress: false
 
 jobs:
@@ -67,7 +67,7 @@ jobs:
     permissions:
       contents: read # checkout only; the drill authenticates with `staging` environment secrets
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'container-drill') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     environment: staging
     timeout-minutes: 30
     steps:
@@ -87,6 +87,7 @@ jobs:
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-container-drill-use.ndjson
           BACKOUT_SOURCE_SHA: ${{ inputs.backout_source_sha }}
           BACKOUT_BUILD_ID: ${{ inputs.backout_build_id }}
           BACKOUT_IMAGE: ${{ inputs.backout_image }}
@@ -112,3 +113,12 @@ jobs:
             --deploy-config "$RUNNER_TEMP/staging-container-deploy.json" \
             --wrangler-bin "$GITHUB_WORKSPACE/wrangler/node_modules/.bin/wrangler" \
             --wrangler-dir "$GITHUB_WORKSPACE/wrangler"
+      - name: Retain container drill and finite-use evidence
+        if: always()
+        uses: actions/upload-artifact@043fb6422e73f0625f431994d867be8cdcc387fd # v7.0.0
+        with:
+          name: staging-container-drill-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/staging-container-drill-evidence.json
+            ${{ runner.temp }}/staging-container-drill-use.ndjson
+          if-no-files-found: error

@@ -48,16 +48,22 @@ build and health, current bindings, database identity, migration/ACL state, and
 an existing reviewed evidence path for joins, voice, messages and slash. A
 missing, failed or unknown fact keeps the gate closed and `T` unset.
 
-The approved policy does not operationally define an ACTIVE hour, the source or
-record shape for its required one-minute samples, or a sample cadence for hours
-1–2. The existing evidence seam is offline, is not wired into the running bot,
-and omits slash; no currently verified reviewed route supplies the required
-four-family live evidence and 120 samples. These terms and sources remain NOT
-VERIFIED, so this gate stays closed. The approved policy names no owner for
-defining or authorizing a live sample method. The separate existing
-technical-policy question remains pending with the CTO; the CEO-held fixture
-authorization is an execution hold, not a definition of the missing terms. No
-new owner or evidence method is assigned here.
+ACTIVE requires exact qualified build/process/environment identity and actual
+representative expected-versus-processed joins, voice, messages and slash with
+affirmative all-family coverage and zero loss, not empty/idle/health-only
+counts. The [B2 evidence contract](staging-soak.md#unresolved-acceptance-terms-and-evidence-gaps)
+requires one-minute sampling from entry through completion, including hours 1–2,
+and 120 distinct mature minute-spaced samples in hours 3–4. No rapid-poll
+substitution is allowed. Four ACTIVE hours remains the conservative envelope,
+not clock acceptance or a supported shorter alternative.
+
+The all-family live sample producer/fixture executor, numeric memory/RSS
+growth/headroom/error-spike criteria and separately authorized startup/cleanup-
+inclusive long-use grant remain unsupported. The offline seam omits slash and
+is not live qualification. B2 remains **NOT VERIFIED**, `T` **unset**, B4
+**NO-GO**. Engineering Lead owns technical disposition and Chief of Staff
+continuation, not a falsely appointed live qualification executor or an unnamed
+old CTO question. Preserve existing credential/rehome/incident holds.
 
 The fixed 60-minute spacing is retired; there is no elapsed-time requirement or
 replacement timed window. Preserve the former window's non-timing stability
@@ -141,9 +147,15 @@ and historical records remain intact.
   as UTC in the existing approved soak record. The first `/readyz` 200, a
   passive wait or an elapsed-time calculation is not `T`; if any input is
   unknown, `T` remains unset.
-- The acceptance interval is **four ACTIVE hours**. Joins, voice, messages and
+- Predeclare the incomplete-attempt stop at `T+4h` only within a separately
+  authorized startup/cleanup-inclusive long-use grant; no grant means no start.
+  The 40min automatic holder cannot authorize B2. Gap, expiry or incomplete
+  evidence at the boundary means INSUFFICIENT/FAIL: safely release/expire, hold
+  and route exact missing proof; no silent reset or renewal.
+- The conservative acceptance envelope is **four ACTIVE hours**. Joins, voice, messages and
   slash remain required; zero missed events is required across the interval.
-- Hours 3–4 require **120 expected one-minute samples**, one for each minute
+- Sample every minute from entry through completion. Hours 3–4 require
+  **120 distinct mature minute-spaced temporal samples**, one for each minute
   across those two hours. These are required, not best-effort. Missing evidence
   yields NOT VERIFIED, never PASS; preserve failed/UNKNOWN intervals and all
   historical records without erasure or reclassification.
@@ -173,13 +185,10 @@ and historical records remain intact.
 - The staging deploy workflow documents a **95–139-second gateway drop per
   deploy**, and a separate historical staging note records a **92–139-second
   redeploy**. These are documented historical interruption ranges, not a
-  verified outage-start-to-recovery measurement; both exceed 60 seconds if a
-  planned redeploy is in scope. The approved policy does not classify planned
-  redeploys as actual outages or name an owner for that classification. The
-  existing technical-policy question remains pending with the CTO; the
-  CEO-held fixture authorization remains the separate execution hold. Until the
-  existing policy path resolves classification and an under-60-second recovery
-  is independently measured, these redeploy exercises cannot establish PASS.
+  verified outage-start-to-recovery measurement. Interrupting planned redeploys
+  count as actual outages by default; historical warnings are not waivers.
+  These exercises cannot establish PASS without independently measured
+  under-60-second recovery and separately authorized stop/restore and budgets.
 - Flat memory and no error spikes remain requirements. Numeric RSS/error
   definitions are unaccepted; the historical B1 RSS receipt is not a new B2
   numeric criterion.

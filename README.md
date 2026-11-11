@@ -138,51 +138,88 @@ are explicitly marked **Not specified in Next**, not guessed from legacy.
 The command rows are no longer committed. The authored
 [command-reference landing page](docs/commands.md) points to the ignored
 `docs/generated/commands.md` and the **command-reference** artifact on each
-Rust-selected check run. Generate explicitly before compiling workspace tests or
-all-targets Clippy. The generator validates tracked configuration first and
+Rust-selected check run. CI generates it explicitly before compiling workspace
+tests or all-targets Clippy. The generator validates tracked configuration first and
 never rewrites it or the saved publication fixtures.
 
-On the persistent controller, after bounded pool admission (the pool policy
-selects controller mode automatically; `--controller` still forces it):
+Use the Actions artifact when Rust is selected, distinguishing the associated
+PR head from the checkout source SHA: default PR runs generate from GitHub's
+synthetic merge tree, not the PR-head tree. Follow the
+[artifact identity guidance](docs/commands.md#read-the-reference), including for
+historical references. Docs-only runs may have no command artifact; use exact-head
+`ci-ok`, selector results and selected jobs as CI evidence, not local generation. CI runs
+`python3 scripts/generate_command_reference.py` and read-only reference tests. Local execution is only for focused
+reproduction of one failing test or crate under the
+[verification policy](CONTRIBUTING.md#focused-failure-reproduction-only), not a
+pre-push build. Heavy focused work uses the guarded Boat wrapper with `--no-env`,
+source-only export and cleanup; permitted non-heavy controller fallback still
+uses the bounded Cargo cache. The generator builds the small core example using
+the canonical renderer; no database, deployment or live values are needed.
 
-```sh
-python3 scripts/generate_command_reference.py --controller
-python3 scripts/cargo_cache.py run -- test -p two-bot-core --test reference_docs
-```
+Configuration remains tracked. Deliberate catalog/supplement changes require
+explicit regeneration through the canonical `regenerate_reference_docs` test in
+`crates/core/tests/reference_docs.rs`, which writes both references. **There is no
+configured Actions route that runs this writer and returns the updated
+configuration.** The ordinary generator only validates tracked configuration;
+it fails on drift before writing commands, and nightly explicitly skips the
+writer to avoid hiding drift.
 
-Outside the controller, use `python3 scripts/generate_command_reference.py`, then
-`cargo test -p two-bot-core --test reference_docs --locked`. The script builds the
-small core example that reuses the canonical renderer; no database, deployment
-or live environment values are needed.
-
-Configuration remains tracked. When deliberately changing its catalog or
-supplement, explicitly regenerate both references with
-`cargo test -p two-bot-core --test reference_docs regenerate_reference_docs -- --ignored`
-(put the Cargo arguments through `scripts/cargo_cache.py` on the controller).
-Review and commit only the configuration change, never generated command rows.
-Ordinary reference tests compare bytes and never regenerate silently: absent,
-stale or malformed generated output fails, and configuration drift remains a
-failure. CI generates before consumers, then runs these read-only tests.
+For a catalog-change task, the author must first arrange narrowly scoped hosted
+regeneration and output retrieval with the CI maintainer through normal
+PR/review gates: bind the writer to the task's exact source SHA, retain run/job
+links and retrieve `docs/configuration.md` for review and commit. This is an
+unmet agent prerequisite, not an already approved command or workflow. Route any
+disputed technical permission to the Engineering Lead; do not invent an approved
+environment, grant a local exception, or silently hand-edit around the writer.
+This documentation does not add that route or authorize regeneration. Never run
+a shared-host build or CI mirror. Review and commit only the configuration
+change, never generated command rows. Ordinary reference tests compare bytes
+and never regenerate silently: absent, stale or malformed generated output and
+configuration drift remain failures. Normal CI generates commands only after
+configuration validation, then runs read-only tests.
 
 ## Contributing
 
 Squash-merge only; PR titles follow Conventional Commits and the body follows the
 [PR template](.github/pull_request_template.md). This repo is public, so keep
 internal tracker IDs out of titles, bodies, commits and branch names. The rulesets
-require `ci-ok`, `gitleaks`, `pr-lint`, `CodeRabbit` and `Devin Review` on the exact
-head commit, with no approving review. The single
-`ci-ok` aggregate gates both selectors, lint (`check`: fmt, clippy -D warnings,
-cargo-deny), all selected `rust tests` and `ignored db` lanes, and `worker check`
-(including the runbook command-drift test). The agent that did the work
-squash-merges once every required check is green and each review finding is fixed
-or answered with evidence. A merge to `main` that touches a path outside the
-`paths-ignore` list in `deploy-staging.yml` (CI scripts and workflows included)
-deploys production, so it also needs the owner's approval. See [Contributing](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). The
-workspace toolchain is pinned in `rust-toolchain.toml`.
+require `ci-ok`, `gitleaks`, `pr-lint` and `Devin Review` on the exact head commit;
+CodeRabbit is advisory, but its findings still need answers. Native task review
+stages remain required. Full suites and CI gates run on **GitHub Actions**, never
+as a local CI mirror. Push the PR branch and keep the PR a draft while incomplete.
+Record the full head SHA and matching Actions run/job links, not local transcripts,
+for reviewers and the Release Manager. The single `ci-ok` aggregate in
+`.github/workflows/check.yml` gates both selectors, lint (`check`: fmt, clippy
+-D warnings, cargo-deny), every selected Rust/database lane and `worker check`
+(including the runbook command-drift test).
 
-Persistent-controller Rust builds use the [bounded Cargo cache wrapper](docs/build-cache.md),
-not a new `target/` in each worktree. The runbook includes offline cache tests,
-fail-closed retention auditing, `/home` available-byte alarms and the Operator rollout.
+The final-stage reviewer squash-merges the pinned settled head before final
+approval; the author merges only without a review stage. Every `main` merge,
+including docs-only, needs the Release Manager's exact-head authorization because
+it can reach production through the promotion path. For web/bot, staging
+qualification is the automatic **post-merge, pre-production exact-main
+staging/e2e/soak gate**, enforced by the promotion guard. Staging accepts only
+main-ancestor SHAs; unmerged-head staging and artifact-equality proofs are not
+substitute merge prerequisites. Runtime-input pushes to `main` start automatic
+qualification; docs-only merges do not trigger `deploy-staging`. Promoting an
+otherwise unqualified exact main SHA (including a docs-only squash SHA) requires
+authorized staging dispatch/qualification first; follow the existing
+[dispatch/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
+without bypassing holds. See
+[Production merge evidence](CONTRIBUTING.md#production-merge-evidence) for the
+superseding contract. Exact-PR-head Actions/Devin, specialist/native review,
+existing production holds, migration/no-migration and rollback evidence, fresh
+per-PR exact-head Release Manager acceptance and release-log recording remain
+required. Neither this policy nor CI evidence claims a staging pass or hold lift,
+or replaces post-merge qualification and exact-SHA artifact/promotion evidence. See
+[Contributing](CONTRIBUTING.md#verification-on-github-actions) and
+[AGENTS.md](AGENTS.md). The toolchain stays pinned in `rust-toolchain.toml`.
+
+Local tests are only for focused reproduction of one failing test or crate;
+heavy focused work uses guarded Boat, never raw-host builds. Permitted non-heavy
+controller fallback uses the [bounded Cargo cache wrapper](docs/build-cache.md),
+not per-worktree `target/` directories or Docker Rust target volumes. A fallback
+never authorizes a full suite or CI mirror.
 
 ## Operations
 

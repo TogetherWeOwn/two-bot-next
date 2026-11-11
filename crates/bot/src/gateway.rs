@@ -1796,7 +1796,22 @@ pub async fn run_shard<I: InviteSource + 'static>(
                                     Some(permit) => {
                                         let interaction = interaction.0.clone();
                                         let runtime = Arc::clone(runtime);
-                                        let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction).await });
+                                        // Per-invocation live announcements bit for the
+                                        // ordered RSVP path (self-role per-dispatch
+                                        // pattern): a stored `0` refuses RSVP commands
+                                        // with the disabled reply before any defer.
+                                        // The runtime's installed test source wins;
+                                        // production reads the poller snapshot.
+                                        let guild = interaction.guild_id.map(|id| id.get().to_string()).unwrap_or_default();
+                                        let boot = runtime.router.gates().announcements;
+                                        let live = runtime
+                                            .live_settings_override()
+                                            .or_else(crate::settings_jobs::live);
+                                        let announcements_live =
+                                            crate::feed_jobs::live_announcements_with(
+                                                &guild, boot, live.as_ref(),
+                                            );
+                                        let acknowledgement = tokio::spawn(async move { runtime.prepare(interaction, announcements_live).await });
                                         // Track owned acknowledgement work so the bounded
                                         // completion policy can cancel it on timeout or
                                         // shard cancellation instead of detaching it.
@@ -2938,6 +2953,68 @@ mod tests {
             assert_eq!(generation.load(Ordering::Acquire), 0);
             assert_eq!(failures.load(Ordering::Acquire), 0);
             assert_eq!(state.read().await.status(), ComponentStatus::Ready);
+        }
+
+        #[tokio::test]
+        async fn checkpoint_io_pending_reports_starting_then_restores_ready_on_success() {
+            let state = RwLock::new(GatewayState::Connected);
+            let generation = AtomicU64::new(0);
+            let failures = AtomicU64::new(0);
+            let (entered, entering) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let operation =
+                checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
+                    entered.send(()).unwrap();
+                    released.await.unwrap();
+                    Ok(())
+                });
+            let observe = async {
+                entering.await.unwrap();
+                // Pending IO: readiness is withdrawn and reports Starting.
+                assert_eq!(*state.read().await, GatewayState::Armed);
+                assert_eq!(state.read().await.status(), ComponentStatus::Starting);
+                release.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+                tokio::join!(operation, observe)
+            })
+            .await
+            .expect("bounded pending checkpoint coordination");
+            result.expect("healthy IO completes");
+            assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(failures.load(Ordering::Acquire), 0);
+            assert_eq!(*state.read().await, GatewayState::Connected);
+            assert_eq!(state.read().await.status(), ComponentStatus::Ready);
+        }
+
+        #[tokio::test]
+        async fn checkpoint_io_pending_failure_never_restores_ready() {
+            let state = RwLock::new(GatewayState::Connected);
+            let generation = AtomicU64::new(0);
+            let failures = AtomicU64::new(0);
+            let (entered, entering) = tokio::sync::oneshot::channel();
+            let (fail, failed) = tokio::sync::oneshot::channel();
+            let operation =
+                checkpoint_io(&state, &generation, &failures, CHECKPOINT_IO_MAX, async {
+                    entered.send(()).unwrap();
+                    failed.await.unwrap();
+                    Err::<(), _>(sqlx::Error::InvalidArgument("test failure".into()))
+                });
+            let observe = async {
+                entering.await.unwrap();
+                assert_eq!(state.read().await.status(), ComponentStatus::Starting);
+                fail.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(CHECKPOINT_IO_MAX, async {
+                tokio::join!(operation, observe)
+            })
+            .await
+            .expect("bounded pending checkpoint failure coordination");
+            assert!(result.is_err());
+            assert_eq!(generation.load(Ordering::Acquire), 0);
+            assert_eq!(failures.load(Ordering::Acquire), 1);
+            assert_eq!(*state.read().await, GatewayState::Armed);
+            assert_eq!(state.read().await.status(), ComponentStatus::Starting);
         }
     }
 

@@ -1,11 +1,9 @@
-"""Pin one runner-routing expression on every job of every workflow (TOG-12339).
+"""Pin explicit standard GitHub-hosted runners in this public repository.
 
-The repo is public and the org's self-hosted runner group refuses public
-repos, so a job with a bare `[self-hosted, two-selfhosted]` label queues
-forever, and a required check behind it (or behind its `needs:`) never
-reports. Every job must use the routing expression documented on `check` in
-check.yml: public repo -> GitHub-hosted, private -> CI_OVERFLOW_* switch, then
-self-hosted. Offline and stdlib-only: no GitHub credentials, no PyYAML.
+Every ordinary job selects ubuntu-latest directly: no dormant private,
+self-hosted or overflow route. A private conversion requires fresh runner and
+cost qualification before execution. Offline and stdlib-only: no GitHub
+credentials, no PyYAML. Visibility is verified separately before execution.
 """
 
 from pathlib import Path
@@ -14,16 +12,15 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github/workflows"
-ROUTED = (
+PUBLIC_RUNNER = "ubuntu-latest"
+# Negative fixture: the former public-first branch still collected private
+# self-hosted/overflow routing in source, even when it was never selected.
+LEGACY_ROUTED = (
     "${{ fromJSON((!github.event.repository.private && '[\"ubuntu-latest\"]') || "
     "(contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), '{job}') && "
     "contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && "
     "vars.CI_OVERFLOW_RUNNER) || '[\"self-hosted\",\"two-selfhosted\"]') }}"
 )
-
-
-def routed(job):
-    return ROUTED.replace("{job}", job)
 
 
 def jobs(text):
@@ -44,7 +41,7 @@ def jobs(text):
 
 
 def violations(text):
-    """Every way a workflow can leave a job on an unroutable runner label."""
+    """Reject indirect or nonstandard runners, including dormant routing."""
     problems = []
     for job, lines in jobs(text).items():
         keys = {
@@ -57,16 +54,17 @@ def violations(text):
             if "runs-on" in keys:
                 problems.append(f"{job}: reusable call must not set runs-on")
             continue
-        if keys.get("runs-on") != routed(job):
-            problems.append(f"{job}: runs-on is {keys.get('runs-on')!r}, not the routed expression")
+        if keys.get("runs-on") != PUBLIC_RUNNER:
+            problems.append(f"{job}: runs-on is {keys.get('runs-on')!r}, not {PUBLIC_RUNNER}")
     # Catch a runs-on hidden anywhere else (nested, flow style, odd indent).
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
     expected = sum(1 for lines in jobs(text).values()
                    if not any(re.match(r"^    uses:", line) for line in lines))
     if len(re.findall(r"(?m)^\s*runs-on:", code)) != expected:
         problems.append("runs-on appears outside the job-level keys")
-    if code.count("two-selfhosted") != expected:
-        problems.append("a self-hosted label appears outside the routed expression")
+    for forbidden in ("self-hosted", "two-selfhosted", "CI_OVERFLOW_"):
+        if forbidden in code:
+            problems.append(f"dormant runner routing remains: {forbidden}")
     return problems
 
 
@@ -75,52 +73,66 @@ def workflow(job_id, runs_on, extra=""):
 
 
 class RepositoryWorkflowTests(unittest.TestCase):
-    def test_every_job_in_every_workflow_uses_the_routed_expression(self):
+    def test_every_job_in_every_workflow_uses_explicit_public_hosted_runner(self):
         files = sorted(WORKFLOWS.glob("*.y*ml"))
         self.assertTrue(files)
-        routed_jobs = 0
+        hosted_jobs = 0
         for path in files:
             text = path.read_text()
             self.assertEqual(violations(text), [], path.name)
-            routed_jobs += text.count("'[\"self-hosted\",\"two-selfhosted\"]'")
-        self.assertGreaterEqual(routed_jobs, 19)
+            hosted_jobs += text.count(f"    runs-on: {PUBLIC_RUNNER}")
+        self.assertGreaterEqual(hosted_jobs, 88)
 
-    def test_required_check_jobs_and_their_needs_are_routed(self):
+    def test_required_check_jobs_and_their_needs_are_hosted(self):
         check = jobs((WORKFLOWS / "check.yml").read_text())
         supply = jobs((WORKFLOWS / "supply-chain.yml").read_text())
         for job, lines in [*((j, check[j]) for j in ("check", "self-role-store", "parity-docs", "container-inputs", "ci-ok")),
                            *((j, supply[j]) for j in ("pr-lint", "gitleaks"))]:
-            self.assertIn(f"    runs-on: {routed(job)}", lines, job)
-
-    def test_public_repo_goes_hosted_before_any_variable_is_read(self):
-        head = routed("x").split("||", 1)[0]
-        self.assertEqual(head, "${{ fromJSON((!github.event.repository.private && '[\"ubuntu-latest\"]') ")
-        self.assertNotIn("vars.", head)
-        self.assertNotIn("self-hosted", head)
+            self.assertIn(f"    runs-on: {PUBLIC_RUNNER}", lines, job)
 
 
 class CheckerMutationTests(unittest.TestCase):
     def test_canonical_job_passes(self):
-        self.assertEqual(violations(workflow("build", routed("build"))), [])
+        self.assertEqual(violations(workflow("build", PUBLIC_RUNNER)), [])
 
     def test_reusable_workflow_call_needs_no_runner(self):
-        text = workflow("build", routed("build"), "  bench:\n    uses: ./.github/workflows/b.yml\n")
+        text = workflow("build", PUBLIC_RUNNER, "  bench:\n    uses: ./.github/workflows/b.yml\n")
         self.assertEqual(violations(text), [])
 
     def test_bare_self_hosted_label_fails(self):
         self.assertTrue(violations(workflow("build", "[self-hosted, two-selfhosted]")))
 
+    def test_legacy_public_private_overflow_route_fails(self):
+        self.assertTrue(violations(workflow("build", LEGACY_ROUTED.replace("{job}", "build"))))
+
     def test_old_self_hosted_default_switch_fails(self):
-        old = routed("build").replace(
+        old = LEGACY_ROUTED.replace("{job}", "build").replace(
             "(!github.event.repository.private && '[\"ubuntu-latest\"]') || ", "")
         self.assertTrue(violations(workflow("build", old)))
 
-    def test_hard_coded_hosted_label_fails(self):
-        # Hosted-only would bill private minutes if the repo goes private again.
-        self.assertTrue(violations(workflow("build", "ubuntu-latest")))
+    def test_indirect_or_nonstandard_hosted_runner_fails(self):
+        for runs_on in ("${{ vars.RUNNER }}", "${{ matrix.runner }}", "ubuntu-latest-16-cores",
+                        "windows-latest", "[ubuntu-latest]", "[ubuntu-latest, self-hosted]"):
+            with self.subTest(runs_on=runs_on):
+                self.assertTrue(violations(workflow("build", runs_on)))
 
-    def test_another_jobs_switch_id_fails(self):
-        self.assertTrue(violations(workflow("build", routed("check"))))
+    def test_dormant_overflow_setting_fails(self):
+        text = workflow("build", PUBLIC_RUNNER, "    env:\n      OLD_RUNNER: ${{ vars.CI_OVERFLOW_RUNNER }}\n")
+        self.assertTrue(violations(text))
+
+    def test_nightly_partitions_use_explicit_public_hosted_runner(self):
+        for job in ("sweep-plan", "sweep-partition", "sweep-guarded", "sweep-docs"):
+            with self.subTest(job=job):
+                self.assertEqual(violations(workflow(job, PUBLIC_RUNNER)), [])
+                self.assertTrue(violations(workflow(job, LEGACY_ROUTED.replace("{job}", "sweep"))))
+                self.assertTrue(violations(workflow(job, LEGACY_ROUTED.replace("{job}", job))))
+                self.assertTrue(violations(workflow(job, LEGACY_ROUTED.replace("{job}", "check"))))
+
+    def test_all_workflows_reject_former_nightly_sweep_aliases(self):
+        for job in ("sweep-plan", "sweep-partition", "sweep-guarded", "sweep-docs", "sweep-extra"):
+            with self.subTest(job=job):
+                self.assertTrue(violations(workflow(job, LEGACY_ROUTED.replace("{job}", "sweep"))))
+                self.assertEqual(violations(workflow(job, PUBLIC_RUNNER)), [])
 
     def test_missing_runs_on_fails(self):
         text = "name: t\non:\n  push:\njobs:\n  build:\n    steps:\n      - run: true\n"
@@ -128,10 +140,10 @@ class CheckerMutationTests(unittest.TestCase):
 
     def test_nested_extra_label_fails(self):
         extra = "    strategy:\n      matrix:\n        runs-on: [self-hosted, two-selfhosted]\n"
-        self.assertTrue(violations(workflow("build", routed("build"), extra)))
+        self.assertTrue(violations(workflow("build", PUBLIC_RUNNER, extra)))
 
     def test_reusable_call_with_runner_fails(self):
-        text = workflow("build", routed("build"),
+        text = workflow("build", PUBLIC_RUNNER,
                         "  bench:\n    uses: ./.github/workflows/b.yml\n    runs-on: ubuntu-latest\n")
         self.assertTrue(violations(text))
 

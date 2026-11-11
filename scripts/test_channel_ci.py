@@ -1,4 +1,4 @@
-"""Offline checks for guarded channel suites and self-hosted nightly isolation."""
+"""Offline checks for guarded channel suites and public-hosted nightly isolation."""
 
 import os
 import re
@@ -8,6 +8,9 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# The nightly sweep is split into four compiling jobs; the `sweep` aggregate
+# (required check name) always runs and is covered by test_nightly_partition_workflow.py.
+SWEEP_COMPILING_JOBS = ("sweep-plan", "sweep-partition", "sweep-guarded", "sweep-docs")
 
 
 def step(workflow, name):
@@ -20,11 +23,16 @@ class ChannelCiTests(unittest.TestCase):
         self.workflow = (ROOT / ".github/workflows/nightly.yml").read_text()
 
     def assert_isolated(self, workflow):
-        # Public-repo routing (TOG-12339): the shared fromJSON expression
-        # selects ubuntu-latest for public repos, so the literal appears in
-        # the expression. What isolation forbids is a hardcoded runner.
-        self.assertNotIn("runs-on: ubuntu-latest", workflow)
-        self.assertIn("!github.event.repository.private", workflow)
+        # Host selection is explicit; database isolation still comes from
+        # the job container and service network, not private runner labels.
+        hosted_jobs = ("changes", "advisories", *SWEEP_COMPILING_JOBS, "sweep")
+        self.assertEqual(len(re.findall(r"(?m)^    runs-on: ubuntu-latest$", workflow)),
+                         len(hosted_jobs))
+        for job in hosted_jobs:
+            body = re.split(r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1)[0]
+            self.assertRegex(body, r"(?m)^    runs-on: ubuntu-latest$", job)
+        self.assertNotIn("CI_OVERFLOW_", workflow)
+        self.assertNotIn("!github.event.repository.private", workflow)
         self.assertNotIn("        ports:", workflow)
         self.assertIn("    container:\n      image: rust:1.99-trixie@sha256:", workflow)
         prepare = step(workflow, "Prepare isolated test databases")
@@ -68,7 +76,11 @@ class ChannelCiTests(unittest.TestCase):
 
     def gate(self, job):
         body = re.split(r"\n  (?=\S)", self.workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1)[0]
-        self.assertIn("    needs: changes\n", body)
+        # Downstream sweep jobs may also need the plan; `changes` must be a
+        # member of the needs list in any YAML form (scalar, flow or block).
+        needs = re.search(r"^    needs:(.*?)(?=^    \S)", body, re.M | re.S)
+        self.assertIsNotNone(needs, f"{job} must declare needs")
+        self.assertIn("changes", re.findall(r"[\w-]+", needs.group(1)), job)
         return re.search(r"^    if: \$\{\{ (.+) \}\}$", body, re.M).group(1)
 
     def runs(self, gate, output, selector_failed=False, cancelled=False):
@@ -86,11 +98,13 @@ class ChannelCiTests(unittest.TestCase):
 
     def test_nightly_gates_heavy_jobs_at_job_level(self):
         self.assertNotIn("    paths:", self.workflow)
-        for job, output in [("pipeline-benchmark", "rust"), ("sweep", "rust"), ("advisories", "supply")]:
+        jobs = [("pipeline-benchmark", "rust"), ("advisories", "supply")]
+        jobs += [(job, "rust") for job in SWEEP_COMPILING_JOBS]
+        for job, output in jobs:
             self.assertEqual(self.gate(job), f"!cancelled() && needs.changes.outputs.{output} != 'false'")
 
     def test_nightly_gates_fail_closed_when_the_selector_job_fails(self):
-        for job in ["pipeline-benchmark", "sweep", "advisories"]:
+        for job in ["pipeline-benchmark", *SWEEP_COMPILING_JOBS, "advisories"]:
             gate = self.gate(job)
             self.assertTrue(self.runs(gate, "true"), job)
             self.assertFalse(self.runs(gate, "false"), job)

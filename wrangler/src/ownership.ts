@@ -146,8 +146,12 @@ export class OwnershipFence {
 /** Whole-body deadline mirroring the receiver convention (internal-actions BODY_TIMEOUT_MS). */
 export const CONTROL_BODY_TIMEOUT_MS = 5_000;
 
-/** Bound control input independently of the untrusted Content-Length header. */
 export async function readChange(request: Request): Promise<OwnershipChange | null> {
+  return parseChange(await readControlBody(request));
+}
+
+/** Bound control input independently of the untrusted Content-Length header. */
+export async function readControlBody(request: Request): Promise<unknown> {
   const reader = request.body?.getReader();
   if (!reader) return null;
   const chunks: Uint8Array[] = [];
@@ -174,7 +178,7 @@ export async function readChange(request: Request): Promise<OwnershipChange | nu
     const bytes = new Uint8Array(size);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-    return parseChange(JSON.parse(new TextDecoder().decode(bytes)));
+    return JSON.parse(new TextDecoder().decode(bytes));
   } catch {
     return null;
   } finally {

@@ -664,10 +664,30 @@ def is_non_file_reference(path):
 # foreign material and vetoes retention eligibility.
 CARGO_TARGET_TOP_LEVEL = frozenset(
     {'debug', 'release', 'doc', 'package', 'tmp',
-     '.rustc_info.json', '.cargo-lock', 'CACHEDIR.TAG'})
+     '.rustc_info.json', '.rustdoc_fingerprint.json', '.cargo-lock', 'CACHEDIR.TAG'})
 # File kinds that must never be treated as regenerable build output.
 PROTECTED_SUFFIXES = frozenset(
     {'.rs', '.md', '.markdown', '.toml', '.bak', '.orig', '.rej', '.pem', '.key'})
+# rustdoc copies its bundled font licences into target's doc/static.files/
+# as *-LICENSE-*.md. That directory is rustdoc output, so those licence
+# files are build output in target scans; every other protected-suffix
+# file vetoes. The exception never applies to scratch scans, whose temp
+# names are arbitrary and never hold rustdoc output.
+RUSTDOC_STATIC_FILES = ('doc', 'static.files')
+
+
+def _is_rustdoc_static_license(base, target, name, suffix):
+    """True for rustdoc-generated font licences under target doc/static.files/.
+
+    Target-only helper: callers in scratch scans must not use it.
+    """
+    if suffix != '.md' or '-license-' not in name.lower():
+        return False
+    try:
+        parts = Path(base).relative_to(target).parts
+    except ValueError:
+        return False
+    return parts == RUSTDOC_STATIC_FILES
 # Directory names that suggest preserved evidence/backups/archives.
 PROTECTED_DIR_NAMES = frozenset(
     {'evidence', 'backup', 'backups', 'archive', 'archives',
@@ -703,6 +723,8 @@ def _preservation_veto_legacy(target):
             if suffix in PROTECTED_SUFFIXES:
                 if suffix == '.rs' and under_codegen_out:
                     continue  # build-script codegen output, not stashed source
+                if _is_rustdoc_static_license(base, target, name, suffix):
+                    continue  # rustdoc font licence, not stashed docs
                 return f'preserved file in target: {name}'
     return None
 
@@ -713,7 +735,9 @@ def preservation_veto(target):
     Calibrated against real Cargo output: a genuine target holds only
     debug/release/doc/package/tmp trees at top level. Nested build-script
     codegen (debug/build/*/out/*.rs) is expected; .rs anywhere else is not
-    Cargo output. Unknown foreign top-level entries fail closed to a veto.
+    Cargo output. rustdoc font licences (doc/static.files/*-LICENSE-*.md)
+    are expected build output; other protected-suffix files veto.
+    Unknown foreign top-level entries fail closed to a veto.
 
     Per-worktree layout: target/ holds only ws-* subdirs, each
     holding Cargo output. Each subdir is veto-checked with the legacy
@@ -775,6 +799,8 @@ def _veto_scan_names(base, target, dirs, files, check_top_level, first):
         if suffix in PROTECTED_SUFFIXES:
             if suffix == '.rs' and under_codegen_out:
                 continue  # build-script codegen output, not stashed source
+            # No rustdoc licence exception here: rustdoc writes to target,
+            # never scratch, whose temp names are arbitrary.
             return f'preserved file in target: {name}'
     return None
 
@@ -938,6 +964,54 @@ def _lock_identity(fd):
 def _lock_path_identity(lock_path):
     info = os.stat(lock_path)
     return (info.st_dev, info.st_ino)
+
+
+def directory_metadata(path):
+    """Capture an existing output root, never invent a replacement's owner/mode."""
+    info = path.lstat()
+    mode = stat.S_IMODE(info.st_mode)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid < 0 or info.st_gid < 0
+            or not any((mode >> shift) & 0o3 == 0o3 for shift in (0, 3, 6))):
+        raise Refusal(f'invalid writable directory metadata: {path}')
+    return info.st_uid, info.st_gid, mode
+
+
+def preflight_metadata_restore(metadata):
+    """Reject known ordinary-credential failures, not promise syscall success."""
+    uid = os.geteuid()
+    if uid == 0:
+        return  # Privileged restoration still has to succeed and verify below.
+    groups = {os.getegid(), *os.getgroups()}
+    for path, (owner, group, mode) in metadata.items():
+        if owner != uid:
+            raise Refusal(f'cannot restore owner of {path}')
+        if group not in groups:
+            parent = path.parent.stat()
+            if parent.st_gid != group or not parent.st_mode & stat.S_ISGID:
+                raise Refusal(f'cannot restore group of {path}')
+            # mkdir can inherit a non-member group, but fchmod clears setgid
+            # for ordinary callers outside that group, even after inheritance.
+            if mode & stat.S_ISGID:
+                raise Refusal(f'cannot restore setgid mode of {path}')
+
+
+def recreate_output_directory(path, metadata):
+    """Restore ownership before mode (chown can clear setgid), under the slot lock."""
+    path.mkdir(mode=0o700)
+    # mkdir applies umask; restore private owner access before the directory open.
+    path.chmod(0o700, follow_symlinks=False)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        uid, gid, mode = metadata
+        info = os.fstat(fd)
+        if (info.st_uid, info.st_gid) != (uid, gid):
+            os.fchown(fd, uid, gid)
+        os.fchmod(fd, mode)
+        info = os.fstat(fd)
+        if (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != metadata:
+            raise Refusal(f'directory metadata restoration did not persist: {path}')
+    finally:
+        os.close(fd)
 
 
 def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
@@ -1160,6 +1234,9 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
             scratch = pending[name]['scratch']
             before_bytes = pending[name]['before_bytes']
             _slot, fd = held[name]
+            mutation_started = False
+            completed_steps = []
+            lease_removed = False
             try:
                 if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
                     results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
@@ -1177,28 +1254,50 @@ def shared_pool_retain(pool, inventory, proc_root='/proc', now=None, max_age=60,
                     results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
                                      'reason': 'slot path escape; skipped, lease kept'}
                     continue
-                shutil.rmtree(target)
-                shutil.rmtree(scratch)
+                # Capture BOTH roots before touching either. Invalid/unreadable
+                # metadata is not permission to recreate with the caller's defaults.
+                metadata = {path: directory_metadata(path) for path in (target, scratch)}
+                preflight_metadata_restore(metadata)
+                if now - captured + time.monotonic() - started > max_age:
+                    raise Refusal('retain took too long; capture a new inventory')
+                mutation_started = True  # even a failing rmtree may remove some output
+                for path in (target, scratch):
+                    shutil.rmtree(path)
+                    completed_steps.append(f'{path.name}_removed')
+                for path in (target, scratch):
+                    recreate_output_directory(path, metadata[path])
+                    completed_steps.append(f'{path.name}_restored')
+                if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
+                    raise Refusal(f'lock file replaced during mutation: {name}')
+                # Keep the crash sentinel until both roots are usable again.
                 lease = slot / 'lease.json'
                 try:
                     lease.unlink()
+                    lease_removed = True
                 except FileNotFoundError:
                     pass
-                target.mkdir()
-                scratch.mkdir()
-                if _lock_path_identity(slot / 'lock') != _lock_identity(fd):
-                    raise Refusal(f'lock file replaced during mutation: {name}')
                 after_bytes = usage(slot)
                 results[name] = {'slot': name, 'path': str(slot), 'eligible': True,
                                  'reason': 'retained; exact slot output reclaimed',
                                  'before_bytes': before_bytes, 'after_bytes': after_bytes,
                                  'reclaimed_bytes': before_bytes - after_bytes,
+                                 'directory_metadata_preserved': True,
                                  'lock_held_through_mutation': True}
-            except Refusal:
-                raise
-            except (OSError, ValueError) as error:
+            except (Refusal, OSError, ValueError) as error:
                 results[name] = {'slot': name, 'path': str(slot), 'eligible': False,
-                                 'reason': f'mutation failed ({error}); skipped'}
+                                 'reason': (f'retain failed ({error}); '
+                                            + ('output may be partially mutated; STOP'
+                                               if mutation_started else 'no mutation; lease kept')),
+                                 'mutation_failed': True, 'mutation_started': mutation_started,
+                                 'completed_steps': completed_steps, 'lease_removed': lease_removed,
+                                 'before_bytes': before_bytes}
+                # Do not continue mutating other slots after a failed lifecycle.
+                for remaining in pending.keys() - results.keys():
+                    results[remaining] = {'slot': remaining,
+                                          'path': str(pending[remaining]['slot']),
+                                          'eligible': False,
+                                          'reason': 'earlier retain failure; skipped, lease kept'}
+                break
         for name in sorted(results):
             ordered.append(results[name])
         return {'version': 1, 'retain': True, 'mutation': True,
@@ -1489,6 +1588,52 @@ def filesystem_finding(path, backing_path, floor):
     return None
 
 
+def retain_with_evidence(pool, inventory, proc_root, evidence):
+    """Prove a new external receipt is writable before any retention mutation.
+
+    This is not the Operator's lease archive or transcript. A prepared record
+    without a final receipt means the outcome is unknown, NOT no mutation.
+    """
+    pool = real_directory(pool)
+    evidence = Path(os.path.abspath(evidence))
+    real_directory(evidence.parent)
+    if evidence.resolve().is_relative_to(pool):
+        raise Refusal('retain evidence must be outside the pool')
+    fd = os.open(evidence, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    result = None
+    final_error = None
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(json.dumps({'version': 1, 'state': 'prepared', 'pool': str(pool),
+                                     'outcome': 'unknown until final receipt',
+                                     'captured_at_unix': inventory.get('captured_at_unix')}))
+            stream.flush()
+            os.fsync(stream.fileno())
+            parent_fd = os.open(evidence.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+            result = shared_pool_retain(pool, inventory, proc_root=proc_root)
+            try:
+                stream.seek(0)
+                stream.write(json.dumps(result, sort_keys=True))
+                stream.truncate()
+                stream.flush()
+                os.fsync(stream.fileno())
+            except OSError as error:
+                final_error = error  # A secondary close/flush failure must not replace this.
+                raise
+    except OSError as error:
+        if result is None:
+            raise  # Preparation failed before retention returned any result.
+        cause = final_error if final_error is not None else error
+        print(json.dumps(result, sort_keys=True), file=sys.stderr)
+        raise Refusal('final evidence write failed; retention may have mutated '
+                      f'output: {cause}') from cause
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
@@ -1519,10 +1664,11 @@ def main():
         if args.command == 'audit':
             result = retention_audit(args.worktrees, json.loads(args.inventory.read_text()))
         elif args.command == 'retain':
-            result = shared_pool_retain(args.pool, json.loads(args.inventory.read_text()),
-                                        proc_root=args.proc_root)
-            if args.evidence is not None:
-                args.evidence.write_text(json.dumps(result, sort_keys=True))
+            inventory = json.loads(args.inventory.read_text())
+            if args.evidence is None:
+                result = shared_pool_retain(args.pool, inventory, proc_root=args.proc_root)
+            else:
+                result = retain_with_evidence(args.pool, inventory, args.proc_root, args.evidence)
         else:
             if args.min_available_bytes <= 0:
                 raise Refusal('available-byte floor must be positive')
@@ -1530,6 +1676,8 @@ def main():
             if result is None:
                 return 0  # Healthy monitoring is silent.
         print(json.dumps(result, sort_keys=True))
+        if args.command == 'retain' and any(row.get('mutation_failed') for row in result['slots']):
+            return 75
         return 1 if args.command == 'filesystem' else 0
     except (Refusal, OSError, ValueError, KeyError, IndexError, subprocess.CalledProcessError) as error:
         print(json.dumps({'finding': 'refused', 'reason': str(error)}), file=sys.stderr)

@@ -28,29 +28,128 @@ name: help-embed-synthetic
 # a missing binding fails closed and an unconfigured gate cannot read green.
 on:
   workflow_call:
-    # The caller must pass the token by name: an environment secret resolves
-    # to "" inside a called workflow unless the caller passes it, even though
-    # this job declares `environment: voice-synthetic`.
+    # The test token crosses the boundary by name. The control token stays in
+    # the separate staging-environment job and never enters the consumer.
+    inputs:
+      staging_use_expires_at:
+        type: string
+        required: true
+      staging_use_sha:
+        type: string
+        required: true
+      staging_use_deployment:
+        type: string
+        required: true
     secrets:
       TWO_VOICE_SYNTHETIC_BOT_TOKEN:
         required: false
+      # The caller must pass this name for the staging Environment to resolve
+      # it in the authorization job; the consumer never references it.
+      STAGING_OWNERSHIP_CONTROL_TOKEN:
+        required: true
   workflow_dispatch:
 
 permissions: {}
 
+# Standalone owns the global window; a called run must never wait on its
+# parent's lock. Inputs are workflow_call-only and come from deploy outputs.
 concurrency:
-  group: help-embed-synthetic
+  group: ${{ inputs.staging_use_expires_at != '' && format('staging-help-consumer-{0}', github.run_id) || 'staging-lifecycle' }}
   cancel-in-progress: false
 
 jobs:
+  staging-window:
+    name: authorize staging use before the consumer
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    environment: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    outputs:
+      expires_at: ${{ steps.begin.outputs.expires_at }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Acquire a finite standalone window and prove readiness
+        id: begin
+        if: inputs.staging_use_expires_at == ''
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_MINUTES: '45'
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use.jsonl
+        run: node wrangler/scripts/staging-use-pipeline.mjs begin
+      - name: Assert the caller's exact window and readiness
+        if: inputs.staging_use_expires_at != ''
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_SHA: ${{ inputs.staging_use_sha }}
+          STAGING_USE_DEPLOYMENT: ${{ inputs.staging_use_deployment }}
+          STAGING_USE_EXPIRES_AT: ${{ inputs.staging_use_expires_at }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use.jsonl
+        run: node wrangler/scripts/staging-use.mjs ready
+      - name: Retain the acquisition or assertion receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-use-help-start-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-use.jsonl
+          if-no-files-found: error
+          retention-days: 14
+
+  # Called runs never release the parent's grant. The workflow lock covers
+  # standalone begin, consumer and cleanup; native expiry covers runner loss.
+  staging-use-release:
+    needs: [staging-window, help-embed-smoke]
+    if: inputs.staging_use_expires_at == '' && always() && github.ref == 'refs/heads/main' && needs.staging-window.outputs.expires_at != ''
+    permissions:
+      contents: read
+    environment: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Release only this standalone run's window
+        if: inputs.staging_use_expires_at == ''
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.staging-window.outputs.expires_at }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-release.jsonl
+        run: node wrangler/scripts/staging-use-pipeline.mjs finish
+      - name: Retain the cleanup receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: staging-use-help-stop-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/staging-use-release.jsonl
+          if-no-files-found: error
+          retention-days: 14
+
   help-embed-smoke:
     name: staging help embed smoke
+    needs: staging-window
     permissions:
       contents: read
     if: github.ref == 'refs/heads/main'
     environment: voice-synthetic
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'help-embed-smoke') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

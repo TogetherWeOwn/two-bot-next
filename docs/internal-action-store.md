@@ -56,7 +56,7 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
   private fields and is only produced after intent and audit commit.
 - `claim_notify(&RequestIdentity, &AuditSubject, event_key)` applies the same
   claim fence for the two DM verbs and pins the validated 1–64-character event-key
-  scalar on the intent and every audit phase (migration `0471`). A changed event
+  scalar on the intent and every audit phase (migration `0473`). A changed event
   key refuses as a mismatch, including when reclaiming a proven-unsent intent.
   It also owns the durable per-member limiter: in the claim transaction it locks
   the `internal_notify_budgets` row (key: SHA-256 of `notify:<canonical

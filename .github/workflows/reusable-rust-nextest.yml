@@ -45,14 +45,14 @@ jobs:
     name: rust nextest
     permissions:
       contents: read
-    # Runner routing (TOG-12339): public repo -> GitHub-hosted, private ->
-    # CI_OVERFLOW_* switch for this named job, then the self-hosted pool.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'nextest') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: explicit standard GitHub-hosted ubuntu-latest; this is
+    # a public repository.
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     # Same job-container and disposable Postgres service as the `rust-tests`
     # lane in check.yml: the lib/bins run below needs the CI test database.
     # A job container gets its own network namespace, so no published host
-    # port collides on the shared self-hosted Docker host.
+    # port must not be published outside the isolated service network.
     container:
       image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     # NOTE: job-container steps default to sh (no pipefail), so every run

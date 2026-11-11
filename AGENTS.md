@@ -50,38 +50,51 @@ its remaining findings, then push the resolution before expecting GitHub to merg
 
 ## Test and build commands
 
-Run the commands that cover your change before every push. The full list, in CI
-order, is in [`CONTRIBUTING.md`](CONTRIBUTING.md#pre-push-checklist).
+Full test suites and CI gates run on **GitHub Actions**, not the shared host.
+Push the PR branch and open a **draft PR** while incomplete; mark it ready only
+when the work is complete. The existing `.github/workflows/check.yml` owns
+`ci-ok`, including both selectors, lint and every selected test/build lane.
+Keep all required checks, security, native review and release gates unchanged.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md#verification-on-github-actions) for the
+push/check workflow and exact-head evidence requirements.
 
-```sh
-cargo fmt --all -- --check
-python3 scripts/generate_command_reference.py
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
-```
+Before pushing docs, run focused static checks such as `git diff --check` and
+`python3 scripts/check_docs_index.py --json`. Never run a local full-suite or
+CI-mirror command: `python3 scripts/local_testdb.py test`, workspace-wide Cargo
+test/Clippy/build, Worker CI sequences, or a `bin/local-ci.sh` recipe. There is
+no tracked `bin/local-ci.sh` in this repo. Splitting a suite into local commands
+does not make it focused.
 
-The generated reference is ignored at `docs/generated/commands.md`; the tracked
-`docs/commands.md` is its landing page. Generate explicitly before test-target
-compilation. On the controller the bounded pool policy selects controller mode
-implicitly (`--controller` and `TWO_CARGO_CONTROLLER=1` still force it;
-`TWO_CARGO_CONTROLLER=0` forces plain cargo); this builds only the generator
-through the bounded cache wrapper. Being inside a Paperclip run does not
-select it, and hosted CI keeps plain cargo. The generator
-never rewrites tracked configuration or independent publication fixtures.
+Local execution is allowed only to reproduce one failing test or crate. Heavy
+focused builds use the guarded `boat` PATH wrapper, its sizing/budget/security
+controls, `--no-env`, a source-only export and verified cleanup; never bypass it.
+Boat fallback never authorizes a full suite/CI mirror or heavy raw-host build.
+If the focused/local limit cannot be met, use Actions or route the actual
+prerequisite. The bounded cache rules below still govern permitted non-heavy
+focused controller Cargo fallback.
 
-On the persistent Paperclip controller, run the compiling commands through the
-cache wrapper described under [Controller builds](#controller-builds).
+CI runs `python3 scripts/generate_command_reference.py` to generate ignored
+`docs/generated/commands.md` before test-target compilation and
+`cargo clippy --workspace --all-targets`; these are Actions steps, not local
+pre-push commands. For an allowed focused controller reproduction only, the
+generator's `--controller` option enforces bounded cache admission, not permission
+to mirror CI. [`docs/commands.md`](docs/commands.md) links the artifacts. The generator never
+rewrites tracked configuration or independent publication fixtures. Database
+tests use only disposable test services, never staging or production; retain
+all guards in [`CONTRIBUTING.md`](CONTRIBUTING.md#database-tests).
 
-The `wrangler/` Worker wrapper has its own `npm ci`, `npm run typecheck` and
-`npm test`. Database tests run only against a disposable test database, never
-staging or production; see [`CONTRIBUTING.md`](CONTRIBUTING.md#database-tests).
-`python3 scripts/local_testdb.py test` runs the CI `rust-tests` steps against a
-disposable Docker Postgres in one command.
+Record the PR's full head SHA and matching Actions run/job URLs for reviewers
+and the Release Manager. Local transcripts are focused reproduction evidence,
+not CI evidence. The final-stage reviewer merges the pinned settled head before
+final approval (the author merges only without a review stage). A merge to
+`main`, including docs-only, needs Release Manager exact-head authorization on
+a child task assigned/addressed to it with `resolverPolicy: not_creator`.
 
 ## Definition of done
 
 - The behavior matches the request.
-- The tests that cover it pass locally.
+- Relevant tests pass in GitHub Actions, with exact-head run/job links recorded.
+- Any permitted focused reproduction and checks not run are disclosed.
 - CI is green on the exact head commit.
 - Review is complete on that same head commit.
 - The PR is squash-merged.
@@ -89,9 +102,11 @@ disposable Docker Postgres in one command.
 
 ## Controller builds
 
-On the persistent Paperclip controller, run compiling Cargo commands through
+Only for a permitted non-heavy focused failure reproduction/fallback on the
+persistent Paperclip controller, run Cargo through
 `python3 scripts/cargo_cache.py run -- <check|test|clippy|build> ...` from your own
-isolated workspace. Pick the smallest test/package that proves the change.
+isolated workspace. Pick one failing test or crate, never the full workspace.
+This cache wrapper is not an alternative location for CI or heavy builds.
 The wrapper supplies offline/locked mode, lean dev/test settings and one of two
 independent cache leases. See [the build-cache runbook](docs/build-cache.md).
 
@@ -99,18 +114,16 @@ Do not create a per-worktree `target/` or an external/container `/tmp` Cargo tar
 point Cargo at the old unbounded shared cache, change agent environments/rosters,
 or evade a busy/refused/missing pool by running Cargo directly. The wrapper places
 cooperative temporary output in quota-covered lease scratch, not container `/tmp`.
-Run the wrapper with a Bash timeout that covers the build (600000 ms) or in the
-background; interrupted partial output stays in the slot and counts against its
-budget. A missing pool/quota/scratch-coverage receipt needs the Operator rollout;
-a full pool needs safe retention/continuation, not another cache. Agents must not
+Run permitted focused commands in the foreground with a timeout covering the
+command; read the result in the same run. Interrupted partial output stays in
+the slot and counts against its budget. A missing pool/quota/scratch-coverage
+receipt needs the Operator rollout; a full pool needs safe retention/continuation,
+not another cache. Agents must not
 clear crash sentinels, delete host caches, mount filesystems or restart services.
 
-`cargo fmt --all -- --check` does not compile and can run directly. The cache
-regressions are offline Python fixtures:
-
-```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
-```
+`cargo fmt --all -- --check` does not compile and can run directly. Cache
+regressions are offline Python fixtures run by Actions. Reproduce only a failing
+fixture locally, not the fixture suite as a CI mirror.
 
 Ephemeral hosted CI and Docker image builds keep their existing Cargo commands.
 Do not use production/staging databases for tests; use only authorized test

@@ -37,7 +37,7 @@ INSERT and UPDATE only, never DELETE/TRUNCATE. The reservation rows preserve
 accepted room-create history across rollback, deletion and restart; runtime can
 settle a hold but cannot erase that durable history. Notification budget rows
 likewise retain rolling admissions and clock high-water across receiver restarts;
-reapply the reviewed role plan after migration `0471` before enabling member
+reapply the reviewed role plan after migration `0473` before enabling member
 notifications. Reader and PUBLIC receive
 no admission-lane access. The verifier requires these three runtime privileges,
 read-only SELECT for the migrator-plan role, and rejects extra erase or public access.
@@ -115,6 +115,14 @@ do carry member columns (`created_by`, `user_id`, `winner_ids`, and the
 `single:<id>` replaced-winner id inside `reroll_kind`), so member erasure
 and guild purge cover all three tables in the reviewed erasure plan; there
 is no reader grant beyond the app pool.
+
+The event instance window table (`event_instance_windows`) is ordinary `table`
+kind for the same reason: the transactional event-observation writers and the
+voice lookup read and write it through the app pool. It holds non-member
+durable lifecycle, order and revocation evidence keyed by guild, event and
+instance start, with no member column, so there is nothing to erase and no
+reader grant beyond the app pool. Backups archive it (v16); an old-format
+restore clears it and never backfills liveness.
 
 The reader cannot read bot base tables, including through inherited/public or
 column-level grants. Normal PostgreSQL views deliberately run with their owner's

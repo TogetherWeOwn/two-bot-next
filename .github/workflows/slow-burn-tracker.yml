@@ -7,7 +7,10 @@ name: slow-burn-tracker
 # continues, and closes it when the burn clears. An unknown verdict never
 # closes an open card.
 #
-# How it works: every five minutes the tracker scrapes staging /ops/metrics
+# How it works: every five minutes the tracker observes staging authority with
+# the existing control bearer (no startup/acquire/extension). Confirmed idle
+# retains unknown-health evidence without a scrape, issue write or cache save.
+# During an active window it scrapes staging /ops/metrics
 # with the environment bearer, appends the snapshot to the cached burn ring
 # and asks the checked-in evaluator (wrangler/scripts/slow-burn-decide.mjs,
 # zero edits to the rule file) whether the slow ticket fires. The five-minute
@@ -70,7 +73,7 @@ jobs:
     environment:
       name: staging
       deployment: false
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'tracker') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -91,7 +94,24 @@ jobs:
           key: slow-burn-ring-v1-${{ github.run_id }}
           restore-keys: |
             slow-burn-ring-v1-
+      # Read only the authenticated control state. Never acquire a window for
+      # a periodic scrape, and never treat idle as a healthy sample/recovery.
+      - name: Observe the staging window without starting it
+        id: window
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+          METRICS_CONFIGURED: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN != '' }}
+          STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use-observer.jsonl
+        run: |
+          set -euo pipefail
+          if [ "$METRICS_CONFIGURED" != "true" ]; then
+            echo "::error::STAGING_METRICS_SCRAPE_TOKEN is unset; refusing a sample-free green run"
+            exit 1
+          fi
+          node wrangler/scripts/staging-use.mjs observe
       - name: Run the slow-burn tracker
+        if: steps.window.outputs.sample == 'true'
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
@@ -109,7 +129,7 @@ jobs:
       # Save-only without restore-keys: restoring here would overwrite the
       # tracker's fresh ring with the stale cached copy before the save.
       - name: Save the burn ring and coverage
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.window.outputs.sample == 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -124,6 +144,8 @@ jobs:
           path: |
             slow-burn-tracker-evidence.json
             slow-burn-exposition.prom
+            ${{ runner.temp }}/staging-use-observer.jsonl
+          if-no-files-found: error
           retention-days: 14
 
   # Dispatched fire/clear proofs only: no environment, no scrape bearer, no
@@ -134,7 +156,7 @@ jobs:
       contents: read # checkout only; proofs read no environment secret
       issues: write # file and resolve the proof card under the slow-burn-test label
     if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && (github.event.inputs.fixture == 'fire' || github.event.inputs.fixture == 'clear')
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'fixture') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

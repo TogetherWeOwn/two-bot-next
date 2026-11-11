@@ -181,7 +181,7 @@ in `docs/production-deploy.md`).
 1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values), only under the separately authorized enablement contract; no role keys or optional capability gates travel through this Worker.
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
-4. Operator applies migrations `0423` (settings CAS), `0424` (event outcome), and `0471` (member-notify idempotency verbs and the durable member budget table) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
+4. Operator applies migrations `0423` (settings CAS), `0424` (event outcome), and `0473` (member-notify idempotency verbs and the durable member budget table) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
 5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete --env staging TWO_INTERNAL_ACTIONS --message <sha>`, same precheck and stamp as above), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
 
 Migration `0424` adds the nullable `internal_idempotency.outcome` column that
@@ -196,7 +196,7 @@ replay reads it, so apply it before this binary and roll back in the same order
 as `0424`: disable the receiver and deploy the previous binary, then drop both
 columns.
 
-Migration `0471` widens the `internal_idempotency.action` allowlist to admit
+Migration `0473` widens the `internal_idempotency.action` allowlist to admit
 `reminder.send` and `place_offer.send`, and widens the
 `internal_action_log.evidence_code` allowlist with `suppressed` for the consent
 backstop. It adds nullable `event_key` columns to intents and audit rows,
@@ -211,7 +211,7 @@ leave the additive columns and widened constraints in place so notification
 receipts remain available. Restoring the old constraints requires separately
 handling retained notification rows, not deleting their evidence.
 
-`0471` also creates `internal_notify_budgets`, the durable per-member limiter.
+`0473` also creates `internal_notify_budgets`, the durable per-member limiter.
 Its primary key is the lowercase SHA-256 hex of `notify:<canonical discord_id>`
 (CHECK `^[a-f0-9]{64}$`), so no member ID, event name or DM text is stored. The
 other columns are numeric only: `credit_ms` (0 to 25,920,000, the 3-admission
@@ -459,12 +459,34 @@ Success (`200` only, `result` always an object, no `error` key):
 | announcement.post | `{message_id}` | |
 | event.upsert/cancel | `{outcome, event_id}` | `outcome` replayed from the stored receipt |
 | event.read | full observed event | behind its allowlist flag |
-| voice.snapshot | live voice-room listing | behind its allowlist flag; refuses `discord_unavailable` unless the gateway is connected, so a warm cache never serves stale occupancy mid-reconnect |
+| voice.snapshot | live voice-room listing | behind its allowlist flag; refuses `discord_unavailable` unless the gateway is connected, so a warm cache never serves stale occupancy mid-reconnect. Each room carries `occupied_since` (Zulu instant the current continuous occupancy began, or `null` when unknown — empty rooms and joins the gateway never witnessed are unknown, never guessed) and, only on the room bound to a currently-windowed event's voice channel, `event_key` (absent means unlinked). A store error behind the key map refuses `internal` instead of serving key-omitted rooms |
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
 | role.assign / guild.add_member | `{outcome}` | `assigned`/`already_held`, `added`/`already_member` |
 | reminder.send / place_offer.send | `{outcome}` | `sent`/`dm_unavailable`; `dm_unavailable` (closed DMs, blocked bot, member not in guild, or suppressed member — a suppressed refusal carries the `suppressed` audit scalar) is a 200 that consumes no place; the wire carries no `message_id`. A shared durable per-member budget (burst 3, exact integer refill of 10/day, strict ceiling of 10 admissions in any rolling 24 hours) is stored in `internal_notify_budgets` under the SHA-256 of `notify:<canonical discord_id>`. In the same transaction as a new claim, `claim_notify` locks that row and charges it only when the claim is `Claimed`; the charge, intent and audit commit together. An exhausted budget rolls back the tentative claim and audit and answers `rate_limited` with `Retry-After` (internal log reason `rate_limited_notify`). Replays, mismatches and in-flight answers are never charged. Every committed new claim counts, including suppressed or closed-DM refusals and proven-unsent 429 retries; denied and replayed requests do not. State persists across processes and restarts. `authorize` only applies the caller limit and validates the facts |
 | moderation.\* | `{outcome[, affected]}` | |
+
+Snapshot event links use accepted, non-member `event_instance_windows`
+evidence (migration 0472), not channel-claim dates or the continued existence
+of a mirror row. Poll swaps and confirmed action responses synchronize it in
+the mirror transaction. Rescheduling updates the window, never the immutable
+instance identity. A completed event with a confirmed end retains only its
+original end + 15 minutes after ordinary mirror omission; omission of a live
+or unknown event does not manufacture completion. The committed guild snapshot
+epoch fences stale/equal liveness replays, even for a never-mirrored legacy
+binding. Ordinary omission records a separate `omitted_at` fence for ordering
+and rollback recency without advancing the last confirmed lifecycle stamp:
+a delayed terminal observation newer than that stamp still applies to an
+established instance. Confirmed completion with a finite end proves grace;
+cancellation or confirmed deletion revokes it, even if a compatibility-only
+mirror replay has a newer stamp. Ambiguous instances or multiple site aliases omit
+`event_key`; database failure still refuses the snapshot. Legacy bindings
+alone never backfill live evidence. This does not add end times to `event.read`,
+change v1, persist occupancy or require a new privileged gateway intent.
+Confirmed deletion has a transactional store seam; no gateway deletion consumer
+or additional gateway intent is added here. An ordinary missing poll row is
+never treated as a confirmed deletion.
+The production snapshot flag remains off pending separate rollout acceptance.
 
 Refusals keep their code, status and retry policy with the fixed message
 `request refused`:

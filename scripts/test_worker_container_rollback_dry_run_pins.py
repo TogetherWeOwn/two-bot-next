@@ -10,8 +10,8 @@ offline fixtures by import (read-only; the protected file is unchanged):
    deferred to takeover (the live path only fences inside takeover after the
    image rollout in that case), while the worker-leg case keeps the
    pre-restore fence line.
-2. Pre-stamp snapshot dry-run: a snapshot with no recorded SHA exits 0 with
-   the exact no-sha gate line, no `None` text, and zero POSTs.
+2. Pre-stamp staging snapshot dry-run: a snapshot with no recorded SHA
+   refuses before planning or mutation. It never prints a no-sha gate line.
 3. No evidence write: a dry-run leaves the `--evidence` path absent, and a
    pre-existing evidence file byte-identical.
 
@@ -70,7 +70,7 @@ class DryRunPinTests(acc.DryRunCase):
         self.assert_no_posts(client, out)
         self.assert_no_mutations(calls, out)
 
-    def test_pre_stamp_snapshot_dry_run_prints_no_sha_gate(self):
+    def test_pre_stamp_staging_snapshot_refuses_before_planning(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = acc.write_snapshot(tmp, serving_sha=None,
                                        provenance_complete=False)
@@ -83,13 +83,15 @@ class DryRunPinTests(acc.DryRunCase):
                                    lambda *a, **k: control):
                 code, out = self.run_dry(acc.snapshot_argv(path, evidence),
                                          client)
-        self.assertEqual(code, 0, out)
-        plan = self.plan_lines(out)
-        self.assertEqual(plan[4],
-                         f"dry-run plan: gate stable readyz for version "
-                         f"{acc.GOOD_VERSION} pre-stamp no-sha")
-        self.assertNotIn("None", out, f"plan must never print None: {out[:400]}")
+            self.assertFalse(evidence.exists(),
+                             "refused staging target must not write evidence")
+        self.assertEqual(code, 1, out)
+        self.assertIn("staging_restore_identity_invalid", out)
+        self.assertNotIn("dry-run plan:", out)
+        self.assertNotIn("pre-stamp no-sha", out)
+        self.assertNotIn("None", out, f"refusal must never print None: {out[:400]}")
         self.assert_no_posts(client, out)
+        self.assertEqual(calls, [], "refused target must not query ownership")
         self.assert_no_mutations(calls, out)
 
     def test_dry_run_writes_no_evidence_file(self):

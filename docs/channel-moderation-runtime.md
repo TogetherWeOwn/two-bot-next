@@ -146,7 +146,7 @@ integrated compatibility must be checked when the member slice merges.
 ## Verification and remaining gate
 
 PR CI is the Rust verification of record under the 2026-10-01 CEO decision on
-TOG-11174; the private repository now uses `[self-hosted, two-selfhosted]` runners.
+TOG-11174; this public repository now selects standard GitHub-hosted `ubuntu-latest`.
 The deferred Operator cache rollout TOG-10906 does not gate PR CI. Controller
 compilation still requires admitted bounded-wrapper leases; no direct/unadmitted
 controller compilation or workflow dispatch is used. Local noncompiling checks

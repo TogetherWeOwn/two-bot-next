@@ -95,7 +95,7 @@ use two_bot_discord::internal_member_moderation::{
 };
 use two_bot_discord::{ActionExecutor, DiscordError, EventActionError, EventCall};
 
-use crate::voice_snapshot::{self, SnapshotRefusal};
+use crate::voice_snapshot::{self, SnapshotRefusal, VoiceOccupancyClock};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const MAX_HEADERS: usize = 64;
@@ -955,6 +955,11 @@ struct ReceiverState {
     /// receiver only projects. A cold cache reads as `discord_unavailable`,
     /// never as an empty guild.
     voice_cache: Arc<DefaultInMemoryCache>,
+    /// In-memory join clock feeding the keyless `voice.snapshot`
+    /// `rooms[].occupied_since`. The gateway loop owns the writes through its
+    /// pipeline observer; the receiver only stamps. An unwired clock reads
+    /// every room as `null`, never as a fabricated start.
+    voice_clock: Arc<VoiceOccupancyClock>,
     /// Live gateway readiness for the keyless `voice.snapshot` read. The
     /// supervisor owns the writes (`GatewayState::Connected` only on a
     /// committed READY/RESUMED, `Armed` again on every transport loss); the
@@ -1007,8 +1012,12 @@ impl ReceiverState {
             // shared gateway handle below, so an unwired state reads as
             // `discord_unavailable`, never as an empty guild. Not ready by
             // default for the same reason: the readiness gate refuses until
-            // the live gateway state is attached and connected.
+            // the live gateway state is attached and connected. Unstamped by
+            // default for the same reason again: without the pipeline's
+            // observer every room reads `occupied_since: null`, never a
+            // fabricated start.
             voice_cache: voice_snapshot::new_shared_cache(),
+            voice_clock: VoiceOccupancyClock::new(),
             gateway_state: Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
@@ -1040,6 +1049,16 @@ impl ReceiverState {
         gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
     ) -> Self {
         self.gateway_state = gateway_state;
+        self
+    }
+
+    /// Attach the join clock feeding the keyless `voice.snapshot`
+    /// `rooms[].occupied_since`. Production `bind` always attaches the clock
+    /// the gateway pipeline observes through; tests that exercise stamped
+    /// rooms attach their own, and anything else keeps the empty default,
+    /// which reads every room as `null`.
+    fn with_voice_clock(mut self, voice_clock: Arc<VoiceOccupancyClock>) -> Self {
+        self.voice_clock = voice_clock;
         self
     }
 
@@ -1259,6 +1278,7 @@ pub async fn bind(
     pool: sqlx::PgPool,
     token: &str,
     voice_cache: Arc<DefaultInMemoryCache>,
+    voice_clock: Arc<VoiceOccupancyClock>,
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
 ) -> std::io::Result<BoundReceiver> {
     use two_bot_core::send_admission::{PgSendAdmission, SendAdmission};
@@ -1320,6 +1340,7 @@ pub async fn bind(
                 Arc::new(channel),
             )
             .with_voice_cache(voice_cache)
+            .with_voice_clock(voice_clock)
             .with_gateway_state(gateway_state),
         ),
     })
@@ -1820,8 +1841,10 @@ async fn read_event(
 /// in `authorize`. The gateway readiness gate refuses next: unless the
 /// supervisor's state is `Connected`, a warm cache is stale occupancy from
 /// before a transport loss, so the read answers `discord_unavailable`
-/// instead of stamping it with a fresh `observed_at`. A cold or split cache
-/// (gateway never READY, or the receiver running without the gateway's
+/// instead of stamping it with a fresh `observed_at`. The event-key map
+/// loads after the gate: a store error refuses `internal` rather than
+/// serving key-omitted rooms as if no room were linked. A cold or split
+/// cache (gateway never READY, or the receiver running without the gateway's
 /// writes) refuses `discord_unavailable` below — the read never invents
 /// occupancy. The only wire effect is the cache read itself: no store
 /// write, no audit row, no member id in logs.
@@ -1839,7 +1862,33 @@ async fn read_voice_snapshot(
         Ok(guild_id) => guild_id,
         Err(_) => return reject(Failure::code(ErrorCode::Internal)),
     };
-    match voice_snapshot::read_voice_snapshot(&state.voice_cache, guild_id) {
+    // Currently-windowed voice-channel → event-key map for `rooms[].event_key`.
+    // A store failure refuses here: silently omitting keys would misreport
+    // linked rooms as unlinked.
+    let event_keys: std::collections::HashMap<u64, String> = match state
+        .store
+        .windowed_event_voice_keys(two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID)
+        .await
+    {
+        Ok(keys) => keys
+            .into_iter()
+            .filter_map(|(channel, key)| channel.parse::<u64>().ok().map(|id| (id, key)))
+            .collect(),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    // The key lookup awaited the database: readiness may have changed while
+    // it was in flight. Hold this guard through the synchronous projection so
+    // a disconnected warm cache never gets a fresh observed_at.
+    let gateway = state.gateway_state.read().await;
+    if *gateway != crate::gateway::GatewayState::Connected {
+        return reject(Failure::code(ErrorCode::DiscordUnavailable));
+    }
+    match voice_snapshot::read_voice_snapshot(
+        &state.voice_cache,
+        &state.voice_clock,
+        guild_id,
+        &event_keys,
+    ) {
         Ok(result) => {
             metrics::global().internal_action(internal_family(action), "executed");
             event_read_response(result, id)
