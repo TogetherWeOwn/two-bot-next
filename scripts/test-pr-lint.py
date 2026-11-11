@@ -481,6 +481,7 @@ class ChangedFileInventoryTests(unittest.TestCase):
                 metadata["head"]["sha"] = git("rev-parse", "HEAD")
             metadata.update(metadata_overrides or {})
             after = {**metadata, **(after_overrides or {})}
+            entries = [{"status": "modified", **entry} for entry in entries]
             fixture = root / "fixture.json"
             fixture.write_text(json.dumps({"before": metadata, "after": after,
                                            "pages": [entries[i:i + 100] for i in range(0, len(entries), 100)] or [[]]}))
@@ -565,6 +566,13 @@ class ChangedFileInventoryTests(unittest.TestCase):
                         [{"filename": "new.rs", "previous_filename": "auth/old.rs\n"}]):
             with self.subTest(entries=entries):
                 self.inventory(entries, success=False)
+
+    def test_renamed_entries_require_their_source_path(self):
+        for extra in ({}, {"previous_filename": None}, {"previous_filename": ""}):
+            with self.subTest(extra=extra):
+                self.inventory([{"filename": "docs/new.md", "status": "renamed", **extra}],
+                               success=False)
+        self.inventory([{"filename": "docs/new.md", "status": "unknown"}], success=False)
 
     def test_dispatch_includes_gitlinks_despite_submodule_ignore_policy(self):
         paths, _, _ = self.inventory(
