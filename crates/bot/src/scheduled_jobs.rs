@@ -42,6 +42,14 @@ const ORPHAN_REASON: &str = "Scheduled message run was not recorded";
 mod tests;
 
 #[cfg(test)]
+#[path = "event_reminder_cadence_tests.rs"]
+mod reminder_cadence_tests;
+
+#[cfg(test)]
+#[path = "event_reminder_settlement_tests.rs"]
+mod reminder_settlement_tests;
+
+#[cfg(test)]
 #[path = "scheduled_stale_audit_acceptance_tests.rs"]
 mod acceptance_tests;
 
@@ -76,7 +84,13 @@ pub(crate) fn register(context: Arc<Context>, activation: &BootActivation) -> Op
         Arc::new(move || {
             let context = context.clone();
             Box::pin(async move {
-                tick(context.pool().await?, &context.rest, &context.guild, now_ms).await
+                tick_with_deadline_follow_up(
+                    context.pool().await?,
+                    &context.rest,
+                    &context.guild,
+                    now_ms,
+                )
+                .await
             })
         }),
     )
@@ -104,8 +118,8 @@ fn register_gated(gates: FeatureGates, action: JobAction) -> Option<Job> {
     gates.automations.then(|| job(action))
 }
 
-/// Ten occurrences at the 5 s REST timeout, each with a possible orphan
-/// delete, stay well inside the attempt timeout.
+/// Scheduled occurrences and both bounded reminder passes share this deadline.
+/// Slow work may exhaust it; no reminder follow-up renews the budget.
 fn job(action: JobAction) -> Job {
     let cadence = Duration::from_millis(SCHEDULER_TICK_MS);
     Job {
@@ -161,7 +175,7 @@ pub(crate) async fn tick(
     clock: impl Fn() -> u64 + Send + Sync,
 ) -> Result<(), ErrorClass> {
     let schedule_error = run_schedule_phase(pool, rest, guild, &clock).await;
-    let reminder_error = remind_event_attendees(pool, rest, guild, &clock)
+    let reminder_error = remind_event_attendees(pool, rest, guild, &clock, None, 2, None)
         .await
         .err();
     match (schedule_error, reminder_error) {
@@ -171,6 +185,126 @@ pub(crate) async fn tick(
         // failures map to the existing Database class today.
         (Some(schedule), Some(_)) => Err(schedule),
     }
+}
+
+/// Keep watching already-mirrored urgent events even when the initial roster
+/// is empty: their first RSVP may commit between ordinary ticks. At most 15
+/// scans, one second apart, share TWO candidate attempts in total, not per scan.
+/// The watch ends before the next ordinary cadence, or sooner when all urgent
+/// events are fenced/expired. Scheduled messages never rerun in this watch.
+/// Everything stays inside the owning supervisor's cancellation and deadline.
+async fn tick_with_deadline_follow_up(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    clock: impl Fn() -> u64 + Send + Sync,
+) -> Result<(), ErrorClass> {
+    use two_bot_core::event_reminder_store::has_pending_event_reminders_before;
+
+    let watch_until = reminder_watch_deadline();
+    tick(pool, rest, guild, &clock).await?;
+    let latest_start = clock().saturating_add(SCHEDULER_TICK_MS);
+    let wire_until = reminder_watch_wire_deadline(watch_until);
+    let clock = &clock;
+    watch_urgent_reminders(watch_until, |remaining| async move {
+        let inspected = remind_event_attendees(
+            pool,
+            rest,
+            guild,
+            clock,
+            Some(latest_start),
+            remaining,
+            Some(wire_until),
+        )
+        .await?;
+        let pending = inspected < remaining
+            && has_pending_event_reminders_before(pool, guild, clock(), latest_start)
+                .await
+                .map_err(reminder_database)?;
+        Ok((inspected, pending))
+    })
+    .await
+}
+
+fn reminder_watch_deadline() -> tokio::time::Instant {
+    let next_tick = jobs::next_cadence_deadline()
+        .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_millis(SCHEDULER_TICK_MS));
+    // Leave one polling interval for cancellation and supervisor bookkeeping.
+    // A timeout at the slot itself would still leave the action active there.
+    next_tick - Duration::from_secs(1)
+}
+
+fn reminder_settlement_grace() -> Duration {
+    Duration::from_millis(two_bot_discord::executor::MESSAGE_SETTLEMENT_GRACE_MS)
+}
+
+fn reminder_watch_wire_deadline(watch_until: tokio::time::Instant) -> tokio::time::Instant {
+    // Settlement stays in place inside the watch, not in a detached task or
+    // across the supervisor's next slot. It cannot authorize more wire time.
+    watch_until - reminder_settlement_grace()
+}
+
+fn event_reminder_deadline(
+    starts_at: &str,
+    clock: &impl Fn() -> u64,
+) -> (u64, Option<tokio::time::Instant>) {
+    // Anchor BEFORE sampling wall time: suspension after the sample must spend
+    // the remaining budget, never renew it from a later monotonic instant.
+    let anchor = tokio::time::Instant::now();
+    let now = clock();
+    let deadline = two_bot_core::scheduled::parse_iso_ms(starts_at)
+        .and_then(|starts| starts.checked_sub(now))
+        .filter(|remaining| *remaining > 0)
+        .map(|remaining| anchor + Duration::from_millis(remaining));
+    (now, deadline)
+}
+
+async fn send_event_reminder(
+    rest: &ActionExecutor,
+    channel: &str,
+    content: &str,
+    deadline: tokio::time::Instant,
+) -> Result<String, DiscordError> {
+    // Keep this production caller seam under test: a timeout at `deadline`
+    // here would cancel the executor's yielding, proven-no-wire release.
+    rest.post_message_confirmed_before(channel, content, &random_nonce(), deadline)
+        .await
+}
+
+async fn watch_urgent_reminders<F, Fut>(
+    watch_until: tokio::time::Instant,
+    mut scan: F,
+) -> Result<(), ErrorClass>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<(usize, bool), ErrorClass>>,
+{
+    if tokio::time::Instant::now() >= watch_until {
+        return Ok(());
+    }
+    let watch = async {
+        let mut remaining = 2;
+        for index in 0..15 {
+            if index > 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            // Check explicitly too: timeout_at may poll an expired future first.
+            if tokio::time::Instant::now() >= watch_until {
+                break;
+            }
+            let (inspected, pending) = scan(remaining).await?;
+            remaining -= inspected;
+            if remaining == 0 || !pending {
+                break;
+            }
+        }
+        Ok(())
+    };
+    // Bound scans, admission, delivery and the pending probe, not just sleeps.
+    // Expiry drops optional work in place; any committed fence stays immutable.
+    tokio::time::timeout_at(watch_until, watch)
+        .await
+        .unwrap_or(Ok(()))
 }
 
 /// Claim and run due scheduled occurrences, stopping the batch on the first
@@ -228,37 +362,53 @@ async fn remind_event_attendees(
     rest: &ActionExecutor,
     guild: &str,
     clock: &impl Fn() -> u64,
-) -> Result<(), ErrorClass> {
-    use two_bot_core::event_reminder_store::{begin_event_reminder_delivery, due_event_reminders};
+    latest_start: Option<u64>,
+    budget: usize,
+    wire_until: Option<tokio::time::Instant>,
+) -> Result<usize, ErrorClass> {
+    use two_bot_core::event_reminder_store::{
+        begin_event_reminder_delivery_with_clock, due_event_reminders_before,
+        EVENT_REMINDER_LEAD_MS,
+    };
 
-    for event in due_event_reminders(pool, guild, clock())
+    let now = clock();
+    let latest_start = latest_start.unwrap_or_else(|| now.saturating_add(EVENT_REMINDER_LEAD_MS));
+    let events = due_event_reminders_before(pool, guild, now, latest_start)
         .await
-        .map_err(reminder_database)?
-    {
-        let now = clock();
-        if !begin_event_reminder_delivery(pool, guild, &event, now)
+        .map_err(reminder_database)?;
+    let inspected = events.len().min(budget);
+    for event in events.into_iter().take(budget) {
+        if wire_until.is_some_and(|at| tokio::time::Instant::now() >= at) {
+            break;
+        }
+        if !begin_event_reminder_delivery_with_clock(pool, guild, &event, clock)
             .await
             .map_err(reminder_database)?
         {
             continue;
         }
-        let (outcome, reason) = if let Some(content) = event_reminder_content(guild, &event) {
-            match rest
-                .post_message_confirmed(&event.channel_id, &content, &random_nonce())
-                .await
-            {
-                Ok(_) => ("posted", None),
-                Err(error) => (
-                    if error.proves_no_effect() || error.is_admission_blocked() {
-                        "failed"
-                    } else {
-                        "delivery_uncertain"
-                    },
-                    Some(discord_error_name(&error)),
-                ),
+        let content = event_reminder_content(guild, &event);
+        // The INSERT and commit may also wait. Keep every committed fence, but
+        // refuse an expired send and bound any transport admission by the start.
+        let (now, deadline) = event_reminder_deadline(&event.starts_at, clock);
+        let (outcome, reason) = match (content, deadline) {
+            (_, None) => ("failed", Some("invalid_or_elapsed_event_start")),
+            (None, Some(_)) => ("failed", Some("invalid_or_oversized_reminder")),
+            (Some(content), Some(deadline)) => {
+                let deadline = wire_until.map_or(deadline, |at| deadline.min(at));
+                let result = send_event_reminder(rest, &event.channel_id, &content, deadline).await;
+                match result {
+                    Ok(_) => ("posted", None),
+                    Err(error) => (
+                        if error.proves_no_effect() || error.is_admission_blocked() {
+                            "failed"
+                        } else {
+                            "delivery_uncertain"
+                        },
+                        Some(discord_error_name(&error)),
+                    ),
+                }
             }
-        } else {
-            ("failed", Some("invalid_or_oversized_reminder"))
         };
         // Only the result is appended; the attempt fact remains immutable.
         // No attendee ids, names or rendered content enter diagnostics/audits.
@@ -274,7 +424,7 @@ async fn remind_event_attendees(
             .await
             .map_err(reminder_database)?;
     }
-    Ok(())
+    Ok(inspected)
 }
 
 fn event_reminder_content(

@@ -19,6 +19,17 @@ pub type JobAction = Arc<dyn Fn() -> JobFuture + Send + Sync>;
 pub type CadenceSource = Arc<dyn Fn() -> Duration + Send + Sync>;
 pub type SharedStatus = Arc<RwLock<BTreeMap<String, JobStatus>>>;
 
+tokio::task_local! {
+    /// Fixed-phase next slot for this attempt, not action-start + cadence.
+    static NEXT_CADENCE_DEADLINE: Instant;
+}
+
+/// Optional work may use this slot to stop before it can discard an ordinary
+/// tick. Scoped to the owning action task; detached children do not inherit it.
+pub(crate) fn next_cadence_deadline() -> Option<Instant> {
+    NEXT_CADENCE_DEADLINE.try_with(|deadline| *deadline).ok()
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct JobStatus {
     pub parked: bool,
@@ -281,11 +292,12 @@ async fn run_job(
                 last_run_tick = Some(run_tick);
                 let action = Arc::clone(&job.action);
                 let timeout = job.timeout;
-                active = Some(tokio::spawn(async move {
+                let next_deadline = run_tick + cadence;
+                active = Some(tokio::spawn(NEXT_CADENCE_DEADLINE.scope(next_deadline, async move {
                     // Construct inside the task too: a panicking factory is isolated.
                     tokio::time::timeout(timeout, async move { action().await }).await
                         .unwrap_or(Err(ErrorClass::Timeout))
-                }));
+                })));
             }
             _ = recheck.tick(), if job.cadence_source.is_some() => {
                 // Between ticks: a changed cadence reschedules the pending
