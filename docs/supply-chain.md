@@ -7,9 +7,8 @@ reusable SBOM workflow was renamed from `supply-chain.yml` because main's
 TOG-11810 fold uses that filename for the native pr-lint + gitleaks gate,
 which has no `workflow_call` trigger.) It
 builds the Dockerfile on GitHub-hosted `ubuntu-latest` in this public
-repository (runner routing in [`sbom.yml`](../.github/workflows/sbom.yml)
-and the `check` note in `check.yml`: a public repo never takes the
-`[self-hosted, two-selfhosted]` label, which would queue forever), without
+repository (explicit selectors in [`sbom.yml`](../.github/workflows/sbom.yml);
+see the [public runner contract](ci-security.md#public-hosted-runner-contract)), without
 registry push or deployment,
 then inventories the exact image and all packages in the workspace Cargo.lock
 (including workspace, optional and development dependencies). The Rust BOM is

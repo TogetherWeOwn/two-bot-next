@@ -130,7 +130,7 @@ the SBOM job. The legacy `required-checks` aggregate is removed.
 
 Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
 HARD, required voice synthetic, test-target inventory HARD) run as steps of
-the `check` lane on the existing routed runner; see
+the `check` lane on standard GitHub-hosted `ubuntu-latest`; see
 [`docs/quality-gates.md`](docs/quality-gates.md). Patch coverage (HARD) runs
 sharded across `coverage-plan`, the `coverage-shard` matrix (with per-shard
 disposable Postgres services and ignored database-backed tests) and the

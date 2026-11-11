@@ -383,15 +383,14 @@ class StaticGuardTests(unittest.TestCase):
         self.assertIn("cancel-in-progress: false", soak_conc)
         self.assertNotIn("deploy-production", soak_conc)
 
-    def test_every_job_uses_the_shared_runner_routing(self):
-        # scripts/test-runner-routing.py pins the full expression (TOG-12339).
+    def test_every_job_uses_explicit_public_hosted_runner(self):
+        # scripts/test-runner-routing.py also rejects dormant/indirect routes.
         self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "soak",
                                       "staging-soak-evidence", "recheck",
                                       "promotion-skipped", "production"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
-            self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
-            self.assertIn(f"vars.CI_OVERFLOW_JOBS || '[]'), '{name}')", runs_on)
+            self.assertEqual(runs_on, "ubuntu-latest", name)
 
     def test_permissions_are_least_privilege(self):
         self.assertEqual(value(TOP["permissions"]), "{}")

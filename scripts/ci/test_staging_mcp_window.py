@@ -48,7 +48,7 @@ class McpWindowTests(unittest.TestCase):
             "workflow token": lambda w: w.update({"env": {"TOKEN": "${{ secrets.STAGING_MCP_TOKEN }}"}}),
             "job tolerated": lambda w: job(w).update({"continue-on-error": "true"}),
             "extra permission": lambda w: job(w)["permissions"].update({"actions": "write"}),
-            "wrong runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
+            "wrong runner": lambda w: job(w).update({"runs-on": "ubuntu-latest-16-cores"}),
             "extended timeout": lambda w: job(w).update({"timeout-minutes": "60"}),
             "missing begin": lambda w: job(w)["steps"].pop(2),
             "missing finish": lambda w: job(w)["steps"].pop(5),

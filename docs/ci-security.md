@@ -6,6 +6,8 @@ CODEOWNERS verification, and **zizmor 1.30.1**. zizmor is installed from its pin
 binary wheel without dependencies and runs with `--offline --strict-collection`;
 it needs no GitHub token. All workflows default to `permissions: {}` and declare
 job-specific grants. Every checkout sets `persist-credentials: false`.
+The [public-hosted runner contract](#public-hosted-runner-contract) covers explicit
+standard Ubuntu selections, compatibility evidence and qualification limits.
 
 The release job retains contents/PR write to publish and reconcile releases;
 only the dispatch job gets actions write. The existing release-branch push uses
@@ -47,12 +49,12 @@ provisioned (TOG-12030); no credential creation or rotation is included here.
 The offline workflow regression uses pinned PyYAML 6.0.3, rejects duplicate
 keys, inventories every workflow/job, requires the staging `deploy` job to
 carry no job condition while keeping the `staging` environment scope, the
-routed runner expression for job `deploy`, and the fenced `release_fence`
+explicit `ubuntu-latest` runner for job `deploy`, and the fenced `release_fence`
 dispatch shape, rejects statically-disabled steps that would report success
 without deploying, and rejects new jobs/workflows or known CI jobs repurposed
 as unapproved deploy/probe alternatives. Negative fixtures cover job-condition
 insertion/mutation, step-level disables, dispatch-shape widening and alternate
-deployment jobs. It also preserves visibility-aware runner routing,
+deployment jobs. It also preserves explicit public-hosted runner selection,
 job-container service isolation, per-job grants and nonpersistent checkouts.
 
 The active job retains GitHub environment `staging`. **A YAML environment
@@ -159,7 +161,7 @@ step 2) without handing any agent a database credential. The regression pins it
 as `workflow_dispatch`-only with exactly two required string inputs
 (`window_start`, `window_end`; no member, guild or default). Its single `read`
 job runs only from `main`, in the `staging-events-read` environment, on the
-routed runner for job `read`, with `contents: read`, a 5-minute timeout and its
+`ubuntu-latest` runner for job `read`, with `contents: read`, a 5-minute timeout and its
 own non-cancelling concurrency group. It has exactly three unconditional steps:
 pinned checkout without persisted credentials, one Run step that passes the
 inputs through the environment (never an inline expression) to
@@ -190,7 +192,7 @@ workflow that gives the privacy fixture its purge-verification counts
 database credential. The regression pins it as `workflow_dispatch`-only
 with exactly one required choice input (`guild`: `g` or `h`, no member,
 window or default). Its single `read` job runs only from `main`, in the
-`staging-privacy-verify-read` environment, on the routed runner for job
+`staging-privacy-verify-read` environment, on the `ubuntu-latest` runner for job
 `read`, with `contents: read`, a 5-minute timeout and its own
 non-cancelling concurrency group. It has exactly three unconditional steps:
 pinned checkout without persisted credentials, one Run step that passes the
@@ -228,7 +230,7 @@ a bounded stable-cohort digest before and after one natural ~900 s DryRun
 interval) without handing any agent a database credential. The regression
 pins it as `workflow_dispatch`-only with no inputs. Its single `census` job
 runs only from `main`, in the existing no-reviewer `staging-migrate-plan`
-environment, on the routed runner for job `census`, with `contents: read`, a
+environment, on the `ubuntu-latest` runner for job `census`, with `contents: read`, a
 30-minute timeout covering the script's single in-job sleep, and its own
 non-cancelling concurrency group. It has exactly two unconditional steps:
 pinned checkout without persisted credentials, and one bash Run step that
@@ -298,7 +300,7 @@ counts with the two pinned auxiliaries, and the anonymous per-table
 guild inventory). The regression pins the same shape as the retention
 census: `workflow_dispatch`-only with no inputs, one `fixture-census`
 job from `main` only, the existing no-reviewer `staging-migrate-plan`
-environment, the routed runner for job `fixture-census`,
+environment, the `ubuntu-latest` runner for job `fixture-census`,
 `contents: read`, exactly two unconditional steps, log only with no
 artifact, and no `set -x`, wrangler, apply, seed or purge route. The
 only deliberate differences are its own non-cancelling concurrency
@@ -434,3 +436,98 @@ job to carry no job condition at all.
 Pedantic zizmor may report informational `superfluous-actions` advisories for
 existing pinned Rust toolchain Actions. They are intentionally retained; all
 existing Action SHAs and pin comments are preserved.
+
+## Public-hosted runner contract
+
+Every ordinary job defined in this repository selects `runs-on: ubuntu-latest`
+explicitly. This includes the local reusable nextest and SBOM workflows, not
+only required PR checks. There is no private/self-hosted fallback or overflow
+variable switch. External pinned reusable workflows retain their own runner
+policy; this change neither rewrites those workflows nor conceals routing in
+an external workflow, variable or generated file.
+
+This contract is for a **public repository**. GitHub's
+[standard runner specification](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories)
+lists public `ubuntu-latest` x64 as 4 CPUs, 16 GB RAM and 14 GB SSD, with free
+standard-runner usage. This is not a larger-runner selection or permission to
+buy overflow. Verify repository visibility before execution and merge. A future
+private conversion requires fresh runner, network and cost qualification
+**before** running workflows; these definitions would otherwise consume private
+hosted minutes. The offline fixtures cannot observe repository visibility.
+
+### Compatibility and limits
+
+The former public branch already selected `ubuntu-latest` for every ordinary
+job definition. The current inventory is 88 jobs across 29 changed workflows,
+including the split nightly legs and bounded staging startup/cleanup jobs.
+Replacing the expression with the literal changes the source contract,
+not the public runner platform. All job containers, service images/options,
+platforms, resource/time limits, permissions, protected environments and test
+selection remain unchanged. No runner registration, fleet setting, secret or
+organization variable is changed.
+
+GitHub's [service-container contract](https://docs.github.com/en/actions/concepts/use-cases/about-service-containers)
+supports Linux job/service containers on hosted Ubuntu. Container jobs reach
+services through job-private Docker networks and service DNS; they do not need
+published host ports. The existing disposable Postgres services keep that
+isolation, their memory/tmpfs/health limits and guarded test URLs. Root inside
+job containers remains available for package installation and loopback test
+forwarding. Host-level Docker/BuildKit jobs retain `linux/amd64`; Worker jobs
+install Node explicitly. No persistent host cache or private runner mount is
+required by these jobs.
+
+Hosted disk is finite and CPU timing is variable: the existing disk-floor
+check, build/job timeouts, benchmark thresholds and concurrency limits remain
+in force. Cached builds are optimizations, not a requirement for a particular
+machine. A disk, memory or duration failure is an unresolved qualification,
+not permission to omit tests, relax a threshold or select a paid runner.
+
+### Existing execution evidence
+
+Read back on 2026-11-04: the jobs below completed on `ubuntu-latest` with runner
+group `GitHub Actions`. These are **historical compatibility evidence**, not
+runs of this change, proof of future network availability, or release approval.
+A workflow-level success alone is insufficient: skipped jobs do not qualify.
+
+| Job family | Existing successful hosted jobs |
+| --- | --- |
+| Rust, nextest, coverage, disposable Postgres, Worker Node, Docker/BuildKit and SBOM | [check run](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41765306074) includes successful selected lanes, coverage shards, container smoke, image scan and SBOM verification |
+| Nightly and benchmark | [nightly run](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41759826693) includes guarded suites, partitions, docs and benchmark; [standalone benchmark](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41470381075) also succeeded |
+| Bounded fuzz smoke | [vote-kick](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38454021749) and [Helix token](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/38968322463) smoke jobs succeeded |
+| Staging deploy and synthetics | [staging run](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41700522944) includes schema/role gates, deploy, user-flow/help/voice synthetics and immutable-artifact certification |
+| Production promotion | [production run](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41699655458) includes successful schema/role gates, soak/evidence/recheck and deploy/readyz, not just a skip receipt |
+| Migration plan, claim and apply | [staging migration](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41375889399) and [production migration](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/41493082701) each ran all three jobs successfully |
+| Manual read-only operation | [staging ownership status](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/39173020313) executed successfully |
+
+These executions demonstrate hosted access to the configured endpoints and
+credentials used by those jobs at those times. They do not establish every
+manual drill/recovery/census branch, every credential's present validity, or
+access to an optional deployment-notification webhook. Standard hosted IPs can
+change; an endpoint requiring a fixed IP or private network needs an explicit
+technical prerequisite, not a silent self-hosted/paid fallback. No live
+production dispatch or credentialed probe is part of runner qualification here.
+The split nightly legs retain the same container, six-partition inventory,
+fail-closed receipt aggregate and event-specific budgets. Bounded staging
+startup/cleanup jobs retain their exact-SHA readiness, finite-use grants,
+native expiry and failure/cancellation cleanup. Their Node/HTTPS runner needs
+are unchanged, but the historical runs above do not qualify those newer paths.
+Current-head CI and independent reviews remain required; production merge and
+any subsequent production exercise retain their separate release approval.
+
+### Offline enforcement
+
+`scripts/test-runner-routing.py` checks every tracked workflow definition,
+rejecting dormant routing, indirect selectors, nonstandard runner labels,
+missing/nested selectors and runners on reusable-workflow calls. The parsed
+workflow suite, supply-chain, production deploy, channel CI and staging
+ownership fixtures also pin the direct hosted contract while retaining their
+other isolation and behavior assertions.
+
+```sh
+python3 scripts/test-runner-routing.py
+python3 -m unittest discover -s scripts/ci -p 'test_workflows.py' -v
+python3 scripts/test-supply-chain.py
+python3 scripts/test-deploy-production.py
+python3 -m unittest discover -s scripts -p 'test_channel_ci.py' -v
+python3 -m unittest discover -s scripts -p 'test_staging_ownership_status.py' -v
+```
