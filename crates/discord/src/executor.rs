@@ -323,6 +323,10 @@ pub struct RawResponse {
     pub(crate) completion: Option<two_bot_core::send_admission::AdmissionPermit>,
 }
 
+#[cfg(test)]
+#[path = "executor_deadline_tests.rs"]
+mod deadline_tests;
+
 type AdmittedSendFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<(RawResponse, bool), DiscordError>> + Send + 'a>,
 >;
@@ -643,6 +647,9 @@ impl HyperTransport {
         // unbounded admit would outlive the receipt/moderation/boot budgets.
         // A timed-out admit never resolved, so no permit exists to release;
         // it reports as a header stall so the caller spends one attempt.
+        if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+            return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
+        }
         let permit = match &self.admission {
             // Constructor restricts ungoverned transport to loopback fixtures.
             None => None,
@@ -655,6 +662,23 @@ impl HyperTransport {
                 },
             },
         };
+        // The timeout polls admission first, including at deadline equality.
+        // Only this pre-wire permit is known to be unused. Bound settlement in
+        // place; a stalled or cancelled completion still leaves it uncertain.
+        if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+            if let Some(permit) = permit {
+                if tokio::time::timeout(
+                    Duration::from_millis(500),
+                    complete_early_release(permit, "expired_before_wire"),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!("Discord send admission completion timed out; lane held");
+                }
+            }
+            return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
+        }
         let mut attempt = crate::executor_metrics::Attempt::new(request);
         // Bound the header wait inside the permit scope so a stalled read
         // releases its lane instead of orphaning it: an outer cancellation
@@ -1354,10 +1378,19 @@ impl ActionExecutor {
         budget: Duration,
     ) -> AdmittedSendFuture<'a> {
         Box::pin(async move {
+            self.send_admitted_before(request, tokio::time::Instant::now() + budget)
+                .await
+        })
+    }
+
+    #[inline(never)]
+    fn send_admitted_before<'a>(
+        &'a self,
+        request: &'a Request,
+        deadline: tokio::time::Instant,
+    ) -> AdmittedSendFuture<'a> {
+        Box::pin(async move {
             self.count();
-            // The absolute attempt instant is fixed before durable admission, so
-            // the admit, the header wait and the body share the one deadline.
-            let deadline = tokio::time::Instant::now() + budget;
             self.inner
                 .transport
                 .send_request(request, Some(deadline))
@@ -1404,15 +1437,11 @@ impl ActionExecutor {
         tokio::time::timeout_at(deadline, self.admit(request, lane))
             .await
             .map_err(|_| GuardError::AdmissionTimeout)??;
-        // The wire phase takes whatever is left of the caller's deadline, so
-        // guard admission, durable admission, headers and body together stay
-        // inside it (the receipt window refuses to land past it). No outer
-        // backstop: the transport's timers share the absolute deadline, and a
-        // stalled GET releases its lane where the permit is in scope.
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .unwrap_or(Duration::ZERO);
-        self.send_admitted_for(request, remaining).await
+        if tokio::time::Instant::now() >= deadline {
+            return Err(GuardError::AdmissionTimeout.into());
+        }
+        // Keep the original instant through durable admission and the wire.
+        self.send_admitted_before(request, deadline).await
     }
 
     /// Singular role mutations use status only. A truncated/stalled provider

@@ -1362,6 +1362,76 @@ mod tests {
         mock.shutdown();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn delete_entry_point_releases_unused_permit_at_deadline() {
+        use std::sync::atomic::AtomicUsize;
+        use two_bot_core::send_admission::{
+            AdmissionError, AdmissionFuture, AdmissionPermit, SendCompletion, SendCooldown,
+            TokenKey,
+        };
+
+        struct Completion(Arc<AtomicUsize>);
+        impl SendCompletion for Completion {
+            fn complete(
+                self: Box<Self>,
+                _: Option<SendCooldown>,
+            ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+        #[derive(Debug)]
+        struct Admission(TokenKey, Arc<AtomicUsize>);
+        impl SendAdmission for Admission {
+            fn token_key(&self) -> &TokenKey {
+                &self.0
+            }
+            fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+                Box::pin(async move {
+                    let mut advance = Box::pin(tokio::time::advance(Duration::from_secs(30)));
+                    std::future::poll_fn(|cx| {
+                        assert!(std::future::Future::poll(advance.as_mut(), cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    Ok(AdmissionPermit::new(Box::new(Completion(self.1.clone()))))
+                })
+            }
+        }
+        let token = "fixture-deadline-token";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let completed = Arc::new(AtomicUsize::new(0));
+        let admission = Admission(
+            TokenKey::for_bot_token(token).expect("token key"),
+            completed.clone(),
+        );
+        let rest = RestClient::with_admission(
+            token.to_owned(),
+            Some(format!(
+                "http://{}",
+                listener.local_addr().expect("address")
+            )),
+            Arc::new(admission),
+        );
+        let started = tokio::time::Instant::now();
+        let result = rest
+            .delete_channel(Id::<ChannelMarker>::new(3333), "deadline test")
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started + Duration::from_secs(30)
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
     /// A page whose headers never arrive must fail at the 30 s page budget on
     /// every transport call site (`exec_list`, `exec_one`, `delete_channel`):
     /// the absolute deadline lives in the transport, so reverting any of
