@@ -20,7 +20,7 @@ on:
         type: boolean
         default: false
       release_tag:
-        description: Digest release to attach SBOM assets (vYYYY.MDD.P, or a legacy vYYYY.MM.DD / vX.Y.Z tag for repair; tags built before 9d064fa38 fail --check-runtime by design)
+        description: Digest release to attach SBOM assets (vYYYY.MDD.P, or a legacy vYYYY.MM.DD / vX.Y.Z tag for repair; tags built before 9d064fa38 fail --check-runtime by design, and tags without cargo-auditable metadata fail native inventory validation by design)
         type: string
         default: ''
 

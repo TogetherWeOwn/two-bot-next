@@ -118,12 +118,17 @@ but `main` fails the same way and names the ref: publication runs from
 `main` only, while a `dry_run` dispatch may run from any ref.
 
 SBOM repair works only for a tag whose source has the current runtime
-composition, which means a tag built at or after `9d064fa38` (#2004). The
-`verify` job in `sbom.yml` runs `--check-runtime` on every ref, historical
-tags included. An older tag was built on an earlier base image (cc-debian13, or
-bookworm-slim for `v0.2.0`), so it fails the zlib-free composition check at
-the inventory step. That failure is by design: there is no per-tag waiver.
-`v0.2.0` is the only release without SBOM assets, and it stays without them.
+composition and whose Dockerfile builds the binary with cargo-auditable
+metadata, which means a tag built at or after `9d064fa38` (#2004) from the
+commit that landed #1990 or later. The `verify` job in `sbom.yml` runs
+`--check-runtime` on every ref, historical tags included. An older tag was
+built on an earlier base image (cc-debian13, or bookworm-slim for `v0.2.0`),
+so it fails the zlib-free composition check at the inventory step. A tag
+built at or after `9d064fa38` but before cargo-auditable builds landed
+rebuilds with its own pre-auditable Dockerfile, so native inventory
+validation fails instead. Either failure is by design: there is no per-tag
+waiver, and tags failing either requirement stay without SBOM assets.
+`v0.2.0` stays without SBOM assets.
 
 To move to a newer shared releaser, repin both `actions/calver` steps in
 `daily-digest.yml` to the same merged `TogetherWeOwn/.github` commit;
