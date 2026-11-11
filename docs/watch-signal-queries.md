@@ -101,9 +101,19 @@ histogram_quantile(0.99, sum by (le) (rate(two_bot_handler_duration_seconds_buck
 rate(two_bot_handler_duration_seconds_count[1h])
 ```
 
-Compare the same quantile across windows (first 24h vs second 24h) rather
-than against a fixed budget. A falling `_count` with a rising p99 means
-fewer but slower dispatches, not an idle bot.
+Compare the same quantile across available comparable windows rather than
+against a fixed budget; compare first 24h vs second 24h only when both were
+observed while the watch was open. If evidence-complete early closure leaves
+that comparison unavailable, record N/A with actual close UTC and reason;
+retain observations due while open, and do not extend the watch just to fill
+later rows or comparisons. A falling `_count` with a rising p99 means fewer
+but slower dispatches, not an idle bot. Early closure still requires all
+prescribed timer/workload coverage and independent B2. If incomplete at +48h,
+record INCOMPLETE; the cutover lead, Release Manager and data lead decide
+hold / incident / rollback and record any separately bounded continuation
+with owner, missing proof and deadline. Normal monitoring, thresholds,
+writer fences, permissions, rollback gates and warm recovery resources remain
+unchanged; N/A is not a waiver for missing required evidence.
 
 ## 4. Unban-queue depth
 

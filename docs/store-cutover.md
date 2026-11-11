@@ -134,7 +134,15 @@ Set the authorized test URL as described in `CONTRIBUTING.md`. An absent URL can
 skip local database bodies; a successful compile or skipped run is not behavioral
 GREEN evidence. A bounded-cache refusal is also not a test verdict.
 
-## Local and CI verification
+## GitHub Actions verification
+
+The commands below describe hosted-CI coverage, not a local CI mirror. Push the
+PR branch and record exact-head Actions run/job links. Local execution is only
+for one failing test or crate under the
+[focused reproduction policy](../CONTRIBUTING.md#focused-failure-reproduction-only),
+including the focused hot-path examples above. Heavy focused builds use guarded
+Boat, never heavy raw-host fallback. Do not execute these commands as a local
+sequence.
 
 All database tests use **agent-testdb or ephemeral CI services only**, never
 staging/production. Tests ignore `DATABASE_URL`, require `TEST_DATABASE_URL`,

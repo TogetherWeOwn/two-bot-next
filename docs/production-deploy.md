@@ -251,6 +251,7 @@ These skips keep it green while deploying nothing:
   (`staging-pending`): the staging completion promotes it;
 - `check.yml` is still running on the target (`ci-pending`): its completion
   promotes it (a completed red CI still refuses);
+- the dedicated automatic-promotion disable is set (see below);
 - the hold variable is still in the future (see below);
 - the target is already live: production `/readyz` already reports the SHA;
 - the live build already contains the target (`older-than-live`): an older
@@ -285,6 +286,27 @@ before the baseline. Automatic promotion measures a **fresh full 30 minutes**
 after that baseline, rechecking exact-build readiness at most every minute
 and at the boundaries. Historical staging-green age, runner queues and idle
 time supply no credit; the guard's historical remainder is advisory only.
+The 30min interval is required continuous coverage on the same exact build and
+process incarnation, not an arbitrary wait; no shorter equivalent is supported.
+Required qualification for the earliest automatic exit is that coverage, at
+least 10 judged requests, the final pinned user-flow/readiness/original-grant
+proof and confirmed release. These are policy requirements, not a claim that
+the shipped gates enforce all of them.
+
+**Current enforcement gap — warning-only insufficient evidence.**
+`scripts/promotion_regression_gate.py::compare` reports `rest_5xx.verdict:
+"insufficient_data"` for fewer than ten judged requests, or a changed process
+incarnation with a clean post-restart window. With healthy journeys it still
+reports overall `verdict: "pass"`; `main` warns and exits zero, and
+`deploy-production.yml` consumes that exit as success. The separate
+`wrangler/scripts/promotion-error-gate.mjs` also treats insufficient data as a
+non-blocking warning. Thus nine clean requests, or clean counters after a
+restart, can leave the workflow green without the required evidence. This is an
+**unsupported enforcement/qualification gap**, not rate PASS or an authorized
+exception. Workflow green alone is not qualification proof: retain the hold and
+route the missing evidence/enforcement to the technical and release owners;
+do not authorize promotion without the required proof. This source-only
+correction does not repair the runtime or pipeline.
 Manual ordinary deploys retain their no-delay policy but use the same finite
 grant, baseline, final sample and release. Rollback and live-SHA cures skip
 the staging holder entirely. A superseded SHA refuses before acquisition;
@@ -302,14 +324,19 @@ cap. Startup readiness can consume up to five minutes before the fresh
 before expiry. A slow/unhealthy candidate that exhausts the grant fails closed;
 the extra job time never authorizes more sampling or extends the grant. Native
 expiry remains necessary if setup/provider calls exhaust the job budget.
+Startup≤5min, original non-renewing grant≤40min and job≤50min are maxima, not
+additional runtime authorization. Insufficient count, reset/restart, no bearer,
+changed build or unknown release is not rate PASS. At grant/budget exhaustion,
+fail closed, retain evidence and safely release or expire; hold and route the
+missing proof rather than renew or promote. This holder does not authorize B2.
 Lifecycle NDJSON and available
 measurement JSON are always retained as
 `staging-soak-<run_id>-<run_attempt>` for seven days. The soak runs outside the
 `deploy-production` lane — only the `production` job holds it —
 so a staging wait never queues an operator production rollback behind it. The lane keeps the default single pending slot, so a `recheck`
-job waits for the soak and both gates, then re-reads the hold, the live
-revision and the active dispatches immediately before the deploy: a hold set,
-a target gone live or stale, or an operator dispatch queued, waiting or in
+job waits for the soak and both gates, then re-reads the disable, the hold,
+the live revision and the active dispatches immediately before the deploy: a
+disable set, a hold set, a target gone live or stale, or an operator dispatch queued, waiting or in
 progress while the gates built or the soak slept skips green instead of
 deploying through the incident — or entering the lane behind a recovery run
 and cancelling it. A failed soak fails closed into no deploy, an unreadable
@@ -330,6 +357,34 @@ decision first. After a manual rollback, set the hold until the incident is
 resolved: otherwise the next automatic run re-selects the staged build that
 was just rolled back and redeploys it (the live check only skips builds the
 live revision already contains, and a rolled-back target is newer than live).
+
+Non-expiring disable: the repository variable
+`PRODUCTION_AUTO_PROMOTE_DISABLED` is the durable replacement for an
+expiry-only hold. Only the exact value `true` disables automatic promotion;
+any other value (including unset/empty) is off. With it set, an automatic
+run that otherwise passes the guard — both the `workflow_run` completions
+(`deploy-staging`, `check`) and the daily schedule backstop — skips green
+before the soak with reason `auto-promote-disabled` (a guard refusal stays
+red and deploys nothing, as before), and the pre-deploy `recheck` re-reads
+it after the gates/soak so a disable set before that checkpoint still
+skips instead of deploying. The `production` job consumes the recheck
+outputs and does not re-read the variable: the residual window between the
+recheck checkpoint and production start is the same one the timed hold
+already has. The live `production` Environment currently has no
+`required_reviewers`, so there is no approval-wait window today; if
+reviewers are ever added, an automatic-only fresh re-read at production
+start must be added before relying on this control. The workflow and its triggers stay enabled (no scheduled/
+backstop entry point is removed, no shared credential is touched), and
+manual dispatches ignore the disable entirely: deploy, rollback and
+live-SHA takeover with `takeover` keep working, and every QA/RM and
+exact-SHA gate still applies to them. Re-enable only after a recorded RM
+rollback/S2 PASS and all remaining exact-SHA qualification/release/incident
+gates, separately controlled — never by automatic expiry. Do not use a
+far-future `PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL` timestamp as a surrogate:
+a date guard stops holding at its expiry even if PASS is absent. Setting
+or clearing `PRODUCTION_AUTO_PROMOTE_DISABLED` is an operator action
+(record the effective-setting readback and the `updated_at` timestamp);
+code alone does not flip the live setting.
 
 ## Rollback-target preflight
 
@@ -848,7 +903,23 @@ Read the variable and the Environment's reviewers again before each dispatch.
 The cutover executor records each checkpoint with
 `scripts/cutover_watch_checkpoint.py` — one checkpoint per call — and pastes
 the emitted row onto the execution card at `T_0` (first `/readyz` 200 on the
-production revision) through the watch deadline `T_0 + 48 h`:
+production revision) until evidence-complete closure or the maximum initial
+watch deadline `T_0 + 48 h`. The 48h bound is not mandatory idle calendar or
+automatic acceptance. Apply [cutover.md §48-hour watch](cutover.md#48-hour-watch):
+all approved checklist/feature/voice/production receipts, prescribed actual timer/
+workload coverage, independent B2, no unexplained loss/resource/recovery gaps,
+singleton/data/job writer fences, migration/watermark/permission/rollback proof
+and a warm reverse-reconciliation manifest are required. B2 is **NOT VERIFIED**,
+`T` **unset**, B4 **NO-GO** until those independent gates pass. This documentation
+does not supply numeric B2 resource criteria, a live producer/fixture executor
+or a long-use grant. Normal monitoring and warm Coolify/recovery points remain
+after closure; no retirement authority is implied.
+
+At `T_0+48h`, missing evidence stays **INCOMPLETE**: cutover lead, Release Manager
+and data lead decide hold/incident/rollback, with accountable owner, deadline
+and next action. No silent extension or pass by timeout.
+
+Checkpoint example (a point readiness observation, not B4 acceptance):
 
 ```sh
 python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
@@ -858,13 +929,14 @@ python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
 ```
 
 `--checkpoint` is one of the five labels `+15m`, `+1h`, `+6h`, `+24h`,
-`+48h`, matching the five checkpoint rows below; `--expected-sha` is the
+`+48h`, matching the five checkpoint rows below while the watch remains open; `--expected-sha` is the
 deployed commit from the watch header and `--expected-build-id` is that
 deploy run's `<run id>-<attempt>` from the run summary. The script is
 read-only: one GET to `/readyz`, no writes, migrates, or DB connections. It
 emits GO only on a 200 with every component ready and an exact
 revision/build-ID match; anything short of a full match is EXTEND, never
-GO, and a ROLLBACK decision stays human. Checkpoints follow
+GO. A point GO is not B4 sign-off or proof of timer/workload coverage; a
+ROLLBACK decision retains its separate authority. Checkpoints follow
 [cutover.md](cutover.md) §48-hour watch. Poll read-only on a short cadence
 (suggested 60 s); record findings, not every healthy poll.
 
@@ -933,8 +1005,11 @@ whole watch so the rollback dispatch never has to hunt for it.
 - `rollback-decision`: at each checkpoint record GO, EXTEND (with new
   deadline), or ROLLBACK. A ROLLBACK row must repeat the previous Worker
   version ID from the header — that is the `<version-id>` the rollback
-  dispatch needs. At +48 h record sign-off or extend the watch on the
-  execution card.
+  dispatch needs. Record evidence-complete closure as soon as every required
+  receipt is sufficient; later checkpoint labels impose no idle hold and must
+  not be fabricated. At +48 h incomplete remains INCOMPLETE; the cutover lead,
+  Release Manager and data lead decide hold/incident/rollback as above. EXTEND
+  is a recorded decision, never automatic additional runtime authority.
 
 ### Signal thresholds (budgets and rollback triggers)
 
@@ -970,7 +1045,7 @@ acceptance.
 
 ### Scheduled-job manual checkpoints
 
-At +15 min, +1 h, +6 h, +24 h and +48 h, inspect the current checkpoint's
+At +15 min, +1 h, +6 h, +24 h and +48 h while the watch is open, inspect the current checkpoint's
 container logs with these exact JSON-field filters (not the `msg` envelope):
 
 ```text
