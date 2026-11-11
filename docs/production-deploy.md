@@ -251,6 +251,7 @@ These skips keep it green while deploying nothing:
   (`staging-pending`): the staging completion promotes it;
 - `check.yml` is still running on the target (`ci-pending`): its completion
   promotes it (a completed red CI still refuses);
+- the dedicated automatic-promotion disable is set (see below);
 - the hold variable is still in the future (see below);
 - the target is already live: production `/readyz` already reports the SHA;
 - the live build already contains the target (`older-than-live`): an older
@@ -307,9 +308,9 @@ measurement JSON are always retained as
 `staging-soak-<run_id>-<run_attempt>` for seven days. The soak runs outside the
 `deploy-production` lane — only the `production` job holds it —
 so a staging wait never queues an operator production rollback behind it. The lane keeps the default single pending slot, so a `recheck`
-job waits for the soak and both gates, then re-reads the hold, the live
-revision and the active dispatches immediately before the deploy: a hold set,
-a target gone live or stale, or an operator dispatch queued, waiting or in
+job waits for the soak and both gates, then re-reads the disable, the hold,
+the live revision and the active dispatches immediately before the deploy: a
+disable set, a hold set, a target gone live or stale, or an operator dispatch queued, waiting or in
 progress while the gates built or the soak slept skips green instead of
 deploying through the incident — or entering the lane behind a recovery run
 and cancelling it. A failed soak fails closed into no deploy, an unreadable
@@ -330,6 +331,34 @@ decision first. After a manual rollback, set the hold until the incident is
 resolved: otherwise the next automatic run re-selects the staged build that
 was just rolled back and redeploys it (the live check only skips builds the
 live revision already contains, and a rolled-back target is newer than live).
+
+Non-expiring disable: the repository variable
+`PRODUCTION_AUTO_PROMOTE_DISABLED` is the durable replacement for an
+expiry-only hold. Only the exact value `true` disables automatic promotion;
+any other value (including unset/empty) is off. With it set, an automatic
+run that otherwise passes the guard — both the `workflow_run` completions
+(`deploy-staging`, `check`) and the daily schedule backstop — skips green
+before the soak with reason `auto-promote-disabled` (a guard refusal stays
+red and deploys nothing, as before), and the pre-deploy `recheck` re-reads
+it after the gates/soak so a disable set before that checkpoint still
+skips instead of deploying. The `production` job consumes the recheck
+outputs and does not re-read the variable: the residual window between the
+recheck checkpoint and production start is the same one the timed hold
+already has. The live `production` Environment currently has no
+`required_reviewers`, so there is no approval-wait window today; if
+reviewers are ever added, an automatic-only fresh re-read at production
+start must be added before relying on this control. The workflow and its triggers stay enabled (no scheduled/
+backstop entry point is removed, no shared credential is touched), and
+manual dispatches ignore the disable entirely: deploy, rollback and
+live-SHA takeover with `takeover` keep working, and every QA/RM and
+exact-SHA gate still applies to them. Re-enable only after a recorded RM
+rollback/S2 PASS and all remaining exact-SHA qualification/release/incident
+gates, separately controlled — never by automatic expiry. Do not use a
+far-future `PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL` timestamp as a surrogate:
+a date guard stops holding at its expiry even if PASS is absent. Setting
+or clearing `PRODUCTION_AUTO_PROMOTE_DISABLED` is an operator action
+(record the effective-setting readback and the `updated_at` timestamp);
+code alone does not flip the live setting.
 
 ## Rollback-target preflight
 

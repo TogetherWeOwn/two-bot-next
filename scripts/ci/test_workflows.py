@@ -3081,8 +3081,8 @@ def production_errors(workflow):
     if (recheck.get("outputs") or {}).get("skip") != "${{ steps.recheck.outputs.skip }}":
         errors.append(f"{name}:recheck: must publish the skip output for production")
     recheck_text = str(recheck)
-    for required in ("vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL", "needs.guard.outputs.sha",
-                     'skip = "live"', 'skip = "older-than-live"',
+    for required in ("vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL", "vars.PRODUCTION_AUTO_PROMOTE_DISABLED", "needs.guard.outputs.sha",
+                     'skip = "auto-promote-disabled"', 'skip = "live"', 'skip = "older-than-live"',
                      'skip = "operator-dispatch-active"',
                      'skip = "dispatch-check-unreadable"',
                      "compare/{target}...{live}",
@@ -3122,6 +3122,16 @@ def production_errors(workflow):
     # run on that SHA that concluded `success` (a `skipped` run does not
     # satisfy the guard).
     script = "\n".join(step.get("run", "") for step in guard.get("steps", []))
+    guard_env = (guard.get("steps") or [{}])[0].get("env", {})
+    # The dedicated non-expiring automatic-new-build disable: exactly
+    # "true" skips automatic runs green; manual dispatch never reaches
+    # the auto branch, so recovery is preserved.
+    if guard_env.get("AUTO_DISABLED") != "${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}":
+        errors.append(f"{name}:guard: must receive the dedicated auto-promote disable as an env")
+    if 'skip = "auto-promote-disabled"' not in script:
+        errors.append(f"{name}:guard: missing dedicated auto-promote disable skip")
+    if 'os.environ.get("AUTO_DISABLED", "") == "true"' not in script:
+        errors.append(f"{name}:guard: missing exact-true auto-promote disable check")
     for required in ("actions/workflows/deploy-staging.yml/runs", 'status="success"',
                      'refuse(f"deploy-staging has no successful run on {sha}")',
                      'rule.get("type") == "required_reviewers"',
@@ -3130,7 +3140,6 @@ def production_errors(workflow):
             errors.append(f"{name}:guard: missing check {required}")
     # Fault switches are absent from the entire production workflow, not
     # forwarded to a guard that promises to refuse them.
-    guard_env = (guard.get("steps") or [{}])[0].get("env", {})
     # A deploy always takes over (10-20 13:31Z: a manual deploy without
     # takeover left production fenced); only the explicit cutover_hold
     # input keeps the fence held.
