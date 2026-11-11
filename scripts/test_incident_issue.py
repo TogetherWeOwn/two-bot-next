@@ -122,6 +122,31 @@ class IncidentIssueTests(unittest.TestCase):
             writes = [call for call in fake.calls if call[0] != "GET"]
             self.assertEqual(len(writes), 2 if outcome[0] == "closed" else 0)
 
+    def test_only_explicit_stale_activity_proof_overrides_the_recovery_fence(self):
+        from datetime import datetime, timezone
+        passed = datetime(2026, 10, 31, 4, 0, tzinfo=timezone.utc)
+        issue = {"number": 12, "body": sink.marker(KEY), "updated_at": "2026-10-31T04:10:00Z"}
+        for proof, expected in ((False, ("held", 12)), (True, ("closed", 12))):
+            fake = FakeGitHub([issue])
+            guard = mock.Mock(return_value=proof)
+            with self.subTest(proof=proof), mock.patch.object(sink, "_request", side_effect=fake):
+                self.assertEqual(sink.close_incident(ENV, KEY, "healthy", quiet_since=passed,
+                                                     activity_is_stale=guard), expected)
+            guard.assert_called_once_with(issue)
+            self.assertEqual(len([call for call in fake.calls if call[0] != "GET"]),
+                             2 if proof else 0)
+
+    def test_failed_stale_activity_proof_propagates_without_closing(self):
+        from datetime import datetime, timezone
+        issue = {"number": 12, "body": sink.marker(KEY), "updated_at": "2026-10-31T04:10:00Z"}
+        fake = FakeGitHub([issue])
+        with mock.patch.object(sink, "_request", side_effect=fake), \
+                self.assertRaises(sink.IncidentError):
+            sink.close_incident(ENV, KEY, "healthy",
+                                quiet_since=datetime(2026, 10, 31, 4, 0, tzinfo=timezone.utc),
+                                activity_is_stale=mock.Mock(side_effect=sink.IncidentError("unreadable")))
+        self.assertTrue(all(call[0] == "GET" for call in fake.calls))
+
     def test_recovery_comments_then_closes_and_tolerates_no_open_issue(self):
         fake = FakeGitHub([{"number": 12, "body": sink.marker(KEY)}])
         self.assertEqual(self.run_with(fake, sink.close_incident, KEY, "healthy"), ("closed", 12))

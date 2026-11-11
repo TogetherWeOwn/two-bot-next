@@ -1466,6 +1466,68 @@ jobs:
           retention-days: 14
           compression-level: 0
 
+  # A production Environment approval can wait before the production timeout
+  # even starts. The daily backstop also reports independently of those jobs.
+  promotion-hold-watch:
+    name: scheduled production hold watch
+    if: github.event_name == 'schedule' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: production-hold-incident
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      deployments: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0 # pending ancestry and path metadata, never comparison patches
+          persist-credentials: false
+      - name: Report holds without waiting on an approval or deployment queue
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NEEDS_JSON: '{}'
+          # Same non-expiring disable the guard/recheck re-read: exactly
+          # "true" classifies the hold explicitly instead of a generic
+          # pending reason. Any other value (including unset) is off.
+          AUTO_DISABLED: ${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}
+        run: python3 scripts/production_hold_incident.py
+
+  # Reporting only: a green skipped workflow is not a production promotion.
+  # This separate lane never holds staging or the production deployment lock.
+  promotion-hold-incident:
+    name: production hold incident
+    needs: [guard, schema-gate, roles-gate, soak, staging-soak-evidence, recheck, production]
+    if: always() && github.ref == 'refs/heads/main'
+    concurrency:
+      group: production-hold-incident
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # current main and first unpromoted main commit
+      actions: read # a successful production job, not just a green workflow
+      deployments: read # recorded promoted SHA can differ from workflow head
+      issues: write # shared incident issue sink only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0 # pending ancestry and path metadata, never comparison patches
+          persist-credentials: false
+      - name: Open, update or close the overdue promotion incident
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          # Same non-expiring disable the guard/recheck re-read: exactly
+          # "true" wins over any timed hold when classifying the report.
+          AUTO_DISABLED: ${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}
+        run: python3 scripts/production_hold_incident.py
+
   production:
     name: wrangler ${{ needs.guard.outputs.mode }} + readyz gate
     needs: [guard, soak, recheck, schema-gate, roles-gate, staging-soak-evidence]

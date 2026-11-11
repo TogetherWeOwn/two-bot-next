@@ -274,6 +274,89 @@ no-ops. These markers do not waive gates or turn a failed gate green. An actual
 rollout still needs the successful `production` job, immutable promotion
 evidence and a matching live `/readyz` revision.
 
+The final **`production hold incident`** job evaluates every outcome, including
+red guards/gates, soak mismatches and green skips such as `ci-not-green`.
+`scripts/production_hold_incident.py` reuses the shared incident sink to open
+one issue titled **`production held > 6h`**, labelled `incident`, under the
+stable `production-held` key. Repeated overdue evaluations comment on that
+issue; a later successful deploy-mode production job comments and closes it only
+when the content, generation and lifecycle checks below permit recovery.
+A workflow success with a skipped production job is not recovery evidence.
+Both reporters reconcile from verified deployment history, so replacement of a
+queued terminal reporter does not itself lose recovery. Alert bodies and
+repeat comments carry the observed serving generation and a checksum of their
+exact content. A delayed, unchanged OLD-generation comment on an older quiet
+issue can close when its generation predates the verified deploy. A delayed
+first-created alert is different: its initial incident-label event at or after
+promotion G holds the issue against G, even if creation preceded G but labeling
+arrived later. No recovery comment or close is written in either case. Without
+a genuinely later verified deploy, that stale incident can remain open
+indefinitely. Body/comment edits retaining the marker, a genuinely newer hold
+or unclassified newer activity also remain open.
+Recovery comments also bind their content to the verified producing generation,
+so a failed close after a successful comment can retry against that same generation.
+Before recovery writes, the caller exhausts bounded issue lifecycle events and
+validates each event's identity, kind and timestamp. A reopen at or after the
+verified promotion completion vetoes that generation, even at equal timestamps
+or with an unchanged recovery receipt; a lost close response does not erase a
+later reopen. All other lifecycle activity at or after completion also holds,
+including unknown event kinds. A genuinely later promotion can supersede older
+lifecycle activity, subject to the existing content/generation checks. Missing,
+malformed, unreadable or incomplete history fails closed within the same
+100-row/10-page, aggregate 100-request and 1 MiB response limits. Comments stay
+classified separately; neither receipts nor actors prove a lifecycle transition.
+The final PATCH is not atomic with concurrent operator changes.
+The checksum detects edits, not hostile authorship. Legacy alerts without
+content-bound generation metadata retain the conservative timestamp fence.
+
+The clock starts at the later of the last verified promotion's completed time
+and the first unpromoted runtime-affecting main commit's committer time (main uses
+squash merges). Commits touching only staging's `paths-ignore` paths do not start
+the clock; a failed or missing staging run for runtime changes still does. The
+reporters resolve main through the metadata-only Git ref API, then use full-depth
+local Git ancestry, commit times and path names, never commit/comparison patches. Missing objects, non-linear ancestry and bounded-reader
+limits fail the report for a later retry rather than inventing a result.
+It alerts only when deployable work is pending and the interval is **strictly
+greater than six hours**; unchanged or ignored-path-only main is not overdue. Promotion history
+comes from deploy-ID production records backed by a completed successful
+production job in the recorded run's producing attempt, not its workflow head
+SHA or overall conclusion. The deployment success-status timestamp must fall
+inside that successful job's start/completion interval; a later skipped rerun
+cannot erase a real earlier promotion or certify a failed attempt. A successful
+rollback establishes the restored serving SHA as the baseline, but does not
+close the incident. Failed post-deploy watches do not reset the clock. The issue includes the
+held-since time, last promoted SHA, current main SHA, skip/failure reason and
+promotion run URL. Missing, malformed or over-budget history fails the reporting
+job instead of inventing success. Its token can read history and write issues,
+not deploy; it has no Environment or live staging access. The daily backstop
+and completion triggers evaluate the threshold; this is not a six-hour polling
+schedule. The daily backstop's independent **`scheduled production hold watch`**
+job has no promotion dependencies, so a waiting production approval or deployment
+queue cannot suppress reporting. It uses the latest promotion job states for the
+reason and run link, prioritizing active production jobs across the bounded run
+list before falling back to the newest terminal run. Both reporters can reconcile
+recovery from the latest verified deploy generation, including its producing run,
+attempt, mode and completion. A newer rollback can never lend an older deploy
+reporter its recovery cutoff. Both reporters share an issue-only concurrency group,
+separate from deployment locks. A disabled hold is classified explicitly
+as `auto-promote-disabled` and named in the alert body as an intentional
+non-expiring disable, winning over any timed hold. The scheduled watch
+re-reads `PRODUCTION_AUTO_PROMOTE_DISABLED` (exactly `true`, as in the
+guard/recheck) to make that classification; the incident reporter instead
+derives it from the guard/recheck skip outputs, so only an automatic run
+whose guard or recheck actually applied the disable is classified that
+way — a manual dispatch, which ignores the disable, keeps its real gate
+failure visible instead of being masked as an intentional hold. It still
+counts as held production — the incident stays open until an operator
+re-enable or a manual deploy-mode promotion recovers it; there is no
+expiry to outlast, and the scheduled watch keeps the explicit reason
+instead of the generic pending fallback while the disable holds.
+For a read-only evaluation, run the helper with `--dry-run` and the
+same `NEEDS_JSON`, repository, run ID and read-authorized token environment;
+it prints the decision without calling the issue sink. CI's synthetic history
+and in-memory issue fixtures exercise alert, repeat and recovery without any
+production dispatch or issue write.
+
 Both completion triggers are necessary: removing `check` loses the wake when
 staging finishes first; removing `deploy-staging` loses it when CI finishes
 first. A `ci-pending` or `staging-pending` run alone does not establish a

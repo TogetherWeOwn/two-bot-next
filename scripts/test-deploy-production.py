@@ -387,7 +387,8 @@ class StaticGuardTests(unittest.TestCase):
         # scripts/test-runner-routing.py also rejects dormant/indirect routes.
         self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "soak",
                                       "staging-soak-evidence", "recheck",
-                                      "promotion-skipped", "production"])
+                                      "promotion-skipped", "promotion-hold-watch",
+                                      "promotion-hold-incident", "production"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
             self.assertEqual(runs_on, "ubuntu-latest", name)
@@ -405,6 +406,12 @@ class StaticGuardTests(unittest.TestCase):
                 self.assertEqual(granted, {})
                 continue
             self.assertTrue(granted, name)
+            if name in {"promotion-hold-watch", "promotion-hold-incident"}:
+                # Reporting can read deployment evidence and update issues,
+                # but cannot write deployments, repository contents or Actions.
+                self.assertEqual(granted, {"contents": "read", "actions": "read",
+                                           "deployments": "read", "issues": "write"})
+                continue
             if name == "production":
                 # Checkout plus the deploy-ID lifecycle: count today's
                 # production Deployments for N, then record this one; plus
