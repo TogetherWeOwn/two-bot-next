@@ -2,6 +2,7 @@
 
 Source: 8ad4550d60210e5022ed1b4a782508d1338936a3,
 scripts/production_hold_incident.py. Not wired to a reporter.
+Unlike the source, verified_content rejects excessive JSON nesting.
 """
 
 from datetime import datetime, timezone
@@ -80,7 +81,7 @@ def verified_content(text, pattern):
     try:
         value = json.loads(match[1], object_pairs_hook=incident_issue._reject_duplicate_keys)
         return value if value.get("content_sha256") == content_digest(content[:-1]) else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return None
 
 
