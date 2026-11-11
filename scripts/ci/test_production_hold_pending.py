@@ -243,10 +243,30 @@ class PendingSinceTest(unittest.TestCase):
                 self.pend()
 
     def test_timeout_refused(self):
-        self.repo.commit({"src/a.rs": "x"})
-        with mock.patch.object(pending, "GIT_TIMEOUT_SECONDS", 0):
-            with self.assertRaises(incident_issue.IncidentError):
-                self.pend()
+        head = self.repo.commit({"src/a.rs": "x"})
+        proc = mock.Mock()
+        proc.stdout.read.return_value = b"false\n"
+        proc.wait.return_value = 0
+        subprocess_double = mock.Mock(PIPE=-1, DEVNULL=-3)
+        subprocess_double.Popen.return_value = proc
+        timer = mock.Mock()
+
+        def start_timer(interval, expire):
+            timer.start.side_effect = expire
+            return timer
+
+        with mock.patch.object(pending, "subprocess", subprocess_double), \
+                mock.patch.object(pending.threading, "Timer", side_effect=start_timer):
+            with self.assertRaisesRegex(incident_issue.IncidentError,
+                                        "^production hold history git timed out$"):
+                self.pend(main=head)
+        self.assertIn("--is-shallow-repository", subprocess_double.Popen.call_args.args[0])
+        subprocess_double.Popen.assert_called_once()
+        proc.kill.assert_called_once_with()
+        proc.stdout.read.assert_called_once_with(pending.MAX_OUTPUT_BYTES + 1)
+        proc.wait.assert_called_once_with()
+        timer.cancel.assert_called_once_with()
+        proc.stdout.close.assert_called_once_with()
 
     def test_missing_git_binary_refused(self):
         fake = mock.Mock(PIPE=-1, DEVNULL=-3)
