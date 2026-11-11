@@ -45,7 +45,6 @@ tiers:
     - "REVIEW.md"
     - "SECURITY.md"
     - "CODE_OF_CONDUCT.md"
-    - "LICENSE"
     - "docs/*.md"
     - "docs/**/*.md"
     - "assets/**" # static brand fixtures
@@ -55,6 +54,8 @@ tiers:
     - "fuzz/corpus/**" # static fuzz corpus fixtures
   ordinary: [] # no modules audited yet; empty is deliberate (see header)
   sensitive: # Security -> QA review; always wins on overlap
+    # License instrument (BSL parameters) is sensitive, not docs copy.
+    - "LICENSE"
     # Review policy and PR contract.
     - ".github/workflows/**"
     - ".github/review-tiers.yml"
