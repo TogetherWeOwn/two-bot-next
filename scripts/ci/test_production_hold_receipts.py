@@ -89,6 +89,34 @@ class ReceiptParsingTest(unittest.TestCase):
                 comment = {"updated_at": "2026-01-03T00:00:00Z", "body": text}
                 self.assertFalse(receipts.stale_activity(History([comment]), stale_issue(valid), REPORT))
 
+    def test_sink_envelopes_preserve_v2_integrity(self):
+        old = dict(REPORT, last_promoted_at="2026-01-01T00:00:00Z")
+        valid = receipt(receipts, old)
+        issue_body = valid + "\n\n" + incident_issue.marker(receipts.KEY) + "\n"
+        comment_body = "Still failing.\n\n" + valid
+        self.assertTrue(receipts.stale_observation(issue_body, REPORT))
+        self.assertTrue(receipts.stale_observation(comment_body, REPORT))
+        comment = {"updated_at": "2026-01-03T00:00:00Z", "body": comment_body}
+        self.assertTrue(receipts.stale_activity(History([comment]), stale_issue(issue_body), REPORT))
+        for text in (issue_body + "extra", comment_body + "extra",
+                     change_metadata(issue_body, observed_at="2026-01-01T13:00:00Z"),
+                     change_metadata(comment_body, observed_at="2026-01-01T13:00:00Z")):
+            with self.subTest(text=text):
+                self.assertFalse(receipts.stale_observation(text, REPORT))
+
+    def test_lifecycle_timestamp_overflow_retains_error_contract(self):
+        class EventHistory(History):
+            def pages(self, path):
+                return [{"id": 1, "event": "reopened", "created_at": raw}] if path.endswith("/events") else []
+
+        valid = receipt(receipts, dict(REPORT, last_promoted_at="2026-01-01T00:00:00Z"))
+        for raw in ("0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"):
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(incident_issue.IncidentError, "production hold timestamp is unreadable"):
+                    receipts.stale_activity(History(), stale_issue(valid), dict(REPORT, last_promoted_at=raw))
+                with self.assertRaisesRegex(incident_issue.IncidentError, "production hold timestamp is unreadable"):
+                    receipts.stale_activity(EventHistory(), stale_issue(valid), REPORT)
+
     def test_timestamp_bounds_and_receipt_rejection(self):
         bad = ("0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00",
                "nonsense", "2026-01-01T00:00:00")
