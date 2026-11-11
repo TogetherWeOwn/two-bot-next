@@ -2937,12 +2937,13 @@ jobs:
       - name: Select jobs or run all
         id: select
         env:
+          EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           rust=true worker=true parity=true supply=true docs=false voice=true
-          if [ "${{ github.event_name }}" = "pull_request" ] \
+          if [ "$EVENT_NAME" = "pull_request" ] \
             && [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ] \
             && result=$(python3 scripts/job-inputs.py \
               --base-ref "$BASE_SHA" --head-ref "$HEAD_SHA"); then
@@ -2956,7 +2957,7 @@ jobs:
             supply=${supply:-true} docs=${docs:-false} voice=${voice:-true}
           fi
           printf 'job-inputs: rust=%s worker=%s parity=%s supply=%s docs=%s voice=%s (event=%s)\n' \
-            "$rust" "$worker" "$parity" "$supply" "$docs" "$voice" "${{ github.event_name }}"
+            "$rust" "$worker" "$parity" "$supply" "$docs" "$voice" "$EVENT_NAME"
           printf 'rust=%s\nworker=%s\nparity=%s\nsupply=%s\ndocs=%s\nvoice=%s\n' \
             "$rust" "$worker" "$parity" "$supply" "$docs" "$voice" >>"$GITHUB_OUTPUT"
 
@@ -2990,19 +2991,20 @@ jobs:
       - name: Select image build or skip
         id: select
         env:
+          EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           build=true
-          if [ "${{ github.event_name }}" = "pull_request" ] \
+          if [ "$EVENT_NAME" = "pull_request" ] \
             && [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ] \
             && result=$(python3 scripts/container-inputs.py \
               --base-ref "$BASE_SHA" --head-ref "$HEAD_SHA"); then
             build="$result"
           fi
           printf 'container-inputs: build=%s (event=%s)\n' \
-            "$build" "${{ github.event_name }}"
+            "$build" "$EVENT_NAME"
           printf 'build=%s\n' "$build" >>"$GITHUB_OUTPUT"
 
   container:

@@ -32,6 +32,7 @@ concurrency:
 
 jobs:
   sbom-target:
+    name: sbom-target
     # Dry runs never publish and may run from any ref; a release_tag
     # publication must be dispatched from main.
     if: ${{ !cancelled() && (inputs.dry_run == true || (inputs.release_tag != '' && github.ref == 'refs/heads/main')) }}
@@ -66,6 +67,7 @@ jobs:
       ref: ${{ needs.sbom-target.outputs.ref }}
 
   verify-sbom:
+    name: verify-sbom
     needs: [sbom-target, release-sbom]
     if: ${{ !cancelled() && needs.release-sbom.result == 'success' && needs.sbom-target.outputs.tag != '' }}
     # Runner routing: see the note on `check` in check.yml.
@@ -93,13 +95,14 @@ jobs:
           python3 scripts/release-sbom-target.py --verify-source sbom/source-sha.txt
 
   attach-sbom:
+    name: attach-sbom
     needs: [sbom-target, verify-sbom]
     if: ${{ !cancelled() && needs.verify-sbom.result == 'success' && needs.sbom-target.outputs.tag != '' && github.ref == 'refs/heads/main' }}
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: write
+      contents: write # Upload verified SBOM assets to the existing GitHub Release.
     # No checkout and no repository script: this job holds the only write
     # token in the chain and spends it solely on the asset upload. The
     # artifact is the one `verify-sbom` already checked in this run, and the

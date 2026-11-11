@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   changes:
+    name: changes
     permissions:
       contents: read
     runs-on: ubuntu-latest

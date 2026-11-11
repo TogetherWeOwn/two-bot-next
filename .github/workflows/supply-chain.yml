@@ -102,8 +102,9 @@ jobs:
           EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_NUMBER: ${{ inputs.pr_number }}
           EVENT_NAME: ${{ github.event_name }}
-        shell: python3 {0}
+        shell: bash
         run: |
+          python3 -I - <<'PY'
           import json, os, subprocess, uuid
 
           event = os.environ["EVENT_NAME"]
@@ -207,6 +208,7 @@ jobs:
               delimiter = uuid.uuid4().hex
               output.write(f"body_file<<{delimiter}\n{body_path}\n{delimiter}\n")
 
+          PY
       # Changed paths feed the T0 attestation floor in pr_standards.py. Read-only:
       # the PR files API under the job's pull-requests: read grant. Renames emit
       # both the new and the previous name (deleting or moving a T0 file stays
@@ -266,8 +268,9 @@ jobs:
           REPO_PRIVATE: ${{ github.event.repository.private }}
           COMMITS: ${{ toJSON(github.event.commits) }}
           CHANGED_FILES_FILE: ${{ steps.changed.outputs.changed_files_file }}
-        shell: python3 {0}
+        shell: bash
         run: |
+          python3 -I - <<'PY'
           import os, sys
 
           # The body travels as a file, never env or step outputs: stored
@@ -301,6 +304,7 @@ jobs:
                       os.environ["CHANGED_FILES"] = handle.read()
           sys.exit(pr_standards.main())
 
+          PY
       # The lint's own unit tests execute the PR head's files
       # (test_pr_standards.py imports the head's pr_standards.py), so they run
       # only after the base-branch gate above has consumed its inputs. An

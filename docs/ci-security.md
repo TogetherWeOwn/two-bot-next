@@ -9,11 +9,17 @@ job-specific grants. Every checkout sets `persist-credentials: false`.
 The [public-hosted runner contract](#public-hosted-runner-contract) covers explicit
 standard Ubuntu selections, compatibility evidence and qualification limits.
 
-The release job retains contents/PR write to publish and reconcile releases;
-only the dispatch job gets actions write. The existing release-branch push uses
-an ephemeral Git credential helper for that one command, not a persisted token.
-Untrusted PR metadata remains in environment variables, never interpolated into
-shell source. The deploy job does not restore caches from PR checks.
+The daily digest job holds `contents: write` to tag and publish its release,
+`deployments: read` to resolve the live production commit, and `actions: write`
+to dispatch the SBOM workflow. That workflow keeps script execution read-only;
+only `attach-sbom` holds `contents: write` to upload verified release assets.
+Untrusted PR metadata and selector event names travel through environment
+variables, never interpolated into shell source. The deploy job does not restore
+caches from PR checks. The two inline Python metadata guards use supported Bash
+steps with isolated Python (`python3 -I -`) and quoted heredocs, preserving their
+base-branch gate provenance without importing modules from the PR checkout.
+Explicit job names match their previous jobs-API identities; permission comments
+explain the existing grants without changing their values.
 
 ## Staging deployment (active)
 

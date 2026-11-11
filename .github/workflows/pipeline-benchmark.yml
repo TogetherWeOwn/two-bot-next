@@ -22,6 +22,7 @@ concurrency:
 
 jobs:
   benchmark:
+    name: benchmark
     permissions:
       contents: read
     # Runner routing: see the note on `check` in check.yml.
