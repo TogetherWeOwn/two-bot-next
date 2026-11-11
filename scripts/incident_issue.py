@@ -178,13 +178,16 @@ def open_incident(env, key, title, body):
     return "opened", number
 
 
-def close_incident(env, key, body, quiet_since=None):
+def close_incident(env, key, body, quiet_since=None, activity_is_stale=None):
     """RECOVERY: comment on and close every open issue for `key`.
 
     Closing all of them also clears a duplicate that a race left open. With
     `quiet_since` (an aware datetime), an issue with activity after it, or
     no readable activity time, is held open instead: an alert after that
-    moment means the check failed again since the evidence of health.
+    moment means the check failed again since the evidence of health. A caller
+    with serialized writers and durable observation provenance may supply
+    `activity_is_stale(issue)` to prove newer activity describes an older failure
+    generation. Without that explicit proof the timestamp fence is unchanged.
     Returns ("closed", lowest closed), ("held", lowest held) when every open
     issue was held, or ("none-open", None) when no issue is open (for
     example an agent already closed it): nothing is left to resolve.
@@ -200,8 +203,9 @@ def close_incident(env, key, body, quiet_since=None):
         number = issue["number"]
         updated = _updated(issue)
         if quiet_since is not None and (updated is None or updated > quiet_since):
-            held.append(number)
-            continue
+            if activity_is_stale is None or not activity_is_stale(issue):
+                held.append(number)
+                continue
         _request("POST", f"/repos/{repo}/issues/{number}/comments", token,
                  {"body": _clip(body, MAX_BODY)})
         _request("PATCH", f"/repos/{repo}/issues/{number}", token,
