@@ -1,5 +1,7 @@
 //! Dev-only disposable Postgres fixtures. Never depend on this crate at runtime.
 
+pub mod pipeline_integrity;
+
 use anyhow::{bail, Context, Result};
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
