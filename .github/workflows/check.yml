@@ -2256,6 +2256,9 @@ jobs:
       - name: custom-command Postgres proof
         run: cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
 
+      - name: automod preview audit proof (CI service only)
+        run: cargo test -p two-bot-core --features db --locked --test automod_preview_audit -- --ignored
+
       - name: automations import/export Postgres proof
         run: cargo test -p two-bot-core --features db --locked --test automation_transfer -- --ignored
 
