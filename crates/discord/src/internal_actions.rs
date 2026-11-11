@@ -10,6 +10,7 @@
 //! executor capabilities. No runtime flags, stores or listeners are installed.
 //! Every 429 feeds the caller-supplied per-token [`CooldownGovernor`].
 
+use crate::brand::{brand_embed, brand_footer_for, EmbedKind};
 use bytes::Bytes;
 use http::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGENT};
 use http_body_util::{BodyExt, Full, Limited};
@@ -21,7 +22,7 @@ use serde_json::{Map, Value};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use twilight_http::{request::TryIntoRequest, Client as TwilightClient};
 use twilight_model::{
-    channel::message::AllowedMentions,
+    channel::message::{embed::Embed, AllowedMentions},
     id::{marker::ChannelMarker, marker::MessageMarker, Id},
 };
 use two_bot_core::internal_actions::{is_snowflake, validate_announcement, ErrorCode};
@@ -134,6 +135,107 @@ pub enum ExecutionOutcome {
     NoEffect(Refusal),
     RateLimited(RateLimitCooldown),
     Unknown(UnknownReason),
+}
+
+/// Kit Echo title prefix (Discord spec §5: the Echo post title is
+/// `Echo · {event}`). Contract v2 keeps `announcement.post` unchanged and
+/// has the site compose Echo text per that pattern, so the bot-side kind
+/// reads the composed title: an `Echo ·` first line is an Echo post.
+const ECHO_TITLE_PREFIX: &str = "Echo ·";
+
+/// Render one `announcement.post` body as the kit announcement/Echo embed
+/// (Discord spec §2–§3, §5). The input contract is unchanged — the site
+/// still sends a text `body` — so the builder only dresses it:
+/// a short first line that fits the title ceiling becomes the title and
+/// the remainder the description; otherwise the whole text is the
+/// description alone with no title. The fallback guarantees no character
+/// is silently dropped: the validated body is capped at 2000 UTF-16 units
+/// and the description ceiling is 4096, so the full text always fits. Both
+/// arms run through the shared message-safety bounds (mass mentions
+/// neutralized, Discord embed ceilings applied). A first line carrying
+/// user/role/channel markup (`<@`, `<#`), a masked link (`](`), or an
+/// opening code fence (```` ``` ````) also falls back to the description
+/// alone: Discord does not render those in embed titles, so the
+/// description is the only place they render.
+/// General announcements take the ember default with the `Announcements`
+/// surface footer; a composed Echo title takes the violet Echo kind with
+/// the `Echo` surface footer. Colour comes only from [`crate::brand`]
+/// via [`EmbedKind`]; no literal appears here. Structured Echo counts
+/// (Came/Stayed/First-timers fields) stay on the site-composed text: the
+/// validated body carries no structured counts to fill them from, so no
+/// field is invented.
+#[must_use]
+pub fn announcement_embed(body: &str) -> Embed {
+    use two_bot_core::message_safety::{
+        neutralize_mentions, text_len, truncate, EMBED_DESCRIPTION_LIMIT, EMBED_TITLE_LIMIT,
+    };
+    // The embed description ceiling bounds the neutralised text, not the
+    // 2000-unit message ceiling: neutralisation inserts a zero-width
+    // space per mass mention, so a body at the validation ceiling can
+    // neutralise past 2000 units, and bounding by the message ceiling
+    // here would silently drop its trailing characters.
+    let safe = truncate(&neutralize_mentions(body), EMBED_DESCRIPTION_LIMIT);
+    let mut lines = safe.lines();
+    let first = lines.next().unwrap_or_default().trim_end();
+    let rest_owned = lines.collect::<Vec<_>>().join("\n");
+    // Only the separator newlines between the title line and the body
+    // collapse. `trim_start()` would also strip the first body line's
+    // indentation (code blocks, lists), destroying its structure, so the
+    // description keeps its leading spaces.
+    let rest = rest_owned.trim_start_matches('\n');
+    // Echo kind reads the composed first line even when it falls back to
+    // the description: the site composes `Echo · {event}` per the contract.
+    let is_echo = first.starts_with(ECHO_TITLE_PREFIX);
+    let (kind, surface) = if is_echo {
+        (EmbedKind::Echo, "Echo")
+    } else {
+        (EmbedKind::Default, "Announcements")
+    };
+    let title_unrenderable = first.contains("<@")
+        || first.contains("<#")
+        || first.contains("](")
+        // Promoting an opening code fence to the title leaves the
+        // description without its opening fence, breaking the block.
+        || first.trim_start().starts_with("```");
+    let promote_to_title =
+        !first.is_empty() && text_len(first) <= EMBED_TITLE_LIMIT && !title_unrenderable;
+    let mut embed = Embed {
+        author: None,
+        color: None,
+        description: None,
+        fields: Vec::new(),
+        footer: None,
+        image: None,
+        kind: "rich".to_owned(),
+        provider: None,
+        thumbnail: None,
+        timestamp: None,
+        title: None,
+        url: None,
+        video: None,
+    };
+    if promote_to_title {
+        embed.title = Some(first.to_owned());
+        // A whitespace-only remainder (trailing blank lines) is not a
+        // description; it would render as an empty-looking block.
+        if !rest.trim().is_empty() {
+            let description = truncate(rest, EMBED_DESCRIPTION_LIMIT);
+            if !description.is_empty() {
+                embed.description = Some(description);
+            }
+        }
+    } else {
+        // No title: the whole text is the description alone, so a single
+        // long paragraph or a markup-carrying first line keeps every
+        // character instead of truncating into the title.
+        let full = safe.trim();
+        if !full.is_empty() {
+            embed.description = Some(truncate(full, EMBED_DESCRIPTION_LIMIT));
+        }
+    }
+    embed = brand_embed(kind, embed);
+    embed.footer = Some(brand_footer_for(surface));
+    embed
 }
 
 /// Uses Twilight's validated request builder, but deliberately does NOT await
@@ -264,11 +366,17 @@ impl AnnouncementExecutor {
         if !two_bot_core::message_safety::has_message_text(&content) {
             return ExecutionOutcome::NoEffect(Refusal::Malformed);
         }
+        // Kit embed treatment (Discord spec §2–§3, §5): the validated text
+        // renders as one branded embed — ember for announcements, violet
+        // for composed Echo titles — instead of a plain message. Mentions
+        // stay suppressed by the explicit empty allowed_mentions below and
+        // by message-safety neutralization inside the builder.
+        let embed = announcement_embed(body["body"].as_str().expect("core validated body"));
         let mentions = AllowedMentions::default();
         let request = match self
             .twilight
             .create_message(channel_id)
-            .content(&content)
+            .embeds(&[embed])
             .allowed_mentions(Some(&mentions))
             .try_into_request()
         {
