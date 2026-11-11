@@ -134,8 +134,9 @@ export class StagingProtectionGate extends DurableObject<ProtectionEnv> {
       // lands after this read but before the POST takes effect outside this
       // worker's control. Failing closed on every change observed up to this
       // read bounds that residual window to the single final request; the
-      // runner's pre-DDL hash/provenance recheck is the compensating control
-      // for it. See docs/staging-migrate-protection.md.
+      // runner's pre-DDL hash/provenance recheck does not recheck the claim
+      // attempt and does not close that remainder. See
+      // docs/staging-migrate-protection.md.
       latest = await api.run(identity.runId, config, Date.now(), false);
       requireEvidence(id(latest.run_attempt) === attempt && latest.head_sha === identity.sha);
       await api.decide(identity.runId, approved);

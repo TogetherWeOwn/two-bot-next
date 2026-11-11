@@ -63,8 +63,8 @@ Fresh GitHub reads must establish:
    final pre-callback read but before the POST takes effect outside the
    worker's control. The worker fails closed on every change observed up to
    that read, bounding the residual window to the single final request; the
-   runner's pre-DDL hash/provenance recheck (which does not recheck the
-   claim attempt) is the compensating control for that remainder.
+   runner's pre-DDL hash/provenance recheck does not recheck the claim
+   attempt and does not close that remainder.
 
 Missing, ambiguous, stale, malformed or failed reads reject; an inability to
 make a safe callback leaves the gate pending, never approved. No API error body,
