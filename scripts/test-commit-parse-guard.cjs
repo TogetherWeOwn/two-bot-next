@@ -214,9 +214,16 @@ try {
 // (release-on-promote.cjs), so release.yml no longer installs the parser.
 const supply = read('.github/workflows/supply-chain.yml');
 const check = read('.github/workflows/check.yml');
-const installs = text => [...text.matchAll(/release-please@(\d+\.\d+\.\d+)/g)].map(match => match[1]);
-for (const [name, text] of [['supply-chain', supply], ['check', check]]) {
-  assert(installs(text).length >= 1 && installs(text).every(version => version === '17.6.0'), `${name} must install release-please@17.6.0`);
+const fixture = 'scripts/fixtures/commit-parser';
+const manifest = JSON.parse(read(`${fixture}/package.json`));
+const lock = JSON.parse(read(`${fixture}/package-lock.json`));
+assert.deepEqual(manifest.dependencies, {'release-please': '17.6.0'});
+assert.deepEqual(lock.packages[''].dependencies, manifest.dependencies);
+assert.equal(lock.packages['node_modules/release-please'].version, '17.6.0');
+for (const [name, text, directory] of [['supply-chain', supply, 'release-parse'], ['check', check, 'release-fixture']]) {
+  assert(text.includes(`${fixture}/package.json`) && text.includes(`${fixture}/package-lock.json`), `${name} must stage both pinned fixture files`);
+  assert(text.includes(`npm ci --prefix "$RUNNER_TEMP/${directory}" --ignore-scripts --no-audit --no-fund`), `${name} must install the locked parser without lifecycle scripts`);
+  assert(!/npm\s+install\b[^\n]*release-please/.test(text), `${name} must not install an ad-hoc parser`);
 }
 assert(!read('.github/workflows/release.yml').includes('release-please-action'), 'release.yml no longer runs release-please');
 const prStep = supply.slice(supply.indexOf('- name: Check the squash commit parses for release notes'));

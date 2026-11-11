@@ -80,7 +80,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            scripts/fixtures/commit-parser
           sparse-checkout-cone-mode: true
 
       - name: Accept metadata already linted on the PR
@@ -325,8 +327,10 @@ jobs:
           HEAD_REF: ${{ steps.pr.outputs.head_ref }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
         run: | # zizmor: ignore[adhoc-packages] pinned release-please parser only
+          mkdir -p "$RUNNER_TEMP/release-parse"
+          cp scripts/fixtures/commit-parser/package.json scripts/fixtures/commit-parser/package-lock.json "$RUNNER_TEMP/release-parse/"
           for attempt in 1 2 3; do
-            npm install --prefix "$RUNNER_TEMP/release-parse" --ignore-scripts --no-audit --no-fund release-please@17.6.0 && break
+            npm ci --prefix "$RUNNER_TEMP/release-parse" --ignore-scripts --no-audit --no-fund && break
             [ "$attempt" -lt 3 ] || exit 1
             sleep 5
           done

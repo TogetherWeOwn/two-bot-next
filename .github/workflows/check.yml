@@ -3694,7 +3694,9 @@ jobs:
         # The PR-side guard uses release-please's pinned conventional-commit
         # parser, in an isolated install with lifecycle scripts disabled.
         run: | # zizmor: ignore[adhoc-packages] pinned commit parser fixture only
-          npm install --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund release-please@17.6.0
+          mkdir -p "$RUNNER_TEMP/release-fixture"
+          cp ../scripts/fixtures/commit-parser/package.json ../scripts/fixtures/commit-parser/package-lock.json "$RUNNER_TEMP/release-fixture/"
+          npm ci --prefix "$RUNNER_TEMP/release-fixture" --ignore-scripts --no-audit --no-fund
       - name: Verify the commit-parse guard
         if: needs.job-inputs.outputs.worker != 'false'
         run: NODE_PATH="$RUNNER_TEMP/release-fixture/node_modules" node ../scripts/test-commit-parse-guard.cjs
