@@ -201,7 +201,7 @@ fn database_sql(operation: &str, name: &str) -> sqlx::AssertSqlSafe<String> {
 async fn dry_run_then_apply_scenario(db: std::sync::Arc<TestDb>) -> TestResult {
     sqlx::query(
         "INSERT INTO gateway_sessions (guild_id, shard_id, session_id, seq, resume_url, updated_at)
-         VALUES ($1, 0, 'current-session', 42, 'ws://mock', now())",
+         VALUES ($1, 0, 'current-session', 42, 'wss://gateway.discord.gg', now())",
     )
     .bind(GUILD)
     .execute(&db.pool)

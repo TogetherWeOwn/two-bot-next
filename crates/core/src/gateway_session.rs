@@ -146,7 +146,7 @@ mod tests {
         GatewaySession {
             session_id: "mock-session".into(),
             sequence: 42,
-            resume_url: "ws://mock-gateway".into(),
+            resume_url: "wss://gateway.discord.gg".into(),
             updated_at_ms: 1000,
         }
     }
