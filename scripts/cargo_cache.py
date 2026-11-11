@@ -668,6 +668,26 @@ CARGO_TARGET_TOP_LEVEL = frozenset(
 # File kinds that must never be treated as regenerable build output.
 PROTECTED_SUFFIXES = frozenset(
     {'.rs', '.md', '.markdown', '.toml', '.bak', '.orig', '.rej', '.pem', '.key'})
+# rustdoc copies its bundled font licences into target's doc/static.files/
+# as *-LICENSE-*.md. That directory is rustdoc output, so those licence
+# files are build output in target scans; every other protected-suffix
+# file vetoes. The exception never applies to scratch scans, whose temp
+# names are arbitrary and never hold rustdoc output.
+RUSTDOC_STATIC_FILES = ('doc', 'static.files')
+
+
+def _is_rustdoc_static_license(base, target, name, suffix):
+    """True for rustdoc-generated font licences under target doc/static.files/.
+
+    Target-only helper: callers in scratch scans must not use it.
+    """
+    if suffix != '.md' or '-license-' not in name.lower():
+        return False
+    try:
+        parts = Path(base).relative_to(target).parts
+    except ValueError:
+        return False
+    return parts == RUSTDOC_STATIC_FILES
 # Directory names that suggest preserved evidence/backups/archives.
 PROTECTED_DIR_NAMES = frozenset(
     {'evidence', 'backup', 'backups', 'archive', 'archives',
@@ -703,6 +723,8 @@ def _preservation_veto_legacy(target):
             if suffix in PROTECTED_SUFFIXES:
                 if suffix == '.rs' and under_codegen_out:
                     continue  # build-script codegen output, not stashed source
+                if _is_rustdoc_static_license(base, target, name, suffix):
+                    continue  # rustdoc font licence, not stashed docs
                 return f'preserved file in target: {name}'
     return None
 
@@ -713,7 +735,9 @@ def preservation_veto(target):
     Calibrated against real Cargo output: a genuine target holds only
     debug/release/doc/package/tmp trees at top level. Nested build-script
     codegen (debug/build/*/out/*.rs) is expected; .rs anywhere else is not
-    Cargo output. Unknown foreign top-level entries fail closed to a veto.
+    Cargo output. rustdoc font licences (doc/static.files/*-LICENSE-*.md)
+    are expected build output; other protected-suffix files veto.
+    Unknown foreign top-level entries fail closed to a veto.
 
     Per-worktree layout: target/ holds only ws-* subdirs, each
     holding Cargo output. Each subdir is veto-checked with the legacy
@@ -775,6 +799,8 @@ def _veto_scan_names(base, target, dirs, files, check_top_level, first):
         if suffix in PROTECTED_SUFFIXES:
             if suffix == '.rs' and under_codegen_out:
                 continue  # build-script codegen output, not stashed source
+            # No rustdoc licence exception here: rustdoc writes to target,
+            # never scratch, whose temp names are arbitrary.
             return f'preserved file in target: {name}'
     return None
 

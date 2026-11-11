@@ -304,9 +304,10 @@ its exact-target inventory row, zero tracked target files, a Git-ignored target,
 no symlink, no actual process reference anywhere in its workspace
 (source/evidence included), and **build-output-only target contents**: only
 Cargo's own top-level entries
-(`debug`, `release`, `doc`, `package`, `tmp`, `.rustc_info.json`, `.cargo-lock`,
-`CACHEDIR.TAG`), with nested build-script codegen (`debug`/`release`
-`build/*/out/*.rs`) expected. A `.gitignore` entry
+(`debug`, `release`, `doc`, `package`, `tmp`, `.rustc_info.json`,
+`.rustdoc_fingerprint.json`, `.cargo-lock`, `CACHEDIR.TAG`), with nested
+build-script codegen (`debug`/`release` `build/*/out/*.rs`) and rustdoc
+font licences (`doc/static.files/*-LICENSE-*.md`) expected. A `.gitignore` entry
 proves nothing about provenance, so preserved evidence/backups/archives/sources
 or any other foreign entry inside `target/` vetoes eligibility (fail closed),
 and foreign files under Cargo's own subtrees that pass every name check stay
