@@ -156,6 +156,16 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
                    ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
                    ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964"}
+# PR-size activation (pinned below): the labeller and the required gate run
+# on PR events, plus a manual dispatch carrying an explicit PR number; the
+# weekly tally runs on schedule or a blank manual dispatch. Pinning these
+# conditions prevents the gate from being silently disabled while its
+# inventory entry and reusable ref stay intact.
+PR_SIZE_JOB_IF = "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''"
+PR_SIZE_WEEKLY_IF = "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')"
+PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size"): PR_SIZE_JOB_IF,
+                         ("pr-size.yml", "pr-size-gate"): PR_SIZE_JOB_IF,
+                         ("pr-size.yml", "pr-size-weekly"): PR_SIZE_WEEKLY_IF}
 # Every ordinary job in this public repository selects standard free hosted
 # Ubuntu directly. A private conversion needs fresh runner/cost qualification.
 PUBLIC_RUNNER = "ubuntu-latest"
@@ -4529,6 +4539,22 @@ def workflow_policy_errors(workflows):
     # An intentional addition needs an explicit policy change and independent review.
     if set(workflows) != set(JOB_INVENTORY):
         errors.append("workflow inventory changed")
+    # Every allowed reusable call must still exist with its pinned ref:
+    # converting a caller to an ordinary job keeps the inventory intact
+    # while evading the ref checks below, which only fire when `uses` is
+    # present. Same for the PR-size activation conditions.
+    for (name, job_id), expected_uses in REUSABLE_CALLS.items():
+        job = workflows.get(name, {}).get("jobs", {}).get(job_id)
+        if job is None:
+            errors.append(f"{name}:{job_id}: missing reusable call")
+        elif job.get("uses") != expected_uses:
+            errors.append(f"{name}:{job_id}: reusable call missing or retargeted")
+    for (name, job_id), expected_if in PR_SIZE_IF_CONDITIONS.items():
+        job = workflows.get(name, {}).get("jobs", {}).get(job_id)
+        if job is None:
+            errors.append(f"{name}:{job_id}: missing PR-size job")
+        elif job.get("if") != expected_if:
+            errors.append(f"{name}:{job_id}: PR-size activation condition changed")
     for name, workflow in workflows.items():
         jobs = workflow.get("jobs", {})
         if set(jobs) != JOB_INVENTORY.get(name, set()):
@@ -8191,6 +8217,56 @@ class WorkflowTests(unittest.TestCase):
                 workflows = deepcopy(self.workflows)
                 workflows["nightly.yml"]["jobs"]["pipeline-benchmark"]["uses"] = target
                 self.assertTrue(workflow_policy_errors(workflows))
+
+    def test_reusable_calls_inventory_is_complete(self):
+        # Deliberately independent of REUSABLE_CALLS: deleting an entry
+        # must not delete its oracle.
+        self.assertEqual(REUSABLE_CALLS, {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
+                                          ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
+                                          ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
+                                          ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
+                                          ("deploy-staging.yml", "help-embed-synthetic"): "./.github/workflows/help-embed-synthetic.yml",
+                                          ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
+                                          ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@63699075b492914c137281acffd4c89e51cc1c4c",
+                                          ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
+                                          ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
+                                          ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
+                                          ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964"})
+        for (name, job_id), expected_uses in REUSABLE_CALLS.items():
+            with self.subTest(workflow=name, job=job_id):
+                job = self.workflows[name]["jobs"].get(job_id, {})
+                self.assertEqual(job.get("uses"), expected_uses)
+
+    def test_reusable_call_cannot_be_removed(self):
+        # Replacing a caller with an ordinary ubuntu-latest job keeps the
+        # job inventory intact while evading the ref checks, which only
+        # fire when `uses` is present.
+        for name, job_id in REUSABLE_CALLS:
+            with self.subTest(workflow=name, job=job_id):
+                workflows = deepcopy(self.workflows)
+                workflows[name]["jobs"][job_id] = {"runs-on": "ubuntu-latest",
+                                                   "steps": [{"run": "echo stub"}]}
+                self.assertTrue(workflow_policy_errors(workflows))
+        workflows = deepcopy(self.workflows)
+        del workflows["pr-size.yml"]["jobs"]["pr-size-gate"]
+        self.assertTrue(workflow_policy_errors(workflows))
+
+    def test_pr_size_activation_conditions_are_pinned(self):
+        jobs = self.workflows["pr-size.yml"]["jobs"]
+        expected = {"pr-size": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
+                    "pr-size-gate": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
+                    "pr-size-weekly": "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')"}
+        for job_id, condition in expected.items():
+            with self.subTest(job=job_id):
+                self.assertEqual(jobs[job_id]["if"], condition)
+        for job_id in expected:
+            with self.subTest(job=job_id, mutation="neutered"):
+                workflows = deepcopy(self.workflows)
+                workflows["pr-size.yml"]["jobs"][job_id]["if"] = "${{ false }}"
+                self.assertTrue(workflow_policy_errors(workflows))
+        workflows = deepcopy(self.workflows)
+        workflows["pr-size.yml"]["jobs"]["pr-size-gate"]["if"] = expected["pr-size-weekly"]
+        self.assertTrue(workflow_policy_errors(workflows))
 
     def test_production_dispatch_safety_rules_are_pinned(self):
         # 10-20 incidents: a manual deploy without takeover left production
