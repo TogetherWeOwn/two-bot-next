@@ -5172,6 +5172,21 @@ class WorkflowTests(unittest.TestCase):
         for name in ("deploy-staging.yml", "deploy-production.yml"):
             self.assertNotIn("merge_group", self.workflows[name]["on"])
 
+    def test_gitleaks_dispatch_uses_trusted_main_policy(self):
+        steps = self.workflows["supply-chain.yml"]["jobs"]["gitleaks"]["steps"]
+        checkout = next(s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"]["fetch-depth"], "0")
+        self.assertEqual(checkout["with"]["persist-credentials"], "false")
+        scan = next(s for s in steps if s.get("name") == "Scan the full history")
+        self.assertEqual(scan["env"]["EVENT_NAME"], "${{ github.event_name }}")
+        self.assertEqual(scan["env"]["BASE_REF"],
+                         "${{ github.base_ref || github.event.merge_group.base_ref || "
+                         "(github.event_name == 'workflow_dispatch' && 'refs/heads/main') }}")
+        self.assertEqual(scan["run"], "bash .github/scripts/gitleaks-scan.sh")
+        selftest = next(s for s in steps if s.get("name") == "Self-test the PR scan policy")
+        self.assertEqual(selftest["run"], "bash .github/scripts/test-gitleaks-scan.sh")
+        self.assertLess(steps.index(selftest), steps.index(scan))
+
     def test_pr_lint_feeds_changed_files_to_the_t0_gate(self):
         # The T0 attestation floor in pr_standards.py needs the PR file list.
         # Pin the step and its wiring so the gate cannot be silently starved.
