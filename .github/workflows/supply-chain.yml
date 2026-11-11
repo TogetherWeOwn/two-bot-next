@@ -80,7 +80,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: .github
+          sparse-checkout: |
+            .github
+            scripts/fixtures/commit-parser
           sparse-checkout-cone-mode: true
 
       - name: Accept metadata already linted on the PR
@@ -102,8 +104,9 @@ jobs:
           EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_NUMBER: ${{ inputs.pr_number }}
           EVENT_NAME: ${{ github.event_name }}
-        shell: python3 {0}
+        shell: bash
         run: |
+          python3 -I - <<'PY'
           import json, os, subprocess, uuid
 
           event = os.environ["EVENT_NAME"]
@@ -207,6 +210,7 @@ jobs:
               delimiter = uuid.uuid4().hex
               output.write(f"body_file<<{delimiter}\n{body_path}\n{delimiter}\n")
 
+          PY
       # Changed paths feed the T0 attestation floor in pr_standards.py. Read-only:
       # the PR files API under the job's pull-requests: read grant. Renames emit
       # both the new and the previous name (deleting or moving a T0 file stays
@@ -266,8 +270,9 @@ jobs:
           REPO_PRIVATE: ${{ github.event.repository.private }}
           COMMITS: ${{ toJSON(github.event.commits) }}
           CHANGED_FILES_FILE: ${{ steps.changed.outputs.changed_files_file }}
-        shell: python3 {0}
+        shell: bash
         run: |
+          python3 -I - <<'PY'
           import os, sys
 
           # The body travels as a file, never env or step outputs: stored
@@ -301,6 +306,7 @@ jobs:
                       os.environ["CHANGED_FILES"] = handle.read()
           sys.exit(pr_standards.main())
 
+          PY
       # The lint's own unit tests execute the PR head's files
       # (test_pr_standards.py imports the head's pr_standards.py), so they run
       # only after the base-branch gate above has consumed its inputs. An
@@ -320,9 +326,11 @@ jobs:
           BODY_FILE: ${{ steps.pr.outputs.body_file }}
           HEAD_REF: ${{ steps.pr.outputs.head_ref }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
-        run: | # zizmor: ignore[adhoc-packages] pinned release-please parser only
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-parse"
+          cp scripts/fixtures/commit-parser/package.json scripts/fixtures/commit-parser/package-lock.json "$RUNNER_TEMP/release-parse/"
           for attempt in 1 2 3; do
-            npm install --prefix "$RUNNER_TEMP/release-parse" --ignore-scripts --no-audit --no-fund release-please@17.6.0 && break
+            npm ci --prefix "$RUNNER_TEMP/release-parse" --ignore-scripts --no-audit --no-fund && break
             [ "$attempt" -lt 3 ] || exit 1
             sleep 5
           done

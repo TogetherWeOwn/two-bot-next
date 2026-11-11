@@ -39,7 +39,7 @@ jobs:
     if: github.ref == 'refs/heads/main' && inputs.dry_run != true
     permissions:
       contents: read
-      actions: read
+      actions: read # Read workflow runs and artifacts for staging-rollback-proof-watch.py.
       issues: write # open or close the staging-rollback-proof incident issue
     runs-on: ubuntu-latest
     timeout-minutes: 5

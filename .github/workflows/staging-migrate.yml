@@ -199,7 +199,7 @@ jobs:
       # producing plan run's manifest artifact through the GitHub API. Same
       # grant the deploy-production guard already carries for run gating; the
       # plan job keeps contents:read only because it produces the manifest.
-      actions: read
+      actions: read # Provenance gate downloads the producing plan run manifest artifact.
     # Dispatch from main only, mode=apply only, and only after a green plan.
     # The binding must be scoped to the staging-migrate-apply environment
     # (required reviewer, main-only deployment branches) so a workflow edited
