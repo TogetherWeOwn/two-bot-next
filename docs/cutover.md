@@ -54,15 +54,21 @@ Create a B4 evidence manifest before scheduling:
   recovery; hours 3–4 include 120 expected one-minute samples. Flat memory and
   no error spikes remain required (numeric RSS/error criteria are unaccepted).
   Include feature/voice evidence, not just health polls; deploy-finish-to-ready
-  is not outage-recovery evidence. The approved policy does not operationally
-  define ACTIVE hours, the required samples' source/shape, or the hours 1–2
-  sample rule; no verified live route currently proves the four-family evidence
-  or 120 samples, so B2 remains NOT VERIFIED and cannot be signed off on the
-  current documentation. The documented staging redeploy interruption is
-  95–139 seconds (with a separate historical 92–139-second staging note); if
-  the approved policy counts planned redeploys as actual outages, these exceed
-  the 60-second limit. That classification is unresolved and no owner is named
-  in the approved text; do not infer a PASS.
+  is not outage-recovery evidence. ACTIVE requires qualified build/process/env
+  identity and actual representative expected-versus-processed all-family
+  coverage, not idle/empty/health-only counts. One-minute cadence applies from
+  entry through completion; hours 3–4 require 120 distinct mature minute-spaced
+  temporal samples, not rapid polls. Four ACTIVE hours is the conservative
+  retained envelope, not clock acceptance. The approved live producer/fixture
+  executor, numeric memory/RSS growth/headroom/error-spike criteria and separate
+  startup/cleanup-inclusive long-use B2 grant remain unsupported: B2 **NOT
+  VERIFIED**, `T` **unset**, B4 **NO-GO**. Engineering Lead owns technical
+  disposition and Chief of Staff continuation; no live executor is appointed.
+  Interrupting planned redeploys count as actual outages by default; historical
+  95–139s/92–139s warnings are not waivers. No grant means no start; the 40min
+  automatic holder cannot authorize B2. At the predeclared `T+4h` incomplete-
+  attempt stop within a separate long-use grant, gap/expiry/incomplete means
+  INSUFFICIENT/FAIL, safe release/expiry and hold, never qualification by timeout.
 - [ ] W16 all-warm rollback rehearsal has passed and shared Neon data/region,
   schema compatibility and backups are signed off. B4 runs **last**. The old
   migration plan's TypeScript/no-copy assumptions are not evidence for the Rust
@@ -639,10 +645,32 @@ recorded reset/authorized recovery, not spin-restart or rotate the token.
 
 ## 48-hour watch
 
+**48h is the maximum initial watch, not a mandatory idle calendar or automatic
+acceptance.** Earliest completion is when all approved checklist, feature,
+voice and production receipts are complete, prescribed actual timer/workload
+coverage is satisfied and independent B2 is accepted. There must be no
+unexplained loss/resource/recovery gap. Retain singleton/data/job writer fences,
+migration, watermarks, permission and rollback proof plus a warm reverse-
+reconciliation manifest. Health-only checkpoint GO is not B4 sign-off.
+
+The [canonical checklist](soak-checklist.md#evidence-bounded-timing-exits)
+retains actual due-action plus negative/idempotency receipts at applicable 15s,
+30s, 60s, 5min, 10min and hourly cadences. Weekly Monday06:15, 24h bot-floor,
+daily backup and monthly restore use their prescribed reviewed fixture-clock/
+backup methods, not week/month idle waits; required live evidence cannot be
+replaced with fixtures. Voice still needs ≥49/50 audible joins, no4017, both
+rekeys and actual sustained playback; 2h is maximum investigation, not endurance
+proof. Unban needs negative/due/idempotent receipts, preserving real 60s expiry
+and 30s sweep. Ticket 5min recovery/60min purge are maintenance cadences,
+not arbitrary holds or shortened retention. No exercise authority is added.
+
 The lead records `T_0 + 48 h`, named coverage and a **real configured** monitor
 before handing off. This document does not install one. Use short read-only
 health polls on an internal endpoint (suggested 60 seconds), deployment events
-and scheduled watch checkpoints at +15 min, +1 h, +6 h, +24 h and +48 h.
+and scheduled watch checkpoints at +15 min, +1 h, +6 h, +24 h and +48 h
+while the initial watch remains open. These are check opportunities, not
+mandatory idle holds; record the completion evidence and actual close time
+without inventing later checkpoint observations.
 Report only findings; keep raw healthy polls in bounded restricted evidence.
 
 | Signal | Finding / action |
@@ -658,9 +686,13 @@ Report only findings; keep raw healthy polls in bounded restricted evidence.
 | Registry / permissions | Record authorized administrator/tool edits and detect unexplained drift, including removed allows and changed defaults; preserve read snapshots for rollback reconciliation, not a baseline-only reset |
 
 Use existing logs/receipts until metrics instrumentation is merged and wired;
-do not assume `/metrics` or a feature counter exists. At +48 h record a
-sign-off or extend the incident/watch on its execution card. Legacy remains
-warm until separate retirement authorization; do not close B4 on a failed watch.
+do not assume `/metrics` or a feature counter exists. At `T_0+48h`, missing
+proof remains **INCOMPLETE**. The cutover lead, Release Manager and data lead
+must decide and record hold/incident/rollback with owner, deadline and next
+action; do not silently extend or pass by timeout. Any separately authorized
+continuation preserves its own bounded evidence window. Legacy and recovery
+points remain warm until separate retirement authorization even after early
+completion; normal monitoring continues. Do not close B4 on a failed watch.
 
 ## Rollback: preserve Next-window writes before reopening legacy
 

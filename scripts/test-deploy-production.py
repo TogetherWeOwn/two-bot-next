@@ -383,15 +383,14 @@ class StaticGuardTests(unittest.TestCase):
         self.assertIn("cancel-in-progress: false", soak_conc)
         self.assertNotIn("deploy-production", soak_conc)
 
-    def test_every_job_uses_the_shared_runner_routing(self):
-        # scripts/test-runner-routing.py pins the full expression (TOG-12339).
+    def test_every_job_uses_explicit_public_hosted_runner(self):
+        # scripts/test-runner-routing.py also rejects dormant/indirect routes.
         self.assertEqual(list(JOBS), ["guard", "schema-gate", "roles-gate", "soak",
                                       "staging-soak-evidence", "recheck",
                                       "promotion-skipped", "production"])
         for name, job in JOBS.items():
             runs_on = value(children(job[1:], 4)["runs-on"])
-            self.assertTrue(runs_on.startswith("${{ fromJSON((!github.event.repository.private && "), name)
-            self.assertIn(f"vars.CI_OVERFLOW_JOBS || '[]'), '{name}')", runs_on)
+            self.assertEqual(runs_on, "ubuntu-latest", name)
 
     def test_permissions_are_least_privilege(self):
         self.assertEqual(value(TOP["permissions"]), "{}")
@@ -440,7 +439,9 @@ class StaticGuardTests(unittest.TestCase):
         self.assertIn("        id: guard", first)
         self.assertIn("        shell: python3 {0}", first)
         self.assertIn("          GH_TOKEN: ${{ github.token }}", first)
-        for check in ("[0-9a-f]{40}", "compare/{sha}...main", "check-runs", "deploy-staging.yml/runs"):
+        self.assertIn("          AUTO_DISABLED: ${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}", first)
+        for check in ("[0-9a-f]{40}", "compare/{sha}...main", "check-runs", "deploy-staging.yml/runs",
+                      'skip = "auto-promote-disabled"', 'os.environ.get("AUTO_DISABLED", "") == "true"'):
             self.assertIn(check, GUARD)
 
     def test_production_deploys_only_validated_guard_outputs(self):
@@ -791,6 +792,7 @@ class StaticGuardTests(unittest.TestCase):
                        "needs.staging-soak-evidence.outputs.skip == ''"):
             self.assertIn(needle, condition)
         self.assertIn("HOLD_UNTIL: ${{ vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL }}", recheck_job)
+        self.assertIn("AUTO_DISABLED: ${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}", recheck_job)
         self.assertIn("SHA: ${{ needs.guard.outputs.sha }}", recheck_job)
         # Entering the single-pending lane behind a recovery dispatch would
         # cancel the queued run, so the recheck skips while a dispatch is
@@ -799,7 +801,8 @@ class StaticGuardTests(unittest.TestCase):
         granted = set(children(children(JOBS["recheck"][1:], 4)["permissions"][1:], 6))
         self.assertEqual(granted, {"contents", "actions"})
         recheck = inline_script("Re-read the promotion hold and the live revision")
-        for needle in ('f"held until {held.isoformat()}"', 'skip = "live"',
+        for needle in ('f"held until {held.isoformat()}"', 'skip = "auto-promote-disabled"',
+                       'skip = "live"',
                        'skip = "older-than-live"',
                        'skip = "operator-dispatch-active"',
                        'skip = "dispatch-check-unreadable"',
@@ -972,7 +975,7 @@ class StaticGuardTests(unittest.TestCase):
 class GuardBehaviourTests(unittest.TestCase):
     def guard(self, sha=SHA, rollback="", image=None, takeover="false", allow_unstaged="false",
               ref="refs/heads/main", auto="", resolved_sha=None, event="workflow_dispatch",
-              run_sha="", run_conclusion="", run_updated="", hold="", spike="",
+              run_sha="", run_conclusion="", run_updated="", hold="", auto_disabled="", spike="",
               run_path="", run_event="", cutover_hold="", **responses):
         if image is None:
             image = IMAGE if rollback else ""
@@ -1096,6 +1099,7 @@ class GuardBehaviourTests(unittest.TestCase):
                 "EVENT_NAME": event,
                 "WORKFLOW_RUN_SHA": run_sha, "WORKFLOW_RUN_CONCLUSION": run_conclusion,
                 "WORKFLOW_RUN_UPDATED_AT": run_updated, "HOLD_UNTIL": hold,
+                "AUTO_DISABLED": auto_disabled,
                 "WORKFLOW_RUN_PATH": run_path, "WORKFLOW_RUN_EVENT": run_event,
                 "INJECT_ERROR_RATE_SPIKE": spike, "CUTOVER_HOLD": cutover_hold,
                 "PRODUCTION_WORKER_URL": "https://production.example.test",
@@ -1123,7 +1127,7 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertIn("::error::Refusing production", stdout)
         self.assertIn(reason, stdout)
 
-    def recheck(self, sha=SHA, hold="", **responses):
+    def recheck(self, sha=SHA, hold="", auto_disabled="", **responses):
         api = {"production-readyz": {"status": 200, "build_revision": "f" * 40},
                "compare-live": {"status": "behind"},
                "dispatch-runs": {"workflow_runs": []}, **responses}
@@ -1150,6 +1154,7 @@ class GuardBehaviourTests(unittest.TestCase):
             output, summary = Path(tmp) / "output", Path(tmp) / "summary"
             env = {
                 "GITHUB_REPOSITORY": REPO, "SHA": sha, "HOLD_UNTIL": hold,
+                "AUTO_DISABLED": auto_disabled,
                 "PRODUCTION_WORKER_URL": "https://production.example.test",
                 "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary),
             }
@@ -2209,6 +2214,34 @@ class GuardBehaviourTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(outputs["skip"], "")
 
+    def test_disable_skips_automatic_runs_green(self):
+        # Behavioral: exact "true" skips the automatic run green with the
+        # dedicated reason, mirroring the hold behavioral tests above.
+        code, outputs, summary, _, _ = self.guard(
+            event="schedule", sha="", auto_disabled="true")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["skip"], "auto-promote-disabled")
+        self.assertIn("nothing is deployed", summary)
+        # Any other value (including unset/empty) is off: the run proceeds
+        # to the normal timed checks.
+        for disabled in ("", "false", "TRUE", "1", "yes"):
+            with self.subTest(auto_disabled=disabled):
+                code, outputs, _, _, _ = self.guard(
+                    event="schedule", sha="", auto_disabled=disabled,
+                    **{"production-readyz": {"status": 200, "build_revision": "f" * 40},
+                       "staging": {"total_count": 1, "workflow_runs": [
+                           {"conclusion": "success"}]}})
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs["skip"], "")
+
+    def test_manual_dispatch_ignores_the_disable(self):
+        # Recovery preserved: an explicit operator dispatch never reaches
+        # the automatic disable branch, so deploy/rollback/takeover proceed.
+        code, outputs, _, _, _ = self.guard(auto_disabled="true")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs["skip"], "")
+        self.assertEqual(outputs["soak_seconds"], "0")
+
     def test_hold_without_a_zone_or_shape_is_refused(self):
         for hold in ("tomorrow", "2026-10-20T07:42:00", "2026-13-01T00:00:00Z"):
             with self.subTest(hold=hold):
@@ -2239,6 +2272,20 @@ class GuardBehaviourTests(unittest.TestCase):
         code, outputs, _, _, _ = self.recheck(hold="2020-01-01T00:00:00Z")
         self.assertEqual(code, 0)
         self.assertEqual(outputs, {"skip": ""})
+
+    def test_recheck_skips_when_the_disable_flips_after_the_guard(self):
+        # Behavioral: a disable set while the gates build or the soak
+        # sleeps is re-read by the pre-deploy recheck and skips green,
+        # so the promotion stops instead of deploying through it.
+        code, outputs, summary, _, _ = self.recheck(auto_disabled="true")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, {"skip": "auto-promote-disabled"})
+        self.assertIn("nothing is deployed", summary)
+        for disabled in ("", "false", "TRUE"):
+            with self.subTest(auto_disabled=disabled):
+                code, outputs, _, _, _ = self.recheck(auto_disabled=disabled)
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs, {"skip": ""})
 
     def test_recheck_skips_live_and_older_than_live(self):
         code, outputs, _, _, _ = self.recheck(

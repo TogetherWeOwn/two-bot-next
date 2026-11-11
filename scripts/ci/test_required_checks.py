@@ -81,7 +81,7 @@ class RequiredChecksReportTests(unittest.TestCase):
             self.assertIn(job, agg["needs"], job)
         # Advisory image smoke remains off the image-build critical path.
         self.assertNotIn("container", agg["needs"])
-        self.assertIn("ci-ok", agg["runs-on"])
+        self.assertEqual(agg["runs-on"], "ubuntu-latest")
         body = "\n".join(step.get("run", "") for step in agg["steps"])
         for marker in ("JOB_INPUTS_RESULT", "CONTAINER_INPUTS_RESULT", "SUPPLY_CHAIN_RESULT",
                        "CHECK_RESULT", "WORKER_RESULT", "PARITY_DOCS_RESULT",
@@ -109,7 +109,7 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertEqual(job.get("permissions"), {"contents": "read"})
         self.assertIn("job-inputs", job.get("needs", []))
         self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
-        self.assertIn("fuzz-compile", job.get("runs-on", ""))
+        self.assertEqual(job.get("runs-on"), "ubuntu-latest")
         text = str(job)
         install = [step for step in job.get("steps", [])
                    if step.get("name") == "Install pinned cargo-fuzz"]

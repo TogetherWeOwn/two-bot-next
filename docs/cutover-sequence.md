@@ -98,9 +98,14 @@ configuration path.
 ## 5. Watch handoff
 
 `T_0` is the first `/readyz` 200 on the production revision. The lead
-records each checkpoint with `scripts/cutover_watch_checkpoint.py` — one
-checkpoint per call — and pastes the emitted row onto the execution card,
-from `T_0` through `T_0 + 48 h`:
+records each checkpoint due while the watch is open with
+`scripts/cutover_watch_checkpoint.py` — one checkpoint per call — and pastes
+the emitted row onto the execution card. The initial watch has a maximum of
+48 h, not a mandatory idle wait. Evidence-complete closure follows
+[cutover.md §48-hour watch](cutover.md#48-hour-watch); record actual close UTC,
+complete receipt links and the closure reason in [watch-run-record.md](watch-run-record.md).
+Later checkpoints and unavailable comparisons are N/A with that close UTC and
+reason, not fabricated observations. For a due checkpoint:
 
 ```sh
 python3 scripts/cutover_watch_checkpoint.py --checkpoint +15m \
@@ -124,8 +129,9 @@ the same checkpoint as a one-line machine receipt with stable reason ids.
   previous ID is the rollback dispatch `<version-id>`), watch deadline,
   named coverage.
 - Cadence: short read-only polls (suggested 60 s) plus deployment events
-  and moderator observations; checkpoints at +15 min, +1 h, +6 h, +24 h,
-  +48 h. Record findings, not every healthy poll.
+  and moderator observations while open; checkpoints at +15 min, +1 h, +6 h,
+  +24 h, +48 h only when due while open. Record findings, not every healthy
+  poll. Closure does not disable normal production monitoring.
 - Signals and budgets: `readyz`/revision, gateway session starts, REST
   429/5xx and latency, unban queue, scheduled jobs, DB pool, RSS/placement,
   event continuity, shutdown drain — thresholds in
@@ -133,9 +139,15 @@ the same checkpoint as a one-line machine receipt with stable reason ids.
   Any unexplained gap or duplicated execution freezes writers and evaluates
   rollback.
 - Handoff criteria: named coverage plus a **real configured** monitor are
-  recorded before handoff; at +48 h record sign-off or extend the watch on
-  the execution card. Legacy stays warm until separate retirement
-  authorization.
+  recorded before handoff. If proof is still incomplete at `T_0 + 48 h`, record
+  **INCOMPLETE**, not sign-off or automatic extension. The cutover lead, Release
+  Manager and data lead record hold/incident/rollback with an owner, UTC deadline
+  and next action on the execution card. Any continuation requires its own
+  separately bounded decision. The checkpoint script's EXTEND output is a probe
+  result, not authority to continue or accept the watch. Preserve all required
+  timer/workload coverage, independent B2, fences, migration/watermark/permission
+  and rollback receipts. Legacy and recovery resources stay warm until separate
+  retirement authorization, regardless of early closure or timeout.
 
 ## Communication
 

@@ -82,7 +82,7 @@ and the re-run receipts on the promotion PR close out.
   `test_ci_minutes.py`) that run in the `check` lane's `scripts/ci`
   discover step. Identical input bytes give identical output bytes.
 - The lane graduated from advisory to required (see Promotion above):
-  it gates merge through `ci-ok` and follows the routed-runner,
+  it gates merge through `ci-ok` and follows the explicit public-hosted runner,
   minimal-grant and inventory pins in `scripts/ci/test_workflows.py`.
 - The phase0/blocker ledger was not present in this repo, so there was no
   local ledger to backtest against; the parser fixtures above are the

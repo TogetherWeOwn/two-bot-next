@@ -32,16 +32,17 @@ Companion docs (normative on conflict — this sheet never overrides them):
 2. The watcher on shift appends one §3 row per finding (record findings,
    not every healthy poll) and one §2 entry per shift change.
 3. Every page gets one §4 escalation row with a named ack owner and ack
-   time. Every checkpoint gets one §5 go/no-go row.
-4. At +48 h the lead fills §6 sign-off. A failed watch keeps the execution
-   card open; nothing is retired on the basis of this sheet.
+   time. Every checkpoint due while open gets one §5 go/no-go row.
+4. The lead fills §6 at actual evidence-complete closure (which may precede
+   +24 h or +48 h) or at +48 h if still incomplete. A failed watch keeps the
+   execution card open; nothing is retired on the basis of this sheet.
 
 ## 1. Watch header (fill once at `T_0`)
 
 | Field | Value |
 | --- | --- |
 | `T_0` (UTC, ISO-8601) | _fill in_ |
-| Watch deadline (`T_0 + 48 h`) | _fill in_ |
+| Maximum initial watch (`T_0 + 48 h`; not a mandatory idle hold) | _fill in_ |
 | Deployed commit SHA | _fill in_ |
 | New Worker version ID | _fill in_ |
 | Previous Worker version ID (the rollback command's version ID) | _fill in_ |
@@ -91,7 +92,7 @@ only (never raw text); warn/page values live in the companion docs.
 | | | `gateway` disconnects + missed events | queries §8 | disconnect count + missed-events count (pair; any nonzero missed events fails zero-gap acceptance) | | watcher on shift | | |
 | | | `keepalive-gap` (heartbeat ACK inactivity) | [keepalive-gap detector §2–4](keepalive-gap-detector.md#2-proposed-thresholds-and-mandatory-eligibility) | adjacent ACK/recovery deltas + readiness/process eligibility + complete timestamp coverage (2 intervals/120 s = watch; 5/300 s = page candidate); scrape availability separate; tick liveness unknown without positive evidence | record-and-watch / operator investigation; paged only through existing path | watcher on shift / on-call operator | | |
 | | | `rest_429_rate` / 5xx share | queries §2; checklist alert `rest_429_rate` | 429 share, hot route, 5xx top routes | | on-call operator | | |
-| | | handler latency | queries §3 | p50 / p95 / p99 + `_count` trend (first 24 h vs second 24 h) | | watcher on shift | | |
+| | | handler latency | queries §3 | p50 / p95 / p99 + `_count` trend over actual UTC bounds; first/second 24 h comparison only if both exist, otherwise N/A with close UTC and reason (no later observations invented) | | watcher on shift | | |
 | | | unban-queue proxies | queries §4 | `periodic job failed` lines + `audit_retry` streak + mirror deliveries (table counts are test-copy only) | | watcher on shift | | |
 | | | restarts | queries §5 | `listening` count + `container started/stopped` + counter-reset noted (reset = restart, not quiet) | | watcher on shift | | |
 | | | `db_errors` by `op` | queries §6; checklist alert `db_errors` | `admission` vs `other` split | | on-call operator | | |
@@ -129,7 +130,11 @@ gateway, no credential substitution).
 ## 5. Checkpoint go/no-go annotations
 
 Checkpoints sit at +15 min, +1 h, +6 h, +24 h, +48 h from `T_0`. One row
-each on the execution card. The ``readyz`` + revision match cell comes from
+each on the execution card, but only for checkpoints due while the watch is
+open. If evidence-complete closure happens first, record the actual close
+UTC in §6 and mark each later row `N/A: closed <UTC> evidence-complete`
+with no readyz, incident or verdict observation invented. The ``readyz`` +
+revision match cell comes from
 `scripts/cutover_watch_checkpoint.py` output (one call per checkpoint — see
 the [48-hour watch log](production-deploy.md#48-hour-watch-log-tog-9699)),
 not hand-filled; the verdict, decider, and deadline cells stay human.
@@ -140,7 +145,12 @@ not hand-filled; the verdict, decider, and deadline cells stay human.
 | +1 h | | | | GO / EXTEND / ROLLBACK | cutover lead | |
 | +6 h | | | | GO / EXTEND / ROLLBACK | cutover lead | |
 | +24 h | | | | GO / EXTEND / ROLLBACK | cutover lead | |
-| +48 h | | sign-off or extend | | GO (sign-off) / EXTEND | cutover lead | |
+| +48 h | | sign-off, or INCOMPLETE | | GO (sign-off, only if evidence-complete) / EXTEND / hold / incident / ROLLBACK | cutover lead (INCOMPLETE: with Release Manager + data lead) | separately bounded continuation only |
+
+At +48 h, incomplete evidence stays INCOMPLETE. The cutover lead, Release
+Manager and data lead record hold/incident/rollback with owner, deadline and
+next action. EXTEND is a separately bounded recorded decision, never an
+automatic extension or a pass by timeout.
 
 A missed budget at any level is an incident, never permission to skip
 reconciliation.
@@ -149,9 +159,12 @@ reconciliation.
 
 | Field | Value |
 | --- | --- |
-| Final verdict (sign-off / extended to _deadline_) | _fill in_ |
-| Legacy image, config, recovery points still warm (failed/extended watch) | y / n |
-| Nothing retired at watch close on the basis of this sheet | confirmed |
+| Actual close (UTC) and basis: evidence-complete early closure / +48 h sign-off / INCOMPLETE | _fill in_ |
+| Receipts complete (checklist, feature, voice, production), actual timer/workload coverage, independent B2 accepted, no unexplained gap; fences, watermarks, permissions, rollback proof, warm reverse-reconciliation manifest retained | _link receipts on card_ |
+| Checkpoints not due before close | N/A with reason (closed before that label) |
+| Final verdict (sign-off / INCOMPLETE: hold, incident or rollback by cutover lead + Release Manager + data lead, owner + deadline + next action / separately bounded continuation _deadline_) | _fill in_ |
+| Legacy image, config, recovery points still warm (always until separate retirement authorization) | y / n |
+| Nothing retired at watch close; normal monitoring continues unchanged | confirmed |
 | Follow-up cards (public issue refs or plain descriptions; no secrets) | _fill in_ |
 | Lead signature (role) + date/time (UTC) | _fill in on card_ |
 
@@ -164,8 +177,10 @@ reconciliation.
   message IDs, probe bodies, or raw error text in any filled copy that
   returns to the repo. Failed-auth details name the expected credential
   and the exact error only.
-- A missing `T_0`, missing revision match, missing ack time, or missing
-  checkpoint row is a gap in the watch, not a silent waiver.
+- A missing `T_0`, missing revision match for an actual observation, missing
+  required ack time, or missing checkpoint row due while open is a gap in the
+  watch, not a silent waiver. A later checkpoint explicitly marked N/A after
+  evidence-complete closure is not a missing observation.
 - A counter that reset to zero means the process restarted; it does not
   mean the window was quiet — re-baseline both scrapes after it.
 - When this sheet disagrees with a threshold, query, or rollback step in

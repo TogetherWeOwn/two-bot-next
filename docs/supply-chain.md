@@ -7,9 +7,8 @@ reusable SBOM workflow was renamed from `supply-chain.yml` because main's
 TOG-11810 fold uses that filename for the native pr-lint + gitleaks gate,
 which has no `workflow_call` trigger.) It
 builds the Dockerfile on GitHub-hosted `ubuntu-latest` in this public
-repository (runner routing in [`sbom.yml`](../.github/workflows/sbom.yml)
-and the `check` note in `check.yml`: a public repo never takes the
-`[self-hosted, two-selfhosted]` label, which would queue forever), without
+repository (explicit selectors in [`sbom.yml`](../.github/workflows/sbom.yml);
+see the [public runner contract](ci-security.md#public-hosted-runner-contract)), without
 registry push or deployment,
 then inventories the exact image and all packages in the workspace Cargo.lock
 (including workspace, optional and development dependencies). The Rust BOM is
@@ -244,11 +243,15 @@ decision. Step A, `debian:trixie-slim` (13.7), still measured 48 HIGH rows over
 measured 0 HIGH/CRITICAL with Trivy v0.69.3. CI re-measures every head; that
 note is not a standing PASS.
 
-The runtime is now moving from `cc-debian13` to `base-nossl-debian13`. The
-`cc` measurements above are prior evidence about a different image. The
-`base-nossl` candidate is unmeasured: full CI, the Trivy gates, container smoke
-and the staging drill have not run for it, and nothing here claims they pass or
-that the image is accepted for production. Security review and the staging
+The runtime uses `base-nossl-debian13` instead of `cc-debian13`. The `cc`
+measurements above are prior evidence about a different image. On 2026-11-07,
+[CI at source SHA `1eb520da611ae5a952fd85643b616f973336c4ae`](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/42418327142)
+passed, including the [Trivy gates and SBOM generation](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/42418327142/job/128541182068),
+[inventory verification](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/42418327142/job/128542889707)
+and [container smoke](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/42418327142/job/128541189930).
+Those results measure that source SHA's dry-run image only; they do not establish
+a pushed image's identity, staging-drill qualification or production acceptance,
+and are not a standing PASS for later heads. Security review and the staging
 drill / Release Manager gates remain.
 
 The base-nossl runtime has seven base Debian packages (base-files,
