@@ -51,7 +51,7 @@ from `TogetherWeOwn/two-design-kit` `v0.2.0`. The kit's
 The upstream generated header stays unchanged, with the tag recorded in the
 enclosing module's documentation instead. `/help` uses `EmbedKind::Default`,
 the kit ember action colour. Live, echo, ok, warn, danger and neutral kinds
-share the same helper. Icon 1 and the `Together We Own` footer are unchanged;
+share the same helper. Icon 1 (the asset) and the `Together We Own` footer text are unchanged; Icon 1 is delivered through Cloudflare Images (see below);
 `brand_footer_for` provides the kit's suffixed form for future surfaces.
 
 The Rust drift test and `scripts/vendor_brand_tokens.py --check` recompute
@@ -77,6 +77,42 @@ On the controller, use the [bounded Cargo wrapper](build-cache.md) for both
 compiling commands. Update the tag in module documentation and this guide,
 and update the smoke fixture colour only when the kit default moves. Record
 the test results in the PR. Never hand-edit `brand_tokens.rs`.
+
+## Icon delivery and rollback contract
+
+`crates/discord/src/brand.rs` owns `BRAND_ICON_URL`:
+`https://imagedelivery.net/cNVnKlHCCMxI9vqDkwBbUQ/two-icon1-dark512-4469ca165f03/public`.
+This is the approved Icon 1 dark 512×512 PNG, already imported as image
+`two-icon1-dark512-4469ca165f03`, served with the existing `public` variant.
+No upload, new variant or credential is needed by the bot.
+
+The real consumers are the footer icons on the embed branches of
+`help_response` and `help_detail_response` in `crates/discord/src/interactions.rs`,
+via `brand_embed` → `brand_footer`. Neither builder adds an author icon.
+This delivery change does not alter the colour mapping, footer text, body or layout. Plain-content help replies
+still have no footer. Changing this constant does not synchronize the bot avatar.
+
+Keep `assets/brand/two-icon-1-dark-512.png` unchanged (29,035 bytes; SHA-256
+`ff0cd5863ed02b1f405bd3f1bf22b192ea7b9e6dc657792cb6df621f8fce438a`).
+The rollback URL is
+`https://raw.githubusercontent.com/TogetherWeOwn/two-bot-next/main/assets/brand/two-icon-1-dark-512.png`.
+To roll delivery back, restore that URL in the constant and its exact-URL Rust
+assertion and Python fixture, through the normal review and release gates.
+Do not delete or re-import the Images copy as part of a code rollback.
+
+Use the existing payload builder and smoke above to check the synthetic
+round-trip on the changed SHA: `expected.icon_url` and both read-back footers
+must contain the Images URL. Record that SHA and smoke run as synthetic evidence
+only: the separate test bot posts these payloads, so a pass does not prove
+that the deployed product bot adopted the Images URL.
+
+For runtime Images adoption, record the exact deployed SHA and a separate
+observation of the product bot using the Images URL in a branded help footer.
+Until that observation exists, runtime adoption remains unproven; if it is
+pending at merge, hand the evidence gap to rollout coordination explicitly.
+Neither an offline fixture pass nor a historical run using the GitHub URL
+proves Images adoption. The synthetic read-back proves the URL field, not a
+visual render or image fetch by Discord.
 
 ## CI gate and provisioning
 

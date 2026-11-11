@@ -1,5 +1,10 @@
 //! Owner brand for user-visible Discord surfaces.
 //!
+//! Icon 1 (gradient "T" in a broken octagon) is the owner's chosen mark.
+//! The raster asset lives at `assets/brand/two-icon-1-dark-512.png`; its
+//! approved Cloudflare Images copy is served through [`BRAND_ICON_URL`]
+//! for embed footer icons. Avatar synchronization is a separate operation.
+//!
 //! Colours come from the Ember Hours design kit
 //! (`TogetherWeOwn/two-design-kit`), not from hand-set hex: the generated
 //! file `brand_tokens.rs` is vendored byte-exact from the kit's
@@ -21,7 +26,8 @@
 //!   logo's top stop and the site's action colour. Pink means *live* on the
 //!   site and nowhere else, so the old pink default moved to
 //!   [`EmbedKind::Live`]; every bot embed keeps the brand while the colour
-//!   language matches the site. Icon 1 and the footer do not change.
+//!   language matches the site. Icon 1 (the asset) and the footer text do
+//!   not change; Icon 1 is delivered through Cloudflare Images.
 //! * [`BRAND_ICON_URL`] and [`BRAND_FOOTER_TEXT`] stay hand-kept here: the
 //!   kit spec leaves assets and copy in `brand.rs`; only colours are tokens.
 //! * Per-surface footers read `Together We Own · <surface>` (spec §2); the
@@ -94,12 +100,12 @@ impl EmbedKind {
     }
 }
 
-/// Stable public URL of the Icon 1 dark-background PNG (512x512).
+/// Public Cloudflare Images delivery URL of the approved Icon 1 dark PNG (512x512).
 ///
-/// Points at this repository so the icon stays reachable without depending
-/// on the web-site card landing first; move it to the site asset URL once
-/// that exists and update this one constant.
-pub const BRAND_ICON_URL: &str = "https://raw.githubusercontent.com/TogetherWeOwn/two-bot-next/main/assets/brand/two-icon-1-dark-512.png";
+/// The committed original remains the rollback asset; see
+/// `docs/staging-help-embed-smoke.md` for the delivery and rollback contract.
+pub const BRAND_ICON_URL: &str =
+    "https://imagedelivery.net/cNVnKlHCCMxI9vqDkwBbUQ/two-icon1-dark512-4469ca165f03/public";
 
 /// Footer text shown on bot-authored embeds.
 pub const BRAND_FOOTER_TEXT: &str = "Together We Own";
@@ -211,14 +217,11 @@ mod brand_tests {
     }
 
     #[test]
-    fn icon_url_is_a_stable_same_repo_public_url() {
-        assert!(
-            BRAND_ICON_URL.starts_with("https://raw.githubusercontent.com/TogetherWeOwn/"),
-            "icon must resolve without depending on another card's deploy"
-        );
-        assert!(
-            BRAND_ICON_URL.ends_with("assets/brand/two-icon-1-dark-512.png"),
-            "icon must be the committed dark-background PNG"
+    fn icon_url_is_the_approved_cloudflare_images_delivery() {
+        assert_eq!(
+            BRAND_ICON_URL,
+            "https://imagedelivery.net/cNVnKlHCCMxI9vqDkwBbUQ/two-icon1-dark512-4469ca165f03/public",
+            "icon must use the approved Icon 1 image and public variant"
         );
     }
 
