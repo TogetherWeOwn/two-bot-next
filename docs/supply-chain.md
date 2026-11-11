@@ -13,8 +13,10 @@ registry push or deployment,
 then inventories the exact image and all packages in the workspace Cargo.lock
 (including workspace, optional and development dependencies). The Rust BOM is
 not a claim that every locked package is linked into the runtime executable.
-The image BOM inventories OS/image packages; Rust binaries are not reliably
-recoverable by image analysis, so the separate lockfile scan is intentional.
+The image BOM inventories OS/image packages. A separate native inventory reads
+cargo-auditable metadata from the runtime binary (below); the lockfile scan
+remains intentional because build, development and other-target dependencies
+can carry risk without shipping in the bot.
 
 Both gates run in the `image` job and use SHA-pinned Trivy Action 0.36.0 with
 Trivy v0.69.3 (see the `uses: aquasecurity/trivy-action@... # 0.36.0` pins
@@ -133,6 +135,94 @@ failed image gates. Successful preflight means only that observations were
 bound and classified; **it is not a vulnerability PASS**. Both Trivy gates,
 their exit codes and the empty ignore file are unchanged.
 
+## Native runtime-crate inventory
+
+The root Dockerfile installs cargo-auditable **v0.7.7**, with SHA-256-pinned
+x86_64 and aarch64 release archives, and runs
+`cargo auditable build --release --locked`. Its native `.dep-v0` dependency
+metadata survives the stripped release profile. Only the bot executable reaches
+the unchanged distroless runtime; the inventory tools do not ship in it.
+
+After loading the saved linux/amd64 image in the trusted `verify` job,
+`scripts/scan-auditable-image.sh` uses **Syft v1.56.0** with
+`--override-default-catalogers cargo-auditable-binary-cataloger`, then
+**Grype v0.121.1** against that native Syft JSON. The override selects only
+that package cataloger (Syft also keeps its file metadata catalogers). Both
+scanners receive a fresh explicit empty YAML config: `/dev/null` has no format
+suffix and is rejected by their config loader. Both Linux amd64 tool archives
+have explicit SHA-256 pins in the script. Downloads and scans have timeouts,
+tools use fresh per-run extraction and cache directories, and cleanup removes
+that scratch on exit. No container
+is started. Grype downloads its vulnerability database into that disposable
+cache; the native report retains scanner and database provenance.
+
+The `supply-chain` Actions artifact includes:
+
+- `runtime-crates.syft.json`: native runtime crate inventory and image metadata;
+- `runtime-crates.grype.json`: every native Grype match, without ignore rules or
+  a new severity gate;
+- `runtime-crates-check.json`: source SHA, immutable local image ID, native
+  config digest (`config_id`), SHA-256 of the lockfile and both native reports,
+  runtime/locked/match counts, separate `runtime_crate_tuples` (R) and complete
+  `locked_crate_tuples` (L) name/version views, and the explicit `lockfile_only`
+  complement (O). `runtime_completeness: "not_proven"` distinguishes accounting
+  from an independent completeness claim;
+- `runtime-crates.sha256`: separate checksums for these diagnostic JSON files
+  and the source SHA/image ID. The release `SHA256SUMS` contract is unchanged;
+  these diagnostic files are not uploaded as release assets.
+
+`scripts/validate-auditable-image.py` requires the pinned scanner identities,
+the expected immutable linux/amd64 image input, and native crate locations at
+`/home/nonroot/two-bot`. Classic Docker identifies images by config digest;
+the containerd image store can report a manifest digest as `.Id`. The exact
+requested digest must match Syft's native `userInput` and either its config
+`imageID` or a native `repoDigests` entry. Grype must preserve the same config
+digest and immutable input. A mutable tag is never an identity fallback.
+Every reported runtime crate must match a name/version
+in the selected source's Cargo.lock; every Grype match must belong to that
+runtime inventory. Empty inventory, missing sentinel crates, unexpected
+locations or unmatched tuples fail closed. Missing metadata in an older image
+also fails validation; rebuilding a historical tag does not retrofit the new
+Dockerfile into that tag.
+
+This is **exact partition accounting, not equality with Cargo.lock**. R and L
+are unique name/version tuples, O = L − R, R ⊆ L, R ∩ O = ∅ and R ∪ O = L.
+The receipt enumerates all three sets deterministically, without inserting
+lockfile-only tuples into the native Syft inventory. Counts come from this
+build, not fixed acceptance constants. Workspace, optional, build, development
+and other-target packages need not ship; those possibilities do not classify
+any particular tuple. Label O **lockfile-only / not reported in this native
+runtime inventory**, never dev-only, safe, unreachable or absent from the
+executable without package-specific evidence.
+
+Partition accounting and the three required crate names are sanity checks,
+not proof that R contains every runtime dependency. A negative runtime-exposure
+or VEX conclusion requires independent, relevant completeness evidence first.
+Native metadata is not function-level reachability and may conservatively
+include unused runtime dependencies. Missing or partial scan evidence is
+unknown, not proof that a crate is absent. Lockfile-only status or absence from
+R never automatically suppresses a finding, discards development/CI or
+supply-chain risk, or accepts a vulnerability. The complete lockfile gate,
+severity thresholds and treatment of unfixed findings are unchanged. The check
+always records `suppressed_count: 0`.
+
+After downloading an artifact into a fresh run-owned directory:
+
+```sh
+(cd <artifact-directory> && sha256sum --check runtime-crates.sha256)
+jq '{source_sha, image_id, runtime_crates, grype_matches, lockfile_only}' \
+  <artifact-directory>/runtime-crates-check.json
+jq '.matches[] | {advisory: .vulnerability.id, crate: .artifact.name,
+  version: .artifact.version}' <artifact-directory>/runtime-crates.grype.json
+```
+
+A zero-match report is not a vulnerability verdict. The synthetic advisory in
+the offline tests demonstrates matching and zero suppression, not a real
+finding against the current bot. Live sample-finding and deployed-artifact
+pilot evidence must be recorded separately. As with the existing SBOMs, the
+local image ID binds this CI build; it is not automatically the production
+registry or deployment digest.
+
 ## Exact-image applicability evidence
 
 After the vulnerability gates, including when either fails, CI runs
@@ -201,10 +291,17 @@ gh run download <run-id> -n supply-chain -D <run-owned-scratch-directory>
 gh workflow run release.yml --ref main -f release_tag=vX.Y.Z
 ```
 
-Repair works only for a tag built at or after `9d064fa38` (#2004). `verify`
-runs `--check-runtime` on every ref, so an older tag fails the zlib-free
+Repair works only for a tag whose source ancestry includes `9d064fa38` and
+whose own Dockerfile builds the binary with `cargo auditable build` — that
+is, both `git merge-base --is-ancestor 9d064fa38 <tag>` passes and
+`git show <tag>:Dockerfile` contains `cargo auditable build`. `verify` runs
+`--check-runtime` on every ref, so an older tag fails the zlib-free
 composition check at the inventory step by design, with no per-tag waiver.
-`v0.2.0` stays without SBOM assets; see `docs/releases.md`.
+Repair rebuilds the tag with its own Dockerfile, so a tag whose ancestry
+includes `9d064fa38` but whose Dockerfile has no `cargo auditable build`
+rebuilds without the metadata and fails native inventory validation by design,
+with no per-tag waiver. Such tags stay without SBOM assets; `v0.2.0` stays
+without SBOM assets; see `docs/releases.md`.
 
 On a selected PR, the dry-run inventories the exact PR head SHA and records
 source SHA and image ID before scanning; `verify` then validates lockfile
@@ -293,6 +390,7 @@ Offline regressions (no Cargo compile, Docker daemon or database access):
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-supply-chain.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_auditable_image.py' -v
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-runtime-image-evidence.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-vulnerability-preflight.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_container_smoke.py

@@ -444,3 +444,143 @@ class TrivyInstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("tar ", calls)
         self.assertFalse(published)
+
+
+class StaticWiringTests(unittest.TestCase):
+    def setUp(self):
+        self.scanner = SCANNER.read_text()
+        self.dockerfile = (ROOT / "Dockerfile").read_text()
+
+    def test_scanner_pins_and_policy(self):
+        for needle in (
+                "syft/releases/download/v1.56.0/syft_1.56.0_linux_amd64.tar.gz",
+                "1c2493cfcf52d3367d6cb25780d9190c111c2219c34c820574c43e8bae15c528",
+                "grype/releases/download/v0.121.1/grype_0.121.1_linux_amd64.tar.gz",
+                "bc3ea3f9e6fd56ac781c08c6c5e614271b79f438200757f6932085c19b0a4657",
+                "--override-default-catalogers cargo-auditable-binary-cataloger",
+                '--config "$scratch/config.yaml"', "set -euo pipefail", "sha256sum --check"):
+            self.assertIn(needle, self.scanner)
+        code = "\n".join(l for l in self.scanner.splitlines() if not l.lstrip().startswith("#"))
+        for forbidden in ("--fail-on", "--ignore", "ignore-states"):
+            self.assertNotIn(forbidden, code)
+        self.assertEqual(self.scanner.count("sha256sum --check"), 2)
+        self.assertIsNone(re.search(r"\|\s*(ba)?sh\b", code))
+
+    def test_validator_pins_match_scanner(self):
+        text = VALIDATOR.read_text()
+        self.assertIn('"1.56.0"', text)
+        self.assertIn('"0.121.1"', text)
+        self.assertIn("v1.56.0", self.scanner)
+        self.assertIn("v0.121.1", self.scanner)
+
+    def test_dockerfile_installs_verified_cargo_auditable_and_uses_it(self):
+        self.assertIn("cargo-auditable/releases/download/v0.7.7/", self.dockerfile)
+        d = self.dockerfile
+        # Installed after the real-source COPY so the dependency layer replays unchanged.
+        self.assertGreater(d.index("cargo-auditable/releases"), d.index("COPY . ."))
+        self.assertLess(d.index("install -m 0755"), d.index("cargo auditable build"))
+        for sha in ("7676443367c5e33d9fb22acef63cccb5e9202de12dae1b0579995eb3e2bc7a18",
+                    "c324af56990601354bbf40080f582ba46f8ec8b807a1388e25bb7e429d285c18"):
+            self.assertIn(sha, self.dockerfile)
+        self.assertIn("sha256sum --check", self.dockerfile)
+        self.assertIn("cargo auditable build --release --locked", self.dockerfile)
+        self.assertNotIn("RUN cargo build --release", self.dockerfile)
+        self.assertLess(self.dockerfile.index("sha256sum --check"),
+                        self.dockerfile.index("install -m 0755"))
+
+
+    def workflow_jobs(self):
+        text = (ROOT / ".github/workflows/sbom.yml").read_text()
+        head, sep, verify = text.partition("\n  verify:\n")
+        self.assertTrue(sep)
+        self.assertIn("\n  image:\n", head)
+        return head, verify
+
+    @staticmethod
+    def code(text):
+        return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+
+    def test_workflow_fixtures_run_before_untrusted_checkout(self):
+        image, _ = self.workflow_jobs()
+        image = self.code(image)
+        fixtures = image.index("python3 -m unittest discover -s scripts -p 'test_auditable_image.py'")
+        self.assertLess(fixtures, image.index("ref: ${{ inputs.ref }}"))
+        self.assertEqual(image.count("inputs.ref"), 1)
+        # Nothing local is executed after the untrusted checkout in this job.
+        self.assertNotIn("python3 scripts/", image[image.index("inputs.ref"):])
+        self.assertNotIn("bash scripts/", image[image.index("inputs.ref"):])
+
+    def test_workflow_installs_trivy_before_untrusted_checkout_and_skips_redirect(self):
+        image, _ = self.workflow_jobs()
+        image = self.code(image)
+        self.assertLess(image.index("name: Install verified pinned Trivy"), image.index("inputs.ref"))
+        self.assertEqual(image.count("skip-setup-trivy: true"), 4)
+        self.assertIn("id: trivy\n        run: bash scripts/install-trivy.sh", image)
+        self.assertIn("!cancelled() && steps.trivy.outcome == 'success'", image)
+        self.assertNotIn('rm -rf "$RUNNER_TEMP/trivy-bin"', image)
+
+    def test_workflow_scan_and_validator_run_only_in_trusted_verify_job(self):
+        image, verify = self.workflow_jobs()
+        image, verify = self.code(image), self.code(verify)
+        for needle in ("scan-auditable-image.sh", "validate-auditable-image.py"):
+            self.assertNotIn(needle, image)
+            self.assertEqual(verify.count(needle), 1)
+        self.assertNotIn("inputs.ref", verify)
+        self.assertNotIn("path: source", verify)
+        self.assertLess(verify.index("docker load -i sbom/image.tar"),
+                        verify.index("scan-auditable-image.sh"))
+        self.assertLess(verify.index("scan-auditable-image.sh"),
+                        verify.index("validate-auditable-image.py"))
+
+    def test_workflow_validator_precedes_lockfile_removal(self):
+        _, verify = self.workflow_jobs()
+        verify = self.code(verify)
+        self.assertEqual(verify.count("rm sbom/Cargo.lock"), 1)
+        self.assertLess(verify.index("python3 scripts/validate-auditable-image.py sbom"),
+                        verify.index("rm sbom/Cargo.lock"))
+
+    def test_workflow_checksums_keep_release_line_and_separate_diagnostics(self):
+        _, verify = self.workflow_jobs()
+        original = "(cd sbom && sha256sum *.cdx.json source-sha.txt image-id.txt > SHA256SUMS)"
+        self.assertEqual(verify.count(original), 1)
+        self.assertEqual(verify.count("> SHA256SUMS"), 1)
+        extra = ("(cd sbom && sha256sum runtime-crates*.json source-sha.txt "
+                 "image-id.txt > runtime-crates.sha256)")
+        self.assertEqual(verify.count(extra), 1)
+        self.assertEqual(verify.count("runtime-crates.sha256"), 1)
+        self.assertLess(verify.index(extra), verify.index("rm sbom/Cargo.lock"))
+
+    def test_workflow_native_failure_keeps_existing_evidence_path(self):
+        _, verify = self.workflow_jobs()
+        steps = verify.split("\n      - name: ")
+        for title in ("Validate native runtime crate evidence",
+                      "Validate SBOM inventories and record checksums"):
+            step = next(s for s in steps if s.startswith(title))
+            self.assertIn("if: ${{ !cancelled() }}", step)
+            self.assertNotIn("continue-on-error", step)
+        for title in ("Collect exact-image applicability evidence",
+                      "Bind findings to exact installed tuples"):
+            step = next(s for s in steps if s.startswith(title))
+            self.assertIn("!cancelled() && steps.inventory.outcome == 'success'", step)
+
+    def test_workflow_keeps_both_trivy_high_critical_gates(self):
+        image, _ = self.workflow_jobs()
+        steps = image.split("\n      - name: ")
+        for title, output in (
+                ("Gate Rust dependencies (HIGH/CRITICAL, including unfixed)",
+                 "sbom/rust-vulnerabilities.json"),
+                ("Gate runtime image (HIGH/CRITICAL, including unfixed)",
+                 "sbom/image-vulnerabilities.json")):
+            matching = [s for s in steps if s.startswith(title)]
+            self.assertEqual(len(matching), 1, title)
+            step = matching[0]
+            for needle in ("uses: aquasecurity/trivy-action@", "severity: HIGH,CRITICAL",
+                           "ignore-unfixed: false", "trivyignores: .trivyignore.yaml",
+                           f"output: {output}", "exit-code: '1'"):
+                self.assertIn(needle, step, title)
+            self.assertNotIn("continue-on-error", step)
+            self.assertNotIn("ignore-unfixed: true", step)
+
+
+if __name__ == "__main__":
+    unittest.main()
