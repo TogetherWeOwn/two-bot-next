@@ -60,12 +60,29 @@ exact head commit. Never bypass or weaken a check.
 
 `pr-lint` requires the paginated PR files inventory to contain exactly the PR's
 reported `changed_files` entry count before expanding old and new rename paths.
-Empty, truncated, malformed or stale inventories fail closed, and every entry
-must carry a valid status; a renamed file must keep its source path. On pull
-requests the trusted base-branch gate checkout must match the inventory's base
-SHA before any gate code runs. GitHub caps this API at 3000 files; a
-legitimately larger PR fails the count check, so split it into independently
-reviewable smaller PRs instead.
+Empty, truncated, malformed or stale inventories fail closed. GitHub caps this
+API at 3000 files; a legitimately larger same-repository PR uses the existing
+manual validation route instead:
+
+```sh
+gh workflow run supply-chain.yml --ref <pr-head-branch> -f pr_number=<number>
+```
+
+The dispatch must target the exact current head branch/SHA of an open PR in this
+repository targeting `main`. It checks out complete history and derives every
+changed path from a merge-base diff of the immutable current `main`/PR head SHAs,
+with rename detection disabled so both sides of a move reach the gate. Dispatch
+resolves `main` directly: the PR API can retain an older base SHA. Submodule
+ignore settings cannot hide gitlink changes. Missing history or an empty/failed
+diff fails closed. The gate itself comes from the trusted PR base (or `main`
+for dispatch), and its checked-out commit must match that same inventory base
+SHA before any gate code runs. If `main` advances during collection, rerun
+validation rather than using a different policy snapshot. All title/body,
+T0 attestation, secret scanning, review and
+merge requirements still apply; dispatch is validation, not a skip or waiver.
+Fork PRs cannot use this same-repository dispatch route; reduce an oversized
+fork PR into independently reviewable PRs instead. Rerun validation after any
+head/base change; a stale check does not validate a new head.
 
 ### Production merge evidence
 

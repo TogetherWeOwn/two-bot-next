@@ -5205,6 +5205,21 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('len(entries) != count', listed["run"])
         self.assertLess(listed["run"].index('len(entries) != count'),
                         listed["run"].index('entry.get("previous_filename")'))
+        self.assertIn('"--ignore-submodules=none"', listed["run"])
+        self.assertIn('"--no-renames", "-z", merge_base, head', listed["run"])
+        self.assertIn('"merge-base", base, head', listed["run"])
+        self.assertIn('f"repos/{repo}/git/ref/heads/main"', listed["run"])
+        self.assertLess(listed["run"].index('base = main["object"]["sha"]'),
+                        listed["run"].index('"merge-base", base, head'))
+        self.assertIn('identity(snapshot()) != identity(pr)', listed["run"])
+        history = next(s for s in steps if s.get("name") == "Check out complete dispatch history")
+        self.assertEqual(history["if"], "github.event_name == 'workflow_dispatch'")
+        self.assertTrue(history["uses"].startswith("actions/checkout@"))
+        self.assertEqual(history["with"]["ref"], "${{ github.sha }}")
+        self.assertEqual(history["with"]["path"], "pr-diff")
+        self.assertEqual(history["with"]["fetch-depth"], "0")
+        self.assertEqual(history["with"]["persist-credentials"], "false")
+        self.assertLess(steps.index(history), steps.index(listed))
         check = next(s for s in steps if s.get("name") == "Check title, body, branch and commits")
         self.assertEqual(check["env"]["CHANGED_FILES_FILE"],
                          "${{ steps.changed.outputs.changed_files_file }}")
@@ -5223,7 +5238,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(base["with"]["ref"],
                          "${{ github.event.pull_request.base.sha || 'main' }}")
         verify = next(s for s in steps if s.get("name") == "Verify base-branch gate snapshot")
-        self.assertEqual(verify["if"], "github.event_name == 'pull_request'")
+        self.assertEqual(verify["if"], base["if"])
         self.assertEqual(verify["env"]["EXPECTED_BASE_SHA"], "${{ steps.changed.outputs.base_sha }}")
         self.assertEqual(verify["shell"], "python3 -I {0}")
         self.assertIn('if actual != expected:', verify["run"])
@@ -5233,6 +5248,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(base["with"]["persist-credentials"], "false")
         check = next(s for s in steps if s.get("name") == "Check title, body, branch and commits")
         self.assertLess(steps.index(base), steps.index(check))
+        self.assertLess(steps.index(verify), steps.index(check))
         self.assertIn("base-gate", check["run"])
         self.assertIn("Base-branch gate checkout is missing", check["run"])
 
