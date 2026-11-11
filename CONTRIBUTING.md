@@ -44,8 +44,9 @@ contributors. Every change lands through a PR; nobody pushes to `main`.
 The rulesets on `main` require one PR and squash-only merges, and block deletion
 and force-pushes. `ci-ok`, `gitleaks` and `pr-lint` are required checks on `main`.
 `ci-ok` runs from `check.yml`; the other two run from `supply-chain.yml`.
-The review apps CodeRabbit and Devin Review are required checks too. No approving
-review is required.
+`Devin Review` is required too. CodeRabbit is advisory: answer its findings when
+it reviews, but never wait for it or trigger it with commands. No approving
+GitHub review is required; native task review stages still apply.
 `pr-lint` runs `.github/scripts/pr_standards.py` (tests beside it): it checks
 the title format, the 100-character limit, the trailing period and a non-empty
 body as errors, and the two required template sections (Linked Issues and
@@ -57,56 +58,53 @@ exact head commit. Never bypass or weaken a check.
 
 ### Production merge evidence
 
-The final-stage reviewer squash-merges the exact reviewed head after all required
-checks pass and every review finding is fixed or answered with evidence. The
-author merges only when there is no review stage. Pin the merge to that head SHA;
-record the squash SHA and the release decision in the release log.
+The final-stage reviewer squash-merges the settled, exact reviewed head in the
+same run as final approval, after all required checks pass and every review
+finding is fixed or answered with evidence. The author merges only when there is
+no review stage. Pin the merge to that head SHA; record the squash SHA and the
+release decision in the release log.
 
 `main` reaches production through staging and automatic promotion. A path ignored
 by `deploy-staging.yml` does not exempt a merge from production safeguards: even a
 docs-only PR needs a fresh, per-PR Release Manager `request_confirmation` on its
-exact head before merge. A manual production dispatch or rollback needs its own
-Release Manager confirmation too.
+exact head before merge. Put the confirmation on a child task assigned and
+addressed to the Release Manager (`resolverPolicy: not_creator`). A manual
+production dispatch or rollback needs its own Release Manager confirmation too.
 
-Exact-head staging qualification remains the default. The artifact-identical
-rule (owner decision 2026-11-05) removes only that staging prerequisite, and only
-when **all** of the following hold:
+For two-web-next and two-bot-next, staging qualification is the automatic
+**post-merge, pre-production exact-main staging/e2e/soak gate** (owner decision
+2026-11-06). Staging accepts only main-ancestor SHAs; an unmerged PR-head staging
+run is not a merge prerequisite. Production promotes only the exact main SHA
+that passes staging deploy, e2e and soak, enforced by the promotion guard. See the
+[production deploy gate](docs/production-deploy.md) and
+[staging rollout gate](docs/staging-rollout-gate.md) for the pipeline evidence.
+This describes the required gate, not a claim that any SHA has qualified.
+Automatic qualification starts on runtime-input pushes to `main`;
+`deploy-staging.yml` ignores docs-only merges. To promote an otherwise unqualified
+exact main SHA, including a docs-only squash SHA, first obtain authorized staging
+dispatch/qualification using the existing
+[dispatch/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
+Do not wait for a docs-only push to trigger it, skip qualification or dispatch
+through an existing hold.
 
-1. **Qualifying actual diff.** Every change is only tests (`test/`, `e2e/`,
-   `*.test.*`, fixtures), documentation (`docs/`, `*.md`), or CI unrelated to
-   build, deploy, release or promotion. Inspect content, not just paths or PR
-   labels. Deploy/release workflows, Wrangler/Worker configuration, Dockerfiles,
-   migrations, package manifests and lockfiles are excluded, even under an
-   otherwise qualifying path. Any runtime, dependency or deployment change is
-   outside this rule.
-2. **Byte-identical production artifacts.** Compare the complete production build
-   artifacts for the exact PR head and current `main`, using the existing
-   production build and artifact definitions. Record both full head SHAs, both
-   bundle/image hashes, and evidence identifying the compared artifacts on the
-   confirmation card. For multiple deployed components, record the paired hashes
-   for each: this bot's container image and Worker bundle must both be covered,
-   including all deployed assets and image metadata. An identical source tree,
-   file label, PR title, isolated Rust binary, or partial build output is not
-   artifact proof. Do not strip provenance stamps to manufacture equality.
-3. **Exact-head gates pass.** Required CI and Devin Review pass on that same PR
-   head, and all review findings are fixed or answered with evidence.
+This contract supersedes the earlier artifact-identical staging exception.
+Unmerged-head staging and paired artifact-equality proofs are not substitute
+merge prerequisites. Do not demand either to satisfy the staging item before
+merge, or treat artifact equality as permission to skip post-merge qualification.
+The pipeline's exact-SHA artifact and promotion evidence remains required.
 
-The Release Manager verifies the classification and records it with both SHAs
-and both hashes (per deployed component) in each decision. Missing/incomplete
-proof, any hash mismatch, or a non-qualifying diff retains the full exact-head
-staging requirement. Supply the normal staging/e2e evidence in that case; in
-either case retain the migration ledger entry (or `no migration`) and rollback
-target with the decision.
-
-This rule waives no required check, review gate or red deterministic gate. Keep
-incident, freeze and hold safeguards, identity/capability holds, exact-head
-per-PR confirmation, SHA-pinned squash merge and release-log recording. Any new
-PR head needs fresh review/check evidence and a new Release Manager confirmation;
-if the `main` comparison SHA changes, revalidate the artifact comparison before
-merge. Previously rejected requests remain historical rejections, not approvals:
-qualifying candidates must supply hashes and be freshly submitted. This policy
-authorizes no pipeline skip/no-op implementation, deployment or other production
-action. On owner revocation, revert this documented rule through normal gates.
+Before merge, retain required GitHub Actions checks and Devin Review on the
+exact PR head, all applicable specialist and native review, and evidence-backed
+finding dispositions. Include the migration ledger entry (or `no migration`)
+and rollback target in the fresh per-PR exact-head Release Manager decision.
+Keep incident, freeze and hold safeguards, identity/capability holds and red
+staging-drill or other deterministic gates; this staging contract lifts none of
+them. A previous rejection remains a rejection, not retroactive approval. Submit
+a fresh confirmation only after its remaining conditions are met. Any new PR
+head requires fresh review/check evidence and Release Manager acceptance before
+the SHA-pinned squash merge and release-log recording. This documentation
+authorizes no pipeline skip/no-op implementation, hold lift, deployment or other
+production action.
 
 ### CI lanes
 
@@ -130,7 +128,7 @@ the SBOM job. The legacy `required-checks` aggregate is removed.
 
 Deterministic quality gates (per-PR advisories HARD, ast-grep and Semgrep
 HARD, required voice synthetic, test-target inventory HARD) run as steps of
-the `check` lane on the existing routed runner; see
+the `check` lane on standard GitHub-hosted `ubuntu-latest`; see
 [`docs/quality-gates.md`](docs/quality-gates.md). Patch coverage (HARD) runs
 sharded across `coverage-plan`, the `coverage-shard` matrix (with per-shard
 disposable Postgres services and ignored database-backed tests) and the
@@ -250,62 +248,96 @@ Release tags use the UTC date the release was planned. Cargo package versions
 stay at `0.4.0`; `feat!` and `BREAKING CHANGE` still appear in the
 breaking-changes notes but never choose a version bump.
 
-## Local development
+## Verification on GitHub Actions
 
-The toolchain comes from `rust-toolchain.toml` (rustup and CI honour it):
-
-```sh
-cargo fmt --all -- --check
-python3 scripts/generate_command_reference.py
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
-```
-
-Generate `docs/generated/commands.md` before compiling workspace tests or
-all-targets Clippy: one test embeds the generated Markdown at compile time.
-On the persistent controller the bounded pool policy selects controller mode implicitly
-(`--controller` still forces it, as does `TWO_CARGO_CONTROLLER=1`; `TWO_CARGO_CONTROLLER=0`
-forces plain cargo), which builds only the generator through bounded
-Cargo admission. A Paperclip run alone never selects it, and hosted CI keeps plain `cargo`. The output is
-ignored; never commit generated registry rows. The authored
-[command-reference landing page](docs/commands.md) links to same-head CI artifacts.
-Normal reference-doc tests compare bytes without writing. Missing or stale output
-fails until explicit generation; tracked configuration drift still fails and is
-never automatically repaired.
-
-The ops-override DB acceptance test mutates process environment. With the test
-DB configured, run it separately from parallel workspace tests (CI does this in
-both the unit-test and coverage lanes):
+Full test suites and CI gates run on **GitHub Actions**, not on the shared host.
+Push the PR branch to run the existing
+[`check.yml`](.github/workflows/check.yml) workflow. Open the PR as a **draft**
+while work is incomplete; mark it ready only when the change is complete.
+The workflow runs on PR opened/synchronize/reopened events, including drafts;
+marking a PR ready is not a substitute for pushing its final head.
 
 ```sh
-cargo test --workspace --features two-bot-core/db --locked -- --skip settings_jobs::tests::ops_overrides_acceptance_tests::
-cargo test -p two-bot --bin two-bot --features two-bot-core/db --locked settings_jobs::tests::ops_overrides_acceptance_tests:: -- --test-threads=1
+git push origin HEAD:docs/describe-the-change
+gh pr create --draft --base main --head docs/describe-the-change --body-file pr.md
+# After the work is complete:
+gh pr ready <pr-number>
+gh pr checks <pr-number>
+gh run list --workflow check.yml --commit <head-sha>
+gh run view <run-id> --json headSha,url,jobs
 ```
 
-Nextest already isolates each test in its own process. On the controller, use the
-bounded cache wrapper for both compiling commands, as required by `AGENTS.md`.
+Use your own public-safe branch name and the repository PR template. Batch each
+review round into one push. `ci-ok` is the aggregate CI verdict: both selectors,
+lint and every selected lane must pass. A heavy lane deselected by the existing
+selectors is not a locally missing prerequisite; do not run it on the host to
+compensate or change selection to manufacture a pass. Full main/scheduled runs
+and any authorized manual Actions run also stay on GitHub.
+
+### Exact-head CI evidence
+
+Record the PR URL, full head SHA, Actions run URL
+(`https://github.com/TogetherWeOwn/two-bot-next/actions/runs/<run-id>`) and relevant
+job URLs (`.../job/<job-id>`) in Verification and the task evidence. Confirm the
+run's `headSha` matches the PR's current head and inspect its jobs and results;
+an older green run, a cancelled run, or a local transcript is not CI evidence for
+a new head. Reviewers and the Release Manager use these exact-head Actions links,
+including `ci-ok` and relevant selected jobs, alongside the other required checks
+and release evidence. Report pending/failed/skipped work honestly. Never claim a
+local reproduction is a full CI pass.
+
+The toolchain remains pinned in `rust-toolchain.toml`. CI runs
+`python3 scripts/generate_command_reference.py` to generate ignored
+`docs/generated/commands.md` before test-target compilation and
+`cargo clippy --workspace --all-targets`, then runs read-only reference tests.
+These are Actions steps, not a local command checklist. For an allowed focused
+controller reproduction only, the generator's `--controller` option enforces
+bounded cache admission; it never authorizes a local CI mirror. The generator never
+rewrites tracked configuration or independent publication fixtures. See the
+[command-reference landing page](docs/commands.md#read-the-reference) for artifact
+identity: a PR run is associated with its head, but default checkout generates
+from the synthetic merge commit. Retain the checkout-log source SHA as well as
+the PR head and run/job links; exact-head CI evidence is not proof of artifact
+bytes from the PR-head tree.
+CI isolates the environment-mutating ops-override acceptance test from parallel
+workspace tests; nextest already isolates tests in separate processes. Reuse the
+workflow's steps and logs rather than mirroring those lanes locally.
 
 ### Pre-push checklist
 
-Run this before every push. It mirrors the CI `check` job's fail-fast order:
-cheap lint/format/offline checks first, so a local failure is found in seconds
-instead of after CI restores the ~4 GiB cargo cache.
+Inspect the diff and run only focused static checks appropriate to the changed
+files; this is **not** a local CI checklist. For documentation changes, use:
 
 ```sh
-cargo fmt --all -- --check
-python3 scripts/check-secret-debug.py --test
-python3 scripts/check-secret-debug.py
-python3 scripts/test-docker-deps.py
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
-python3 scripts/check_soak_checklist.py
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist.py' -v
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_soak_checklist_noexec_acceptance.py' -v
-python3 tests/voice_templates/validate.py
-python3 -m unittest discover -s tests/voice_templates -p 'test_*.py' -v
+git diff --check
+python3 scripts/check_docs_index.py --json
 ```
 
-(`test-docker-deps.py` without `--cargo` covers the offline layer shape; CI
-additionally runs the real locked `cargo fetch` after the cache restore.)
+A formatting-only check such as `cargo fmt --all -- --check` does not compile.
+Do not execute a local full suite or CI mirror, including
+`python3 scripts/local_testdb.py test`, workspace-wide Cargo test/Clippy/build
+commands, or a `bin/local-ci.sh` wrapper. This repository has no tracked
+`bin/local-ci.sh`; do not copy a local-CI recipe from another repo. The legacy
+testdb harness remains implementation code, not an approved verification path.
+Do not run it to verify documentation.
+
+### Focused failure reproduction only
+
+Local test execution is allowed only to reproduce **one failing test or crate**,
+not as routine pre-push CI. Record the failing Actions job, narrow command and
+result. Heavy focused builds use the guarded `boat` PATH wrapper with its sizing,
+budget and security controls, `--no-env`, a source-only export of gitleaks-clean
+tracked files and verified box cleanup. Never bypass the wrapper or upload
+credentials, `.env`, incidental
+untracked files or a whole unchecked working tree. Preserve the tested source
+SHA/input identity. Do not use `--keep`.
+
+A Boat fallback does not authorize a full suite, CI mirror or heavy raw-host
+build. A permitted non-heavy focused Cargo fallback on the persistent controller
+still uses the [bounded cache wrapper](docs/build-cache.md); never run Cargo
+directly to evade admission. If the focused/local limit or any prerequisite
+cannot be met, defer to GitHub Actions or route that actual prerequisite.
+Do not create per-worktree Docker Rust target volumes to reproduce CI.
 
 ### Database tests
 
@@ -316,53 +348,30 @@ use `DATABASE_URL`, application credentials, credential fallbacks, or libpq
 `PG*` connection variables. A configured connection/setup failure must fail the
 test, not skip it.
 
-#### One-command local harness
+#### Actions database lanes, not a local mirror
 
-`python3 scripts/local_testdb.py test` mirrors the CI `rust-tests` job with Docker:
-it starts the same digest-pinned Postgres as `agent-testdb:5432` (trust auth,
-tmpfs data, bounded WAL) on a private network, creates the same bootstrap
-databases, and runs the job's test steps with the same step-scoped environment
-in a runner built from the job's `rust:bookworm` image. The guard accepts only
-the literal `agent-testdb` host, so Cargo runs inside that runner rather than on
-the host. Unlike CI it adds `--no-fail-fast`, so one failing test binary does not
-hide the rest, and it prints per-step exit codes and pass/fail/ignored totals.
-It also runs the job's property-test 30-second budget and metrics RSS steps; the
-budget is timed on your host, so a local pass does not prove the CI runner's.
+The `rust tests`, ignored database and coverage lanes in `check.yml` provision
+disposable Postgres and their test environment on GitHub Actions. Push the PR
+branch and link the exact-head run and failing/passing job; do not run the legacy
+`python3 scripts/local_testdb.py test` CI mirror. Its per-checkout Docker Rust
+target volumes are not an approved local build cache. Do not substitute
+`local_testdb.py exec` to run the same suite in pieces.
 
-```sh
-python3 scripts/local_testdb.py test                  # fresh DB + rust-tests steps + summary
-python3 scripts/local_testdb.py exec -- python3 scripts/generate_command_reference.py  # once per fresh checkout
-python3 scripts/local_testdb.py exec [--fresh] -- cargo test -p two-bot-core --features db --locked
-python3 scripts/local_testdb.py env                   # the exported test environment
-python3 scripts/local_testdb.py down [--volumes]      # --volumes also drops the target cache
-```
+Existing Docker volumes and containers are not permission to reuse the harness.
+Retirement/cleanup belongs to the operator after exact resource identification
+and verification that no active checkout or container references them; never
+prune another checkout's volume or delete evidence as part of a docs change.
 
-Each checkout gets its own network, database, runner and Cargo target volume.
-`test` always starts on an empty database; `up`/`exec` reuse it unless `--fresh`
-is given. The database tmpfs defaults to 4 GiB (`TWO_LOCAL_TESTDB_TMPFS_GIB`), not
-CI's 1 GiB: a many-core host keeps more fixture databases alive at once, and a full
-tmpfs surfaces as `No space left on device` (SQLSTATE 53100) failures.
-The Cargo registry and rustup toolchain live in a shared `two-localtest-cache`
-volume. `scripts/ci/test_local_testdb.py` fails when `check.yml` and the
-harness drift apart.
+#### Focused database failure reproduction
 
-Retention: run `down` when the checkout is done, adding `--volumes` once its
-target cache is no longer needed. A `two-localtest-*-target` volume whose
-workspace no longer exists and whose containers are gone is a removal
-candidate for the operator (exact volume name only, after re-verifying no
-container references it); never prune another checkout's live volume.
-
-#### Manual setup
-
-Create one empty bootstrap database `two_bot_test_local` on the disposable
-service, owned by its documented `agent_test` principal (empty password, with
-`CREATEDB` permission). Then run:
-
-```sh
-export TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local
-cargo test -p two-bot-testsupport --locked
-cargo test -p two-bot-core --features db --locked --test website_contract --test internal_action_store --test leveling_store
-```
+Only a single failing test or crate may be reproduced under the
+[focused execution policy](#focused-failure-reproduction-only). If its approved
+sandbox cannot reach a disposable service with the guarded identity below,
+reproduce on Actions instead; never relax the guard or use a live database.
+An authorized disposable service uses one empty `two_bot_test_local` bootstrap,
+owned by `agent_test` (empty password, `CREATEDB` permission), with
+`TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/two_bot_test_local`.
+This describes fixture setup, not permission to start a local full-suite runner.
 
 The shared guard requires `postgres`/`postgresql`, literal `agent_test:@`, an
 allowlisted host, explicit port 5432, and a lowercase `two_bot_test_*` database
@@ -426,17 +435,13 @@ low/moderate advisories remain visible but do not fail it. There are no audit
 suppressions. Fix new high/critical findings before merging; any proposed
 exception needs an explicit tracking note and expiry, not a silent ignore.
 
-Rerun the audit and its offline pass/failure fixtures from the repository root
-with the existing npm and Python CI tools (no new local prerequisites):
-
-```sh
-npm --prefix wrangler audit --audit-level=high --include=dev --json
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_worker_npm_audit.py' -v
-```
-
-The offline fixtures stub npm and check the actual workflow command's exit-status
-and JSON-log propagation; the native audit above queries the registry's current
-advisories. Audits detect known advisories, not every supply-chain compromise.
+Use the selected Actions `worker check` job for audit and Worker-suite evidence,
+not a local `npm ci`/typecheck/test CI mirror. Its offline fixtures in
+`scripts/ci/test_worker_npm_audit.py` stub npm and check the workflow command's
+exit-status and JSON-log propagation; the audit
+queries the registry's current advisories. Reproduce one failing fixture only
+under the focused execution policy above. Audits detect known advisories, not
+every supply-chain compromise.
 Never commit secrets, `.env` files or `target/`. See [README.md](README.md) for
 the full service reference.
 

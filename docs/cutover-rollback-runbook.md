@@ -58,9 +58,16 @@ come from [cutover.md](cutover.md) §§Registry swap and Rollback.
   alone is not proof of drainage.
 - **First-ready gap:** first `/readyz` 200 within 60 s of a restart or
   deploy event; sustained 503 past that freezes writers.
-- **Watch:** 48 h from first production ready (`T_0`), with checkpoints
-  at +15 min, +1 h, +6 h, +24 h and +48 h. Extend the watch on
-  uncertainty; never close it on a failed watch.
+- **Watch:** at most 48 h from first production ready (`T_0`), with
+  checkpoints at +15 min, +1 h, +6 h, +24 h and +48 h only while the
+  watch remains open. Evidence-complete closure (all receipts, actual
+  timer/workload coverage and independent B2) may precede +24 h or +48 h;
+  record the actual close UTC and mark later checkpoints N/A, never
+  fabricate them. Incomplete at +48 h stays INCOMPLETE: cutover lead,
+  Release Manager and data lead record hold/incident/rollback; any
+  continuation is separately bounded, never automatic. Never close on a
+  failed watch. Fences, watermarks, permissions and warm legacy/recovery
+  points stay in force after closure.
 - **Shutdown drain:** 35 s per SIGTERM; a second signal exits immediately.
 - **Session checkpoint:** at most 15 min old for RESUME; first production
   boot forces a fresh IDENTIFY through the reviewed one-shot path.

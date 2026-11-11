@@ -62,7 +62,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Audit domain](audit-core.md)
 - [Audit mirror](audit-service.md)
 - [Audit persistence](audit-store.md)
-- [Action signing v2](internal-action-signing-v2.md)
+- [Signing v2](internal-action-signing-v2.md)
 - [Action persistence](internal-action-store.md)
 - [Action ingress](internal-actions-receiver.md)
 - [Announcements](internal-action-executor.md)
@@ -71,6 +71,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Event executors](internal-event-executors.md)
 - [Member executors](internal-member-execution.md)
 - [Moderation executor](internal-member-moderation.md)
+- [Bot-site contract](bot-site-contract.md)
 
 ## Commands, moderation and community
 
@@ -94,7 +95,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Channel runtime](channel-moderation-runtime.md)
 - [Lane recovery](channel-lane-reconciliation.md)
 - [Member moderation](member-moderation.md)
-- [Warning history (proposal)](warning-history-spec.md)
+- [Warning history](warning-history-spec.md)
 - [Self-view](moderation-sanction-selfview-spec.md)
 - [Disable gate](moderation-disable-preflight.md)
 - [Hierarchy](moderation-hierarchy-order.md)
@@ -179,13 +180,13 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Prefix seam](router-voice-prefix.md)
 - [Create plan](voice-room-creation-plan.md)
 - [Create admission](voice-create-admission-core.md)
-- [Ownership domain](voice-ownership-core.md)
+- [Ownership](voice-ownership-core.md)
 - [Room controls](voice-room-controls-core.md)
 - [Private rooms](voice-private-core.md)
-- [Room access gate](voice-access-core.md)
+- [Access gate](voice-access-core.md)
 - [Access corpus](voice-access-golden.md)
 - [Vote-kick](voice-vote-kick-core.md)
-- [Cooldown tests](voice-vote-cooldown-acceptance.md)
+- [Cooldown](voice-vote-cooldown-acceptance.md)
 - [Vote cooldown](voice-vote-kick-cooldown-checklist.md)
 - [Templates](voice-template-core.md)
 - [Template styling](voice-style-core.md)
@@ -223,10 +224,10 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Alert drill](voice-lifecycle-alert-drill.md)
 - [Cutover rehearsal](voice-cutover-rehearsal.md)
 - [Rollbacks](voice-cutover-rollback-triggers.md)
-- [Rollback tabletop](voice-rollback-trigger-drill.md)
+- [Rollback drill](voice-rollback-trigger-drill.md)
 - [Freeze](voice-t5-freeze-readback-receipt.md)
 - [Publish diff](voice/publish-diff-record-template.md)
-- [Music node spike](music-voice-node-spike.md)
+- [Music spike](music-voice-node-spike.md)
 
 ## Staging acceptance
 

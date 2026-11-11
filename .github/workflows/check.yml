@@ -94,18 +94,12 @@ jobs:
     needs: [job-inputs]
     # Failed, skipped or cancelled dependencies must not make check appear green.
     if: ${{ always() }}
-    # Runner routing (TOG-12339). Every job in every workflow uses this
-    # expression with its own job id; scripts/test-runner-routing.py pins it.
-    # - Public repo: GitHub-hosted ubuntu-latest, free. The org runner group
-    #   refuses public repos, so a self-hosted label would queue forever. An
-    #   event payload without `repository` (schedule) also lands here.
-    # - Private repo: [self-hosted, two-selfhosted], unless repo vars
-    #   CI_OVERFLOW_RUNNER (JSON runs-on, e.g. ["ubuntu-latest"]),
-    #   CI_OVERFLOW_JOBS (JSON job ids) and CI_OVERFLOW_EVENTS (JSON event
-    #   names) all select the job (TOG ops, 2026-10-01). Flip back without a PR
-    #   by deleting CI_OVERFLOW_RUNNER. Hosted minutes then come from the
-    #   included allowance; an rbx1 guard reverts at 45k.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'check') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: every job uses the explicit standard GitHub-hosted
+    # `runs-on: ubuntu-latest`. This is a public repository, so the
+    # GitHub-hosted Ubuntu runner is free and the org self-hosted runner
+    # group is not used. A private conversion needs fresh runner/cost
+    # qualification before execution; see docs/ci-security.md.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
       image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
@@ -363,6 +357,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_argparse_refusal_acceptance.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_negative_spellings.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_compare_pipeline_bench_intake_acceptance.py' -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_pipeline_bench_profile.py' -v
       - name: SBOM intake refusal acceptance (offline)
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_validate_sbom_intake_refusal_acceptance.py' -v
@@ -577,23 +572,23 @@ jobs:
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on `check`.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'rust-tests') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     # Suite-only since the HARD patch-coverage measurement split out of this
     # lane: the combined job outgrew 60 minutes (59m54s on main, one 60m07s
     # mid-measurement kill), while the replay alone measured ~30 min of a
     # 42m16s job. 45 minutes keeps comfortable headroom for a cache-cold or
     # slow runner without letting a hung suite burn a full hour.
     timeout-minutes: 45
-    # Self-hosted runners share one Docker host, so a published 5432 collides
-    # across concurrent jobs. A job container gets its own network namespace:
+    # Keep database isolation inside the job container network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
+    # No database host port is published.
     container:
       image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
       CARGO_TERM_COLOR: always
       TWO_CUSTOM_COMMAND_TEST_CI: "1"
       TWO_AUTOMATION_TRANSFER_TEST_CI: "1"
-      # Disk hygiene for hosted overflow runners (TOG-12134): the integration
+      # Disk hygiene for standard hosted runners: the integration
       # link step (`cargo test --workspace --test '*'`) links ~70 test
       # binaries and exhausted the job-container overlay (98 MB left, rust-lld
       # bus error on two consecutive main heads). Line tables keep failure
@@ -620,8 +615,13 @@ jobs:
           # Ephemeral CI service only; tests explicitly use an empty password.
           # Slice scratch databases are created in the prepare step below.
           POSTGRES_HOST_AUTH_METHOD: trust
+          # The log-reader regression enables completion logging only
+          # on its own synthetic connection; unrelated suites remain unlogged.
+          POSTGRES_INITDB_ARGS: >-
+            -c logging_collector=on -c log_destination=jsonlog
+            -c log_rotation_age=0 -c log_rotation_size=0
         # PG18 places data and WAL below this volume. Isolate disposable fixture
-        # checkpoint I/O from shared-host disk; keep PostgreSQL defaults intact.
+        # checkpoint I/O from shared-host disk; retain maintenance defaults.
         # Tmpfs counts against the 2GiB service cap; do not spill it into swap.
         options: >-
           --tmpfs /var/lib/postgresql:rw,size=1073741824
@@ -985,7 +985,7 @@ jobs:
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on `check`.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'coverage-plan') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -1080,7 +1080,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.coverage-plan.outputs.matrix) }}
     # Runner routing: see the note on `check`.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'coverage-shard') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     # One shard's legs plus the instrumented build stay far below the 60-minute
     # ceiling the old single job needed (its llvm-cov replay alone measured
     # ~30 min of a 42m16s job, with one 60m07s mid-measurement kill). 45 minutes
@@ -1094,7 +1094,7 @@ jobs:
       CARGO_TERM_COLOR: always
       TWO_CUSTOM_COMMAND_TEST_CI: "1"
       TWO_AUTOMATION_TRANSFER_TEST_CI: "1"
-      # Disk hygiene for hosted overflow runners (TOG-12134): the integration
+      # Disk hygiene for standard hosted runners: the integration
       # link step (`cargo test --workspace --test '*'`) links ~70 test
       # binaries and exhausted the job-container overlay (98 MB left, rust-lld
       # bus error on two consecutive main heads). Line tables keep failure
@@ -1131,8 +1131,13 @@ jobs:
           # Ephemeral CI service only; tests explicitly use an empty password.
           # Slice scratch databases are created in the prepare step below.
           POSTGRES_HOST_AUTH_METHOD: trust
+          # The log-reader regression enables completion logging only
+          # on its own synthetic connection; unrelated suites remain unlogged.
+          POSTGRES_INITDB_ARGS: >-
+            -c logging_collector=on -c log_destination=jsonlog
+            -c log_rotation_age=0 -c log_rotation_size=0
         # PG18 places data and WAL below this volume. Isolate disposable fixture
-        # checkpoint I/O from shared-host disk; keep PostgreSQL defaults intact.
+        # checkpoint I/O from shared-host disk; retain maintenance defaults.
         # Tmpfs counts against the 2GiB service cap; do not spill it into swap.
         options: >-
           --tmpfs /var/lib/postgresql:rw,size=1073741824
@@ -1724,7 +1729,7 @@ jobs:
     # cancelled or unexpectedly skipped shard.
     if: ${{ always() && !cancelled() && needs.job-inputs.outputs.rust != 'false' && needs.coverage-plan.result == 'success' }}
     # Runner routing: see the note on `check`.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'patch-coverage') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     # Download, union and gate only: no toolchain, container or database.
     timeout-minutes: 15
     steps:
@@ -1813,11 +1818,11 @@ jobs:
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on `check`.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'ignored-db-stores') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
-    # Self-hosted runners share one Docker host, so a published 5432 collides
-    # across concurrent jobs. A job container gets its own network namespace:
+    # Keep database isolation inside the job container network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
+    # No database host port is published.
     container:
       image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
@@ -2288,11 +2293,11 @@ jobs:
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on `check`.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'ignored-db-runtime') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
-    # Self-hosted runners share one Docker host, so a published 5432 collides
-    # across concurrent jobs. A job container gets its own network namespace:
+    # Keep database isolation inside the job container network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
+    # No database host port is published.
     container:
       image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
@@ -2720,10 +2725,10 @@ jobs:
     # Skip when the selector sees no Rust inputs (not a required check).
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on the first job above.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'moderation-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     # Each job container has a private service network; never publish a fixed
-    # host port on the shared self-hosted runner Docker host.
+    # host port outside that isolated service network.
     container:
       image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     services:
@@ -2794,7 +2799,7 @@ jobs:
     # aggregator only enforces this job when parity was selected.
     if: needs.job-inputs.outputs.parity != 'false'
     # Runner routing: see the note on the first job above.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'parity-docs') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2819,7 +2824,7 @@ jobs:
     # aggregator only enforces this job when rust was selected.
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on the first job above.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'self-role-store') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     # A job container resolves service names directly. The test's fixed
     # agent-testdb endpoint cannot fall back to an inherited DATABASE_URL.
@@ -2912,7 +2917,7 @@ jobs:
     permissions:
       contents: read
     # Runner routing: see the note on the first job above.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'job-inputs') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.select.outputs.rust }}
@@ -2970,7 +2975,7 @@ jobs:
     permissions:
       contents: read
     # Runner routing: see the note on the first job above.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'container-inputs') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       build: ${{ steps.select.outputs.build }}
@@ -3007,7 +3012,7 @@ jobs:
       contents: read
     needs: container-inputs
     # Runner routing: see the note on the first job above.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'container') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       IMAGE: two-bot-next:smoke-${{ github.run_id }}-${{ github.run_attempt }}
@@ -3101,11 +3106,11 @@ jobs:
     # Skip when the selector sees no Rust inputs (not a required check).
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on the first job above.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'community-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Self-hosted runners share one Docker host, so a published 5432 collides
-    # across concurrent jobs. A job container gets its own network namespace:
+    # Keep database isolation inside the job container network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
+    # No database host port is published.
     container:
       image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     services:
@@ -3188,11 +3193,11 @@ jobs:
     # Skip when the selector sees no Rust inputs (not a required check).
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on the first job above.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'feeds-db') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Self-hosted runners share one Docker host, so a published 5432 collides
-    # across concurrent jobs. A job container gets its own network namespace:
+    # Keep database isolation inside the job container network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
+    # No database host port is published.
     container:
       image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
     env:
@@ -3258,7 +3263,7 @@ jobs:
     # Skip when the selector sees no Rust inputs (not a required check).
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on the first job above.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'tickets-postgres') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     # Service DNS stays inside this job's network; never publish a shared port.
     container:
@@ -3354,7 +3359,7 @@ jobs:
     # `ci-ok` only accepts the skip when the selector deselected the job.
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on `check`.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'fuzz-compile') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
       image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
@@ -3454,7 +3459,7 @@ jobs:
     # missing selector fails closed via the guard step, never a false green.
     if: ${{ always() }}
     # Runner routing: see the note on the first job above.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'worker') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
       run:
@@ -3709,7 +3714,7 @@ jobs:
     # A skipped or cancelled dependency must not read as green.
     if: ${{ always() }}
     # Runner routing: see the note on the first job above.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'ci-ok') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Aggregate CI verdict

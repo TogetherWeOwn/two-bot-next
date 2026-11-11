@@ -7,16 +7,41 @@ This procedure is TWO Bot Next only; it does not touch services or databases.
 
 ## Local builds
 
-Use the repository wrapper from your isolated workspace:
+Full suites and CI gates run on **GitHub Actions** by pushing the PR branch;
+keep the PR a draft while incomplete. This runbook controls cache admission,
+not permission to run CI locally. Use exact-head Actions run/job links as CI
+evidence, not local transcripts. The
+[verification policy](../CONTRIBUTING.md#verification-on-github-actions) governs
+all verification recipes, including older focused examples below.
+
+Local execution is only for reproduction of one failing test or crate. Heavy
+focused work uses the guarded `boat` PATH wrapper with its sizing/budget/security
+controls, `--no-env`, source-only export and verified box cleanup (never `--keep`).
+No fallback authorizes a full suite, CI mirror or heavy raw-host build. If the
+focused/local limit cannot be met, defer to Actions or route the prerequisite.
+
+Only for an approved non-heavy focused controller reproduction/fallback, use
+the repository cache wrapper from your isolated workspace, with the fully
+qualified failing test name from the failing Actions job, for example:
 
 ```sh
-python3 scripts/cargo_cache.py run -- check -p two-bot-core
-python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib
+python3 scripts/cargo_cache.py run -- test -p two-bot-core --lib <fully-qualified-failing-test-name> -- --exact
 ```
 
-Run the wrapper with a Bash timeout that covers the build (600000 ms) or in
-the background. An interrupted run keeps its `lease.json` sentinel and any
-partial output stays in the slot, counting against its budget; a stale
+Keep the complete module path (for example,
+`internal_actions::tests::event_key_names_a_key_never_a_snowflake`), not just the
+short function name. Retain `--exact` to bound reproduction and confirm the
+result reports **exactly one test ran**. Zero tests is not a successful
+reproduction; correct the name/target against the failing job rather than
+broadening the selector.
+
+Do not run `local_testdb.py test`, a copied `bin/local-ci.sh` recipe or a sequence
+of crate commands that reconstructs CI. Never create per-worktree Docker Rust
+target volumes as a replacement cache.
+
+Run permitted focused commands in the foreground with an adequate timeout and
+read their result in the same run. An interrupted run keeps its `lease.json`
+sentinel and any partial output stays in the slot, counting against its budget; a stale
 under-budget lease with a dead recorded Cargo process group is recovered on
 the next acquire, while over-budget or live-group leases stay for Operator
 inspection.
@@ -168,7 +193,12 @@ policy assumes a larger backing filesystem than exists.
 
 ## Offline verification
 
+Actions owns these fixture suites as well; offline does not mean approved for a
+local CI mirror. The commands document coverage, not a host pre-push checklist.
+Only a single failing fixture may be reproduced locally under the focused policy.
+
 ```sh
+# GitHub Actions only as suites.
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_cargo_cache.py' -v
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_pool_capacity_acceptance.py' -v
 ```
