@@ -1,6 +1,7 @@
 //! Synthetic admission for the transport's absolute deadline boundary.
 
 use super::*;
+use std::io::ErrorKind::WouldBlock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use two_bot_core::send_admission::{
     AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, SendCompletion, SendCooldown,
@@ -63,11 +64,7 @@ impl SendAdmission for Admission {
             // yielding back to the timeout before returning the permit.
             if !self.advance.is_zero() {
                 let mut advance = Box::pin(tokio::time::advance(self.advance));
-                std::future::poll_fn(|cx| {
-                    assert!(std::future::Future::poll(advance.as_mut(), cx).is_pending());
-                    std::task::Poll::Ready(())
-                })
-                .await;
+                assert!(futures_util::poll!(advance.as_mut()).is_pending());
             }
             Ok(AdmissionPermit::new(Box::new(Completion(
                 self.ledger.clone(),
@@ -85,12 +82,10 @@ fn fixture(
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.set_nonblocking(true).expect("nonblocking");
     let ledger = Arc::new(Ledger::default());
+    let origin = format!("http://{}", listener.local_addr().expect("address"));
     let transport = HyperTransport::with_admission(
         TOKEN.to_owned(),
-        Some(format!(
-            "http://{}",
-            listener.local_addr().expect("address")
-        )),
+        Some(origin),
         Arc::new(Admission {
             key: TokenKey::for_bot_token(TOKEN).expect("token key"),
             ledger: ledger.clone(),
@@ -118,9 +113,7 @@ async fn equality_releases_unused_permit_without_wire() {
     assert_eq!(tokio::time::Instant::now(), deadline);
     assert_eq!(ledger.admits.load(Ordering::SeqCst), 1);
     assert_eq!(ledger.completions.load(Ordering::SeqCst), 1);
-    assert!(
-        matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
+    assert!(matches!(listener.accept(), Err(ref error) if error.kind() == WouldBlock));
 }
 
 #[tokio::test(start_paused = true)]
@@ -134,9 +127,7 @@ async fn expired_permit_settlement_yields_or_times_out_in_place() {
         assert_eq!(ledger.started.load(Ordering::SeqCst), 1);
         assert_eq!(ledger.completions.load(Ordering::SeqCst), completed);
         assert!(tokio::time::Instant::now() <= deadline + Duration::from_millis(500));
-        assert!(
-            matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
-        );
+        assert!(matches!(listener.accept(), Err(ref error) if error.kind() == WouldBlock));
     }
 }
 
@@ -147,17 +138,11 @@ async fn cancellation_during_settlement_does_not_complete_permit() {
     let deadline = tokio::time::Instant::now() + budget;
     let request = request();
     let mut send = Box::pin(transport.send_request(&request, Some(deadline)));
-    std::future::poll_fn(|cx| {
-        assert!(std::future::Future::poll(send.as_mut(), cx).is_pending());
-        std::task::Poll::Ready(())
-    })
-    .await;
+    assert!(futures_util::poll!(send.as_mut()).is_pending());
     assert_eq!(ledger.started.load(Ordering::SeqCst), 1);
     drop(send);
     assert_eq!(ledger.completions.load(Ordering::SeqCst), 0);
-    assert!(
-        matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
+    assert!(matches!(listener.accept(), Err(ref error) if error.kind() == WouldBlock));
 }
 
 #[tokio::test(start_paused = true)]
@@ -168,9 +153,7 @@ async fn expired_deadline_never_admits_or_sends() {
     assert!(matches!(result, Err(ref error) if error == HEADER_TIMEOUT_MESSAGE));
     assert_eq!(ledger.admits.load(Ordering::SeqCst), 0);
     assert_eq!(ledger.completions.load(Ordering::SeqCst), 0);
-    assert!(
-        matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
+    assert!(matches!(listener.accept(), Err(ref error) if error.kind() == WouldBlock));
 }
 
 #[tokio::test(start_paused = true)]
@@ -194,9 +177,7 @@ async fn status_only_and_cutover_delete_release_at_equality() {
         };
         assert_eq!(result.as_deref(), Some(HEADER_TIMEOUT_MESSAGE));
         assert_eq!(ledger.completions.load(Ordering::SeqCst), 1);
-        assert!(
-            matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
-        );
+        assert!(matches!(listener.accept(), Err(ref error) if error.kind() == WouldBlock));
     }
 }
 
@@ -212,11 +193,7 @@ async fn local_admission_at_deadline_proves_no_effect() {
     let lane = executor.inner.pace_last_at.lock().await;
     let request = request();
     let mut send = Box::pin(executor.send_with_timeout_for(&request, Some(false), budget));
-    std::future::poll_fn(|cx| {
-        assert!(std::future::Future::poll(send.as_mut(), cx).is_pending());
-        std::task::Poll::Ready(())
-    })
-    .await;
+    assert!(futures_util::poll!(send.as_mut()).is_pending());
     tokio::time::advance(budget).await;
     drop(lane);
     let error = send.await.expect_err("deadline must refuse the send");
@@ -230,32 +207,22 @@ async fn local_admission_at_deadline_proves_no_effect() {
     ));
     assert!(error.proves_no_effect());
     assert_eq!(ledger.admits.load(Ordering::SeqCst), 0);
-    assert!(
-        matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
+    assert!(matches!(listener.accept(), Err(ref error) if error.kind() == WouldBlock));
 }
 
 #[tokio::test(start_paused = true)]
 async fn status_entry_point_releases_at_deadline_equality() {
     let budget = Duration::from_millis(750);
     let (transport, ledger, listener) = fixture(budget, Settlement::Yielding);
-    let executor = ActionExecutor::assemble_with_timeout(
-        TOKEN.to_owned(),
-        Some(format!(
-            "http://{}",
-            listener.local_addr().expect("address")
-        )),
-        transport,
-        budget,
-    )
-    .expect("executor");
+    let origin = format!("http://{}", listener.local_addr().expect("address"));
+    let executor =
+        ActionExecutor::assemble_with_timeout(TOKEN.to_owned(), Some(origin), transport, budget)
+            .expect("executor");
     let result = executor.send_status(&request()).await;
     assert!(matches!(result, Err(ref error) if error == HEADER_TIMEOUT_MESSAGE));
     assert_eq!(ledger.admits.load(Ordering::SeqCst), 1);
     assert_eq!(ledger.completions.load(Ordering::SeqCst), 1);
-    assert!(
-        matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
+    assert!(matches!(listener.accept(), Err(ref error) if error.kind() == WouldBlock));
 }
 
 #[tokio::test]

@@ -1364,6 +1364,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn delete_entry_point_releases_unused_permit_at_deadline() {
+        use std::io::ErrorKind::WouldBlock;
         use std::sync::atomic::AtomicUsize;
         use two_bot_core::send_admission::{
             AdmissionError, AdmissionFuture, AdmissionPermit, SendCompletion, SendCooldown,
@@ -1409,14 +1410,8 @@ mod tests {
             TokenKey::for_bot_token(token).expect("token key"),
             completed.clone(),
         );
-        let rest = RestClient::with_admission(
-            token.to_owned(),
-            Some(format!(
-                "http://{}",
-                listener.local_addr().expect("address")
-            )),
-            Arc::new(admission),
-        );
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let rest = RestClient::with_admission(token.to_owned(), Some(origin), Arc::new(admission));
         let started = tokio::time::Instant::now();
         let result = rest
             .delete_channel(Id::<ChannelMarker>::new(3333), "deadline test")
@@ -1427,9 +1422,7 @@ mod tests {
             started + Duration::from_secs(30)
         );
         assert_eq!(completed.load(Ordering::SeqCst), 1);
-        assert!(
-            matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
-        );
+        assert!(matches!(listener.accept(), Err(ref error) if error.kind() == WouldBlock));
     }
 
     /// A page whose headers never arrive must fail at the 30 s page budget on
