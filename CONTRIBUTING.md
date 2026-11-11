@@ -193,20 +193,26 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_ni
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
 ```
 
-### Pull-request size labels (advisory)
+### Pull-request size labels and required size gate
 
 `.github/workflows/pr-size.yml` labels every pull request `size/S` (up to 100
 counted lines), `size/M` (up to 400), `size/L` (up to 1000) or `size/XL`, and
 keeps one advisory comment on pull requests over the 400-line threshold.
 Counted lines are additions + deletions excluding lockfiles, generated files
 and fixtures (plus `migrations.lock`, the generated migration inventory; the
-hand-written migration SQL stays counted). The labeller lives once in the org
+hand-written migration SQL stays counted). The labeller and the gate live
+once in the org
 [TogetherWeOwn/.github](https://github.com/TogetherWeOwn/.github) repository
-(CI-STANDARD.md, "Advisory PR-size labels"); the workflow here is a thin
-caller pinned to a central SHA and passes only this repo's generated paths.
-This is advisory only: it is not a required check and never blocks a merge.
-A Monday run of the same workflow prints the weekly tally of merged pull
-requests per size; the labels are the durable record behind it.
+(CI-STANDARD.md, "Advisory PR-size labels" and "PR size gate"); the workflow
+here is a thin caller pinned to a central SHA and passes only this repo's
+generated paths. The labels are advisory only: the `pr-size` job is never a
+required check and never blocks a merge. The separate `pr-size-gate` job in
+the same workflow is required once added to the repository ruleset and fails
+pull requests too large for the automated reviewer (warn from 200 counted
+lines, fail over 400 lines or 20 files, hard stop at 1000); it is promoted to
+the ruleset only after it has reported on the default branch (two-step
+ship). A Monday run of the same workflow prints the weekly tally of merged
+pull requests per size; the labels are the durable record behind it.
 
 ### Issues
 
