@@ -1,13 +1,17 @@
 """Offline regression tests for inert production-hold receipt parsing."""
 
 import json
+import subprocess
 import sys
+import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import incident_issue
 import production_hold_receipts as receipts
 
 
@@ -37,10 +41,86 @@ class History:
         return self.comments if path.endswith("/comments") else []
 
 
+def receipt(module, report):
+    return module.body(report) + "\n" + module.observation(report)
+
+
+def change_metadata(text, **changes):
+    match = receipts.OBSERVATION.search(text)
+    value = json.loads(match[1])
+    value.update(changes)
+    return text[:match.start(1)] + json.dumps(value, sort_keys=True) + text[match.end(1):]
+
+
+def stale_issue(text):
+    return {"number": 1, "updated_at": "2026-01-03T00:00:00Z", "body": text}
+
+
 class ReceiptParsingTest(unittest.TestCase):
+    def test_observation_integrity_and_lifecycle(self):
+        old = dict(REPORT, last_promoted_at="2026-01-01T00:00:00Z")
+        valid = receipt(receipts, old)
+        self.assertTrue(receipts.stale_observation(valid, REPORT))
+        self.assertTrue(receipts.stale_activity(History(), stale_issue(valid), REPORT))
+        current = dict(old, last_promoted_at=REPORT["last_promoted_at"],
+                       held_since=REPORT["last_promoted_at"], observed_at=REPORT["last_promoted_at"])
+        self.assertFalse(receipts.stale_observation(receipt(receipts, current), REPORT))
+        changed = dict(old, main_sha="c" * 40)
+        self.assertTrue(receipts.stale_observation(receipt(receipts, changed), REPORT))
+        body, marker = valid.split("\n<!--", 1)
+        mixed = receipts.body(changed) + "\n<!--" + marker
+        legacy_value = {key: old[key] for key in receipts.OBSERVATION_FIELDS}
+        legacy_value["content_sha256"] = receipts.content_digest(body)
+        legacy = body + "\n<!-- production-hold-observation: " + json.dumps(legacy_value) + " -->"
+        tampered = [change_metadata(valid, last_promoted_at="2025-12-31T00:00:00Z"),
+                    change_metadata(valid, observed_at="2026-01-01T13:00:00Z"),
+                    valid.replace("Skip/failure reason: held", "Skip/failure reason: edited"),
+                    mixed, legacy, change_metadata(valid, version=99)]
+        # Even a recomputed unkeyed digest cannot excuse inconsistent duplicated fields.
+        match = receipts.OBSERVATION.search(tampered[0])
+        metadata = json.loads(match[1])
+        metadata.pop("envelope_sha256")
+        metadata["envelope_sha256"] = receipts.observation_digest(body, metadata)
+        tampered.append(body + "\n<!-- production-hold-observation: " + json.dumps(metadata) + " -->")
+        for text in tampered:
+            with self.subTest(text=text):
+                self.assertFalse(receipts.stale_observation(text, REPORT))
+                self.assertFalse(receipts.stale_activity(History(), stale_issue(text), REPORT))
+                comment = {"updated_at": "2026-01-03T00:00:00Z", "body": text}
+                self.assertFalse(receipts.stale_activity(History([comment]), stale_issue(valid), REPORT))
+
+    def test_timestamp_bounds_and_receipt_rejection(self):
+        bad = ("0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00",
+               "nonsense", "2026-01-01T00:00:00")
+        old = dict(REPORT, last_promoted_at="2026-01-01T00:00:00Z")
+        for raw in bad:
+            with self.subTest(raw=raw):
+                with self.assertRaisesRegex(incident_issue.IncidentError, "production hold timestamp is unreadable"):
+                    receipts.moment(raw)
+                self.assertFalse(receipts.stale_observation(receipt(receipts, dict(old, observed_at=raw)), REPORT))
+        self.assertEqual(receipts.moment("2026-01-01T01:00:00+01:00"),
+                         datetime(2026, 1, 1, tzinfo=timezone.utc))
+        self.assertEqual(receipts.moment("2026-01-01T00:00:00Z"),
+                         datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+    def test_pinned_prefix_exhibits_both_original_defects(self):
+        source = subprocess.check_output(
+            ["git", "show", "280c9630e9618a913da3c725ebc2a5ad81367f82:scripts/production_hold_receipts.py"],
+            cwd=ROOT, text=True)
+        before = types.ModuleType("receipt_before_fix")
+        exec(compile(source, "receipt_before_fix", "exec"), before.__dict__)
+        old = dict(REPORT, last_promoted_at="2026-01-01T00:00:00Z")
+        tampered = change_metadata(receipt(before, old), last_promoted_at="2025-12-31T00:00:00Z")
+        self.assertTrue(before.stale_observation(tampered, REPORT))
+        self.assertTrue(before.stale_activity(History(), stale_issue(tampered), REPORT))
+        with self.assertRaises(OverflowError):
+            before.moment("0001-01-01T00:00:00+01:00")
+        with self.assertRaises(OverflowError):
+            before.stale_observation(receipt(before, dict(old, observed_at="9999-12-31T23:59:59-01:00")), REPORT)
+
     def test_deep_json_is_rejected_in_both_envelopes_and_callers(self):
         # Construct JSON directly: the decoder, not the encoder, hits its limit.
-        nested = '{"nested":' + '[' * 2000 + '0' + ']' * 2000 + '}'
+        nested = '{"nested":' + '[' * 10000 + '0' + ']' * 10000 + '}'
         with self.assertRaises(RecursionError):
             json.loads(nested)
         for kind, pattern in (("observation", receipts.OBSERVATION),
