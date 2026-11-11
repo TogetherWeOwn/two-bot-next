@@ -1,0 +1,151 @@
+# Review tiers for two-bot-next.
+#
+# Classification: a pull request's tier is the highest tier of any changed
+# file. Sensitive wins on overlap; unmatched paths default to sensitive
+# (default_tier below). Content triggers escalate any tier to sensitive
+# regardless of path: new/changed public endpoint or input parsing;
+# auth/authz/session; crypto/keys; secrets/credentials; permission checks;
+# tenant isolation/personal data; SQL/schema/migrations; dependency or
+# lockfile changes; CI/workflow changes; weakened test assertions, deleted
+# tests/snapshots or lowered gates in test files.
+#
+# Review per tier: low -> QA; ordinary -> QA; sensitive/unclassified ->
+# Security -> QA. QA verifies the author's risk_tier attestation and may
+# escalate any PR. This file itself is always sensitive.
+#
+# Sensitive floor for this repo (never downgrade): the bot holds a live
+# Discord gateway, member moderation authority, DB credentials, signed
+# internal actions and a Postgres store, so all production Rust/Worker
+# source, migrations, deploy and CI paths are sensitive. Unlisted paths
+# (including every new top-level path) default to sensitive.
+#
+# Governance docs that define review severity, the merge-evidence rule,
+# the quality bar and the disclosure route (CONTRIBUTING.md,
+# CONSTRAINTS.md, REVIEW.md, SECURITY.md) are sensitive: weakening them
+# must not ride QA-only review. crates/cutover/** is sensitive at any
+# depth (T0 floor), including its erasure, privacy, retention and
+# secret-connection tests. Executable scripts under the test trees are
+# sensitive like scripts/** — a CI gate or generator is not a fixture.
+#
+# Low covers allowlisted docs copy, the remaining static brand assets,
+# static non-sensitive fixtures and additive tests only; content
+# triggers still apply. One deliberate consequence: inline *_tests.rs
+# inside sensitive src/ stays sensitive (sensitive wins on overlap) —
+# only standalone test trees are low.
+#
+# Ordinary is intentionally empty in this bootstrap: no module has been
+# audited as free of untrusted input, sensitive output, permissions,
+# persistence and trust-boundary effects. Add a module only with an audit
+# justification in the PR body. All production code stays sensitive until
+# then; a small correct map beats a big wrong one.
+#
+# Glob syntax: repo-relative minimatch. Sensitive wins on overlap, so a
+# sensitive glob matching a low/ordinary path keeps the path sensitive.
+
+version: 1
+default_tier: sensitive # anything not matched below
+tiers:
+  low: # QA review; content triggers still escalate to sensitive
+    - "README.md"
+    - "CHANGELOG.md"
+    - "CONTEXT.md"
+    - "CODE_OF_CONDUCT.md"
+    - "docs/*.md"
+    - "docs/**/*.md"
+    - "assets/**" # static brand fixtures
+    - "tests/**" # additive integration/acceptance tests (data only; scripts are sensitive)
+    - "crates/*/tests/**" # additive integration tests (data only; scripts are sensitive)
+    - "ast-grep-rule-tests/**" # additive lint-rule tests
+    - "fuzz/corpus/**" # static fuzz corpus fixtures
+  ordinary: [] # no modules audited yet; empty is deliberate (see header)
+  sensitive: # Security -> QA review; always wins on overlap
+    # License instrument (BSL parameters) is sensitive, not docs copy.
+    - "LICENSE"
+    # Review policy and PR contract.
+    - ".github/workflows/**"
+    - ".github/review-tiers.yml"
+    - ".github/CODEOWNERS"
+    - ".github/scripts/**"
+    - ".github/dependabot.yml"
+    - ".github/release.yml"
+    - ".github/pull_request_template.md"
+    - ".github/ISSUE_TEMPLATE/**"
+    # Governance docs defining merge evidence, the quality bar, reviewer
+    # floors and the private disclosure route.
+    - "CONTRIBUTING.md"
+    - "CONSTRAINTS.md"
+    - "REVIEW.md"
+    - "SECURITY.md"
+    # Dependency manifests, lockfiles and install/build scripts.
+    - "Cargo.toml"
+    - "Cargo.lock"
+    - "crates/*/Cargo.toml"
+    - "fuzz/Cargo.toml"
+    - "fuzz/Cargo.lock"
+    - "wrangler/package.json"
+    - "wrangler/package-lock.json"
+    - "wrangler/tsconfig.json"
+    - "wrangler/*.toml"
+    - "wrangler/**/*.toml"
+    - "wrangler/**/*.json"
+    - "wrangler/**/*.jsonc"
+    - "rust-toolchain.toml"
+    - "deny.toml"
+    - ".config/**"
+    - ".gitleaks.toml"
+    - ".gitleaksignore"
+    - ".semgrep/**"
+    - ".trivyignore.yaml"
+    - "sgconfig.yml"
+    - "ast-grep-rules/**"
+    - "scripts/**"
+    - "bin/**"
+    # DB schema, migrations and role SQL (personal data, grants, erasure).
+    - "sql/**"
+    - "crates/*/migrations/**"
+    - "crates/store/src/migrations.rs"
+    - "migrations.lock"
+    - "crates/store/src/pool.rs"
+    - "crates/core/src/database_url.rs"
+    - "crates/core/src/database_tls.rs"
+    - "crates/core/src/database_roles.rs"
+    - "crates/bot/src/database_roles_cli.rs"
+    # Production source: Discord gateway, auth/session, crypto/keys,
+    # secrets, public endpoints and input parsing, permission checks,
+    # tenant isolation and personal data.
+    - "src/**"
+    - "crates/bot/src/**"
+    - "crates/core/src/**"
+    - "crates/discord/src/**"
+    - "crates/store/src/**"
+    - "crates/cutover/**"
+    - "crates/voice-probe/src/**"
+    - "crates/testsupport/src/**"
+    - "crates/bot/examples/**"
+    - "crates/core/examples/**"
+    - "wrangler/src/**"
+    - "wrangler/scripts/**"
+    - "wrangler/test/**"
+    - "fuzz/fuzz_targets/**"
+    # Executable scripts under the test trees (CI gates and generators).
+    # Same class as scripts/**; data fixtures stay low.
+    - "tests/**/*.py"
+    - "tests/**/*.mjs"
+    - "tests/**/*.sh"
+    - "crates/*/tests/**/*.py"
+    - "crates/*/tests/**/*.mjs"
+    - "crates/*/tests/**/*.sh"
+    # Live embed icon served from main by BRAND_ICON_URL.
+    - "assets/brand/two-icon-1-dark-512.png"
+    # Runtime/network/IAM config, infra and deploy/release paths.
+    - "Dockerfile"
+    - ".dockerignore"
+    - "deploy/**"
+    - "release-please-config.json"
+    - ".release-please-manifest.json"
+    # Agent policy and tool-permission files.
+    - "AGENTS.md"
+    - ".claude/**"
+    - ".editorconfig"
+    - ".gitattributes"
+    - ".gitignore"
