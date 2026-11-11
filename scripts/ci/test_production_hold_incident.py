@@ -379,6 +379,32 @@ class ReasonTests(unittest.TestCase):
         self.assertEqual(hold.reason({}), "no successful production promotion")
         self.assertEqual(hold.reason({}, disabled=True), hold.AUTO_PROMOTE_DISABLED)
 
+    def test_disabled_hold_requires_guard_or_recheck_application(self):
+        # Automatic runs whose guard/recheck actually applied the disable
+        # carry its skip output; only those classify as disabled holds.
+        for job in ("guard", "recheck"):
+            with self.subTest(job=job):
+                needs = {job: {"outputs": {"skip": hold.AUTO_PROMOTE_DISABLED}}}
+                self.assertTrue(hold.disabled_hold(needs, ""))
+                self.assertTrue(hold.disabled_hold(needs, "true"))
+
+    def test_disabled_hold_does_not_mask_a_manual_failure(self):
+        # A manual dispatch ignores the disable in the guard, so the
+        # reporter's setting must not mask its gate failure as a hold.
+        failed = {"guard": {"result": "success", "outputs": {"auto": "false"}},
+                  "schema-gate": {"result": "failure"}}
+        self.assertFalse(hold.disabled_hold(failed, "true"))
+        self.assertEqual(hold.reason(failed, disabled=hold.disabled_hold(failed, "true")),
+                         "schema-gate not green")
+        timed = {"guard": {"outputs": {"skip": "held until 2999-01-01T00:00:00+00:00"}}}
+        self.assertFalse(hold.disabled_hold(timed, "true"))
+
+    def test_disabled_hold_scheduled_watch_rereads_setting(self):
+        # The scheduled watch has no needs: only it re-reads the variable.
+        self.assertTrue(hold.disabled_hold({}, "true"))
+        self.assertFalse(hold.disabled_hold({}, ""))
+        self.assertFalse(hold.disabled_hold({}, "TRUE"))
+
     def test_auto_promote_disabled_alert_names_the_non_expiring_class(self):
         gh = scenario("2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z")
         needs = {"guard": {"result": "success", "outputs": {"skip": "auto-promote-disabled"}}}

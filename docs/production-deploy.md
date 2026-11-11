@@ -338,14 +338,19 @@ list before falling back to the newest terminal run. Both reporters can reconcil
 recovery from the latest verified deploy generation, including its producing run,
 attempt, mode and completion. A newer rollback can never lend an older deploy
 reporter its recovery cutoff. Both reporters share an issue-only concurrency group,
-separate from deployment locks. Both reporters also re-read
-`PRODUCTION_AUTO_PROMOTE_DISABLED` (exactly `true`, as in the guard/recheck):
-a disabled hold is classified explicitly as `auto-promote-disabled` and named
-in the alert body as an intentional non-expiring disable, winning over any
-timed hold. It still counts as held production — the incident stays open
-until an operator re-enable or a manual deploy-mode promotion recovers it;
-there is no expiry to outlast, and the scheduled watch keeps the explicit
-reason instead of the generic pending fallback while the disable holds.
+separate from deployment locks. A disabled hold is classified explicitly
+as `auto-promote-disabled` and named in the alert body as an intentional
+non-expiring disable, winning over any timed hold. The scheduled watch
+re-reads `PRODUCTION_AUTO_PROMOTE_DISABLED` (exactly `true`, as in the
+guard/recheck) to make that classification; the incident reporter instead
+derives it from the guard/recheck skip outputs, so only an automatic run
+whose guard or recheck actually applied the disable is classified that
+way — a manual dispatch, which ignores the disable, keeps its real gate
+failure visible instead of being masked as an intentional hold. It still
+counts as held production — the incident stays open until an operator
+re-enable or a manual deploy-mode promotion recovers it; there is no
+expiry to outlast, and the scheduled watch keeps the explicit reason
+instead of the generic pending fallback while the disable holds.
 For a read-only evaluation, run the helper with `--dry-run` and the
 same `NEEDS_JSON`, repository, run ID and read-authorized token environment;
 it prints the decision without calling the issue sink. CI's synthetic history

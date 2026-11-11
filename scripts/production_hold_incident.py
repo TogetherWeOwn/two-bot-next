@@ -185,6 +185,22 @@ def auto_disabled(raw):
     return raw == "true"
 
 
+def disabled_hold(needs, raw):
+    """Whether this report is an auto-promote-disabled hold.
+
+    The incident reporter derives it from the guard/recheck skip outputs:
+    only an automatic run whose guard or recheck actually applied the
+    disable carries that skip. A manual dispatch never applies it (the
+    guard ignores it), so re-reading the variable here would mask a
+    manual run's gate failure as an intentional hold. The scheduled
+    watch has no needs of its own, so only it re-reads the variable.
+    """
+    for job in ("guard", "recheck"):
+        if needs.get(job, {}).get("outputs", {}).get("skip") == AUTO_PROMOTE_DISABLED:
+            return True
+    return not needs and auto_disabled(raw)
+
+
 def reason(needs, disabled=False):
     # The non-expiring disable wins over every timed check, exactly as the
     # guard and pre-deploy recheck skip with it before parsing the hold.
@@ -373,7 +389,7 @@ def main():
             raise ValueError()
         history = History(env)
         run_url = f"https://github.com/{history.repo}/actions/runs/{run_id}"
-        disabled = auto_disabled(env.get("AUTO_DISABLED", ""))
+        disabled = disabled_hold(needs, env.get("AUTO_DISABLED", ""))
         report = decide(history, needs, datetime.now(timezone.utc), run_url, disabled=disabled)
         # The scheduled watch has no needs of its own: without the disable
         # it falls back to the active-run lookup, but the explicit
