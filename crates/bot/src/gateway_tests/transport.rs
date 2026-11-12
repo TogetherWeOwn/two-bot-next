@@ -64,3 +64,30 @@ fn rejects_non_loopback_proxy_and_resume_override() {
     )
     .is_err());
 }
+
+/// Assert a shard installed exactly the saved session and URL, or neither.
+fn assert_installed(shard: &Shard, url: &str, installed: bool) {
+    assert_eq!(shard.resume_url(), installed.then_some(url));
+    assert_eq!(
+        shard.session().map(|s| (s.id(), s.sequence())),
+        installed.then_some(("session", 42))
+    );
+}
+
+#[tokio::test]
+async fn public_builders_preserve_valid_discord_session_and_empty_state() {
+    let saved = checkpoint("session", 42, RESUME_URL);
+    for saved in [None, Some(&saved)] {
+        let config = crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), saved);
+        assert_installed(
+            &Shard::with_config(ShardId::ONE, config),
+            RESUME_URL,
+            saved.is_some(),
+        );
+        for bootstrap in [None, Some("ws://127.0.0.1:2345")] {
+            let shard =
+                crate::gateway::build_shard(TOKEN.into(), Intents::empty(), saved, bootstrap);
+            assert_installed(&shard, RESUME_URL, saved.is_some());
+        }
+    }
+}

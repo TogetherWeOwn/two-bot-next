@@ -1,6 +1,7 @@
 //! S5/S6 integration: all effects, including invite baselines and bot flags,
 //! must roll back with a failed checkpoint. Only test-container schemas.
 use super::*;
+use futures_util::FutureExt as _;
 use two_bot_core::gateway_funnel::{ActivityTouch, SnapshotWrite};
 use two_bot_core::{analytics_family::AnalyticsCategory, InviteSnapshotStore, InviteState};
 use two_bot_discord::MessageEligibility;
@@ -20,6 +21,20 @@ fn invite(uses: u64) -> InviteState {
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn snapshot_bot_activity_and_checkpoint_commit_or_roll_back_together() {
     let db = TestDb::new().await;
+    let result =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(25), async {
+            snapshot_case(&db).await;
+            writer_cases(&db, &db.store, RESUME_URL, RESUME_URL).await;
+        }))
+        .catch_unwind()
+        .await;
+    db.close().await;
+    result
+        .expect("transaction assertions")
+        .expect("transaction deadline");
+}
+
+async fn snapshot_case(db: &TestDb) {
     two_bot_store::migrate(&db.pool).await.unwrap();
     two_bot_store::apply_web_contract(&db.pool).await.unwrap();
     db.store
@@ -114,7 +129,6 @@ async fn snapshot_bot_activity_and_checkpoint_commit_or_roll_back_together() {
         DispatchAction::Duplicate
     );
     assert_eq!(db.store.invite_snapshots().await.unwrap()[0].uses, 2);
-    db.close().await;
 }
 
 #[tokio::test]
@@ -190,4 +204,96 @@ async fn persistent_pipeline_hydrates_invites_and_stages_bot_departure_on_restar
     .unwrap();
     assert_eq!(restarted.handlers().store().load(2222)[0].uses, 7);
     db.close().await;
+}
+
+async fn write_case(
+    store: &GatewaySessionStore,
+    saved: &GatewaySession,
+    batch: FunnelBatch,
+    with_job: bool,
+) -> Result<DispatchAction, sqlx::Error> {
+    if !with_job {
+        return store.commit_dispatch(saved, batch).await;
+    }
+    let (action, id) = store
+        .commit_dispatch_with_job(
+            saved,
+            batch,
+            Some(two_bot_cutover::gateway_session::GatewayJob {
+                payload: "{}".into(),
+                occurred_at_ms: saved.updated_at_ms,
+            }),
+        )
+        .await?;
+    assert_eq!(id.is_some(), action == DispatchAction::Apply);
+    if let Some(id) = id {
+        let identity: (String, i64) =
+            sqlx::query_as("SELECT session_id, seq FROM gateway_onboarding_jobs WHERE id=$1")
+                .bind(id)
+                .fetch_one(store.pool())
+                .await?;
+        assert_eq!(identity, (saved.session_id.clone(), saved.sequence as i64));
+    }
+    Ok(action)
+}
+
+async fn writer_cases(db: &TestDb, store: &GatewaySessionStore, url: &str, expected: &str) {
+    for with_job in [false, true] {
+        store.clear().await.unwrap();
+        sqlx::query("DELETE FROM gateway_onboarding_jobs")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let saved = checkpoint("atomic", 1, url);
+        let raw = || async {
+            sqlx::query_as::<_, (String, i64, String, i64)>("SELECT session_id, seq, resume_url, floor(extract(epoch FROM updated_at)*1000)::bigint FROM gateway_sessions").fetch_one(&db.pool).await.unwrap()
+        };
+        let batch = |uses, fail| FunnelBatch {
+            snapshots: vec![SnapshotWrite::StoreAll(2222, vec![invite(uses)])],
+            events: if fail {
+                vec![event(EventType::MemberLeave, "not-a-timestamp")]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        };
+        for (seq, uses, fail, action) in [
+            (1, 3, false, Some(DispatchAction::Apply)),
+            (2, 99, true, None),
+            (1, 99, false, Some(DispatchAction::Duplicate)),
+        ] {
+            let mut dispatch = saved.clone();
+            dispatch.sequence = seq;
+            dispatch.updated_at_ms += i64::from(uses == 99);
+            assert_eq!(
+                write_case(store, &dispatch, batch(uses, fail), with_job)
+                    .await
+                    .ok(),
+                action
+            );
+            assert_eq!(
+                raw().await,
+                ("atomic".into(), 1, expected.into(), saved.updated_at_ms)
+            );
+            assert_eq!(store.invite_snapshots().await.unwrap()[0].uses, 3);
+            let jobs: Vec<(String, i64)> =
+                sqlx::query_as("SELECT session_id, seq FROM gateway_onboarding_jobs")
+                    .fetch_all(&db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                jobs,
+                if with_job {
+                    vec![("atomic".into(), 1)]
+                } else {
+                    vec![]
+                }
+            );
+        }
+        let loaded = load_boot_session(store).await.unwrap();
+        assert_eq!(loaded.is_some(), !expected.is_empty());
+        if let Some(loaded) = loaded {
+            assert!(loaded == saved, "valid fields survive boot unchanged");
+        }
+    }
 }

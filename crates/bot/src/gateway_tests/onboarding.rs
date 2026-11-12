@@ -1374,7 +1374,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
     let db = TestDb::new().await;
     let result = bounded(async {
         db.store
-            .commit_dispatch(&checkpoint(SESSION, 1, "ws://mock"), FunnelBatch::default())
+            .commit_dispatch(&checkpoint(SESSION, 1, RESUME_URL), FunnelBatch::default())
             .await
             .unwrap();
         let mut bad = event(EventType::FirstMessage, "2026-09-29T12:00:00.000Z");
@@ -1382,7 +1382,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
         assert!(db
             .store
             .commit_dispatch_with_job(
-                &checkpoint(SESSION, 2, "ws://mock"),
+                &checkpoint(SESSION, 2, RESUME_URL),
                 FunnelBatch {
                     events: vec![bad],
                     ..Default::default()
@@ -1402,7 +1402,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
         let (action, id) = db
             .store
             .commit_dispatch_with_job(
-                &checkpoint(SESSION, 2, "ws://mock"),
+                &checkpoint(SESSION, 2, RESUME_URL),
                 FunnelBatch {
                     events: vec![event(EventType::FirstMessage, "2026-09-29T12:00:00.000Z")],
                     ..Default::default()
@@ -1436,7 +1436,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
             let result = db
                 .store
                 .commit_dispatch_with_job(
-                    &checkpoint(SESSION, seq, "ws://mock"),
+                    &checkpoint(SESSION, seq, RESUME_URL),
                     FunnelBatch::default(),
                     Some(durable_welcome()),
                 )
@@ -1450,7 +1450,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
             assert_eq!(
                 db.store
                     .commit_dispatch_with_job(
-                        &checkpoint(SESSION, seq, "ws://mock"),
+                        &checkpoint(SESSION, seq, RESUME_URL),
                         FunnelBatch::default(),
                         Some(durable_welcome()),
                     )
@@ -1468,7 +1468,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
         assert!(
             db.store
                 .commit_dispatch_with_job(
-                    &checkpoint(SESSION, 34, "ws://mock"),
+                    &checkpoint(SESSION, 34, RESUME_URL),
                     FunnelBatch {
                         events: vec![event(EventType::SecondMessage, "2026-09-29T12:00:01.000Z")],
                         ..Default::default()
@@ -1491,7 +1491,7 @@ async fn onboarding_gateway_outbox_transaction_rollback_duplicate_and_capacity_3
         let result = db
             .store
             .commit_dispatch_with_job(
-                &checkpoint(SESSION, 34, "ws://mock"),
+                &checkpoint(SESSION, 34, RESUME_URL),
                 FunnelBatch::default(),
                 Some(durable_welcome()),
             )
@@ -1517,7 +1517,7 @@ async fn onboarding_gateway_outbox_recovery_stops_after_three_claims() {
         let (_, id) = db
             .store
             .commit_dispatch_with_job(
-                &checkpoint(SESSION, 1, "ws://mock"),
+                &checkpoint(SESSION, 1, RESUME_URL),
                 FunnelBatch::default(),
                 Some(durable_welcome()),
             )

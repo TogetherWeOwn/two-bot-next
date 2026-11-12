@@ -200,7 +200,7 @@ fn event(kind: EventType, at: &str) -> FunnelEvent {
 async fn gateway_transaction_rolls_back_effects_and_sequence_and_rejects_replay() {
     let db = TestDb::new().await;
     let first = event(EventType::FirstMessage, "2026-09-29T12:00:00.000Z");
-    let saved = checkpoint("mock-session", 42, "ws://mock");
+    let saved = checkpoint("mock-session", 42, RESUME_URL);
     db.store
         .commit_dispatch(
             &saved,
@@ -234,7 +234,7 @@ async fn gateway_transaction_rolls_back_effects_and_sequence_and_rejects_replay(
         Some(EventType::SecondMessage)
     );
     changed_timestamp.occurred_at = "not-a-timestamp".into();
-    let bad = checkpoint("mock-session", 43, "ws://mock");
+    let bad = checkpoint("mock-session", 43, RESUME_URL);
     let batch = FunnelBatch {
         events: vec![
             event(EventType::SecondMessage, "2026-09-29T12:00:02.000Z"),
@@ -257,7 +257,7 @@ async fn gateway_transaction_rolls_back_effects_and_sequence_and_rejects_replay(
     assert_eq!(
         db.store
             .commit_dispatch(
-                &checkpoint("mock-session", 41, "ws://mock"),
+                &checkpoint("mock-session", 41, RESUME_URL),
                 FunnelBatch::default()
             )
             .await
@@ -266,7 +266,7 @@ async fn gateway_transaction_rolls_back_effects_and_sequence_and_rejects_replay(
     );
     db.store
         .commit_dispatch(
-            &checkpoint("new-session", 1, "ws://mock"),
+            &checkpoint("new-session", 1, RESUME_URL),
             FunnelBatch::default(),
         )
         .await
@@ -287,7 +287,7 @@ async fn gateway_transaction_rolls_back_effects_and_sequence_and_rejects_replay(
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn gateway_stale_session_is_cleared_before_boot() {
     let db = TestDb::new().await;
-    let mut saved = checkpoint("expired", 42, "ws://mock");
+    let mut saved = checkpoint("expired", 42, RESUME_URL);
     saved.updated_at_ms -= SESSION_MAX_AGE_MS + 1;
     db.store
         .commit_dispatch(&saved, FunnelBatch::default())
