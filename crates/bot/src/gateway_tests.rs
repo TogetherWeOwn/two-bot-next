@@ -40,6 +40,7 @@ mod persistent;
 mod recovery;
 mod rsvp;
 mod supervised_reconnect;
+mod transport;
 mod voice;
 
 const GUILD: &str = "2222";
@@ -649,11 +650,7 @@ async fn spawn_runner_with_automod_until_shutdown(
     let saved = load_boot_session(&db.store)
         .await
         .expect("load boot session");
-    // Shard::with_config consumes session/resume_url out of Config, so inject
-    // the mock bootstrap URL before construction, using the production factory.
-    let config = crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), saved.as_ref());
-    let builder = ConfigBuilder::from(config).proxy_url(url.to_owned());
-    let shard = Shard::with_config(ShardId::ONE, builder.build());
+    let shard = transport::test_shard(saved.as_ref(), url, None).expect("loopback transport");
     let pipeline = Arc::new(build_pipeline(
         db.store.milestones().await.expect("milestones"),
         None,
