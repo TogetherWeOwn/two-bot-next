@@ -1458,6 +1458,65 @@ pub fn validate_event_key(body: &Map<String, Value>) -> Result<&str, ActionError
     Ok(key)
 }
 
+/// Validated reminder facts. This type does not enable or dispatch the action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReminderSendRequest<'a> {
+    pub discord_id: &'a str,
+    pub event_key: &'a str,
+    pub starts_at: String,
+    pub event_name: &'a str,
+}
+
+impl<'a> ReminderSendRequest<'a> {
+    pub fn validate(body: &'a Map<String, Value>) -> Result<Self, ActionError> {
+        if body.contains_key("body") {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"body\" must not be present; the bot renders its own template",
+                "body_not_allowed",
+            ));
+        }
+        let discord_id = require_snowflake(body, "discord_id")?;
+        if discord_id.starts_with('0') || discord_id.parse::<u64>().is_err() {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"discord_id\" must be a canonical nonzero Discord id",
+                "bad_discord_id",
+            ));
+        }
+        let event_key = require_field_str(body, "event_key")?;
+        if event_key.len() > 64 || !valid_event_key(event_key) {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"event_key\" must be 1-64 characters of [A-Za-z0-9._:-]",
+                "bad_event_key",
+            ));
+        }
+        if require_field_str(body, "kind")? != "starting_soon" {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"kind\" must be \"starting_soon\"",
+                "bad_kind",
+            ));
+        }
+        let starts_at = require_timestamp(body, "starts_at")?;
+        let event_name = require_field_str(body, "event_name")?;
+        if utf16_len(event_name) > 100 {
+            return Err(ActionError::new(
+                ErrorCode::Malformed,
+                "\"event_name\" is longer than 100 characters",
+                "event_name_too_long",
+            ));
+        }
+        Ok(Self {
+            discord_id,
+            event_key,
+            starts_at,
+            event_name,
+        })
+    }
+}
+
 /// Refusal for a well-formed key with no mapping in this guild (legacy
 /// `event_key_unknown`): `action_not_allowed`, before any Discord call.
 #[must_use]
@@ -3328,6 +3387,81 @@ mod tests {
         let refused = unmapped_event_key("ghost:key");
         assert_eq!(refused.code, ErrorCode::ActionNotAllowed);
         assert_eq!(refused.log_reason, "event_key_unknown");
+    }
+
+    #[test]
+    fn reminder_facts_validate_without_enabling_delivery() {
+        let body = map(json!({
+            "discord_id": "18446744073709551615",
+            "event_key": "k".repeat(64),
+            "kind": "starting_soon",
+            "starts_at": "2026-11-04T18:00:00+01:00",
+            "event_name": "😀".repeat(50),
+            "future_field": true,
+        }));
+        let facts = ReminderSendRequest::validate(&body).expect("valid facts");
+        assert_eq!(facts.discord_id, "18446744073709551615");
+        assert_eq!(facts.event_key, "k".repeat(64));
+        assert_eq!(facts.starts_at, "2026-11-04T17:00:00.000Z");
+        assert_eq!(facts.event_name, "😀".repeat(50));
+        for action in ["reminder.send", "place_offer.send"] {
+            assert!(!is_implemented(action));
+            let error = assert_allowed(
+                action,
+                &InternalFlags::from_map(&HashMap::new()),
+                true,
+                true,
+            )
+            .expect_err("notification remains unavailable");
+            assert_eq!(error.code, ErrorCode::ActionNotAllowed);
+        }
+    }
+
+    #[test]
+    fn reminder_facts_refuse_malformed_inputs() {
+        let valid = || {
+            map(json!({
+                "discord_id": "123456789012345678",
+                "event_key": "launch:2026",
+                "kind": "starting_soon",
+                "starts_at": "2026-11-04T18:00:00Z",
+                "event_name": "Launch Night",
+            }))
+        };
+        for (field, value, reason) in [
+            ("discord_id", json!("0123456789012345678"), "bad_discord_id"),
+            (
+                "discord_id",
+                json!("18446744073709551616"),
+                "bad_discord_id",
+            ),
+            ("discord_id", json!(123), "missing_discord_id"),
+            ("event_key", json!("k".repeat(65)), "bad_event_key"),
+            ("event_key", json!("bad/key"), "bad_event_key"),
+            ("event_key", json!(""), "missing_event_key"),
+            ("kind", json!("other"), "bad_kind"),
+            ("kind", json!(null), "missing_kind"),
+            ("starts_at", json!("not a timestamp"), "bad_starts_at"),
+            (
+                "starts_at",
+                json!("9999-12-31T23:30:00-01:00"),
+                "bad_starts_at",
+            ),
+            ("event_name", json!("😀".repeat(51)), "event_name_too_long"),
+            ("event_name", json!(""), "missing_event_name"),
+            ("body", json!(null), "body_not_allowed"),
+        ] {
+            let mut body = valid();
+            body.insert(field.to_owned(), value);
+            let error = ReminderSendRequest::validate(&body).expect_err(reason);
+            assert_eq!(error.code, ErrorCode::Malformed, "{field}");
+            assert_eq!(error.log_reason, reason, "{field}");
+        }
+        for field in ["discord_id", "event_key", "kind", "starts_at", "event_name"] {
+            let mut body = valid();
+            body.remove(field);
+            assert!(ReminderSendRequest::validate(&body).is_err(), "{field}");
+        }
     }
 
     #[test]
