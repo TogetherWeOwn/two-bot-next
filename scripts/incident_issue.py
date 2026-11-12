@@ -188,9 +188,9 @@ def close_incident(env, key, body, quiet_since=None, activity_is_stale=None):
     with serialized writers and durable observation provenance may supply
     `activity_is_stale(issue)` to prove newer activity describes an older failure
     generation. Without that explicit proof the timestamp fence is unchanged.
-    Returns ("closed", lowest closed), ("held", lowest held) when every open
-    issue was held, or ("none-open", None) when no issue is open (for
-    example an agent already closed it): nothing is left to resolve.
+    Returns ("held", lowest held) if any issue was held, even when others
+    were closed; ("closed", lowest closed) if all were closed; or
+    ("none-open", None) when no issue is open.
     """
     if not KEY.fullmatch(key or ""):
         raise IncidentError("refusing: invalid incident key")
@@ -211,7 +211,7 @@ def close_incident(env, key, body, quiet_since=None, activity_is_stale=None):
         _request("PATCH", f"/repos/{repo}/issues/{number}", token,
                  {"state": "closed", "state_reason": "completed"})
         closed.append(number)
-    return ("closed", closed[0]) if closed else ("held", held[0])
+    return ("held", held[0]) if held else ("closed", closed[0])
 
 
 def run_link(env=None):
