@@ -326,13 +326,8 @@ async fn spawn_onboarding_with_store(
         .unwrap(),
     );
     let saved = load_boot_session(store).await.unwrap();
-    let config = crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), saved.as_ref());
-    let shard = Shard::with_config(
-        ShardId::ONE,
-        ConfigBuilder::from(config)
-            .proxy_url(url.to_owned())
-            .build(),
-    );
+    let shard = transport::test_shard(saved.as_ref(), url, None)
+        .expect("onboarding fixture uses a loopback gateway");
     // Both the runtime and cache are newly constructed, not reused at restart.
     let pipeline = Arc::new(build_pipeline(store.milestones().await.unwrap(), None));
     let state = Arc::new(RwLock::new(GatewayState::Armed));

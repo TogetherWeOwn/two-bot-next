@@ -44,6 +44,7 @@ mod transport;
 mod voice;
 
 const GUILD: &str = "2222";
+const RESUME_URL: &str = "wss://gateway.discord.gg";
 const TOKEN: &str = "mock-token";
 
 /// `GatewaySessionStore` serializes every checkpoint on
