@@ -158,6 +158,95 @@ class IncidentIssueTests(unittest.TestCase):
         self.assertEqual(self.run_with(fake, sink.close_incident, KEY, "healthy"), ("none-open", None))
         self.assertEqual(len(fake.calls), 1)
 
+    def test_mixed_recovery_reports_lowest_held_and_keeps_safe_writes(self):
+        from datetime import datetime, timezone
+        passed = datetime(2026, 10, 31, 4, 0, tzinfo=timezone.utc)
+        for safe, held in ((5, 12), (12, 5)):
+            for updated in ("2026-10-31T04:10:00Z", None, "garbage", "2026-10-31T04:10:00"):
+                with self.subTest(safe=safe, held=held, updated=updated):
+                    issues = [{"number": safe, "body": sink.marker(KEY),
+                               "updated_at": "2026-10-31T04:00:00Z"},
+                              {"number": held, "body": sink.marker(KEY)}]
+                    if updated is not None:
+                        issues[1]["updated_at"] = updated
+                    fake = FakeGitHub(issues)
+                    with mock.patch.object(sink, "_request", side_effect=fake):
+                        result = sink.close_incident(ENV, KEY, "healthy", quiet_since=passed)
+                    self.assertEqual(result, ("held", held))
+                    self.assertEqual([call[:2] for call in fake.calls[1:]], [
+                        ("POST", f"/repos/owner/repo/issues/{safe}/comments"),
+                        ("PATCH", f"/repos/owner/repo/issues/{safe}")])
+
+    def test_all_held_reports_lowest_number_without_writes(self):
+        from datetime import datetime, timezone
+        issues = [{"number": n, "body": sink.marker(KEY)} for n in (12, 5)]
+        fake = FakeGitHub(issues)
+        with mock.patch.object(sink, "_request", side_effect=fake):
+            result = sink.close_incident(ENV, KEY, "healthy",
+                                         quiet_since=datetime(2026, 10, 31, tzinfo=timezone.utc))
+        self.assertEqual(result, ("held", 5))
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_stale_callback_invocation_boundaries_and_partial_closure(self):
+        from datetime import datetime, timezone
+        passed = datetime(2026, 10, 31, 4, 0, tzinfo=timezone.utc)
+        issues = [{"number": n, "body": sink.marker(KEY), "updated_at": updated}
+                  for n, updated in ((1, "2026-10-31T03:59:59Z"),
+                                     (2, "2026-10-31T04:00:00Z"),
+                                     (3, "2026-10-31T04:10:00Z"),
+                                     (4, "bad"))]
+        for proof, result, writes in ((False, ("held", 3), [1, 2]),
+                                      (True, ("closed", 1), [1, 2, 3, 4])):
+            with self.subTest(proof=proof):
+                fake = FakeGitHub(issues)
+                guard = mock.Mock(return_value=proof)
+                with mock.patch.object(sink, "_request", side_effect=fake):
+                    self.assertEqual(sink.close_incident(ENV, KEY, "healthy", quiet_since=passed,
+                                                        activity_is_stale=guard), result)
+                self.assertEqual(guard.call_args_list, [mock.call(issues[2]), mock.call(issues[3])])
+                self.assertEqual([call[1] for call in fake.calls if call[0] == "PATCH"],
+                                 [f"/repos/owner/repo/issues/{n}" for n in writes])
+        fake = FakeGitHub(issues)
+        guard = mock.Mock(side_effect=AssertionError("unexpected callback"))
+        with mock.patch.object(sink, "_request", side_effect=fake):
+            self.assertEqual(sink.close_incident(ENV, KEY, "healthy", activity_is_stale=guard),
+                             ("closed", 1))
+        guard.assert_not_called()
+
+    def test_callback_failure_after_safe_close_propagates(self):
+        from datetime import datetime, timezone
+        issues = [{"number": 1, "body": sink.marker(KEY), "updated_at": "2026-10-31T03:00:00Z"},
+                  {"number": 2, "body": sink.marker(KEY), "updated_at": "2026-10-31T05:00:00Z"}]
+        fake = FakeGitHub(issues)
+        guard = mock.Mock(side_effect=sink.IncidentError("unreadable"))
+        with mock.patch.object(sink, "_request", side_effect=fake), self.assertRaisesRegex(
+                sink.IncidentError, "unreadable"):
+            sink.close_incident(ENV, KEY, "healthy", quiet_since=datetime(2026, 10, 31, 4, tzinfo=timezone.utc),
+                                activity_is_stale=guard)
+        guard.assert_called_once_with(issues[1])
+        self.assertEqual([call[:2] for call in fake.calls[1:]], [
+            ("POST", "/repos/owner/repo/issues/1/comments"), ("PATCH", "/repos/owner/repo/issues/1")])
+
+    def test_transport_failure_after_safe_close_propagates(self):
+        issues = [{"number": n, "body": sink.marker(KEY)} for n in (1, 2)]
+        for method in ("POST", "PATCH"):
+            with self.subTest(method=method):
+                fake = FakeGitHub(issues)
+                def request(verb, path, token, body=None):
+                    result = fake(verb, path, token, body)
+                    if verb == method and "/issues/2" in path:
+                        raise sink.IncidentError("transport failed")
+                    return result
+                with mock.patch.object(sink, "_request", side_effect=request), self.assertRaisesRegex(
+                        sink.IncidentError, "transport failed"):
+                    sink.close_incident(ENV, KEY, "healthy")
+                expected = [("POST", "/repos/owner/repo/issues/1/comments"),
+                            ("PATCH", "/repos/owner/repo/issues/1"),
+                            ("POST", "/repos/owner/repo/issues/2/comments")]
+                if method == "PATCH":
+                    expected.append(("PATCH", "/repos/owner/repo/issues/2"))
+                self.assertEqual([call[:2] for call in fake.calls[1:]], expected)
+
     def test_refusals_fail_closed_without_writing(self):
         for open_issues in ({"not": "a list"}, [{"number": "7"}], [{"number": 7, "body": 3}], [{"number": 0}]):
             fake = FakeGitHub(open_issues)

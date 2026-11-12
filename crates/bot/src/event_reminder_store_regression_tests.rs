@@ -5,6 +5,17 @@
 #![cfg(test)]
 
 use super::*;
+use two_bot_core::event_reminder_store::{
+    begin_event_reminder_delivery_with_clock, due_event_reminders_before,
+    has_pending_event_reminders_before, EVENT_REMINDER_LEAD_MS,
+};
+
+async fn required_fixture() -> TestDatabase {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap required");
+    TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))
+        .await
+        .expect("create migrated disposable database")
+}
 
 async fn candidate(pool: &PgPool, guild: &str) -> EventReminder {
     let mut due = due_event_reminders(pool, guild, T0)
@@ -234,6 +245,159 @@ async fn wait_for_advisory_waiters(pool: &PgPool, wanted: i64) {
     })
     .await
     .expect("both reservations reached the contested admission boundary");
+}
+
+#[tokio::test]
+async fn bounded_candidates_and_pending_probe_observe_boundaries_and_fences() {
+    let db = required_fixture().await;
+    let mut early = event(E1, "Early");
+    early.starts_at = format_iso_ms(T0 + 1);
+    let mut cutoff = event(E2, "Cutoff");
+    cutoff.starts_at = format_iso_ms(T0 + 10);
+    let mut beyond = event(E3, "Beyond");
+    beyond.starts_at = format_iso_ms(T0 + EVENT_REMINDER_LEAD_MS + 1);
+    seed_events(db.pool(), GUILD, &[early, cutoff, beyond]).await;
+    for id in [E1, E2, E3] {
+        rsvp(db.pool(), GUILD, id, U1, RsvpStatus::Going).await;
+    }
+    let read = |now, end| due_event_reminders_before(db.pool(), GUILD, now, end);
+    assert!(read(T0, T0).await.expect("start equality").is_empty());
+    let due = read(T0, T0 + 10).await.expect("inclusive cutoff");
+    assert_eq!(
+        due.iter().map(|e| e.event_id.as_str()).collect::<Vec<_>>(),
+        [E1, E2]
+    );
+    let due = read(T0 + 1, u64::MAX).await.expect("lead cap");
+    assert_eq!(
+        due.iter().map(|e| e.event_id.as_str()).collect::<Vec<_>>(),
+        [E2, E3]
+    );
+    let due = read(T0, u64::MAX).await.expect("lead cap excludes beyond");
+    assert_eq!(
+        due.iter().map(|e| e.event_id.as_str()).collect::<Vec<_>>(),
+        [E1, E2]
+    );
+    assert!(begin_event_reminder_delivery(db.pool(), GUILD, &due[0], T0)
+        .await
+        .expect("reserve early event"));
+    assert!(
+        !has_pending_event_reminders_before(db.pool(), GUILD, T0, T0 + 1)
+            .await
+            .expect("fence excludes pending event")
+    );
+    assert!(read(T0, T0 + 1)
+        .await
+        .expect("fence excludes candidate")
+        .is_empty());
+    assert_eq!(
+        audits(db.pool(), GUILD, E1).await,
+        [pending_attempt(GUILD, E1)]
+    );
+    assert!(
+        !begin_event_reminder_delivery_with_clock(db.pool(), GUILD, &due[0], &|| T0)
+            .await
+            .expect("immutable fence rejects duplicate")
+    );
+    assert_eq!(
+        audits(db.pool(), GUILD, E1).await,
+        [pending_attempt(GUILD, E1)]
+    );
+
+    assert!(begin_event_reminder_delivery(db.pool(), GUILD, &due[1], T0)
+        .await
+        .expect("reserve cutoff event"));
+    assert!(read(T0, u64::MAX).await.expect("lead cap").is_empty());
+    assert!(
+        !has_pending_event_reminders_before(db.pool(), GUILD, T0, u64::MAX)
+            .await
+            .expect("pending probe respects lead cap")
+    );
+    assert!(
+        has_pending_event_reminders_before(db.pool(), GUILD, T0 + 1, u64::MAX)
+            .await
+            .expect("event enters lead window")
+    );
+
+    let mut empty = event(E4, "Empty roster");
+    empty.starts_at = format_iso_ms(T0 + 5);
+    seed_events(db.pool(), OTHER_GUILD, &[empty]).await;
+    assert!(
+        has_pending_event_reminders_before(db.pool(), OTHER_GUILD, T0, T0 + 5)
+            .await
+            .expect("empty roster remains pending")
+    );
+    assert!(
+        due_event_reminders_before(db.pool(), OTHER_GUILD, T0, T0 + 5)
+            .await
+            .expect("empty roster is not due")
+            .is_empty()
+    );
+    assert!(
+        !has_pending_event_reminders_before(db.pool(), OTHER_GUILD, T0 + 5, u64::MAX)
+            .await
+            .expect("start equality is not pending")
+    );
+    assert!(
+        !has_pending_event_reminders_before(db.pool(), GUILD, T0, T0)
+            .await
+            .expect("empty interval")
+    );
+    db.close().await.expect("verified teardown");
+}
+
+#[tokio::test]
+async fn clock_is_sampled_after_guild_lock_wait() {
+    let db = required_fixture().await;
+    seed_one(db.pool()).await;
+    let selected = candidate(db.pool(), GUILD).await;
+    let peer = db.independent_pool().await.expect("independent worker");
+    let mut gate = db.pool().begin().await.expect("admission lock transaction");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('event_reminders:' || $1, 0))")
+        .bind(GUILD)
+        .execute(&mut *gate)
+        .await
+        .expect("hold guild lock");
+    let clock = Arc::new(AtomicU64::new(T0));
+    let sampled = Arc::new(AtomicU64::new(0));
+    let worker = tokio::spawn({
+        let pool = peer.clone();
+        let clock = Arc::clone(&clock);
+        let sampled = Arc::clone(&sampled);
+        async move {
+            begin_event_reminder_delivery_with_clock(&pool, GUILD, &selected, &|| {
+                sampled.fetch_add(1, Ordering::SeqCst);
+                clock.load(Ordering::SeqCst)
+            })
+            .await
+        }
+    });
+    wait_for_advisory_waiters(db.pool(), 1).await;
+    assert_eq!(
+        sampled.load(Ordering::SeqCst),
+        0,
+        "clock must not run while locked"
+    );
+    clock.store(START, Ordering::SeqCst);
+    gate.commit().await.expect("release guild lock");
+    assert!(!tokio::time::timeout(Duration::from_secs(10), worker)
+        .await
+        .expect("worker completed")
+        .expect("worker joined")
+        .expect("admission"));
+    assert_eq!(sampled.load(Ordering::SeqCst), 1);
+    assert!(audits(db.pool(), GUILD, E1).await.is_empty());
+    let fresh = candidate(db.pool(), GUILD).await;
+    assert!(
+        begin_event_reminder_delivery_with_clock(db.pool(), GUILD, &fresh, &|| T0)
+            .await
+            .expect("in-window positive control")
+    );
+    assert_eq!(
+        audits(db.pool(), GUILD, E1).await,
+        [pending_attempt(GUILD, E1)]
+    );
+    peer.close().await;
+    db.close().await.expect("verified teardown");
 }
 
 // An INSERT trigger pauses the first reservation after its capacity predicate
