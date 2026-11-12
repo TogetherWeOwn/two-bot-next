@@ -396,11 +396,9 @@ jobs:
         env:
           GITLEAKS_BIN: ${{ runner.temp }}/gitleaks
           EVENT_NAME: ${{ github.event_name }}
-          # base_ref is empty on merge_group; the queue commit's target
-          # branch arrives as merge_group.base_ref (refs/heads/main), which
-          # gitleaks-scan.sh strips to the branch name.
-          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
-        # On pull_request and merge_group the base branch's .gitleaks.toml /
-        # .gitleaksignore apply, so an allowlist is honoured only after it
-        # has merged.
+          # Dispatch validates a PR head, not merged code. Its policy comes
+          # only from main; merge_group supplies a full target ref instead.
+          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref || (github.event_name == 'workflow_dispatch' && 'refs/heads/main') }}
+        # PR, queue and dispatch scans use only merged policy. The wrapper
+        # validates the base ref and pins one commit for both policy files.
         run: bash .github/scripts/gitleaks-scan.sh
