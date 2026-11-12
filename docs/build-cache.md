@@ -155,8 +155,9 @@ external targets. Its success must not clear this gate.** Do not extend candidat
 selection by globbing `/tmp/*target*`, a directory name, or issue terminal status.
 Scratch can contain source/evidence, active runs, shared data or mixed outputs.
 
-Keep the TWO build-admission hold until the Operator records a scratch-coverage
-receipt on the **same rollout card** with:
+Keep the TWO rollout admission restriction until the Operator retains both the
+pre-policy scratch-coverage receipt and post-policy adoption evidence on the
+**same rollout card**. Collect them in this order:
 
 1. Canonical container-to-host mount/writable-layer mapping, measured backing
    filesystem and allocated-byte accounting for these paths and all discovered
@@ -169,21 +170,35 @@ receipt on the **same rollout card** with:
    neither supplies external-path eligibility nor authorizes scratch deletion;
    any proposed external cleanup needs a separately validated exact-path procedure
    within the existing Operator handoff. No generic `/tmp` cleanup is permitted.
-3. Adoption evidence that inherited external Cargo output and cooperative temp
-   output go to the new pool; prove quota inheritance for **target and scratch**.
-   Tiny fake invocations from two isolated workspaces suffice; no full Rust build.
-   Record before/after external-target and writable-layer growth observations.
-   Existing preserved output must be explicitly accounted for within host headroom;
-   unexplained growth or a writer ignoring the wrapper/temp settings leaves this
-   gate unresolved and goes to the Director of Engineering.
+3. Before policy write, provision the empty new pool under rollout step 2 and
+   independently prove quota inheritance for **target and scratch**, including the
+   real path/project/hard-limit query and separate tiny limit/refusal drill described
+   there. Retain external-target and writable-layer allocated-byte baselines;
+   explicitly account for existing preserved output within host headroom. These
+   checks require no real-pool wrapper invocation. Unresolved coverage, headroom
+   or unexplained growth stops rollout; disposable fixture tests alone do not
+   establish actual pool quota or scratch coverage.
+4. After the receipt-bearing policy is written in rollout step 3, collect adoption
+   evidence in step 4 that inherited external Cargo output and cooperative temp
+   output go to **the new pool**. Tiny fake invocations from two isolated workspaces
+   suffice; no full Rust build. Record slot usage, quota enforcement and before/after
+   external-target and writable-layer growth observations. Unexplained growth or a
+   writer ignoring the wrapper/temp settings leaves the gate unresolved and goes
+   to the Director of Engineering. Stop further invocations until resolved; do not
+   release the rollout restriction.
 
-Only after this evidence exists may the Operator set `scratch_coverage_receipt`
-in `policy.json` and release admission. The wrapper **refuses launch** when that
-receipt is absent/blank, even with a quota receipt. Like `quota_receipt`, this is
-an attestation pointer, not code verification of host mappings or receipt contents.
-Until then rollout remains **not deployed/unresolved**; do not fill the field with
-a placeholder. No environment/roster changes, mount/service operations, archive
-pruning or new spend are authorized by this gate.
+Only after items 1–3 are verified and retained may the Operator set
+`scratch_coverage_receipt` in the step-3 `policy.json`. The receipt attests that
+pre-policy coverage, not completed adoption; record item 4 as pending, then append
+its actual results on the same card. This permits only the narrow new-pool wrapper
+allowance, not release of the rollout restriction. Item 4 and every step-5 gate
+must pass before release. The wrapper **refuses launch** when the receipt is
+absent/blank, even with a quota receipt. Like `quota_receipt`, this is an attestation
+pointer, not code verification of host mappings or receipt contents. Rollout remains
+**not deployed/unresolved** until post-policy verification passes; do not fill the
+field with a placeholder or synthetic adoption evidence. No environment/roster
+changes, mount/service operations, archive pruning or new spend are authorized
+by this gate.
 
 Each run also prints a `pool_provisioning_mismatch` JSON finding on stderr when
 `min_available_bytes + slots * slot_budget_bytes` or `hard_limit_bytes` exceeds
@@ -785,14 +800,22 @@ Keep the existing rollout receipts on the same remediation/handoff card.
    Do not trust the container's `/home` reading.
 2. Before scratch checks or pool creation, establish and record the supported
    **bounded TWO-only build-admission restriction**: method, scope, start, expiry
-   and release/undo. Keep it effective through pool provisioning, policy write
+   and release/undo. Record its scope explicitly: refuse direct compiling Cargo
+   commands and builds against the legacy shared cache throughout rollout. Refuse
+   real-pool wrapper builds until the step-3 policy with retained quota and scratch
+   coverage receipts exists; before then, use only disposable offline fixture pools
+   for admission tests. Once that policy exists, admit only repo-wrapper invocations
+   against the new bounded pool, including the step-4 concurrent adoption checks.
+   This narrow allowance does not release the restriction on direct Cargo or legacy
+   builds. Keep the restriction effective through pool provisioning, policy write
    and post-verification in steps 2–4; release it only in step 5. If it expires or
    loses coverage, **stop rollout**; re-establish and verify the supported bounded
    restriction before resuming. Do not extend it indefinitely for review.
-   Resolve and retain the container-scratch coverage evidence above. If mapping,
-   attribution, process visibility or external growth is unresolved, **stop rollout
-   and preserve fail-closed admission refusal**; successful worktree audit alone
-   is insufficient. This rollout restriction is distinct from the legacy-removal
+   Resolve and retain container-scratch mapping and process evidence (items 1–2
+   above). If mapping, attribution, process visibility or external growth is
+   unresolved, **stop rollout and preserve fail-closed admission refusal**;
+   successful worktree audit alone is insufficient. This rollout restriction is
+   distinct from the legacy-removal
    mutation hold. Release temporary **legacy-removal readiness holders** at their
    recorded bound before asynchronous evidence review; that release must not
    release the rollout restriction or stretch a legacy mutation hold across review.
@@ -806,7 +829,12 @@ Keep the existing rollout receipts on the same remediation/handoff card.
    **If this filesystem lacks already-supported quotas, stop this substep and
    route the constraint to the Director of Engineering.** No global remount,
    new disk, package install or unbounded soft-only fallback is authorized here.
-3. After that evidence exists, write the pool policy:
+   Complete pre-policy scratch-coverage item 3 with these quota results and the
+   external-output/headroom baselines. Retain the genuine coverage receipt for
+   items 1–3; item 4 adoption remains explicitly pending until step 4 below.
+3. After the actual quota evidence and pre-policy scratch-coverage items 1–3 exist,
+   write the pool policy using those retained receipt references (post-policy adoption
+   is still pending):
    ```json
    {"version":1,"slots":2,"slot_budget_bytes":6442450944,
     "hard_limit_bytes":17179869184,"min_available_bytes":10737418240,
@@ -819,9 +847,13 @@ Keep the existing rollout receipts on the same remediation/handoff card.
 4. Pin the monitor script at the merged SHA in the existing host monitoring
    mechanism; test both quiet healthy output and a synthetic threshold finding by
    setting the threshold above current available bytes. Register the existing alert
-   route. Adopt the repo wrapper for subsequent TWO builds; no full Rust build is
-   needed for this rollout. Record slot usage, quota enforcement and zero new
-   per-worktree targets for the first concurrent isolated invocations.
+   route. Adopt the repo wrapper for subsequent TWO builds under the step-2 scope,
+   using only the new pool with the step-3 policy in place; no full Rust build is
+   needed for this rollout. Complete scratch-coverage item 4 against the real new
+   pool with tiny fake concurrent invocations from two isolated workspaces. Append
+   slot usage, quota enforcement, zero new per-worktree targets and external-target/
+   writable-layer growth observations to the retained coverage evidence. A failed
+   observation stops further invocations and leaves the release gate unresolved.
 5. Release the rollout admission restriction only after the guard, quota, monitor **and scratch
    coverage** are verified. Attach quota/audit/monitor/adoption/scratch receipts to
    the same Operator card. Admission tests before final policy use disposable
