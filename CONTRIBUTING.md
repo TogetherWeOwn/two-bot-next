@@ -56,6 +56,17 @@ instance UI link, internal host) always fails. On a push to `main` it
 also checks every commit subject. All required checks must be green on the
 exact head commit. Never bypass or weaken a check.
 
+### Complete PR inventories
+
+`pr-lint` requires the paginated PR files inventory to contain exactly the PR's
+reported `changed_files` entry count before expanding old and new rename paths.
+Empty, truncated, malformed or stale inventories fail closed, and every entry
+must carry a valid status; a renamed file must keep its source path. On pull
+requests the trusted base-branch gate checkout must match the inventory's base
+SHA before any gate code runs. GitHub caps this API at 3000 files; a
+legitimately larger PR fails the count check, so split it into independently
+reviewable smaller PRs instead.
+
 ### Production merge evidence
 
 The final-stage reviewer squash-merges the settled, exact reviewed head in the

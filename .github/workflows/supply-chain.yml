@@ -211,35 +211,84 @@ jobs:
               output.write(f"body_file<<{delimiter}\n{body_path}\n{delimiter}\n")
 
           PY
-      # Changed paths feed the T0 attestation floor in pr_standards.py. Read-only:
-      # the PR files API under the job's pull-requests: read grant. Renames emit
-      # both the new and the previous name (deleting or moving a T0 file stays
-      # T0); deletes arrive with status removed and are included like any other
-      # change. An empty or missing list fails the job, so a PR cannot reach
-      # the gate without one. Push and merge_group runs skip this step: a push
-      # carries no PR number (the step would fail every main commit) and the
-      # check step lints the commit subjects instead.
+      # Count file entries before expanding rename paths, and require a
+      # stable PR snapshot. Empty, truncated or inconsistent inventories fail
+      # closed. Push and merge_group have no inventory here and keep their
+      # existing checks.
       - name: List changed files
         if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
         id: changed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: python3 -I {0}
         run: |
-          set -euo pipefail
-          case "${PR_NUMBER}" in
-            ''|*[!0-9]*)
-              echo "Expected a numeric PR number" >&2
-              exit 1
-              ;;
-          esac
-          files_path="${RUNNER_TEMP}/changed-files.txt"
-          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
-            --paginate \
-            -q '.[] | [.filename, .previous_filename] | map(select(. != null and . != "")) | .[]' \
-            > "${files_path}"
-          test -s "${files_path}" || { echo "Changed-file list is empty" >&2; exit 1; }
-          echo "changed_files_file=${files_path}" >> "${GITHUB_OUTPUT}"
+          import json, os, re, subprocess
+          from pathlib import Path
+
+          number = os.environ["PR_NUMBER"]
+          if not re.fullmatch(r"[1-9][0-9]*", number):
+              raise SystemExit("Expected a positive PR number")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          endpoint = f"repos/{repo}/pulls/{number}"
+
+          def snapshot():
+              return json.loads(subprocess.check_output(["gh", "api", endpoint], text=True))
+
+          pr = snapshot()
+          head, base, count = pr["head"]["sha"], pr["base"]["sha"], pr.get("changed_files")
+          if (not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (head, base))
+                  or type(count) is not int or count < 1):
+              raise SystemExit("Missing or invalid PR inventory metadata")
+          if os.environ["EVENT_NAME"] == "workflow_dispatch":
+              if (pr["state"] != "open" or pr["base"]["ref"] != "main"
+                      or pr["head"]["repo"]["full_name"].lower() != repo.lower()
+                      or head != os.environ["GITHUB_SHA"]
+                      or f"refs/heads/{pr['head']['ref']}" != os.environ["GITHUB_REF"]):
+                  raise SystemExit("Dispatch ref/SHA must match an open same-repository PR targeting main")
+          elif head != os.environ["EVENT_HEAD_SHA"] or base != os.environ["EVENT_BASE_SHA"]:
+              raise SystemExit("PR inventory no longer matches this event's head/base SHA")
+          pages = json.loads(subprocess.check_output([
+              "gh", "api", endpoint + "/files?per_page=100", "--paginate", "--slurp",
+          ], text=True))
+          if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+              raise SystemExit("Malformed PR file pages")
+          entries = [entry for page in pages for entry in page]
+          if len(entries) != count:
+              raise SystemExit("Incomplete PR file inventory; split oversized PRs into "
+                               "independently reviewable smaller PRs (see CONTRIBUTING.md)")
+          paths, filenames = [], set()
+          for entry in entries:
+              if (not isinstance(entry, dict) or entry.get("status") not in
+                      ("added", "removed", "modified", "renamed", "copied", "changed", "unchanged")):
+                  raise SystemExit("Missing or invalid PR file status")
+              if entry["status"] == "renamed" and not entry.get("previous_filename"):
+                  raise SystemExit("Renamed PR file is missing its source path")
+              name = entry["filename"]
+              if not isinstance(name, str) or not name or name in filenames:
+                  raise SystemExit("Missing or duplicate PR filename")
+              filenames.add(name)
+              paths.append(name)
+              if entry.get("previous_filename") is not None:
+                  paths.append(entry["previous_filename"])
+
+          # A line-based gate cannot represent embedded line separators.
+          if not paths or any(not isinstance(name, str) or not name or "\0" in name
+                              or name.splitlines() != [name] for name in paths):
+              raise SystemExit("Changed-file paths are empty or not representable")
+          def identity(value):
+              return (value["head"]["sha"], value["base"]["sha"], value.get("changed_files"),
+                      value["head"]["ref"], value["base"]["ref"], value["state"])
+
+          if identity(snapshot()) != identity(pr):
+              raise SystemExit("PR metadata changed while collecting its file inventory; rerun")
+          files_path = Path(os.environ["RUNNER_TEMP"]) / "changed-files.txt"
+          files_path.write_text("\n".join(paths) + "\n", encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"changed_files_file={files_path}\nbase_sha={base}\n")
 
       - name: Check out base-branch gate
         if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
@@ -252,12 +301,32 @@ jobs:
           # Same shape as the gitleaks base-branch policy below: a weakened
           # gate merges first as its own small reviewed PR carrying a T0
           # attestation, and only then judges others. Dispatch runs validate a
-          # PR targeting main, so an empty base SHA falls back to main.
+          # PR targeting main, so an empty base SHA falls back to main. On pull
+          # requests, verify the checked-out commit against the immutable
+          # inventory snapshot before running any gate code.
           ref: ${{ github.event.pull_request.base.sha || 'main' }}
           path: base-gate
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: true
           persist-credentials: false
+
+      - name: Verify base-branch gate snapshot
+        if: github.event_name == 'pull_request'
+        env:
+          EXPECTED_BASE_SHA: ${{ steps.changed.outputs.base_sha }}
+        shell: python3 -I {0}
+        run: |
+          import os, re, subprocess
+
+          expected = os.environ["EXPECTED_BASE_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", expected):
+              raise SystemExit("Missing or invalid inventory base SHA")
+          actual = subprocess.check_output([
+              "git", "-C", os.path.join(os.environ["GITHUB_WORKSPACE"], "base-gate"),
+              "rev-parse", "HEAD",
+          ], text=True).strip()
+          if actual != expected:
+              raise SystemExit("Base-branch gate no longer matches the inventory snapshot; rerun")
 
       - name: Check title, body, branch and commits
         if: github.event_name != 'merge_group'

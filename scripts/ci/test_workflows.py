@@ -5198,6 +5198,13 @@ class WorkflowTests(unittest.TestCase):
                          "github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'")
         self.assertIn("pulls/", listed["run"])
         self.assertIn("previous_filename", listed["run"])
+        self.assertEqual(listed["shell"], "python3 -I {0}")
+        self.assertEqual(listed["env"]["EVENT_HEAD_SHA"], "${{ github.event.pull_request.head.sha }}")
+        self.assertEqual(listed["env"]["EVENT_BASE_SHA"], "${{ github.event.pull_request.base.sha }}")
+        self.assertIn('"--paginate", "--slurp"', listed["run"])
+        self.assertIn('len(entries) != count', listed["run"])
+        self.assertLess(listed["run"].index('len(entries) != count'),
+                        listed["run"].index('entry.get("previous_filename")'))
         check = next(s for s in steps if s.get("name") == "Check title, body, branch and commits")
         self.assertEqual(check["env"]["CHANGED_FILES_FILE"],
                          "${{ steps.changed.outputs.changed_files_file }}")
@@ -5215,6 +5222,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(str(base.get("uses", "")).startswith("actions/checkout@"))
         self.assertEqual(base["with"]["ref"],
                          "${{ github.event.pull_request.base.sha || 'main' }}")
+        verify = next(s for s in steps if s.get("name") == "Verify base-branch gate snapshot")
+        self.assertEqual(verify["if"], "github.event_name == 'pull_request'")
+        self.assertEqual(verify["env"]["EXPECTED_BASE_SHA"], "${{ steps.changed.outputs.base_sha }}")
+        self.assertEqual(verify["shell"], "python3 -I {0}")
+        self.assertIn('if actual != expected:', verify["run"])
+        self.assertLess(steps.index(base), steps.index(verify))
         self.assertEqual(base["with"]["path"], "base-gate")
         self.assertEqual(base["with"]["sparse-checkout"], ".github/scripts")
         self.assertEqual(base["with"]["persist-credentials"], "false")
