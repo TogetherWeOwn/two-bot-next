@@ -674,7 +674,9 @@ impl HyperTransport {
                 .await
                 .is_err()
                 {
-                    tracing::warn!("Discord send admission completion timed out; lane held");
+                    tracing::warn!(
+                        "Discord send admission completion timed out; lane state uncertain"
+                    );
                 }
             }
             return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
