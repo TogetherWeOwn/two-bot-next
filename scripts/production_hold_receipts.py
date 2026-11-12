@@ -3,6 +3,10 @@
 Source: 8ad4550d60210e5022ed1b4a782508d1338936a3,
 scripts/production_hold_incident.py. Not wired to a reporter.
 Unlike the source, verified_content rejects excessive JSON nesting.
+Observation v2 binds metadata and rendered content with an unkeyed digest:
+this detects inconsistent edits, not authorship or coherent rewrites. Legacy,
+unknown and inconsistent observations remain fenced, not reissued or trusted.
+Recovery receipts retain their separate body-only contract. No reporter is wired.
 """
 
 from datetime import datetime, timezone
@@ -29,7 +33,7 @@ def moment(raw):
         value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         if value.tzinfo is not None:
             return value.astimezone(timezone.utc)
-    except (AttributeError, TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError, OverflowError):
         pass
     raise incident_issue.IncidentError("production hold timestamp is unreadable")
 
@@ -54,10 +58,19 @@ def content_digest(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+OBSERVATION_FIELDS = (*GENERATION_FIELDS, "main_sha", "observed_at", "held_since")
+
+
+def observation_digest(content, value):
+    return content_digest(json.dumps([content, value], sort_keys=True, separators=(",", ":")))
+
+
 def observation(report):
-    fields = (*GENERATION_FIELDS, "main_sha", "observed_at", "held_since")
-    value = {key: report[key] for key in fields}
-    value["content_sha256"] = content_digest(body(report))
+    value = {key: report[key] for key in OBSERVATION_FIELDS}
+    value["version"] = 2
+    content = body(report)
+    value["content_sha256"] = content_digest(content)
+    value["envelope_sha256"] = observation_digest(content, value)
     return "<!-- production-hold-observation: " + json.dumps(value, sort_keys=True) + " -->"
 
 
@@ -80,7 +93,24 @@ def verified_content(text, pattern):
         return None
     try:
         value = json.loads(match[1], object_pairs_hook=incident_issue._reject_duplicate_keys)
-        return value if value.get("content_sha256") == content_digest(content[:-1]) else None
+        content = content[:-1]
+        if not isinstance(value, dict) or value.get("content_sha256") != content_digest(content):
+            return None
+        if pattern is OBSERVATION:
+            # Legacy body-only checksums cannot establish metadata consistency.
+            if (set(value) != set(OBSERVATION_FIELDS) | {"version", "content_sha256", "envelope_sha256"}
+                    or type(value["version"]) is not int or value["version"] != 2):
+                return None
+            metadata = {key: val for key, val in value.items() if key != "envelope_sha256"}
+            if value["envelope_sha256"] != observation_digest(content, metadata):
+                return None
+            prefix = (f"- Held since: {value['held_since']}\n"
+                      f"- Last promoted SHA: `{value['last_promoted_sha']}`\n"
+                      f"- Last promotion completed: {value['last_promoted_at']}\n"
+                      f"- Current main SHA: `{value['main_sha']}`\n")
+            if not content.startswith(prefix):
+                return None
+        return value
     except (TypeError, ValueError, RecursionError):
         return None
 
