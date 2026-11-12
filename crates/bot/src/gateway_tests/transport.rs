@@ -22,8 +22,8 @@ pub(super) fn test_shard(
     Ok(Shard::with_config(ShardId::ONE, builder.build()))
 }
 
-#[test]
-fn saved_session_uses_its_resume_url_by_default() {
+#[tokio::test]
+async fn saved_session_uses_its_resume_url_by_default() {
     let saved = checkpoint("session", 42, "ws://127.0.0.1:1234");
     let shard = test_shard(Some(&saved), "ws://127.0.0.1:2345", None).unwrap();
     assert_eq!(shard.resume_url(), Some(saved.resume_url.as_str()));
@@ -32,8 +32,8 @@ fn saved_session_uses_its_resume_url_by_default() {
     assert_eq!(session.sequence(), 42);
 }
 
-#[test]
-fn explicit_resume_override_is_distinct_from_saved_url() {
+#[tokio::test]
+async fn explicit_resume_override_is_distinct_from_saved_url() {
     let saved = checkpoint("session", 42, "ws://127.0.0.1:1234");
     let shard = test_shard(
         Some(&saved),
@@ -45,8 +45,8 @@ fn explicit_resume_override_is_distinct_from_saved_url() {
     assert_eq!(shard.session().unwrap().id(), "session");
 }
 
-#[test]
-fn no_session_has_no_resume_and_cannot_override() {
+#[tokio::test]
+async fn no_session_has_no_resume_and_cannot_override() {
     let shard = test_shard(None, "ws://127.0.0.1:2345", None).unwrap();
     assert!(shard.session().is_none());
     assert!(shard.resume_url().is_none());
