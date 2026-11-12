@@ -277,7 +277,7 @@ class MigrationTests(unittest.TestCase):
         self.assertIn("'origin/main'", step)
         self.assertIn('python3 scripts/check-migrations.py --base-ref "$MIGRATION_BASE"', step)
         self.assertIn("python3 scripts/test-check-migrations.py", step)
-        checkout = workflow.split("steps:", 1)[1].split("- name:", 1)[0]
+        checkout = workflow.split("  check:\n", 1)[1].split("steps:", 1)[1].split("- name:", 1)[0]
         self.assertIn("fetch-depth: 0", checkout)
 
 

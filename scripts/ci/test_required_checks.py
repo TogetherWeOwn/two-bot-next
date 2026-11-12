@@ -201,7 +201,7 @@ class RequiredChecksReportTests(unittest.TestCase):
                          "--security-opt no-new-privileges", "--user 65534:65534",
                          "env -i", "dst=/fixtures,readonly", "test_production_outputs -v"):
             self.assertIn(boundary, run)
-        self.assertIn("scripts/production_outputs.py scripts/test_production_outputs.py", run)
+        self.assertIn("scripts/build_identity.py scripts/production_outputs.py scripts/test_production_outputs.py", run)
         self.assertEqual(run.count("--mount "), 1)
         for result in ("failure", "cancelled", "skipped"):
             self.assertEqual(self.run_aggregator("ci-ok", {"deploy-id-fixtures": result}, selected="false"), 1)
