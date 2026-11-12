@@ -21,46 +21,31 @@ GOOD_ID = f"2026.10.21.3+{SHA7}"
 OTHER_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
-class Harness(unittest.TestCase):
+class DeployIdTests(unittest.TestCase):
     def setUp(self):
         holder = tempfile.TemporaryDirectory()
         self.addCleanup(holder.cleanup)
         self.temp = Path(holder.name).resolve()
         self.out = self.temp / "output"
-        self.summary = self.temp / "summary"
-        environment = patch.dict(os.environ, {}, clear=True)
+        environment = patch.dict(os.environ, {"PATH": "", "RUNNER_TEMP": str(self.temp),
+                                             "GITHUB_OUTPUT": str(self.out),
+                                             "GITHUB_STEP_SUMMARY": str(self.temp / "summary")}, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
-
-    def env(self, **extra):
-        base = {"PATH": os.environ.get("PATH", ""), "RUNNER_TEMP": str(self.temp),
-                "GITHUB_OUTPUT": str(self.out), "GITHUB_STEP_SUMMARY": str(self.summary)}
-        base.update(extra)
-        return base
 
     def output(self):
         return self.out.read_text() if self.out.exists() else ""
 
-
-class DeployIdTests(Harness):
-    def run_main(self, completed=None, raises=None, sha=SHA):
-        if completed is not None and completed.returncode:
-            raises = production_outputs.OutputError("deploy ID producer failed")
-        stub = patch.object(production_outputs, "capture_deploy_id",
-                            side_effect=raises,
-                            return_value=completed.stdout if completed is not None else None)
-        with stub as run, redirect_stderr(io.StringIO()) as err, \
-                patch.dict(os.environ, self.env()):
+    def run_main(self, stdout=None, raises=None, sha=SHA):
+        with patch.object(production_outputs, "capture_deploy_id", side_effect=raises,
+                          return_value=stdout) as run, redirect_stderr(io.StringIO()) as err:
             code = production_outputs.main(["deploy-id", "--sha", sha])
         return code, err.getvalue(), run
-
-    def done(self, stdout, code=0):
-        return subprocess.CompletedProcess([], code, stdout=stdout, stderr=b"")
 
     def test_accepts_with_and_without_newline_and_calls_production(self):
         for stdout in (f"DEPLOY_ID={GOOD_ID}\n".encode(), f"DEPLOY_ID={GOOD_ID}".encode()):
             self.out.write_text("")
-            code, _err, run = self.run_main(self.done(stdout))
+            code, _err, run = self.run_main(stdout)
             self.assertEqual(code, 0)
             self.assertEqual(self.output(), f"deploy_id={GOOD_ID}\n")
         argv = run.call_args.args[0]
@@ -92,14 +77,14 @@ class DeployIdTests(Harness):
         ]
         for stdout in bad:
             with self.subTest(stdout=stdout[:60]):
-                code, err, _run = self.run_main(self.done(stdout))
+                code, err, _run = self.run_main(stdout)
                 self.assertEqual(code, 1)
                 self.assertEqual(self.output(), "")
                 self.assertEqual(err.count("\n"), 1)
                 self.assertNotIn("\x00", err)
 
     def test_failed_or_unavailable_producer_writes_nothing(self):
-        code, _err, _run = self.run_main(self.done(f"DEPLOY_ID={GOOD_ID}\n".encode(), code=1))
+        code, _err, _run = self.run_main(raises=production_outputs.OutputError("deploy ID producer failed"))
         self.assertEqual((code, self.output()), (1, ""))
         code, _err, _run = self.run_main(raises=OSError("boom"))
         self.assertEqual((code, self.output()), (1, ""))
@@ -109,7 +94,7 @@ class DeployIdTests(Harness):
     def test_rejects_bad_sha_without_running_producer(self):
         for sha in ("", "abc", SHA.upper(), SHA + "0", "g" * 40):
             with self.subTest(sha=sha):
-                code, _err, run = self.run_main(self.done(b""), sha=sha)
+                code, _err, run = self.run_main(b"", sha=sha)
                 self.assertEqual(code, 1)
                 run.assert_not_called()
 
@@ -117,7 +102,7 @@ class DeployIdTests(Harness):
         stub = self.temp / "producer.py"
         stub.write_text("raise SystemExit(1)\n")
         with patch.object(production_outputs, "DEPLOY_ID_SCRIPT", stub), \
-                patch.dict(os.environ, self.env()), redirect_stderr(io.StringIO()):
+                redirect_stderr(io.StringIO()):
             self.assertEqual(production_outputs.main(["deploy-id", "--sha", SHA]), 1)
         self.assertEqual(self.output(), "")
 
@@ -151,16 +136,30 @@ class DeployIdTests(Harness):
         waitid.assert_called_once_with(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
         self.assertEqual(calls.mock_calls, [unittest.mock.call.killpg(process.pid, production_outputs.signal.SIGKILL), unittest.mock.call.wait(timeout=1)])
 
+    def test_exit_observed_after_deadline_is_refused(self):
+        process, selector = MagicMock(), MagicMock()
+        process.pid = 12345
+        selector.__enter__.return_value.select.return_value = [True]
+        with patch.object(production_outputs.subprocess, "Popen", return_value=process), \
+                patch.object(production_outputs.selectors, "DefaultSelector", return_value=selector), \
+                patch.object(production_outputs.os, "read", return_value=b""), \
+                patch.object(production_outputs.os, "waitid", return_value=os.waitid_result((12345, 0, 0, 0, os.CLD_EXITED))), \
+                patch.object(production_outputs.os, "killpg"), \
+                patch.object(production_outputs.time, "monotonic", side_effect=[0, 1, 121]), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            production_outputs.capture_deploy_id(["producer"])
+        process.wait.assert_called_once_with(timeout=1)
+        process.stdout.close.assert_called_once_with()
+
     def test_cleanup_timeout_refuses_without_output(self):
-        process = MagicMock()
+        process, selector = MagicMock(), MagicMock()
         process.pid = 12345
         process.wait.side_effect = subprocess.TimeoutExpired("producer", 1)
-        selector = MagicMock()
         selector.__enter__.return_value.select.return_value = []
         with patch.object(production_outputs.subprocess, "Popen", return_value=process), \
                 patch.object(production_outputs.os, "killpg") as killpg, \
                 patch.object(production_outputs.selectors, "DefaultSelector", return_value=selector), \
-                patch.dict(os.environ, self.env()), redirect_stderr(io.StringIO()) as err:
+                redirect_stderr(io.StringIO()) as err:
             code = production_outputs.main(["deploy-id", "--sha", SHA])
         self.assertEqual(code, 1)
         self.assertEqual(self.output(), "")
@@ -170,8 +169,7 @@ class DeployIdTests(Harness):
         process.stdout.close.assert_called_once_with()
 
     def test_timed_out_direct_child_is_reaped(self):
-        popen = subprocess.Popen
-        children = []
+        popen, children = subprocess.Popen, []
 
         def spawn(*args, **kwargs):
             child = popen(*args, **kwargs)
@@ -209,7 +207,7 @@ class DeployIdTests(Harness):
             self.assertFalse(late.exists())
 
     def test_missing_output_path_refuses(self):
-        with patch.dict(os.environ, self.env(GITHUB_OUTPUT="relative")), \
+        with patch.dict(os.environ, {"GITHUB_OUTPUT": "relative"}), \
                 redirect_stderr(io.StringIO()), \
                 patch.object(production_outputs, "capture_deploy_id",
                              return_value=f"DEPLOY_ID={GOOD_ID}\n".encode()):

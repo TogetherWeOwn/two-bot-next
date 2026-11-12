@@ -69,6 +69,8 @@ def capture_deploy_id(argv):
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(argv, DEPLOY_ID_TIMEOUT)
             time.sleep(min(0.01, remaining))
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(argv, DEPLOY_ID_TIMEOUT)
         if result.si_code != os.CLD_EXITED or result.si_status != 0:
             raise OutputError("deploy ID producer failed")
         return bytes(stdout)
