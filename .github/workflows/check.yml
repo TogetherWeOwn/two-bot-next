@@ -109,12 +109,13 @@ jobs:
           fixture_dir="$(mktemp -d)"
           trap 'rm -rf "$fixture_dir"' EXIT
           chmod 755 "$fixture_dir"
-          install -m 644 scripts/build_identity.py scripts/production_outputs.py scripts/test_production_outputs.py "$fixture_dir/"
+          mkdir "$fixture_dir/scripts"
+          install -m 644 scripts/build_identity.py scripts/production_outputs.py scripts/test_production_outputs.py "$fixture_dir/scripts/"
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
             --memory 256m --pids-limit 64 --user 65534:65534 --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m \
             --mount "type=bind,src=$fixture_dir,dst=/fixtures,readonly" --workdir /fixtures \
             deploy-id-fixture-runtime env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
-            python3 -m unittest test_production_outputs -v
+            python3 scripts/test_production_outputs.py -v
 
   check:
     name: check

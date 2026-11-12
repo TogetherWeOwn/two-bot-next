@@ -199,7 +199,7 @@ class RequiredChecksReportTests(unittest.TestCase):
         run = next(step["run"] for step in job["steps"] if "docker run" in step.get("run", ""))
         for boundary in ("--network none", "--read-only", "--cap-drop ALL",
                          "--security-opt no-new-privileges", "--user 65534:65534",
-                         "env -i", "dst=/fixtures,readonly", "test_production_outputs -v"):
+                         "env -i", "dst=/fixtures,readonly", "python3 scripts/test_production_outputs.py -v"):
             self.assertIn(boundary, run)
         self.assertIn("scripts/build_identity.py scripts/production_outputs.py scripts/test_production_outputs.py", run)
         self.assertEqual(run.count("--mount "), 1)
