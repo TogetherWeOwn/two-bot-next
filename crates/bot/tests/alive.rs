@@ -41,6 +41,10 @@ struct TestDb {
 
 impl TestDb {
     async fn new() -> Self {
+        Self::new_with_claim_fault(Self::new_schema_name(), false).await
+    }
+
+    async fn new_with_claim_fault(schema: String, lose_commit_ack: bool) -> Self {
         let options = database_guard::test_options(); // Guard BEFORE any connection.
         let admin = PgPoolOptions::new()
             .max_connections(1)
@@ -48,18 +52,18 @@ impl TestDb {
             .connect_with(options.clone())
             .await
             .expect("disposable database connection");
-        let schema = format!(
-            "alive_test_{}_{}",
-            std::process::id(),
-            two_bot_core::funnel::now_millis_for_test()
-        );
-        assert!(schema
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-            .execute(&admin)
-            .await
-            .expect("isolated schema");
+        let created = Self::claim_schemas(&admin, &schema, lose_commit_ack).await;
+        if !matches!(created, Ok(Ok(()))) {
+            // A failed or timed-out COMMIT has an uncertain outcome. Do not
+            // drop either name without proof that this transaction committed.
+            eprintln!("schema setup failed or was uncertain; retain {schema} and its companion");
+            if matches!(created, Ok(Err(sqlx::Error::Protocol(ref message)))
+                if message == "injected lost commit acknowledgement")
+            {
+                panic!("injected lost commit acknowledgement after schema claim");
+            }
+            panic!("isolated schema creation failed");
+        }
         // sqlx's to_url_lossy does NOT serialize options. Explicitly put the
         // search_path in the URL so the harness migration bootstrap and the
         // child binary both stay inside our schema.
@@ -70,17 +74,45 @@ impl TestDb {
         // The gateway binary is DML-only and never migrates: the harness
         // performs the operator's migration step before spawning the child,
         // exactly like the documented production bootstrap.
-        two_bot_cutover::connect_with_tls(&child_url, 1, false, TlsPolicy::LocalOnly)
-            .await
-            .expect("operator-equivalent migration bootstrap")
-            .close()
-            .await;
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(STEP)
-            .connect(&child_url)
-            .await
-            .expect("schema-scoped observer");
+        // Bootstrap can fail after opening a connection, before returning its
+        // pool. Treat its whole lifetime as uncertain until close completes.
+        let mut migration_close_uncertain = true;
+        let setup = AssertUnwindSafe(async {
+            let migration_pool =
+                two_bot_cutover::connect_with_tls(&child_url, 1, false, TlsPolicy::LocalOnly)
+                    .await
+                    .expect("operator-equivalent migration bootstrap");
+            timeout(STEP, migration_pool.close())
+                .await
+                .expect("migration pool close deadline");
+            migration_close_uncertain = false;
+            PgPoolOptions::new()
+                .max_connections(2)
+                .acquire_timeout(STEP)
+                .connect(&child_url)
+                .await
+                .expect("schema-scoped observer")
+        })
+        .catch_unwind()
+        .await;
+        let pool = match setup {
+            Ok(pool) => pool,
+            Err(panic) => {
+                if migration_close_uncertain {
+                    eprintln!("migration pool did not close; retain {schema} and its companion");
+                    let _ = timeout(STEP, admin.close()).await;
+                    std::panic::resume_unwind(panic);
+                }
+                let cleanup_failed = Self::drop_schemas(&admin, &schema).await;
+                let admin_closed = timeout(STEP, admin.close()).await.is_ok();
+                assert!(!cleanup_failed, "drop schemas after setup failure");
+                assert!(
+                    admin_closed,
+                    "admin pool close deadline after setup failure"
+                );
+                std::panic::resume_unwind(panic);
+            }
+        };
         Self {
             admin,
             pool,
@@ -89,27 +121,85 @@ impl TestDb {
         }
     }
 
+    fn new_schema_name() -> String {
+        static NEXT_SCHEMA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        format!(
+            "alive_test_{}_{}_{}",
+            std::process::id(),
+            two_bot_core::funnel::now_millis_for_test(),
+            NEXT_SCHEMA.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    async fn claim_schemas(
+        admin: &PgPool,
+        schema: &str,
+        lose_commit_ack: bool,
+    ) -> Result<Result<(), sqlx::Error>, tokio::time::error::Elapsed> {
+        assert!(schema
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+        // Claim both names in one transaction; never drop names after an
+        // unsuccessful or uncertain claim.
+        timeout(STEP, async {
+            let mut transaction = admin.begin().await?;
+            for name in [schema, &format!("{schema}_web_v1")] {
+                sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {name}")))
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            transaction.commit().await?;
+            if lose_commit_ack {
+                return Err(sqlx::Error::Protocol(
+                    "injected lost commit acknowledgement".into(),
+                ));
+            }
+            Ok(())
+        })
+        .await
+    }
+
     fn store(&self) -> GatewaySessionStore {
         GatewaySessionStore::new(self.pool.clone(), GUILD.to_owned(), 0)
     }
 
     async fn close(self) {
-        self.pool.close().await;
+        if timeout(STEP, self.pool.close()).await.is_err() {
+            eprintln!(
+                "observer pool did not close; retain {} and its companion",
+                self.schema
+            );
+            let _ = timeout(STEP, self.admin.close()).await;
+            panic!("observer pool close deadline");
+        }
         // Website jobs apply the companion contract schema (`<schema>_web_v1`)
         // on first tick; drop both generated schemas so no companion schema
         // or helper functions leak. Companion may not exist if jobs never fired.
-        for schema in [&self.schema, &format!("{}_web_v1", self.schema)] {
+        let cleanup_failed = Self::drop_schemas(&self.admin, &self.schema).await;
+        let admin_closed = timeout(STEP, self.admin.close()).await.is_ok();
+        assert!(!cleanup_failed, "drop only our generated schemas");
+        assert!(admin_closed, "admin pool close deadline");
+    }
+
+    async fn drop_schemas(admin: &PgPool, schema: &str) -> bool {
+        let mut cleanup_failed = false;
+        for schema in [schema, &format!("{schema}_web_v1")] {
             assert!(schema
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_'));
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DROP SCHEMA IF EXISTS {schema} CASCADE"
-            )))
-            .execute(&self.admin)
-            .await
-            .expect("drop only our generated schemas");
+            let dropped = timeout(
+                STEP,
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DROP SCHEMA IF EXISTS {schema} CASCADE"
+                )))
+                .execute(admin),
+            )
+            .await;
+            if !matches!(dropped, Ok(Ok(_))) {
+                cleanup_failed = true;
+            }
         }
-        self.admin.close().await;
+        cleanup_failed
     }
 }
 
@@ -752,4 +842,121 @@ async fn real_binary_is_alive_and_resumes_after_sigterm() {
         }
     }
     assert!(started.elapsed() < Duration::from_secs(60));
+}
+
+#[test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+fn fixture_schema_collision_preserves_existing_companion() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("fixture runtime");
+    runtime.block_on(async {
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(STEP)
+            .connect_with(database_guard::test_options())
+            .await
+            .expect("disposable database connection");
+        let schema = TestDb::new_schema_name();
+        let companion = format!("{schema}_web_v1");
+        // Only remove this name if this test successfully created it.
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {companion}")))
+            .execute(&admin)
+            .await
+            .expect("create collision sentinel");
+        let setup = AssertUnwindSafe(TestDb::new_with_claim_fault(schema.clone(), false))
+            .catch_unwind()
+            .await;
+        let existing: Vec<String> = sqlx::query_scalar(
+            "SELECT nspname FROM pg_namespace WHERE nspname = $1 OR nspname = $2 ORDER BY nspname",
+        )
+        .bind(&schema)
+        .bind(&companion)
+        .fetch_all(&admin)
+        .await
+        .expect("inspect collision outcome");
+        // This test owns only the empty sentinel; never drop the primary name.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {companion}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("remove collision sentinel");
+        timeout(STEP, admin.close())
+            .await
+            .expect("admin close deadline");
+        let panic = match setup {
+            Err(panic) => panic,
+            Ok(_) => panic!("collision must reject fixture setup"),
+        };
+        assert_eq!(
+            panic.downcast_ref::<&str>().copied(),
+            Some("isolated schema creation failed")
+        );
+        assert_eq!(
+            existing,
+            vec![companion],
+            "claim must roll back the primary and preserve the sentinel"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+fn fixture_lost_commit_ack_retains_both_schemas() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("fixture runtime");
+    runtime.block_on(async {
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(STEP)
+            .connect_with(database_guard::test_options())
+            .await
+            .expect("disposable database connection");
+        let schema = TestDb::new_schema_name();
+        let setup = AssertUnwindSafe(TestDb::new_with_claim_fault(schema.clone(), true))
+            .catch_unwind()
+            .await;
+        // Only this injected panic proves that our transaction committed. Any
+        // other outcome leaves ownership uncertain and must not trigger cleanup.
+        let panic = match setup {
+            Err(panic) => panic,
+            Ok(_) => panic!("injected setup failure did not occur"),
+        };
+        assert_eq!(
+            panic.downcast_ref::<&str>().copied(),
+            Some("injected lost commit acknowledgement after schema claim")
+        );
+        let verifier = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(STEP)
+            .connect_with(database_guard::test_options())
+            .await
+            .expect("independent schema verifier");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_namespace WHERE nspname = $1 OR nspname = $2",
+        )
+        .bind(&schema)
+        .bind(format!("{schema}_web_v1"))
+        .fetch_one(&verifier)
+        .await
+        .expect("inspect uncertain claim");
+        assert_eq!(
+            count, 2,
+            "committed schemas must remain after a lost acknowledgement"
+        );
+        timeout(STEP, verifier.close())
+            .await
+            .expect("verifier close deadline");
+        assert!(
+            !TestDb::drop_schemas(&admin, &schema).await,
+            "remove test-owned schemas"
+        );
+        timeout(STEP, admin.close())
+            .await
+            .expect("admin close deadline");
+    });
 }
