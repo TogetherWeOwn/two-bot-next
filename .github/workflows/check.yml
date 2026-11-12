@@ -2688,7 +2688,7 @@ jobs:
 
       - name: All-feature gateway policy and recovery (CI service only)
         env:
-          TWO_TEST_DATABASE_URL: ${{ env.TWO_GATEWAY_TEST_DATABASE_URL }}
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot --all-features --locked gateway_tests -- --include-ignored --test-threads=1
 
       - name: All-feature binary lifecycle acceptance (CI service only, under 60 s)
