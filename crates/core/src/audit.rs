@@ -173,7 +173,7 @@ pub fn format_audit_event(event: &AuditEvent) -> String {
     if !(event.kind == AuditKind::ModerationAction
         && matches!(
             event.action.as_deref(),
-            Some("member_unban" | "moderation.unban")
+            Some("member_unban" | "moderation.unban" | "moderation.unban_scheduled")
         ))
     {
         fields.push(format!("severity `{}`", event.kind.severity_label()));
@@ -565,7 +565,11 @@ mod tests {
             "AT".into(),
         );
         event.target_id = Some("2".into());
-        for action in ["member_unban", "moderation.unban"] {
+        for action in [
+            "member_unban",
+            "moderation.unban",
+            "moderation.unban_scheduled",
+        ] {
             event.action = Some(action.into());
             let text = format_audit_event(&event);
             assert!(has_audit_event_identity(&text, "unban:1"));
