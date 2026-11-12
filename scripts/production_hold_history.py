@@ -27,7 +27,8 @@ class History:
     def pages(self, path, key=None, **query):
         for page in range(1, MAX_PAGES + 1):
             data = self.get(path, per_page=PAGE_SIZE, page=page, **query)
-            rows = data.get(key) if key and isinstance(data, dict) else data
+            rows = data.get(key) if key is not None and isinstance(data, dict) else (
+                data if key is None else None)
             if not isinstance(rows, list) or len(rows) > PAGE_SIZE or any(
                     not isinstance(row, dict) for row in rows):
                 raise incident_issue.IncidentError("production hold history is malformed")

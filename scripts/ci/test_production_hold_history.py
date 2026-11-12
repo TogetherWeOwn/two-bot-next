@@ -105,6 +105,20 @@ class EvidenceBoundTests(unittest.TestCase):
 
 
 class ReaderContractTests(unittest.TestCase):
+    def test_keyed_pages_reject_bare_lists(self):
+        for payload in ([], [{}]):
+            with self.subTest(payload=payload), \
+                    mock.patch.object(incident_issue, "_request", return_value=payload), \
+                    self.assertRaises(incident_issue.IncidentError):
+                list(hold.History(ENV).pages("x", key="jobs"))
+
+    def test_keyed_pages_traverse_wrapped_lists(self):
+        rows = [{"n": i} for i in range(hold.PAGE_SIZE + 1)]
+        gh = FakeGitHub()
+        gh.routes["x"] = paged(rows, key="jobs")
+        with mock.patch.object(incident_issue, "_request", gh.request):
+            self.assertEqual(list(history(gh).pages("x", key="jobs")), rows)
+
     def test_import_is_inert(self):
         output = io.StringIO()
         with mock.patch.dict(os.environ, {}, clear=True), \
