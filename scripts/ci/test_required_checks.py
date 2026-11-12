@@ -191,6 +191,21 @@ class RequiredChecksReportTests(unittest.TestCase):
                         for name in re.findall(r"fn (configured_database_reports_seeded_family_frontier)\b", body)]
         self.assertEqual(frontier_fns, ["configured_database_reports_seeded_family_frontier"])
 
+    def test_deploy_id_fixtures_are_isolated_and_required(self):
+        jobs = self.workflows["check.yml"]["jobs"]
+        job = jobs["deploy-id-fixtures"]
+        self.assertNotIn("if", job)
+        self.assertIn("deploy-id-fixtures", jobs["ci-ok"]["needs"])
+        run = next(step["run"] for step in job["steps"] if "docker run" in step.get("run", ""))
+        for boundary in ("--network none", "--read-only", "--cap-drop ALL",
+                         "--security-opt no-new-privileges", "--user 65534:65534",
+                         "env -i", "dst=/fixtures,readonly", "test_production_outputs -v"):
+            self.assertIn(boundary, run)
+        self.assertIn("scripts/production_outputs.py scripts/test_production_outputs.py", run)
+        self.assertEqual(run.count("--mount "), 1)
+        for result in ("failure", "cancelled", "skipped"):
+            self.assertEqual(self.run_aggregator("ci-ok", {"deploy-id-fixtures": result}, selected="false"), 1)
+
     def test_nextest_is_required_and_rust_gated(self):
         job = self.workflows["check.yml"]["jobs"]["nextest"]
         self.assertEqual(job.get("name"), "rust nextest")

@@ -87,6 +87,35 @@ jobs:
   # lane is gated by `ci-ok`: a lane missing from its `needs:` and gated list
   # would be a false gate (see scripts/ci/test_required_checks.py).
 
+  deploy-id-fixtures:
+    name: isolated deploy ID fixtures
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run fixtures without checkout, credentials or network
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Build the runtime separately; the test container receives only these two files.
+          docker build -t deploy-id-fixture-runtime - <<'EOF'
+          FROM rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
+          RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*
+          EOF
+          fixture_dir="$(mktemp -d)"
+          trap 'rm -rf "$fixture_dir"' EXIT
+          chmod 755 "$fixture_dir"
+          install -m 644 scripts/production_outputs.py scripts/test_production_outputs.py "$fixture_dir/"
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --memory 256m --pids-limit 64 --user 65534:65534 --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m \
+            --mount "type=bind,src=$fixture_dir,dst=/fixtures,readonly" --workdir /fixtures \
+            deploy-id-fixture-runtime env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
+            python3 -m unittest test_production_outputs -v
+
   check:
     name: check
     permissions:
@@ -3714,7 +3743,7 @@ jobs:
     name: ci-ok
     permissions:
       contents: read
-    needs: [job-inputs, container-inputs, supply-chain, check, rust-tests, coverage-plan, coverage-shard, patch-coverage, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db, fuzz-compile, nextest]
+    needs: [job-inputs, container-inputs, supply-chain, check, deploy-id-fixtures, rust-tests, coverage-plan, coverage-shard, patch-coverage, ignored-db-stores, ignored-db-runtime, worker, parity-docs, self-role-store, community-db, feeds-db, tickets-postgres, moderation-db, fuzz-compile, nextest]
     # A skipped or cancelled dependency must not read as green.
     if: ${{ always() }}
     # Runner routing: see the note on the first job above.
@@ -3731,6 +3760,7 @@ jobs:
           SUPPLY_SELECTED: ${{ needs.job-inputs.outputs.supply }}
           SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}
           CHECK_RESULT: ${{ needs.check.result }}
+          DEPLOY_ID_FIXTURES_RESULT: ${{ needs.deploy-id-fixtures.result }}
           RUST_TESTS_RESULT: ${{ needs.rust-tests.result }}
           COVERAGE_PLAN_RESULT: ${{ needs.coverage-plan.result }}
           COVERAGE_SHARD_RESULT: ${{ needs.coverage-shard.result }}
@@ -3791,6 +3821,7 @@ jobs:
                       continue
                   failures.append(f"{job}: result={result!r} selected={selected(sel_var)}")
               for job, var in (("check", "CHECK_RESULT"),
+                               ("deploy-id-fixtures", "DEPLOY_ID_FIXTURES_RESULT"),
                                ("container-inputs", "CONTAINER_INPUTS_RESULT")):
                   result = os.environ.get(var, "")
                   if result != "success":
