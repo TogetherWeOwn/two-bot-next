@@ -157,12 +157,8 @@ async fn start_runner(
         .await
         .unwrap();
     let saved = load_boot_session(&store).await.unwrap();
-    let shard = crate::gateway::build_shard(
-        TOKEN.into(),
-        Intents::empty(),
-        saved.as_ref(),
-        Some(&peer.url),
-    );
+    let shard = transport::test_shard(saved.as_ref(), &peer.url, None)
+        .expect("retention fixture uses a loopback gateway");
     let pipeline = Arc::new(build_pipeline(store.milestones().await.unwrap(), None));
     let state = Arc::new(RwLock::new(GatewayState::Armed));
     let (stop, rx) = watch::channel(false);

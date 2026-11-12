@@ -40,9 +40,11 @@ mod persistent;
 mod recovery;
 mod rsvp;
 mod supervised_reconnect;
+mod transport;
 mod voice;
 
 const GUILD: &str = "2222";
+const RESUME_URL: &str = "wss://gateway.discord.gg";
 const TOKEN: &str = "mock-token";
 
 /// `GatewaySessionStore` serializes every checkpoint on
@@ -481,6 +483,127 @@ async fn readiness_wait_has_a_bounded_deadline() {
     wait_connected(&RwLock::new(GatewayState::Armed)).await;
 }
 
+/// Non-DB regression: READY must never steer a reconnect to a remote host.
+/// One loopback listener serves IDENTIFY -> READY -> opcode 7, then the RESUME.
+#[tokio::test]
+async fn ready_loopback_endpoint_keeps_reconnect_resume_local() {
+    ensure_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("mock listen");
+    let url = format!("ws://{}", listener.local_addr().expect("address"));
+    let (auth_tx, mut auth) = mpsc::channel::<Value>(4);
+    let (reconnect_tx, reconnect_rx) = tokio::sync::oneshot::channel::<()>();
+    let ready_url = url.clone();
+    let server = tokio::spawn(async move {
+        let mut reconnect_rx = Some(reconnect_rx);
+        for connection in 0..2 {
+            let (stream, _) = listener.accept().await.expect("mock accept");
+            let (_, mut ws) = ServerBuilder::new()
+                .accept(stream)
+                .await
+                .expect("websocket");
+            ws.send(Message::text(
+                json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string(),
+            ))
+            .await
+            .expect("hello");
+            while let Some(Ok(message)) = ws.next().await {
+                if message.is_close() {
+                    break;
+                }
+                if !message.is_text() {
+                    continue;
+                }
+                let packet: Value =
+                    serde_json::from_str(message.as_text().expect("text")).expect("packet");
+                match packet["op"].as_u64() {
+                    Some(1) => ws
+                        .send(Message::text("{\"op\":11,\"d\":null}".to_owned()))
+                        .await
+                        .expect("ack"),
+                    Some(2 | 6) => {
+                        auth_tx.send(packet).await.expect("auth capture");
+                        if connection == 0 {
+                            ws.send(Message::text(
+                                ready(&ready_url, "loopback-session").to_string(),
+                            ))
+                            .await
+                            .expect("ready");
+                            // Hold opcode 7 until the test has checked the endpoint.
+                            reconnect_rx
+                                .take()
+                                .expect("single reconnect gate")
+                                .await
+                                .expect("reconnect gate");
+                            ws.send(Message::text("{\"op\":7,\"d\":null}".to_owned()))
+                                .await
+                                .expect("reconnect");
+                        } else {
+                            ws.send(Message::text(
+                                json!({"op":0,"s":2,"t":"RESUMED","d":{}}).to_string(),
+                            ))
+                            .await
+                            .expect("resumed");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let config = crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), None);
+    let config = ConfigBuilder::from(config).proxy_url(url.clone()).build();
+    let mut shard = Shard::with_config(ShardId::ONE, config);
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut reconnect_tx = Some(reconnect_tx);
+        let mut identified = false;
+        let mut resume = None;
+        let mut resumed = false;
+        loop {
+            tokio::select! {
+                Some(packet) = auth.recv() => {
+                    if !identified {
+                        if packet["op"] != 2 {
+                            return Err("first local authentication was not IDENTIFY");
+                        }
+                        identified = true;
+                    } else {
+                        resume = Some(packet);
+                    }
+                }
+                item = shard.next() => {
+                    let Some(Ok(twilight_gateway::Message::Text(text))) = item else { continue };
+                    if text.contains("\"READY\"") {
+                        // Checked before opcode 7 is released, so a regression
+                        // fails here and never dials a remote host.
+                        if shard.resume_url() != Some(url.as_str()) {
+                            return Err("READY redirected the resume endpoint outside loopback");
+                        }
+                        if let Some(gate) = reconnect_tx.take() {
+                            gate.send(()).expect("release reconnect");
+                        }
+                    }
+                    if text.contains("\"RESUMED\"") {
+                        resumed = true;
+                    }
+                }
+            }
+            if let (true, Some(packet)) = (resumed, resume.as_ref()) {
+                return Ok(packet.clone());
+            }
+        }
+    })
+    .await;
+    server.abort();
+    let _ = server.await;
+    let resume = outcome
+        .expect("local RESUME deadline")
+        .expect("loopback-only reconnect");
+    assert_eq!(resume["op"], 6);
+    assert_eq!(resume["d"]["session_id"], "loopback-session");
+    assert_eq!(resume["d"]["seq"], 1);
+}
+
 async fn spawn_runner(
     db: &TestDb,
     url: &str,
@@ -528,11 +651,7 @@ async fn spawn_runner_with_automod_until_shutdown(
     let saved = load_boot_session(&db.store)
         .await
         .expect("load boot session");
-    // Shard::with_config consumes session/resume_url out of Config, so inject
-    // the mock bootstrap URL before construction, using the production factory.
-    let config = crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), saved.as_ref());
-    let builder = ConfigBuilder::from(config).proxy_url(url.to_owned());
-    let shard = Shard::with_config(ShardId::ONE, builder.build());
+    let shard = transport::test_shard(saved.as_ref(), url, None).expect("loopback transport");
     let pipeline = Arc::new(build_pipeline(
         db.store.milestones().await.expect("milestones"),
         None,
