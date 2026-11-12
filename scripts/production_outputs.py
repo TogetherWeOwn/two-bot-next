@@ -5,6 +5,7 @@ import argparse
 import os
 import re
 import selectors
+import signal
 import subprocess
 import sys
 import time
@@ -47,7 +48,8 @@ def write_output(name, value):
 def capture_deploy_id(argv):
     """Capture a bounded producer record; never retain producer diagnostics."""
     deadline = time.monotonic() + DEPLOY_ID_TIMEOUT
-    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               start_new_session=True)
     try:
         stdout = bytearray()
         with selectors.DefaultSelector() as selector:
@@ -62,16 +64,20 @@ def capture_deploy_id(argv):
                 stdout.extend(chunk)
                 if len(stdout) > MAX_DEPLOY_ID_STDOUT:
                     raise OutputError("deploy ID producer output is not exactly one record")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired(argv, DEPLOY_ID_TIMEOUT)
-        if process.wait(timeout=remaining) != 0:
+        while not (result := os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, DEPLOY_ID_TIMEOUT)
+            time.sleep(min(0.01, remaining))
+        if result.si_code != os.CLD_EXITED or result.si_status != 0:
             raise OutputError("deploy ID producer failed")
         return bytes(stdout)
     finally:
         try:
-            if process.poll() is None:
-                process.kill()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             process.wait(timeout=1)
         finally:
             process.stdout.close()

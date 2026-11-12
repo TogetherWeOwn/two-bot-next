@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -37,21 +38,8 @@ class Harness(unittest.TestCase):
         base.update(extra)
         return base
 
-    def cli(self, *args, **env):
-        return subprocess.run([sys.executable, str(SCRIPT), *args], env=self.env(**env),
-                              capture_output=True, text=True, timeout=60, check=False)
-
     def output(self):
         return self.out.read_text() if self.out.exists() else ""
-
-    def summary_text(self):
-        return self.summary.read_text() if self.summary.exists() else ""
-
-    def refused(self, result):
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(self.output(), "")
-        self.assertTrue(result.stderr.startswith("production_outputs failed: "))
-        self.assertEqual(result.stderr.count("\n"), 1)
 
 
 class DeployIdTests(Harness):
@@ -148,20 +136,36 @@ class DeployIdTests(Harness):
                 self.assertRaises(subprocess.TimeoutExpired):
             production_outputs.capture_deploy_id(command("import time; time.sleep(10)"))
 
+    def test_signal_precedes_reap_on_normal_completion(self):
+        process, selector, calls = MagicMock(), MagicMock(), MagicMock()
+        process.pid = 12345
+        selector.__enter__.return_value.select.return_value = [True]
+        calls.attach_mock(process.wait, "wait")
+        with patch.object(production_outputs.subprocess, "Popen", return_value=process), \
+                patch.object(production_outputs.selectors, "DefaultSelector", return_value=selector), \
+                patch.object(production_outputs.os, "read", return_value=b""), \
+                patch.object(production_outputs.os, "waitid", return_value=os.waitid_result((12345, 0, 0, 0, os.CLD_EXITED))) as waitid, \
+                patch.object(production_outputs.os, "killpg") as killpg:
+            calls.attach_mock(killpg, "killpg")
+            self.assertEqual(production_outputs.capture_deploy_id(["producer"]), b"")
+        waitid.assert_called_once_with(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        self.assertEqual(calls.mock_calls, [unittest.mock.call.killpg(process.pid, production_outputs.signal.SIGKILL), unittest.mock.call.wait(timeout=1)])
+
     def test_cleanup_timeout_refuses_without_output(self):
         process = MagicMock()
-        process.poll.return_value = None
+        process.pid = 12345
         process.wait.side_effect = subprocess.TimeoutExpired("producer", 1)
         selector = MagicMock()
         selector.__enter__.return_value.select.return_value = []
         with patch.object(production_outputs.subprocess, "Popen", return_value=process), \
+                patch.object(production_outputs.os, "killpg") as killpg, \
                 patch.object(production_outputs.selectors, "DefaultSelector", return_value=selector), \
                 patch.dict(os.environ, self.env()), redirect_stderr(io.StringIO()) as err:
             code = production_outputs.main(["deploy-id", "--sha", SHA])
         self.assertEqual(code, 1)
         self.assertEqual(self.output(), "")
         self.assertEqual(err.getvalue(), "production_outputs failed: deploy ID producer unavailable\n")
-        process.kill.assert_called_once_with()
+        killpg.assert_called_once_with(process.pid, production_outputs.signal.SIGKILL)
         process.wait.assert_called_once_with(timeout=1)
         process.stdout.close.assert_called_once_with()
 
@@ -183,6 +187,26 @@ class DeployIdTests(Harness):
         self.assertTrue(children[0].stdout.closed)
         with self.assertRaises(ChildProcessError):
             os.waitpid(children[0].pid, os.WNOHANG)
+
+    def test_timeout_kills_live_descendant_even_after_producer_exits(self):
+        for mode in ("alive", "exited", "overflow"):
+            ready, late = self.temp / f"ready-{mode}", self.temp / f"late-{mode}"
+            child = (f"from pathlib import Path; import time; Path({str(ready)!r}).touch(); "
+                     f"time.sleep(2); Path({str(late)!r}).touch()")
+            parent = ("import subprocess,sys,time; from pathlib import Path; "
+                      f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
+                      f"p=Path({str(ready)!r}); "
+                      "exec('while not p.exists(): time.sleep(0.01)'); "
+                      + {"exited": "sys.exit(0)", "alive": "time.sleep(10)",
+                         "overflow": "sys.stdout.write('x'*10000); sys.stdout.flush(); time.sleep(10)"}[mode])
+            error = production_outputs.OutputError if mode == "overflow" else subprocess.TimeoutExpired
+            with self.subTest(mode=mode), \
+                    patch.object(production_outputs, "DEPLOY_ID_TIMEOUT", 1), \
+                    self.assertRaises(error):
+                production_outputs.capture_deploy_id([sys.executable, "-c", parent])
+            self.assertTrue(ready.exists())
+            time.sleep(2.3)
+            self.assertFalse(late.exists())
 
     def test_missing_output_path_refuses(self):
         with patch.dict(os.environ, self.env(GITHUB_OUTPUT="relative")), \
