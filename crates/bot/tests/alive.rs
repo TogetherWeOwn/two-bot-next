@@ -865,7 +865,9 @@ fn fixture_schema_collision_preserves_existing_companion() {
             .execute(&admin)
             .await
             .expect("create collision sentinel");
-        let claim = TestDb::claim_schemas(&admin, &schema, false).await;
+        let setup = AssertUnwindSafe(TestDb::new_with_claim_fault(schema.clone(), false))
+            .catch_unwind()
+            .await;
         let existing: Vec<String> = sqlx::query_scalar(
             "SELECT nspname FROM pg_namespace WHERE nspname = $1 OR nspname = $2 ORDER BY nspname",
         )
@@ -875,14 +877,23 @@ fn fixture_schema_collision_preserves_existing_companion() {
         .await
         .expect("inspect collision outcome");
         // This test owns only the empty sentinel; never drop the primary name.
-        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {companion}")))
-            .execute(&admin)
-            .await
-            .expect("remove collision sentinel");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {companion}"
+        )))
+        .execute(&admin)
+        .await
+        .expect("remove collision sentinel");
         timeout(STEP, admin.close())
             .await
             .expect("admin close deadline");
-        assert!(matches!(claim, Ok(Err(_))), "collision must reject claim");
+        let panic = match setup {
+            Err(panic) => panic,
+            Ok(_) => panic!("collision must reject fixture setup"),
+        };
+        assert_eq!(
+            panic.downcast_ref::<&str>().copied(),
+            Some("isolated schema creation failed")
+        );
         assert_eq!(
             existing,
             vec![companion],
