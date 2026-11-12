@@ -160,7 +160,8 @@ pub fn has_audit_event_identity(content: &str, entry_id: &str) -> bool {
 /// Stays a plain text line per the kit bot-log grammar (Discord spec §4:
 /// one record per line, no embed); the severity text label from
 /// [`AuditKind::severity_label`] follows the kind so severity is readable
-/// without colour. Metadata arrays truncate: empty renders `none`, long
+/// without colour, except for unban reversals, which have no severity label.
+/// Metadata arrays truncate: empty renders `none`, long
 /// ones keep a fitting prefix plus ` (+N omitted)` (scalar values truncate
 /// to 300 chars). Whole messages over 2000 chars truncate to 1996 + `...`.
 #[must_use]
@@ -168,13 +169,22 @@ pub fn format_audit_event(event: &AuditEvent) -> String {
     let mut fields = vec![
         event.identity(),
         format!("**{}**", event.kind.as_str().replace('_', " ")),
-        format!("severity `{}`", event.kind.severity_label()),
+    ];
+    if !(event.kind == AuditKind::ModerationAction
+        && matches!(
+            event.action.as_deref(),
+            Some("member_unban" | "moderation.unban")
+        ))
+    {
+        fields.push(format!("severity `{}`", event.kind.severity_label()));
+    }
+    fields.extend([
         format!("at {}", event.occurred_at),
         format!(
             "target `{}`",
             event.target_id.as_deref().unwrap_or("unknown")
         ),
-    ];
+    ]);
     if let Some(actor) = event.actor_id.as_deref() {
         fields.push(format!("actor `{actor}`"));
     }
@@ -544,6 +554,37 @@ mod tests {
                 "{kind:?} mirror line carries its severity label"
             );
         }
+    }
+
+    #[test]
+    fn unban_reversals_omit_severity_without_changing_other_actions() {
+        let mut event = AuditEvent::new(
+            "unban:1".into(),
+            AuditKind::ModerationAction,
+            "1".into(),
+            "AT".into(),
+        );
+        event.target_id = Some("2".into());
+        for action in ["member_unban", "moderation.unban"] {
+            event.action = Some(action.into());
+            let text = format_audit_event(&event);
+            assert!(has_audit_event_identity(&text, "unban:1"));
+            assert!(text.contains(&format!("action `{action}`")));
+            assert!(text.contains("target `2`"));
+            assert!(!text.contains("severity `"), "{text}");
+        }
+        for action in [
+            None,
+            Some("member_ban"),
+            Some("moderation.ban"),
+            Some("other"),
+        ] {
+            event.action = action.map(str::to_owned);
+            assert!(format_audit_event(&event).contains("severity `high`"));
+        }
+        event.kind = AuditKind::MemberUpdate;
+        event.action = Some("member_unban".into());
+        assert!(format_audit_event(&event).contains("severity `medium`"));
     }
 
     #[test]
