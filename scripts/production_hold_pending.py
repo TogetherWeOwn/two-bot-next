@@ -189,12 +189,10 @@ def _commit_time(root, commit):
     return datetime.fromtimestamp(int(text), tz=timezone.utc)
 
 
-def pending_since(promoted, main, root=ROOT):
-    """Committer time of the first runtime-affecting commit after promoted.
+def first_pending_sha(promoted, main, root=ROOT):
+    """Return the first runtime-affecting SHA, or None for a validated empty range.
 
-    Returns an aware UTC datetime, or None when every commit after promoted
-    (or none) would be skipped by deploy-staging. A commit with no changed
-    paths is treated as runtime-affecting (conservative).
+    A commit with no changed paths is treated as runtime-affecting (conservative).
     """
     promoted = _require_sha(promoted)
     main = _require_sha(main)
@@ -214,6 +212,12 @@ def pending_since(promoted, main, root=ROOT):
     for commit in _first_parent_chain(root, promoted, main):
         paths = _changed_paths(root, previous, commit)
         if not paths or not all(is_ignored(p) for p in paths):
-            return _commit_time(root, commit)
+            return commit
         previous = commit
     return None
+
+
+def pending_since(promoted, main, root=ROOT):
+    """Return the first pending commit's committer time, or None."""
+    commit = first_pending_sha(promoted, main, root)
+    return _commit_time(root, commit) if commit is not None else None
