@@ -5,6 +5,10 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: configuration-reference-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   configuration-reference:
     # This one-off writer runs only on its own PR, including while it is a draft.
