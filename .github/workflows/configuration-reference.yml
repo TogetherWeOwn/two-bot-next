@@ -1,0 +1,44 @@
+name: configuration reference snapshot
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  regenerate:
+    # This one-off writer is admitted only from the reviewed default branch.
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the fixed source snapshot
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 5e0fb45936f06ea1495b8da2ea77ad3d0e4951b8
+          persist-credentials: false
+      - name: Verify source identity
+        run: test "$(git rev-parse HEAD)" = 5e0fb45936f06ea1495b8da2ea77ad3d0e4951b8
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
+        with:
+          toolchain: "1.99.1"
+      - name: Regenerate reference documents
+        run: |
+          mkdir -p docs/generated
+          cargo test --locked -p two-bot-core --test reference_docs regenerate_reference_docs -- --ignored --exact
+      - name: Record artifact provenance
+        run: |
+          mkdir -p reference-output
+          cp docs/configuration.md reference-output/configuration.md
+          git rev-parse HEAD > reference-output/source-sha.txt
+          sha256sum reference-output/configuration.md > reference-output/sha256.txt
+      - name: Upload configuration reference
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
+        with:
+          name: configuration-reference-5e0fb45936f06ea1495b8da2ea77ad3d0e4951b8
+          path: reference-output/
+          if-no-files-found: error
+          retention-days: 7
