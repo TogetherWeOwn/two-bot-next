@@ -2294,7 +2294,8 @@ jobs:
     if: needs.job-inputs.outputs.rust != 'false'
     # Runner routing: see the note on `check`.
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event_name == 'push' && 60 || 30 }}
+    # The serial gateway suites can exceed 30 minutes on PRs; retain a hard cap.
+    timeout-minutes: 60
     # Keep database isolation inside the job container network namespace:
     # the service resolves as agent-testdb:5432 and loopback is job-private.
     # No database host port is published.
