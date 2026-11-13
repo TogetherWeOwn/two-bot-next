@@ -261,6 +261,10 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_single_core.py' -v
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_ci_postgres_storage.py' -v
 
+      - name: Prove sampled-stop baseline ceilings and corrected repetitions
+        timeout-minutes: 3
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/ci/prove_cargo_cache_sampled_stop.py
+
       - name: Guard channel CI database routing and job isolation
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_channel_ci.py' -v
 
