@@ -335,11 +335,7 @@ impl MockGateway {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("mock listen");
         let url = format!("ws://{}", listener.local_addr().expect("address"));
         let (sender, auth) = mpsc::channel(4);
-        let gateway_url = if invalid_url {
-            format!("{url}/invalid")
-        } else {
-            url.clone()
-        };
+        let gateway_url = format!("{url}{}", if invalid_url { "/invalid" } else { "" });
         let task = tokio::spawn(async move {
             for connection in 0..if invalid { 2 } else { 1 } {
                 let (stream, _) = listener.accept().await.expect("mock accept");

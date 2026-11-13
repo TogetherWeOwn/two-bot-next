@@ -727,6 +727,24 @@ fn assert_settle_window(source: &str) {
     );
 }
 
+fn assert_startup_probe(probes: &str) {
+    let probe_timeout = timeout_step_async_body(probes, "startup probe must use STEP timeout");
+    assert_poll_site(&probe_timeout, "}) {", 10);
+    let probe_loop = loop_body(&probe_timeout, "}) {");
+    assert_direct_loop_statement(
+        &probe_loop,
+        "bot.assert_alive();",
+        "startup probe must check liveness",
+    );
+    assert_timeout_async_result_suffix(
+        probes,
+        r#")
+        .await
+        .expect("positive post-load onboarding failure deadline");"#,
+        "startup probe timeout must fail",
+    );
+}
+
 #[test]
 fn alive_polling_uses_bounded_backoff_under_deadline() {
     assert_alive_step_deadline(ALIVE);
@@ -741,6 +759,9 @@ fn alive_polling_uses_bounded_backoff_under_deadline() {
         "checkpoint must poll inside its STEP deadline",
         10,
     );
+
+    let probes = function_body(ALIVE, "strict_boot_probes");
+    assert_startup_probe(&probes);
 
     let lifecycle = function_body(ALIVE, "lifecycle");
     let events_tick = source_between(
@@ -788,7 +809,7 @@ fn alive_polling_uses_bounded_backoff_under_deadline() {
     assert_settle_window(&settle);
     assert_settle_ungated(&lifecycle);
 
-    assert_sleep_inventory(ALIVE, 4, "alive.rs sleep inventory");
+    assert_sleep_inventory(ALIVE, 5, "alive.rs sleep inventory");
     assert_no_code_contains(
         ALIVE,
         "yield_now",
@@ -895,6 +916,35 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
     })
     .is_err());
 
+    let probes = function_body(ALIVE, "strict_boot_probes");
+    assert_startup_probe(&probes);
+    for (before, after) in [
+        ("sleep(Duration::from_millis(10)).await;", ""),
+        ("from_millis(10)", "from_millis(50)"),
+        (
+            "sleep(Duration::from_millis(10)).await;",
+            "if false { sleep(Duration::from_millis(10)).await; }",
+        ),
+        (
+            "sleep(Duration::from_millis(10)).await;",
+            "continue; sleep(Duration::from_millis(10)).await;",
+        ),
+        ("timeout(STEP, async", "timeout(STEP * 2, async"),
+        ("bot.assert_alive();", ""),
+        ("bot.assert_alive();", "if false { bot.assert_alive(); }"),
+        (
+            ".expect(\"positive post-load onboarding failure deadline\");",
+            ";",
+        ),
+    ] {
+        let mutated = probes.replace(before, after);
+        assert_ne!(mutated, probes, "mutation must apply: {before}");
+        assert!(
+            std::panic::catch_unwind(|| assert_startup_probe(&mutated)).is_err(),
+            "mutation must be rejected: {before}"
+        );
+    }
+
     let lifecycle = function_body(ALIVE, "lifecycle");
     let settle = source_between(&lifecycle, "let settle_until =", "assert_ready_correlation");
     assert_settle_window(&settle);
@@ -969,14 +1019,14 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
 
     // A stray long sleep outside every named poll loop breaks the
     // whole-file inventory even though each named site still passes.
-    assert_sleep_inventory(ALIVE, 4, "alive.rs sleep inventory");
+    assert_sleep_inventory(ALIVE, 5, "alive.rs sleep inventory");
     let stray_long_sleep = ALIVE.replacen(
         "bot.assert_alive();",
         "sleep(Duration::from_secs(5)).await;\n            bot.assert_alive();",
         1,
     );
     assert!(std::panic::catch_unwind(|| {
-        assert_sleep_inventory(&stray_long_sleep, 4, "alive.rs sleep inventory");
+        assert_sleep_inventory(&stray_long_sleep, 5, "alive.rs sleep inventory");
     })
     .is_err());
     let spaced_stray_sleep = ALIVE.replacen(
@@ -985,7 +1035,7 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
         1,
     );
     assert!(std::panic::catch_unwind(|| {
-        assert_sleep_inventory(&spaced_stray_sleep, 4, "alive.rs sleep inventory");
+        assert_sleep_inventory(&spaced_stray_sleep, 5, "alive.rs sleep inventory");
     })
     .is_err());
     let stray_sleep_until = ALIVE.replacen(
@@ -994,7 +1044,7 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
         1,
     );
     assert!(std::panic::catch_unwind(|| {
-        assert_sleep_inventory(&stray_sleep_until, 4, "alive.rs sleep inventory");
+        assert_sleep_inventory(&stray_sleep_until, 5, "alive.rs sleep inventory");
     })
     .is_err());
 }

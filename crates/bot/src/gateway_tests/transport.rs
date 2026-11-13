@@ -81,6 +81,9 @@ fn assert_installed(shard: &Shard, url: &str, installed: bool) {
 
 #[tokio::test]
 async fn strict_and_checked_builders_and_received_fallback() {
+    use crate::gateway::{
+        build_shard, build_shard_config, build_shard_config_with_policy, checkpoint_resume_url,
+    };
     use two_bot_core::gateway_session::{
         boot_action, boot_action_with_policy, BootAction, BootDirective, ResumePolicy,
     };
@@ -119,29 +122,21 @@ async fn strict_and_checked_builders_and_received_fallback() {
                 boot_action_with_policy(Some(&saved), directive, at, policy),
                 resume(ok)
             );
-            let config = crate::gateway::build_shard_config_with_policy(
+            let config = build_shard_config_with_policy(
                 TOKEN.into(),
                 Intents::empty(),
                 Some(&saved),
                 policy,
             );
             assert_installed(&Shard::with_config(ShardId::ONE, config), url, ok);
-            let built = crate::gateway::build_shard(
-                TOKEN.into(),
-                Intents::empty(),
-                Some(&saved),
-                bootstrap,
-            );
+            let built = build_shard(TOKEN.into(), Intents::empty(), Some(&saved), bootstrap);
             assert_installed(&built, url, ok);
-            let config =
-                crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), Some(&saved));
+            let config = build_shard_config(TOKEN.into(), Intents::empty(), Some(&saved));
             assert_installed(&Shard::with_config(ShardId::ONE, config), url, strict_ok);
             let normalized = Some(policy.normalize(url));
-            let fallback = |current, id| {
-                crate::gateway::checkpoint_resume_url(policy, current, Some(&saved), id)
-            };
+            let fallback = |current, id| checkpoint_resume_url(policy, current, Some(&saved), id);
             assert_eq!(
-                crate::gateway::checkpoint_resume_url(policy, Some(url), None, "session"),
+                checkpoint_resume_url(policy, Some(url), None, "session"),
                 normalized
             );
             assert_eq!(fallback(None, "session"), normalized);

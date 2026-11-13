@@ -307,12 +307,11 @@ async fn writer_cases(db: &TestDb, store: &GatewaySessionStore, url: &str, expec
 }
 
 async fn writer_policies(db: &TestDb) {
+    use two_bot_core::gateway_session::ResumePolicy;
     for bootstrap in [None, Some("ws://127.0.0.1:1")] {
         let store = GatewaySessionStore::new(db.pool.clone(), GUILD.into(), 0);
         let store = if bootstrap.is_some() {
-            store.with_resume_policy(two_bot_core::gateway_session::ResumePolicy::for_bootstrap(
-                bootstrap,
-            ))
+            store.with_resume_policy(ResumePolicy::for_bootstrap(bootstrap))
         } else {
             store
         };
