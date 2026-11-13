@@ -2342,7 +2342,7 @@ pub fn build_shard_config_with_policy(
     let mut builder = ConfigBuilder::new(token, intents);
     // Both fields are required to resume the saved session at its proper URL.
     // Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.ConfigBuilder.html#method.session
-    if let Some(session) = session.filter(|saved| !policy.normalize(&saved.resume_url).is_empty()) {
+    if let Some(session) = session.filter(|saved| !policy.normalize(&saved.resume_url).is_empty() || !saved.resume_url.is_empty()) {
         builder = builder
             .session(Session::new(session.sequence, session.session_id.clone()))
             .resume_url(session.resume_url.clone());
