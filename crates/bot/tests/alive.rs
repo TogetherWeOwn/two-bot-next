@@ -706,19 +706,17 @@ async fn strict_boot_probes(db: &TestDb, api: &str, bots: &mut Vec<Bot>, logs: &
             .unwrap();
         bots.push(Bot::spawn(db, addr, None, api, logs));
         let bot = bots.last_mut().unwrap();
-        let status = timeout(STEP, bot.child.wait())
-            .await
-            .expect("post-load failure exit deadline")
-            .unwrap();
-        bot.drain().await;
-        assert!(!status.success(), "invalid onboarding must fail startup");
-        assert!(
-            logs.lock().await.lines().any(|line| {
+        timeout(STEP, async {
+            while !logs.lock().await.lines().any(|line| {
                 line.contains("\"error_class\":\"onboarding_gates_invalid\"")
                     && line.contains("\"failed_step\":\"onboarding_gates\"")
-            }),
-            "positive post-load onboarding failure"
-        );
+            }) {
+                bot.assert_alive();
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("positive post-load onboarding failure deadline");
         assert!(db.store().load().await.unwrap().is_none());
         assert_eq!(raw_url(db).await, None, "boot rejected raw checkpoint");
         assert!(bot.cleanup().await, "probe teardown");
