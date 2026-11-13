@@ -1,8 +1,10 @@
 # Staff-set ticket priority labels with honest queue ordering
 
-Status: **Deferred to 2026-12** (owner decision 2026-11-01). Revisit then, or
-earlier if a host names a need and an M2 slot opens. First pick (B0) for the
-free M2 slot. Original proposal: written 2026-10-26. No runtime, migration,
+Status: **Deferred, undecided** (owner decision 2026-11-10, superseding the
+2026-11-01 "Deferred to 2026-12" deferral and its free-M2-slot early trigger;
+see [ADR 0003](adr/0003-m3-deferred.md)). No build until explicitly
+commissioned; no automatic revisit, December date or early-slot trigger
+remains. Original proposal: written 2026-10-26. No runtime, migration,
 command, queue, message, permission, production action or activation is added.
 This file is the authoritative editable repository spec; the issue document
 records its exact commit/hash and review disposition.

@@ -1,7 +1,9 @@
 # Events: one private add-to-calendar handoff
 
-Status: **Deferred to 2026-12** (owner decision 2026-11-01). Revisit with the
-events-and-RSVP theme; no build until then. Original proposal: written
+Status: **Deferred, undecided** (owner decision 2026-11-10, superseding the
+2026-11-01 "Deferred to 2026-12" deferral; see [ADR 0003](adr/0003-m3-deferred.md)).
+No build until explicitly commissioned; no automatic revisit or December date
+remains. Original proposal: written
 2026-10-24. No commands, components, attachments, storage, migrations,
 endpoints, permissions, sends or runtime tests are added, and no export is
 created. Merge publishes a proposal, not permission to implement or activate it.

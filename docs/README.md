@@ -1,12 +1,13 @@
 # Docs map
 
-Rows: `- [Purpose](relative.md)`. Run `python3 scripts/check_docs_index.py --json`.
-Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
+Run `python3 scripts/check_docs_index.py --json`.
 
 ## References
 
 - [Find a doc](README.md)
 - [Framework](adr/0001-discord-framework.md)
+- [Sequencing](adr/0002-m2-m3-sequencing.md)
+- [Deferred items](adr/0003-m3-deferred.md)
 - [Commands](commands.md)
 - [Settings](configuration.md)
 - [Parity ledger](parity.md)
@@ -19,6 +20,8 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## Operations
 
+- [Handoff](handoff.md)
+- [Current state](plans/current-state-2026-11.md)
 - [Runbook](runbook.md)
 - [Observability](runbook-observability.md)
 - [Metrics](metrics.md)
@@ -46,7 +49,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Incident](production-incident-2026-10-15-postmortem.md)
 - [Audit reads](ops-control.md)
 
-## Storage and internal actions
+## Storage
 
 - [Event store](event-store.md)
 - [Database roles](database-roles.md)
@@ -73,7 +76,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Moderation executor](internal-member-moderation.md)
 - [Bot-site contract](bot-site-contract.md)
 
-## Commands, moderation and community
+## Commands and moderation
 
 - [Publication](command-publish.md)
 - [Restoration](command-restoration.md)
@@ -229,7 +232,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Publish diff](voice/publish-diff-record-template.md)
 - [Music spike](music-voice-node-spike.md)
 
-## Staging acceptance
+## Staging
 
 - [Soak lifecycle](staging-soak.md)
 - [Soak plan](soak-checklist.md)
@@ -255,7 +258,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [REST pacing](pacing-backoff-acceptance.md)
 - [Retention runtime](testing/retention-runtime.md)
 
-## Cutover and watch
+## Cutover
 
 - [Cutover procedure](cutover.md)
 - [Cutover guard](cutover-guard-checklist.md)
@@ -281,7 +284,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 - [Signal dry run](watch-signal-dry-run.md)
 - [Error-budget alerts](error-budget-alerts.md)
 
-## Engineering and security
+## Engineering
 
 - [Quality gates](quality-gates.md)
 - [CI security](ci-security.md)
