@@ -2274,7 +2274,7 @@ async fn onboarding_queue(
     }
 }
 
-fn checkpoint_resume_url<'a>(
+pub(crate) fn checkpoint_resume_url<'a>(
     policy: ResumePolicy,
     current: Option<&'a str>,
     received: Option<&'a GatewaySession>,
@@ -2301,12 +2301,16 @@ pub fn build_shard(
     session: Option<&GatewaySession>,
     gateway_url: Option<&str>,
 ) -> Shard {
-    let config = build_shard_config_with_policy(
-        token,
-        intents,
-        session,
-        ResumePolicy::for_bootstrap(gateway_url),
-    );
+    let config = if gateway_url.is_none() {
+        build_shard_config(token, intents, session)
+    } else {
+        build_shard_config_with_policy(
+            token,
+            intents,
+            session,
+            ResumePolicy::for_bootstrap(gateway_url),
+        )
+    };
     let config = match gateway_url {
         Some(url) if is_loopback_gateway(url) => twilight_gateway::ConfigBuilder::from(config)
             .proxy_url(url.to_owned())
