@@ -366,8 +366,11 @@ impl MemberRuntime {
     }
 
     /// Success reply naming the sanitized target: the verb base first, the
-    /// [`sanitize_target_display`] slot next, and exactly ` Already applied.`
-    /// last on replay.
+    /// [`sanitize_target_display`] slot next, the severity label (absent
+    /// for unbans), and exactly ` Already applied.` last on replay. Stays
+    /// a plain text private reply (kit Discord spec §6 defines no mod-log
+    /// embed pattern; §7 keeps ephemeral moderation copy textual); the
+    /// severity label keeps moderation severity readable without colour.
     pub(crate) fn outcome_text_with_target(result: &MemberResult, target_display: &str) -> String {
         let base = match result.outcome {
             MemberOutcome::Banned => "Banned",
@@ -378,11 +381,30 @@ impl MemberRuntime {
             MemberOutcome::Unbanned => "Unbanned",
         };
         let target = sanitize_target_display(target_display);
-        if result.replayed {
-            format!("{base} {target}. Already applied.")
-        } else {
-            format!("{base} {target}.")
+        // An unban lifts a ban rather than imposing a severity, so it
+        // carries no severity label: `Unbanned dave.` reads as the lift
+        // itself, not as a missing value.
+        match severity_label(result.outcome) {
+            Some(severity) if result.replayed => {
+                format!("{base} {target}. Severity: {severity}. Already applied.")
+            }
+            Some(severity) => format!("{base} {target}. Severity: {severity}."),
+            None if result.replayed => format!("{base} {target}. Already applied."),
+            None => format!("{base} {target}."),
         }
+    }
+}
+
+/// Severity word for one member-moderation outcome (kit Discord spec §1:
+/// the colour bar is decorative; every surface also says its state in
+/// words). Removal from the server is high, exclusion from channels is
+/// medium, a warning is low, and an unban carries no severity word.
+fn severity_label(outcome: MemberOutcome) -> Option<&'static str> {
+    match outcome {
+        MemberOutcome::Banned | MemberOutcome::TemporarilyBanned => Some("high"),
+        MemberOutcome::Kicked | MemberOutcome::TimedOut => Some("medium"),
+        MemberOutcome::Warned => Some("low"),
+        MemberOutcome::Unbanned => None,
     }
 }
 
@@ -1406,7 +1428,7 @@ mod tests {
                 },
                 "dave"
             ),
-            "Banned dave."
+            "Banned dave. Severity: high."
         );
         assert_eq!(
             MemberRuntime::outcome_text_with_target(
@@ -1416,7 +1438,7 @@ mod tests {
                 },
                 "dave"
             ),
-            "Banned dave. Already applied."
+            "Banned dave. Severity: high. Already applied."
         );
     }
 
@@ -1433,7 +1455,7 @@ mod tests {
                 },
                 "dave"
             ),
-            "Temporarily banned dave."
+            "Temporarily banned dave. Severity: high."
         );
         assert_eq!(
             MemberRuntime::outcome_text_with_target(
@@ -1443,7 +1465,7 @@ mod tests {
                 },
                 "dave"
             ),
-            "Temporarily banned dave. Already applied."
+            "Temporarily banned dave. Severity: high. Already applied."
         );
     }
 
@@ -1460,7 +1482,7 @@ mod tests {
                 },
                 "dave"
             ),
-            "Kicked dave."
+            "Kicked dave. Severity: medium."
         );
         assert_eq!(
             MemberRuntime::outcome_text_with_target(
@@ -1470,7 +1492,7 @@ mod tests {
                 },
                 "dave"
             ),
-            "Kicked dave. Already applied."
+            "Kicked dave. Severity: medium. Already applied."
         );
     }
 
@@ -1487,7 +1509,7 @@ mod tests {
                 },
                 "dave"
             ),
-            "Timed out dave."
+            "Timed out dave. Severity: medium."
         );
         assert_eq!(
             MemberRuntime::outcome_text_with_target(
@@ -1497,7 +1519,7 @@ mod tests {
                 },
                 "dave"
             ),
-            "Timed out dave. Already applied."
+            "Timed out dave. Severity: medium. Already applied."
         );
     }
 
@@ -1514,7 +1536,7 @@ mod tests {
                 },
                 "dave"
             ),
-            "Warned dave."
+            "Warned dave. Severity: low."
         );
         assert_eq!(
             MemberRuntime::outcome_text_with_target(
@@ -1524,7 +1546,7 @@ mod tests {
                 },
                 "dave"
             ),
-            "Warned dave. Already applied."
+            "Warned dave. Severity: low. Already applied."
         );
     }
 
@@ -1532,7 +1554,7 @@ mod tests {
     fn unban_success_confirmation_copy_is_pinned() {
         // Same reply layer as `/ban`: `handle_command` renders through
         // `outcome_text_with_target`, so this pins the exact unban success
-        // copy.
+        // copy. An unban lifts a ban and carries no severity label.
         assert_eq!(
             MemberRuntime::outcome_text_with_target(
                 &MemberResult {
@@ -1977,15 +1999,20 @@ mod tests {
     fn replay_suffix_confirmation_copy_is_pinned() {
         // The replay suffix is one uniform arm: every outcome replays by
         // appending exactly ` Already applied.` after its named target.
+        // Unbans carry no severity label; the others keep it before the
+        // suffix.
         let fresh = [
-            (MemberOutcome::Banned, "Banned"),
-            (MemberOutcome::TemporarilyBanned, "Temporarily banned"),
-            (MemberOutcome::Kicked, "Kicked"),
-            (MemberOutcome::TimedOut, "Timed out"),
-            (MemberOutcome::Warned, "Warned"),
-            (MemberOutcome::Unbanned, "Unbanned"),
+            (MemberOutcome::Banned, "Banned", "high"),
+            (
+                MemberOutcome::TemporarilyBanned,
+                "Temporarily banned",
+                "high",
+            ),
+            (MemberOutcome::Kicked, "Kicked", "medium"),
+            (MemberOutcome::TimedOut, "Timed out", "medium"),
+            (MemberOutcome::Warned, "Warned", "low"),
         ];
-        for (outcome, base) in fresh {
+        for (outcome, base, severity) in fresh {
             assert_eq!(
                 MemberRuntime::outcome_text_with_target(
                     &MemberResult {
@@ -1994,9 +2021,19 @@ mod tests {
                     },
                     "dave"
                 ),
-                format!("{base} dave. Already applied.")
+                format!("{base} dave. Severity: {severity}. Already applied.")
             );
         }
+        assert_eq!(
+            MemberRuntime::outcome_text_with_target(
+                &MemberResult {
+                    outcome: MemberOutcome::Unbanned,
+                    replayed: true,
+                },
+                "dave"
+            ),
+            "Unbanned dave. Already applied."
+        );
     }
 }
 

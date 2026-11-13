@@ -48,9 +48,12 @@
 //!    with the same idempotency key but corrected options must succeed with
 //!    exactly one accepted audit (never a denied + accepted pair, never a key
 //!    mismatch).
-//! 4. Valid invocations behave byte-identically to today: same success copy
-//!    (`"Banned 3333."`, `"Temporarily banned 3333."`, `"Kicked 3333."`,
-//!    `"Timed out 3333."`, `"Warned 3333."`), same one mutation (warn: ledger
+//! 4. Valid invocations behave byte-identically to the kit-labelled copy:
+//!    same success copy (`"Banned 3333. Severity: high."`,
+//!    `"Temporarily banned 3333. Severity: high."`,
+//!    `"Kicked 3333. Severity: medium."`,
+//!    `"Timed out 3333. Severity: medium."`,
+//!    `"Warned 3333. Severity: low."`), same one mutation (warn: ledger
 //!    only, no Discord mutation), same one accepted audit, same `done`
 //!    idempotency, same replay (`" Already applied."`, no second mutation, no
 //!    duplicate audit). Hierarchy (`"The target is equal to or above your
@@ -421,11 +424,11 @@ async fn assert_strict_refusal(
 
 fn expected_success(verb: &str) -> &'static str {
     match verb {
-        "ban" => "Banned 3333.",
-        "tempban" => "Temporarily banned 3333.",
-        "kick" => "Kicked 3333.",
-        "timeout" => "Timed out 3333.",
-        "warn" => "Warned 3333.",
+        "ban" => "Banned 3333. Severity: high.",
+        "tempban" => "Temporarily banned 3333. Severity: high.",
+        "kick" => "Kicked 3333. Severity: medium.",
+        "timeout" => "Timed out 3333. Severity: medium.",
+        "warn" => "Warned 3333. Severity: low.",
         _ => unreachable!(),
     }
 }
