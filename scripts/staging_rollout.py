@@ -1026,7 +1026,10 @@ def verify(args, client):
                         )
                         later_rollouts = []
                         if final_image != image and verified_previous_image and not listing_seen_target:
-                            later_rollouts = [mapping(item) for item in rollouts(client, app["id"])
+                            final_rollouts = deadline_aware_read(
+                                client, lambda: rollouts(client, app["id"]), final_app, final, image,
+                                True, verification_started)
+                            later_rollouts = [mapping(item) for item in final_rollouts
                                               if mapping(item).get("id") != pinned["id"]
                                               and timestamp(mapping(item).get("created_at"))
                                               > timestamp(pinned.get("created_at"))]
