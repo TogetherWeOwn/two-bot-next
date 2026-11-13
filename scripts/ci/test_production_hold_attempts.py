@@ -2,7 +2,6 @@
 import importlib
 import io
 import os
-import subprocess
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -17,6 +16,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import incident_issue
 import production_hold_attempts as attempts
 import production_hold_history as reader
+from production_hold_import_probe import assert_inert_import
 from test_production_hold_history import ENV, REPO, FakeGitHub, paged
 
 RUN = "actions/runs/7"
@@ -302,55 +302,11 @@ class AttemptTests(unittest.TestCase):
                 self.assertEqual(self.verify()[0], 1)
 
     def test_fresh_process_import_has_no_side_effects(self):
-        scripts = str(Path(__file__).resolve().parents[1])
-        probe = r"""
-import importlib, os, socket, subprocess, sys
-sys.path.insert(0, sys.argv[1])
-assert all(name not in sys.modules for name in (
-    'production_hold_attempts', 'production_hold_receipts', 'incident_issue'))
-violations = []
-def guard(event, args):
-    mutation = event in {
-        'os.remove', 'os.rename', 'os.mkdir', 'os.rmdir', 'os.chdir',
-        'os.chmod', 'os.chown', 'os.link', 'os.symlink', 'os.truncate',
-        'os.putenv', 'os.unsetenv', 'os.system', 'os.exec', 'os.spawn',
-        'subprocess.Popen',
-    } or event.startswith('socket.')
-    if event == 'open':
-        mode, flags = args[1], args[2]
-        mutation = ((isinstance(mode, str) and any(c in mode for c in 'wax+'))
-                    or (isinstance(flags, int) and bool(flags & (
-                        os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))))
-    if mutation:
-        violations.append(event)
-        raise RuntimeError('blocked side effect')
-sys.addaudithook(guard)
-if sys.argv[2] == 'negative':
-    actions = [lambda: open(os.devnull, 'w'), lambda: socket.socket(),
-               lambda: subprocess.Popen(['unused']), lambda: os.putenv('PROBE', '1')]
-    for action in actions:
-        try:
-            action()
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError('audit guard did not block negative control')
-    assert len(violations) == len(actions), violations
-else:
-    importlib.import_module('production_hold_attempts')
-    assert 'incident_issue' in sys.modules
-    assert 'production_hold_receipts' in sys.modules
-    assert not violations, violations
-"""
-        for mode in ("negative", "import"):
-            with self.subTest(mode=mode):
-                result = subprocess.run(
-                    [sys.executable, "-I", "-B", "-c", probe, scripts, mode],
-                    env={}, capture_output=True, text=True, timeout=10,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout, "")
-                self.assertEqual(result.stderr, "")
+        assert_inert_import(
+            self, 'production_hold_attempts',
+            ['production_hold_attempts', 'production_hold_receipts', 'incident_issue'],
+            ['incident_issue', 'production_hold_receipts'],
+        )
 
 
 original = reader.History.get
