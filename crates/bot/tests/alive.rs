@@ -323,6 +323,7 @@ struct MockDiscord {
     url: String,
     api: String,
     auth: mpsc::Receiver<Value>,
+    handshakes: mpsc::Receiver<()>,
     release: mpsc::Sender<()>,
     rest_requests: Arc<Mutex<Vec<RestRequest>>>,
     connections: Arc<AtomicUsize>,
@@ -345,6 +346,7 @@ impl MockDiscord {
         let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", rest_listener.local_addr().unwrap());
         let (auth_tx, auth) = mpsc::channel(2);
+        let (handshake_tx, handshakes) = mpsc::channel(2);
         let (release, mut gates) = mpsc::channel(4);
         let resume_url = url.clone();
         let connections = Arc::new(AtomicUsize::new(0));
@@ -357,6 +359,7 @@ impl MockDiscord {
                     .accept(stream)
                     .await
                     .expect("mock websocket");
+                handshake_tx.send(()).await.expect("handshake receiver");
                 gates.recv().await.expect("release HELLO");
                 ws.send(Message::text(
                     json!({"op":10,"d":{"heartbeat_interval":45000}}).to_string(),
@@ -418,6 +421,7 @@ impl MockDiscord {
             url,
             api,
             auth,
+            handshakes,
             release,
             rest_requests,
             connections,
@@ -1075,7 +1079,7 @@ fn fixture_lost_commit_ack_retains_both_schemas() {
 async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outcome() {
     for outcome in 0..4 {
         let db = TestDb::new().await;
-        let discord = MockDiscord::new().await;
+        let mut discord = MockDiscord::new().await;
         let addr = TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap()
@@ -1091,6 +1095,9 @@ async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outc
         let mut bot = Bot::spawn(&db, addr, &discord.url, &discord.api, &logs);
         let exercised = AssertUnwindSafe(timeout(STEP, async {
             wait_http(&mut bot, addr, "/healthz", 200).await;
+            // Health precedes gateway initialization. Finish the upgrade before
+            // intentionally killing the child, but keep HELLO gated.
+            discord.handshakes.recv().await.expect("mock handshake");
             match outcome {
                 1 => panic!("injected fixture assertion"),
                 2 => std::future::pending::<()>().await,
