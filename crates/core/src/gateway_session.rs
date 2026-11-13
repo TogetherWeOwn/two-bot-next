@@ -105,7 +105,7 @@ fn boot_action_for(
     };
     let age = now_ms.checked_sub(saved.updated_at_ms);
     if saved.session_id.is_empty()
-        || policy.normalize(&saved.resume_url).is_empty()
+        || (policy.normalize(&saved.resume_url).is_empty() && saved.resume_url.is_empty())
         || !matches!(age, Some(0..=SESSION_MAX_AGE_MS))
     {
         BootAction::DiscardAndIdentify
