@@ -3565,6 +3565,38 @@ mod tests {
     }
 
     #[test]
+    fn released_v16_inventory_keeps_instance_windows_mandatory() {
+        // Freeze the released prefix instead of using the current inventory:
+        // later formats may append tables without changing a v16 archive.
+        let tables: Vec<Value> = complete_tables(&BTreeMap::new())
+            .into_iter()
+            .take(108)
+            .collect();
+        assert_eq!(tables.len(), 108);
+        assert_eq!(tables[107]["name"], "event_instance_windows");
+        let mut released = manifest(tables);
+        released["version"] = serde_json::json!(16);
+        let end = serde_json::json!({"kind": "end", "rows": 0});
+        let contents = inspect_bytes(&gzip_lines(&[released.clone(), end.clone()]))
+            .expect("released v16 inventory remains readable");
+        assert_eq!(contents.manifest.version, 16);
+        assert!(contents
+            .manifest
+            .tables
+            .iter()
+            .any(|table| table.name == "event_instance_windows"));
+
+        released["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|table| table["name"] != "event_instance_windows");
+        let error = inspect_bytes(&gzip_lines(&[released, end]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("event_instance_windows"), "{error}");
+    }
+
+    #[test]
     fn v15_archives_read_without_event_instance_windows_but_v16_requires_them() {
         assert_eq!(DUMP_VERSION, 16, "new dumps require the instance windows");
         assert_eq!(V16_ADDED_TABLES.to_vec(), ["event_instance_windows"]);
