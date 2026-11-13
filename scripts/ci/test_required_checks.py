@@ -154,6 +154,10 @@ class RequiredChecksReportTests(unittest.TestCase):
         self.assertIn("fuzz-compile", agg["needs"])
         self.assertIn("FUZZ_COMPILE_RESULT", "\n".join(step.get("run", "") for step in agg["steps"]))
 
+    def test_ignored_db_runtime_has_bounded_time_for_serial_suites(self):
+        job = self.workflows["check.yml"]["jobs"]["ignored-db-runtime"]
+        self.assertEqual(str(job.get("timeout-minutes")), "60")
+
     def test_ignored_db_runtime_routes_claimed_ignored_tests(self):
         # These two filters are the only required-lane coverage for eleven
         # ignored tests. Cargo exits 0 when a filter matches nothing, so pin
