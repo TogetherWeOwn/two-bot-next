@@ -394,10 +394,11 @@ jobs:
       - name: Install Rust toolchain
         id: toolchain
         if: needs.job-inputs.outputs.rust != 'false'
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
-          components: rustfmt, clippy
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: rustfmt, clippy
+        run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
 
@@ -718,10 +719,11 @@ jobs:
 
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
-          components: rustfmt, clippy
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: rustfmt, clippy
+        run: bash .github/scripts/install-rust-toolchain.sh
         # The installer retries only checksum-rotation failures, so a
         # transient download failure (`Network is unreachable` syncing the
         # channel manifest, as on main 2026-10-13) fails the job before any
@@ -1006,9 +1008,11 @@ jobs:
 
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: ''
+        run: bash .github/scripts/install-rust-toolchain.sh
         # The installer retries only checksum-rotation failures, so a
         # transient download failure fails the job before planning runs.
         # Continue so the next step can retry the same pin; it fails closed below.
@@ -1234,10 +1238,11 @@ jobs:
 
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
-          components: rustfmt, clippy
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: rustfmt, clippy
+        run: bash .github/scripts/install-rust-toolchain.sh
         # The installer retries only checksum-rotation failures, so a
         # transient download failure (`Network is unreachable` syncing the
         # channel manifest, as on main 2026-10-13) fails the job before any
@@ -1944,10 +1949,11 @@ jobs:
 
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
-          components: rustfmt, clippy
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: rustfmt, clippy
+        run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
 
@@ -2419,10 +2425,11 @@ jobs:
 
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
-          components: rustfmt, clippy
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: rustfmt, clippy
+        run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
 
@@ -2761,11 +2768,12 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         if: needs.job-inputs.outputs.rust != 'false'
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
-          components: clippy
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: clippy
+        run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
 
@@ -2861,9 +2869,11 @@ jobs:
           fetch-depth: 1
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: ''
+        run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
 
@@ -3145,10 +3155,11 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
-          components: clippy
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: clippy
+        run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
 
@@ -3232,10 +3243,11 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
-          components: clippy
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: clippy
+        run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
 
@@ -3302,9 +3314,11 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: ''
+        run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
 
@@ -3388,10 +3402,12 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
-        with:
-          toolchain: "nightly-2026-10-01" # Pinned nightly for libFuzzer; stable pin stays in rust-toolchain.toml.
-          components: rust-src
+      - name: Install Rust toolchain
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "nightly-2026-10-01" # Pinned nightly for libFuzzer; stable pin stays in rust-toolchain.toml.
+          RUST_COMPONENTS: rust-src
+        run: bash .github/scripts/install-rust-toolchain.sh
       # Per-job dependency cache: the key includes the job id (no
       # shared-key), so this job keeps its own entry; saved on pushes only.
       - name: Restore cargo cache

@@ -540,3 +540,20 @@ python3 scripts/test-deploy-production.py
 python3 -m unittest discover -s scripts -p 'test_channel_ci.py' -v
 python3 -m unittest discover -s scripts -p 'test_staging_ownership_status.py' -v
 ```
+
+## Native Rust setup
+
+Rust setup in `check.yml` executes `.github/scripts/install-rust-toolchain.sh`
+with an exact `RUST_TOOLCHAIN` and explicit `RUST_COMPONENTS`. Other workflows
+retain their pinned Rust setup action. Stable lanes match `rust-toolchain.toml`;
+the libFuzzer lanes retain `nightly-2026-10-01` and `rust-src`. Native setup
+installs the minimal profile without self-update, selects the same default, and
+verifies the explicit toolchain. Existing fail-closed retry steps and their
+conditions remain. No migrated lane requested extra targets or a directory
+override, or consumed the former action's outputs. The Cargo incremental/color
+defaults are preserved.
+
+Hosted Ubuntu and the pinned Rust job containers must supply `rustup`, `cargo`
+and `rustc` on PATH. Missing tools fail explicitly; setup never runs a downloaded
+bootstrap or silently uses the image's moving default. Offline shim tests prove
+argument boundaries and failures, not hosted tool availability or compilation.

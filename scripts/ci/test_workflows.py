@@ -9757,12 +9757,41 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
+    NATIVE_RUST_INSTALLER_RUN = "bash .github/scripts/install-rust-toolchain.sh"
+    # Only check.yml has migrated to the native installer; the other
+    # workflows keep the dtolnay action until their own migrations land.
+    NATIVE_RUST_WORKFLOWS = ("check.yml",)
+
+    def rust_installer(self, workflow_name, step):
+        """Return {"toolchain", "components"} for an installer step, else None.
+
+        check.yml must use the native installer (bash step, pin and components
+        in env); a leftover action step fails here rather than being skipped
+        by the enumeration. Other workflows still use the action
+        (with.toolchain / with.components).
+        """
+        is_action = str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")
+        if workflow_name in self.NATIVE_RUST_WORKFLOWS:
+            self.assertFalse(is_action, "dtolnay/rust-toolchain action must not return")
+            if str(step.get("run", "")).strip() != self.NATIVE_RUST_INSTALLER_RUN:
+                return None
+            self.assertEqual(step.get("shell"), "bash", "native installer must run under bash")
+            self.assertIsInstance(step.get("env", {}).get("RUST_TOOLCHAIN"), str)
+            self.assertIsInstance(step["env"].get("RUST_COMPONENTS"), str)
+            self.assertNotIn("with", step)
+            return {"toolchain": step["env"]["RUST_TOOLCHAIN"],
+                    "components": step["env"]["RUST_COMPONENTS"]}
+        if not is_action:
+            return None
+        with_ = step.get("with") or {}
+        return {"toolchain": with_.get("toolchain"), "components": with_.get("components", "")}
+
     def test_check_toolchains_match_the_repository_pin(self):
         channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
         self.assertRegex(channel, r"^\d+\.\d+\.\d+$")
         installers = {
             job_id: [step for step in job.get("steps", [])
-                     if step.get("uses", "").startswith("dtolnay/rust-toolchain@")]
+                     if self.rust_installer("check.yml", step)]
             for job_id, job in self.workflows["check.yml"]["jobs"].items()
         }
         installers = {job: steps for job, steps in installers.items() if steps}
@@ -9777,14 +9806,14 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(len(steps), 1)
                 if job_id == "fuzz-compile":
                     # libFuzzer needs nightly; pinned date, not floating stable.
-                    self.assertEqual(steps[0].get("with", {}).get("toolchain"), "nightly-2026-10-01")
-                    self.assertEqual(set(steps[0]["with"]["components"].replace(" ", "").split(",")),
+                    self.assertEqual(steps[0]["env"]["RUST_TOOLCHAIN"], "nightly-2026-10-01")
+                    self.assertEqual(set(steps[0]["env"]["RUST_COMPONENTS"].replace(" ", "").split(",")),
                                      {"rust-src"})
                     continue
                 # Floating stable can install a different fmt/clippy than Cargo
                 # selects from the repository pin inside the job container.
-                self.assertEqual(steps[0].get("with", {}).get("toolchain"), channel)
-        self.assertEqual(set(installers["check"][0]["with"]["components"].replace(" ", "").split(",")),
+                self.assertEqual(steps[0]["env"]["RUST_TOOLCHAIN"], channel)
+        self.assertEqual(set(installers["check"][0]["env"]["RUST_COMPONENTS"].replace(" ", "").split(",")),
                          {"rustfmt", "clippy"})
 
     def pinned_toolchain_lanes(self, channel):
@@ -9795,8 +9824,8 @@ class WorkflowTests(unittest.TestCase):
         lanes = []
         for workflow_name in ("check.yml", "reusable-rust-nextest.yml"):
             for job_id, job in self.workflows[workflow_name]["jobs"].items():
-                if any(str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")
-                       and step.get("with", {}).get("toolchain") == channel
+                if any((installer := self.rust_installer(workflow_name, step)) is not None
+                       and installer["toolchain"] == channel
                        for step in job.get("steps", [])):
                     lanes.append((workflow_name, job_id))
         # Sentinels: an enumeration that silently found nothing would pass
@@ -9827,7 +9856,7 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(workflow=workflow_name, job=job_id):
                 steps = self.workflows[workflow_name]["jobs"][job_id]["steps"]
                 installers = [index for index, step in enumerate(steps)
-                              if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
+                              if self.rust_installer(workflow_name, step)]
                 self.assertEqual(len(installers), 1)
                 index = installers[0]
                 installer = steps[index]
@@ -9845,7 +9874,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertNotEqual(retry.get("continue-on-error"), True,
                                     "the retry must fail the job when the toolchain stays missing")
                 self.assertIn(channel, retry["run"])
-                components = installer.get("with", {}).get("components", "")
+                components = self.rust_installer(workflow_name, installer)["components"]
                 for component in filter(None, components.replace(" ", "").split(",")):
                     with self.subTest(component=component):
                         self.assertIn(component, retry["run"])
@@ -9892,7 +9921,7 @@ class WorkflowTests(unittest.TestCase):
             for workflow_name, job_id in targets:
                 steps = self.workflows[workflow_name]["jobs"][job_id]["steps"]
                 installers = [index for index, step in enumerate(steps)
-                              if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
+                              if self.rust_installer(workflow_name, step)]
                 self.assertEqual(len(installers), 1)
                 run_text = str(steps[installers[0] + 1]["run"])
                 for case_name, succeed_on, expected_status, expected_installs in (
