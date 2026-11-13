@@ -149,7 +149,10 @@ async fn start_runner(
     voice: Option<Arc<dyn VoiceEventSink>>,
 ) -> RunningGateway {
     ensure_crypto_provider();
-    let store = GatewaySessionStore::new(pool.clone(), RETENTION_GUILD.to_owned(), 0);
+    let store = GatewaySessionStore::new(pool.clone(), RETENTION_GUILD.to_owned(), 0)
+        .with_resume_policy(two_bot_core::gateway_session::ResumePolicy::for_bootstrap(
+            Some(&peer.url),
+        ));
     // Rebinding the synthetic websocket endpoint is fixture setup only.
     sqlx::query("UPDATE gateway_sessions SET resume_url = $1")
         .bind(&peer.url)

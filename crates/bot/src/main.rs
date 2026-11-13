@@ -664,6 +664,11 @@ async fn run(cli_args: &[String]) {
                         gateway_db.pool().clone(),
                         guild_id.to_string(),
                         0,
+                    )
+                    .with_resume_policy(
+                        two_bot_core::gateway_session::ResumePolicy::for_bootstrap(
+                            gateway_url.as_deref(),
+                        ),
                     );
                     let saved = gateway::load_boot_session(&store).await.map_err(|error| {
                         step_failure(FailureClass::CheckpointLoadFailed, "checkpoint_load", error)

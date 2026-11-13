@@ -218,10 +218,14 @@ struct Bot {
 }
 
 impl Bot {
-    fn spawn(db: &TestDb, addr: SocketAddr, gateway: &str, api: &str, logs: &Logs) -> Self {
+    fn spawn(db: &TestDb, addr: SocketAddr, gateway: Option<&str>, api: &str, logs: &Logs) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_two-bot"));
         command.env_clear();
-        command.env("DISCORD_GATEWAY_URL", gateway);
+        // No gateway override is a strict-boot probe: onboarding must reject.
+        match gateway {
+            Some(gateway) => command.env("DISCORD_GATEWAY_URL", gateway),
+            None => command.env("TWO_ONBOARDING_MODE", "invalid-probe"),
+        };
         let mut child = command
             .env("LISTEN_ADDR", addr.to_string())
             .env("DISCORD_TOKEN", "alive-synthetic-token")
@@ -678,12 +682,47 @@ fn assert_ready_correlation(logs: &str) {
     assert!(seen > 0, "expected at least one ready commit in logs");
 }
 
+async fn seed_raw(db: &TestDb, url: &str) {
+    sqlx::query("INSERT INTO gateway_sessions (guild_id, shard_id, session_id, seq, resume_url, updated_at) VALUES ($1,0,$2,42,$3,now()) ON CONFLICT (guild_id,shard_id) DO UPDATE SET resume_url=EXCLUDED.resume_url")
+        .bind(GUILD).bind(SESSION).bind(url).execute(&db.pool).await.unwrap();
+}
+
 async fn raw_url(db: &TestDb) -> Option<String> {
     sqlx::query_scalar("SELECT resume_url FROM gateway_sessions WHERE guild_id=$1 AND shard_id=0")
         .bind(GUILD)
         .fetch_optional(&db.pool)
         .await
         .unwrap()
+}
+
+async fn strict_boot_probes(db: &TestDb, api: &str, bots: &mut Vec<Bot>, logs: &Logs, saved: &str) {
+    for url in [saved, "wss://remote.invalid"] {
+        logs.lock().await.clear();
+        seed_raw(db, url).await;
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        bots.push(Bot::spawn(db, addr, None, api, logs));
+        let bot = bots.last_mut().unwrap();
+        let status = timeout(STEP, bot.child.wait())
+            .await
+            .expect("post-load failure exit deadline")
+            .unwrap();
+        bot.drain().await;
+        assert!(!status.success(), "invalid onboarding must fail startup");
+        assert!(
+            logs.lock().await.lines().any(|line| {
+                line.contains("\"error_class\":\"onboarding_gates_invalid\"")
+                    && line.contains("\"failed_step\":\"onboarding_gates\"")
+            }),
+            "positive post-load onboarding failure"
+        );
+        assert!(db.store().load().await.unwrap().is_none());
+        assert_eq!(raw_url(db).await, None, "boot rejected raw checkpoint");
+        assert!(bot.cleanup().await, "probe teardown");
+    }
 }
 
 async fn lifecycle(
@@ -706,7 +745,7 @@ async fn lifecycle(
         } else {
             decoy.unwrap_or("ws://127.0.0.1:1")
         };
-        bots.push(Bot::spawn(db, addr, gateway, &discord.api, logs));
+        bots.push(Bot::spawn(db, addr, Some(gateway), &discord.api, logs));
         let bot = bots.last_mut().unwrap();
         let health = wait_http(bot, addr, "/healthz", 200).await;
         assert!(health.contains("\"status\":\"ok\""));
@@ -913,6 +952,13 @@ async fn binary_lifecycle(accepting_decoy: bool) {
     let mut bots = Vec::new();
     let decoy = MockDiscord::new().await; // Accepting listener: any dial is counted.
     let exercise = async {
+        strict_boot_probes(&db, &discord.api, &mut bots, &logs, &decoy.url).await;
+        let owned = discord.connections.load(SeqCst) + decoy.connections.load(SeqCst);
+        assert_eq!(owned, 0, "no override-absent listener connections");
+        logs.lock().await.clear();
+        discord.rest_requests.lock().await.clear();
+        // Inadmissible checkpoint under a checked local bootstrap must IDENTIFY.
+        seed_raw(&db, &format!("{}/invalid", decoy.url)).await;
         let bootstrap = accepting_decoy.then_some(decoy.url.as_str());
         lifecycle(&db, &mut discord, &mut bots, &logs, bootstrap).await;
         assert_eq!(
@@ -1092,7 +1138,7 @@ async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outc
         ];
         let schema = db.schema.clone();
         let logs = Logs::default();
-        let mut bot = Bot::spawn(&db, addr, &discord.url, &discord.api, &logs);
+        let mut bot = Bot::spawn(&db, addr, Some(&discord.url), &discord.api, &logs);
         let exercised = AssertUnwindSafe(timeout(STEP, async {
             wait_http(&mut bot, addr, "/healthz", 200).await;
             // Health precedes gateway initialization. Finish the upgrade before

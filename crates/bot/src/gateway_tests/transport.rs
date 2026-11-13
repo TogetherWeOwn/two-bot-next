@@ -14,7 +14,12 @@ pub(super) fn test_shard(
             return Err("resume override requires a session and a literal loopback socket");
         }
     }
-    let config = crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), saved);
+    let config = crate::gateway::build_shard_config_with_policy(
+        TOKEN.into(),
+        Intents::empty(),
+        saved,
+        two_bot_core::gateway_session::ResumePolicy::for_bootstrap(Some(proxy)),
+    );
     let mut builder = ConfigBuilder::from(config).proxy_url(proxy.to_owned());
     if let Some(url) = resume_override {
         builder = builder.resume_url(url.to_owned());
@@ -72,6 +77,77 @@ fn assert_installed(shard: &Shard, url: &str, installed: bool) {
         shard.session().map(|s| (s.id(), s.sequence())),
         installed.then_some(("session", 42))
     );
+}
+
+#[tokio::test]
+async fn strict_and_checked_builders_and_received_fallback() {
+    use two_bot_core::gateway_session::{
+        boot_action, boot_action_with_policy, BootAction, BootDirective, ResumePolicy,
+    };
+    let resume = |ok| {
+        if ok {
+            BootAction::Resume
+        } else {
+            BootAction::DiscardAndIdentify
+        }
+    };
+    let local = Some("ws://127.0.0.1:2345");
+    let bootstraps = [
+        None,
+        local,
+        Some("ws://localhost:2345"),
+        Some("wss://remote.invalid"),
+    ];
+    let urls = [
+        RESUME_URL,
+        "ws://127.0.0.1:1234",
+        "ws://[::1]:1234",
+        "wss://remote.invalid",
+        "ws://localhost:1234",
+        "",
+    ];
+    for bootstrap in bootstraps {
+        let policy = ResumePolicy::for_bootstrap(bootstrap);
+        for url in urls {
+            let saved = checkpoint("session", 42, url);
+            let strict_ok = url == RESUME_URL;
+            let ok = strict_ok || (bootstrap == local && crate::gateway::is_loopback_gateway(url));
+            let at = saved.updated_at_ms;
+            assert_eq!(boot_action(Some(&saved), at), resume(strict_ok));
+            let directive = BootDirective::None;
+            assert_eq!(
+                boot_action_with_policy(Some(&saved), directive, at, policy),
+                resume(ok)
+            );
+            let config = crate::gateway::build_shard_config_with_policy(
+                TOKEN.into(),
+                Intents::empty(),
+                Some(&saved),
+                policy,
+            );
+            assert_installed(&Shard::with_config(ShardId::ONE, config), url, ok);
+            let built = crate::gateway::build_shard(
+                TOKEN.into(),
+                Intents::empty(),
+                Some(&saved),
+                bootstrap,
+            );
+            assert_installed(&built, url, ok);
+            let config =
+                crate::gateway::build_shard_config(TOKEN.into(), Intents::empty(), Some(&saved));
+            assert_installed(&Shard::with_config(ShardId::ONE, config), url, strict_ok);
+            let normalized = Some(policy.normalize(url));
+            let fallback = |current, id| {
+                crate::gateway::checkpoint_resume_url(policy, current, Some(&saved), id)
+            };
+            assert_eq!(
+                crate::gateway::checkpoint_resume_url(policy, Some(url), None, "session"),
+                normalized
+            );
+            assert_eq!(fallback(None, "session"), normalized);
+            assert_eq!(fallback(None, "new-session"), None);
+        }
+    }
 }
 
 #[tokio::test]
