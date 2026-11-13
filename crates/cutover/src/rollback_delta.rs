@@ -168,6 +168,12 @@ pub const TABLE_SPECS: &[TableSpec] = &[
     TableSpec { table: "internal_event_keys", measure: TableMeasure::Columns(&["created_at", "updated_at"]) },
     TableSpec { table: "internal_idempotency", measure: TableMeasure::Columns(&["created_at"]) },
     TableSpec { table: "internal_nonces", measure: TableMeasure::Columns(&["burned_at"]) },
+    // Notification limiter state (0473): updated_ms is an epoch-ms integer,
+    // not a timestamp, and the legacy bot never reads the table.
+    TableSpec {
+        table: "internal_notify_budgets",
+        measure: TableMeasure::Unmeasurable("no timestamp column; updated_ms is an epoch-ms limiter stamp the legacy bot never reads", DISPOSITION_ACCEPT_WITH_REASON),
+    },
     // Retirements rewrite disabled_at without touching created_at, so the
     // maximum across both is the row's last write (same shape as tickets).
     TableSpec { table: "invite_campaigns", measure: TableMeasure::Columns(&["created_at", "disabled_at"]) },

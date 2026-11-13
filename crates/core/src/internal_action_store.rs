@@ -11,8 +11,8 @@ use crate::channel_moderation::PurgeStopReason;
 use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
 use crate::internal_actions::{
     body_hash, is_implemented, is_snowflake, valid_event_key, valid_idempotency_key,
-    valid_nonce_format, within_skew, CLAIM_STALE_SECONDS, MAX_BODY_BYTES, NONCE_TTL_SECONDS,
-    SKEW_SECONDS,
+    valid_nonce_format, valid_notify_event_key, within_skew, NotifyBucketState,
+    CLAIM_STALE_SECONDS, MAX_BODY_BYTES, NONCE_TTL_SECONDS, SKEW_SECONDS,
 };
 
 /// Clock domain for the durable nonce high-water mark. One guard per clock
@@ -34,6 +34,8 @@ pub enum InternalStoreError {
     Unavailable,
     #[error("internal-action transition refused")]
     TransitionRefused,
+    #[error("member notification rate limited")]
+    NotifyRateLimited { retry_after_secs: u64 },
 }
 
 impl From<sqlx::Error> for InternalStoreError {
@@ -493,11 +495,38 @@ impl InternalActionStore {
         identity: &RequestIdentity,
         subject: &AuditSubject,
     ) -> Result<InternalClaim, InternalStoreError> {
+        self.claim_inner(identity, subject, None).await
+    }
+
+    /// Pin a notification's event-key scalar in the same transaction as its
+    /// member subject and intent audit. No event name, timestamp or DM text.
+    pub async fn claim_notify(
+        &self,
+        identity: &RequestIdentity,
+        subject: &AuditSubject,
+        event_key: &str,
+    ) -> Result<InternalClaim, InternalStoreError> {
+        if !matches!(
+            identity.action.as_str(),
+            "reminder.send" | "place_offer.send"
+        ) || !valid_notify_event_key(event_key)
+        {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        self.claim_inner(identity, subject, Some(event_key)).await
+    }
+
+    async fn claim_inner(
+        &self,
+        identity: &RequestIdentity,
+        subject: &AuditSubject,
+        event_key: Option<&str>,
+    ) -> Result<InternalClaim, InternalStoreError> {
         let mut tx = self.pool.begin().await?;
         let inserted: Option<i64> = sqlx::query_scalar(
             "INSERT INTO internal_idempotency \
-             (caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id, target_id, resolved_role_id) \
-             VALUES ($1, $2, $3, $4, 'in_flight', $5, $6, $7, $8) \
+             (caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id, target_id, resolved_role_id, event_key) \
+             VALUES ($1, $2, $3, $4, 'in_flight', $5, $6, $7, $8, $9) \
              ON CONFLICT (caller_hash, key_hash) DO NOTHING RETURNING intent_id",
         )
         .bind(&identity.caller_hash)
@@ -508,6 +537,7 @@ impl InternalActionStore {
         .bind(subject.actor_id.as_ref().map(DiscordId::as_str))
         .bind(subject.target_id.as_ref().map(DiscordId::as_str))
         .bind(subject.resolved_role_id.as_ref().map(DiscordId::as_str))
+        .bind(event_key)
         .fetch_optional(&mut *tx)
         .await?;
         let result = if let Some(intent_id) = inserted {
@@ -528,7 +558,9 @@ impl InternalActionStore {
             })
         } else {
             let row = Self::lock_identity(&mut tx, identity).await?;
-            if !Self::matches(&row, identity)? {
+            if !Self::matches(&row, identity)?
+                || row.try_get::<Option<&str>, _>("event_key")? != event_key
+            {
                 InternalClaim::Mismatch
             } else {
                 match row.try_get::<&str, _>("state")? {
@@ -557,8 +589,76 @@ impl InternalActionStore {
                 }
             }
         };
+        if event_key.is_some() && matches!(result, InternalClaim::Claimed(_)) {
+            let member = subject
+                .target_id
+                .as_ref()
+                .ok_or(InternalStoreError::InvalidInput)?;
+            Self::take_notify_budget(&mut tx, member).await?;
+        }
         tx.commit().await?;
         Ok(result)
+    }
+
+    // Serialize the shared member budget in the same transaction as the new
+    // claim. A denial rolls both back; replays, mismatches and in-flight reads
+    // never charge. Conservatively count all committed attempts, including
+    // suppressed/closed DMs and proven-unsent 429s, to bound retry pressure.
+    async fn take_notify_budget(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        member: &DiscordId,
+    ) -> Result<(), InternalStoreError> {
+        let bucket_key = body_hash(format!("notify:{}", member.as_str()).as_bytes());
+        sqlx::query(
+            "INSERT INTO internal_notify_budgets (bucket_key) VALUES ($1) \
+             ON CONFLICT (bucket_key) DO NOTHING",
+        )
+        .bind(&bucket_key)
+        .execute(&mut **tx)
+        .await?;
+        let row = sqlx::query(
+            "SELECT credit_ms, updated_ms, admissions FROM internal_notify_budgets \
+             WHERE bucket_key = $1 FOR UPDATE",
+        )
+        .bind(&bucket_key)
+        .fetch_one(&mut **tx)
+        .await?;
+        // Read the database clock after any lock wait. Persist the bucket's
+        // high-water mark so a receiver restart or clock rollback cannot refill it.
+        let now_ms: i64 = sqlx::query_scalar(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        let nonnegative =
+            |value: i64| u64::try_from(value).map_err(|_| InternalStoreError::InvalidInput);
+        let admissions: Vec<i64> = row.try_get("admissions")?;
+        let mut bucket = NotifyBucketState {
+            credit_ms: nonnegative(row.try_get("credit_ms")?)?,
+            updated_ms: nonnegative(row.try_get("updated_ms")?)?,
+            admissions: admissions
+                .into_iter()
+                .map(nonnegative)
+                .collect::<Result<_, _>>()?,
+        };
+        let decision = bucket.take(nonnegative(now_ms)?);
+        if !decision.allowed {
+            return Err(InternalStoreError::NotifyRateLimited {
+                retry_after_secs: decision.retry_after_secs,
+            });
+        }
+        let admissions: Vec<i64> = bucket.admissions.into_iter().map(|ms| ms as i64).collect();
+        sqlx::query(
+            "UPDATE internal_notify_budgets SET credit_ms = $2, updated_ms = $3, admissions = $4 \
+             WHERE bucket_key = $1",
+        )
+        .bind(&bucket_key)
+        .bind(bucket.credit_ms as i64)
+        .bind(bucket.updated_ms as i64)
+        .bind(admissions)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 
     /// Release only when the caller proves the mutation was never dispatched.
@@ -610,8 +710,38 @@ impl InternalActionStore {
         claim: &ExecutionClaim,
         response: &TerminalResponse,
     ) -> Result<(), InternalStoreError> {
-        self.terminalize(&claim.identity, Some(claim.intent_id), response, None)
-            .await
+        self.terminalize(
+            &claim.identity,
+            Some(claim.intent_id),
+            response,
+            None,
+            "executor",
+        )
+        .await
+    }
+
+    /// Record a consent-backstop refusal: the member suppressed bot DMs
+    /// (`privacy_opt_outs`), so delivery never ran. The receipt is the same
+    /// `dm_unavailable` shape a closed-DM refusal finishes, but the terminal
+    /// audit carries `suppressed` instead of `executor`, so operators can tell
+    /// "never attempted" from "attempted and refused". The wire is unchanged.
+    pub async fn finish_suppressed(
+        &self,
+        claim: &ExecutionClaim,
+    ) -> Result<(), InternalStoreError> {
+        self.terminalize(
+            &claim.identity,
+            Some(claim.intent_id),
+            &TerminalResponse::Success {
+                resource_id: None,
+                affected: 0,
+                outcome: None,
+                stop_reason: None,
+            },
+            None,
+            "suppressed",
+        )
+        .await
     }
 
     /// A timeout/crash path retains the intent; it never releases execution rights.
@@ -647,7 +777,7 @@ impl InternalActionStore {
         if !evidence.supports(response) {
             return Err(InternalStoreError::InvalidInput);
         }
-        self.terminalize(identity, None, response, Some(evidence))
+        self.terminalize(identity, None, response, Some(evidence), "executor")
             .await
     }
 
@@ -657,6 +787,7 @@ impl InternalActionStore {
         owner_id: Option<i64>,
         response: &TerminalResponse,
         evidence: Option<ReconciliationEvidence>,
+        executor_evidence: &'static str,
     ) -> Result<(), InternalStoreError> {
         let mut tx = self.pool.begin().await?;
         let row = Self::lock_identity(&mut tx, identity).await?;
@@ -683,7 +814,7 @@ impl InternalActionStore {
         .bind(response.stop_reason())
         .execute(&mut *tx)
         .await?;
-        Self::complete_locked(&mut tx, intent_id, response, evidence).await?;
+        Self::complete_locked(&mut tx, intent_id, response, evidence, executor_evidence).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -696,6 +827,7 @@ impl InternalActionStore {
         intent_id: i64,
         response: &TerminalResponse,
         evidence: Option<ReconciliationEvidence>,
+        executor_evidence: &'static str,
     ) -> Result<(), InternalStoreError> {
         sqlx::query(
             "UPDATE internal_idempotency SET state = 'completed', response_code = $2, \
@@ -715,7 +847,7 @@ impl InternalActionStore {
             tx,
             intent_id,
             "terminal",
-            Some(evidence.map_or("executor", ReconciliationEvidence::as_str)),
+            Some(evidence.map_or(executor_evidence, ReconciliationEvidence::as_str)),
         )
         .await?;
         Ok(())
@@ -879,7 +1011,7 @@ impl InternalActionStore {
             .execute(&mut *tx)
             .await?;
         }
-        Self::complete_locked(&mut tx, intent_id, response, Some(evidence)).await?;
+        Self::complete_locked(&mut tx, intent_id, response, Some(evidence), "executor").await?;
         tx.commit().await?;
         Ok(())
     }
@@ -930,9 +1062,9 @@ impl InternalActionStore {
         sqlx::query(
             "INSERT INTO internal_action_log \
              (intent_id, phase, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-              response_code, http_status, evidence_code, resource_id, affected, outcome, stop_reason) \
+              response_code, http_status, evidence_code, resource_id, affected, outcome, stop_reason, event_key) \
              SELECT intent_id, $2, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-                    response_code, http_status, $3, resource_id, affected, outcome, stop_reason \
+                    response_code, http_status, $3, resource_id, affected, outcome, stop_reason, event_key \
              FROM internal_idempotency WHERE intent_id = $1 \
              ON CONFLICT (intent_id, phase) DO NOTHING",
         )

@@ -76,6 +76,7 @@ SELECT schema_name, name, kind FROM (VALUES
     ('public', 'internal_clock_high_water', 'table'),
     ('public', 'internal_idempotency', 'table'),
     ('public', 'internal_action_log', 'table'),
+    ('public', 'internal_notify_budgets', 'admission'),
     ('public', 'internal_discord_events', 'table'),
     ('public', 'internal_event_keys', 'table'),
     ('public', 'stream_live_claims', 'table'),

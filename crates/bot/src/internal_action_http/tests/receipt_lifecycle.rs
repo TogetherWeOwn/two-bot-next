@@ -96,6 +96,7 @@ fn lifecycle_rig(pool: sqlx::PgPool, capacity: usize, released: bool) -> Lifecyc
         pool,
         effect,
         Arc::new(MockEffect::new(MockOutcome::Success)),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
         reads,
         mutates,
         Arc::new(MockModeration::default()),

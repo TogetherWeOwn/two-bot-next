@@ -54,6 +54,23 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
   `Claimed(ExecutionClaim)`, `InFlight`, `NeedsReconciliation`, `Replay(response)`
   or `Mismatch`. All except `Claimed` prohibit execution. An `ExecutionClaim` has
   private fields and is only produced after intent and audit commit.
+- `claim_notify(&RequestIdentity, &AuditSubject, event_key)` applies the same
+  claim fence for the two DM verbs and pins the validated 1–64-character event-key
+  scalar on the intent and every audit phase (migration `0473`). A changed event
+  key refuses as a mismatch, including when reclaiming a proven-unsent intent.
+  It also owns the durable per-member limiter: in the claim transaction it locks
+  the `internal_notify_budgets` row (key: SHA-256 of `notify:<canonical
+  discord_id>`; numeric `credit_ms`, `updated_ms` and at most 10 `admissions`)
+  and charges it only when the outcome is `Claimed`. Burst 3, exact integer
+  refill of 10/day and a strict rolling-24-hour maximum of 10 are unchanged. When
+  the budget is exhausted the transaction rolls back the tentative claim and
+  audit and returns `NotifyRateLimited { retry_after_secs }`. Replay, mismatch,
+  in-flight and reconciliation answers never charge. Every committed new claim
+  counts, including suppression, closed DMs and proven-unsent 429 retries; denials
+  and replays do not. The state is shared by both verbs and all callers and
+  persists across processes and restarts.
+  Payload event names, schedule/expiry timestamps and rendered DM text are never
+  persisted; the limiter stores only its own numeric admission times.
 - `release_proven_not_sent(ExecutionClaim)` requires owning-executor proof that
   the mutation was never dispatched. It consumes the opaque, non-Clone claim on
   every return path, atomically records a `released`/`proven_not_sent` audit and
@@ -66,6 +83,9 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
   no-dispatch release, not an attempt count. Reconciliation refuses `not_sent`
   even when aged. Unknown, completed or stale ordinary claims cannot be released.
 - `finish(&ExecutionClaim, &TerminalResponse)` commits completion and its audit.
+- `finish_suppressed(&ExecutionClaim)` commits the same `dm_unavailable` receipt
+  a closed-DM refusal finishes, but its terminal audit carries `suppressed`
+  instead of `executor` (contract v2 §7 consent backstop).
 - `mark_unknown(&ExecutionClaim)` preserves the slot and deduplicates the unknown
   audit. It never releases the claim.
 - `reconcile(&RequestIdentity, &TerminalResponse, ReconciliationEvidence)` accepts

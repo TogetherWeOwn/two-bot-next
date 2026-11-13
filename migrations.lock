@@ -536,6 +536,10 @@
     "crates/cutover/migrations/0472_event_instance_windows.sql": {
       "sha256": "ff2af4cb454c9fa569fb2722593ff35f3af3c347dc55fcea82ddeff0c21bd671",
       "justification": "Retain accepted event instance windows and independent lifecycle, omission and revocation fences outside the exact-replacement mirror; omission stamps preserve rollback recency without masking delayed terminal observations."
+    },
+    "crates/cutover/migrations/0473_internal_action_member_notify.sql": {
+      "sha256": "e00e112590aa6339ebb46994d0ac65cdc41f2042671ff3ee52763234a5641aa0",
+      "justification": "Admit reminder.send and place_offer.send to durable internal-action intents, add bounded event-key correlation and suppressed evidence, and persist hashed per-member notification budgets atomically with execution claims. Widen existing checks with NOT VALID then validation. This unmerged migration remains compatible with previous binaries; disable the receiver and roll back the binary before any schema backout, retaining budget history."
     }
   }
 }

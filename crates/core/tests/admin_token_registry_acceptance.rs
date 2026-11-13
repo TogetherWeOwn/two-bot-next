@@ -123,6 +123,14 @@ const V0_SCOPE_MAP: [(&str, &str); 19] = [
     ("automations.import", SCOPE_ADMIN),
 ];
 
+/// Slice-1 scope rows: the member-notify DM verbs. An outbound DM is
+/// irreversible once read, so both verbs require the admin scope, like the
+/// broadcast verb. Later slices add rows here, never in `V0_SCOPE_MAP`.
+const MEMBER_NOTIFY_SCOPE_MAP: [(&str, &str); 2] = [
+    ("reminder.send", SCOPE_ADMIN),
+    ("place_offer.send", SCOPE_ADMIN),
+];
+
 /// Strings that can never become verbs: the only inputs pinned to no scope.
 /// Future real verbs (message/channel/role/passthrough/audit) are
 /// deliberately absent: later slices map them without touching this file.
@@ -292,6 +300,35 @@ fn admin_verbs_require_admin() {
             InternalFlags::required_admin_scope(verb),
             Some(SCOPE_ADMIN),
             "{verb} is an admin verb"
+        );
+    }
+}
+
+#[test]
+fn member_notify_verbs_require_admin() {
+    assert_eq!(MEMBER_NOTIFY_SCOPE_MAP.len(), 2);
+    for (verb, scope) in MEMBER_NOTIFY_SCOPE_MAP {
+        assert_eq!(scope, SCOPE_ADMIN, "{verb} is an admin verb");
+        assert_eq!(
+            InternalFlags::required_admin_scope(verb),
+            Some(SCOPE_ADMIN),
+            "{verb} is an admin verb"
+        );
+        assert!(
+            InternalFlags::admin_scope_allows(&[SCOPE_ADMIN], verb),
+            "admin must allow {verb}"
+        );
+        assert!(
+            !InternalFlags::admin_scope_allows(&[SCOPE_MODERATE], verb),
+            "moderate must refuse the admin verb {verb}"
+        );
+        assert!(
+            !InternalFlags::admin_scope_allows(&[SCOPE_READ], verb),
+            "read must refuse the write verb {verb}"
+        );
+        assert!(
+            live_token_allows(&[SCOPE_ADMIN], verb, GUILD),
+            "token predicate must preserve exact scope on {verb}"
         );
     }
 }
