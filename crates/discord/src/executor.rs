@@ -217,6 +217,15 @@ impl DiscordError {
             if detail == &two_bot_core::send_admission::AdmissionError::Blocked.to_string())
     }
 
+    /// The canonical durable admission storage refusal is pre-wire, not a
+    /// transport failure. Keep this provenance narrow: other unavailable
+    /// details, including storage-looking text, do not prove an unsent request.
+    #[must_use]
+    pub fn is_admission_storage(&self) -> bool {
+        matches!(self, Self::Unavailable(detail)
+            if detail == &two_bot_core::send_admission::AdmissionError::Storage.to_string())
+    }
+
     /// True when the failure proves the request had no effect: everything
     /// [`Self::is_safe_pre_mutation`] covers, plus a 429. Discord documents a
     /// rate-limited request as not processed, and the send-admission layer
@@ -4697,6 +4706,26 @@ mod tests {
             DiscordError::Rejected("discord refused the request".to_owned()),
         ] {
             assert!(!error.is_admission_blocked(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn only_canonical_admission_storage_proves_pre_wire_storage_refusal() {
+        assert!(
+            DiscordError::Unavailable(AdmissionError::Storage.to_string()).is_admission_storage()
+        );
+        for error in [
+            DiscordError::Unavailable(AdmissionError::Blocked.to_string()),
+            DiscordError::Unavailable(format!("{} ", AdmissionError::Storage)),
+            DiscordError::Unavailable("transport: database unavailable".to_owned()),
+            DiscordError::Unavailable("Discord response body unavailable".to_owned()),
+            DiscordError::Unavailable(HEADER_TIMEOUT_MESSAGE.to_owned()),
+            DiscordError::Unavailable(BODY_TIMEOUT_MESSAGE.to_owned()),
+            DiscordError::Timeout,
+            DiscordError::RateLimited,
+            DiscordError::Rejected(AdmissionError::Storage.to_string()),
+        ] {
+            assert!(!error.is_admission_storage(), "{error:?}");
         }
     }
 
