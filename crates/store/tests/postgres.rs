@@ -90,6 +90,48 @@ fn event(t: EventType, at: &str) -> FunnelEvent {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires authorized disposable test database via TEST_DATABASE_URL"]
+async fn failed_contract_install_keeps_version_1_0_and_future_versions_stay() {
+    let f = Fixture::new().await;
+    migrate(&f.pool).await.unwrap();
+    sqlx::query("DROP TABLE voice_heat_hours")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    two_bot_store::apply_web_contract(&f.pool)
+        .await
+        .expect_err("voice_heat view needs its table");
+    let version: String = sqlx::query_scalar("SELECT contract_version FROM web_contract_meta")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(version, "1.0");
+    let views: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_views WHERE schemaname = $1")
+        .bind(format!("{}_web_v1", f.schema))
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(views, 0);
+
+    // Restore the table, record a future version, and apply: untouched.
+    sqlx::raw_sql(include_str!("../migrations/0471_voice_heat_hours.sql"))
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE web_contract_meta SET contract_version = '1.2'")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    two_bot_store::apply_web_contract(&f.pool).await.unwrap();
+    let version: String = sqlx::query_scalar("SELECT contract_version FROM web_contract_meta")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(version, "1.2");
+    f.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires authorized TEST_DATABASE_URL"]
 async fn migrations_contract_and_checksum_guard() {
     let f = Fixture::new().await;
@@ -110,6 +152,12 @@ async fn migrations_contract_and_checksum_guard() {
         .unwrap();
     assert_eq!(timeout, "15s");
     assert_eq!(f.admin.options().get_max_connections(), 5);
+    // Migrations alone never claim the 1.1 views.
+    let before: String = sqlx::query_scalar("SELECT contract_version FROM web_contract_meta")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(before, "1.0");
     two_bot_store::apply_web_contract(&f.pool).await.unwrap();
     two_bot_store::apply_web_contract(&f.pool).await.unwrap();
     let web = format!("{}_web_v1", f.schema);
@@ -119,7 +167,7 @@ async fn migrations_contract_and_checksum_guard() {
     .fetch_one(&f.pool)
     .await
     .unwrap();
-    assert_eq!(version, "1.0");
+    assert_eq!(version, "1.1");
     let counts: (Option<i32>, Option<i32>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT human_member_count, online_count FROM {web}.live_counts"
     )))
@@ -143,6 +191,15 @@ async fn migrations_contract_and_checksum_guard() {
     .await
     .unwrap();
     assert_eq!(ladder, 5);
+    // Contract 1.1 addition: the voice-heat grid always carries 168 cells,
+    // empty before the first sampler flush, with the insufficient label.
+    let heat: (i64, String) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*), min(source) FROM {web}.voice_heat"
+    )))
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(heat, (168, "insufficient".to_owned()));
     // Corrupt only this test's ledger: a deployed checksum mismatch must fail.
     sqlx::query(
         "UPDATE _two_bot_migrations SET checksum = decode('00', 'hex') WHERE version = 400",

@@ -1,8 +1,8 @@
 //! Keyless `voice.snapshot` projection over the shared gateway cache.
 //!
 //! The signed `POST /internal/actions` receiver serves this verb from the
-//! same [`DefaultInMemoryCache`] the gateway loop feeds through the
-//! pipeline: Discord exposes no REST voice-state list, so the live cache is
+//! same fenced [`two_bot_discord::SharedCache`] the gateway loop feeds through
+//! the pipeline: Discord exposes no REST voice-state list, so the live cache is
 //! the only source. A cache that cannot prove a complete guild view refuses
 //! with [`SnapshotRefusal::CacheIncomplete`] (the receiver answers
 //! `discord_unavailable`), never a partial listing and never invented data.
@@ -204,17 +204,42 @@ impl two_bot_discord::VoiceTransitionObserver for VoiceOccupancyClock {
 /// occupancy readable, so callers gate on the supervisor's readiness first
 /// and only call this while the gateway is connected.
 pub(crate) fn read_voice_snapshot(
-    cache: &DefaultInMemoryCache,
+    cache: &two_bot_discord::SharedCache,
     clock: &VoiceOccupancyClock,
     guild_id: Snowflake,
     event_keys: &HashMap<Snowflake, String>,
 ) -> Result<Value, SnapshotRefusal> {
-    let mut rooms = collect_rooms(cache, guild_id).ok_or(SnapshotRefusal::CacheIncomplete)?;
+    let mut rooms = cache
+        .with_guild_snapshot(guild_id, |cache| collect_rooms(cache, guild_id))
+        .flatten()
+        .ok_or(SnapshotRefusal::CacheIncomplete)?;
     clock.stamp_rooms(guild_id, &mut rooms);
     for room in &mut rooms {
         room.event_key = event_keys.get(&room.channel_id).cloned();
     }
     project(observed_at_now(), rooms)
+}
+
+/// Read the same complete-cache, bot/AFK-excluded total without building an
+/// HTTP response. The relay byte budget applies only to the room listing,
+/// never to the sampler's scalar. Callers still gate gateway freshness.
+pub(crate) fn read_voice_total(
+    cache: &two_bot_discord::SharedCache,
+    guild_id: Snowflake,
+) -> Result<usize, SnapshotRefusal> {
+    let rooms = cache
+        .with_guild_snapshot(guild_id, |cache| collect_rooms(cache, guild_id))
+        .flatten()
+        .ok_or(SnapshotRefusal::CacheIncomplete)?;
+    Ok(total_in_voice(&rooms))
+}
+
+fn total_in_voice(rooms: &[RoomDraft]) -> usize {
+    rooms
+        .iter()
+        .filter(|room| !room.afk)
+        .map(|room| room.member_ids.len())
+        .sum()
 }
 
 /// Whole-second Zulu timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for `observed_at`.
@@ -260,8 +285,8 @@ fn format_whole_second_zulu_parts(
 
 /// Shared-cache handle constructor for the binary wiring (kept beside the
 /// reader so `main.rs` needs no twilight imports of its own).
-pub(crate) fn new_shared_cache() -> Arc<DefaultInMemoryCache> {
-    Arc::new(two_bot_discord::build_cache())
+pub(crate) fn new_shared_cache() -> Arc<two_bot_discord::SharedCache> {
+    Arc::new(two_bot_discord::SharedCache::default())
 }
 
 /// Collect every guild voice channel with its human occupants. Returns
@@ -280,7 +305,11 @@ pub(crate) fn new_shared_cache() -> Arc<DefaultInMemoryCache> {
 fn collect_rooms(cache: &DefaultInMemoryCache, guild_id: Snowflake) -> Option<Vec<RoomDraft>> {
     let guild_key: Id<GuildMarker> = Id::new(guild_id);
     let guild = cache.guild(guild_key)?;
+    if guild.unavailable() == Some(true) {
+        return None;
+    }
     let afk_channel: Option<Id<ChannelMarker>> = guild.afk_channel_id();
+    drop(guild);
     let channel_ids: Vec<Id<ChannelMarker>> =
         cache.guild_channels(guild_key)?.iter().copied().collect();
     let mut rooms = Vec::new();
@@ -353,11 +382,7 @@ pub(crate) fn project(
             b.channel_id,
         ))
     });
-    let total_in_voice: usize = rooms
-        .iter()
-        .filter(|room| !room.afk)
-        .map(|room| room.member_ids.len())
-        .sum();
+    let total_in_voice = total_in_voice(&rooms);
     let wire_rooms: Vec<Value> = rooms
         .iter()
         .map(|room| {
@@ -398,6 +423,96 @@ pub(crate) fn project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn guild_snapshot() -> twilight_model::guild::Guild {
+        let mut guild: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/voice_guild.json"))
+                .expect("guild fixture");
+        guild["channels"] = json!([{
+            "id": "31", "guild_id": "100", "type": 2, "name": "voice",
+            "permission_overwrites": []
+        }]);
+        guild["voice_states"] = json!([{
+            "guild_id": "100", "channel_id": "31", "user_id": "42",
+            "session_id": "fixture", "deaf": false, "mute": false,
+            "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false
+        }]);
+        serde_json::from_value(guild).expect("populated guild fixture")
+    }
+
+    #[test]
+    fn unavailable_and_ready_pending_guilds_refuse_until_full_snapshot() {
+        use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
+        let cache = new_shared_cache();
+        assert!(cache.needs_bootstrap());
+        cache.update(&Event::UserUpdate(
+            serde_json::from_value(json!({
+                "id": "999", "username": "fixture", "discriminator": "0", "mfa_enabled": false
+            }))
+            .expect("replayed user update"),
+        ));
+        assert!(
+            cache.needs_bootstrap(),
+            "a replayed identity is not READY evidence"
+        );
+        let full = || Event::GuildCreate(Box::new(GuildCreate::Available(guild_snapshot())));
+        cache.update(&full());
+        assert_eq!(read_voice_total(&cache, 100), Ok(1));
+        // Twilight retains an old guild on READY. Its pending marker must
+        // prevent the retained complete-looking roster from being sampled.
+        let ready = serde_json::from_value(json!({
+            "v": 10, "session_id": "fixture", "resume_gateway_url": "ws://fixture.invalid",
+            "application": {"id": "999", "flags": 0},
+            "user": {"id": "999", "username": "fixture", "discriminator": "0", "mfa_enabled": false},
+            "guilds": [{"id": "100", "unavailable": true}]
+        }))
+        .expect("ready fixture");
+        cache.update(&Event::Ready(ready));
+        assert!(!cache.needs_bootstrap());
+        assert_eq!(
+            read_voice_total(&cache, 100),
+            Err(SnapshotRefusal::CacheIncomplete)
+        );
+        assert_eq!(
+            read_voice_snapshot(
+                &cache,
+                &VoiceOccupancyClock::default(),
+                100,
+                &HashMap::new()
+            ),
+            Err(SnapshotRefusal::CacheIncomplete)
+        );
+        cache.update(&full());
+        assert_eq!(read_voice_total(&cache, 100), Ok(1));
+        cache.update(&Event::GuildCreate(Box::new(GuildCreate::Unavailable(
+            serde_json::from_value(json!({"id": "100", "unavailable": true}))
+                .expect("unavailable guild fixture"),
+        ))));
+        assert_eq!(
+            read_voice_total(&cache, 100),
+            Err(SnapshotRefusal::CacheIncomplete)
+        );
+        cache.update(&full());
+        assert_eq!(read_voice_total(&cache, 100), Ok(1));
+        assert_eq!(
+            read_voice_snapshot(
+                &cache,
+                &VoiceOccupancyClock::default(),
+                100,
+                &HashMap::new()
+            )
+            .expect("full snapshot")["total_in_voice"],
+            1
+        );
+        let mut empty = guild_snapshot();
+        empty.voice_states.clear();
+        cache.update(&Event::GuildCreate(Box::new(GuildCreate::Available(empty))));
+        assert_eq!(
+            read_voice_total(&cache, 100),
+            Ok(0),
+            "genuine empty snapshot is zero"
+        );
+    }
 
     fn draft(
         channel_id: Snowflake,
@@ -798,15 +913,23 @@ mod tests {
     fn pipeline_clock_preserves_intervals_and_forgets_same_member_after_a_gap() {
         use twilight_model::gateway::event::Event;
         for reseed in [false, true] {
-            let pipeline = two_bot_discord::MemPipeline::for_replay();
+            let cache = new_shared_cache();
+            let pipeline = two_bot_discord::MemPipeline::with_shared_cache(
+                two_bot_core::MemStore::new(),
+                Some(two_bot_core::NoopLeveling),
+                Some(two_bot_core::NoopFacts),
+                two_bot_discord::ScriptedInvites::new(),
+                two_bot_discord::NoClassification,
+                two_bot_discord::PipelineSnapshots::new(),
+                cache.clone(),
+            );
             let clock = VoiceOccupancyClock::new();
             pipeline.set_voice_transition_observer(clock.clone());
             pipeline.handle_at(&pipeline_guild(&[]), "2026-11-03T09:59:00Z");
             pipeline.handle_at(&pipeline_voice(7, Some(200)), "2026-11-03T10:00:00Z");
             pipeline.handle_at(&pipeline_voice(8, Some(200)), "2026-11-03T10:01:00Z");
             let snapshot = || {
-                read_voice_snapshot(pipeline.cache(), &clock, 100, &HashMap::new())
-                    .expect("complete guild")
+                read_voice_snapshot(&cache, &clock, 100, &HashMap::new()).expect("complete guild")
             };
             for member in [99, 7] {
                 // An unrelated guild departure cannot erase this interval.

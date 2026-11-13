@@ -46,6 +46,10 @@ pub enum DbDumpError {
     Refused(String),
 }
 
+/// Excluded from archives but owned by no restored row: restore truncates them
+/// so stale derived rows cannot mix with the recovered process's fresh samples.
+const CLEARED_EXCLUDED_TABLES: &[&str] = &["voice_heat_hours"];
+
 /// Total, locale-independent order even for composite keys or tables without
 /// a primary key. Text output is the archive's representation; equal sort keys
 /// therefore mean identical archived rows (including JSON and binary columns).
@@ -477,6 +481,9 @@ impl RestoreReport {
                 archived.saturating_sub(self.translated_voice_command_role_members)
             }
             "voice_access_controls" => archived + self.voice_access_controls_added,
+            "web_contract_meta" => {
+                archived.max(self.initialized_tables.get(table).copied().unwrap_or(0))
+            }
             _ => archived,
         }
     }
@@ -497,6 +504,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         tracing::warn!(version = manifest.version, tables = ?missing, "old dump lacks tables; restore clears them (settings revision singleton resets to zero)");
     }
     let mut dropped_columns: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut initialized_tables = BTreeMap::new();
 
     let mut tx = pool.begin().await?;
     let mut target_tables = Vec::new();
@@ -516,6 +524,15 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             target_tables.push(*name);
         }
     }
+    // Excluded-but-cleared tables join the same lock/truncate set so a restore
+    // never leaves stale target rows beside re-sampled data. Absent on historical
+    // targets: skip, never CASCADE.
+    let mut cleared_tables = target_tables.clone();
+    for name in CLEARED_EXCLUDED_TABLES {
+        if !columns_of(&mut tx, name).await?.is_empty() {
+            cleared_tables.push(*name);
+        }
+    }
     // Lock before changing guards. Only two named application triggers are
     // suspended, never FK/check constraints or session_replication_role. ALTER
     // TABLE is transactional: error/cancellation rolls back data AND guards.
@@ -523,10 +540,29 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     // https://www.postgresql.org/docs/16/sql-altertable.html
     sqlx::query(audited(format!(
         "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
-        target_tables.join(", ")
+        cleared_tables.join(", ")
     )))
     .execute(&mut *tx)
     .await?;
+    // A published contract describes the destination's installed views, not
+    // archived guild data. Keep its version under the same exclusive lock;
+    // an older archive may still restore the guild without downgrading the
+    // capability (including a future installed version). An unpublished
+    // historical target retains the archive's metadata until view installation.
+    let published: bool = sqlx::query_scalar(
+        "SELECT to_regclass(format('%I.contract_meta',
+             CASE WHEN current_schema() = 'public' THEN 'web_v1'
+                  ELSE current_schema() || '_web_v1' END)) IS NOT NULL",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let installed_contract: Option<String> = if published {
+        sqlx::query_scalar("SELECT contract_version FROM web_contract_meta WHERE singleton")
+            .fetch_optional(&mut *tx)
+            .await?
+    } else {
+        None
+    };
     // Moderation history fence: overwriting destination evidence could forget
     // a post-backup PUT/DELETE or a newer permanent ban. Refuse while the
     // lock is held so no concurrent writer slips evidence in after the check.
@@ -575,7 +611,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     // A single explicit truncate covers all FK dependencies, without CASCADE
     // touching foreign/website tables. No RESTART IDENTITY: that would discard
     // the target's own high-water mark, which the restarts below preserve.
-    sqlx::query(audited(format!("TRUNCATE {}", target_tables.join(", "))))
+    sqlx::query(audited(format!("TRUNCATE {}", cleared_tables.join(", "))))
         .execute(&mut *tx)
         .await?;
     // Cooldowns are intentionally not archived; discard stale target throttles.
@@ -713,6 +749,23 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             }
             query.execute(&mut *tx).await?;
         }
+    }
+
+    if let Some(version) = installed_contract {
+        if !manifest
+            .tables
+            .iter()
+            .any(|t| t.name == "web_contract_meta" && t.count > 0)
+        {
+            initialized_tables.insert("web_contract_meta".to_owned(), 1);
+        }
+        sqlx::query(
+            "INSERT INTO web_contract_meta (singleton, contract_version) VALUES (TRUE, $1)
+             ON CONFLICT (singleton) DO UPDATE SET contract_version = EXCLUDED.contract_version",
+        )
+        .bind(version)
+        .execute(&mut *tx)
+        .await?;
     }
 
     // Even a matching accepted snapshot intent cannot prove current remote
@@ -932,7 +985,6 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     // v3 predates the required singleton. Clearing stale target data is not
     // enough: settings writes would subsequently fail without this baseline.
     // Never synthesize application settings/history or replace an archived row.
-    let mut initialized_tables = BTreeMap::new();
     if missing.contains(&"guild_settings_revision") {
         let columns = columns_of(&mut tx, "guild_settings_revision").await?;
         if columns.iter().any(|(name, _)| name == "singleton")

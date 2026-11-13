@@ -468,6 +468,80 @@ pub struct MessageEligibility {
     pub capture_only: bool,
 }
 
+/// Gateway cache with a fence for coherent multi-map guild projections.
+/// Twilight synchronizes individual maps, but a GuildCreate replaces channels
+/// and the voice roster before replacing its guild entry. Readers must not
+/// mistake that intermediate state for a complete empty guild.
+pub struct SharedCache {
+    inner: InMemoryCache,
+    /// READY can retain an old guild entry while its new snapshot is pending.
+    /// Keep those guilds ineligible until an available GuildCreate completes.
+    pending_guilds: RwLock<HashSet<Snowflake>>,
+    ready_seen: AtomicBool,
+}
+
+impl Default for SharedCache {
+    fn default() -> Self {
+        Self {
+            inner: build_cache(),
+            pending_guilds: RwLock::new(HashSet::new()),
+            ready_seen: AtomicBool::new(false),
+        }
+    }
+}
+
+impl SharedCache {
+    /// Apply one gateway event atomically with respect to guild projections.
+    pub fn update(&self, event: &Event) {
+        let mut pending = self.pending_guilds.write().expect("cache snapshot fence");
+        match event {
+            Event::Ready(ready) => {
+                pending.extend(ready.guilds.iter().map(|guild| guild.id.get()));
+                self.ready_seen.store(true, Ordering::Release);
+            }
+            Event::GuildCreate(create) => match create.as_ref() {
+                twilight_model::gateway::payload::incoming::GuildCreate::Available(guild) => {
+                    pending.remove(&guild.id.get());
+                }
+                twilight_model::gateway::payload::incoming::GuildCreate::Unavailable(guild) => {
+                    pending.insert(guild.id.get());
+                }
+            },
+            Event::GuildDelete(guild) => {
+                if guild.unavailable == Some(true) {
+                    pending.insert(guild.id.get());
+                } else {
+                    pending.remove(&guild.id.get());
+                }
+            }
+            _ => {}
+        }
+        self.inner.update(event);
+    }
+
+    /// A replayed UserUpdate can populate the current user in a cold cache.
+    /// Only a READY proves this process bootstrapped its gateway snapshot.
+    #[must_use]
+    pub fn needs_bootstrap(&self) -> bool {
+        !self.ready_seen.load(Ordering::Acquire)
+    }
+
+    /// Read a complete guild projection without racing a cache update. A
+    /// rebuilding, unavailable or poisoned cache refuses instead of blocking
+    /// an HTTP read or recording a partial sampler observation.
+    pub fn with_guild_snapshot<T>(
+        &self,
+        guild_id: Snowflake,
+        read: impl FnOnce(&InMemoryCache) -> T,
+    ) -> Option<T> {
+        let pending = self.pending_guilds.try_read().ok()?;
+        if pending.contains(&guild_id) {
+            return None;
+        }
+        Some(read(&self.inner))
+    }
+}
+
 /// The S3 gateway pipeline. `S`/`L`/`F` are the core seams; `I` serves invite
 /// counters; `C` classifies channels. Share via `Arc` between the shard
 /// runner and the HTTP layer (snapshot reads, health).
@@ -480,12 +554,9 @@ pub struct Pipeline<
     P = PipelineSnapshots,
 > {
     /// Shared with the internal-actions receiver's voice-snapshot read: the
-    /// gateway loop feeds events through this pipeline (`cache.update`), and
-    /// the receiver reads the same handle. Twilight's cache is internally
-    /// synchronized, so concurrent gateway writes and receiver reads are
-    /// safe; the receiver's projection fails closed on any gap instead of
-    /// inventing data.
-    cache: Arc<InMemoryCache>,
+    /// gateway loop feeds events through this pipeline, and coherent guild
+    /// projections hold the shared fence across every cache lookup.
+    cache: Arc<SharedCache>,
     handlers: FunnelHandlers<S, L, F>,
     invites: InviteTracker<P>,
     invite_source: I,
@@ -569,11 +640,7 @@ impl<
             invite_source,
             classifier,
             snapshots,
-            Arc::new(
-                InMemoryCache::builder()
-                    .resource_types(cache_resource_types())
-                    .build(),
-            ),
+            Arc::new(SharedCache::default()),
         )
     }
 
@@ -589,7 +656,7 @@ impl<
         invite_source: I,
         classifier: C,
         snapshots: P,
-        cache: Arc<InMemoryCache>,
+        cache: Arc<SharedCache>,
     ) -> Self {
         Self {
             cache,
@@ -645,10 +712,11 @@ impl<
         &self.handlers
     }
 
-    /// Access the cache (shard runner updates, tests seed).
+    /// Access individual cached objects. Multi-map guild projections must use
+    /// the caller-owned [`SharedCache::with_guild_snapshot`] instead.
     #[must_use]
     pub fn cache(&self) -> &InMemoryCache {
-        &self.cache
+        &self.cache.inner
     }
 
     /// Access the invite source (replay tests queue scripted snapshots).
@@ -763,17 +831,17 @@ impl<
         };
         let guild = guild_id_key(guild_id);
         let users: Vec<_> = self
-            .cache
+            .cache()
             .guild_voice_states(guild)
             .map(|users| users.iter().copied().collect())
             .unwrap_or_default();
         let mut members: Vec<_> = users
             .into_iter()
             .filter(|user| {
-                self.cache
+                self.cache()
                     .voice_state(*user, guild)
                     .is_some_and(|state| state.channel_id().get() == channel_id)
-                    && !self.cache.user(*user).is_some_and(|user| user.bot)
+                    && !self.cache().user(*user).is_some_and(|user| user.bot)
             })
             .map(|user| user.get())
             .collect();
@@ -995,6 +1063,7 @@ impl<
                 // first sighting of a cleared member still clears the gate.
                 let was_pending = self
                     .cache
+                    .inner
                     .member(guild_id_key(guild_id), user_id_key(member_id))
                     .map(|m| m.pending())
                     .unwrap_or(true);
@@ -1085,10 +1154,12 @@ impl<
                 // or a real null frame keeps the legacy READY unknown-end path.
                 let absent_from_roster = self
                     .cache
+                    .inner
                     .guild_voice_states(guild_id_key(guild_id))
                     .is_some_and(|members| !members.contains(&user_id_key(member_id)));
                 let old_channel = self
                     .cache
+                    .inner
                     .voice_state(user_id_key(member_id), guild_id_key(guild_id))
                     .map(|v| v.channel_id().get())
                     .filter(|_| new_channel.is_none() || !absent_from_roster);
@@ -1143,7 +1214,7 @@ impl<
                         previous_channel_id: old_channel,
                         current_channel_id: new_channel,
                         is_bot: self
-                            .cache
+                            .cache()
                             .user(user_id_key(member_id))
                             .is_some_and(|user| user.bot),
                         previous_channel_members: self.voice_room_members(guild_id, old_channel),
@@ -1240,6 +1311,22 @@ mod tests {
     use super::*;
 
     const GUILD: Snowflake = 7;
+
+    #[test]
+    fn guild_snapshot_refuses_during_cache_rebuild_and_fences_the_whole_read() {
+        let cache = SharedCache::default();
+        let rebuild = cache.pending_guilds.write().expect("rebuild fence");
+        assert_eq!(cache.with_guild_snapshot(GUILD, |_| 42), None);
+        drop(rebuild);
+        assert_eq!(
+            cache.with_guild_snapshot(GUILD, |_| {
+                assert!(cache.pending_guilds.try_write().is_err());
+                42
+            }),
+            Some(42)
+        );
+        assert!(cache.pending_guilds.try_write().is_ok());
+    }
 
     #[test]
     fn idle_chains_prune_at_10k_hot_untouched() {

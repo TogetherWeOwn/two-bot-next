@@ -45,7 +45,6 @@ use tokio::{
     task::JoinSet,
 };
 use tracing::Instrument;
-use twilight_cache_inmemory::DefaultInMemoryCache;
 use two_bot_core::{
     automation_transfer::{
         diff_import, export_document, max_import_entries, parse_import_document, ImportOutcome,
@@ -917,7 +916,7 @@ struct ReceiverState {
     /// read. The gateway loop owns the writes through its pipeline; the
     /// receiver only projects. A cold cache reads as `discord_unavailable`,
     /// never as an empty guild.
-    voice_cache: Arc<DefaultInMemoryCache>,
+    voice_cache: Arc<two_bot_discord::SharedCache>,
     /// In-memory join clock feeding the keyless `voice.snapshot`
     /// `rooms[].occupied_since`. The gateway loop owns the writes through its
     /// pipeline observer; the receiver only stamps. An unwired clock reads
@@ -996,7 +995,7 @@ impl ReceiverState {
     /// the gateway pipeline writes through; tests that exercise the verb
     /// seed their own. Anything else keeps the cold default, which reads as
     /// `discord_unavailable`.
-    fn with_voice_cache(mut self, voice_cache: Arc<DefaultInMemoryCache>) -> Self {
+    fn with_voice_cache(mut self, voice_cache: Arc<two_bot_discord::SharedCache>) -> Self {
         self.voice_cache = voice_cache;
         self
     }
@@ -1238,7 +1237,7 @@ pub async fn bind(
     config: InternalActionConfig,
     pool: sqlx::PgPool,
     token: &str,
-    voice_cache: Arc<DefaultInMemoryCache>,
+    voice_cache: Arc<two_bot_discord::SharedCache>,
     voice_clock: Arc<VoiceOccupancyClock>,
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
 ) -> std::io::Result<BoundReceiver> {

@@ -252,14 +252,19 @@ An optional legacy table may be absent only when there are no archived rows for
 it. Nonempty legacy data without a matching target table refuses **before any
 truncate**, rather than silently discarding it.
 
-Four application tables are excluded, each with its reason inline in
+Five application tables are excluded, each with its reason inline in
 `EXCLUDED_TABLES`: `xp_cooldowns` (short-lived award throttles; restore clears
 target cooldowns), `discord_send_admission` (per-credential lane state that a
 recovered process re-learns), `gateway_onboarding_jobs` (a restart-recovery
-queue bound to a gateway session) and `automation_command_registry_resync`
+queue bound to a gateway session), `automation_command_registry_resync`
 (the pending registry-publication marker; a recovered process republishes
-the complete custom-command set on boot regardless). The store chain's `rollback_journal` and
-`rollback_watermarks` are excluded too: the journal is append-only
+the complete custom-command set on boot regardless) and `voice_heat_hours`
+(short-lived derived rolling calibration; a recovered process re-samples from
+the live gateway cache, and the heat grid degrades honestly to "estimate" on
+gaps). Restore truncates the target's `voice_heat_hours` in the same locked
+transaction as the archived tables (skipped when absent, never CASCADE), so
+`web_v1.voice_heat` starts as 168 gap cells; a failed restore keeps the rows.
+The store chain's `rollback_journal` and `rollback_watermarks` are excluded too: the journal is append-only
 cutover evidence (the `PgFunnelStore` funnel append and the production
 gateway batch writer in `crates/cutover/src/gateway_session.rs` journal each
 `events` insert inside the primary transaction under a savepoint best-effort
@@ -270,7 +275,12 @@ Migration ledgers (`_sqlx_migrations`, `schema_migrations` and the store
 chain's `_two_bot_migrations`) describe target DDL and are never restored.
 Replay guards, idempotency records, gateway sessions, lease-bearing durable
 tables and audit history are **not** ephemeral exclusions. Derived `web_v1`
-views contain no independent table data; the website service's own separate
+views contain no independent table data. When the destination has an installed
+contract publication, restore keeps its `contract_version` under the same
+transaction/lock while restoring the archived `guild_id`; an older archive
+cannot downgrade the destination's installed capability. Unpublished targets
+retain archived metadata until view installation reconciles the version. A
+failed restore rolls back both fields. The website service's own separate
 database is out of scope. The migration-backed coverage test compares real
 tables against these classifications, so adding an unclassified table to
 either chain fails CI: the cutover chain is migrated for real, and the store

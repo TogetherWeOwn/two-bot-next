@@ -404,6 +404,7 @@ async fn exercise(pool: &PgPool, roles: &[String]) -> Result<(), sqlx::Error> {
         "next_event",
         "funnel_daily",
         "funnel_by_source",
+        "voice_heat",
     ] {
         as_role(pool, &roles[2], &format!("SELECT * FROM web_v1.{view}")).await?;
     }
@@ -1555,10 +1556,23 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         }
     }
     require(ledger == STAGING_LEDGER29.len(), "29-state incomplete").unwrap();
-    sqlx::raw_sql(include_str!("../../../sql/web_v1.sql"))
+    // The historical ledger predates voice heat. Install its existing views
+    // and strict helper functions, leaving the pending table/view absent.
+    let (staging_views, _) = include_str!("../../../sql/web_v1.sql")
+        .split_once("CREATE OR REPLACE VIEW web_v1.voice_heat AS")
+        .expect("voice heat view boundary");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(staging_views))
         .execute(&provision_pool)
         .await
         .unwrap();
+    let heat_absent: bool = sqlx::query_scalar(
+        "SELECT to_regclass('public.voice_heat_hours') IS NULL \
+         AND to_regclass('web_v1.voice_heat') IS NULL",
+    )
+    .fetch_one(&provision_pool)
+    .await
+    .unwrap();
+    require(heat_absent, "historical ledger already has voice heat").unwrap();
     sqlx::raw_sql("CREATE TABLE public._sqlx_migrations (version bigint PRIMARY KEY);")
         .execute(&provision_pool)
         .await
@@ -1649,6 +1663,19 @@ async fn scratch_bootstrap_flow_from_staging_ledger() {
         }
     }
     require(!pending.is_empty(), "no pending migrations applied").unwrap();
+    // Refresh the full contract as the migrator only after its new table exists.
+    sqlx::raw_sql(include_str!("../../../sql/web_v1.sql"))
+        .execute(&migrator_pool)
+        .await
+        .unwrap();
+    let heat_cells: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM web_v1.voice_heat \
+         WHERE source = 'insufficient' AND avg_in_voice IS NULL AND coverage = 0",
+    )
+    .fetch_one(&migrator_pool)
+    .await
+    .unwrap();
+    require(heat_cells == 168, "pending heat view grid incomplete").unwrap();
     let pending_rows = pending
         .iter()
         .map(|version| format!("({version})"))

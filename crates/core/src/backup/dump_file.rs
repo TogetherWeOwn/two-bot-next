@@ -376,6 +376,11 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "backfill_history_counts",
     "member_catchup_cursors",
     "member_catchup_members",
+    // Voice-heat hourly aggregates (0471/0472): short-lived derived rolling
+    // calibration, not source data. A restore re-samples from the live gateway
+    // cache; stale pre-restore hours would mislabel the freshness of the heat
+    // grid, which already degrades honestly to "estimate" on gaps.
+    "voice_heat_hours",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
     // manifest metadata only, never restored application data. The store
