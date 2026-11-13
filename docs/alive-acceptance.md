@@ -37,9 +37,10 @@ five-second step deadlines. Assertion failures print captured stdout/stderr.
 | Logging | Listener log precedes gateway initialization; committed-ready log on each boot |
 | JSON logging | Request `LOG_FORMAT=json` (the binary defaults to JSON: `crates/bot/src/logging.rs:28-32`); validate every emitted line as a JSON object with a string `msg` (`crates/bot/tests/alive.rs:678-689`) |
 
-The mock uses one stable endpoint across boots. The second child receives an
-unreachable bootstrap URL, proving that its unchanged persisted resume endpoint
-is actually selected. HELLO and READY/RESUMED are separately gated by the test.
+The mock uses one stable endpoint across boots. Separate tests restart with an
+unreachable bootstrap or a distinct accepting loopback decoy. Both require
+RESUME at the unchanged saved endpoint, raw wire-URL persistence and no decoy
+connections. HELLO and READY/RESUMED remain separately gated.
 
 ## Binary lifecycle seams
 
@@ -61,3 +62,8 @@ is actually selected. HELLO and READY/RESUMED are separately gated by the test.
   (`crates/bot/tests/alive.rs:136`) and requires every line to parse as JSON
   with a string `msg` (`crates/bot/tests/alive.rs:681-689`). Re-checked at
   `bce86a791`.
+
+The fixture teardown regression exercises success, caught assertion and deadline
+paths. It checks child reap, consumed readers, joined mock/request tasks, socket
+rebind and owned-schema absence. Uncertain cleanup retains schemas and fails;
+source assertions are not evidence that an Actions execution passed.
