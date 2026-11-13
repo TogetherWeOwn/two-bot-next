@@ -218,10 +218,14 @@ struct Bot {
 }
 
 impl Bot {
-    fn spawn(db: &TestDb, addr: SocketAddr, gateway: &str, api: &str, logs: &Logs) -> Self {
+    fn spawn(db: &TestDb, addr: SocketAddr, gateway: Option<&str>, api: &str, logs: &Logs) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_two-bot"));
         command.env_clear();
-        command.env("DISCORD_GATEWAY_URL", gateway);
+        // No gateway override is a strict-boot probe: onboarding must reject.
+        match gateway {
+            Some(gateway) => command.env("DISCORD_GATEWAY_URL", gateway),
+            None => command.env("TWO_ONBOARDING_MODE", "invalid-probe"),
+        };
         let mut child = command
             .env("LISTEN_ADDR", addr.to_string())
             .env("DISCORD_TOKEN", "alive-synthetic-token")
@@ -706,7 +710,7 @@ async fn lifecycle(
         } else {
             decoy.unwrap_or("ws://127.0.0.1:1")
         };
-        bots.push(Bot::spawn(db, addr, gateway, &discord.api, logs));
+        bots.push(Bot::spawn(db, addr, Some(gateway), &discord.api, logs));
         let bot = bots.last_mut().unwrap();
         let health = wait_http(bot, addr, "/healthz", 200).await;
         assert!(health.contains("\"status\":\"ok\""));
@@ -1092,7 +1096,7 @@ async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outc
         ];
         let schema = db.schema.clone();
         let logs = Logs::default();
-        let mut bot = Bot::spawn(&db, addr, &discord.url, &discord.api, &logs);
+        let mut bot = Bot::spawn(&db, addr, Some(&discord.url), &discord.api, &logs);
         let exercised = AssertUnwindSafe(timeout(STEP, async {
             wait_http(&mut bot, addr, "/healthz", 200).await;
             // Health precedes gateway initialization. Finish the upgrade before
