@@ -1412,6 +1412,30 @@ class OrchestrationTests(OfflineTestCase):
         self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
         self.assert_no_evidence()
 
+    def test_final_stale_listing_read_past_deadline_reports_drift(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+        original_api = client.api
+        rollout_reads = 0
+
+        def delayed_api(path):
+            nonlocal rollout_reads
+            result = original_api(path)
+            if path == ROWS_PATH:
+                rollout_reads += 1
+                if rollout_reads == 2:
+                    self.clock.now = client.deadline
+            return result
+
+        client.api = delayed_api
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        self.assertEqual(caught.exception.detail, "listing_image=baseline later_rollouts=0")
+        self.assert_no_evidence()
+
     def lag_client(self, readyz_routes):
         lagged = lag_row()
         client = verify_client()

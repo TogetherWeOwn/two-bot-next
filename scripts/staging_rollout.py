@@ -1036,7 +1036,9 @@ def verify(args, client):
                                             image_drift_detail(client, final_app, final, image))
                         listing_lag = final_image != image
                         if complete or lag_streak + 1 >= ACTIVE_LAG_CONFIRMATIONS:
-                            require(time.monotonic() < client.deadline, "rollout_timeout")
+                            deadline_aware_read(
+                                client, lambda: require(time.monotonic() < client.deadline, "rollout_timeout"),
+                                final_app, final, image, listing_lag, verification_started)
                             evidence = {"verification_elapsed_seconds": round(time.monotonic() - verification_started, 3),
                                         "worker_version": version, "application_id": app["id"],
                                         "rollout_id": pinned["id"],
