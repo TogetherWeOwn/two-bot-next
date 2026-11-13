@@ -328,6 +328,12 @@ async fn writer_policies(db: &TestDb) {
                 } else {
                     ""
                 };
+            sqlx::query("UPDATE invite_snapshots SET uses = 2 WHERE guild_id = $1 AND code = $2")
+                .bind(GUILD)
+                .bind("fixture")
+                .execute(&db.pool)
+                .await
+                .unwrap();
             writer_cases(db, &store, url, expected).await;
         }
     }
