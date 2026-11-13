@@ -164,9 +164,12 @@ the canonical renderer; no database, deployment or live values are needed.
 
 Configuration remains tracked. Deliberate catalog/supplement changes require
 explicit regeneration through the canonical `regenerate_reference_docs` test in
-`crates/core/tests/reference_docs.rs`, which writes both references. **There is no
-configured Actions route that runs this writer and returns the updated
-configuration.** The ordinary generator only validates tracked configuration;
+`crates/core/tests/reference_docs.rs`, which writes both references. The
+`configuration-reference.yml` workflow is a one-off hosted writer for source
+SHA `5e0fb45936f06ea1495b8da2ea77ad3d0e4951b8`; it uploads only the configuration
+reference and its provenance, not generated command rows. Its pull request job
+runs only for the writer's own PR, including while it is a draft. The ordinary
+generator only validates tracked configuration;
 it fails on drift before writing commands, and nightly explicitly skips the
 writer to avoid hiding drift.
 
@@ -174,10 +177,10 @@ For a catalog-change task, the author must first arrange narrowly scoped hosted
 regeneration and output retrieval with the CI maintainer through normal
 PR/review gates: bind the writer to the task's exact source SHA, retain run/job
 links and retrieve `docs/configuration.md` for review and commit. This is an
-unmet agent prerequisite, not an already approved command or workflow. Route any
-disputed technical permission to the Engineering Lead; do not invent an approved
-environment, grant a local exception, or silently hand-edit around the writer.
-This documentation does not add that route or authorize regeneration. Never run
+prerequisite for any other source SHA: the one-off workflow does not authorize
+arbitrary source refs. Route any disputed technical permission to the Engineering
+Lead; do not invent an approved environment, grant a local exception, or silently
+hand-edit around the writer. Never run
 a shared-host build or CI mirror. Review and commit only the configuration
 change, never generated command rows. Ordinary reference tests compare bytes
 and never regenerate silently: absent, stale or malformed generated output and

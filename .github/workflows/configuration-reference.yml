@@ -1,0 +1,53 @@
+name: configuration reference snapshot
+
+on:
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: configuration-reference-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  configuration-reference:
+    # This one-off writer runs only on its own PR, including while it is a draft.
+    if: ${{ github.event.pull_request.number == 2081 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the fixed source snapshot
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 5e0fb45936f06ea1495b8da2ea77ad3d0e4951b8
+          persist-credentials: false
+      - name: Verify source identity
+        run: test "$(git rev-parse HEAD)" = 5e0fb45936f06ea1495b8da2ea77ad3d0e4951b8
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
+        with:
+          toolchain: "1.99.1"
+      - name: Regenerate reference documents
+        run: |
+          mkdir -p docs/generated
+          cargo test --locked -p two-bot-core --test reference_docs regenerate_reference_docs -- --ignored --exact
+      - name: Record artifact provenance
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p reference-output
+          cp docs/configuration.md reference-output/configuration.md
+          git rev-parse HEAD > reference-output/source-sha.txt
+          printf '%s\n' "$WORKFLOW_SHA" > reference-output/workflow-sha.txt
+          printf '%s\n' "$PR_HEAD_SHA" > reference-output/pr-head-sha.txt
+          (cd reference-output && sha256sum configuration.md > sha256.txt)
+      - name: Upload configuration reference
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
+        with:
+          name: configuration-reference-5e0fb45936f06ea1495b8da2ea77ad3d0e4951b8
+          path: reference-output/
+          if-no-files-found: error
+          retention-days: 3
