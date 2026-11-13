@@ -220,8 +220,7 @@ class NativeRustToolchainTest(unittest.TestCase):
         self.assertNotIn("GITHUB_STATE", text)
 
     def test_all_installers_keep_their_components_and_checkout_order(self):
-        # Only check.yml has migrated; the other workflows keep the dtolnay
-        # action until their own migrations, so they must have no native step.
+        # Unlisted workflows retain the action until their own migrations.
         expected = {
             "check.yml": {
                 "check": "rustfmt, clippy", "rust-tests": "rustfmt, clippy", "coverage-plan": "",
@@ -229,13 +228,15 @@ class NativeRustToolchainTest(unittest.TestCase):
                 "ignored-db-runtime": "rustfmt, clippy", "moderation-db": "clippy", "self-role-store": "",
                 "community-db": "clippy", "feeds-db": "clippy", "tickets-postgres": "", "fuzz-compile": "rust-src",
             },
+            "helix-token-fuzz-smoke.yml": {"helix-token-smoke": "rust-src"},
+            "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke": "rust-src"},
         }
         actual = {}
         for path in (ROOT / ".github/workflows").glob("*.yml"):
             doc = yaml.safe_load(path.read_text())
             for job_id, job in doc["jobs"].items():
                 for index, step in enumerate(job.get("steps", [])):
-                    if path.name == "check.yml":
+                    if path.name in expected:
                         self.assertNotIn("dtolnay/rust-toolchain@", step.get("uses", ""))
                     if step.get("run") != "bash .github/scripts/install-rust-toolchain.sh":
                         continue
@@ -244,6 +245,8 @@ class NativeRustToolchainTest(unittest.TestCase):
                         actual.setdefault(path.name, {})[job_id] = step["env"]["RUST_COMPONENTS"]
                         self.assertEqual(step["shell"], "bash")
                         self.assertNotIn("with", step)
+                        if path.name in {"helix-token-fuzz-smoke.yml", "vote-kick-fuzz-smoke.yml"}:
+                            self.assertEqual(step["env"]["RUST_TOOLCHAIN"], "nightly-2026-10-01")
                         self.assertTrue(any(s.get("uses", "").startswith("actions/checkout@")
                                             for s in job["steps"][:index]))
         self.assertEqual(actual, expected)
