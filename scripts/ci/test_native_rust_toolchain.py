@@ -21,7 +21,16 @@ printf '%s %s\\n' "${{0##*/}}" "$*" >> "$FAKE_CALLS"
 if [ "${{0##*/}}" = rustup ]; then
   printf 'permit=%s\\n' "${{RUSTUP_PERMIT_COPY_RENAME:-}}" >> "$FAKE_CALLS"
   case "$1" in
-    toolchain) [ -z "${{FAKE_FAIL_INSTALL:-}}" ] || exit 1 ;;
+    toolchain)
+      [ -z "${{FAKE_FAIL_INSTALL:-}}" ] || exit 1
+      count=0
+      [ ! -f "$FAKE_COUNT" ] || read -r count < "$FAKE_COUNT"
+      count=$((count + 1))
+      printf '%s\n' "$count" > "$FAKE_COUNT"
+      if [ "$count" -le "${{FAKE_FAILURES:-0}}" ]; then
+        printf '%s\n' "$FAKE_DIAGNOSTIC" >&2
+        exit 42
+      fi ;;
     default) [ -z "${{FAKE_FAIL_DEFAULT:-}}" ] || exit 1 ;;
   esac
 fi
@@ -40,6 +49,11 @@ class NativeRustToolchainTest(unittest.TestCase):
                 shim = bin_dir / tool
                 shim.write_text(SHIM.format(bash=BASH))
                 shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+            for tool in ("mktemp", "rm", "grep", "tee"):
+                (bin_dir / tool).symlink_to(shutil.which(tool))
+            sleep = bin_dir / "sleep"
+            sleep.write_text(f"#!{BASH}\nprintf 'sleep %s\\n' \"$*\" >> \"$FAKE_CALLS\"\n")
+            sleep.chmod(sleep.stat().st_mode | stat.S_IXUSR)
             calls = tmp_path / "calls.txt"
             github_env = tmp_path / "github_env"
             calls.write_text("")
@@ -49,6 +63,7 @@ class NativeRustToolchainTest(unittest.TestCase):
                 "HOME": tmp,
                 "CARGO_HOME": "/fixture/cargo",
                 "FAKE_CALLS": str(calls),
+                "FAKE_COUNT": str(tmp_path / "count"),
                 "GITHUB_ENV": str(github_env),
                 "RUST_TOOLCHAIN": "1.99.1",
                 "RUST_COMPONENTS": "",
@@ -112,6 +127,44 @@ class NativeRustToolchainTest(unittest.TestCase):
         self.assertEqual(len([c for c in calls if c.startswith("rustup toolchain install")]), 1)
         self.assertFalse([c for c in calls if c.startswith("rustup default")])
         self.assertEqual(github_env, [])
+
+    def test_checksum_retry_recovery_and_exhaustion(self):
+        diagnostic = ("checksum failed for archive\n"
+                      "this is likely due to an ongoing update of the official release server")
+        for failures in (2, 5):
+            with self.subTest(failures=failures):
+                proc, calls, _, github_env = self.run_script(env={
+                    "FAKE_FAILURES": str(failures), "FAKE_DIAGNOSTIC": diagnostic,
+                    "RUST_COMPONENTS": "rustfmt,clippy",
+                })
+                installs = [c for c in calls if c.startswith("rustup toolchain install")]
+                self.assertEqual(len(installs), min(failures + 1, 5))
+                self.assertTrue(all(c == installs[0] for c in installs))
+                self.assertEqual(calls.count("sleep 30"), min(failures, 4))
+                self.assertEqual(proc.stdout.count(diagnostic), failures)
+                self.assertEqual(proc.stderr.count("Retrying rustup"), min(failures, 4))
+                if failures == 5:
+                    self.assertEqual(proc.returncode, 42)
+                    self.assertFalse(any(c.startswith("rustup default") for c in calls))
+                    self.assertEqual(github_env, [])
+                else:
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertTrue(any(c.startswith("rustup default") for c in calls))
+                    self.assertTrue(github_env)
+
+    def test_other_errors_do_not_retry(self):
+        for diagnostic in ("unrelated failure", "checksum failed for archive",
+                           "this is likely due to an ongoing update of the official release server"):
+            with self.subTest(diagnostic=diagnostic):
+                proc, calls, _, github_env = self.run_script(env={
+                    "FAKE_FAILURES": "5", "FAKE_DIAGNOSTIC": diagnostic,
+                })
+                self.assertEqual(proc.returncode, 42)
+                self.assertIn(diagnostic, proc.stdout)
+                self.assertEqual(len([c for c in calls if c.startswith("rustup toolchain install")]), 1)
+                self.assertNotIn("sleep 30", calls)
+                self.assertFalse(any(c.startswith("rustup default") for c in calls))
+                self.assertEqual(github_env, [])
 
     def test_default_and_version_failures_fail(self):
         for flag in ("FAKE_FAIL_DEFAULT", "FAKE_FAIL_RUSTC"):
