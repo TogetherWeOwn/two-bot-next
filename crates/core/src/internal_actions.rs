@@ -530,6 +530,11 @@ pub enum ErrorCode {
     Unauthorized,
     StaleRequest,
     ActionNotAllowed,
+    /// Well-formed key with no record behind it (the attendance read's
+    /// unknown-key and no-sessions answers). The Worker already relays
+    /// `not_found`/404 from its boundary refusals; this is the first
+    /// receiver-constructed use of the code.
+    NotFound,
     Replayed,
     /// A settings row changed since the caller observed it; refresh, do not retry blindly.
     VersionConflict,
@@ -552,6 +557,7 @@ impl ErrorCode {
             Self::Unauthorized => "unauthorized",
             Self::StaleRequest => "stale_request",
             Self::ActionNotAllowed => "action_not_allowed",
+            Self::NotFound => "not_found",
             Self::Replayed => "replayed",
             Self::VersionConflict => "version_conflict",
             Self::InProgress => "in_progress",
@@ -570,6 +576,7 @@ impl ErrorCode {
             Self::Malformed => 400,
             Self::Unauthorized | Self::StaleRequest => 401,
             Self::ActionNotAllowed => 403,
+            Self::NotFound => 404,
             Self::Replayed | Self::VersionConflict | Self::InProgress => 409,
             Self::DiscordRejected => 422,
             Self::RateLimited => 429,
@@ -592,6 +599,7 @@ impl ErrorCode {
             | Self::Unauthorized
             | Self::StaleRequest
             | Self::ActionNotAllowed
+            | Self::NotFound
             | Self::Replayed
             | Self::VersionConflict
             | Self::DiscordRejected => false,
@@ -669,10 +677,11 @@ pub fn auth_failure(log_reason: impl Into<String>) -> ActionError {
 
 /// Every verb the endpoint will run, in legacy publish order: the card's 18
 /// plus `event.read`, the narrow mapped-event verifier that landed later
-/// (TOG-5510), plus `voice.snapshot`, the keyless gateway-cache read. Adding
-/// a verb here without deciding which side of [`NEEDS_IDEMPOTENCY_KEY`] it
-/// falls on is the mistake that set exists to prevent.
-pub const IMPLEMENTED_ACTIONS: [&str; 20] = [
+/// (TOG-5510), plus `voice.snapshot`, the keyless gateway-cache read, plus
+/// `event.attendance.read`, the keyless event-window voice-session read.
+/// Adding a verb here without deciding which side of [`NEEDS_IDEMPOTENCY_KEY`]
+/// it falls on is the mistake that set exists to prevent.
+pub const IMPLEMENTED_ACTIONS: [&str; 21] = [
     "role.assign",
     "guild.add_member",
     "announcement.post",
@@ -693,6 +702,7 @@ pub const IMPLEMENTED_ACTIONS: [&str; 20] = [
     "moderation.lockdown",
     "moderation.unlock",
     "voice.snapshot",
+    "event.attendance.read",
 ];
 
 /// Actions where a repeat is not harmless, so the caller must send an
@@ -844,6 +854,14 @@ impl InternalFlags {
         // every other post-launch verb; absent or non-`1` stays refused.
         if flag("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT") {
             enabled.insert("voice.snapshot".to_owned());
+        }
+        // Keyless event-window attendance read from the session log. Default
+        // off like every other post-launch verb; absent or non-`1` stays
+        // refused. The flag gates both halves: the read verb here and the
+        // logger on the bot side (see `crate::event_attendance`), so both
+        // stay dark until the operator flips it after staging verification.
+        if flag("TWO_INTERNAL_ALLOW_ATTENDANCE_READ") {
+            enabled.insert("event.attendance.read".to_owned());
         }
         // Merely shipping the implementation must not widen the allowlist.
         if flag("TWO_INTERNAL_ALLOW_AUTOMATIONS") {
@@ -2108,7 +2126,7 @@ pub const ADMIN_SCOPE_ADMIN: &str = "admin";
 impl InternalFlags {
     /// Scope the admin API requires for `action` (scope map v0).
     ///
-    /// Covers the 20 verbs the endpoint runs today: 4 read, 8 moderate and
+    /// Covers the 21 verbs the endpoint runs today: 5 read, 8 moderate and
     /// 8 admin. `role.assign` is deliberately admin (a privilege grant, not
     /// membership tooling). Later slices extend the map with new verbs;
     /// anything unmapped — including strings that can never be verbs —
@@ -2116,9 +2134,11 @@ impl InternalFlags {
     #[must_use]
     pub fn required_admin_scope(action: &str) -> Option<&'static str> {
         match action {
-            "settings.get" | "event.read" | "automations.export" | "voice.snapshot" => {
-                Some(ADMIN_SCOPE_READ)
-            }
+            "settings.get"
+            | "event.read"
+            | "automations.export"
+            | "voice.snapshot"
+            | "event.attendance.read" => Some(ADMIN_SCOPE_READ),
             "moderation.warn"
             | "moderation.timeout"
             | "moderation.kick"
@@ -2857,6 +2877,7 @@ mod tests {
             (ErrorCode::Unauthorized, 401, false),
             (ErrorCode::StaleRequest, 401, false),
             (ErrorCode::ActionNotAllowed, 403, false),
+            (ErrorCode::NotFound, 404, false),
             (ErrorCode::Replayed, 409, false),
             (ErrorCode::VersionConflict, 409, false),
             (ErrorCode::InProgress, 409, true),
@@ -2870,6 +2891,7 @@ mod tests {
             assert_eq!(code.status(), status, "{:?}", code);
             assert_eq!(code.retryable(), retryable, "{:?}", code);
         }
+        assert_eq!(ErrorCode::NotFound.as_str(), "not_found");
         assert_eq!(auth_failure("x").message, AUTH_FAILURE_MESSAGE);
         assert_eq!(auth_failure("x").code, ErrorCode::Unauthorized);
     }
@@ -2911,8 +2933,11 @@ mod tests {
         assert!(on("TWO_INTERNAL_ALLOW_EVENT_CANCEL").is_enabled("event.cancel"));
         assert!(on("TWO_INTERNAL_ALLOW_EVENT_READ").is_enabled("event.read"));
         assert!(on("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT").is_enabled("voice.snapshot"));
+        assert!(on("TWO_INTERNAL_ALLOW_ATTENDANCE_READ").is_enabled("event.attendance.read"));
         // No flag, no read: the voice snapshot stays dark by default.
         assert!(!InternalFlags::from_map(&HashMap::new()).is_enabled("voice.snapshot"));
+        // No flag, no attendance: the attendance read stays dark by default.
+        assert!(!InternalFlags::from_map(&HashMap::new()).is_enabled("event.attendance.read"));
         let auto = on("TWO_INTERNAL_ALLOW_AUTOMATIONS");
         assert!(auto.is_enabled("automations.import"));
         assert!(auto.is_enabled("automations.export"));
@@ -3041,11 +3066,12 @@ mod tests {
         // slices add two env-only keys
         // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID). The
         // voice.snapshot read adds one env-only key
-        // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT).
+        // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT). The event.attendance.read
+        // adds one env-only key (TWO_INTERNAL_ALLOW_ATTENDANCE_READ).
         for (class, expected) in [
             (SettingClass::Hot, 52),
             (SettingClass::Cold, 18),
-            (SettingClass::EnvOnly, 67),
+            (SettingClass::EnvOnly, 68),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),

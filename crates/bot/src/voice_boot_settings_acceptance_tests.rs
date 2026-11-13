@@ -119,8 +119,14 @@ fn boot_with_token(token: &str, pairs: &[(&str, &str)]) -> (Result<(), RoomHttpE
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://agent_test@agent-testdb:5432/agent_test")
         .expect("a lazy pool needs no database connection");
-    let result =
-        build_production_runtime(token, pool, AutomodPolicy::default(), || None).map(|_| ());
+    let result = build_production_runtime(
+        token,
+        pool,
+        AutomodPolicy::default(),
+        || None,
+        Default::default(),
+    )
+    .map(|_| ());
     let logged = capture.text()[start..].to_owned();
     for (key, value) in prior {
         match value {

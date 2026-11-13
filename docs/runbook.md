@@ -1320,8 +1320,10 @@ Refused `two_bot_internal_actions_total` outcomes rose for one family in
 3 consecutive keepalive samples. Every outcome other than `executed`
 (`auth_failure`, `unknown_key`, `clock_skew`, `nonce_replay`,
 `rate_limit`, `unknown_action`, `action_disabled`, `malformed_body`,
-`conflict`, `upstream`, `internal`) counts as a refusal: the signed
-website-action receiver saw the request and refused it. The streak (not
+`conflict`, `upstream`, `not_found`, `internal`) counts as a refusal: the signed
+website-action receiver saw the request and refused it (routine
+`not_found` lookups count too, so steady site polling of an unmapped key
+raises its family's streak rather than reading as silence). The streak (not
 a single window) pages, because a receiver-abuse or refusal storm stays
 quiet through the burn math while one forged probe must not. The firing
 key names its family (`receiver_refusals:moderation`). The first sample

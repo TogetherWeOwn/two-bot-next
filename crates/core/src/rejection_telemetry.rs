@@ -70,11 +70,17 @@ pub enum RejectionClass {
     Upstream,
     /// Server-side failure (misconfiguration, storage unavailable).
     Internal,
+    /// A well-formed, authorized request with no record behind it (the
+    /// attendance read's unknown-key and no-sessions answers). Routine
+    /// negative lookups, not an attack or a failure; the separate class
+    /// keeps them from reading as either on the alertable signal. Last so
+    /// the existing indices stay stable.
+    NotFound,
 }
 
 impl RejectionClass {
     /// Every class, in index order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::AuthFailure,
         Self::UnknownKey,
         Self::ClockSkew,
@@ -86,6 +92,7 @@ impl RejectionClass {
         Self::Conflict,
         Self::Upstream,
         Self::Internal,
+        Self::NotFound,
     ];
     /// Number of classes; also the number of `other` overflow buckets.
     pub const COUNT: usize = Self::ALL.len();
@@ -112,6 +119,7 @@ impl RejectionClass {
             | ErrorCode::DiscordUnavailable
             | ErrorCode::UpstreamTimeout => Self::Upstream,
             ErrorCode::Internal => Self::Internal,
+            ErrorCode::NotFound => Self::NotFound,
         }
     }
 
@@ -130,6 +138,7 @@ impl RejectionClass {
             Self::Conflict => "conflict",
             Self::Upstream => "upstream",
             Self::Internal => "internal",
+            Self::NotFound => "not_found",
         }
     }
 

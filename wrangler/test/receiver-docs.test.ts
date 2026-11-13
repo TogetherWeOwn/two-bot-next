@@ -25,8 +25,11 @@ const headers = {
   "idempotency-key": `intent-${randomBytes(6).toString("hex")}`,
   [REQUEST_ID_HEADER]: id,
 };
+// NOT_FORWARDED excludes generic flag forwarding; attendance has its own
+// exact-value receiver-gated path, unlike the other capability switches.
 const blocked = Object.entries(NOT_FORWARDED).filter(([key, reason]) =>
-  (key.startsWith("TWO_INTERNAL_ALLOW_") || key === "TWO_INTERNAL_ROLE_KEYS") && !reason.includes("test-only"))
+  (key.startsWith("TWO_INTERNAL_ALLOW_") || key === "TWO_INTERNAL_ROLE_KEYS") &&
+  key !== "TWO_INTERNAL_ALLOW_ATTENDANCE_READ" && !reason.includes("test-only"))
   .map(([key]) => key);
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -45,6 +48,7 @@ function startupEnv(): Record<string, string> {
     };
     const env = {
       TWO_INTERNAL_ACTIONS: "1", TWO_INTERNAL_CALLERS: "fixture:website",
+      TWO_INTERNAL_ALLOW_ATTENDANCE_READ: "1",
       TWO_INTERNAL_CHANNEL_KEYS: "fixture:123456789012345678",
       TWO_INTERNAL_KEYS: `fixture:${randomBytes(32).toString("hex")}`,
       ...Object.fromEntries(blocked.map((key) => [key, key.endsWith("ROLE_KEYS") ? "member:123456789012345678" : "1"])),
@@ -185,6 +189,7 @@ function conforms(markdown: string, evidence: Evidence): void {
   assert.doesNotMatch(markdown, /status.*and.*error_class.*only/i, "stale log-field promise");
   const wiring = table(markdown, "Name").map((row) => row[0]!);
   assert.deepEqual(wiring.sort(), Object.keys(evidence.env).filter((key) => key.startsWith("TWO_INTERNAL_")).sort());
+  assert.equal(evidence.env["TWO_INTERNAL_ALLOW_ATTENDANCE_READ"], "1");
   assert.deepEqual(table(markdown, "Not forwarded").map((row) => row[0]).sort(), blocked.sort());
   for (const key of blocked) assert.equal(evidence.env[key], undefined, key);
   const gate = table(markdown, "Layer").find((row) => row[0] === "Gate")?.[1] ?? "";
@@ -205,6 +210,8 @@ test("receiver runbook matches observed budgets, headers, logs and container wir
     ["old logs only", doc.replace(/^\| Logs \|.*$/m, "| Logs | Scalar internal_actions_ingress events: status and error_class only. |")],
     ["missing release", doc.replace(/^\| release \|.*\n/m, "")],
     ["forwarded role keys", doc.replace("| `TWO_INTERNAL_KEYS` |", "| `TWO_INTERNAL_ROLE_KEYS` | Worker secret |\n| `TWO_INTERNAL_KEYS` |")],
+    ["missing attendance forwarding", doc.replace(/^\| `TWO_INTERNAL_ALLOW_ATTENDANCE_READ` \|.*\n/m, "")],
+    ["attendance incorrectly unforwarded", doc.replace("| Not forwarded | Effect |", "| Not forwarded | Effect |\n| `TWO_INTERNAL_ALLOW_ATTENDANCE_READ` | stays gated off |")],
     ["stage role keys", doc.replace("2. Operator stages", "2. Operator stages `TWO_INTERNAL_ROLE_KEYS`, then stages")],
     ["wrong timeout code", doc.replace("| `upstream_timeout` | true |", "| `request_timeout` | true |")],
     ["stale idempotency cap", doc.replace(/^\| idempotency-key \|.*$/m, "| idempotency-key | Optional at ingress; at most 999 bytes. Receiver action rules still apply |")],

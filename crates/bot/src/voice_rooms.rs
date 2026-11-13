@@ -122,6 +122,9 @@ use two_bot_core::{
     AutomodPolicy, CommandDefinition, OverwriteTarget, PermissionFinding,
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
+use two_bot_cutover::event_attendance::{
+    AttendanceSession, AttendanceWindow, NewAttendanceSession,
+};
 use two_bot_cutover::voice_rooms::{CreateClaim, JoinGrantIntent, OwnerGrantIntent, PgRoomStore};
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, MessageRef, RoomChannelAttributes,
@@ -150,6 +153,7 @@ pub enum StoreError {
     Unavailable,
     CredentialRefused,
     Conflict,
+    AttendanceMetadataUnsupported,
 }
 
 impl std::fmt::Display for StoreError {
@@ -160,6 +164,7 @@ impl std::fmt::Display for StoreError {
             Self::Unavailable => "the store is unavailable",
             Self::CredentialRefused => "the store refused the bot credential",
             Self::Conflict => "the store reported a conflict",
+            Self::AttendanceMetadataUnsupported => "the attendance metadata is unsupported",
         })
     }
 }
@@ -445,6 +450,177 @@ pub trait RoomPersistence: Send + Sync {
     ) -> impl Future<Output = Result<u64, StoreError>> + Send {
         let _ = (event_id, instance, present);
         async { Ok::<u64, StoreError>(0) }
+    }
+    /// Minimal bounded recovery page, never an unbounded guild session read.
+    /// A known member limits the read to that member; unsupported stores refuse
+    /// that scope rather than broadening it to unrelated guild members.
+    fn attendance_recovery_page(
+        &self,
+        guild: Snowflake,
+        member: Option<Snowflake>,
+        after_id: i64,
+    ) -> impl Future<
+        Output = Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError>,
+    > + Send {
+        let _ = (guild, after_id);
+        async move {
+            if member.is_some() {
+                Err(StoreError::Unavailable)
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+    /// Conservative recovery only: no new rows, tags or inferred leave times.
+    fn recover_attendance_sessions(
+        &self,
+        guild: Snowflake,
+        ids: &[i64],
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send {
+        let _ = (guild, ids);
+        async { Ok(0) }
+    }
+    /// Mapped attendance windows for one guild, for the session logger.
+    /// Default empty for stores without the attendance tables.
+    fn attendance_windows(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        previous: Option<Snowflake>,
+        observed_at: OffsetDateTime,
+    ) -> impl Future<Output = Result<Vec<AttendanceWindow>, StoreError>> + Send {
+        let _ = (guild, member, previous, observed_at);
+        async { Ok::<Vec<AttendanceWindow>, StoreError>(Vec::new()) }
+    }
+    /// The member's still-open attendance rows in the guild. Default empty
+    /// for stores without the attendance tables.
+    fn open_attendance_sessions(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<Vec<AttendanceSession>, StoreError>> + Send {
+        let _ = (guild, member);
+        async { Ok::<Vec<AttendanceSession>, StoreError>(Vec::new()) }
+    }
+    /// Open one attendance row; returns the new row id. Default no-op for
+    /// stores without the attendance tables.
+    fn insert_attendance_session(
+        &self,
+        new: NewAttendanceSession,
+    ) -> impl Future<Output = Result<i64, StoreError>> + Send {
+        let _ = new;
+        async { Ok::<i64, StoreError>(0) }
+    }
+    /// Finalize one open attendance row; returns rows closed. Default no-op
+    /// for stores without the attendance tables.
+    fn close_attendance_session(
+        &self,
+        id: i64,
+        left_at: OffsetDateTime,
+        channel_name: Option<String>,
+        event_keys: &[String],
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send {
+        let _ = (id, left_at, channel_name, event_keys);
+        async { Ok::<u64, StoreError>(0) }
+    }
+    /// Every session tagged with one event key in the guild, for the
+    /// attendance read. Default empty for stores without the tables.
+    fn attendance_sessions_for_event_key(
+        &self,
+        guild: Snowflake,
+        event_key: &str,
+    ) -> impl Future<Output = Result<Vec<AttendanceSession>, StoreError>> + Send {
+        let _ = (guild, event_key);
+        async { Ok::<Vec<AttendanceSession>, StoreError>(Vec::new()) }
+    }
+    /// Whether the pair holds a guild-scoped opt-out suppression row. The
+    /// attendance logger consults this before opening a span; a suppressed
+    /// member opens nothing. Default unsuppressed for stores without the
+    /// privacy tables.
+    fn is_attendance_suppressed(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let _ = (guild, member);
+        async { Ok::<bool, StoreError>(false) }
+    }
+    /// Whether guild-wide voice capture is enabled (`voice_enabled`, missing
+    /// row means enabled). Default enabled for stores without the settings
+    /// table.
+    fn is_attendance_voice_enabled(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        let _ = guild;
+        async { Ok::<bool, StoreError>(true) }
+    }
+}
+
+/// Every `RoomPersistence` store satisfies the attendance logger's narrow
+/// surface by forwarding. The binary reaches the pure projection half through
+/// `two_bot::event_attendance`, so it needs no impl.
+impl<T: RoomPersistence> crate::event_attendance::AttendanceStore for T {
+    type Error = StoreError;
+    fn unsupported_stored_tags(error: &Self::Error) -> bool {
+        *error == StoreError::AttendanceMetadataUnsupported
+    }
+    fn attendance_windows(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        previous: Option<Snowflake>,
+        observed_at: OffsetDateTime,
+    ) -> impl Future<Output = Result<Vec<AttendanceWindow>, Self::Error>> + Send {
+        <T as RoomPersistence>::attendance_windows(self, guild, member, previous, observed_at)
+    }
+    fn open_attendance_sessions(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<Vec<AttendanceSession>, Self::Error>> + Send {
+        <T as RoomPersistence>::open_attendance_sessions(self, guild, member)
+    }
+    fn insert_attendance_session(
+        &self,
+        new: NewAttendanceSession,
+    ) -> impl Future<Output = Result<i64, Self::Error>> + Send {
+        <T as RoomPersistence>::insert_attendance_session(self, new)
+    }
+    fn close_attendance_session(
+        &self,
+        id: i64,
+        left_at: OffsetDateTime,
+        channel_name: Option<String>,
+        event_keys: &[String],
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+        <T as RoomPersistence>::close_attendance_session(
+            self,
+            id,
+            left_at,
+            channel_name,
+            event_keys,
+        )
+    }
+    fn attendance_sessions_for_event_key(
+        &self,
+        guild: Snowflake,
+        event_key: &str,
+    ) -> impl Future<Output = Result<Vec<AttendanceSession>, Self::Error>> + Send {
+        <T as RoomPersistence>::attendance_sessions_for_event_key(self, guild, event_key)
+    }
+    fn is_attendance_suppressed(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        <T as RoomPersistence>::is_attendance_suppressed(self, guild, member)
+    }
+    fn is_attendance_voice_enabled(
+        &self,
+        guild: Snowflake,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        <T as RoomPersistence>::is_attendance_voice_enabled(self, guild)
     }
 }
 
@@ -765,6 +941,108 @@ impl RoomPersistence for PgRoomStore {
     ) -> Result<u64, StoreError> {
         let present: Vec<String> = present.iter().map(|id| id.to_string()).collect();
         self.close_event_voice_spans_absent(event_id, instance, &present)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn attendance_recovery_page(
+        &self,
+        guild: Snowflake,
+        member: Option<Snowflake>,
+        after_id: i64,
+    ) -> Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError> {
+        let member = member.map(|member| member.to_string());
+        self.attendance_recovery_page(&guild.to_string(), member.as_deref(), after_id)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn recover_attendance_sessions(
+        &self,
+        guild: Snowflake,
+        ids: &[i64],
+    ) -> Result<u64, StoreError> {
+        self.recover_attendance_sessions(&guild.to_string(), ids)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn attendance_windows(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+        previous: Option<Snowflake>,
+        observed_at: OffsetDateTime,
+    ) -> Result<Vec<AttendanceWindow>, StoreError> {
+        self.attendance_windows_for_transition(
+            &guild.to_string(),
+            &member.to_string(),
+            previous.map(|id| id.to_string()).as_deref(),
+            observed_at,
+        )
+        .await
+        .map_err(store_error)
+    }
+
+    async fn open_attendance_sessions(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> Result<Vec<AttendanceSession>, StoreError> {
+        self.open_attendance_sessions(&guild.to_string(), &member.to_string())
+            .await
+            .map_err(store_error)
+    }
+
+    async fn insert_attendance_session(
+        &self,
+        new: NewAttendanceSession,
+    ) -> Result<i64, StoreError> {
+        self.insert_attendance_session(&new)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn close_attendance_session(
+        &self,
+        id: i64,
+        left_at: OffsetDateTime,
+        channel_name: Option<String>,
+        event_keys: &[String],
+    ) -> Result<u64, StoreError> {
+        self.close_attendance_session(id, left_at, channel_name.as_deref(), event_keys)
+            .await
+            .map_err(|error| {
+                if two_bot_cutover::event_attendance::is_unsupported_stored_tags(&error) {
+                    StoreError::AttendanceMetadataUnsupported
+                } else {
+                    store_error(error)
+                }
+            })
+    }
+
+    async fn attendance_sessions_for_event_key(
+        &self,
+        guild: Snowflake,
+        event_key: &str,
+    ) -> Result<Vec<AttendanceSession>, StoreError> {
+        self.attendance_sessions_for_event_key(&guild.to_string(), event_key)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn is_attendance_suppressed(
+        &self,
+        guild: Snowflake,
+        member: Snowflake,
+    ) -> Result<bool, StoreError> {
+        self.is_attendance_suppressed(&guild.to_string(), &member.to_string())
+            .await
+            .map_err(store_error)
+    }
+
+    async fn is_attendance_voice_enabled(&self, guild: Snowflake) -> Result<bool, StoreError> {
+        self.is_attendance_voice_enabled(&guild.to_string())
             .await
             .map_err(store_error)
     }
@@ -1129,7 +1407,7 @@ fn observe_voice_actor_load_failure_kind(guild: Snowflake, error: &str, retrying
 }
 
 /// Fixed token naming a voice admin store failure without its internals.
-/// [`StoreError`] is already bounded to three variants with no driver detail,
+/// [`StoreError`] is already bounded to fixed variants with no driver detail,
 /// so the token is the variant in snake_case: rerun the failing admin command
 /// path for detail.
 fn admin_store_error_token(error: StoreError) -> &'static str {
@@ -1137,6 +1415,7 @@ fn admin_store_error_token(error: StoreError) -> &'static str {
         StoreError::Unavailable => "unavailable",
         StoreError::CredentialRefused => "credential_refused",
         StoreError::Conflict => "conflict",
+        StoreError::AttendanceMetadataUnsupported => "attendance_metadata_unsupported",
     }
 }
 
@@ -2020,6 +2299,7 @@ fn write_permission_findings(
 pub struct LiveGuild {
     guild_id: Snowflake,
     inner: Arc<RwLock<LiveState>>,
+    attendance_reads: crate::event_attendance::AttendanceReadFence,
 }
 
 impl LiveGuild {
@@ -2027,6 +2307,7 @@ impl LiveGuild {
         Self {
             guild_id,
             inner: Arc::new(RwLock::new(LiveState::default())),
+            attendance_reads: crate::event_attendance::AttendanceReadFence::default(),
         }
     }
 
@@ -2093,6 +2374,7 @@ impl LiveGuild {
         }
         let mut live = self.write_state();
         live.generation += 1;
+        self.attendance_reads.invalidate();
         live.channels = snapshot
             .channels
             .into_iter()
@@ -2135,6 +2417,7 @@ impl LiveGuild {
         let mut live = self.write_state();
         live.ready = false;
         live.generation += 1;
+        self.attendance_reads.invalidate();
         live.empty_since.clear();
     }
 
@@ -7878,11 +8161,19 @@ enum ActorCommand {
     /// A member's voice channel changed (join, leave or move): the worker
     /// records the event-voice presence transition. Sent only on actual
     /// transitions (same-channel frames send none), alongside Join/Reconcile.
-    /// Idempotent at the store, so buffering and replays are safe.
+    /// Idempotent at the store, so buffering and replays are safe. `is_bot`
+    /// (unknown counts as human, like the snapshot) and the guild's AFK
+    /// channel ride along for the attendance logger, which has no cache
+    /// access of its own; channel names resolve from live state at the
+    /// write sites.
     EventVoicePresence {
         member_id: Snowflake,
         previous: Option<Snowflake>,
         current: Option<Snowflake>,
+        is_bot: bool,
+        afk_channel: Option<Snowflake>,
+        observed_at: time::OffsetDateTime,
+        attendance_observation: Option<crate::event_attendance::AttendanceObservation>,
     },
     /// A new or edited creator row (`/create`, `/textchannels`): the worker
     /// swaps it in for rooms created from here on.
@@ -8414,6 +8705,19 @@ fn requires_guild_authority(command: &VoiceCommand) -> bool {
     )
 }
 
+/// One voice-state frame for an existing actor. The AFK channel rides
+/// alongside the frame for the attendance logger; bundling the frame keeps
+/// the feed under the arity lint without a checker waiver.
+struct VoiceFrame {
+    guild: Snowflake,
+    member: Snowflake,
+    channel: Option<Snowflake>,
+    bot: Option<bool>,
+    afk_channel: Option<Snowflake>,
+    display: String,
+    received: tokio::time::Instant,
+}
+
 pub struct VoiceRuntime<S, H> {
     make: Arc<dyn Fn() -> (S, H) + Send + Sync>,
     tick: Duration,
@@ -8433,6 +8737,7 @@ pub struct VoiceRuntime<S, H> {
     synthetic_humans: HashSet<Snowflake>,
     seeds: AtomicU64,
     actors: Mutex<HashMap<Snowflake, GuildActor>>,
+    attendance_reads: crate::event_attendance::AttendanceReadAuthority,
     /// The gateway is connected as far as voice is concerned: set once READY
     /// or RESUMED is handled, cleared by every transport `disconnect`. While
     /// set, a live view that is not ready is a fault, not an outage, and
@@ -8481,6 +8786,7 @@ where
             synthetic_humans: HashSet::new(),
             seeds: AtomicU64::new(initial_seed()),
             actors: Mutex::new(HashMap::new()),
+            attendance_reads: crate::event_attendance::AttendanceReadAuthority::default(),
             gateway_connected: AtomicBool::new(false),
             access_lock: tokio::sync::Mutex::new(()),
             pending_imports: Mutex::new(HashMap::new()),
@@ -8495,6 +8801,16 @@ where
     fn parse_voice_command(&self, interaction: &Interaction) -> Option<VoiceCommand> {
         let identities = self.command_identities.read().ok()?;
         parse_voice_command_with_registry(interaction, &identities)
+    }
+
+    /// Share attendance recovery readiness with the signed receiver. Install
+    /// before any actors exist; an unwired receiver remains conservative.
+    pub fn with_attendance_reads(
+        mut self,
+        authority: crate::event_attendance::AttendanceReadAuthority,
+    ) -> Self {
+        self.attendance_reads = authority;
+        self
     }
 
     /// Install boot configuration before spawning any actors.
@@ -8677,6 +8993,8 @@ where
             tx,
             backpressure: ActorInboxBackpressure::default(),
         };
+        self.attendance_reads
+            .register(guild, actor.live.attendance_reads.clone());
         actor
             .live
             .protect_channels(self.protected_channels.iter().copied());
@@ -8824,29 +9142,36 @@ where
         bot: Option<bool>,
         display: String,
     ) -> bool {
-        self.voice_frame_received(
+        self.voice_frame_received(VoiceFrame {
             guild,
             member,
             channel,
             bot,
+            afk_channel: None,
             display,
-            tokio::time::Instant::now(),
-        )
+            received: tokio::time::Instant::now(),
+        })
     }
 
-    fn voice_frame_received(
-        &self,
-        guild: Snowflake,
-        member: Snowflake,
-        channel: Option<Snowflake>,
-        bot: Option<bool>,
-        display: String,
-        received: tokio::time::Instant,
-    ) -> bool {
+    fn voice_frame_received(&self, frame: VoiceFrame) -> bool {
+        let VoiceFrame {
+            guild,
+            member,
+            channel,
+            bot,
+            afk_channel,
+            display,
+            received,
+        } = frame;
         let Some(actor) = self.live_actor(guild) else {
             return false;
         };
         let previous = actor.live.member_channel(member);
+        // Ingress, not actor processing, revokes publication of older evidence.
+        // A refused send drops the guard and requests conservative recovery.
+        let attendance_observation = (previous != channel
+            && crate::event_attendance::logger_enabled())
+        .then(|| actor.live.attendance_reads.observe(member));
         let command = match actor.live.voice_update_with_occupancy(member, channel, bot) {
             Some((ticket, occupancy_at_join)) => {
                 // Seeding TEST (occupancy-to-join curve): one label-free
@@ -8883,9 +9208,18 @@ where
         // nothing, so this costs one command per join/leave/move only.
         if previous != channel {
             let _ = actor.try_send_command(ActorCommand::EventVoicePresence {
+                attendance_observation,
                 member_id: member,
                 previous,
                 current: channel,
+                // Unknown identity counts as human, like the snapshot.
+                is_bot: bot.unwrap_or(false),
+                afk_channel,
+                observed_at: time::OffsetDateTime::now_utc()
+                    .checked_sub(
+                        time::Duration::try_from(received.elapsed()).unwrap_or(time::Duration::MAX),
+                    )
+                    .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
             });
         }
         actor.try_send_command(command)
@@ -9513,14 +9847,21 @@ where
                             .member(guild_key, user_key)
                             .map(|member| member.roles().iter().map(|id| id.get()).collect())
                     });
-                self.voice_frame_received(
-                    guild_id,
-                    member_id,
-                    update.channel_id.map(|id| id.get()),
+                self.voice_frame_received(VoiceFrame {
+                    guild: guild_id,
+                    member: member_id,
+                    channel: update.channel_id.map(|id| id.get()),
                     bot,
-                    display_name(cache, guild_id, member_id),
+                    // The AFK channel id comes from the cached guild: the
+                    // actor owns no cache handle, so dispatch captures it on
+                    // the same transition as the bot flag.
+                    afk_channel: cache
+                        .guild(Id::new(guild_id))
+                        .and_then(|guild| guild.afk_channel_id())
+                        .map(|id| id.get()),
+                    display: display_name(cache, guild_id, member_id),
                     received,
-                );
+                });
                 if let Some(actor) = self.live_actor(guild_id) {
                     actor.live.set_member_roles(member_id, roles);
                 }
@@ -9824,6 +10165,7 @@ async fn run_actor_with_initial<S: RoomPersistence, H: RoomWrites + 'static>(
         ActorLimits::default(),
         initial,
         backpressure,
+        crate::event_attendance::logger_enabled(),
     )
     .await;
 }
@@ -10145,7 +10487,270 @@ async fn run_actor_with_limits<S: RoomPersistence, H: RoomWrites + 'static>(
     limits: ActorLimits,
     backpressure: &ActorInboxBackpressure,
 ) {
-    run_actor_inner(worker, inbox, tick, limits, VecDeque::new(), backpressure).await;
+    run_actor_inner(
+        worker,
+        inbox,
+        tick,
+        limits,
+        VecDeque::new(),
+        backpressure,
+        crate::event_attendance::logger_enabled(),
+    )
+    .await;
+}
+
+/// A new process/actor or gateway generation cannot prove continuity of any
+/// prior open span. Drain those spans conservatively before accepting new
+/// captures. Maintenance detects recovery even without another voice frame;
+/// it must not infer leaves from a live view ahead of queued actor commands.
+/// One page per turn, with a single deadline across both reads and writes.
+#[derive(Default)]
+struct AttendanceRecovery {
+    generation: Option<u64>,
+    loss_generation: u64,
+    member_loss: Option<(Snowflake, u64)>,
+    pending_observation: Option<crate::event_attendance::AttendanceObservation>,
+    after_id: i64,
+    resetting: bool,
+    capture_since: Option<OffsetDateTime>,
+    fence: Option<crate::event_attendance::AttendanceRecoveryGuard>,
+    pending: Option<crate::event_attendance::AttendanceTransition>,
+}
+
+impl AttendanceRecovery {
+    fn observe_generation(&mut self, live: &LiveGuild) {
+        let state = live.read_state();
+        if self.generation != Some(state.generation) {
+            self.generation = Some(state.generation);
+            self.after_id = 0;
+            self.member_loss = None;
+            self.resetting = true;
+            self.fence = Some(live.attendance_reads.begin_full_recovery());
+        }
+    }
+
+    fn capture_allowed(&mut self, live: &LiveGuild) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        self.observe_generation(live);
+        live.read_state().ready && !self.resetting && live.attendance_reads.capture_allowed()
+    }
+
+    fn transition_allowed(&mut self, live: &LiveGuild, observed_at: OffsetDateTime) -> bool {
+        self.capture_allowed(live) && self.capture_since.is_some_and(|since| observed_at >= since)
+    }
+
+    async fn record<S: RoomPersistence, H: RoomWrites>(
+        &mut self,
+        worker: &GuildRoomWorker<S, H>,
+        transition: crate::event_attendance::VoiceTransition,
+        observation: Option<crate::event_attendance::AttendanceObservation>,
+    ) {
+        if self.pending.is_some() {
+            // Keep the original close evidence. Later frames still serve the
+            // room lane, but only that member's continuity was lost.
+            return;
+        }
+        if transition.previous == transition.current {
+            if let Some(observation) = observation {
+                observation.acknowledge();
+            }
+            return;
+        }
+        if !transition.enabled {
+            // Flag-off ingress carries no guard. A fenced/skipped frame does:
+            // dropping it quarantines its member, without replaying evidence.
+            return;
+        }
+        self.loss_generation = worker.live.attendance_reads.loss_generation();
+        self.pending_observation = observation;
+        self.fence = Some(worker.live.attendance_reads.begin_recovery());
+        self.pending = Some(crate::event_attendance::AttendanceTransition::new(
+            transition,
+        ));
+        self.resume_pending(worker).await;
+    }
+
+    async fn resume_pending<S: RoomPersistence, H: RoomWrites>(
+        &mut self,
+        worker: &GuildRoomWorker<S, H>,
+    ) {
+        let generation = self.generation;
+        let loss_generation = self.loss_generation;
+        if let Some(pending) = &mut self.pending {
+            pending
+                .turn_if(&worker.store, || {
+                    let live = worker.live.read_state();
+                    live.ready
+                        && generation == Some(live.generation)
+                        && worker.live.attendance_reads.may_open(loss_generation)
+                })
+                .await;
+        }
+        self.finish_pending(&worker.live);
+    }
+
+    fn finish_pending(&mut self, live: &LiveGuild) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.is_complete())
+        {
+            self.pending = None;
+            if let Some(observation) = self.pending_observation.take() {
+                observation.acknowledge();
+            }
+            let state = live.read_state();
+            if state.ready && self.generation == Some(state.generation) {
+                if let Some(fence) = &self.fence {
+                    fence.complete();
+                }
+            }
+        }
+    }
+
+    // Release identity strings before the finalization await and keep page
+    // validation out of the generic recovery future's cancellation paths.
+    #[inline(never)]
+    fn recovery_ids(
+        rows: Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>,
+        member: Option<Snowflake>,
+    ) -> Option<(Vec<i64>, bool)> {
+        let page_size = two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE;
+        if rows.len() > page_size
+            || member.is_some_and(|member| {
+                let member = member.to_string();
+                rows.iter().any(|row| row.member_id != member)
+            })
+        {
+            return None;
+        }
+        let close_limit = if member.is_some() { 8 } else { page_size };
+        let exhausted = if member.is_some() {
+            rows.len() <= close_limit
+        } else {
+            rows.len() < page_size
+        };
+        let ids = rows.iter().take(close_limit).map(|row| row.id).collect();
+        Some((ids, exhausted))
+    }
+
+    // Share the fetch/finalize state machine, but retain distinct store reads
+    // and close limits for member loss versus a genuine full discontinuity.
+    async fn recover_page<S: RoomPersistence, H: RoomWrites>(
+        worker: &GuildRoomWorker<S, H>,
+        generation: u64,
+        member: Option<Snowflake>,
+        after_id: i64,
+    ) -> Result<Option<(i64, bool)>, StoreError> {
+        let guild = worker.live.guild_id;
+        let rows = worker
+            .store
+            .attendance_recovery_page(guild, member, after_id)
+            .await?;
+        let Some((ids, exhausted)) = Self::recovery_ids(rows, member) else {
+            return Ok(None);
+        };
+        {
+            let live = worker.live.read_state();
+            if !live.ready || live.generation != generation {
+                return Ok(None);
+            }
+        }
+        worker
+            .store
+            .recover_attendance_sessions(guild, &ids)
+            .await?;
+        Ok(Some((ids.last().copied().unwrap_or(after_id), exhausted)))
+    }
+
+    async fn turn<S: RoomPersistence, H: RoomWrites>(
+        &mut self,
+        worker: &GuildRoomWorker<S, H>,
+        enabled: bool,
+    ) {
+        if !enabled {
+            return;
+        }
+        if self.pending.is_some() {
+            // Finish the original observed close before interruption cleanup
+            // can zero any of its rows. Never spend two attendance budgets in
+            // the same maintenance turn, even when the last close completes.
+            self.resume_pending(worker).await;
+            return;
+        }
+        self.observe_generation(&worker.live);
+        let (generation, ready) = {
+            let live = worker.live.read_state();
+            (live.generation, live.ready)
+        };
+        if !ready {
+            return;
+        }
+        let fence = &worker.live.attendance_reads;
+        let loss = if self.resetting {
+            None
+        } else {
+            if self
+                .member_loss
+                .is_some_and(|loss| !fence.loss_is_current(loss))
+            {
+                self.member_loss = None;
+                self.after_id = 0;
+            }
+            if self.member_loss.is_none() {
+                self.member_loss = fence.next_loss();
+                self.after_id = 0;
+            }
+            let Some(loss) = self.member_loss else { return };
+            Some(loss)
+        };
+        // Share one timeout/await state for both scopes. Cancellation drops the
+        // entire page future without advancing either retained cursor.
+        let recover =
+            Self::recover_page(worker, generation, loss.map(|loss| loss.0), self.after_id);
+        let result = tokio::time::timeout(Duration::from_millis(1_000), recover).await;
+        let Ok(Ok(Some((after_id, exhausted)))) = result else {
+            // No cursor advance on failure/cancellation, including an
+            // uncertain commit. Never retry within the same turn.
+            if loss.is_none() {
+                debug!(
+                    guild = worker.live.guild_id.to_string(),
+                    "attendance recovery deferred"
+                );
+            }
+            return;
+        };
+        let live = worker.live.read_state();
+        if live.generation != generation || self.generation != Some(generation) || !live.ready {
+            return;
+        }
+        if let Some(loss) = loss {
+            if !fence.loss_is_current(loss) {
+                self.member_loss = None;
+                self.after_id = 0;
+                return;
+            }
+            self.after_id = after_id;
+            if exhausted {
+                fence.finish_loss(loss);
+                self.member_loss = None;
+                self.after_id = 0;
+                // Queued observations from the fenced interval are not joins.
+                self.capture_since = Some(OffsetDateTime::now_utc());
+            }
+        } else {
+            self.after_id = after_id;
+            if exhausted && self.fence.as_ref().is_some_and(|fence| fence.complete()) {
+                self.after_id = 0;
+                // Buffered pre-recovery frames are not new evidence;
+                // never replay their joins into the repaired epoch.
+                self.capture_since = Some(OffsetDateTime::now_utc());
+                self.resetting = false;
+            }
+        }
+    }
 }
 
 async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
@@ -10155,6 +10760,7 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     limits: ActorLimits,
     initial: VecDeque<ActorCommand>,
     backpressure: &ActorInboxBackpressure,
+    attendance_enabled: bool,
 ) {
     let generation = next_voice_actor_generation();
     let start = tokio::time::Instant::now();
@@ -10163,6 +10769,8 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     let mut dispatch_ready = false;
     let mut maintenance_ready = false;
     let mut ev_repair_due_ms: u64 = 0;
+    let mut attendance_recovery = AttendanceRecovery::default();
+    attendance_recovery.turn(worker, attendance_enabled).await;
     let mut dispatch_budget = 8u8;
     let mut consecutive_inbox_turns = 0u8;
     let mut complete_join_pair = false;
@@ -10222,73 +10830,53 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
             }
         })
     };
-    // Commands buffered while the worker loaded (initialization retry)
-    // apply first, in arrival order, under the same read-through and
-    // apply path as inbox commands; stale joins are refused by the usual
-    // ticket guards inside `apply_command`.
-    for command in initial {
-        let now_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        if let ActorCommand::Join { ticket, .. } = &command {
-            worker.revalidate_creator(ticket.creator_id).await;
-        }
-        if let ActorCommand::EventVoicePresence {
-            member_id,
-            previous,
-            current,
-        } = &command
-        {
-            crate::event_voice_channels::record_transition(
-                &worker.store,
-                worker.live.guild_id,
-                *member_id,
-                *previous,
-                *current,
-            )
-            .await;
-        }
-        let accepted = apply_command(worker, command, now_ms, backpressure);
-        // An Ownership command stages its reply on the durable commit;
-        // drive it before the next command so replies stay ordered.
-        worker.drive_staged_ownership(now_ms).await;
-        metrics::global().voice_actor_inbox_turn();
-        if accepted {
-            last_progress = tokio::time::Instant::now();
-        }
-        dispatch_ready |= accepted;
-    }
-    // Snapshot occupants never sent a transition (`publish_snapshot` only
-    // sends `Reconcile`): flush them join-only so a member already sitting
-    // in a bound event channel owns an open span. Collected before any
-    // await so no live-state lock crosses a store write; the helper caps
-    // the whole flush at one total budget and the 60s repair picks up any
-    // occupants skipped past it.
-    let snapshot_occupants: Vec<(Snowflake, Snowflake)> = {
-        let live = worker.live.read_state();
-        live.members
-            .iter()
-            .filter_map(|(member_id, member)| {
-                member.channel_id.map(|channel| (*member_id, channel))
-            })
-            .collect()
-    };
-    let _ = crate::event_voice_channels::flush_bootstrap_presence(
-        &worker.store,
-        worker.live.guild_id,
-        &snapshot_occupants,
-    )
-    .await;
+    let mut initial = initial;
+    let mut bootstrap_pending = true;
     stall.snapshot(worker, last_progress);
     loop {
         tokio::select! {
             biased;
+            _ = std::future::ready(()), if bootstrap_pending && initial.is_empty() => {
+                bootstrap_pending = false;
+                // Snapshot occupants never sent a transition (`publish_snapshot` only
+                // sends `Reconcile`): flush them join-only so a member already sitting
+                // in a bound event channel owns an open span. Collected before any
+                // await so no live-state lock crosses a store write; the helper caps
+                // the whole flush at one total budget and the 60s repair picks up any
+                // occupants skipped past it.
+                let snapshot_occupants: Vec<(Snowflake, Snowflake)> = {
+                    let live = worker.live.read_state();
+                    live.members
+                        .iter()
+                        .filter_map(|(member_id, member)| {
+                            member.channel_id.map(|channel| (*member_id, channel))
+                        })
+                        .collect()
+                };
+                let _ = crate::event_voice_channels::flush_bootstrap_presence(
+                    &worker.store,
+                    worker.live.guild_id,
+                    &snapshot_occupants,
+                )
+                .await;
+            }
             // Fair scheduling: park the inbox once the consecutive-turn
             // bound is reached so a ready dispatch, timer or maintenance
             // branch runs instead. The count resets on any timer or
             // maintenance turn, or on a no-op dispatch with none due; a
             // progressing dispatch keeps the park (see below).
-            command = inbox.recv(), if consecutive_inbox_turns < VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS => {
-                let Some(command) = command else { break };
-                backpressure.release_for(&command);
+            command = async {
+                if let Some(command) = initial.pop_front() {
+                    Some((command, false))
+                } else {
+                    inbox.recv().await.map(|command| (command, true))
+                }
+            }, if consecutive_inbox_turns < VOICE_ACTOR_MAX_CONSECUTIVE_INBOX_TURNS => {
+                let Some((mut command, release)) = command else { break };
+                // Initialization already released its inbox accounting.
+                if release {
+                    backpressure.release_for(&command);
+                }
                 let now_ms = start
                     .elapsed()
                     .as_millis()
@@ -10305,7 +10893,11 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                     member_id,
                     previous,
                     current,
-                } = &command
+                    is_bot,
+                    afk_channel,
+                    observed_at,
+                    attendance_observation,
+                } = &mut command
                 {
                     crate::event_voice_channels::record_transition(
                         &worker.store,
@@ -10313,6 +10905,39 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                         *member_id,
                         *previous,
                         *current,
+                    )
+                    .await;
+                    // Attendance sessions persist on the same transition, after
+                    // the event-voice write: names resolve from the actor's
+                    // latest live view so renames converge at close time.
+                    let (previous_name, current_name) = {
+                        let live = worker.live.read_state();
+                        (
+                            previous.and_then(|id| {
+                                live.channels.get(&id).and_then(|room| room.name.clone())
+                            }),
+                            current.and_then(|id| {
+                                live.channels.get(&id).and_then(|room| room.name.clone())
+                            }),
+                        )
+                    };
+                    let enabled = attendance_enabled
+                        && attendance_recovery.transition_allowed(&worker.live, *observed_at);
+                    attendance_recovery.record(
+                        worker,
+                        crate::event_attendance::VoiceTransition {
+                            guild: worker.live.guild_id,
+                            member: *member_id,
+                            previous: *previous,
+                            current: *current,
+                            is_bot: *is_bot,
+                            afk_channel: *afk_channel,
+                            observed_at: *observed_at,
+                            previous_name,
+                            current_name,
+                            enabled,
+                        },
+                        attendance_observation.take(),
                     )
                     .await;
                 }
@@ -10450,6 +11075,9 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
                 worker.refresh_empty_grace();
                 worker.send_notices(now_ms).await;
                 worker.flush_kick_audit(now_ms).await;
+                // Recovery pages continue on maintenance even with no more
+                // voice frames. Do not invent joins from the snapshot.
+                attendance_recovery.turn(worker, attendance_enabled).await;
                 // Event-voice presence repair (at most every 60s): re-open a
                 // lost join and close a lost leave against the live occupant
                 // snapshot. The snapshot is collected before any await so no
@@ -10694,6 +11322,7 @@ pub fn build_production_runtime(
     pool: sqlx::PgPool,
     name_policy: AutomodPolicy,
     live_source: impl Fn() -> Option<two_bot_core::settings::LiveSettings> + Send + Sync + 'static,
+    attendance_reads: crate::event_attendance::AttendanceReadAuthority,
 ) -> Result<VoiceResponder<PgRoomStore, RoomHttp, RoomHttp>, RoomHttpError> {
     // Fatal settings name only the first refused key, in existing validation
     // order, before the gateway's generic `voice HTTP setup failed` event.
@@ -10730,7 +11359,8 @@ pub fn build_production_runtime(
             .with_admission_config(configured_admission(|key| std::env::var(key).ok()))
             .with_synthetic_humans(synthetic_humans)
             .with_name_policy(name_policy)
-            .with_live_source(live_source),
+            .with_live_source(live_source)
+            .with_attendance_reads(attendance_reads),
         ),
         Arc::new(replies),
     ))

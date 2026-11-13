@@ -3,9 +3,11 @@
 //! Stale/unknown intents are never reclaimed. Reconciliation records a proven
 //! terminal outcome, not a new execution lease. See `docs/internal-action-store.md`.
 
+use futures_util::TryStreamExt;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::str::FromStr as _;
+use time::OffsetDateTime;
 
 use crate::channel_moderation::PurgeStopReason;
 use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
@@ -852,6 +854,9 @@ impl InternalActionStore {
             }
         }
         let mut tx = self.pool.begin().await?;
+        // Reconciliation is another key writer. Serialize before idempotency
+        // row locks so capture cannot validate one occurrence and persist another.
+        crate::event_instance_store::lock_guild(&mut tx, guild_id).await?;
         let row = sqlx::query(
             "SELECT state, action, guild_id FROM internal_idempotency \
              WHERE intent_id = $1 FOR UPDATE",
@@ -989,6 +994,8 @@ impl InternalActionStore {
         if !is_snowflake(event_id) {
             return Err(InternalStoreError::InvalidInput);
         }
+        let mut tx = self.pool.begin().await?;
+        crate::event_instance_store::lock_guild(&mut tx, guild_id).await?;
         sqlx::query(
             "INSERT INTO internal_event_keys (guild_id, event_key, event_id) \
              VALUES ($1, $2, $3) \
@@ -998,8 +1005,9 @@ impl InternalActionStore {
         .bind(guild_id)
         .bind(event_key)
         .bind(event_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1021,6 +1029,186 @@ impl InternalActionStore {
         .await?)
     }
 
+    /// Historical captured window by key, never permission to start capture.
+    /// An upsert or reconciliation alone creates no attendance record.
+    pub async fn attendance_window_for_key(
+        &self,
+        guild_id: &str,
+        event_key: &str,
+    ) -> Result<Option<AttendanceWindow>, InternalStoreError> {
+        Self::check_event_key_shape(guild_id, event_key)?;
+        Ok(
+            sqlx::query_as::<_, (OffsetDateTime, OffsetDateTime)>(ATTENDANCE_WINDOW_FOR_KEY_SQL)
+                .bind(guild_id)
+                .bind(event_key)
+                .fetch_optional(&self.pool)
+                .await?
+                .map(|(starts_at, ends_at)| AttendanceWindow {
+                    event_key: event_key.to_owned(),
+                    starts_at,
+                    ends_at,
+                }),
+        )
+    }
+
+    /// Every session row tagged with the event key, oldest first. Empty means
+    /// no attendance: the read refuses `not_found`, including mapped windows
+    /// whose sessions all predate the logger.
+    pub async fn attendance_sessions_for_event_key(
+        &self,
+        guild_id: &str,
+        event_key: &str,
+    ) -> Result<Vec<AttendanceSession>, InternalStoreError> {
+        Self::check_event_key_shape(guild_id, event_key)?;
+        let bound: Option<(OffsetDateTime, Option<Vec<OffsetDateTime>>)> =
+            sqlx::query_as(ATTENDANCE_SESSION_BOUND_SQL)
+                .bind(guild_id)
+                .bind(event_key)
+                .bind(MAX_ATTENDANCE_CAPTURE_STOPS as i64)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((bound, stops)) = bound else {
+            return Ok(Vec::new());
+        };
+        let stops = stops.ok_or(InternalStoreError::Unavailable)?;
+        // Stream a bounded prefix and refuse an overflow, never truncate totals.
+        // Bound each text cell in SQL before the driver materializes it. An ID
+        // longer than 20 bytes (a u64 has at most 20 digits) becomes the empty
+        // sentinel, which never parses; a truncated prefix could parse as a
+        // different valid ID, so IDs are never cut.
+        let mut raw = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                bool,
+                bool,
+                OffsetDateTime,
+                Option<OffsetDateTime>,
+                OffsetDateTime,
+            ),
+        >(
+            "SELECT CASE WHEN octet_length(member_id) <= 20 THEN member_id ELSE '' END,
+                    CASE WHEN octet_length(channel_id) <= 20 THEN channel_id ELSE '' END,
+                    LEFT(channel_name, 65537), is_bot, afk,
+                    joined_at, left_at, COALESCE(name_observed_at, joined_at)
+             FROM event_voice_sessions
+             WHERE guild_id = $1 AND event_keys @> ARRAY[$2]
+             ORDER BY joined_at, id LIMIT $3",
+        )
+        .bind(guild_id)
+        .bind(event_key)
+        .bind((MAX_ATTENDANCE_INPUT_SESSIONS + 1) as i64)
+        .fetch(&self.pool);
+        let mut sessions = Vec::new();
+        let mut name_bytes = 0usize;
+        while let Some((
+            member_id,
+            channel_id,
+            channel_name,
+            is_bot,
+            afk,
+            joined_at,
+            left_at,
+            name_observed_at,
+        )) = raw.try_next().await?
+        {
+            name_bytes = name_bytes.saturating_add(channel_name.len());
+            if sessions.len() == MAX_ATTENDANCE_INPUT_SESSIONS
+                || channel_name.len() > 65536
+                || name_bytes > MAX_ATTENDANCE_INPUT_NAME_BYTES
+            {
+                return Err(InternalStoreError::Unavailable);
+            }
+            sessions.push(AttendanceSession {
+                member_id,
+                channel_id,
+                channel_name,
+                name_observed_at,
+                is_bot,
+                afk,
+                joined_at,
+                left_at: Some(cap_attendance_session(joined_at, left_at, bound, &stops)),
+            });
+        }
+        Ok(sessions)
+    }
+}
+
+/// Maximum raw spans admitted to one signed attendance read. Overflow refuses
+/// the complete read; it never yields a truncated positive list.
+pub const MAX_ATTENDANCE_INPUT_SESSIONS: usize = 4096;
+/// Aggregate room-name bytes admitted before projection/copying.
+pub const MAX_ATTENDANCE_INPUT_NAME_BYTES: usize = 1024 * 1024;
+/// Maximum fixed-width loss-of-authority timestamps admitted before decoding.
+/// Together with the raw-span bound this caps both allocation and cap scans;
+/// overflow refuses the whole read, never truncates credit history.
+pub const MAX_ATTENDANCE_CAPTURE_STOPS: usize = 4096;
+
+/// Shared historical-window projection used by both attendance stores.
+/// Identity is fixed at capture; key repointing cannot redirect a past record.
+pub const ATTENDANCE_WINDOW_FOR_KEY_SQL: &str =
+    "SELECT COALESCE(w.starts_at, h.starts_at), COALESCE(w.ends_at, h.ends_at)
+     FROM event_attendance_windows h LEFT JOIN event_instance_windows w
+       ON w.guild_id = h.guild_id AND w.event_id = h.event_id
+      AND w.instance_starts_at = h.instance_starts_at
+     WHERE h.guild_id = $1 AND h.event_key = $2";
+
+/// Shared per-key upper bound for session projection. Revocation/unknown absence
+/// stops credit immediately, even if a leave is missed; finite windows never
+/// credit voice after grace. This is finalization, not capture permission.
+pub const ATTENDANCE_SESSION_BOUND_SQL: &str =
+    "SELECT LEAST(clock_timestamp(), COALESCE(w.ends_at, h.ends_at) + INTERVAL '15 minutes',
+                  w.revoked_at::timestamptz,
+                  CASE WHEN w.status = 'missing' THEN w.omitted_at::timestamptz END) AS capture_end,
+            CASE WHEN cardinality(h.capture_stops) <= $3 THEN h.capture_stops ELSE NULL END
+     FROM event_attendance_windows h LEFT JOIN event_instance_windows w
+       ON w.guild_id = h.guild_id AND w.event_id = h.event_id
+      AND w.instance_starts_at = h.instance_starts_at
+     WHERE h.guild_id = $1 AND h.event_key = $2";
+
+/// Cap one span at the first loss of capture authority after its join. A later
+/// accepted observation may permit new spans, but cannot fill the missing gap
+/// of an already-open span, even after the shared lifecycle becomes live again.
+pub fn cap_attendance_session(
+    joined_at: OffsetDateTime,
+    left_at: Option<OffsetDateTime>,
+    bound: OffsetDateTime,
+    stops: &[OffsetDateTime],
+) -> OffsetDateTime {
+    stops
+        .iter()
+        .copied()
+        .filter(|stop| *stop >= joined_at)
+        .fold(left_at.unwrap_or(bound).min(bound), OffsetDateTime::min)
+}
+
+/// One historical captured event window, in DB time. The receiver converts
+/// to epoch millis for the read projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttendanceWindow {
+    pub event_key: String,
+    pub starts_at: OffsetDateTime,
+    pub ends_at: OffsetDateTime,
+}
+
+/// One stored attendance session row for the read projection. The receiver
+/// converts the stamps to epoch millis; corrupt snowflakes fail the read at
+/// parse time, never silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttendanceSession {
+    pub member_id: String,
+    pub channel_id: String,
+    pub channel_name: String,
+    pub name_observed_at: OffsetDateTime,
+    pub is_bot: bool,
+    pub afk: bool,
+    pub joined_at: OffsetDateTime,
+    pub left_at: Option<OffsetDateTime>,
+}
+
+impl InternalActionStore {
     /// Voice-channel → website event-key map for the currently-windowed
     /// events of one guild. `voice.snapshot` stamps `rooms[].event_key` from
     /// this so the site can join heat rows to its event metadata: one entry
@@ -1077,6 +1265,24 @@ impl InternalActionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attendance_caps_preserve_missing_gaps_but_allow_later_spans() {
+        let at = |minutes| OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(minutes);
+        let stops = [at(20), at(40)];
+        assert_eq!(cap_attendance_session(at(10), None, at(60), &stops), at(20));
+        assert_eq!(cap_attendance_session(at(30), None, at(60), &stops), at(40));
+        assert_eq!(cap_attendance_session(at(50), None, at(60), &stops), at(60));
+        assert_eq!(
+            cap_attendance_session(at(10), Some(at(15)), at(60), &stops),
+            at(15)
+        );
+        assert_eq!(
+            cap_attendance_session(at(10), Some(at(90)), at(60), &[]),
+            at(60)
+        );
+        assert_eq!(cap_attendance_session(at(20), None, at(60), &stops), at(20));
+    }
 
     #[test]
     fn boundary_and_debug_are_secret_safe() {

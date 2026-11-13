@@ -44,6 +44,13 @@ are outside this implementation's scope.
   join/leave spans: erasure removes the erased member's rows, guild-scoped
   through the scheduled-event mirror. The channel claim row
   (`event_voice_channels`) carries no member identity and is untouched.
+  Event-window voice sessions (`event_voice_sessions`) record one row per
+  member and channel, with join and leave times. When capture is enabled, a
+  session can open from 15 minutes before a mapped event starts to 15 minutes
+  after it ends; it can close later. Rows also store `channel_name`, `is_bot`,
+  `afk`, `event_keys` and `name_observed_at`. This is not an always-on voice log.
+  Erasure removes the erased member's rows by
+  (`guild_id`, `member_id`), and rows roll off 90 days after joining.
   Erasure removes database tracking only, never the Discord channel.
   Guild room-command controls
   (`voice_access_controls`: creation switch, required role ID, per-command role
@@ -258,7 +265,8 @@ step summary.
 
 The retention module (`two-bot-cutover::retention`, migration `0438`)
 applies rolling nominal windows when invoked: raw presence/voice rows use a
-30-day window, the audit-log cache uses 45 days, and user deletion requests
+30-day window, event-window voice sessions use a 90-day window, the audit-log
+cache uses 45 days, and user deletion requests
 complete in under 72 hours with a receipt unless a replay guard is unresolved,
 in which case the request stays pending with no receipt and is reported as
 deferred (with overdue requests older than 72 hours counted separately).
@@ -293,7 +301,10 @@ queued purge). The live gateway invokes the queue/cancel paths on real
 `GUILD_DELETE`/`GUILD_CREATE` dispatches (outage payloads never queue; an
 available rejoin cancels before the next run), and the supervised retention
 job runs on a bounded schedule: a dry run that deletes nothing unless
-`TWO_RETENTION_MODE` is exactly `execute`. No other automatic age-based
+`TWO_RETENTION_MODE` is exactly `execute`. A completed guild purge removes both
+raw attendance sessions and memberless captured-window history before the
+shared instance evidence. Member erasure removes only the sessions; the
+memberless history must not pin an old event key after a guild purge. No other automatic age-based
 purger is installed: do not claim a live 30/90-day TTL beyond the windows
 this job enforces. Every run reports per-class metrics, with partial runs
 (deferred/overdue deletions, failed guild purges) surfaced as warnings that
@@ -403,7 +414,7 @@ voice.
 | --- | --- | --- |
 | Presence | `presence_enabled` | `presence_update` |
 | Activity | `activity_enabled` | `first/second/third_message`, community `message_created` facts |
-| Voice | `voice_enabled` | `voice_session_start/end`, `first_voice_session`, community `voice_session_started/ended` facts |
+| Voice | `voice_enabled` | `voice_session_start/end`, `first_voice_session`, community `voice_session_started/ended` facts, event-attendance session opens and new close-time tags (existing tags still finalize) |
 
 Every other event type still persists: joins, leaves, gate clears,
 onboarding prompts, invite clicks and routing rows serve
@@ -423,11 +434,16 @@ inviters keep the aggregate use count with a blanked inviter field, in the
 standalone capture's counter baseline and the backfill baseline alike, which
 share one writer), the onboarding writers (including the prompt guard, which
 re-gates before the insert for opt-outs that land while the welcome is in
-flight), `touch_activity` / `mark_bot`, and the inactivity sweep (suppression-only:
-a suppressed pair is skipped inside the per-member transaction, so the sweep
-never recreates the purged `member_inactive` row). Every gated writer serializes
-with concurrent opt-outs (a shared table lock, so a write that passes the
-gate can never land after the purge), and `member_join` rows strip a
+flight), `touch_activity` / `mark_bot`, the event-attendance session logger
+(a suppressed member or a voice-disabled guild opens no span and adds no new
+close-time tag, while existing tags still finalize), and the inactivity sweep
+(suppression-only: a suppressed pair is skipped inside the per-member
+transaction, so the sweep never recreates the purged `member_inactive` row).
+Every gated writer serializes with concurrent opt-outs so a write that passes
+the gate cannot land after the purge. Attendance uses the opt-out/opt-in pair
+advisory lock, preceded by a guild analytics-settings advisory lock shared with
+the toggle writer; other gated writers use a shared table lock. Attendance's
+lifecycle and session locks follow those privacy locks. `member_join` rows strip a
 suppressed inviter's `inviterId` from metadata while keeping the joiner's
 own row. Gateway activity timestamps carry their originating family
 (message/activity versus voice) through the timestamp buffer, and the

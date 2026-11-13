@@ -9,8 +9,23 @@ use sqlx::{PgConnection, PgPool};
 
 use crate::scheduled_events::ScheduledEvent;
 
+/// Exclude lifecycle/capture writers before retention takes any table locks.
+/// Ordinary writers share this transaction lock across guilds; retention takes
+/// it exclusively. Acquire it before guild/event, mirror and history locks.
+pub async fn lock_retention(connection: &mut PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('event_instance_retention', 0))")
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
 /// Serialize mirror swaps, mutations and binding adoption for one guild.
 pub async fn lock_guild(connection: &mut PgConnection, guild_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended('event_instance_retention', 0))",
+    )
+    .execute(&mut *connection)
+    .await?;
     sqlx::query(
         "SELECT pg_advisory_xact_lock(hashtextextended('event_instance_windows:' || $1, 0))",
     )
@@ -48,13 +63,13 @@ pub(crate) async fn observe_in(
     sqlx::query(
         "INSERT INTO event_instance_windows AS w
            (guild_id, event_id, instance_starts_at, starts_at, ends_at,
-            status, observed_at, revoked_at, identity_ambiguous)
+            status, observed_at, revoked_at, identity_ambiguous, attendance_recovered_at)
          SELECT $1, $2,
                 COALESCE((SELECT MIN(c.instance_starts_at) FROM event_voice_channels c
                           WHERE c.event_id = $2 HAVING COUNT(*) = 1), $3::text::timestamptz),
                 $3::text::timestamptz, $4::text::timestamptz, $5, $6,
                 CASE WHEN $5 = 'cancelled' THEN $6 ELSE NULL END,
-                (SELECT COUNT(*) > 1 FROM event_voice_channels c WHERE c.event_id = $2)
+                (SELECT COUNT(*) > 1 FROM event_voice_channels c WHERE c.event_id = $2), NULL
          WHERE $5 = 'cancelled' OR (
            $5 = 'completed' AND EXISTS (
              SELECT 1 FROM event_instance_windows confirmed
@@ -81,6 +96,10 @@ pub(crate) async fn observe_in(
          ON CONFLICT (guild_id, event_id) WHERE is_current DO UPDATE SET
            starts_at = EXCLUDED.starts_at, ends_at = EXCLUDED.ends_at,
            status = EXCLUDED.status, observed_at = EXCLUDED.observed_at,
+           attendance_recovered_at = CASE
+             WHEN w.status = 'missing' AND EXCLUDED.status IN ('scheduled', 'active', 'completed')
+             THEN GREATEST(w.omitted_at::timestamptz, EXCLUDED.observed_at::timestamptz)
+             ELSE w.attendance_recovered_at END,
            revoked_at = CASE WHEN EXCLUDED.status = 'cancelled'
                              THEN EXCLUDED.observed_at ELSE w.revoked_at END
          WHERE w.observed_at <= EXCLUDED.observed_at
@@ -96,6 +115,35 @@ pub(crate) async fn observe_in(
     .bind(event.status.as_str())
     .bind(observed_at)
     .bind(advancing_snapshot)
+    .execute(&mut *connection)
+    .await?;
+    stop_attendance_in(connection, guild_id).await
+}
+
+// Retain finalization boundaries before a later positive observation can replace
+// missing evidence. This is historical credit metadata, never capture authority.
+// At most one stop after the last capture is needed; repeated omission polls
+// cannot grow a captured record indefinitely.
+async fn stop_attendance_in(
+    connection: &mut PgConnection,
+    guild_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE event_attendance_windows h
+         SET capture_stops = array_append(h.capture_stops, s.stopped_at),
+             changed_at = clock_timestamp()
+         FROM event_instance_windows w
+         CROSS JOIN LATERAL (
+           SELECT LEAST(w.revoked_at::timestamptz,
+                        CASE WHEN w.status = 'missing' THEN w.omitted_at::timestamptz END) AS stopped_at
+         ) s
+         WHERE h.guild_id = $1 AND w.guild_id = h.guild_id AND w.event_id = h.event_id
+           AND w.instance_starts_at = h.instance_starts_at AND s.stopped_at IS NOT NULL
+           AND NOT (s.stopped_at = ANY(h.capture_stops))
+           AND NOT EXISTS (SELECT 1 FROM unnest(h.capture_stops) stopped
+                           WHERE stopped >= h.updated_at)",
+    )
+    .bind(guild_id)
     .execute(connection)
     .await?;
     Ok(())
@@ -128,9 +176,9 @@ pub(crate) async fn omit_in(
     .bind(guild_id)
     .bind(observed_at)
     .bind(incoming_ids)
-    .execute(connection)
+    .execute(&mut *connection)
     .await?;
-    Ok(())
+    stop_attendance_in(connection, guild_id).await
 }
 
 /// Revoke a positively confirmed deletion, including retained completion grace.
@@ -175,6 +223,7 @@ pub async fn confirm_deleted(
     .bind(observed_at)
     .execute(&mut *tx)
     .await?;
+    stop_attendance_in(&mut tx, guild_id).await?;
     tx.commit().await
 }
 
@@ -196,6 +245,9 @@ pub(crate) async fn maintain_in(
              AND e.status NOT IN ('scheduled', 'active')
              AND (e.ends_at IS NULL OR e.ends_at < NOW() - INTERVAL '15 minutes')
              AND NOT EXISTS (SELECT 1 FROM event_voice_channels c WHERE c.event_id = e.event_id)
+             AND NOT EXISTS (SELECT 1 FROM event_attendance_windows h
+                             WHERE h.guild_id = e.guild_id AND h.event_id = e.event_id
+                               AND h.instance_starts_at = e.instance_starts_at)
              AND NOT EXISTS (SELECT 1 FROM internal_event_keys k
                              WHERE k.guild_id = e.guild_id AND k.event_id = e.event_id)
              AND NOT EXISTS (SELECT 1 FROM scheduled_events s

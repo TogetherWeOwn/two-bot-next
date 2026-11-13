@@ -122,7 +122,7 @@ fn internal_family(action: ActionLabel) -> &'static str {
     match action {
         ActionLabel::Known(name) => match name {
             "announcement.post" => "announcement",
-            "event.read" | "event.upsert" | "event.cancel" => "event",
+            "event.read" | "event.upsert" | "event.cancel" | "event.attendance.read" => "event",
             "settings.get" | "settings.set" => "settings",
             "role.assign" | "guild.add_member" => "membership",
             "voice.snapshot" => "voice",
@@ -930,6 +930,7 @@ struct ReceiverState {
     /// reads as `discord_unavailable` with a fresh `observed_at` never
     /// stamped on stale occupancy.
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
+    attendance_reads: two_bot::event_attendance::AttendanceReadAuthority,
     clock: Mutex<ClockGuard>,
     buckets: Mutex<TokenBuckets>,
     telemetry: Mutex<RejectionTelemetry>,
@@ -980,6 +981,7 @@ impl ReceiverState {
             voice_cache: voice_snapshot::new_shared_cache(),
             voice_clock: VoiceOccupancyClock::new(),
             gateway_state: Arc::new(RwLock::new(crate::gateway::GatewayState::Armed)),
+            attendance_reads: Default::default(),
             clock: Mutex::new(ClockGuard::new()),
             buckets: Mutex::new(TokenBuckets::new()),
             telemetry: Mutex::new(RejectionTelemetry::default()),
@@ -1020,6 +1022,14 @@ impl ReceiverState {
     /// which reads every room as `null`.
     fn with_voice_clock(mut self, voice_clock: Arc<VoiceOccupancyClock>) -> Self {
         self.voice_clock = voice_clock;
+        self
+    }
+
+    fn with_attendance_reads(
+        mut self,
+        attendance_reads: two_bot::event_attendance::AttendanceReadAuthority,
+    ) -> Self {
+        self.attendance_reads = attendance_reads;
         self
     }
 
@@ -1241,6 +1251,7 @@ pub async fn bind(
     voice_cache: Arc<DefaultInMemoryCache>,
     voice_clock: Arc<VoiceOccupancyClock>,
     gateway_state: Arc<RwLock<crate::gateway::GatewayState>>,
+    attendance_reads: two_bot::event_attendance::AttendanceReadAuthority,
 ) -> std::io::Result<BoundReceiver> {
     use two_bot_core::send_admission::{PgSendAdmission, SendAdmission};
     use two_bot_discord::internal_actions::CooldownGovernor;
@@ -1299,7 +1310,8 @@ pub async fn bind(
             )
             .with_voice_cache(voice_cache)
             .with_voice_clock(voice_clock)
-            .with_gateway_state(gateway_state),
+            .with_gateway_state(gateway_state)
+            .with_attendance_reads(attendance_reads),
         ),
     })
 }
@@ -1589,6 +1601,11 @@ async fn receive(
     if decision.action == "voice.snapshot" {
         return read_voice_snapshot(state, id, key, action).await;
     }
+    // Keyless attendance read: no durable claim, no Idempotency-Key, same as
+    // the reads above. The committed nonce is the replay guard.
+    if decision.action == "event.attendance.read" {
+        return read_event_attendance(state, &decision, id, key, action).await;
+    }
     // Mutating event verbs take the same durable claim/audit path as
     // announcements below, with their own validation and key mapping.
     if supports_event_mutation(&decision.action) {
@@ -1849,6 +1866,122 @@ async fn read_voice_snapshot(
             reject(Failure::code(ErrorCode::DiscordUnavailable))
         }
         Err(SnapshotRefusal::OverBudget) => reject(Failure::code(ErrorCode::Internal)),
+    }
+}
+
+fn not_found_code(ticket: &two_bot::event_attendance::AttendanceReadTicket) -> ErrorCode {
+    if ticket.is_current() {
+        ErrorCode::NotFound
+    } else {
+        ErrorCode::DiscordUnavailable
+    }
+}
+
+/// Keyless `event.attendance.read`: project the §4 attendance shape from the
+/// stored voice-session rows for the caller's `event_key` in the staging
+/// guild. An unmapped key refuses `not_found` before touching sessions; a
+/// mapped window with no tagged rows refuses `not_found` too — every window
+/// that closed before the logger shipped has no rows by construction, so the
+/// pre-enable answer is `not_found` without a special case. The read is a
+/// positive list only (who was there, never an absence list): below-threshold
+/// members stay listed with their minutes, and the threshold travels in the
+/// payload. A disabled flag refuses earlier in `authorize`. The only store
+/// effects are reads; no audit row, no member id in logs.
+async fn read_event_attendance(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let event_key = match validate_event_key(&decision.body) {
+        Ok(key) => key.to_owned(),
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    // Shares the mutation gate so a read cannot overtake an upsert's window
+    // persist: without it a read racing a confirm could answer `not_found`
+    // for a key whose mapping just landed.
+    let Ok(_gate) = tokio::time::timeout(state.event_gate_wait, state.event_gate.lock()).await
+    else {
+        return reject(Failure::code(ErrorCode::InProgress));
+    };
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let Some(ticket) = guild_id
+        .parse()
+        .ok()
+        .and_then(|guild| state.attendance_reads.ticket(guild))
+    else {
+        return reject(Failure::code(ErrorCode::DiscordUnavailable));
+    };
+    let window = match state
+        .store
+        .attendance_window_for_key(guild_id, &event_key)
+        .await
+    {
+        Ok(Some(window)) => window,
+        // No captured window means no record, whether the key is unknown or
+        // its event closed before logging was enabled.
+        // The negative answer is also an output of the original epoch: a
+        // recovery that finished during the await cannot revive an old ticket.
+        Ok(None) => return reject(Failure::code(not_found_code(&ticket))),
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let sessions = match state
+        .store
+        .attendance_sessions_for_event_key(guild_id, &event_key)
+        .await
+    {
+        Ok(sessions) => sessions,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let window_ms = two_bot::event_attendance::AttendanceWindowMs {
+        event_key: window.event_key.clone(),
+        starts_ms: two_bot::event_attendance::millis_of(window.starts_at),
+        ends_ms: two_bot::event_attendance::millis_of(window.ends_at),
+    };
+    let mut rows = Vec::with_capacity(sessions.len());
+    for session in &sessions {
+        // Corrupt snowflakes fail the read, never silently: the TEXT
+        // convention says these columns are always decimal ids.
+        let (member_id, channel_id) = match (
+            session.member_id.parse::<two_bot_core::Snowflake>(),
+            session.channel_id.parse::<two_bot_core::Snowflake>(),
+        ) {
+            (Ok(member), Ok(channel)) => (member, channel),
+            _ => return reject(Failure::code(ErrorCode::Internal)),
+        };
+        rows.push(two_bot::event_attendance::SessionMs {
+            member_id,
+            channel_id,
+            channel_name: session.channel_name.clone(),
+            name_observed_ns: session.name_observed_at.unix_timestamp_nanos(),
+            is_bot: session.is_bot,
+            afk: session.afk,
+            joined_ms: two_bot::event_attendance::millis_of(session.joined_at),
+            left_ms: session.left_at.map(two_bot::event_attendance::millis_of),
+        });
+    }
+    let now_ms = i64::try_from(now_ms()).unwrap_or(i64::MAX);
+    match two_bot::event_attendance::project_attendance(&event_key, &window_ms, &rows, now_ms) {
+        Ok(result) => {
+            let response = event_read_response(result, id);
+            // A recovery may have completed while these SQL reads or the
+            // projection ran. Its readiness cannot validate an older epoch.
+            if !ticket.is_current() {
+                return reject(Failure::code(ErrorCode::DiscordUnavailable));
+            }
+            metrics::global().internal_action(internal_family(action), "executed");
+            response
+        }
+        // No tagged sessions (including every pre-enable window): the key
+        // names nothing the logger saw.
+        Err(two_bot::event_attendance::AttendanceRefusal::NoRecord) => {
+            reject(Failure::code(not_found_code(&ticket)))
+        }
+        Err(two_bot::event_attendance::AttendanceRefusal::OverBudget) => {
+            reject(Failure::code(ErrorCode::Internal))
+        }
     }
 }
 
@@ -2693,6 +2826,9 @@ async fn mutate_event(
                     mark_unknown_best_effort(&state.store, &claim, action).await;
                     return reject(Failure::reconciliation());
                 }
+                // The executor's accepted Discord response already committed
+                // lifecycle evidence with the mirror. A key is only an address:
+                // neither registration nor reconciliation creates attendance.
             }
             let response = TerminalResponse::Success {
                 resource_id: Some(event_id),

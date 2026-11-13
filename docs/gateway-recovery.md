@@ -49,6 +49,46 @@ hook inputs, not persisted rewards, live gateway ordering or installed behavior.
 Internal pipeline unit tests additionally cover scoped chain retirement and an
 in-flight join overlapping deletion. Deployment/acceptance evidence is separate.
 
+### Event-window attendance continuity
+
+Attendance remains gated by `TWO_INTERNAL_ALLOW_ATTENDANCE_READ` (OFF unless
+explicitly enabled). An actual gateway, actor or process discontinuity drains
+old open attendance rows in bounded identity-only pages before capture resumes;
+snapshots do not reconstruct joins, tags or outage credit. Observations made
+before or during that full sweep remain read barriers until consumed or dropped,
+but do not create redundant member-loss scopes: no new rows are captured during
+the sweep. This coverage follows the observation even if it stays queued past
+completion. A genuinely newer observation after completion still records loss;
+ordinary close completion never clears member loss or saturation.
+
+A dropped, refused or skipped known-member observation revokes guild read tickets
+immediately, but **does not** establish a guild-wide interruption. The actor
+retains one original close continuation and finishes its observed boundary,
+name evidence and tags before recovery can touch those rows. Replacement opens
+are suppressed if loss occurs while that close is pending. Known losses retain
+only member identity and loss incarnation, never frames or replay evidence.
+Member-scoped recovery reads at most 32 identities and finalizes at most eight
+rows per turn; a newer loss cannot be cleared by an older page completion.
+Original-close and recovery work never each spend a separate 1,000 ms attendance
+budget in the same turn. Unrelated continuous members keep their stored spans.
+
+At **32 distinct dirty members**, a 33rd distinct loss latches unknown-loss
+capture-stop in constant space. Existing closes and known scopes still drain,
+but attendance capture and read publication remain fail-closed even after those
+scopes finish. No member is evicted, no guild-wide zeroing sweep is invented,
+and room commands remain available. Only a genuine gateway/actor/process
+discontinuity enters the normal full-recovery contract and clears this latch;
+do not manufacture a disconnect merely to claim attendance is healthy.
+
+Stored attendance tag arrays are independently sanitized at open-row read and
+close-time expansion. Canonical empty and bounded one-dimensional arrays with
+lower bound one are supported. NULLs, unsupported dimensions/bounds and
+oversized metadata use by-ID finalization without replacing tags or name
+evidence. A shape change between read and close disables replacement capture
+and retains the same close boundary for bounded retry, rather than retrying a
+decoder failure forever. Malformed historical data may still refuse attendance
+reads; successful finalization is not a claim that the data became readable.
+
 ## RSVP interaction scheduling (S4)
 
 The shared executor resolves the current bot application and synchronizes the full guild command registry before polling the shard. This also covers a persisted-session boot that receives RESUMED without READY; failed registry sync prevents gateway readiness.

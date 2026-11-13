@@ -8,7 +8,8 @@ listener with the durable store, announcement executor, event-read,
 voice-snapshot, event-mutation, settings, automations, moderation, membership and
 channel-moderation executors, nonce-commit authentication capability and strict
 receiver configuration. It supports `announcement.post`, the keyless `event.read`
-(behind `TWO_INTERNAL_ALLOW_EVENT_READ`), the keyless `voice.snapshot`
+(behind `TWO_INTERNAL_ALLOW_EVENT_READ`), the keyless `event.attendance.read`
+(behind `TWO_INTERNAL_ALLOW_ATTENDANCE_READ`), the keyless `voice.snapshot`
 (behind `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT`), `event.upsert` and `event.cancel`
 (cancel behind `TWO_INTERNAL_ALLOW_EVENT_CANCEL`), `settings.get`/`settings.set`
 (behind `TWO_INTERNAL_ALLOW_SETTINGS`), the automations pair
@@ -124,6 +125,7 @@ only while `TWO_INTERNAL_ACTIONS` is exactly `1`:
 | `TWO_INTERNAL_CONTAINER` | Worker constant `1`: the Worker sets it to mark the process as running inside the container network, where the wildcard bind is reachable only via `containerFetch` and the startup port check. That network is presumed private but unverified. The marker is a deployment claim, not a proof: the bot trusts it only because the Worker (not the Operator) sets it. A wildcard bind without exactly this marker is refused. |
 | `TWO_INTERNAL_CHANNEL_KEYS` | Worker secret, e.g. `smoke-throwaway:<channel snowflake in the TWO Staging guild>` |
 | `TWO_INTERNAL_KEYS` | Worker secret `web-staging:<64 hex>`; never a var, never logged |
+| `TWO_INTERNAL_ALLOW_ATTENDANCE_READ` | Optional exact `1`, forwarded explicitly only while the receiver is enabled; absent by default and left off after merge pending separate staging/production rollout approval |
 
 `NOT_FORWARDED` in `wrangler/src/container-env.ts` deliberately excludes the
 following. Setting them as Worker secrets cannot change the container's
@@ -166,10 +168,15 @@ is the serving version (same id as `wrangler deployments status --env staging`),
 and if they differ redeploy the intended SHA through the workflow first (full rule
 in `docs/production-deploy.md`).
 
-1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
+Before deploying the attendance build, apply `0471`, shipped `0472`, and additive
+`0475` through the normal migration/release gate, even with attendance off:
+shared lifecycle writers reference the attendance history and recovery column.
+No migration or flag enablement is authorized by this guide alone.
+
+1. Merge this change after its release gates. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values), only under the separately authorized enablement contract; no role keys or optional capability gates travel through this Worker.
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
-4. Operator applies migrations `0423` (settings CAS) and `0424` (event outcome) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
+4. Operator applies migrations `0423` (settings CAS), `0424` (event outcome), `0471` (attendance windows/sessions), `0472` (accepted event instances) and `0475` (attendance recovery boundary) first, as required above even for a dark attendance build (the bot does not apply migrations; an enabled receiver's finish fails without the columns, and `event.attendance.read` answers `internal` without its tables), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
 5. Rollback: stage deletion of `TWO_INTERNAL_ACTIONS` (`wrangler versions secret delete --env staging TWO_INTERNAL_ACTIONS --message <sha>`, same precheck and stamp as above), deploy and transfer ownership; or use the existing Worker-version rollback. The route is absent again and the next container start carries no receiver setting.
 
 Migration `0424` adds the nullable `internal_idempotency.outcome` column that
@@ -417,6 +424,7 @@ Success (`200` only, `result` always an object, no `error` key):
 | announcement.post | `{message_id}` | |
 | event.upsert/cancel | `{outcome, event_id}` | `outcome` replayed from the stored receipt |
 | event.read | full observed event | behind its allowlist flag |
+| event.attendance.read | §4 attendance shape below | behind its allowlist flag; unmapped keys and mapped windows with no tagged sessions refuse `not_found` |
 | voice.snapshot | live voice-room listing | behind its allowlist flag; refuses `discord_unavailable` unless the gateway is connected, so a warm cache never serves stale occupancy mid-reconnect. Each room carries `occupied_since` (Zulu instant the current continuous occupancy began, or `null` when unknown — empty rooms and joins the gateway never witnessed are unknown, never guessed) and, only on the room bound to a currently-windowed event's voice channel, `event_key` (absent means unlinked). A store error behind the key map refuses `internal` instead of serving key-omitted rooms |
 | settings.get/set | `{key, ...}` plus top-level integer `version` | `version` beside `result`, never inside |
 | automations.export/import | command document / `{imported, skipped, conflicts}` | |
@@ -444,6 +452,99 @@ Confirmed deletion has a transactional store seam; no gateway deletion consumer
 or additional gateway intent is added here. An ordinary missing poll row is
 never treated as a confirmed deletion.
 The production snapshot flag remains off pending separate rollout acceptance.
+
+### `event.attendance.read` result shape (§4)
+
+`result` is `{v: 1, event_key, window: {starts_at, ends_at}, threshold_minutes: 10,
+peak_concurrent, rooms: [{channel_id, name_at_close}], members: [{discord_id, minutes,
+sessions, first_joined_at}], final}`. Positive list only: who was there, never an
+absence list. Members below the threshold stay listed with their minutes; the
+threshold travels in the payload. Bots never appear in `members` and never count
+toward `peak_concurrent`; AFK occupants keep their member rows but never count
+toward the peak. Overlapping rows for one member are unioned before computing
+minutes; their non-AFK intervals are unioned separately for peak concurrency, so a
+failed move-close cannot count that member twice. `sessions` still counts the
+stored rows. A direct room move preserves the old span when its channel matches
+the observed previous channel, even after that span's original event window ends.
+A fresh rejoin or foreign-channel leave cannot prove continuity for a missed close;
+that stale span finalizes at its join with original tags only. Boundaries use gateway
+observation time, not actor processing time. Opens delayed over one minute or dated
+in the future are dropped; closes keep their observed boundary. The write transaction
+still refuses new opens after grace. An existing continuous captured span can acquire
+a later accepted window's overlap even when that window closed before departure.
+`rooms` selects each channel's latest persisted `name_observed_at`, independently
+of join order and credit caps. Names use database observation/write time, not the
+gateway frame's older voice boundary. Missing metadata preserves name and stamp. Still-open rows clamp at `min(now, window close)`; `final`
+is true only once the window plus its 15-minute grace has passed, and the website
+only writes an Echo from `final: true` reads. `not_found` covers unmapped keys and
+mapped windows with no tagged sessions — including every window that closed before
+the logger shipped, which has no rows by construction (no backfill). Raw sessions
+roll off 90 days after joining. Capture consults the opt-out at open time
+(contract v2 §9): a suppressed member opens no span — absent from the record,
+not anonymised in it — and `guild_analytics_settings.voice_enabled = off`
+stops capture guild-wide; closes still finalize so no open row leaks.
+Actor starts and gateway-generation changes drain old open spans at their joins:
+unknown offline time earns no credit, even if the occupant is present again.
+Recovery processes 32 rows per one-second turn, retries failed pages, and blocks
+capture until drained. Signed reads share that recovery fence: an unwired actor,
+cold start, disconnected gateway, or unfinished drain refuses `discord_unavailable`,
+not a partial list. Gateway observations fence reads before queue admission; readiness
+requires every observation to finish. Reads revalidate their original epoch for
+positive and absent results; a newer recovery cannot revive an old ticket. Actor
+exit revokes readiness. Refused or skipped attendance frames require conservative
+recovery, even in the same gateway generation. Buffered pre-recovery joins stay
+missed. Maintenance detects recovery without new frames; snapshots never open spans.
+
+Normal transitions also share one total one-second deadline across reads, gates
+and writes, with at most eight close attempts per turn. Open rows page 32 at a time;
+relevant candidates cap at 128, names at 4 KiB and stored tag text at 16 KiB per row.
+Planning filters for the observation/continuous span before the candidate limit.
+Oversized candidates grant no new capture; existing tags still finalize. Malformed
+rows, including NULL tags, finalize by id without replacing stored metadata and
+disable replacement opens. The actor retains original close evidence for maintenance
+retries, but keeps consuming room commands. Later attendance frames cannot overwrite
+pending closes: they require conservative recovery. Room dispatch/timers continue.
+No new open passes unfinished closes;
+uncertain closes retry the same id/boundary/tags, while uncertain opens never retry.
+A gateway change during continuation permits retained closes but no new open,
+and requires recovery before reads/capture resume. Reads refuse while pending.
+
+Capture consumes the shared accepted `event_instance_windows` authority, not
+caller-requested upsert dates or a retained attendance window. New spans and new
+tags revalidate finite-window containment, lifecycle and privacy in a transaction.
+Capture takes the analytics-settings lock, the opt-out/opt-in pair lock, then the
+guild ordering lock used by mirror and reconciliation writers, before session
+row locks. Lifecycle/capture writers first share a retention gate; retention takes
+it exclusively before sorted table locks, avoiding instance/history lock inversion.
+The settings and privacy writers share their locks, including when rows are absent;
+committed suppression or voice-disable cannot race past the capture check. Cancellation, confirmed
+deletion, unconfirmed absence, ambiguous instances and unknown ends authorize no
+new capture. Positive completion keeps only its confirmed finite closing grace.
+The historical `(guild, event_key, event_id, instance_starts_at)` capture record
+is written atomically with a session/tag, never by key registration or
+reconciliation; a repointed key cannot combine different occurrences. Historical
+reads remain available after revocation, with session credit capped by the
+accepted revocation/absence instant. Lifecycle writers retain historical credit
+stops in their existing mirror transaction, so later re-observation cannot fill
+an unconfirmed gap in an older span; fresh spans may start after re-observation.
+Migration `0475` adds a historical recovery boundary to shared instance evidence.
+After an absence, a new span or first close-time tag must begin no earlier than
+that first accepted recovery; ordinary positive refreshes never move the boundary.
+A span crossing an unrecorded gap gets no uncertain new tag. Existing evidence
+and older archives default to the migration/restore timestamp because their
+recovery history is unknown; no attendance is backfilled. Newly accepted instances
+start without a recovery fence until an actual absence/recovery. The logger still
+finalizes existing rows when the shared lookup returns no live windows. Both
+attendance migrations are additive; shipped migration `0472` is unchanged.
+
+Signed attendance reads admit at most 4,096 raw spans, 4,096 fixed-width capture
+stops and 1 MiB of room-name bytes. SQL checks stop cardinality before decoding,
+bounds text cells and streams rows; overflow refuses the whole read as `internal`,
+never truncated totals. Overlong identities become invalid sentinels, not prefixes.
+The independent
+serialized-result budget still reserves the relay envelope below 64 KiB.
+
+### Refusal codes
 
 Refusals keep their code, status and retry policy with the fixed message
 `request refused`:

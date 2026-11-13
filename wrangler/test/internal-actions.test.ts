@@ -816,6 +816,26 @@ test("receiver env reaches the Container only while TWO_INTERNAL_ACTIONS is exac
   assert.ok(on.logs.every((line) => !line.includes(KEYS)), "the signing key is never logged");
 });
 
+test("attendance capability forwards only with two exact explicit opt-ins", async (t) => {
+  for (const receiver of [undefined, "0", "true", "1"]) {
+    for (const attendance of [undefined, "0", "true", " 1", "1 ", "1"]) {
+      const h = await harness(t, {
+        ...ENABLED_ENV,
+        TWO_INTERNAL_ACTIONS: receiver,
+        TWO_INTERNAL_ALLOW_ATTENDANCE_READ: attendance,
+        TWO_INTERNAL_ALLOW_MODERATION: "1",
+      });
+      await h.warm();
+      const forwarded = h.starts[0]?.env ?? {};
+      assert.equal(forwarded["TWO_INTERNAL_ALLOW_ATTENDANCE_READ"],
+        receiver === "1" && attendance === "1" ? "1" : undefined,
+        JSON.stringify({ receiver, attendance }));
+      assert.equal(forwarded["TWO_INTERNAL_ALLOW_MODERATION"], undefined);
+      assert.ok(h.logs.every((line) => !line.includes(KEYS)));
+    }
+  }
+});
+
 test("BOT_PORT may not collide with the receiver port while it is enabled", async (t) => {
   await assert.rejects(() => harness(t, { ...ENABLED_ENV, BOT_PORT: String(RECEIVER_PORT) }), /BOT_PORT must differ/);
   const dark = await harness(t, { ...DARK_ENV, BOT_PORT: String(RECEIVER_PORT) });

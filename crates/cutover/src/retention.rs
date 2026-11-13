@@ -130,6 +130,9 @@ pub struct RetentionReport {
     /// Raw voice rows deleted (older than 30 days): voice-session `events`
     /// rows plus `event_store` voice captures by `event_time`.
     pub voice_raw_deleted: u64,
+    /// Raw attendance rows deleted (older than 90 days):
+    /// `event_voice_sessions` rows by `joined_at`.
+    pub attendance_raw_deleted: u64,
     /// Audit-cache rows deleted (older than 45 days):
     /// `operational_audit_log` rows plus `event_store` cached Discord
     /// audit entries by `event_time`.
@@ -207,6 +210,7 @@ impl RetentionReport {
     pub fn total_deleted(&self) -> u64 {
         self.presence_raw_deleted
             + self.voice_raw_deleted
+            + self.attendance_raw_deleted
             + self.audit_cache_deleted
             + self.stream_live_delivered_expired
             + self.guild_rows_purged
@@ -494,6 +498,7 @@ async fn run_retention_core(
                 .await?;
             let presence = count_presence_raw(&mut tx).await?;
             let voice = count_voice_raw(&mut tx).await?;
+            let attendance = count_attendance_raw(&mut tx).await?;
             let audit = count_audit_cache(&mut tx).await?;
             let live_expired =
                 count_expired_delivered_live(&mut *tx, DELIVERED_DEDUP_RETENTION_DAYS).await?;
@@ -541,6 +546,7 @@ async fn run_retention_core(
             RetentionReport {
                 presence_raw_deleted: presence,
                 voice_raw_deleted: voice,
+                attendance_raw_deleted: attendance,
                 audit_cache_deleted: audit,
                 stream_live_delivered_expired: live_expired,
                 guild_rows_purged: guild_rows,
@@ -567,6 +573,10 @@ async fn run_retention_core(
             sqlx::query("SET LOCAL statement_timeout = '15s'")
                 .execute(&mut *tx)
                 .await?;
+            // Lifecycle writers touch instance evidence before capture history.
+            // Exclude them before taking sorted table locks, not after acquiring
+            // attendance's table lock and waiting for the instance table.
+            two_bot_core::event_instance_store::lock_retention(&mut tx).await?;
             // Same sorted-lock discipline as erase_member, covering every
             // table the time-window deletes, guild purges, and per-user
             // deletions can touch. The plan tables plus the raw probe and
@@ -606,6 +616,16 @@ async fn run_retention_core(
             "DELETE FROM operational_audit_log WHERE occurred_at < now() - make_interval(days => $1)",
         )
         .bind(AUDIT_CACHE_RETENTION_DAYS)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+            // Attendance sessions roll off 90 days after joining, oldest
+            // first by `joined_at`. The table rides the erasure-plan lock
+            // list above, so no new lock arm is needed.
+            let attendance = sqlx::query(
+            "DELETE FROM event_voice_sessions WHERE joined_at < now() - make_interval(days => $1)",
+        )
+        .bind(crate::event_attendance::ATTENDANCE_SESSION_RETENTION_DAYS)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -758,6 +778,7 @@ async fn run_retention_core(
             RetentionReport {
                 presence_raw_deleted: presence,
                 voice_raw_deleted: voice,
+                attendance_raw_deleted: attendance,
                 audit_cache_deleted: audit,
                 stream_live_delivered_expired: live_expired,
                 guild_rows_purged: guild_rows,
@@ -884,6 +905,7 @@ async fn count_raw_expiry_candidates(
     Ok(RetentionReport {
         presence_raw_deleted: presence as u64,
         voice_raw_deleted: voice as u64,
+        attendance_raw_deleted: 0,
         audit_cache_deleted: audit as u64,
         stream_live_delivered_expired: 0,
         guild_rows_purged: 0,
@@ -1030,6 +1052,7 @@ pub async fn run_raw_expiry_batch(
     let mut report = RetentionReport {
         presence_raw_deleted: 0,
         voice_raw_deleted: 0,
+        attendance_raw_deleted: 0,
         audit_cache_deleted: 0,
         stream_live_delivered_expired: 0,
         guild_rows_purged: 0,
@@ -1266,6 +1289,10 @@ async fn complete_request(
 const EVENT_INSTANCE_GUILD_PURGE_TABLES: &[&str] = &[
     "event_voice_channels",
     "internal_event_keys",
+    // Memberless captured-window history: it keeps a key bound to the old
+    // instance, so a rejoined guild could never reuse it. Purge it before the
+    // instance evidence it references; member erasure never touches it.
+    "event_attendance_windows",
     "event_instance_windows",
 ];
 
@@ -1336,6 +1363,10 @@ fn guild_projection_time_exclusions(table: &str, first_placeholder: usize) -> Ve
         "operational_audit_log" => vec![(
             format!("occurred_at < now() - make_interval(days => ${first_placeholder})"),
             AUDIT_CACHE_RETENTION_DAYS,
+        )],
+        "event_voice_sessions" => vec![(
+            format!("joined_at < now() - make_interval(days => ${first_placeholder})"),
+            crate::event_attendance::ATTENDANCE_SESSION_RETENTION_DAYS,
         )],
         _ => Vec::new(),
     }
@@ -1498,6 +1529,21 @@ async fn count_voice_raw(
     .fetch_one(&mut **tx)
     .await?;
     Ok(funnel as u64)
+}
+
+/// Raw attendance sessions joined earlier than the 90-day horizon, mirroring
+/// the Execute time-window delete so the dry run counts what the live run
+/// removes.
+async fn count_attendance_raw(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<u64, sqlx::Error> {
+    let sessions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM event_voice_sessions WHERE joined_at < now() - make_interval(days => $1)",
+    )
+    .bind(crate::event_attendance::ATTENDANCE_SESSION_RETENTION_DAYS)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(sessions as u64)
 }
 
 async fn count_audit_cache(
@@ -1693,6 +1739,7 @@ mod retention_stage_order_tests {
         RetentionReport {
             presence_raw_deleted: 0,
             voice_raw_deleted: 0,
+            attendance_raw_deleted: 0,
             audit_cache_deleted: 0,
             stream_live_delivered_expired: 0,
             guild_rows_purged: 0,
@@ -1820,12 +1867,13 @@ mod ledger_tests {
         }
     }
 
-    fn report(values: [u64; 12]) -> RetentionReport {
-        let [presence, voice, audit, live_expired, guild_rows, failed, deferred_guilds, oldest_secs, completed, deferred, gap, overdue] =
+    fn report(values: [u64; 13]) -> RetentionReport {
+        let [presence, voice, attendance, audit, live_expired, guild_rows, failed, deferred_guilds, oldest_secs, completed, deferred, gap, overdue] =
             values;
         RetentionReport {
             presence_raw_deleted: presence,
             voice_raw_deleted: voice,
+            attendance_raw_deleted: attendance,
             audit_cache_deleted: audit,
             stream_live_delivered_expired: live_expired,
             guild_rows_purged: guild_rows,
@@ -1843,7 +1891,7 @@ mod ledger_tests {
 
     #[test]
     fn empty_run_deletes_nothing() {
-        let idle = report([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let idle = report([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(idle.total_deleted(), 0);
     }
 
@@ -1853,7 +1901,8 @@ mod ledger_tests {
         // overdue signals vary freely: none of them may leak into the total.
         let mut rng = Ladder(0x1234_5678_9abc_def0);
         for _ in 0..256 {
-            let (presence, voice, audit, live_expired, guild_rows) = (
+            let (presence, voice, attendance, audit, live_expired, guild_rows) = (
+                rng.below(1_000_000),
                 rng.below(1_000_000),
                 rng.below(1_000_000),
                 rng.below(1_000_000),
@@ -1863,6 +1912,7 @@ mod ledger_tests {
             let raffle = report([
                 presence,
                 voice,
+                attendance,
                 audit,
                 live_expired,
                 guild_rows,
@@ -1876,8 +1926,8 @@ mod ledger_tests {
             ]);
             assert_eq!(
                 raffle.total_deleted(),
-                presence + voice + audit + live_expired + guild_rows,
-                "the total must sum exactly the five row classes, got {raffle:?}"
+                presence + voice + attendance + audit + live_expired + guild_rows,
+                "the total must sum exactly the six row classes, got {raffle:?}"
             );
         }
     }
@@ -1889,7 +1939,8 @@ mod ledger_tests {
         // The DB acceptance suite exercises the actual #960 projection logic.
         let mut rng = Ladder(0x0bad_f00d_dead_beef);
         for _ in 0..256 {
-            let (presence, voice, audit, live_expired, guild_rows) = (
+            let (presence, voice, attendance, audit, live_expired, guild_rows) = (
+                rng.below(1_000_000),
                 rng.below(1_000_000),
                 rng.below(1_000_000),
                 rng.below(1_000_000),
@@ -1899,6 +1950,7 @@ mod ledger_tests {
             let dry = report([
                 presence,
                 voice,
+                attendance,
                 audit,
                 live_expired,
                 guild_rows,
@@ -1913,6 +1965,7 @@ mod ledger_tests {
             let live = report([
                 presence,
                 voice,
+                attendance,
                 audit,
                 live_expired,
                 guild_rows,
@@ -2039,6 +2092,23 @@ mod ledger_tests {
         assert!(audit_condition.contains("$2"), "{audit_condition}");
         assert_eq!(audit_days, AUDIT_CACHE_RETENTION_DAYS);
 
+        // Attendance sessions roll off 90 days after `joined_at` through the
+        // same time-window stage, so the projection excludes them with the
+        // same window.
+        let (attendance_condition, attendance_days) =
+            guild_projection_time_exclusions("event_voice_sessions", 2)
+                .into_iter()
+                .next()
+                .expect("event_voice_sessions needs a projection exclusion");
+        assert!(
+            attendance_condition.contains("$2"),
+            "{attendance_condition}"
+        );
+        assert_eq!(
+            attendance_days,
+            crate::event_attendance::ATTENDANCE_SESSION_RETENTION_DAYS
+        );
+
         let mut without_exclusion: Vec<String> = crate::member_erasure::plan()
             .tables
             .iter()
@@ -2046,7 +2116,10 @@ mod ledger_tests {
             .collect();
         without_exclusion.push("presence_probe".to_owned());
         for table in without_exclusion {
-            if table == "events" || table == "operational_audit_log" {
+            if table == "events"
+                || table == "operational_audit_log"
+                || table == "event_voice_sessions"
+            {
                 continue;
             }
             assert!(

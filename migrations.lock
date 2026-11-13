@@ -533,9 +533,17 @@
       "sha256": "eb1feb5257b747b8d114923f32a40a032929dd4437c61329b1c62d1c1dd1ad8b",
       "justification": "Expand step: copy the imported voice creation switch and guild-wide command role from voice_guild_settings into voice_access_controls, the columns the runtime gates enforce, tightening only (creation off wins, an enforced role wins) and syncing the legacy columns as a mirror for the previous binary until a contract migration drops them; data copy only, no DDL."
     },
+    "crates/cutover/migrations/0471_event_attendance.sql": {
+      "sha256": "13f719e7ede6ebb329c63e61f4e40afb54e5ed6bd4a2bd15f6ba57d36cf351c2",
+      "justification": "Event-window voice-session log for the keyless attendance read: historical captured-instance schedules and credit-stop boundaries, never a second live authority, plus raw sessions recorded only under accepted lifecycle and privacy evidence; additive tables and indexes, no backfill; raw sessions roll off 90 days after joining."
+    },
     "crates/cutover/migrations/0472_event_instance_windows.sql": {
       "sha256": "ff2af4cb454c9fa569fb2722593ff35f3af3c347dc55fcea82ddeff0c21bd671",
       "justification": "Retain accepted event instance windows and independent lifecycle, omission and revocation fences outside the exact-replacement mirror; omission stamps preserve rollback recency without masking delayed terminal observations."
+    },
+    "crates/cutover/migrations/0475_attendance_recovery_boundary.sql": {
+      "sha256": "c67287ffe1412d04dd4191fe1b3ad5c4f4b5e3ae69f203c98c361f10876838bc",
+      "justification": "Retain the first accepted recovery after omission as a historical attendance credit fence independent of positive refresh stamps; additive nullable timestamp, with a migration/old-archive restore boundary for evidence lacking recovery history, and no attendance backfill."
     }
   }
 }

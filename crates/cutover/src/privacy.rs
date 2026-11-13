@@ -124,13 +124,35 @@ async fn begin_member_change<'a>(
     sqlx::query("SET LOCAL statement_timeout = '15s'")
         .execute(&mut *tx)
         .await?;
-    // Always take this before table/row locks, including when no suppression
-    // row exists. Transaction scope releases it on commit, error or cancel.
+    lock_member_change(&mut tx, guild, member).await?;
+    Ok(tx)
+}
+
+// Shared with attendance capture, including when no suppression row exists.
+// Take before table/row locks; transaction scope releases it on every exit.
+pub(crate) async fn lock_member_change(
+    connection: &mut sqlx::PgConnection,
+    guild: &str,
+    member: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("privacy:{guild}:{member}"))
-        .execute(&mut *tx)
+        .execute(connection)
         .await?;
-    Ok(tx)
+    Ok(())
+}
+
+// A missing settings row must serialize too. Capture takes settings, member,
+// then lifecycle locks; settings writers never acquire member/lifecycle locks.
+pub(crate) async fn lock_analytics_settings(
+    connection: &mut sqlx::PgConnection,
+    guild: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("analytics_settings:{guild}"))
+        .execute(connection)
+        .await?;
+    Ok(())
 }
 
 async fn opt_out(
@@ -349,6 +371,11 @@ pub async fn set_analytics_settings(
             "invalid analytics settings identity".into(),
         ));
     }
+    let mut tx = db.pool().begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *tx)
+        .await?;
+    lock_analytics_settings(&mut tx, guild).await?;
     sqlx::query(
         "INSERT INTO guild_analytics_settings (guild_id, presence_enabled, activity_enabled, voice_enabled, updated_at)
          VALUES ($1, $2, $3, $4, clock_timestamp())
@@ -362,9 +389,9 @@ pub async fn set_analytics_settings(
     .bind(presence)
     .bind(activity)
     .bind(voice)
-    .execute(db.pool())
+    .execute(&mut *tx)
     .await?;
-    Ok(())
+    tx.commit().await
 }
 
 #[cfg(test)]

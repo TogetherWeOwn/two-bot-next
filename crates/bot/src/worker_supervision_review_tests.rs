@@ -239,10 +239,11 @@ fn main_releases_the_activity_flush_after_the_gateway_joins_and_joins_it() {
     // late presence/voice frames and the voice guard's closed spans miss the
     // pass. Dropping the flush join detaches the pass from the process exit.
     let main = code_only(MAIN_SOURCE);
+    let compact: String = main.split_whitespace().collect();
     assert_eq!(
         occurrences(
-            &main,
-            "build_voice_runtime(&config, VoiceGates::from_env().enabled, activity_drain)"
+            &compact,
+            "build_voice_runtime(&config,VoiceGates::from_env().enabled,activity_drain,attendance_reads,)"
         ),
         1,
         "the flush loop must take its own drain latch, not the service watch"

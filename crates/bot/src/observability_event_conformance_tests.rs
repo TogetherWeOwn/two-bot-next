@@ -205,9 +205,10 @@ const MAIN_RS_ADJACENT: [&str; 14] = [
     "automod activation wired into the gateway loop",
 ];
 
-// `crates/bot/src/voice_rooms.rs`: per-command voice UX receipts, not gateway
-// session events.
-const VOICE_RS_ADJACENT: [&str; 26] = [
+// `crates/bot/src/voice_rooms.rs`: voice UX and attendance-recovery receipts,
+// not gateway session events.
+const VOICE_RS_ADJACENT: [&str; 27] = [
+    "attendance recovery deferred",
     "voice succession refused",
     "voice succession handed the room to the longest-present member",
     "voice actor load failed; retrying with capped backoff",

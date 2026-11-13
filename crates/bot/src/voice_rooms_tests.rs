@@ -283,7 +283,23 @@ struct Store {
     /// Scripted live event-voice bindings for the guild repair; empty by
     /// default, so the repair is a no-op unless the test seeds a binding.
     ev_bindings: Mutex<Vec<EventVoiceBinding>>,
+    attendance_recovery_rows: Mutex<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>>,
+    attendance_recovery_closed: Mutex<Vec<i64>>,
+    attendance_recovery_delay: Mutex<Option<Duration>>,
+    /// Open attendance rows the logger may finalize; a successful close
+    /// removes the row (and its recovery mirror), a failed one keeps it.
+    attendance_open: Mutex<Vec<AttendanceSession>>,
+    attendance_window_rows: Mutex<Vec<AttendanceWindow>>,
+    /// Every close attempt in order, failed ones included.
+    attendance_close_log: Mutex<Vec<AttendanceCloseAttempt>>,
+    attendance_close_errors: Mutex<VecDeque<StoreError>>,
+    /// One-shot sleep inside the next close, after it is logged, so a test can
+    /// drive a real per-turn timeout that drops the close before it commits.
+    attendance_close_delay: Mutex<Option<Duration>>,
+    attendance_inserts: Mutex<Vec<NewAttendanceSession>>,
 }
+
+type AttendanceCloseAttempt = (i64, OffsetDateTime, Option<String>, Vec<String>);
 
 impl Store {
     fn new(trace: Trace) -> Self {
@@ -342,11 +358,131 @@ impl Store {
             kick_audit: Mutex::new(Vec::new()),
             kick_audit_errors: Mutex::new(VecDeque::new()),
             ev_bindings: Mutex::new(Vec::new()),
+            attendance_recovery_rows: Mutex::new(Vec::new()),
+            attendance_recovery_closed: Mutex::new(Vec::new()),
+            attendance_recovery_delay: Mutex::new(None),
+            attendance_open: Mutex::new(Vec::new()),
+            attendance_window_rows: Mutex::new(Vec::new()),
+            attendance_close_log: Mutex::new(Vec::new()),
+            attendance_close_errors: Mutex::new(VecDeque::new()),
+            attendance_close_delay: Mutex::new(None),
+            attendance_inserts: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl RoomPersistence for Store {
+    async fn attendance_windows(
+        &self,
+        _: Snowflake,
+        _: Snowflake,
+        _: Option<Snowflake>,
+        _: OffsetDateTime,
+    ) -> Result<Vec<AttendanceWindow>, StoreError> {
+        Ok(self.attendance_window_rows.lock().unwrap().clone())
+    }
+
+    async fn open_attendance_sessions(
+        &self,
+        _: Snowflake,
+        member: Snowflake,
+    ) -> Result<Vec<AttendanceSession>, StoreError> {
+        Ok(self
+            .attendance_open
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row.member_id == member.to_string())
+            .take(two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE)
+            .cloned()
+            .collect())
+    }
+
+    async fn insert_attendance_session(
+        &self,
+        new: NewAttendanceSession,
+    ) -> Result<i64, StoreError> {
+        let mut inserts = self.attendance_inserts.lock().unwrap();
+        inserts.push(new);
+        Ok(inserts.len() as i64)
+    }
+
+    async fn close_attendance_session(
+        &self,
+        id: i64,
+        left_at: OffsetDateTime,
+        channel_name: Option<String>,
+        event_keys: &[String],
+    ) -> Result<u64, StoreError> {
+        self.attendance_close_log.lock().unwrap().push((
+            id,
+            left_at,
+            channel_name,
+            event_keys.to_vec(),
+        ));
+        if let Some(error) = self.attendance_close_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let delay = self.attendance_close_delay.lock().unwrap().take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.attendance_open
+            .lock()
+            .unwrap()
+            .retain(|row| row.id != id);
+        self.attendance_recovery_rows
+            .lock()
+            .unwrap()
+            .retain(|row| row.id != id);
+        Ok(1)
+    }
+
+    async fn attendance_recovery_page(
+        &self,
+        _: Snowflake,
+        member: Option<Snowflake>,
+        after_id: i64,
+    ) -> Result<Vec<two_bot_cutover::event_attendance::AttendanceRecoveryRow>, StoreError> {
+        Ok(self
+            .attendance_recovery_rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                row.id > after_id && member.is_none_or(|member| row.member_id == member.to_string())
+            })
+            .take(two_bot_cutover::event_attendance::ATTENDANCE_RECOVERY_PAGE_SIZE)
+            .cloned()
+            .collect())
+    }
+
+    async fn recover_attendance_sessions(
+        &self,
+        _: Snowflake,
+        ids: &[i64],
+    ) -> Result<u64, StoreError> {
+        let delay = self.attendance_recovery_delay.lock().unwrap().take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.attendance_recovery_rows
+            .lock()
+            .unwrap()
+            .retain(|row| !ids.contains(&row.id));
+        // A conservative recovery finalizes the row itself, so a later
+        // transition cannot still see it open (collateral becomes visible).
+        self.attendance_open
+            .lock()
+            .unwrap()
+            .retain(|row| !ids.contains(&row.id));
+        self.attendance_recovery_closed
+            .lock()
+            .unwrap()
+            .extend_from_slice(ids);
+        Ok(ids.len() as u64)
+    }
+
     async fn creators(&self, _: u64) -> Result<Vec<CreatorChannel>, StoreError> {
         match self.creators_error {
             Some(error) => Err(error),
@@ -1499,6 +1635,1500 @@ fn fixture() -> (LiveGuild, Store, Http, Trace) {
         Http::new(trace.clone()),
         trace,
     )
+}
+
+fn recovery_row(
+    id: i64,
+    member: Snowflake,
+    channel: Snowflake,
+) -> two_bot_cutover::event_attendance::AttendanceRecoveryRow {
+    two_bot_cutover::event_attendance::AttendanceRecoveryRow {
+        id,
+        member_id: member.to_string(),
+        channel_id: channel.to_string(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_read_authority_tracks_actor_recovery_and_gateway_epochs() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    assert!(authority.ticket(GUILD).is_none(), "actor not loaded yet");
+    store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .extend((1..=33).map(|id| recovery_row(id, MEMBER, CREATOR)));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    assert!(authority.ticket(GUILD).is_none(), "second page outstanding");
+    recovery.turn(&worker, true).await;
+    let old_read = authority.ticket(GUILD).expect("all pages committed");
+    assert!(old_read.is_current());
+    worker.live.disconnect();
+    assert!(
+        !old_read.is_current(),
+        "gateway invalidates before actor runs"
+    );
+    assert!(authority.ticket(GUILD).is_none());
+    worker.live.publish(snapshot(&[], vec![]));
+    assert!(
+        authority.ticket(GUILD).is_none(),
+        "snapshot is not recovery"
+    );
+    recovery.turn(&worker, true).await;
+    let new_read = authority.ticket(GUILD).expect("new epoch recovered");
+    assert!(new_read.is_current());
+    assert!(
+        !old_read.is_current(),
+        "new readiness cannot revive old reads"
+    );
+    drop(recovery);
+    assert!(!new_read.is_current(), "actor exit revokes readiness");
+    assert!(authority.ticket(GUILD).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_recovery_completion_cannot_publish_after_gateway_changes_during_commit() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .push(recovery_row(1, MEMBER, CREATOR));
+    *store.attendance_recovery_delay.lock().unwrap() = Some(Duration::from_millis(100));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    let interruption = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        worker.live.disconnect();
+        worker.live.publish(snapshot(&[], vec![]));
+    };
+    tokio::join!(recovery.turn(&worker, true), interruption);
+    assert!(authority.ticket(GUILD).is_none());
+    assert!(recovery.resetting);
+    assert_eq!(
+        recovery.after_id, 0,
+        "no cursor advance on stale generation"
+    );
+    recovery.turn(&worker, true).await;
+    assert!(authority.ticket(GUILD).is_some());
+}
+
+#[test]
+fn attendance_replacing_an_actor_revokes_old_reads_and_old_completion() {
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    let old = crate::event_attendance::AttendanceReadFence::default();
+    authority.register(GUILD, old.clone());
+    let old_actor = old.begin_recovery();
+    assert!(old_actor.complete());
+    let old_read = authority.ticket(GUILD).unwrap();
+    let replacement = crate::event_attendance::AttendanceReadFence::default();
+    authority.register(GUILD, replacement.clone());
+    assert!(!old_read.is_current());
+    assert!(!old_actor.complete());
+    assert!(authority.ticket(GUILD).is_none());
+    let new_actor = replacement.begin_recovery();
+    assert!(new_actor.complete());
+    drop(old_actor);
+    assert!(authority.ticket(GUILD).unwrap().is_current());
+    assert!(
+        authority.ticket(GUILD + 1).is_none(),
+        "guild-scoped readiness"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_restart_recovery_drains_bounded_pages_before_capture() {
+    let (live, store, http, _) = fixture();
+    store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .extend((1..=69).map(|id| recovery_row(id, MEMBER, CREATOR)));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    assert!(!recovery.capture_allowed(&worker.live));
+    for (closed, allowed) in [(32, false), (64, false), (69, true)] {
+        recovery.turn(&worker, true).await;
+        assert_eq!(
+            worker
+                .store
+                .attendance_recovery_closed
+                .lock()
+                .unwrap()
+                .len(),
+            closed
+        );
+        assert_eq!(recovery.capture_allowed(&worker.live), allowed);
+    }
+    assert!(worker
+        .store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_gateway_recovery_does_not_bridge_a_snapshot_occupant() {
+    let (live, store, http, _) = fixture();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    worker.live.voice_update(MEMBER, Some(CREATOR), Some(false));
+    worker
+        .store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .push(recovery_row(1, MEMBER, CREATOR));
+    // Uninterrupted presence preserves an open span.
+    recovery.turn(&worker, true).await;
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
+    worker.live.disconnect();
+    worker.live.publish(snapshot(
+        &[],
+        vec![VoiceMember {
+            member_id: MEMBER,
+            channel_id: CREATOR,
+            bot: Some(false),
+        }],
+    ));
+    assert!(!recovery.capture_allowed(&worker.live));
+    // Being present again does not establish continuous presence while offline.
+    recovery.turn(&worker, true).await;
+    assert_eq!(
+        *worker.store.attendance_recovery_closed.lock().unwrap(),
+        vec![1]
+    );
+    assert!(recovery.capture_allowed(&worker.live));
+    let since = recovery.capture_since.unwrap();
+    assert!(!recovery.transition_allowed(&worker.live, since - time::Duration::seconds(1)));
+    assert!(recovery.transition_allowed(&worker.live, since));
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_periodic_recovery_catches_a_missed_leave_without_new_frames() {
+    let (live, store, http, _) = fixture();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    worker.live.voice_update(MEMBER, Some(CREATOR), Some(false));
+    worker
+        .store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .extend([
+            recovery_row(1, MEMBER, CREATOR),
+            recovery_row(2, MEMBER + 1, CREATOR),
+            recovery_row(3, MEMBER, CREATOR + 1),
+        ]);
+    recovery.turn(&worker, true).await;
+    // A newer live view does not trump queued transitions in this generation.
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
+    worker.live.disconnect();
+    recovery.turn(&worker, true).await;
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
+    worker.live.publish(snapshot(&[], vec![]));
+    // The maintenance call alone discovers recovery; no new voice frame.
+    recovery.turn(&worker, true).await;
+    assert_eq!(
+        *worker.store.attendance_recovery_closed.lock().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert!(worker
+        .store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_recovery_timeout_retains_cursor_and_retries_without_capture() {
+    let (live, store, http, _) = fixture();
+    store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .push(recovery_row(1, MEMBER, CREATOR));
+    *store.attendance_recovery_delay.lock().unwrap() = Some(Duration::from_secs(10));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    let start = tokio::time::Instant::now();
+    recovery.turn(&worker, true).await;
+    assert_eq!(start.elapsed(), Duration::from_secs(1));
+    assert_eq!(recovery.after_id, 0);
+    assert!(!recovery.capture_allowed(&worker.live));
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
+    recovery.turn(&worker, true).await;
+    assert_eq!(
+        *worker.store.attendance_recovery_closed.lock().unwrap(),
+        vec![1]
+    );
+    assert!(recovery.capture_allowed(&worker.live));
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_dark_recovery_never_touches_the_store() {
+    let (live, store, http, _) = fixture();
+    store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .push(recovery_row(1, MEMBER, CREATOR));
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, false).await;
+    assert_eq!(recovery.generation, None);
+    assert_eq!(
+        worker.store.attendance_recovery_rows.lock().unwrap().len(),
+        1
+    );
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+/// Seed `count` open rows for `MEMBER` in `CREATOR` plus one window covering
+/// now, mirroring each row into the recovery page so a premature conservative
+/// recovery would be visible. Returns the observation instant to use.
+fn seed_open_attendance(store: &Store, count: i64) -> OffsetDateTime {
+    // Attendance persists epoch milliseconds, so the observation instant is
+    // already at stored precision and equality survives the round trip.
+    let now = crate::event_attendance::datetime_of(crate::event_attendance::millis_of(
+        OffsetDateTime::now_utc(),
+    ));
+    store
+        .attendance_window_rows
+        .lock()
+        .unwrap()
+        .push(AttendanceWindow {
+            event_key: "evt".to_owned(),
+            starts_at: now - time::Duration::hours(1),
+            ends_at: now + time::Duration::hours(1),
+        });
+    for id in 1..=count {
+        store
+            .attendance_open
+            .lock()
+            .unwrap()
+            .push(AttendanceSession {
+                id,
+                member_id: MEMBER.to_string(),
+                channel_id: CREATOR.to_string(),
+                channel_name: "lobby".to_owned(),
+                name_observed_at: now - time::Duration::seconds(30),
+                is_bot: false,
+                afk: false,
+                joined_at: now - time::Duration::seconds(30),
+                left_at: None,
+                event_keys: Vec::new(),
+            });
+        store
+            .attendance_recovery_rows
+            .lock()
+            .unwrap()
+            .push(recovery_row(id, MEMBER, CREATOR));
+    }
+    now
+}
+
+/// A move out of `CREATOR` observed at `observed_at`.
+fn attendance_move(observed_at: OffsetDateTime) -> crate::event_attendance::VoiceTransition {
+    crate::event_attendance::VoiceTransition {
+        guild: GUILD,
+        member: MEMBER,
+        previous: Some(CREATOR),
+        current: Some(CREATOR + 1),
+        is_bot: false,
+        afk_channel: None,
+        previous_name: Some("lobby".to_owned()),
+        current_name: Some("room".to_owned()),
+        observed_at,
+        enabled: true,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_pending_closes_block_capture_and_reads_until_continuation_finishes() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    // More open rows than one turn's close budget (8).
+    let observed_at = seed_open_attendance(&store, 9);
+    store.attendance_recovery_rows.lock().unwrap().clear();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    assert!(recovery.capture_allowed(&worker.live));
+    let read = authority.ticket(GUILD).expect("recovered before the frame");
+
+    recovery
+        .record(&worker, attendance_move(observed_at), None)
+        .await;
+    assert!(recovery.pending.is_some(), "ninth close is outstanding");
+    assert_eq!(worker.store.attendance_close_log.lock().unwrap().len(), 8);
+    assert!(
+        worker.store.attendance_inserts.lock().unwrap().is_empty(),
+        "no open passes an unfinished close"
+    );
+    assert!(!recovery.capture_allowed(&worker.live));
+    assert!(!read.is_current(), "old read ticket is revoked");
+    assert!(
+        authority.ticket(GUILD).is_none(),
+        "no new read while pending"
+    );
+
+    recovery.turn(&worker, true).await;
+    assert!(recovery.pending.is_none());
+    assert_eq!(worker.store.attendance_close_log.lock().unwrap().len(), 9);
+    assert!(worker.store.attendance_open.lock().unwrap().is_empty());
+    let inserts = worker.store.attendance_inserts.lock().unwrap();
+    assert_eq!(inserts.len(), 1, "open happens once, after the last close");
+    assert_eq!(inserts[0].channel_id, (CREATOR + 1).to_string());
+    assert_eq!(inserts[0].joined_at, observed_at);
+    drop(inserts);
+    assert!(recovery.capture_allowed(&worker.live));
+    assert!(authority
+        .ticket(GUILD)
+        .expect("readiness restored")
+        .is_current());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_close_error_retries_the_exact_close_before_any_open() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    let observed_at = seed_open_attendance(&store, 2);
+    store.attendance_recovery_rows.lock().unwrap().clear();
+    store
+        .attendance_close_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::Unavailable);
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    assert!(authority.ticket(GUILD).is_some());
+
+    recovery
+        .record(&worker, attendance_move(observed_at), None)
+        .await;
+    assert!(recovery.pending.is_some());
+    assert!(!recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_none());
+    assert_eq!(worker.store.attendance_close_log.lock().unwrap().len(), 1);
+    assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+    assert_eq!(worker.store.attendance_open.lock().unwrap().len(), 2);
+
+    recovery.turn(&worker, true).await;
+    let log = worker.store.attendance_close_log.lock().unwrap().clone();
+    assert_eq!(log.len(), 3, "failed close, its retry, then the second row");
+    assert_eq!(log[0], log[1], "retry keeps id, stamp, name and tags");
+    assert_eq!(log[0].0, 1);
+    assert_eq!(log[0].3, vec!["evt".to_owned()]);
+    assert_eq!(log[2].0, 2);
+    assert_eq!(log[2].1, log[0].1, "every close keeps the observed stamp");
+    assert!(recovery.pending.is_none());
+    assert_eq!(worker.store.attendance_inserts.lock().unwrap().len(), 1);
+    assert!(recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_gateway_change_while_pending_finishes_closes_but_never_opens() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    assert!(recovery.capture_allowed(&worker.live));
+    // Seeded after startup recovery and mirrored in the recovery page, so
+    // running conservative recovery before the continuation would zero row 9.
+    let observed_at = seed_open_attendance(&worker.store, 9);
+    recovery
+        .record(&worker, attendance_move(observed_at), None)
+        .await;
+    assert!(recovery.pending.is_some());
+    assert_eq!(worker.store.attendance_close_log.lock().unwrap().len(), 8);
+
+    worker.live.disconnect();
+    worker.live.publish(snapshot(&[], vec![]));
+    recovery.turn(&worker, true).await;
+    assert!(recovery.pending.is_none(), "last close still finishes");
+    let log = worker.store.attendance_close_log.lock().unwrap().clone();
+    assert_eq!(log.len(), 9);
+    assert_eq!(log[8].1, log[0].1, "observation is retained, not zeroed");
+    assert_eq!(log[8].3, vec!["evt".to_owned()]);
+    assert!(
+        worker.store.attendance_inserts.lock().unwrap().is_empty(),
+        "a changed gateway never opens after the closes"
+    );
+    assert!(
+        worker
+            .store
+            .attendance_recovery_closed
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "conservative recovery did not zero the pending row first"
+    );
+    assert!(
+        !recovery.capture_allowed(&worker.live),
+        "next recovery required"
+    );
+    assert!(authority.ticket(GUILD).is_none());
+
+    recovery.turn(&worker, true).await;
+    assert!(recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_some());
+    assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_failure_does_not_park_unrelated_room_inbox_commands() {
+    let (live, store, http, _) = fixture();
+    let observed_at = seed_open_attendance(&store, 2);
+    store.attendance_recovery_rows.lock().unwrap().clear();
+    store
+        .attendance_close_errors
+        .lock()
+        .unwrap()
+        .extend(std::iter::repeat_n(StoreError::Unavailable, 256));
+    let shared_live = live.clone();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        run_actor_inner(
+            &mut worker,
+            rx,
+            Duration::from_millis(100),
+            ActorLimits::default(),
+            VecDeque::new(),
+            &ActorInboxBackpressure::default(),
+            true,
+        )
+        .await;
+        worker
+    });
+    let (reply, ready) = oneshot::channel();
+    tx.send(ActorCommand::Status(reply)).unwrap();
+    ready.await.unwrap();
+    tx.send(ActorCommand::EventVoicePresence {
+        member_id: MEMBER,
+        previous: Some(CREATOR),
+        current: None,
+        is_bot: false,
+        afk_channel: None,
+        observed_at: OffsetDateTime::now_utc().max(observed_at),
+        attendance_observation: Some(shared_live.attendance_reads.observe(MEMBER)),
+    })
+    .unwrap();
+    let ticket = shared_live
+        .voice_update(MEMBER + 1, Some(CREATOR), Some(false))
+        .unwrap();
+    tx.send(ActorCommand::Join {
+        ticket,
+        display: "unrelated".to_owned(),
+        seed: 7,
+        created_at: NOW.to_owned(),
+        received: tokio::time::Instant::now(),
+    })
+    .unwrap();
+    let (reply, control) = oneshot::channel();
+    tx.send(ActorCommand::Ownership {
+        actor_id: MEMBER + 2,
+        is_admin: false,
+        command: OwnershipCommand::Reclaim,
+        reply,
+    })
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), control)
+        .await
+        .expect("room command cannot wait for attendance recovery")
+        .unwrap();
+    // Sustained: later room commands still progress after more retry windows.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let (reply, control) = oneshot::channel();
+    tx.send(ActorCommand::Ownership {
+        actor_id: MEMBER + 3,
+        is_admin: false,
+        command: OwnershipCommand::Reclaim,
+        reply,
+    })
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), control)
+        .await
+        .expect("room commands stay live while attendance keeps failing")
+        .unwrap();
+    drop(tx);
+    let worker = handle.await.unwrap();
+    assert_eq!(worker.store.attendance_open.lock().unwrap().len(), 2);
+    assert!(!worker.store.attendance_close_log.lock().unwrap().is_empty());
+    assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+    assert!(
+        worker.queue.pending_counts(GUILD).0 > 0 || !worker.rooms.is_empty(),
+        "the unrelated creator join reached room dispatch"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_queued_observation_revokes_reads_until_its_observed_close_commits() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    let old_read = authority.ticket(GUILD).unwrap();
+    let observed_at = seed_open_attendance(&worker.store, 1);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let actor = GuildActor {
+        live: worker.live.clone(),
+        tx,
+        backpressure: ActorInboxBackpressure::default(),
+    };
+    assert!(actor.try_send_command(ActorCommand::EventVoicePresence {
+        member_id: MEMBER,
+        previous: Some(CREATOR),
+        current: None,
+        is_bot: false,
+        afk_channel: None,
+        observed_at,
+        attendance_observation: Some(actor.live.attendance_reads.observe(MEMBER)),
+    }));
+    assert!(
+        !old_read.is_current(),
+        "the actor has not consumed the leave yet"
+    );
+    assert!(authority.ticket(GUILD).is_none());
+    let ActorCommand::EventVoicePresence {
+        attendance_observation,
+        ..
+    } = rx.recv().await.unwrap()
+    else {
+        panic!("expected voice frame")
+    };
+    let mut transition = attendance_move(observed_at);
+    transition.current = None;
+    recovery
+        .record(&worker, transition, attendance_observation)
+        .await;
+    assert!(authority.ticket(GUILD).unwrap().is_current());
+    assert!(
+        !old_read.is_current(),
+        "catch-up never revives a previous ticket"
+    );
+    assert_eq!(
+        worker.store.attendance_close_log.lock().unwrap()[0].1,
+        observed_at
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_refused_frame_requires_same_gateway_generation_recovery() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    let read = authority.ticket(GUILD).unwrap();
+    let generation = worker.live.read_state().generation;
+    worker
+        .store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .extend((1..=65).map(|id| recovery_row(id, MEMBER, CREATOR)));
+    worker
+        .store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .extend((101..=110).map(|id| recovery_row(id, MEMBER + 1, CREATOR)));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let actor = GuildActor {
+        live: worker.live.clone(),
+        tx,
+        backpressure: ActorInboxBackpressure::default(),
+    };
+    for _ in 0..VOICE_ACTOR_INBOX_CAP {
+        assert!(actor.try_send_command(ActorCommand::Reconcile));
+    }
+    assert!(!actor.try_send_command(ActorCommand::EventVoicePresence {
+        member_id: MEMBER,
+        previous: Some(CREATOR),
+        current: None,
+        is_bot: false,
+        afk_channel: None,
+        observed_at: OffsetDateTime::now_utc(),
+        attendance_observation: Some(actor.live.attendance_reads.observe(MEMBER)),
+    }));
+    assert!(!read.is_current());
+    assert!(authority.ticket(GUILD).is_none());
+    assert!(!recovery.capture_allowed(&worker.live));
+    // Only the refused member is recovered: 65 identities at eight per turn,
+    // while an unrelated member's rows stay open and unrecovered.
+    for turn in 1..=8usize {
+        recovery.turn(&worker, true).await;
+        assert_eq!(
+            worker
+                .store
+                .attendance_recovery_closed
+                .lock()
+                .unwrap()
+                .len(),
+            turn * 8
+        );
+        assert!(authority.ticket(GUILD).is_none());
+        assert!(!recovery.capture_allowed(&worker.live));
+    }
+    recovery.turn(&worker, true).await;
+    {
+        let closed = worker.store.attendance_recovery_closed.lock().unwrap();
+        assert_eq!(*closed, (1..=65).collect::<Vec<i64>>());
+    }
+    assert_eq!(
+        worker.store.attendance_recovery_rows.lock().unwrap().len(),
+        10,
+        "unrelated member's identities were never finalized"
+    );
+    assert_eq!(worker.live.read_state().generation, generation);
+    assert!(authority.ticket(GUILD).unwrap().is_current());
+    assert!(!read.is_current());
+    assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_pending_frame_loss_preserves_closes_but_revokes_replacement_open() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    let observed_at = seed_open_attendance(&worker.store, 9);
+    recovery
+        .record(
+            &worker,
+            attendance_move(observed_at),
+            Some(worker.live.attendance_reads.observe(MEMBER)),
+        )
+        .await;
+    assert!(recovery.pending.is_some());
+    recovery
+        .record(
+            &worker,
+            attendance_move(observed_at + time::Duration::seconds(1)),
+            Some(worker.live.attendance_reads.observe(MEMBER)),
+        )
+        .await;
+    assert_eq!(worker.store.attendance_close_log.lock().unwrap().len(), 8);
+    recovery.turn(&worker, true).await;
+    assert!(recovery.pending.is_none());
+    {
+        let log = worker.store.attendance_close_log.lock().unwrap();
+        assert_eq!(log.len(), 9);
+        assert!(
+            log.iter().all(|close| close.1 == observed_at),
+            "original evidence survives"
+        );
+    }
+    assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+    assert!(authority.ticket(GUILD).is_none());
+    recovery.turn(&worker, true).await;
+    assert!(authority.ticket(GUILD).is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_loss_between_eligibility_and_record_never_opens_replacement() {
+    for lost in [1, 33] {
+        let (live, store, http, _) = fixture();
+        let authority = crate::event_attendance::AttendanceReadAuthority::default();
+        authority.register(GUILD, live.attendance_reads.clone());
+        let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+        let mut recovery = AttendanceRecovery::default();
+        recovery.turn(&worker, true).await;
+        let observed_at = seed_open_attendance(&worker.store, 1);
+        // Use the fixture's stored millisecond precision for the ready boundary.
+        recovery.capture_since = Some(observed_at);
+        let mut movement = attendance_move(observed_at);
+        movement.enabled = recovery.transition_allowed(&worker.live, observed_at);
+        assert!(movement.enabled);
+        // Concurrent ingress loses continuity after eligibility but before the
+        // continuation samples its generation. A matching scalar is not enough.
+        lose_members(&worker, lost);
+        recovery
+            .record(
+                &worker,
+                movement,
+                Some(worker.live.attendance_reads.observe(MEMBER)),
+            )
+            .await;
+        assert!(recovery.pending.is_none());
+        let log = worker.store.attendance_close_log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].1, observed_at);
+        assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+        assert!(authority.ticket(GUILD).is_none());
+        assert!(!recovery.capture_allowed(&worker.live));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_unsupported_metadata_close_retries_by_id_without_expansion_or_open() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    let observed_at = seed_open_attendance(&store, 2);
+    store.attendance_recovery_rows.lock().unwrap().clear();
+    store
+        .attendance_close_errors
+        .lock()
+        .unwrap()
+        .push_back(StoreError::AttendanceMetadataUnsupported);
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+
+    recovery
+        .record(&worker, attendance_move(observed_at), None)
+        .await;
+    assert!(recovery.pending.is_some(), "refusal defers, not completes");
+    {
+        let log = worker.store.attendance_close_log.lock().unwrap();
+        assert_eq!(log.len(), 1, "no second budget in the refusing turn");
+        assert_eq!(log[0].3, vec!["evt".to_owned()]);
+        assert_eq!(log[0].2.as_deref(), Some("lobby"));
+    }
+    assert_eq!(worker.store.attendance_open.lock().unwrap().len(), 2);
+
+    recovery.turn(&worker, true).await;
+    assert!(recovery.pending.is_none());
+    let log = worker.store.attendance_close_log.lock().unwrap().clone();
+    assert_eq!(log.len(), 3, "refused close, its by-id retry, then row two");
+    assert_eq!(
+        log[1],
+        (1, observed_at, None, Vec::new()),
+        "same row and boundary; no name or tag expansion"
+    );
+    assert_eq!(log[2].0, 2);
+    assert_eq!(log[2].1, observed_at);
+    assert!(worker.store.attendance_open.lock().unwrap().is_empty());
+    assert!(
+        worker.store.attendance_inserts.lock().unwrap().is_empty(),
+        "no replacement capture after unsupported metadata"
+    );
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+/// Seed one open row for `member` in `CREATOR`, joined at `joined_at`, mirrored
+/// into the recovery page so a collateral conservative recovery is visible.
+fn seed_member_open(store: &Store, id: i64, member: Snowflake, joined_at: OffsetDateTime) {
+    store
+        .attendance_open
+        .lock()
+        .unwrap()
+        .push(AttendanceSession {
+            id,
+            member_id: member.to_string(),
+            channel_id: CREATOR.to_string(),
+            channel_name: "lobby".to_owned(),
+            name_observed_at: joined_at,
+            is_bot: false,
+            afk: false,
+            joined_at,
+            left_at: None,
+            event_keys: Vec::new(),
+        });
+    store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .push(recovery_row(id, member, CREATOR));
+}
+
+/// A move out of `CREATOR` for `member`.
+fn attendance_move_for(
+    member: Snowflake,
+    observed_at: OffsetDateTime,
+) -> crate::event_attendance::VoiceTransition {
+    let mut transition = attendance_move(observed_at);
+    transition.member = member;
+    transition
+}
+
+/// A leaves with one close timing out, B's frame is skipped while A is pending,
+/// and C (open for 90 minutes) must neither be recovered nor lose its duration.
+#[tokio::test(start_paused = true)]
+async fn attendance_member_loss_during_pending_close_recovers_only_that_member() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    assert!(recovery.capture_allowed(&worker.live));
+
+    let (a, b, c) = (MEMBER, MEMBER + 1, MEMBER + 2);
+    // Nine rows for A exceed one turn's close budget, so A stays pending.
+    let observed_at = seed_open_attendance(&worker.store, 9);
+    seed_member_open(
+        &worker.store,
+        101,
+        b,
+        observed_at - time::Duration::minutes(5),
+    );
+    let c_joined = observed_at - time::Duration::minutes(90);
+    worker.store.attendance_window_rows.lock().unwrap()[0].starts_at =
+        observed_at - time::Duration::hours(2);
+    seed_member_open(&worker.store, 201, c, c_joined);
+
+    // A's first close times out (dropped before it commits) exactly once.
+    *worker.store.attendance_close_delay.lock().unwrap() = Some(Duration::from_secs(60));
+    recovery
+        .record(
+            &worker,
+            attendance_move_for(a, observed_at),
+            Some(worker.live.attendance_reads.observe(a)),
+        )
+        .await;
+    assert!(recovery.pending.is_some());
+    assert_eq!(worker.store.attendance_close_log.lock().unwrap().len(), 1);
+    assert_eq!(worker.store.attendance_open.lock().unwrap().len(), 11);
+
+    // B's frame arrives while A is pending: the room lane serves it, attendance
+    // keeps A's evidence and quarantines only B.
+    recovery
+        .record(
+            &worker,
+            attendance_move_for(b, observed_at + time::Duration::seconds(1)),
+            Some(worker.live.attendance_reads.observe(b)),
+        )
+        .await;
+    assert!(authority.ticket(GUILD).is_none());
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
+
+    // A's pending closes finish first, each with the original observed stamp.
+    for _ in 0..4 {
+        if recovery.pending.is_none() {
+            break;
+        }
+        recovery.turn(&worker, true).await;
+    }
+    assert!(recovery.pending.is_none());
+    {
+        let log = worker.store.attendance_close_log.lock().unwrap();
+        assert_eq!(log[0].0, 1);
+        assert_eq!(log[1], log[0], "timed-out close retries the exact evidence");
+        assert!(log.iter().all(|close| close.1 == observed_at));
+        assert_eq!(
+            log.iter().map(|close| close.0).collect::<Vec<_>>(),
+            [1, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+    }
+    assert!(
+        worker
+            .store
+            .attendance_recovery_closed
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "no recovery ran before A's continuation finished"
+    );
+
+    // Then exactly B is recovered; C's row is untouched and still open.
+    for _ in 0..3 {
+        recovery.turn(&worker, true).await;
+    }
+    assert_eq!(
+        *worker.store.attendance_recovery_closed.lock().unwrap(),
+        [101]
+    );
+    {
+        let open = worker.store.attendance_open.lock().unwrap();
+        assert_eq!(open.iter().map(|row| row.id).collect::<Vec<_>>(), [201]);
+        assert_eq!(open[0].joined_at, c_joined);
+    }
+    assert_eq!(
+        worker
+            .store
+            .attendance_recovery_rows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        [201]
+    );
+    assert!(recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_some());
+
+    // C's real leave later closes with its full duration, not at its join.
+    let leave = observed_at + time::Duration::seconds(5);
+    recovery
+        .record(
+            &worker,
+            attendance_move_for(c, leave),
+            Some(worker.live.attendance_reads.observe(c)),
+        )
+        .await;
+    let log = worker.store.attendance_close_log.lock().unwrap().clone();
+    let close = log.last().unwrap();
+    assert_eq!(close.0, 201);
+    assert_eq!(close.1, leave);
+    assert_eq!(
+        close.1 - c_joined,
+        time::Duration::minutes(90) + time::Duration::seconds(5)
+    );
+    assert_eq!(close.3, ["evt"]);
+    use crate::event_attendance::{millis_of, project_attendance, AttendanceWindowMs, SessionMs};
+    let earned = project_attendance(
+        "evt",
+        &AttendanceWindowMs {
+            event_key: "evt".to_owned(),
+            starts_ms: millis_of(observed_at - time::Duration::hours(2)),
+            ends_ms: millis_of(observed_at + time::Duration::hours(1)),
+        },
+        &[SessionMs {
+            member_id: c,
+            channel_id: CREATOR,
+            channel_name: close.2.clone().unwrap(),
+            name_observed_ns: leave.unix_timestamp_nanos(),
+            is_bot: false,
+            afk: false,
+            joined_ms: millis_of(c_joined),
+            left_ms: Some(millis_of(close.1)),
+        }],
+        millis_of(leave),
+    )
+    .unwrap();
+    assert_eq!(earned["members"][0]["minutes"], 90);
+    assert!(worker.store.attendance_open.lock().unwrap().is_empty());
+    assert!(recovery.capture_allowed(&worker.live));
+}
+
+#[test]
+fn attendance_recovery_ids_preserve_scope_limits_and_page_exhaustion() {
+    for count in [0, 1, 8, 9, 31, 32] {
+        let rows = || {
+            (1..=count)
+                .map(|id| recovery_row(id, MEMBER, CREATOR))
+                .collect()
+        };
+        let (ids, exhausted) = AttendanceRecovery::recovery_ids(rows(), Some(MEMBER)).unwrap();
+        assert_eq!(ids, (1..=count.min(8)).collect::<Vec<_>>());
+        assert_eq!(exhausted, count <= 8);
+        let (ids, exhausted) = AttendanceRecovery::recovery_ids(rows(), None).unwrap();
+        assert_eq!(ids, (1..=count).collect::<Vec<_>>());
+        assert_eq!(exhausted, count < 32);
+    }
+    for scope in [Some(MEMBER), None] {
+        let rows = (1..=33)
+            .map(|id| recovery_row(id, MEMBER, CREATOR))
+            .collect();
+        assert!(AttendanceRecovery::recovery_ids(rows, scope).is_none());
+    }
+    let mixed = vec![
+        recovery_row(1, MEMBER, CREATOR),
+        recovery_row(2, MEMBER + 1, CREATOR),
+    ];
+    assert!(AttendanceRecovery::recovery_ids(mixed.clone(), Some(MEMBER)).is_none());
+    assert_eq!(
+        AttendanceRecovery::recovery_ids(mixed, None),
+        Some((vec![1, 2], true))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_member_recovery_pages_through_a_timeout_without_losing_the_cursor() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    {
+        let mut rows = worker.store.attendance_recovery_rows.lock().unwrap();
+        rows.extend((1..=20).map(|id| recovery_row(id, MEMBER, CREATOR)));
+        rows.push(recovery_row(500, MEMBER + 1, CREATOR));
+    }
+    drop(worker.live.attendance_reads.observe(MEMBER));
+    assert!(authority.ticket(GUILD).is_none());
+
+    // The first page times out before its commit: nothing closes, cursor stays.
+    *worker.store.attendance_recovery_delay.lock().unwrap() = Some(Duration::from_secs(5));
+    recovery.turn(&worker, true).await;
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
+    assert_eq!(recovery.after_id, 0);
+    assert!(authority.ticket(GUILD).is_none());
+
+    // Eight identities per turn, resuming from the committed cursor.
+    for (closed, cursor) in [(8usize, 8i64), (16, 16)] {
+        recovery.turn(&worker, true).await;
+        assert_eq!(
+            worker
+                .store
+                .attendance_recovery_closed
+                .lock()
+                .unwrap()
+                .len(),
+            closed
+        );
+        assert_eq!(recovery.after_id, cursor);
+        assert!(authority.ticket(GUILD).is_none());
+        assert!(!recovery.capture_allowed(&worker.live));
+    }
+    recovery.turn(&worker, true).await;
+    assert_eq!(
+        *worker.store.attendance_recovery_closed.lock().unwrap(),
+        (1..=20).collect::<Vec<i64>>()
+    );
+    assert_eq!(recovery.after_id, 0);
+    assert!(recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_some());
+    assert_eq!(
+        worker.store.attendance_recovery_rows.lock().unwrap().len(),
+        1,
+        "the unrelated member was not recovered"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_newer_loss_during_a_recovery_commit_is_not_erased_by_the_older_page() {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    worker
+        .store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .extend((1..=3).map(|id| recovery_row(id, MEMBER, CREATOR)));
+    drop(worker.live.attendance_reads.observe(MEMBER));
+    *worker.store.attendance_recovery_delay.lock().unwrap() = Some(Duration::from_millis(100));
+
+    // The same member and another member are lost while the page commits.
+    let newer = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(worker.live.attendance_reads.observe(MEMBER));
+        drop(worker.live.attendance_reads.observe(MEMBER + 1));
+    };
+    tokio::join!(recovery.turn(&worker, true), newer);
+    assert_eq!(
+        *worker.store.attendance_recovery_closed.lock().unwrap(),
+        [1, 2, 3]
+    );
+    assert!(
+        authority.ticket(GUILD).is_none(),
+        "older page cannot publish"
+    );
+    assert!(!recovery.capture_allowed(&worker.live));
+    assert_eq!(recovery.after_id, 0);
+
+    // The newer incarnation is recovered on later turns, then the other member.
+    for _ in 0..2 {
+        assert!(authority.ticket(GUILD).is_none());
+        recovery.turn(&worker, true).await;
+    }
+    assert!(recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_some());
+}
+
+/// Distinct members whose frames were lost; none own the seeded rows.
+fn lose_members(worker: &GuildRoomWorker<Store, Http>, count: u64) {
+    for offset in 0..count {
+        drop(
+            worker
+                .live
+                .attendance_reads
+                .observe(MEMBER + 1_000 + offset),
+        );
+    }
+}
+
+async fn saturation_scenario(
+    lost: u64,
+) -> (
+    GuildRoomWorker<Store, Http>,
+    AttendanceRecovery,
+    OffsetDateTime,
+) {
+    let (live, store, http, _) = fixture();
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    let observed_at = seed_open_attendance(&worker.store, 9);
+    seed_member_open(
+        &worker.store,
+        900,
+        MEMBER + 500,
+        observed_at - time::Duration::minutes(10),
+    );
+    recovery
+        .record(
+            &worker,
+            attendance_move(observed_at),
+            Some(worker.live.attendance_reads.observe(MEMBER)),
+        )
+        .await;
+    assert!(recovery.pending.is_some());
+    lose_members(&worker, lost);
+    for _ in 0..(lost + 4) {
+        recovery.turn(&worker, true).await;
+    }
+    (worker, recovery, observed_at)
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_loss_table_at_capacity_recovers_each_member_and_resumes_capture() {
+    let (worker, mut recovery, observed_at) = saturation_scenario(32).await;
+    assert!(recovery.pending.is_none());
+    let log = worker.store.attendance_close_log.lock().unwrap().clone();
+    assert_eq!(log.len(), 9);
+    assert!(log.iter().all(|close| close.1 == observed_at));
+    assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+    // Lost members owned no rows, and neither the neighbor nor A was swept.
+    assert!(worker
+        .store
+        .attendance_recovery_closed
+        .lock()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        worker
+            .store
+            .attendance_open
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        [900]
+    );
+    assert!(
+        recovery.capture_allowed(&worker.live),
+        "all 32 losses were recovered"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn attendance_loss_table_overflow_keeps_capture_off_without_a_guild_sweep() {
+    let (worker, mut recovery, observed_at) = saturation_scenario(33).await;
+    assert!(
+        recovery.pending.is_none(),
+        "the retained close still finished"
+    );
+    let log = worker.store.attendance_close_log.lock().unwrap().clone();
+    assert_eq!(log.len(), 9);
+    assert!(log.iter().all(|close| close.1 == observed_at));
+    assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+    assert!(
+        worker
+            .store
+            .attendance_recovery_closed
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "overflow never becomes a guild-wide conservative recovery"
+    );
+    assert_eq!(
+        worker
+            .store
+            .attendance_open
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        [900],
+        "no collateral on the unrelated open row"
+    );
+    assert!(
+        !recovery.capture_allowed(&worker.live),
+        "unknown loss keeps capture and publication off"
+    );
+}
+
+/// A genuine gateway discontinuity with `rows` stale open rows. Returns after
+/// the first 32-row page, so the full recovery is mid-flight (`resetting`),
+/// together with a read ticket issued before the discontinuity.
+async fn full_recovery_mid_flight(
+    rows: i64,
+) -> (
+    GuildRoomWorker<Store, Http>,
+    AttendanceRecovery,
+    crate::event_attendance::AttendanceReadAuthority,
+    crate::event_attendance::AttendanceReadTicket,
+    u64,
+) {
+    let (live, store, http, _) = fixture();
+    let authority = crate::event_attendance::AttendanceReadAuthority::default();
+    authority.register(GUILD, live.attendance_reads.clone());
+    let worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    let mut recovery = AttendanceRecovery::default();
+    recovery.turn(&worker, true).await;
+    let old_read = authority.ticket(GUILD).expect("initial recovery complete");
+    worker.live.disconnect();
+    worker.live.publish(snapshot(&[], vec![]));
+    worker
+        .store
+        .attendance_recovery_rows
+        .lock()
+        .unwrap()
+        .extend((1..=rows).map(|id| recovery_row(id, MEMBER, CREATOR)));
+    recovery.turn(&worker, true).await;
+    let generation = worker.live.read_state().generation;
+    assert!(recovery.resetting, "full recovery is still pending");
+    assert_eq!(recovery.generation, Some(generation));
+    assert_eq!(
+        worker
+            .store
+            .attendance_recovery_closed
+            .lock()
+            .unwrap()
+            .len(),
+        32
+    );
+    assert!(!old_read.is_current());
+    assert!(authority.ticket(GUILD).is_none());
+    assert!(!recovery.capture_allowed(&worker.live));
+    (worker, recovery, authority, old_read, generation)
+}
+
+/// Drain the remaining pages of a 65-row full recovery, asserting the page
+/// bound and that nothing is captured or readable until the last page.
+async fn finish_full_recovery(
+    worker: &GuildRoomWorker<Store, Http>,
+    recovery: &mut AttendanceRecovery,
+    authority: &crate::event_attendance::AttendanceReadAuthority,
+    generation: u64,
+) {
+    for closed in [64usize, 65] {
+        assert!(recovery.resetting);
+        assert!(authority.ticket(GUILD).is_none());
+        assert!(!recovery.capture_allowed(&worker.live));
+        recovery.turn(worker, true).await;
+        assert_eq!(
+            worker
+                .store
+                .attendance_recovery_closed
+                .lock()
+                .unwrap()
+                .len(),
+            closed,
+            "at most one 32-row page per turn"
+        );
+        assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+        assert_eq!(
+            worker.live.read_state().generation,
+            generation,
+            "no manufactured gateway change"
+        );
+    }
+    assert!(!recovery.resetting);
+    assert_eq!(
+        *worker.store.attendance_recovery_closed.lock().unwrap(),
+        (1..=65).collect::<Vec<i64>>()
+    );
+}
+
+/// Observations dropped while a genuine multi-page full recovery is pending are
+/// covered by that recovery. Thirty-three of them must not become a lasting
+/// saturated loss that keeps capture and reads off after the full completes.
+#[tokio::test(start_paused = true)]
+async fn attendance_full_recovery_covers_observations_dropped_while_reset_pending() {
+    let (worker, mut recovery, authority, old_read, generation) =
+        full_recovery_mid_flight(65).await;
+    for offset in 0..33u64 {
+        let observed_at = OffsetDateTime::now_utc();
+        let mut movement = attendance_move_for(MEMBER + 2_000 + offset, observed_at);
+        movement.enabled = recovery.transition_allowed(&worker.live, observed_at);
+        assert!(!movement.enabled, "reset pending refuses the transition");
+        let member = movement.member;
+        recovery
+            .record(
+                &worker,
+                movement,
+                Some(worker.live.attendance_reads.observe(member)),
+            )
+            .await;
+        assert!(recovery.pending.is_none());
+        assert!(authority.ticket(GUILD).is_none());
+        assert!(!recovery.capture_allowed(&worker.live));
+    }
+    assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+    finish_full_recovery(&worker, &mut recovery, &authority, generation).await;
+
+    assert!(
+        recovery.capture_allowed(&worker.live),
+        "covered drops left no loss behind"
+    );
+    assert!(worker.live.attendance_reads.next_loss().is_none());
+    let new_read = authority
+        .ticket(GUILD)
+        .expect("readiness after full recovery");
+    assert!(new_read.is_current());
+    assert!(!old_read.is_current(), "the old read stays invalid");
+    let since = recovery.capture_since.unwrap();
+    assert!(recovery.transition_allowed(&worker.live, since));
+}
+
+/// Observations obtained during the reset but resolved after the full recovery
+/// completes keep reads fenced until acknowledged or dropped, then neither leave
+/// a loss nor allow the stale transition to open.
+#[tokio::test(start_paused = true)]
+async fn attendance_queued_reset_observations_fence_reads_until_resolved_without_stale_opens() {
+    for acknowledge in [false, true] {
+        let (worker, mut recovery, authority, old_read, generation) =
+            full_recovery_mid_flight(65).await;
+        let stale_at = OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let mut queued = Vec::new();
+        for offset in 0..33u64 {
+            let member = MEMBER + 2_000 + offset;
+            let mut movement = attendance_move_for(member, stale_at);
+            movement.enabled = recovery.transition_allowed(&worker.live, stale_at);
+            assert!(!movement.enabled);
+            queued.push((movement, worker.live.attendance_reads.observe(member)));
+        }
+        finish_full_recovery(&worker, &mut recovery, &authority, generation).await;
+
+        assert!(
+            authority.ticket(GUILD).is_none(),
+            "unresolved queued observations keep reads fenced"
+        );
+        assert!(
+            !recovery.transition_allowed(&worker.live, stale_at),
+            "a pre-recovery observation can never open"
+        );
+        let mut resolved = 0;
+        for (mut movement, observation) in queued {
+            assert!(authority.ticket(GUILD).is_none());
+            if acknowledge {
+                movement.current = movement.previous;
+            }
+            recovery.record(&worker, movement, Some(observation)).await;
+            resolved += 1;
+            assert!(recovery.pending.is_none());
+            assert_eq!(authority.ticket(GUILD).is_some(), resolved == 33);
+        }
+        assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
+        assert!(worker.store.attendance_close_log.lock().unwrap().is_empty());
+        assert!(worker.live.attendance_reads.next_loss().is_none());
+        assert!(recovery.capture_allowed(&worker.live));
+        let new_read = authority.ticket(GUILD).expect("readiness after resolution");
+        assert!(new_read.is_current());
+        assert!(!old_read.is_current());
+        assert_eq!(worker.live.read_state().generation, generation);
+    }
+}
+
+/// A fresh loss after the full recovery completed is a real loss: it is not
+/// erased by an older queued reset observation resolving, and is recovered
+/// only by its own member recovery.
+#[tokio::test(start_paused = true)]
+async fn attendance_fresh_loss_after_full_recovery_survives_old_queued_reset_guard() {
+    let (worker, mut recovery, authority, _old_read, generation) =
+        full_recovery_mid_flight(65).await;
+    let stale_at = OffsetDateTime::now_utc() - time::Duration::seconds(1);
+    let mut movement = attendance_move_for(MEMBER + 2_000, stale_at);
+    movement.enabled = recovery.transition_allowed(&worker.live, stale_at);
+    assert!(!movement.enabled);
+    let old_guard = worker.live.attendance_reads.observe(MEMBER + 2_000);
+    finish_full_recovery(&worker, &mut recovery, &authority, generation).await;
+
+    // The same member is genuinely lost after completion.
+    drop(worker.live.attendance_reads.observe(MEMBER + 2_000));
+    let fresh = worker
+        .live
+        .attendance_reads
+        .next_loss()
+        .expect("fresh loss");
+    assert!(!recovery.capture_allowed(&worker.live));
+    recovery.record(&worker, movement, Some(old_guard)).await;
+    assert_eq!(
+        worker.live.attendance_reads.next_loss(),
+        Some(fresh),
+        "old reset guard did not erase or rewrite the fresh loss"
+    );
+    assert!(!recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_none());
+
+    // Only its own member recovery clears it.
+    recovery.turn(&worker, true).await;
+    assert!(worker.live.attendance_reads.next_loss().is_none());
+    assert!(recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_some());
+    assert_eq!(worker.live.read_state().generation, generation);
+}
+
+/// Intentional saturation after the full recovery stays off: coverage by a
+/// completed full recovery must not hide thirty-three fresh losses.
+#[tokio::test(start_paused = true)]
+async fn attendance_fresh_saturation_after_full_recovery_keeps_capture_off() {
+    let (worker, mut recovery, authority, _old_read, generation) =
+        full_recovery_mid_flight(65).await;
+    finish_full_recovery(&worker, &mut recovery, &authority, generation).await;
+    assert!(recovery.capture_allowed(&worker.live));
+    lose_members(&worker, 33);
+    for _ in 0..crate::event_attendance::ATTENDANCE_LOSS_MEMBERS {
+        recovery.turn(&worker, true).await;
+    }
+    assert!(worker.live.attendance_reads.next_loss().is_none());
+    assert!(!recovery.capture_allowed(&worker.live));
+    assert!(authority.ticket(GUILD).is_none());
+    assert!(worker.store.attendance_inserts.lock().unwrap().is_empty());
 }
 
 /// `snapshot` re-keyed to `guild`: channel guild ids and the @everyone

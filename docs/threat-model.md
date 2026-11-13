@@ -34,11 +34,12 @@ ingress "staging-only, dark by default" (`wrangler/src/index.ts:882-883`).
 ## Scope and current exposure
 
 The historical contract has **18 actions**. The current core allowlist has
-**20** (rechecked 2026-11-03 for the `voice.snapshot` addition): those 18 plus
-`event.read` and the keyless `voice.snapshot` gateway-cache read
-(`crates/core/src/internal_actions.rs:675`; nine moderation verbs at `:686`,
-14 idempotency-bound at `:703`). All 20 are assessed below. `docs/parity.md:226`
-records the same 20 actions with `event.read` and the `settings.set`
+**21** (rechecked 2026-11-03 for the `event.attendance.read` addition): those
+18 plus `event.read`, the keyless `voice.snapshot` gateway-cache read, and the
+keyless `event.attendance.read` voice-session-log read
+(`crates/core/src/internal_actions.rs:684`; nine moderation verbs at `:695`,
+14 idempotency-bound at `:713`). All 21 are assessed below. `docs/parity.md:226`
+records the same 21 actions with `event.read` and the `settings.set`
 compare-and-set (`expected_version`); the core constants above are
 authoritative. The legacy `docs/INTERNAL_ACTIONS.md` is not in this checkout;
 the ported core, [parity inventory](parity.md) and
@@ -252,6 +253,7 @@ policy; that fence must not be taken from a caller-supplied guild ID.
 | `moderation.lockdown` | Deny channel participation; repeated intents can silence the guild | Same policy; change only the send/thread/reaction lockdown bits on @everyone (a role overwrite that allows sending still wins), validate channel ownership, refresh recovery seed/generation only when the live send deny is absent; do not grant new permissions as a side effect. | Yes |
 | `moderation.unlock` | Restore participation; bad overwrite restoration can widen access | Same policy; read live masks, restore only the recorded lockdown bits (thread/reaction bits only while still locked), preserve other live bits, refuse send-bit drift; serialize with lockdown. External admin GET/write races are not fenced. | Yes |
 | `event.read` (additional nineteenth) | Disclose one mapped event's status/details | `ALLOW_EVENT_READ`; mapped event and guild ownership checks, minimal response, no arbitrary event enumeration. | No |
+| `event.attendance.read` (twenty-first) | Disclose one mapped event's voice attendance: per-member minutes, rooms and peak concurrency | `ALLOW_ATTENDANCE_READ`; finite mapped accepted-instance evidence gates capture; windows are history only, never backfilled. Transactional suppression/voice gates. Positive-only; below-threshold kept; per-member unions for minutes/peak; bots excluded, AFK excluded from peak; capped relay, member IDs only. `not_found` for unknown/pre-enable keys; raw sessions prune 90 days after joining; no out-of-window capture. | No |
 | `voice.snapshot` (twentieth) | Disclose live voice-room occupancy: channel names and occupant member IDs | `ALLOW_VOICE_SNAPSHOT`; guild voice channels only (stage excluded), bots excluded, AFK occupants listed but untotaled, relay-budget-capped, member IDs only (no usernames or presence). Rooms add `occupied_since` (Zulu instant the room's current continuous occupancy began, `null` when unknown) and, only on the room bound to a currently-windowed event, `event_key` (the site's own key echoed back, omitted elsewhere): both are room-level, neither names a member's join time. Refuses `discord_unavailable` unless the gateway supervisor reports `Connected`, so a warm cache never serves stale occupancy mid-reconnect. | No |
 
 The nine moderation actions require **both** `TWO_INTERNAL_ALLOW_MODERATION=1`

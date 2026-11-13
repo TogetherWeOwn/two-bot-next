@@ -26,8 +26,11 @@ const isOptionalLine = (line: string) => Object.hasOwn(ALERT_OPTIONAL_INPUT_LABE
 const isVoiceFamilyLine = (line: string) =>
   line.startsWith("two_bot_internal_actions_total{") && line.includes('family="voice"');
 
+const isNotFoundLine = (line: string) =>
+  line.startsWith("two_bot_internal_actions_total{") && line.includes('outcome="not_found"');
+
 test("every current required label combination is required, not merely one row per family", () => {
-  const lines = metricsLines().filter((line) => !isOptionalLine(line) && !isVoiceFamilyLine(line));
+  const lines = metricsLines().filter((line) => !isOptionalLine(line) && !isVoiceFamilyLine(line) && !isNotFoundLine(line));
   for (let i = 0; i < lines.length; i++) {
     assert.equal(parseAlertScrape(lines.filter((_, j) => j !== i).join("\n")), null, lines[i]);
   }
@@ -37,19 +40,57 @@ test("older exposition without the voice family still parses", () => {
   const withoutVoice = metricsLines().filter((line) => !isVoiceFamilyLine(line)).join("\n");
   const samples = parseAlertScrape(withoutVoice);
   assert.ok(samples);
-  assert.equal(samples.filter((s) => s.name === "two_bot_internal_actions_total").length, 6 * 12);
+  assert.equal(samples.filter((s) => s.name === "two_bot_internal_actions_total").length, 6 * 13);
   assert.ok(parseAlertScrape(metricsBody()));
 });
 
 test("a partially present voice family fails the scrape", () => {
   // All-or-nothing: a missing outcome row would undercount refusals and
-  // clear a rising-refusal streak, so eleven of twelve voice rows is a
-  // failed scrape while zero of twelve is a rolled-back container.
+  // clear a rising-refusal streak, so twelve of thirteen voice rows is a
+  // failed scrape while zero of thirteen is a rolled-back container.
   const lines = metricsLines();
   const voiceIndex = lines.findIndex(isVoiceFamilyLine);
   assert.ok(voiceIndex >= 0);
   assert.equal(parseAlertScrape(lines.filter((_, j) => j !== voiceIndex).join("\n")), null);
   assert.ok(parseAlertScrape(lines.filter((line) => !isVoiceFamilyLine(line)).join("\n")));
+});
+
+test("old 12-outcome exposition without not_found rows still parses", () => {
+  const old = metricsLines().filter((line) => !isNotFoundLine(line)).join("\n");
+  const samples = parseAlertScrape(old);
+  assert.ok(samples);
+  assert.equal(samples.filter((s) => s.name === "two_bot_internal_actions_total").length, 7 * 12);
+  const oldWithoutVoice = metricsLines().filter((line) => !isNotFoundLine(line) && !isVoiceFamilyLine(line)).join("\n");
+  assert.ok(parseAlertScrape(oldWithoutVoice));
+});
+
+test("partial not_found rows fail the scrape, complete ones parse", () => {
+  const lines = metricsLines();
+  const rows = lines.filter(isNotFoundLine);
+  assert.equal(rows.length, 7);
+  for (const row of rows) {
+    // One missing row, whether voice or not.
+    assert.equal(parseAlertScrape(lines.filter((line) => line !== row).join("\n")), null, row);
+    // One lone row on an otherwise old exposition.
+    const lone = lines.filter((line) => !isNotFoundLine(line) || line === row).join("\n");
+    assert.equal(parseAlertScrape(lone), null, row);
+  }
+  // Complete not_found set on an exposition without the voice family.
+  assert.ok(parseAlertScrape(lines.filter((line) => !isVoiceFamilyLine(line)).join("\n")));
+  // Voice present without its not_found row while others carry it is partial.
+  const voiceRow = rows.find(isVoiceFamilyLine)!;
+  assert.equal(parseAlertScrape(lines.filter((line) => line !== voiceRow).join("\n")), null);
+});
+
+test("not_found rows are validated like every other outcome row", () => {
+  const lines = metricsLines();
+  const index = lines.findIndex(isNotFoundLine);
+  assert.ok(index >= 0);
+  for (const bad of ["-1", "1.5", "NaN", "+Inf", "abc"]) {
+    const mutated = lines.map((line, i) => i === index ? line.replace(/[^ ]+$/, bad) : line);
+    assert.equal(parseAlertScrape(mutated.join("\n")), null, bad);
+  }
+  assert.equal(parseAlertScrape([...lines, lines[index]!].join("\n")), null, "duplicate");
 });
 
 test("older exposition without the optional gauges still parses", () => {

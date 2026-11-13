@@ -282,6 +282,23 @@ VALUES ('100000000000000001', '100000000000000011', '2026-08-02T18:00:00.000Z',
         '2026-08-01T18:00:00.000Z', '2026-08-01T20:00:00.000Z', 'completed',
         '2026-08-01T20:01:00.000Z', '2026-08-01T20:10:00.000Z',
         '2026-08-01T20:05:00.000Z', FALSE, TRUE);
+-- Event attendance (0471, v17): retained per-event windows plus the raw
+-- voice-session log. One closed bot/AFK session tagged with an event key and
+-- one open session with an empty key array, so the roundtrip covers the
+-- nullable left_at, both booleans, the text[] column and the bigserial id.
+INSERT INTO event_attendance_windows
+    (guild_id, event_key, event_id, instance_starts_at, starts_at, ends_at, updated_at, changed_at)
+VALUES ('100000000000000001', 'event-key-seed', '100000000000000011',
+        '2026-08-02T18:00:00.000Z', '2026-08-02T18:30:00.000Z',
+        '2026-08-02T20:00:00.000Z', '2026-08-02T18:31:00.000Z', '2026-08-02T19:01:00.000Z');
+INSERT INTO event_voice_sessions
+    (guild_id, member_id, channel_id, channel_name, is_bot, afk, joined_at, left_at,
+     event_keys, name_observed_at, changed_at)
+VALUES ('100000000000000001', '100000000000000002', '100000000000000003', 'Event Stage',
+        TRUE, TRUE, '2026-08-02T18:31:00.000Z', '2026-08-02T19:00:00.000Z',
+        ARRAY['event-key-seed'], '2026-08-02T19:00:00.000Z', '2026-08-02T19:01:00.000Z'),
+       ('100000000000000001', '100000000000000004', '100000000000000003', '',
+        FALSE, FALSE, '2026-08-02T18:35:00.000Z', NULL, '{}', NULL, '2026-08-02T18:36:00.000Z');
 -- Event voice pair (0455, v13): one claimed instance plus one closed and one
 -- open presence span, so the roundtrip covers the nullable lease/left_at.
 INSERT INTO event_voice_channels

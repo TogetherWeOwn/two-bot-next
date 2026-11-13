@@ -28,7 +28,7 @@ export const ALERT_INPUT_LABELS: Record<string, Record<string, readonly string[]
   two_bot_dispatch_drops_total: { lane: ["messages", "interactions", "registry", "privileged", "busy", "reactions"] },
   two_bot_internal_actions_total: {
     family: ["announcement", "event", "settings", "moderation", "membership", "voice", "other"],
-    outcome: ["executed", "auth_failure", "unknown_key", "clock_skew", "nonce_replay", "rate_limit", "unknown_action", "action_disabled", "malformed_body", "conflict", "upstream", "internal"],
+    outcome: ["executed", "auth_failure", "unknown_key", "clock_skew", "nonce_replay", "rate_limit", "unknown_action", "action_disabled", "malformed_body", "conflict", "upstream", "not_found", "internal"],
   },
   // Gateway transport and job-run family. Always emitted on the same render
   // path as the gateway/job inputs above (metrics.rs, since #82/#123), so a
@@ -150,18 +150,30 @@ function combinations(axes: Record<string, readonly string[]>): Record<string, s
 // A partially present `voice` family is still a failure (see below): a
 // missing outcome row would undercount refusals and clear a rising streak,
 // so the family is all-or-nothing — absent entirely, or complete.
+//
+// The `not_found` outcome postdates older containers too: they emit twelve
+// outcomes per family. Rollout and rollback both cross that boundary, so the
+// `not_found` rows are likewise never required on their own. They are
+// all-or-nothing across the families the scrape carries: once any `not_found`
+// row is present, every present family must carry its row, otherwise a
+// partial series would undercount refusals and clear a rising streak.
+const isVoice = (labels: Record<string, string>) => labels["family"] === "voice";
+const isNotFound = (labels: Record<string, string>) => labels["outcome"] === "not_found";
+const INTERNAL_ACTIONS = "two_bot_internal_actions_total";
+const internalActionRows = combinations(ALERT_INPUT_LABELS[INTERNAL_ACTIONS]!);
+const rowKeys = (keep: (labels: Record<string, string>) => boolean) =>
+  new Set(internalActionRows.filter(keep).map((labels) => identity(INTERNAL_ACTIONS, labels)));
+
 const REQUIRED_INPUTS = new Set(Object.entries(ALERT_INPUT_LABELS).flatMap(([name, axes]) =>
   combinations(axes)
-    .filter((labels) => !(name === "two_bot_internal_actions_total" && labels["family"] === "voice"))
+    .filter((labels) => !(name === INTERNAL_ACTIONS && (isVoice(labels) || isNotFound(labels))))
     .map((labels) => identity(name, labels))));
 
-// Every `voice`-family combination. When a scrape carries any of these rows
-// it must carry all of them; when it carries none the older container is
-// accepted as-is.
-const VOICE_INTERNAL_ACTIONS_INPUTS = new Set(
-  combinations(ALERT_INPUT_LABELS["two_bot_internal_actions_total"]!)
-    .filter((labels) => labels["family"] === "voice")
-    .map((labels) => identity("two_bot_internal_actions_total", labels)));
+// Pre-`not_found` voice rows. When a scrape carries any voice row it must
+// carry all of these; when it carries none the older container is accepted.
+const VOICE_INTERNAL_ACTIONS_INPUTS = rowKeys((labels) => isVoice(labels) && !isNotFound(labels));
+const VOICE_NOT_FOUND_INPUT = rowKeys((labels) => isVoice(labels) && isNotFound(labels));
+const NOT_FOUND_INPUTS = rowKeys((labels) => !isVoice(labels) && isNotFound(labels));
 
 // Prometheus numbers, not JavaScript's empty/hexadecimal/Infinity coercions.
 const NUMBER = "(?:[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?|NaN|[+-]?Inf)";
@@ -217,7 +229,12 @@ export function parseAlertScrape(text: string): Sample[] | null {
   }
   const incarnation = samples.filter((sample) => sample.name === "two_bot_process_incarnation");
   if (incarnation.length > 0 && processIncarnation(incarnation) === undefined) return null;
-  const voiceSeen = [...VOICE_INTERNAL_ACTIONS_INPUTS].some((key) => seen.has(key));
-  const voiceComplete = !voiceSeen || [...VOICE_INTERNAL_ACTIONS_INPUTS].every((key) => seen.has(key));
-  return [...REQUIRED_INPUTS].every((key) => seen.has(key)) && voiceComplete ? samples : null;
+  const anySeen = (keys: Set<string>) => [...keys].some((key) => seen.has(key));
+  const allSeen = (keys: Set<string>) => [...keys].every((key) => seen.has(key));
+  const voiceSeen = anySeen(VOICE_INTERNAL_ACTIONS_INPUTS) || anySeen(VOICE_NOT_FOUND_INPUT);
+  const voiceComplete = !voiceSeen || allSeen(VOICE_INTERNAL_ACTIONS_INPUTS);
+  const notFoundSeen = anySeen(NOT_FOUND_INPUTS) || anySeen(VOICE_NOT_FOUND_INPUT);
+  const notFoundComplete = !notFoundSeen
+    || (allSeen(NOT_FOUND_INPUTS) && (!voiceSeen || allSeen(VOICE_NOT_FOUND_INPUT)));
+  return allSeen(REQUIRED_INPUTS) && voiceComplete && notFoundComplete ? samples : null;
 }

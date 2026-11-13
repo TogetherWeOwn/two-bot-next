@@ -175,6 +175,20 @@ const SUCCESSES: { name: string; value: Record<string, unknown> }[] = [
       request_id: REQUEST_ID,
     },
   },
+  {
+    name: "event.attendance.read",
+    value: {
+      ok: true,
+      result: {
+        v: 1, event_key: "synthetic-raid-night",
+        window: { starts_at: "2026-11-02T20:00:00.000Z", ends_at: "2026-11-02T22:00:00.000Z" },
+        threshold_minutes: 10, peak_concurrent: 2, final: true,
+        rooms: [{ channel_id: "222333444555666777", name_at_close: "synthetic-lobby" }],
+        members: [{ discord_id: "1001", minutes: 45, sessions: 1, first_joined_at: "2026-11-02T20:05:00.000Z" }],
+      },
+      request_id: REQUEST_ID,
+    },
+  },
 ];
 
 function captureLogs(t: TestContext): string[] {

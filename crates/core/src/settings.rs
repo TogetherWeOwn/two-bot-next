@@ -126,6 +126,7 @@ pub const SETTING_CLASSES: &[(&str, SettingClass)] = &[
     // --- so the census stays complete and the drift test can see them) ---
     ("TWO_INTERNAL_ACTIONS", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_ADD_MEMBER", SettingClass::EnvOnly),
+    ("TWO_INTERNAL_ALLOW_ATTENDANCE_READ", SettingClass::EnvOnly),
     ("TWO_INTERNAL_ALLOW_AUTOMATIONS", SettingClass::EnvOnly),
     (
         "TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE",
@@ -1294,6 +1295,7 @@ mod tests {
         "TWO_HEALTH_PORT",
         "TWO_INTERNAL_ACTIONS",
         "TWO_INTERNAL_ALLOW_ADD_MEMBER",
+        "TWO_INTERNAL_ALLOW_ATTENDANCE_READ",
         "TWO_INTERNAL_ALLOW_AUTOMATIONS",
         "TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE",
         "TWO_INTERNAL_ALLOW_EVENT_CANCEL",
@@ -1344,7 +1346,7 @@ mod tests {
             assert_eq!(classify_key(key), Some(SettingClass::EnvOnly), "{key}");
         }
         let expected_total = EXPECTED_HOT.len() + EXPECTED_COLD.len() + EXPECTED_ENV_ONLY.len();
-        assert_eq!(expected_total, 137, "tripwire lists must stay complete");
+        assert_eq!(expected_total, 138, "tripwire lists must stay complete");
         assert_eq!(
             SETTING_CLASSES.len(),
             expected_total,

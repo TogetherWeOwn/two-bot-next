@@ -114,6 +114,9 @@ JOB_INVENTORY = {
     "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke"},
     # Manual, bounded Helix token parser fuzz smoke; read-only and secret-free.
     "helix-token-fuzz-smoke.yml": {"helix-token-smoke"},
+    # Actual pinned prior-source startup/DML against disposable candidate-schema
+    # fixtures. Read-only, synthetic loopback only; no deployment route.
+    "attendance-n-minus-one.yml": {"compatibility"},
     # SDLC 2.3 CI speed evidence (the shared nextest lane graduated to a
     # required check.yml job): dorny/paths-filter affected-only selection
     # and the minutes-per-merged-PR report.
