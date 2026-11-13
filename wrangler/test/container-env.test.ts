@@ -104,6 +104,13 @@ test("unlisted names, secrets and non-string values are dropped", () => {
   assert.deepEqual(forwardedFlagVars(env), { TWO_ANNOUNCEMENTS: "1" });
 });
 
+test("reserved member notification gate is never forwarded", () => {
+  const env = { TWO_INTERNAL_ACTIONS: "1", TWO_INTERNAL_ALLOW_MEMBER_NOTIFY: "1" };
+  assert.ok(Object.hasOwn(NOT_FORWARDED, "TWO_INTERNAL_ALLOW_MEMBER_NOTIFY"));
+  assert.equal(forwardedFlagVars(env).TWO_INTERNAL_ALLOW_MEMBER_NOTIFY, undefined);
+  assert.equal(containerEnv(env).TWO_INTERNAL_ALLOW_MEMBER_NOTIFY, undefined);
+});
+
 test("hostile settings-map typo keys stay test-only and never reach the Container", () => {
   const env = {
     TWO_ASSISTANT_ENDPOINTS: "https://fixture.invalid/not-a-runtime-endpoint",

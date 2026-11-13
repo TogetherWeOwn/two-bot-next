@@ -137,6 +137,7 @@ capabilities; this table is not an instruction to create or stage them.
 | `TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE` | Automation overwrite stays gated off |
 | `TWO_INTERNAL_ALLOW_EVENT_CANCEL` | `event.cancel` stays gated off |
 | `TWO_INTERNAL_ALLOW_EVENT_READ` | `event.read` stays gated off |
+| `TWO_INTERNAL_ALLOW_MEMBER_NOTIFY` | Reserved gate is not wired; notification actions remain unimplemented |
 | `TWO_INTERNAL_ALLOW_MODERATION` | Member/channel moderation stay gated off, even with `TWO_MODERATION=1` |
 | `TWO_INTERNAL_ALLOW_SETTINGS` | Settings get/set stay gated off |
 | `TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT` | `voice.snapshot` stays gated off |
