@@ -727,6 +727,37 @@ fn assert_settle_window(source: &str) {
     );
 }
 
+fn assert_startup_probe(probes: &str) {
+    let probe_timeout = timeout_step_async_body(probes, "startup probe must use STEP timeout");
+    assert_poll_site(&probe_timeout, "}) {", 10);
+    let probe_loop = loop_body(&probe_timeout, "}) {");
+    assert_direct_loop_statement(
+        &probe_loop,
+        "bot.assert_alive();",
+        "startup probe must check liveness",
+    );
+    assert_timeout_async_result_suffix(
+        probes,
+        r#")
+        .await
+        .expect("positive post-load onboarding failure deadline");"#,
+        "startup probe timeout must fail",
+    );
+}
+
+fn startup_probe_fixture() -> &'static str {
+    r#"timeout(STEP, async {
+        while !logs.lock().await.lines().any(|line| {
+            line.contains("onboarding_gates_invalid")
+        }) {
+            bot.assert_alive();
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+        .await
+        .expect("positive post-load onboarding failure deadline");"#
+}
+
 #[test]
 fn alive_polling_uses_bounded_backoff_under_deadline() {
     assert_alive_step_deadline(ALIVE);
@@ -894,6 +925,35 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
         );
     })
     .is_err());
+
+    let probes = startup_probe_fixture();
+    assert_startup_probe(probes);
+    for (before, after) in [
+        ("sleep(Duration::from_millis(10)).await;", ""),
+        ("from_millis(10)", "from_millis(50)"),
+        (
+            "sleep(Duration::from_millis(10)).await;",
+            "if false { sleep(Duration::from_millis(10)).await; }",
+        ),
+        (
+            "sleep(Duration::from_millis(10)).await;",
+            "continue; sleep(Duration::from_millis(10)).await;",
+        ),
+        ("timeout(STEP, async", "timeout(STEP * 2, async"),
+        ("bot.assert_alive();", ""),
+        ("bot.assert_alive();", "if false { bot.assert_alive(); }"),
+        (
+            ".expect(\"positive post-load onboarding failure deadline\");",
+            ";",
+        ),
+    ] {
+        let mutated = probes.replace(before, after);
+        assert_ne!(mutated, probes, "mutation must apply: {before}");
+        assert!(
+            std::panic::catch_unwind(|| assert_startup_probe(&mutated)).is_err(),
+            "mutation must be rejected: {before}"
+        );
+    }
 
     let lifecycle = function_body(ALIVE, "lifecycle");
     let settle = source_between(&lifecycle, "let settle_until =", "assert_ready_correlation");
