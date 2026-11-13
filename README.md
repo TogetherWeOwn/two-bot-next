@@ -164,11 +164,12 @@ the canonical renderer; no database, deployment or live values are needed.
 
 Configuration remains tracked. Deliberate catalog/supplement changes require
 explicit regeneration through the canonical `regenerate_reference_docs` test in
-`crates/core/tests/reference_docs.rs`, which writes both references. The manual
+`crates/core/tests/reference_docs.rs`, which writes both references. The
 `configuration-reference.yml` workflow is a one-off hosted writer for source
 SHA `5e0fb45936f06ea1495b8da2ea77ad3d0e4951b8`; it uploads only the configuration
-reference and its provenance, not generated command rows. It runs only when
-dispatched on `main`. The ordinary generator only validates tracked configuration;
+reference and its provenance, not generated command rows. Its pull request job
+runs only for the writer's own PR, including while it is a draft. The ordinary
+generator only validates tracked configuration;
 it fails on drift before writing commands, and nightly explicitly skips the
 writer to avoid hiding drift.
 

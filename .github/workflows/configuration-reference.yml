@@ -1,14 +1,14 @@
 name: configuration reference snapshot
 
 on:
-  workflow_dispatch:
+  pull_request:
 
 permissions: {}
 
 jobs:
-  regenerate:
-    # This one-off writer is admitted only from the reviewed default branch.
-    if: ${{ github.ref == 'refs/heads/main' }}
+  configuration-reference:
+    # This one-off writer runs only on its own PR, including while it is a draft.
+    if: ${{ github.event.pull_request.number == 2081 }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -30,15 +30,20 @@ jobs:
           mkdir -p docs/generated
           cargo test --locked -p two-bot-core --test reference_docs regenerate_reference_docs -- --ignored --exact
       - name: Record artifact provenance
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           mkdir -p reference-output
           cp docs/configuration.md reference-output/configuration.md
           git rev-parse HEAD > reference-output/source-sha.txt
-          sha256sum reference-output/configuration.md > reference-output/sha256.txt
+          printf '%s\n' "$WORKFLOW_SHA" > reference-output/workflow-sha.txt
+          printf '%s\n' "$PR_HEAD_SHA" > reference-output/pr-head-sha.txt
+          (cd reference-output && sha256sum configuration.md > sha256.txt)
       - name: Upload configuration reference
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
         with:
           name: configuration-reference-5e0fb45936f06ea1495b8da2ea77ad3d0e4951b8
           path: reference-output/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 3
