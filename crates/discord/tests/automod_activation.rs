@@ -1273,3 +1273,56 @@ async fn settled_decisions_reach_the_global_outcome_counters() {
     );
     bypass_mock.shutdown().await;
 }
+
+/// Slice 3d (spec §5.0): the preview handle reads the shared runtime under
+/// its lock and releases it synchronously — no executor, ledger, or facts
+/// call, and a second read sees the same live state. Runs on a Tokio runtime
+/// (like every other test in this file) because building the real executor
+/// spawns twilight's rate-limit reactor, which requires a runtime context
+/// even though the preview path never sends.
+///
+/// Correction (CI, 2026-11-02): plain #[test] panics with "there is no
+/// reactor running" at executor construction; #[tokio::test] fixes it with
+/// no body change.
+#[tokio::test]
+async fn preview_handle_reads_live_runtime_without_mutation() {
+    // Loopback origin satisfies send admission at build time; the preview
+    // handle never touches the executor, so no request is ever sent.
+    let activation = AutomodActivation::new(
+        runtime(false),
+        MemLedger::default(),
+        StaticFacts::default(),
+        ActionExecutor::with_proxy(
+            "preview-handle-token".to_owned(),
+            Some("http://127.0.0.1:9".to_owned()),
+        )
+        .expect("executor builds against a loopback origin"),
+    );
+    let message = two_bot_core::automod::AutomodMessage {
+        guild_id: STAGING_GUILD_ID.to_owned(),
+        channel_id: CHANNEL.to_owned(),
+        message_id: "preview:7".to_owned(),
+        author_id: AUTHOR.to_owned(),
+        author_is_bot: false,
+        role_ids: vec![],
+        content: "has blocked in it".to_owned(),
+        mentioned_user_ids: vec![],
+        attachment_names: vec![],
+        observed_timestamp_ms: 1_790_726_400_000,
+    };
+    let first = activation.preview(|runtime| runtime.preview(&message, 0));
+    assert_eq!(
+        first.result,
+        two_bot_core::automod_preview::PreviewResult::Matched
+    );
+    assert_eq!(first.filter, Some(AutomodFilter::BadWords));
+    assert!(first.dry_run);
+    // A second lock acquisition sees the same state: the handle never holds
+    // the mutex across an await, and the probe records nothing.
+    let (config, second) = activation.preview(|runtime| {
+        assert!(runtime.admits(Some(STAGING_GUILD_ID)));
+        (runtime.effective_config(), runtime.preview(&message, 0))
+    });
+    assert_eq!(second, first);
+    assert_eq!(config.policy.bad_words, vec!["blocked".to_owned()]);
+}

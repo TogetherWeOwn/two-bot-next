@@ -6,11 +6,14 @@ else, so no test touches a real toolchain or the network.
 
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
 import tempfile
 import unittest
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".github/scripts/install-rust-toolchain.sh"
@@ -21,7 +24,16 @@ printf '%s %s\\n' "${{0##*/}}" "$*" >> "$FAKE_CALLS"
 if [ "${{0##*/}}" = rustup ]; then
   printf 'permit=%s\\n' "${{RUSTUP_PERMIT_COPY_RENAME:-}}" >> "$FAKE_CALLS"
   case "$1" in
-    toolchain) [ -z "${{FAKE_FAIL_INSTALL:-}}" ] || exit 1 ;;
+    toolchain)
+      [ -z "${{FAKE_FAIL_INSTALL:-}}" ] || exit 1
+      count=0
+      [ ! -f "$FAKE_COUNT" ] || read -r count < "$FAKE_COUNT"
+      count=$((count + 1))
+      printf '%s\n' "$count" > "$FAKE_COUNT"
+      if [ "$count" -le "${{FAKE_FAILURES:-0}}" ]; then
+        printf '%s\n' "$FAKE_DIAGNOSTIC" >&2
+        exit 42
+      fi ;;
     default) [ -z "${{FAKE_FAIL_DEFAULT:-}}" ] || exit 1 ;;
   esac
 fi
@@ -40,6 +52,11 @@ class NativeRustToolchainTest(unittest.TestCase):
                 shim = bin_dir / tool
                 shim.write_text(SHIM.format(bash=BASH))
                 shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+            for tool in ("mktemp", "rm", "grep", "tee"):
+                (bin_dir / tool).symlink_to(shutil.which(tool))
+            sleep = bin_dir / "sleep"
+            sleep.write_text(f"#!{BASH}\nprintf 'sleep %s\\n' \"$*\" >> \"$FAKE_CALLS\"\n")
+            sleep.chmod(sleep.stat().st_mode | stat.S_IXUSR)
             calls = tmp_path / "calls.txt"
             github_env = tmp_path / "github_env"
             calls.write_text("")
@@ -49,6 +66,7 @@ class NativeRustToolchainTest(unittest.TestCase):
                 "HOME": tmp,
                 "CARGO_HOME": "/fixture/cargo",
                 "FAKE_CALLS": str(calls),
+                "FAKE_COUNT": str(tmp_path / "count"),
                 "GITHUB_ENV": str(github_env),
                 "RUST_TOOLCHAIN": "1.99.1",
                 "RUST_COMPONENTS": "",
@@ -113,6 +131,44 @@ class NativeRustToolchainTest(unittest.TestCase):
         self.assertFalse([c for c in calls if c.startswith("rustup default")])
         self.assertEqual(github_env, [])
 
+    def test_checksum_retry_recovery_and_exhaustion(self):
+        diagnostic = ("checksum failed for archive\n"
+                      "this is likely due to an ongoing update of the official release server")
+        for failures in (2, 5):
+            with self.subTest(failures=failures):
+                proc, calls, _, github_env = self.run_script(env={
+                    "FAKE_FAILURES": str(failures), "FAKE_DIAGNOSTIC": diagnostic,
+                    "RUST_COMPONENTS": "rustfmt,clippy",
+                })
+                installs = [c for c in calls if c.startswith("rustup toolchain install")]
+                self.assertEqual(len(installs), min(failures + 1, 5))
+                self.assertTrue(all(c == installs[0] for c in installs))
+                self.assertEqual(calls.count("sleep 30"), min(failures, 4))
+                self.assertEqual(proc.stdout.count(diagnostic), failures)
+                self.assertEqual(proc.stderr.count("Retrying rustup"), min(failures, 4))
+                if failures == 5:
+                    self.assertEqual(proc.returncode, 42)
+                    self.assertFalse(any(c.startswith("rustup default") for c in calls))
+                    self.assertEqual(github_env, [])
+                else:
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertTrue(any(c.startswith("rustup default") for c in calls))
+                    self.assertTrue(github_env)
+
+    def test_other_errors_do_not_retry(self):
+        for diagnostic in ("unrelated failure", "checksum failed for archive",
+                           "this is likely due to an ongoing update of the official release server"):
+            with self.subTest(diagnostic=diagnostic):
+                proc, calls, _, github_env = self.run_script(env={
+                    "FAKE_FAILURES": "5", "FAKE_DIAGNOSTIC": diagnostic,
+                })
+                self.assertEqual(proc.returncode, 42)
+                self.assertIn(diagnostic, proc.stdout)
+                self.assertEqual(len([c for c in calls if c.startswith("rustup toolchain install")]), 1)
+                self.assertNotIn("sleep 30", calls)
+                self.assertFalse(any(c.startswith("rustup default") for c in calls))
+                self.assertEqual(github_env, [])
+
     def test_default_and_version_failures_fail(self):
         for flag in ("FAKE_FAIL_DEFAULT", "FAKE_FAIL_RUSTC"):
             with self.subTest(flag=flag):
@@ -162,6 +218,56 @@ class NativeRustToolchainTest(unittest.TestCase):
         self.assertNotIn("GITHUB_OUTPUT", text)
         self.assertNotIn("GITHUB_PATH", text)
         self.assertNotIn("GITHUB_STATE", text)
+
+    def test_all_installers_keep_their_components_and_checkout_order(self):
+        # Only check.yml has migrated; the other workflows keep the dtolnay
+        # action until their own migrations, so they must have no native step.
+        expected = {
+            "check.yml": {
+                "check": "rustfmt, clippy", "rust-tests": "rustfmt, clippy", "coverage-plan": "",
+                "coverage-shard": "rustfmt, clippy", "ignored-db-stores": "rustfmt, clippy",
+                "ignored-db-runtime": "rustfmt, clippy", "moderation-db": "clippy", "self-role-store": "",
+                "community-db": "clippy", "feeds-db": "clippy", "tickets-postgres": "", "fuzz-compile": "rust-src",
+            },
+        }
+        actual = {}
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            doc = yaml.safe_load(path.read_text())
+            for job_id, job in doc["jobs"].items():
+                for index, step in enumerate(job.get("steps", [])):
+                    if path.name == "check.yml":
+                        self.assertNotIn("dtolnay/rust-toolchain@", step.get("uses", ""))
+                    if step.get("run") != "bash .github/scripts/install-rust-toolchain.sh":
+                        continue
+                    with self.subTest(workflow=path.name, job=job_id):
+                        self.assertNotIn(job_id, actual.get(path.name, {}))
+                        actual.setdefault(path.name, {})[job_id] = step["env"]["RUST_COMPONENTS"]
+                        self.assertEqual(step["shell"], "bash")
+                        self.assertNotIn("with", step)
+                        self.assertTrue(any(s.get("uses", "").startswith("actions/checkout@")
+                                            for s in job["steps"][:index]))
+        self.assertEqual(actual, expected)
+
+    def test_no_workflow_consumes_installer_outputs(self):
+        # The action exposed cachekey/name/... outputs; the native installer
+        # has none, so no step may read outputs from an installer step.
+        workflows = sorted((ROOT / ".github/workflows").glob("*.yml"))
+        self.assertTrue(workflows)
+        for path in workflows:
+            doc = yaml.safe_load(path.read_text()) or {}
+            for job_id, job in (doc.get("jobs") or {}).items():
+                steps = job.get("steps") or []
+                ids = {
+                    step["id"] for step in steps
+                    if "install-rust-toolchain.sh" in str(step.get("run", "")) and "id" in step
+                }
+                if not ids:
+                    continue
+                body = yaml.safe_dump(job)
+                for step_id in ids:
+                    with self.subTest(workflow=path.name, job=job_id, step=step_id):
+                        refs = re.findall(rf"steps\.{re.escape(step_id)}\.outputs\.\w+", body)
+                        self.assertEqual(refs, [])
 
 
 if __name__ == "__main__":
