@@ -128,6 +128,14 @@ stop a different attempt's singleton; it is **not** proof that this run never
 acquired a grant, or that staging is now stopped/idle. The parent's release and
 native expiry receipts supply the stop evidence.
 
+Authenticated staging status GETs return a non-cacheable 503 with unknown state
+if the Durable Object cannot answer within 10 seconds. This is neither readiness
+nor proof of ownership or cleanup. `restore-check` and `finish` share a
+180-second monotonic retry budget across their status reads; each request remains
+bounded to 15 seconds. Other errors fail closed, and release POSTs are never
+retried by this mechanism. Exhaustion leaves cleanup unconfirmed; native expiry
+remains the backstop. The original expiry and identity checks are unchanged.
+
 The staging Worker/container rollback now refuses a target unless its immutable
 Worker-version bindings prove `STAGING_RUNTIME_POLICY=bounded`,
 `TWO_DEPLOY_ENV=staging` and the receipt's exact `CONTAINER_RELEASE` SHA. Missing,
@@ -442,13 +450,16 @@ merge or an unverified deployment is not `t0`.
    A stale listing that is not verified as the rollout's previous image fails as
    `application_image_drift`. For a verified previous-image listing that has not
    yet passed the runtime probes, `verify` keeps polling (last observation
-   `application_image=stale`) up to twenty-four polls or until the 300s verify
-   deadline, whichever comes first. The stale-poll cap does not interrupt an
-   in-progress active-lag confirmation; it can still complete its required second
-   full pass. If the deadline ends while the last known listing is still stale—
-   including when a deadline-bounded control-plane read times out after it—the gate
-   fails closed as `application_image_drift` (the deadline usually ends it first,
-   since the polls only count once the rollout completes). A gateway failure named in
+   `application_image=stale`) up to twenty-four polls or until the verify
+   deadline, whichever comes first. The deadline defaults to 600 seconds and can
+   be shortened with `--verify-timeout-seconds` (1–600); the cap avoids extending
+   the workflow's cleanup budget. Successful evidence records
+   `verification_elapsed_seconds`, measured from the start of verification. The
+   stale-poll cap does not interrupt an in-progress active-lag confirmation; it
+   can still complete its required second full pass. If the deadline ends while
+   the last known listing is still stale—including when a deadline-bounded
+   control-plane read times out after it—the gate fails closed as
+   `application_image_drift`. A gateway failure named in
    the last observation keeps `rollout_timeout`, because the rollback triggers key on it.
    A drift failure (also raised if the listing stops matching on the final re-read)
    prints a fixed-vocabulary diagnostic: `listing_image=target|baseline|other` (where
@@ -566,7 +577,7 @@ not proof of live 5xx enforcement, which additionally needs the
 
 ## Bounds and fail-closed cases
 
-The verification phase has a five-minute deadline, ten-second network socket
+The verification phase has a default ten-minute deadline, ten-second network socket
 bounds, bounded response sizes and five-second convergence intervals. Docker
 inspection has twenty-second subprocess bounds. Readiness 503 is a truthful
 parked process, **never** successful deployment acceptance. SDK/API failures and
