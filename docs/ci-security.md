@@ -543,9 +543,10 @@ python3 -m unittest discover -s scripts -p 'test_staging_ownership_status.py' -v
 
 ## Native Rust setup
 
-Rust setup in `check.yml` executes `.github/scripts/install-rust-toolchain.sh`
-with an exact `RUST_TOOLCHAIN` and explicit `RUST_COMPONENTS`. Other workflows
-retain their pinned Rust setup action. Stable lanes match `rust-toolchain.toml`;
+Rust setup in `check.yml` and the helix-token and vote-kick fuzz smoke workflows
+executes `.github/scripts/install-rust-toolchain.sh` with an exact
+`RUST_TOOLCHAIN` and explicit `RUST_COMPONENTS`. Other workflows retain their
+pinned Rust setup action. Stable lanes match `rust-toolchain.toml`;
 the libFuzzer lanes retain `nightly-2026-10-01` and `rust-src`. Native setup
 installs the minimal profile without self-update, selects the same default, and
 verifies the explicit toolchain. Existing fail-closed retry steps and their
