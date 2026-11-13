@@ -13,11 +13,13 @@
 # Security -> QA. QA verifies the author's risk_tier attestation and may
 # escalate any PR. This file itself is always sensitive.
 #
-# Sensitive floor for this repo (never downgrade): the bot holds a live
-# Discord gateway, member moderation authority, DB credentials, signed
-# internal actions and a Postgres store, so all production Rust/Worker
-# source, migrations, deploy and CI paths are sensitive. Unlisted paths
-# (including every new top-level path) default to sensitive.
+# Sensitive floor for this repo: the bot holds a live Discord gateway,
+# member moderation authority, DB credentials, signed internal actions and
+# a Postgres store. Gateway, moderation, DB/migrations, signed actions,
+# crates/cutover/**, deploy/CI and governance docs stay sensitive.
+# Production Rust/Worker source stays sensitive except for exact audited
+# ordinary entries below. Unlisted paths (including every new module)
+# default to sensitive.
 #
 # Governance docs that define review severity, the merge-evidence rule,
 # the quality bar and the disclosure route (CONTRIBUTING.md,
@@ -33,11 +35,13 @@
 # inside sensitive src/ stays sensitive (sensitive wins on overlap) —
 # only standalone test trees are low.
 #
-# Ordinary is intentionally empty in this bootstrap: no module has been
-# audited as free of untrusted input, sensitive output, permissions,
-# persistence and trust-boundary effects. Add a module only with an audit
-# justification in the PR body. All production code stays sensitive until
-# then; a small correct map beats a big wrong one.
+# Ordinary covers only audited modules free of untrusted input, sensitive
+# output, permissions, persistence, moderation authority, credentials and
+# trust-boundary effects. Add an exact path only with an audit justification
+# in the PR body; a small correct map beats a big wrong one.
+# brand_tokens.rs contains numeric presentation constants only; its embed
+# consumer uses them solely for colour, not content, visibility or authority.
+# The surrounding brand renderer (including its live icon URL) stays sensitive.
 #
 # Glob syntax: repo-relative minimatch. Sensitive wins on overlap, so a
 # sensitive glob matching a low/ordinary path keeps the path sensitive.
@@ -57,7 +61,8 @@ tiers:
     - "crates/*/tests/**" # additive integration tests (data only; scripts are sensitive)
     - "ast-grep-rule-tests/**" # additive lint-rule tests
     - "fuzz/corpus/**" # static fuzz corpus fixtures
-  ordinary: [] # no modules audited yet; empty is deliberate (see header)
+  ordinary: # QA review; content triggers still escalate to sensitive
+    - "crates/discord/src/brand_tokens.rs" # numeric presentation constants only
   sensitive: # Security -> QA review; always wins on overlap
     # License instrument (BSL parameters) is sensitive, not docs copy.
     - "LICENSE"
@@ -116,7 +121,9 @@ tiers:
     - "src/**"
     - "crates/bot/src/**"
     - "crates/core/src/**"
-    - "crates/discord/src/**"
+    # Other Discord source inherits default_tier=sensitive. Keeping the
+    # blanket glob here would override the exact ordinary entry above;
+    # low's standalone test-tree globs do not match nested src/ tests.
     - "crates/store/src/**"
     - "crates/cutover/**"
     - "crates/voice-probe/src/**"
