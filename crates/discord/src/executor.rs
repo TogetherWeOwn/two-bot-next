@@ -855,10 +855,11 @@ impl PendingHeaders<'_> {
         .await;
         let body = match collected {
             Ok(Ok(body)) => body.to_bytes().to_vec(),
-            // 429 is definitive no-effect even with a broken, oversized or
-            // timed-out body. Missing timing installs an indefinite hold
-            // instead of a default.
-            Err(_) | Ok(Err(_)) if status == 429 => Vec::new(),
+            // These received rejections prove no effect even with a broken,
+            // oversized or timed-out body. Preserve their status and use the
+            // normal receipt settlement below exactly once. 429 still needs
+            // its body timing first; missing timing installs an indefinite hold.
+            Err(_) | Ok(Err(_)) if matches!(status, 400 | 403 | 404 | 429) => Vec::new(),
             Err(_) => {
                 // Headers arrived but the body stalled: a GET cannot mutate,
                 // so release the lane where the permit is in scope. Without

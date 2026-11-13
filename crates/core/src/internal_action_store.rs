@@ -10,9 +10,9 @@ use std::str::FromStr as _;
 use crate::channel_moderation::PurgeStopReason;
 use crate::clock_guard::CLOCK_SKEW_TOLERANCE_MS;
 use crate::internal_actions::{
-    body_hash, is_implemented, is_snowflake, valid_event_key, valid_idempotency_key,
-    valid_nonce_format, within_skew, CLAIM_STALE_SECONDS, MAX_BODY_BYTES, NONCE_TTL_SECONDS,
-    SKEW_SECONDS,
+    body_hash, is_implemented, is_request_id, is_snowflake, valid_event_key, valid_idempotency_key,
+    valid_nonce_format, within_skew, VoiceMoveOutcome, CLAIM_STALE_SECONDS, MAX_BODY_BYTES,
+    NONCE_TTL_SECONDS, SKEW_SECONDS,
 };
 
 /// Clock domain for the durable nonce high-water mark. One guard per clock
@@ -330,6 +330,32 @@ pub struct InternalActionStore {
     pool: PgPool,
 }
 
+/// Claimless audit write for one self-only voice move. Bundled into one
+/// struct so the recorder stays under the `too_many_arguments` limit; every
+/// field is a validated scalar (caller id, nonce hash, raw body witness,
+/// snowflakes, request id, outcome word), never free text.
+#[derive(Debug, Clone, Copy)]
+pub struct VoiceMoveAudit<'a> {
+    pub caller: &'a str,
+    pub nonce_hash: &'a str,
+    pub authenticated_payload: &'a [u8],
+    pub guild_id: &'a str,
+    pub member_id: &'a str,
+    pub from_channel_id: Option<&'a str>,
+    pub to_channel_id: &'a str,
+    pub request_id: &'a str,
+    pub outcome: VoiceMoveOutcome,
+}
+
+/// `key_hash` for a claimless voice move audit. The NUL-delimited prefix keeps
+/// it disjoint from ordinary idempotency identities, whose keys are limited to
+/// alphanumerics and `._:-` and hash as `sha256(key)`: no ordinary key can
+/// reproduce this preimage, so a fresh nonce never collides with a key of the
+/// same text.
+fn voice_audit_key_hash(nonce_hash: &str) -> String {
+    body_hash(format!("voice.move_member\0nonce\0{nonce_hash}").as_bytes())
+}
+
 impl InternalActionStore {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
@@ -636,6 +662,83 @@ impl InternalActionStore {
         Ok(())
     }
 
+    /// Claimless audit for one self-only voice move. The intent row starts
+    /// `completed` and the log gains a single `terminal` row in the same
+    /// transaction: repeats re-evaluate live voice state and converge on the
+    /// `already_in_room` no-op, so there is no claim to replay. `nonce_hash`
+    /// (`AuthDecision.nonce_hash`, `sha256_hex(nonce)`) supplies the audit key
+    /// material: the nonce burn proved delivery admission, and the
+    /// (caller, voice-audit key) conflict refuses a second write for it.
+    /// `voice_audit_key_hash` domain-separates the stored identity from
+    /// ordinary idempotency keys, including keys matching the raw nonce.
+    /// The guild and target are always known after shape validation;
+    /// `from_channel_id` is `None` exactly when the move never learned it
+    /// (member not connected). Returns the intent id for operator tracing.
+    pub async fn record_voice_move(
+        &self,
+        audit: VoiceMoveAudit<'_>,
+    ) -> Result<i64, InternalStoreError> {
+        let VoiceMoveAudit {
+            caller,
+            nonce_hash,
+            authenticated_payload,
+            guild_id,
+            member_id,
+            from_channel_id,
+            to_channel_id,
+            request_id,
+            outcome,
+        } = audit;
+        if caller.is_empty()
+            || caller.len() > 128
+            || !caller
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+            || nonce_hash.len() != 64
+            || !nonce_hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || authenticated_payload.len() > MAX_BODY_BYTES
+            || !is_snowflake(guild_id)
+            || !is_snowflake(member_id)
+            || from_channel_id.is_some_and(|id| !is_snowflake(id))
+            || !is_snowflake(to_channel_id)
+            || !is_request_id(request_id)
+        {
+            return Err(InternalStoreError::InvalidInput);
+        }
+        let mut tx = self.pool.begin().await?;
+        let intent_id: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO internal_idempotency \
+             (caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id, target_id, \
+              response_code, http_status, resource_id, affected, outcome, \
+              from_channel_id, to_channel_id, request_id) \
+             VALUES ($1, $2, 'voice.move_member', $3, 'completed', $4, NULL, $5, \
+                     $6, $7, NULL, $8, $9, $10, $11, $12) \
+             ON CONFLICT (caller_hash, key_hash) DO NOTHING RETURNING intent_id",
+        )
+        .bind(body_hash(caller.as_bytes()))
+        .bind(voice_audit_key_hash(nonce_hash))
+        .bind(body_hash(authenticated_payload))
+        .bind(guild_id)
+        .bind(member_id)
+        .bind(outcome.response_code())
+        .bind(i32::from(outcome.status()))
+        .bind(outcome.affected())
+        .bind(outcome.as_str())
+        .bind(from_channel_id)
+        .bind(to_channel_id)
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(intent_id) = intent_id else {
+            return Err(InternalStoreError::TransitionRefused);
+        };
+        Self::audit(&mut tx, intent_id, "terminal", Some("executor")).await?;
+        tx.commit().await?;
+        Ok(intent_id)
+    }
+
     /// Caller owns proving the evidence. This method only records a terminal result;
     /// it cannot reset an intent or return an ExecutionClaim. Fresh intents refuse.
     pub async fn reconcile(
@@ -930,9 +1033,11 @@ impl InternalActionStore {
         sqlx::query(
             "INSERT INTO internal_action_log \
              (intent_id, phase, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-              response_code, http_status, evidence_code, resource_id, affected, outcome, stop_reason) \
+              response_code, http_status, evidence_code, resource_id, affected, outcome, stop_reason, \
+              from_channel_id, to_channel_id, request_id) \
              SELECT intent_id, $2, caller_hash, action, guild_id, actor_id, target_id, resolved_role_id, \
-                    response_code, http_status, $3, resource_id, affected, outcome, stop_reason \
+                    response_code, http_status, $3, resource_id, affected, outcome, stop_reason, \
+                    from_channel_id, to_channel_id, request_id \
              FROM internal_idempotency WHERE intent_id = $1 \
              ON CONFLICT (intent_id, phase) DO NOTHING",
         )

@@ -536,6 +536,10 @@
     "crates/cutover/migrations/0472_event_instance_windows.sql": {
       "sha256": "ff2af4cb454c9fa569fb2722593ff35f3af3c347dc55fcea82ddeff0c21bd671",
       "justification": "Retain accepted event instance windows and independent lifecycle, omission and revocation fences outside the exact-replacement mirror; omission stamps preserve rollback recency without masking delayed terminal observations."
+    },
+    "crates/cutover/migrations/0473_internal_action_voice_move.sql": {
+      "sha256": "b0925e1a9caca8ffa7fa9fe58c84537d79686fad59f4aa3d569147227012f2ad",
+      "justification": "Voice-move audit columns (source/target channel, request id) plus the verb, its nine outcomes and its two refusal codes in the internal-action CHECKs; existing rows stay NULL. CHECKs add NOT VALID with separate VALIDATE."
     }
   }
 }

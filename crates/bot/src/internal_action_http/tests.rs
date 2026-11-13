@@ -4,7 +4,7 @@ use super::*;
 use axum::body::Body;
 use std::{
     collections::{HashMap, HashSet},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tower::ServiceExt;
 use twilight_cache_inmemory::DefaultInMemoryCache;
@@ -21,6 +21,7 @@ mod automations;
 mod drain_shutdown;
 mod receipt_lifecycle;
 mod settings;
+mod voice_reconciliation;
 
 /// Stored `internal_idempotency` receipt row: action, state, response code,
 /// status, resource, affected count, guild, actor, target, resolved role.
@@ -2577,6 +2578,2230 @@ async fn voice_snapshot_empty_guild_lists_rooms_with_zero_total() {
     assert_eq!(body["result"]["total_in_voice"], 0);
     assert_eq!(body["result"]["rooms"].as_array().expect("rooms").len(), 5);
     db.close().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Self-only `voice.move_member` (live voice move)
+// ---------------------------------------------------------------------------
+
+fn set_voice_move_flag(on: bool) {
+    if on {
+        std::env::set_var("TWO_INTERNAL_ALLOW_VOICE_MOVE", "1");
+    } else {
+        std::env::remove_var("TWO_INTERNAL_ALLOW_VOICE_MOVE");
+    }
+}
+
+fn voice_move_payload(member: &str, channel: &str) -> String {
+    serde_json::json!({"action": "voice.move_member", "discord_id": member, "channel_id": channel})
+        .to_string()
+}
+
+/// Offline voice-move double: the auth/flag/bucket fences must refuse before
+/// this is ever called, so deny-path tests assert `calls() == 0`.
+#[derive(Clone)]
+enum MockVoiceAnswer {
+    Receipt(VoiceMoveOutcome, Option<String>, Option<u64>),
+    Unavailable,
+}
+
+struct MockVoiceMove {
+    calls: AtomicUsize,
+    answer: std::sync::Mutex<MockVoiceAnswer>,
+}
+
+impl MockVoiceMove {
+    fn receipt(
+        outcome: VoiceMoveOutcome,
+        from: Option<&str>,
+        retry_after_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            answer: std::sync::Mutex::new(MockVoiceAnswer::Receipt(
+                outcome,
+                from.map(str::to_owned),
+                retry_after_secs,
+            )),
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            answer: std::sync::Mutex::new(MockVoiceAnswer::Unavailable),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl VoiceMoveEffect for MockVoiceMove {
+    fn execute_move<'a>(
+        &'a self,
+        _: &'a VoiceMoveRequest<'a>,
+    ) -> BoxFuture<'a, Result<VoiceMoveReceipt, ActionError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.answer.lock().unwrap().clone() {
+                MockVoiceAnswer::Receipt(outcome, from_channel_id, retry_after_secs) => {
+                    Ok(VoiceMoveReceipt {
+                        outcome,
+                        from_channel_id,
+                        retry_after_secs,
+                    })
+                }
+                MockVoiceAnswer::Unavailable => Err(ActionError::new(
+                    ErrorCode::DiscordUnavailable,
+                    "Discord was unreachable",
+                    "discord_unreachable",
+                )),
+            }
+        })
+    }
+}
+
+fn voice_move_state(pool: sqlx::PgPool, voice_move: Arc<MockVoiceMove>) -> ReceiverState {
+    let effect = Arc::new(MockEffect::new(MockOutcome::Success));
+    let voice_move: Arc<dyn VoiceMoveEffect> = voice_move;
+    ReceiverState::new(
+        config(),
+        pool,
+        effect.clone(),
+        effect,
+        Arc::new(MockEventRead::default()),
+        Arc::new(MockEventMutate),
+        Arc::new(MockModeration::default()),
+        Arc::new(MockChannel::default()),
+    )
+    .with_voice_move(voice_move)
+}
+
+fn voice_move_app(pool: sqlx::PgPool, voice_move: Arc<MockVoiceMove>) -> Router {
+    router(Arc::new(voice_move_state(pool, voice_move)))
+}
+
+#[tokio::test]
+async fn voice_move_cancelled_handler_keeps_capacity_and_audit_until_drain() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(true);
+    let effect = Arc::new(MockVoiceMove::receipt(
+        VoiceMoveOutcome::Moved,
+        Some(VOICE_MOVE_SOURCE_ID),
+        None,
+    ));
+    let mut receiver = voice_move_state(db.pool().clone(), effect.clone());
+    receiver.capacity = Arc::new(Semaphore::new(1));
+    let state = Arc::new(receiver);
+    // Nonce persistence is independent of these tables. The move completes,
+    // then its terminal audit waits here so cancellation hits the exact gap.
+    let mut lock = db.pool().begin().await.unwrap();
+    sqlx::query("LOCK TABLE internal_idempotency, internal_action_log IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let raw = voice_move_payload(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let mut request = signed_read(&raw, "old");
+    request.headers_mut().insert(
+        "x-request-id",
+        HeaderValue::from_static("00000000000000000000000001"),
+    );
+    let client = tokio::spawn(answer(router(state.clone()), request));
+    let blocked = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+                 WHERE NOT l.granted AND c.relname IN \
+                 ('internal_idempotency', 'internal_action_log')",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    client.abort();
+    let cancelled = client.await.unwrap_err().is_cancelled();
+    let held = state.capacity.available_permits();
+    let probe = tokio::time::timeout(
+        Duration::from_secs(1),
+        answer(router(state.clone()), signed_read(&raw, "old")),
+    )
+    .await;
+    // Start shutdown's actual join path before releasing the audit lock.
+    state.draining.store(true, Ordering::SeqCst);
+    let draining = {
+        let state = state.clone();
+        tokio::spawn(
+            async move { BoundReceiver::drain_children(&state, Duration::from_secs(3)).await },
+        )
+    };
+    tokio::task::yield_now().await;
+    let joined_early = draining.is_finished();
+    lock.rollback().await.unwrap();
+    let drained = draining.await.unwrap();
+    set_voice_move_flag(false);
+    assert!(blocked.is_ok(), "effect reached terminal persistence");
+    assert!(cancelled);
+    assert_eq!(held, 0, "client cancellation must not release capacity");
+    let (status, _, body) = probe.expect("busy probe returns without waiting for audit");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "busy");
+    assert!(!joined_early, "shutdown must wait for audit completion");
+    assert!(drained, "receipt child drains cleanly after persistence");
+    assert_eq!(state.capacity.available_permits(), 1);
+    assert_eq!(
+        effect.calls(),
+        1,
+        "busy probe never reaches the move effect"
+    );
+    let row: (String, String, String, String) = sqlx::query_as(
+        "SELECT outcome, from_channel_id, to_channel_id, request_id \
+         FROM internal_action_log WHERE action = 'voice.move_member' AND phase = 'terminal'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(row.0, "moved");
+    assert_eq!(row.1, VOICE_MOVE_SOURCE_ID);
+    assert_eq!(row.2, VOICE_MOVE_TARGET_ID);
+    assert_eq!(row.3, "00000000000000000000000001");
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_move_draining_receiver_refuses_before_effect_or_audit() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(true);
+    let effect = Arc::new(MockVoiceMove::receipt(
+        VoiceMoveOutcome::Moved,
+        Some(VOICE_MOVE_SOURCE_ID),
+        None,
+    ));
+    let state = Arc::new(voice_move_state(db.pool().clone(), effect.clone()));
+    state.draining.store(true, Ordering::SeqCst);
+    let raw = voice_move_payload(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let (status, _, body) = answer(router(state.clone()), signed_read(&raw, "old")).await;
+    assert!(BoundReceiver::drain_children(&state, Duration::from_secs(1)).await);
+    set_voice_move_flag(false);
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"]["code"], "discord_unavailable");
+    assert_eq!(effect.calls(), 0);
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM internal_action_log WHERE action = 'voice.move_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows, 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_move_tampered_signed_subject_is_refused_before_effect_or_audit() {
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(true);
+    let effect = Arc::new(MockVoiceMove::receipt(
+        VoiceMoveOutcome::Moved,
+        Some(VOICE_MOVE_SOURCE_ID),
+        None,
+    ));
+    let app = voice_move_app(db.pool().clone(), effect.clone());
+    let raw = voice_move_payload(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let mut request = signed_read(&raw, "old");
+    // An unsigned client cannot replace the session-derived subject covered
+    // by the website's MAC. Session derivation itself belongs to that signer.
+    *request.body_mut() = Body::from(voice_move_payload(
+        VOICE_MOVE_SECOND_ID,
+        VOICE_MOVE_TARGET_ID,
+    ));
+    let (status, _, body) = answer(app, request).await;
+    set_voice_move_flag(false);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(effect.calls(), 0);
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM internal_action_log WHERE action = 'voice.move_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows, 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_move_flag_off_is_refused_before_any_effect() {
+    // The nonce burns durably before authorize, so even the flag-off refusal
+    // needs the migrated test database, like the `voice.snapshot` tests.
+    let Some(db) = database().await else { return };
+    let voice_move = Arc::new(MockVoiceMove::receipt(
+        VoiceMoveOutcome::Moved,
+        Some("111111111111111111"),
+        None,
+    ));
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(false);
+    // Keyless like `event.read`: no Idempotency-Key header is sent.
+    let (status, _, body) = answer(
+        voice_move_app(db.pool().clone(), voice_move.clone()),
+        signed_read(
+            &voice_move_payload("333333333333333333", "222222222222222222"),
+            "old",
+        ),
+    )
+    .await;
+    set_voice_move_flag(false);
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(body["error"]["retryable"], false);
+    assert_eq!(voice_move.calls(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_move_malformed_body_is_refused_before_any_effect() {
+    let Some(db) = database().await else { return };
+    let voice_move = Arc::new(MockVoiceMove::receipt(
+        VoiceMoveOutcome::Moved,
+        Some("111111111111111111"),
+        None,
+    ));
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(true);
+    let (status, _, body) = answer(
+        voice_move_app(db.pool().clone(), voice_move.clone()),
+        signed_read(&voice_move_payload("abc", "222222222222222222"), "old"),
+    )
+    .await;
+    set_voice_move_flag(false);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "malformed");
+    assert_eq!(body["error"]["retryable"], false);
+    assert_eq!(voice_move.calls(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_move_unwired_is_refused_even_when_allowed() {
+    // No `with_voice_move`: production `bind` always attaches the executor, so
+    // a verb without a wired effect adapter stays refused when the flag gate
+    // authorizes it.
+    let Some(db) = database().await else { return };
+    let state = state(
+        db.pool().clone(),
+        Arc::new(MockEffect::new(MockOutcome::Success)),
+    );
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(true);
+    let (status, _, body) = answer(
+        router(state),
+        signed_read(
+            &voice_move_payload("333333333333333333", "222222222222222222"),
+            "old",
+        ),
+    )
+    .await;
+    set_voice_move_flag(false);
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "action_not_allowed");
+    assert_eq!(body["error"]["retryable"], false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_move_moved_answers_from_channel_and_audits() {
+    let Some(db) = database().await else { return };
+    let voice_move = Arc::new(MockVoiceMove::receipt(
+        VoiceMoveOutcome::Moved,
+        Some("111111111111111111"),
+        None,
+    ));
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(true);
+    let (status, headers, body) = answer(
+        voice_move_app(db.pool().clone(), voice_move.clone()),
+        signed_read(
+            &voice_move_payload("333333333333333333", "222222222222222222"),
+            "old",
+        ),
+    )
+    .await;
+    set_voice_move_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("idempotent-replay"));
+    assert_eq!(
+        headers
+            .get(header::CACHE_CONTROL)
+            .map(HeaderValue::as_bytes),
+        Some(b"no-store".as_slice())
+    );
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["result"]["outcome"], "moved");
+    assert_eq!(body["result"]["from_channel_id"], "111111111111111111");
+    assert!(body["request_id"].is_string());
+    assert_eq!(voice_move.calls(), 1);
+    let row: (String, String, Option<String>, String) = sqlx::query_as(
+        "SELECT outcome, response_code, from_channel_id, to_channel_id \
+         FROM internal_idempotency WHERE action = 'voice.move_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (
+            "moved".to_owned(),
+            "success".to_owned(),
+            Some("111111111111111111".to_owned()),
+            "222222222222222222".to_owned(),
+        )
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_move_domain_words_answer_two_hundred() {
+    // Every definitive domain word renders its closed `outcome` with HTTP 200;
+    // only `moved` carries `from_channel_id`. Distinct members keep the
+    // per-member bucket out of the table.
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(true);
+    let cases: &[(VoiceMoveOutcome, Option<&str>)] = &[
+        (VoiceMoveOutcome::AlreadyInRoom, Some("222222222222222222")),
+        (VoiceMoveOutcome::NotConnected, None),
+        (VoiceMoveOutcome::NotPermitted, None),
+        (VoiceMoveOutcome::RoomFull, None),
+        (VoiceMoveOutcome::RoomGone, None),
+        (VoiceMoveOutcome::BotNotPermitted, None),
+    ];
+    for (index, (outcome, from)) in cases.iter().enumerate() {
+        let member = format!("3333333333333333{:02}", 10 + index);
+        let voice_move = Arc::new(MockVoiceMove::receipt(*outcome, *from, None));
+        let (status, headers, body) = answer(
+            voice_move_app(db.pool().clone(), voice_move.clone()),
+            signed_read(&voice_move_payload(&member, "222222222222222222"), "old"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "outcome {outcome:?}");
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .map(HeaderValue::as_bytes),
+            Some(b"no-store".as_slice())
+        );
+        assert_eq!(
+            body["result"]["outcome"],
+            outcome.as_str(),
+            "outcome {outcome:?}"
+        );
+        assert!(
+            body["result"].get("from_channel_id").is_none(),
+            "only moved carries from_channel_id: {outcome:?}"
+        );
+        assert_eq!(voice_move.calls(), 1);
+    }
+    set_voice_move_flag(false);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_move_rate_limited_answers_retry_after() {
+    let Some(db) = database().await else { return };
+    let voice_move = Arc::new(MockVoiceMove::receipt(
+        VoiceMoveOutcome::RateLimited,
+        Some("111111111111111111"),
+        Some(7),
+    ));
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(true);
+    let (status, headers, body) = answer(
+        voice_move_app(db.pool().clone(), voice_move.clone()),
+        signed_read(
+            &voice_move_payload("333333333333333333", "222222222222222222"),
+            "old",
+        ),
+    )
+    .await;
+    set_voice_move_flag(false);
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["code"], "rate_limited");
+    assert_eq!(body["error"]["retryable"], true);
+    assert_eq!(
+        headers.get(header::RETRY_AFTER).map(HeaderValue::as_bytes),
+        Some(b"7".as_slice())
+    );
+    assert_eq!(voice_move.calls(), 1);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_move_effect_error_is_discord_unavailable_but_audited() {
+    // Fail-closed retryable, still audited so the attempt is named in the
+    // audit trail.
+    let Some(db) = database().await else { return };
+    let voice_move = Arc::new(MockVoiceMove::unavailable());
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(true);
+    let (status, _, body) = answer(
+        voice_move_app(db.pool().clone(), voice_move.clone()),
+        signed_read(
+            &voice_move_payload("333333333333333333", "222222222222222222"),
+            "old",
+        ),
+    )
+    .await;
+    set_voice_move_flag(false);
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"]["code"], "discord_unavailable");
+    assert_eq!(body["error"]["retryable"], true);
+    assert_eq!(voice_move.calls(), 1);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM internal_idempotency WHERE action = 'voice.move_member'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn voice_move_member_bucket_holds_six_moves_per_five_minutes() {
+    // One app (one in-memory bucket set), one member: six moves pass, the
+    // seventh refuses `rate_limited` before the effect runs again.
+    let Some(db) = database().await else { return };
+    let voice_move = Arc::new(MockVoiceMove::receipt(
+        VoiceMoveOutcome::Moved,
+        Some("111111111111111111"),
+        None,
+    ));
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_move_flag(true);
+    let app = voice_move_app(db.pool().clone(), voice_move.clone());
+    let payload = voice_move_payload("333333333333333333", "222222222222222222");
+    for _ in 0..6 {
+        let (status, _, _) = answer(app.clone(), signed_read(&payload, "old")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(voice_move.calls(), 6);
+    let (status, _, body) = answer(app, signed_read(&payload, "old")).await;
+    set_voice_move_flag(false);
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["code"], "rate_limited");
+    assert_eq!(body["error"]["retryable"], true);
+    assert_eq!(voice_move.calls(), 6, "bucket refuses before the effect");
+    db.close().await.unwrap();
+}
+
+use two_bot_core::voice_permissions::{PERM_CONNECT, PERM_MOVE_MEMBERS, PERM_VIEW_CHANNEL};
+
+const VOICE_MOVE_BOT_ID: &str = "777777777777777777";
+/// Shape-valid low-entropy fixtures: the receiver's snowflake gate needs
+/// 17–20 digits, and the secret scanner flags high-entropy digit runs, so
+/// the move ids stay in the `1000000000000000xx` family like the event ids
+/// above. The shared snapshot seeder's single-digit rooms cannot be reused.
+const VOICE_MOVE_MEMBER_ID: &str = "100000000000000041";
+const VOICE_MOVE_SECOND_ID: &str = "100000000000000042";
+const VOICE_MOVE_SOURCE_ID: &str = "100000000000000031";
+const VOICE_MOVE_TARGET_ID: &str = "100000000000000032";
+const VOICE_MOVE_ROLE_ID: &str = "100000000000000020";
+const VOICE_MOVE_OWNER_ID: &str = "123456789012345678";
+/// One mover id per PATCH-issuing executor test: the Discord send guard is
+/// process-global and keys its learned 429 deadline by method plus full path
+/// (guild and member included), so the 429 the limited test provokes would
+/// refuse a sibling test's PATCH on the same member id when `cargo test`
+/// runs the binary in one process. Distinct ids keep every PATCH route
+/// unique however the scheduler interleaves the tests; `nextest` isolates
+/// processes and never sees this.
+const VOICE_MOVE_DENIED_ID: &str = "100000000000000043";
+const VOICE_MOVE_LIMITED_ID: &str = "100000000000000044";
+const VOICE_MOVE_STALE_ID: &str = "100000000000000045";
+const VOICE_MOVE_NOT_SENT_ID: &str = "100000000000000046";
+const VOICE_MOVE_BROKEN_ID: &str = "100000000000000047";
+
+/// A 429 teaches the process-global guard its route, so each rate-limit case
+/// takes a member id of its own.
+fn voice_move_rate_limit_id(case: usize) -> String {
+    format!("1000000000000100{case:02}")
+}
+
+fn voice_move_rate_limit_member(user_id: &str) -> bool {
+    user_id.len() == 18 && user_id.starts_with("1000000000000100")
+}
+
+/// Mover ids the loopback double snapshots: the seeded member plus one per
+/// PATCH-issuing executor test.
+fn voice_move_known_member(user_id: &str) -> bool {
+    matches!(
+        user_id,
+        VOICE_MOVE_MEMBER_ID
+            | VOICE_MOVE_SECOND_ID
+            | VOICE_MOVE_DENIED_ID
+            | VOICE_MOVE_LIMITED_ID
+            | VOICE_MOVE_STALE_ID
+            | VOICE_MOVE_NOT_SENT_ID
+            | VOICE_MOVE_BROKEN_ID
+    ) || voice_move_rate_limit_member(user_id)
+}
+
+/// Gateway cache for the voice-move executor tests: the moving member sits in
+/// the source room and a second member holds the target room (so a limit of
+/// one reads full). The shared snapshot seeder's single-digit ids fail the
+/// receiver's snowflake shape gate, so this guild uses the shape-valid move
+/// fixtures above; no AFK room, so neither room reads as gone.
+fn seeded_voice_move_cache() -> Arc<DefaultInMemoryCache> {
+    seeded_voice_move_cache_for(VOICE_MOVE_MEMBER_ID)
+}
+
+fn seeded_voice_move_cache_for(member_id: &str) -> Arc<DefaultInMemoryCache> {
+    seed_voice_move_cache(voice_snapshot::new_shared_cache(), member_id)
+}
+
+fn seed_voice_move_cache(
+    cache: Arc<DefaultInMemoryCache>,
+    member_id: &str,
+) -> Arc<DefaultInMemoryCache> {
+    let mut guild: Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/voice_guild.json"))
+            .expect("voice guild fixture parses");
+    guild["id"] = Value::String(staging_guild().to_owned());
+    guild["afk_channel_id"] = Value::Null;
+    guild["channels"] = serde_json::json!([
+        voice_channel(VOICE_MOVE_SOURCE_ID, 2, "lobby", 0, 0),
+        voice_channel(VOICE_MOVE_TARGET_ID, 2, "alpha", 1, 0),
+    ]);
+    guild["members"] = serde_json::json!([
+        voice_member(member_id, false),
+        voice_member(VOICE_MOVE_SECOND_ID, false),
+    ]);
+    guild["voice_states"] = serde_json::json!([
+        {"guild_id": staging_guild(), "channel_id": VOICE_MOVE_SOURCE_ID,
+         "user_id": member_id,
+         "session_id": "move-s1", "deaf": false, "mute": false,
+         "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false},
+        {"guild_id": staging_guild(), "channel_id": VOICE_MOVE_TARGET_ID,
+         "user_id": VOICE_MOVE_SECOND_ID,
+         "session_id": "move-s2", "deaf": false, "mute": false,
+         "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false},
+    ]);
+    let guild: Guild = serde_json::from_value(guild).expect("patched guild deserializes");
+    cache.update(&Event::GuildCreate(Box::new(GuildCreate::Available(guild))));
+    cache
+}
+
+/// Loopback Discord double for the production voice-move executor: the guild
+/// snapshot, the bot identity, the member snapshots, the two room snapshots
+/// and a configurable PATCH answer. An unexpected extra Discord call is a
+/// visible path, not a shifted canned reply.
+#[derive(Clone)]
+struct MockVoiceApiConfig {
+    guild_status: u16,
+    target_status: u16,
+    target_kind: u8,
+    target_limit: u32,
+    patch_status: u16,
+    patch_retry_after: Option<String>,
+    member_timeout: Value,
+    target_status_after_patch: Option<u16>,
+    target_overwrites_after_patch: Vec<Value>,
+    identity_seen: Option<Arc<tokio::sync::Notify>>,
+    disconnect_on_member: Option<Arc<RwLock<crate::gateway::GatewayState>>>,
+    /// Set once every prerequisite read of a move has been served, so a test
+    /// admission can refuse exactly the PATCH that follows.
+    prerequisites_done: Option<Arc<AtomicBool>>,
+    /// How the FIRST member PATCH answer's body (and headers) misbehaves after
+    /// the configured status; later PATCHes answer normally.
+    patch_body: PatchBody,
+    /// Status of every PATCH after the first, so a test can recover.
+    patch_status_after_first: Option<u16>,
+    /// JSON body of every well-formed PATCH answer.
+    patch_json: Value,
+    /// Synthetic remote effect, deliberately separate from gateway publication.
+    patch_effect: Option<Arc<Mutex<Option<String>>>>,
+    /// Hold the response after the wire PATCH and synthetic effect, so the
+    /// real gateway arrival can precede local terminal completion.
+    patch_response_barrier: Option<Arc<PatchResponseBarrier>>,
+}
+
+struct PatchResponseBarrier {
+    entered: tokio::sync::Notify,
+    proceed: tokio::sync::Semaphore,
+}
+
+/// Misbehaving first member PATCH answer, served by a raw socket loop that
+/// dispatches the parsed request to the normal router (so routes and
+/// recording are unchanged) and then writes the answer by hand. The status
+/// line and headers are always the configured ones except for the two modes
+/// that never send them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatchBody {
+    Normal,
+    /// Declares 64 body bytes, sends a few, then closes.
+    Truncated,
+    /// Chunked body whose first chunk size is invalid, then closes.
+    Erroring,
+    /// Declares 64 body bytes, sends a few, then holds the socket open.
+    Stalled,
+    /// Reads the request and holds the socket open without answering.
+    NoHeaders,
+    /// Reads the request, then closes the socket without answering.
+    PreHeaderClose,
+}
+
+/// Raw per-connection loop: one request per connection, `Connection: close`.
+/// Only the first PATCH is broken; everything else is serialised from the
+/// router's own response. Connection tasks die with the loop (the mock drop
+/// aborts it) and are bounded by their own deadline.
+async fn serve_with_broken_patch(listener: TcpListener, app: Router, mode: PatchBody) {
+    let patches = Arc::new(AtomicUsize::new(0));
+    let mut connections = tokio::task::JoinSet::new();
+    while let Ok((stream, _)) = listener.accept().await {
+        let app = app.clone();
+        let patches = patches.clone();
+        connections.spawn(async move {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                raw_exchange(stream, app, patches, mode),
+            )
+            .await;
+        });
+    }
+}
+
+async fn raw_exchange(
+    mut stream: tokio::net::TcpStream,
+    app: Router,
+    patches: Arc<AtomicUsize>,
+    mode: PatchBody,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0u8; 1];
+        if head.len() >= 16 * 1024 || stream.read(&mut byte).await? == 0 {
+            return Ok(());
+        }
+        head.push(byte[0]);
+    }
+    let text = String::from_utf8_lossy(&head).into_owned();
+    let mut lines = text.split("\r\n");
+    let mut request_line = lines.next().unwrap_or_default().split(' ');
+    let method = request_line.next().unwrap_or_default().to_owned();
+    let path = request_line.next().unwrap_or_default().to_owned();
+    let length = lines
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    if length > 64 * 1024 {
+        return Ok(());
+    }
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).await?;
+    let first_patch = method == "PATCH" && patches.fetch_add(1, Ordering::SeqCst) == 0;
+    let request = Request::builder()
+        .method(method.as_str())
+        .uri(path.as_str())
+        .body(Body::from(body))
+        .map_err(std::io::Error::other)?;
+    let response = app.oneshot(request).await.expect("router is infallible");
+    let broken = first_patch.then_some(mode);
+    match broken {
+        Some(PatchBody::NoHeaders) => std::future::pending::<()>().await,
+        Some(PatchBody::PreHeaderClose) => return Ok(()),
+        _ => {}
+    }
+    let (parts, body) = response.into_parts();
+    let full = axum::body::to_bytes(body, 1 << 20)
+        .await
+        .map_err(std::io::Error::other)?;
+    let mut out = format!(
+        "HTTP/1.1 {} {}\r\n",
+        parts.status.as_u16(),
+        parts.status.canonical_reason().unwrap_or("Unknown")
+    )
+    .into_bytes();
+    for (name, value) in &parts.headers {
+        if [
+            header::CONTENT_LENGTH,
+            header::TRANSFER_ENCODING,
+            header::CONNECTION,
+        ]
+        .contains(name)
+        {
+            continue;
+        }
+        out.extend_from_slice(format!("{name}: ").as_bytes());
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"connection: close\r\n");
+    match broken {
+        Some(PatchBody::Truncated | PatchBody::Stalled) => {
+            out.extend_from_slice(b"content-length: 64\r\n\r\n{\"message\"");
+        }
+        Some(PatchBody::Erroring) => {
+            out.extend_from_slice(b"transfer-encoding: chunked\r\n\r\nzz\r\n");
+        }
+        _ => {
+            out.extend_from_slice(format!("content-length: {}\r\n\r\n", full.len()).as_bytes());
+            out.extend_from_slice(&full);
+        }
+    }
+    stream.write_all(&out).await?;
+    stream.flush().await?;
+    if broken == Some(PatchBody::Stalled) {
+        std::future::pending::<()>().await;
+    }
+    stream.shutdown().await
+}
+
+const BROKEN_PATCH_BODIES: [PatchBody; 3] = [
+    PatchBody::Truncated,
+    PatchBody::Erroring,
+    PatchBody::Stalled,
+];
+
+impl Default for MockVoiceApiConfig {
+    fn default() -> Self {
+        Self {
+            guild_status: 200,
+            target_status: 200,
+            target_kind: 2,
+            target_limit: 0,
+            patch_status: 200,
+            patch_retry_after: None,
+            member_timeout: Value::Null,
+            target_status_after_patch: None,
+            target_overwrites_after_patch: Vec::new(),
+            identity_seen: None,
+            disconnect_on_member: None,
+            prerequisites_done: None,
+            patch_body: PatchBody::Normal,
+            patch_status_after_first: None,
+            patch_json: Value::Null,
+            patch_effect: None,
+            patch_response_barrier: None,
+        }
+    }
+}
+
+struct MockVoiceApi {
+    origin: String,
+    requests: Arc<Mutex<Vec<Value>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MockVoiceApi {
+    async fn start(config: MockVoiceApiConfig) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let guild_id = staging_guild().to_owned();
+        let patch_body = config.patch_body;
+        let task = tokio::spawn(async move {
+            let app = Router::new().fallback(move |request: Request| {
+                let guild_id = guild_id.clone();
+                let seen = seen.clone();
+                let config = config.clone();
+                async move {
+                    let (parts, _) = request.into_parts();
+                    let path = parts.uri.path().to_owned();
+                    let method = parts.method.clone();
+                    {
+                        let mut calls = seen.lock().unwrap();
+                        calls.push(json!({
+                            "method": method.as_str(),
+                            "path": path,
+                        }));
+                        if let Some(done) = &config.prerequisites_done {
+                            let guild_path = format!("/api/v10/guilds/{guild_id}");
+                            let served = |wanted: String| {
+                                calls.iter().any(|call| {
+                                    call["method"] == "GET" && call["path"] == wanted.as_str()
+                                })
+                            };
+                            if served(guild_path.clone())
+                                && served(format!("/api/v10/channels/{VOICE_MOVE_SOURCE_ID}"))
+                                && served(format!("/api/v10/channels/{VOICE_MOVE_TARGET_ID}"))
+                                && served(format!("{guild_path}/members/{VOICE_MOVE_BOT_ID}"))
+                                && served(format!(
+                                    "{guild_path}/members/{VOICE_MOVE_NOT_SENT_ID}"
+                                ))
+                            {
+                                done.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    let guild_path = format!("/api/v10/guilds/{guild_id}");
+                    if path == "/api/v10/users/@me" {
+                        if let Some(seen) = &config.identity_seen {
+                            seen.notify_one();
+                        }
+                        return (
+                            StatusCode::OK,
+                            HeaderMap::new(),
+                            Json(json!({"id": VOICE_MOVE_BOT_ID, "bot": true})),
+                        );
+                    }
+                    if path == guild_path {
+                        if config.guild_status == StatusCode::OK.as_u16() {
+                            let everyone = PERM_VIEW_CHANNEL | PERM_CONNECT;
+                            let mover = PERM_VIEW_CHANNEL | PERM_CONNECT | PERM_MOVE_MEMBERS;
+                            return (
+                                StatusCode::OK,
+                                HeaderMap::new(),
+                                Json(json!({
+                                    "id": guild_id,
+                                    "owner_id": VOICE_MOVE_OWNER_ID,
+                                    "afk_channel_id": Value::Null,
+                                    "roles": [
+                                        {"id": guild_id, "position": 0,
+                                         "permissions": everyone.to_string()},
+                                        {"id": VOICE_MOVE_ROLE_ID, "position": 3,
+                                         "permissions": mover.to_string()},
+                                    ],
+                                })),
+                            );
+                        }
+                        return (
+                            StatusCode::from_u16(config.guild_status)
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                            HeaderMap::new(),
+                            Json(Value::Null),
+                        );
+                    }
+                    let members_prefix = format!("{guild_path}/members/");
+                    if let Some(user_id) = path.strip_prefix(members_prefix.as_str()) {
+                        if method == axum::http::Method::PATCH && voice_move_known_member(user_id) {
+                            if let Some(effect) = &config.patch_effect {
+                                *effect.lock().unwrap() = Some(VOICE_MOVE_TARGET_ID.to_owned());
+                            }
+                            let mut headers = HeaderMap::new();
+                            if let Some(wait) = config.patch_retry_after {
+                                headers.insert(header::RETRY_AFTER, wait.parse().unwrap());
+                            }
+                            let first = seen
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|call| call["method"] == "PATCH")
+                                .count()
+                                <= 1;
+                            let status = match (first, config.patch_status_after_first) {
+                                (false, Some(later)) => later,
+                                _ => config.patch_status,
+                            };
+                            if let Some(barrier) = &config.patch_response_barrier {
+                                barrier.entered.notify_one();
+                                barrier.proceed.acquire().await.unwrap().forget();
+                            }
+                            return (
+                                StatusCode::from_u16(status)
+                                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                                headers,
+                                Json(config.patch_json.clone()),
+                            );
+                        }
+                        let member = |id: &str| {
+                            json!({
+                                "user": {"id": id}, "roles": [VOICE_MOVE_ROLE_ID],
+                                "communication_disabled_until": config.member_timeout,
+                            })
+                        };
+                        if user_id == VOICE_MOVE_BOT_ID || voice_move_known_member(user_id) {
+                            if user_id != VOICE_MOVE_BOT_ID {
+                                if let Some(state) = &config.disconnect_on_member {
+                                    *state.write().await = crate::gateway::GatewayState::Armed;
+                                }
+                            }
+                            return (StatusCode::OK, HeaderMap::new(), Json(member(user_id)));
+                        }
+                        return (StatusCode::NOT_FOUND, HeaderMap::new(), Json(Value::Null));
+                    }
+                    if path == format!("/api/v10/channels/{VOICE_MOVE_SOURCE_ID}") {
+                        return (
+                            StatusCode::OK,
+                            HeaderMap::new(),
+                            Json(json!({
+                                "id": VOICE_MOVE_SOURCE_ID,
+                                "guild_id": guild_id,
+                                "type": 2,
+                                "user_limit": 0,
+                                "permission_overwrites": [],
+                            })),
+                        );
+                    }
+                    if path == format!("/api/v10/channels/{VOICE_MOVE_TARGET_ID}") {
+                        let patched = seen.lock().unwrap().iter().any(|call| call["method"] == "PATCH");
+                        let target_status = if patched { config.target_status_after_patch.unwrap_or(config.target_status) } else { config.target_status };
+                        if target_status != StatusCode::OK.as_u16() {
+                            return (
+                                StatusCode::from_u16(target_status)
+                                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                                HeaderMap::new(),
+                                Json(Value::Null),
+                            );
+                        }
+                        return (
+                            StatusCode::OK,
+                            HeaderMap::new(),
+                            Json(json!({
+                                "id": VOICE_MOVE_TARGET_ID,
+                                "guild_id": guild_id,
+                                "type": config.target_kind,
+                                "user_limit": config.target_limit,
+                                "permission_overwrites": if patched { config.target_overwrites_after_patch } else { Vec::new() },
+                            })),
+                        );
+                    }
+                    (StatusCode::NOT_FOUND, HeaderMap::new(), Json(Value::Null))
+                }
+            });
+            if patch_body == PatchBody::Normal {
+                axum::serve(listener, app).await.unwrap();
+            } else {
+                serve_with_broken_patch(listener, app, patch_body).await;
+            }
+        });
+        Self {
+            origin,
+            requests,
+            task,
+        }
+    }
+
+    fn patch_calls(&self) -> usize {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| seen.get("method").and_then(Value::as_str) == Some("PATCH"))
+            .count()
+    }
+
+    fn gather_calls(&self) -> usize {
+        let guild_path = format!("/api/v10/guilds/{}", staging_guild());
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| seen["method"] == "GET" && seen["path"] == guild_path)
+            .count()
+    }
+}
+
+impl Drop for MockVoiceApi {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The real [`VoiceMoveExecutor`] over loopback Discord and the shared
+/// gateway cache: gather/decide/PATCH/regather run the production path, not
+/// the offline double.
+fn voice_move_executor(mock: &MockVoiceApi, cache: Arc<DefaultInMemoryCache>) -> VoiceMoveExecutor {
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(mock.origin.clone()))
+            .unwrap();
+    VoiceMoveExecutor::new(
+        discord,
+        cache,
+        connected_gateway(),
+        VoiceOccupancyClock::new(),
+    )
+}
+
+fn voice_move_body(member: &str, channel: &str) -> Map<String, Value> {
+    serde_json::from_value(
+        json!({"action": "voice.move_member", "discord_id": member, "channel_id": channel}),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn voice_move_executor_moves_through_the_live_fact_set() {
+    // The member sits in the source room in the seeded cache; the target is
+    // open, so the production gather/decide/PATCH answers `moved` from source.
+    let mock = MockVoiceApi::start(MockVoiceApiConfig::default()).await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache())
+        .execute_move(&request)
+        .await
+        .expect("open move succeeds");
+    assert_eq!(receipt.outcome, VoiceMoveOutcome::Moved);
+    assert_eq!(
+        receipt.from_channel_id.as_deref(),
+        Some(VOICE_MOVE_SOURCE_ID)
+    );
+    assert_eq!(mock.patch_calls(), 1, "one PATCH for one move");
+}
+
+#[tokio::test]
+async fn voice_move_executor_gateway_not_ready_is_unavailable() {
+    // Warm cache, gateway mid-reconnect: the executor refuses before any
+    // Discord call, never guessing `not_connected` from stale occupancy.
+    let mock = MockVoiceApi::start(MockVoiceApiConfig::default()).await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(mock.origin.clone()))
+            .unwrap();
+    let executor = VoiceMoveExecutor::new(
+        discord,
+        seeded_voice_move_cache(),
+        Arc::new(tokio::sync::RwLock::new(
+            crate::gateway::GatewayState::Armed,
+        )),
+        VoiceOccupancyClock::new(),
+    );
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let error = executor
+        .execute_move(&request)
+        .await
+        .expect_err("not-ready gateway refuses");
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(mock.patch_calls(), 0);
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn voice_move_executor_queued_request_rechecks_gateway() {
+    let identity_seen = Arc::new(tokio::sync::Notify::new());
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        identity_seen: Some(identity_seen.clone()),
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let executor = voice_move_executor(&mock, seeded_voice_move_cache());
+    let gate = executor.admission_gate.lock().await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).unwrap();
+    let mut future = executor.execute_move(&request);
+    tokio::select! {
+        result = &mut future => panic!("admission gate did not hold request: {result:?}"),
+        _ = identity_seen.notified() => {
+            *executor.gateway_state.write().await = crate::gateway::GatewayState::Armed;
+            drop(gate);
+        }
+        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("identity handshake timed out"),
+    }
+    let error = tokio::time::timeout(Duration::from_secs(5), future)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(mock.patch_calls(), 0);
+    assert!(!mock
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request["path"] == format!("/api/v10/guilds/{}", staging_guild())));
+}
+
+#[tokio::test]
+async fn voice_move_executor_gateway_gap_during_gather_prevents_patch() {
+    let state = connected_gateway();
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        disconnect_on_member: Some(state.clone()),
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let discord =
+        ActionExecutor::with_proxy("not-a-credential".to_owned(), Some(mock.origin.clone()))
+            .unwrap();
+    let executor = VoiceMoveExecutor::new(
+        discord,
+        seeded_voice_move_cache(),
+        state,
+        VoiceOccupancyClock::new(),
+    );
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).unwrap();
+    assert_eq!(
+        executor.execute_move(&request).await.unwrap_err().code,
+        ErrorCode::DiscordUnavailable
+    );
+    assert_eq!(mock.patch_calls(), 0);
+}
+
+#[tokio::test]
+async fn voice_move_executor_missing_target_is_room_gone() {
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        target_status: 404,
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache())
+        .execute_move(&request)
+        .await
+        .expect("gone target answers");
+    assert_eq!(receipt.outcome, VoiceMoveOutcome::RoomGone);
+    assert_eq!(mock.patch_calls(), 0, "gone rooms never PATCH");
+}
+
+#[tokio::test]
+async fn voice_move_executor_disconnected_member_is_not_connected() {
+    let cache = seeded_voice_move_cache();
+    cache.update(&Event::VoiceStateUpdate(Box::new(voice_state(
+        VOICE_MOVE_MEMBER_ID,
+        None,
+    ))));
+    let mock = MockVoiceApi::start(MockVoiceApiConfig::default()).await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let receipt = voice_move_executor(&mock, cache)
+        .execute_move(&request)
+        .await
+        .expect("disconnected member answers");
+    assert_eq!(receipt.outcome, VoiceMoveOutcome::NotConnected);
+    assert_eq!(mock.patch_calls(), 0);
+}
+
+#[tokio::test]
+async fn voice_move_executor_cold_cache_is_unavailable_not_disconnected() {
+    let mock = MockVoiceApi::start(MockVoiceApiConfig::default()).await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let error = voice_move_executor(&mock, voice_snapshot::new_shared_cache())
+        .execute_move(&request)
+        .await
+        .expect_err("REST success does not prove gateway guild completeness");
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(mock.patch_calls(), 0);
+}
+
+#[tokio::test]
+async fn voice_move_executor_unavailable_guild_is_not_disconnected() {
+    let cache = seeded_voice_move_cache();
+    let deleted = serde_json::from_value(serde_json::json!({
+        "id": staging_guild(), "unavailable": true,
+    }))
+    .expect("unavailable guild fixture parses");
+    cache.update(&Event::GuildDelete(deleted));
+    let mock = MockVoiceApi::start(MockVoiceApiConfig::default()).await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let error = voice_move_executor(&mock, cache)
+        .execute_move(&request)
+        .await
+        .expect_err("an unavailable guild cannot prove occupancy");
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(mock.patch_calls(), 0);
+}
+
+#[tokio::test]
+async fn voice_move_executor_disabled_voice_cache_is_not_disconnected() {
+    use twilight_cache_inmemory::ResourceType;
+    let cache = Arc::new(
+        DefaultInMemoryCache::builder()
+            .resource_types(ResourceType::GUILD | ResourceType::CHANNEL)
+            .build(),
+    );
+    let cache = seed_voice_move_cache(cache, VOICE_MOVE_MEMBER_ID);
+    let mock = MockVoiceApi::start(MockVoiceApiConfig::default()).await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let error = voice_move_executor(&mock, cache)
+        .execute_move(&request)
+        .await
+        .expect_err("disabled voice-state caching cannot prove occupancy");
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(mock.patch_calls(), 0);
+}
+
+#[tokio::test]
+async fn voice_move_executor_known_empty_guild_is_not_connected() {
+    let cache = seeded_voice_move_cache();
+    for member in [VOICE_MOVE_MEMBER_ID, VOICE_MOVE_SECOND_ID] {
+        cache.update(&Event::VoiceStateUpdate(Box::new(voice_state(
+            member, None,
+        ))));
+    }
+    let guild = twilight_model::id::Id::new(staging_guild().parse().unwrap());
+    assert!(cache.guild(guild).is_some());
+    assert!(cache.guild_voice_states(guild).is_none());
+    let mock = MockVoiceApi::start(MockVoiceApiConfig::default()).await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let receipt = voice_move_executor(&mock, cache)
+        .execute_move(&request)
+        .await
+        .expect("tracked empty guild proves no connection");
+    assert_eq!(receipt.outcome, VoiceMoveOutcome::NotConnected);
+    assert_eq!(mock.patch_calls(), 0);
+}
+
+#[tokio::test]
+async fn voice_move_executor_full_room_refuses_before_patch() {
+    // The target holds the second member in the seeded cache; a limit of one
+    // makes it full, so the decision refuses before the PATCH.
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        target_limit: 1,
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache())
+        .execute_move(&request)
+        .await
+        .expect("full room answers");
+    assert_eq!(receipt.outcome, VoiceMoveOutcome::RoomFull);
+    assert_eq!(mock.patch_calls(), 0);
+}
+
+#[tokio::test]
+async fn voice_move_executor_denied_patch_is_bot_not_permitted() {
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        patch_status: 403,
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let body = voice_move_body(VOICE_MOVE_DENIED_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache_for(VOICE_MOVE_DENIED_ID))
+        .execute_move(&request)
+        .await
+        .expect("denied PATCH answers");
+    assert_eq!(receipt.outcome, VoiceMoveOutcome::BotNotPermitted);
+    assert_eq!(mock.patch_calls(), 1);
+}
+
+#[tokio::test]
+async fn voice_move_executor_limited_patch_carries_discord_wait() {
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        patch_status: 429,
+        patch_retry_after: Some("5".to_owned()),
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let body = voice_move_body(VOICE_MOVE_LIMITED_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+    let receipt = voice_move_executor(&mock, seeded_voice_move_cache_for(VOICE_MOVE_LIMITED_ID))
+        .execute_move(&request)
+        .await
+        .expect("limited PATCH answers");
+    assert_eq!(receipt.outcome, VoiceMoveOutcome::RateLimited);
+    assert_eq!(receipt.retry_after_secs, Some(5));
+    assert_eq!(mock.patch_calls(), 1);
+}
+
+/// Durable-admission double: grants every read, refuses with the configured
+/// typed error once the mock has served the move's prerequisites, until the
+/// test opens the lane. Counts grants and settlements.
+#[derive(Debug)]
+struct PatchLaneAdmission {
+    key: two_bot_core::send_admission::TokenKey,
+    armed: Arc<AtomicBool>,
+    open: AtomicBool,
+    refusals: AtomicUsize,
+    error: two_bot_core::send_admission::AdmissionError,
+    admitted: AtomicUsize,
+    completed: Arc<SettlementEvidence>,
+}
+
+#[derive(Debug, Default)]
+struct SettlementEvidence {
+    count: AtomicUsize,
+    cooldowns: Mutex<Vec<Option<two_bot_core::send_admission::SendCooldown>>>,
+}
+
+struct GrantedCompletion(Arc<SettlementEvidence>);
+
+impl two_bot_core::send_admission::SendCompletion for GrantedCompletion {
+    fn complete(
+        self: Box<Self>,
+        cooldown: Option<two_bot_core::send_admission::SendCooldown>,
+    ) -> two_bot_core::send_admission::AdmissionFuture<
+        'static,
+        Result<(), two_bot_core::send_admission::AdmissionError>,
+    > {
+        self.0.count.fetch_add(1, Ordering::SeqCst);
+        self.0.cooldowns.lock().unwrap().push(cooldown);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl two_bot_core::send_admission::SendAdmission for PatchLaneAdmission {
+    fn token_key(&self) -> &two_bot_core::send_admission::TokenKey {
+        &self.key
+    }
+    fn admit(
+        &self,
+    ) -> two_bot_core::send_admission::AdmissionFuture<
+        '_,
+        Result<
+            two_bot_core::send_admission::AdmissionPermit,
+            two_bot_core::send_admission::AdmissionError,
+        >,
+    > {
+        let refused = self.armed.load(Ordering::SeqCst) && !self.open.load(Ordering::SeqCst);
+        if refused {
+            self.refusals.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.admitted.fetch_add(1, Ordering::SeqCst);
+        }
+        let error = self.error;
+        let completed = self.completed.clone();
+        Box::pin(async move {
+            if refused {
+                Err(error)
+            } else {
+                Ok(two_bot_core::send_admission::AdmissionPermit::new(
+                    Box::new(GrantedCompletion(completed)),
+                ))
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn voice_move_executor_admission_blocked_patch_releases_reservation() {
+    // The durable lane refuses the PATCH after every read succeeded: nothing
+    // reached the wire, so neither the seat nor the member stays fenced. Once
+    // the lane opens, the same member is admitted and moved.
+    const TOKEN: &str = "not-a-credential";
+    let armed = Arc::new(AtomicBool::new(false));
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        prerequisites_done: Some(armed.clone()),
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let admission = Arc::new(PatchLaneAdmission {
+        key: two_bot_core::send_admission::TokenKey::for_bot_token(TOKEN).unwrap(),
+        armed,
+        open: AtomicBool::new(false),
+        refusals: AtomicUsize::new(0),
+        error: two_bot_core::send_admission::AdmissionError::Blocked,
+        admitted: AtomicUsize::new(0),
+        completed: Arc::new(SettlementEvidence::default()),
+    });
+    let discord = ActionExecutor::with_admission(
+        TOKEN.to_owned(),
+        Some(mock.origin.clone()),
+        admission.clone(),
+    )
+    .unwrap();
+    let executor = VoiceMoveExecutor::new(
+        discord,
+        seeded_voice_move_cache_for(VOICE_MOVE_NOT_SENT_ID),
+        connected_gateway(),
+        VoiceOccupancyClock::new(),
+    );
+    let body = voice_move_body(VOICE_MOVE_NOT_SENT_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+
+    let error = executor
+        .execute_move(&request)
+        .await
+        .expect_err("blocked admission is a retryable refusal");
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(error.log_reason, "voice_move_not_sent");
+    assert_eq!(mock.patch_calls(), 0, "a refused admission sends no PATCH");
+    assert!(admission.refusals.load(Ordering::SeqCst) >= 1);
+
+    admission.open.store(true, Ordering::SeqCst);
+    let receipt = executor
+        .execute_move(&request)
+        .await
+        .expect("a leaked reservation would refuse the same member here");
+    assert_eq!(receipt.outcome, VoiceMoveOutcome::Moved);
+    assert_eq!(mock.patch_calls(), 1);
+}
+
+/// Real executor over a durable-admission double. The lane refuses with
+/// `error` only while `armed` is set (by the mock) and `open` is false.
+struct LaneFixture {
+    mock: MockVoiceApi,
+    admission: Arc<PatchLaneAdmission>,
+    executor: VoiceMoveExecutor,
+}
+
+fn lane_fixture(
+    mock: MockVoiceApi,
+    armed: Arc<AtomicBool>,
+    open: bool,
+    error: two_bot_core::send_admission::AdmissionError,
+    cache: Arc<DefaultInMemoryCache>,
+) -> LaneFixture {
+    const TOKEN: &str = "not-a-credential";
+    let admission = Arc::new(PatchLaneAdmission {
+        key: two_bot_core::send_admission::TokenKey::for_bot_token(TOKEN).unwrap(),
+        armed,
+        open: AtomicBool::new(open),
+        refusals: AtomicUsize::new(0),
+        error,
+        admitted: AtomicUsize::new(0),
+        completed: Arc::new(SettlementEvidence::default()),
+    });
+    let discord = ActionExecutor::with_admission(
+        TOKEN.to_owned(),
+        Some(mock.origin.clone()),
+        admission.clone(),
+    )
+    .unwrap();
+    let executor = VoiceMoveExecutor::new(
+        discord,
+        cache,
+        connected_gateway(),
+        VoiceOccupancyClock::new(),
+    );
+    LaneFixture {
+        mock,
+        admission,
+        executor,
+    }
+}
+
+impl LaneFixture {
+    /// Every granted permit was settled once: the rejected PATCH did not leave
+    /// the durable lane held.
+    fn assert_settled(&self) {
+        let admitted = self.admission.admitted.load(Ordering::SeqCst);
+        assert_eq!(
+            admitted,
+            self.admission.completed.count.load(Ordering::SeqCst),
+            "every admitted request settles exactly once"
+        );
+        assert!(
+            admitted > self.mock.patch_calls(),
+            "reads and PATCH were admitted"
+        );
+    }
+}
+
+/// The widest wait a rejected PATCH may take: the executor's own 2 s attempt
+/// budget plus slack. A broken body must be bounded by it, never hang.
+const BROKEN_PATCH_BOUND: Duration = Duration::from_secs(5);
+
+async fn move_within_bound(
+    executor: &VoiceMoveExecutor,
+    request: &VoiceMoveRequest<'_>,
+) -> Result<VoiceMoveReceipt, ActionError> {
+    tokio::time::timeout(BROKEN_PATCH_BOUND, executor.execute_move(request))
+        .await
+        .expect("a rejected PATCH settles within the bounded attempt budget")
+}
+
+async fn broken_patch_fixture(config: MockVoiceApiConfig, member: &str) -> LaneFixture {
+    let mock = MockVoiceApi::start(config).await;
+    lane_fixture(
+        mock,
+        Arc::new(AtomicBool::new(false)),
+        true,
+        two_bot_core::send_admission::AdmissionError::Blocked,
+        seeded_voice_move_cache_for(member),
+    )
+}
+
+#[tokio::test]
+async fn voice_move_executor_admission_storage_is_not_sent_and_releases_reservation() {
+    // Durable storage failing before the PATCH proves nothing reached the wire,
+    // exactly like a blocked lane: retryable, no PATCH, member and seat free.
+    let armed = Arc::new(AtomicBool::new(false));
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        prerequisites_done: Some(armed.clone()),
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let fixture = lane_fixture(
+        mock,
+        armed,
+        false,
+        two_bot_core::send_admission::AdmissionError::Storage,
+        seeded_voice_move_cache_for(VOICE_MOVE_NOT_SENT_ID),
+    );
+    let body = voice_move_body(VOICE_MOVE_NOT_SENT_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+
+    let error = fixture
+        .executor
+        .execute_move(&request)
+        .await
+        .expect_err("storage-refused admission is a retryable refusal");
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(error.log_reason, "voice_move_not_sent");
+    assert_eq!(
+        fixture.mock.patch_calls(),
+        0,
+        "a refused admission sends no PATCH"
+    );
+    assert!(fixture.admission.refusals.load(Ordering::SeqCst) >= 1);
+
+    fixture.admission.open.store(true, Ordering::SeqCst);
+    let receipt = fixture
+        .executor
+        .execute_move(&request)
+        .await
+        .expect("a leaked reservation would refuse the same member here");
+    assert_eq!(receipt.outcome, VoiceMoveOutcome::Moved);
+    assert_eq!(fixture.mock.patch_calls(), 1);
+    fixture.assert_settled();
+}
+
+#[tokio::test]
+async fn voice_move_executor_admission_storage_does_not_leak_the_last_seat() {
+    // The target holds one seat. The storage-refused member must not keep it:
+    // another member takes it, and only then does the first member see it full.
+    let cache = seeded_voice_move_cache_for(VOICE_MOVE_NOT_SENT_ID);
+    cache.update(&Event::VoiceStateUpdate(Box::new(voice_state(
+        VOICE_MOVE_SECOND_ID,
+        Some(VOICE_MOVE_SOURCE_ID),
+    ))));
+    let armed = Arc::new(AtomicBool::new(false));
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        prerequisites_done: Some(armed.clone()),
+        target_limit: 1,
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let fixture = lane_fixture(
+        mock,
+        armed,
+        false,
+        two_bot_core::send_admission::AdmissionError::Storage,
+        cache,
+    );
+    let first_body = voice_move_body(VOICE_MOVE_NOT_SENT_ID, VOICE_MOVE_TARGET_ID);
+    let first = VoiceMoveRequest::validate(&first_body).unwrap();
+    let second_body = voice_move_body(VOICE_MOVE_SECOND_ID, VOICE_MOVE_TARGET_ID);
+    let second = VoiceMoveRequest::validate(&second_body).unwrap();
+
+    let error = fixture.executor.execute_move(&first).await.unwrap_err();
+    assert_eq!(error.log_reason, "voice_move_not_sent");
+    assert_eq!(fixture.mock.patch_calls(), 0);
+
+    fixture.admission.open.store(true, Ordering::SeqCst);
+    assert_eq!(
+        fixture
+            .executor
+            .execute_move(&second)
+            .await
+            .unwrap()
+            .outcome,
+        VoiceMoveOutcome::Moved,
+        "the refused move left the seat free"
+    );
+    assert_eq!(
+        fixture.executor.execute_move(&first).await.unwrap().outcome,
+        VoiceMoveOutcome::RoomFull,
+        "the moved member legitimately owns the seat"
+    );
+    assert_eq!(fixture.mock.patch_calls(), 1);
+    fixture.assert_settled();
+}
+
+#[tokio::test]
+async fn voice_move_executor_generic_admission_failure_stays_uncertain() {
+    // Only the canonical blocked/storage refusals prove no send. Any other
+    // admission failure keeps the generic failure and the member reserved.
+    for error in [
+        two_bot_core::send_admission::AdmissionError::Configuration,
+        two_bot_core::send_admission::AdmissionError::StaleClaim,
+    ] {
+        let armed = Arc::new(AtomicBool::new(false));
+        let mock = MockVoiceApi::start(MockVoiceApiConfig {
+            prerequisites_done: Some(armed.clone()),
+            ..MockVoiceApiConfig::default()
+        })
+        .await;
+        let fixture = lane_fixture(
+            mock,
+            armed,
+            false,
+            error,
+            seeded_voice_move_cache_for(VOICE_MOVE_NOT_SENT_ID),
+        );
+        let body = voice_move_body(VOICE_MOVE_NOT_SENT_ID, VOICE_MOVE_TARGET_ID);
+        let request = VoiceMoveRequest::validate(&body).unwrap();
+        let failure = fixture.executor.execute_move(&request).await.unwrap_err();
+        assert_eq!(failure.code, ErrorCode::DiscordUnavailable);
+        assert_eq!(failure.log_reason, "voice_move_discord_failed", "{error:?}");
+        assert_eq!(fixture.mock.patch_calls(), 0);
+
+        fixture.admission.open.store(true, Ordering::SeqCst);
+        let again = fixture.executor.execute_move(&request).await.unwrap_err();
+        assert_eq!(again.code, ErrorCode::DiscordUnavailable);
+        assert_eq!(
+            fixture.mock.patch_calls(),
+            0,
+            "an unproven send keeps the member reserved: {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn voice_move_executor_patch_header_timeout_stays_uncertain() {
+    // The PATCH reached the wire and Discord never answered: unproven, so the
+    // failure is generic and the member stays reserved against a second send.
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        patch_body: PatchBody::NoHeaders,
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let body = voice_move_body(VOICE_MOVE_BROKEN_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).unwrap();
+    let executor = voice_move_executor(&mock, seeded_voice_move_cache_for(VOICE_MOVE_BROKEN_ID));
+    let error = tokio::time::timeout(BROKEN_PATCH_BOUND, executor.execute_move(&request))
+        .await
+        .expect("the attempt budget bounds a silent PATCH")
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(error.log_reason, "voice_move_discord_failed");
+    assert_eq!(mock.patch_calls(), 1);
+    assert_eq!(
+        executor.execute_move(&request).await.unwrap_err().code,
+        ErrorCode::DiscordUnavailable
+    );
+    assert_eq!(mock.patch_calls(), 1, "an uncertain move is never re-sent");
+}
+
+#[tokio::test]
+async fn voice_move_executor_denied_patch_with_unreadable_body_is_bot_not_permitted() {
+    // A 403 is a definitive refusal even when its body is truncated, fails or
+    // stalls. One PATCH, one settlement, and the same member can move after.
+    for mode in BROKEN_PATCH_BODIES {
+        let fixture = broken_patch_fixture(
+            MockVoiceApiConfig {
+                patch_status: 403,
+                patch_status_after_first: Some(200),
+                patch_body: mode,
+                ..MockVoiceApiConfig::default()
+            },
+            VOICE_MOVE_BROKEN_ID,
+        )
+        .await;
+        let body = voice_move_body(VOICE_MOVE_BROKEN_ID, VOICE_MOVE_TARGET_ID);
+        let request = VoiceMoveRequest::validate(&body).unwrap();
+        let receipt = move_within_bound(&fixture.executor, &request)
+            .await
+            .expect("denied PATCH answers");
+        assert_eq!(receipt.outcome, VoiceMoveOutcome::BotNotPermitted);
+        assert_eq!(fixture.mock.gather_calls(), 1, "403 needs no regather");
+        assert_eq!(
+            fixture.mock.patch_calls(),
+            1,
+            "the rejection is never re-sent"
+        );
+        fixture.assert_settled();
+
+        let receipt = move_within_bound(&fixture.executor, &request)
+            .await
+            .expect("a leaked reservation would refuse the same member");
+        assert_eq!(receipt.outcome, VoiceMoveOutcome::Moved);
+        assert_eq!(fixture.mock.patch_calls(), 2);
+        fixture.assert_settled();
+    }
+}
+
+#[tokio::test]
+async fn voice_move_executor_stale_patch_with_unreadable_body_regathers_once() {
+    // 400/404 with an unreadable body is still Stale: one regather, and a
+    // still-Proceed regather is unavailable, never a second PATCH. The same
+    // member then moves on a later request.
+    for status in [400, 404] {
+        for mode in BROKEN_PATCH_BODIES {
+            let fixture = broken_patch_fixture(
+                MockVoiceApiConfig {
+                    patch_status: status,
+                    patch_status_after_first: Some(200),
+                    patch_body: mode,
+                    ..MockVoiceApiConfig::default()
+                },
+                VOICE_MOVE_BROKEN_ID,
+            )
+            .await;
+            let body = voice_move_body(VOICE_MOVE_BROKEN_ID, VOICE_MOVE_TARGET_ID);
+            let request = VoiceMoveRequest::validate(&body).unwrap();
+            let error = move_within_bound(&fixture.executor, &request)
+                .await
+                .expect_err("unexplained stale PATCH cannot diagnose bot grants");
+            assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+            assert_eq!(error.log_reason, "voice_move_stale_unexplained");
+            assert_eq!(fixture.mock.patch_calls(), 1, "the regather never re-sends");
+            assert_eq!(fixture.mock.gather_calls(), 2, "exactly one fresh regather");
+            fixture.assert_settled();
+
+            let receipt = move_within_bound(&fixture.executor, &request)
+                .await
+                .expect("a stale rejection releases the member");
+            assert_eq!(receipt.outcome, VoiceMoveOutcome::Moved);
+            assert_eq!(fixture.mock.patch_calls(), 2);
+            fixture.assert_settled();
+        }
+    }
+}
+
+#[tokio::test]
+async fn voice_move_executor_stale_patch_with_unreadable_body_keeps_fresh_refusals() {
+    for status in [400, 404] {
+        for mode in [PatchBody::Truncated, PatchBody::Erroring] {
+            for (config, expected) in [
+                (
+                    MockVoiceApiConfig {
+                        target_status_after_patch: Some(404),
+                        ..MockVoiceApiConfig::default()
+                    },
+                    VoiceMoveOutcome::RoomGone,
+                ),
+                (
+                    MockVoiceApiConfig {
+                        target_overwrites_after_patch: vec![
+                            json!({"id": VOICE_MOVE_BOT_ID, "type": 1, "allow": "0", "deny": PERM_MOVE_MEMBERS.to_string()}),
+                        ],
+                        ..MockVoiceApiConfig::default()
+                    },
+                    VoiceMoveOutcome::BotNotPermitted,
+                ),
+            ] {
+                let fixture = broken_patch_fixture(
+                    MockVoiceApiConfig {
+                        patch_status: status,
+                        patch_body: mode,
+                        ..config
+                    },
+                    VOICE_MOVE_BROKEN_ID,
+                )
+                .await;
+                let body = voice_move_body(VOICE_MOVE_BROKEN_ID, VOICE_MOVE_TARGET_ID);
+                let request = VoiceMoveRequest::validate(&body).unwrap();
+                let receipt = move_within_bound(&fixture.executor, &request)
+                    .await
+                    .expect("fresh refusal answers");
+                assert_eq!(receipt.outcome, expected, "{status}");
+                assert_eq!(fixture.mock.patch_calls(), 1);
+                fixture.assert_settled();
+            }
+        }
+    }
+}
+
+/// A broken body behind a status that proves nothing (2xx, 5xx, redirect)
+/// stays uncertain: generic failure, one PATCH, and no second send.
+async fn assert_unreadable_body_stays_uncertain(status: u16) {
+    for mode in BROKEN_PATCH_BODIES {
+        let mock = MockVoiceApi::start(MockVoiceApiConfig {
+            patch_status: status,
+            patch_body: mode,
+            ..MockVoiceApiConfig::default()
+        })
+        .await;
+        let body = voice_move_body(VOICE_MOVE_BROKEN_ID, VOICE_MOVE_TARGET_ID);
+        let request = VoiceMoveRequest::validate(&body).unwrap();
+        let executor =
+            voice_move_executor(&mock, seeded_voice_move_cache_for(VOICE_MOVE_BROKEN_ID));
+        let error = move_within_bound(&executor, &request)
+            .await
+            .expect_err("an unreadable non-rejection answer is unproven");
+        assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+        assert_eq!(error.log_reason, "voice_move_discord_failed", "{status}");
+        assert_eq!(mock.patch_calls(), 1);
+        assert_eq!(
+            move_within_bound(&executor, &request)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::DiscordUnavailable
+        );
+        assert_eq!(mock.patch_calls(), 1, "an uncertain move is never re-sent");
+    }
+}
+
+#[tokio::test]
+async fn voice_move_executor_success_status_with_unreadable_body_stays_uncertain() {
+    assert_unreadable_body_stays_uncertain(200).await;
+}
+
+#[tokio::test]
+async fn voice_move_executor_server_error_with_unreadable_body_stays_uncertain() {
+    assert_unreadable_body_stays_uncertain(500).await;
+}
+
+#[tokio::test]
+async fn voice_move_executor_redirect_with_unreadable_body_stays_uncertain() {
+    assert_unreadable_body_stays_uncertain(302).await;
+}
+
+#[tokio::test]
+async fn voice_move_executor_pre_header_close_stays_uncertain() {
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        patch_body: PatchBody::PreHeaderClose,
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let body = voice_move_body(VOICE_MOVE_BROKEN_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).unwrap();
+    let executor = voice_move_executor(&mock, seeded_voice_move_cache_for(VOICE_MOVE_BROKEN_ID));
+    let error = move_within_bound(&executor, &request).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+    assert_eq!(error.log_reason, "voice_move_discord_failed");
+    assert_eq!(mock.patch_calls(), 1);
+    assert!(move_within_bound(&executor, &request).await.is_err());
+    assert_eq!(mock.patch_calls(), 1, "a closed socket is not a rejection");
+}
+
+#[tokio::test]
+async fn voice_move_executor_limited_patch_with_unreadable_body_keeps_header_wait() {
+    // A 429 is definitive whatever its body does, and the receipt wait stays
+    // the header's: a missing or malformed header is the one-second floor,
+    // and a well-formed body naming another wait does not replace the header.
+    use two_bot_core::send_admission::SendCooldown::{FiniteMs, Indefinite};
+    let cases = [
+        (
+            Some("5"),
+            PatchBody::Truncated,
+            Value::Null,
+            5,
+            FiniteMs(5000),
+        ),
+        (
+            Some("5"),
+            PatchBody::Erroring,
+            Value::Null,
+            5,
+            FiniteMs(5000),
+        ),
+        (
+            Some("5"),
+            PatchBody::Stalled,
+            Value::Null,
+            5,
+            FiniteMs(5000),
+        ),
+        (None, PatchBody::Truncated, Value::Null, 1, Indefinite),
+        (
+            Some("garbage"),
+            PatchBody::Erroring,
+            Value::Null,
+            1,
+            Indefinite,
+        ),
+        (
+            Some("5"),
+            PatchBody::Normal,
+            json!({"retry_after": 9.0}),
+            5,
+            FiniteMs(9000),
+        ),
+        (None, PatchBody::Stalled, Value::Null, 1, Indefinite),
+    ];
+    for (index, (header, mode, patch_json, expected, cooldown)) in cases.into_iter().enumerate() {
+        let member = voice_move_rate_limit_id(index);
+        let mock = MockVoiceApi::start(MockVoiceApiConfig {
+            patch_status: 429,
+            patch_retry_after: header.map(str::to_owned),
+            patch_body: mode,
+            patch_json,
+            ..MockVoiceApiConfig::default()
+        })
+        .await;
+        let body = voice_move_body(&member, VOICE_MOVE_TARGET_ID);
+        let request = VoiceMoveRequest::validate(&body).unwrap();
+        let fixture = lane_fixture(
+            mock,
+            Arc::new(AtomicBool::new(false)),
+            true,
+            two_bot_core::send_admission::AdmissionError::Blocked,
+            seeded_voice_move_cache_for(&member),
+        );
+        let receipt = move_within_bound(&fixture.executor, &request)
+            .await
+            .expect("limited PATCH answers");
+        assert_eq!(
+            receipt.outcome,
+            VoiceMoveOutcome::RateLimited,
+            "case {index}"
+        );
+        assert_eq!(receipt.retry_after_secs, Some(expected), "case {index}");
+        assert_eq!(fixture.mock.patch_calls(), 1);
+        fixture.assert_settled();
+        assert_eq!(
+            fixture.admission.completed.cooldowns.lock().unwrap().last().copied(),
+            Some(Some(cooldown)),
+            "durable timing uses body precedence, header fallback or a missing-timing hold: case {index}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn voice_move_executor_unexplained_stale_patch_is_unavailable() {
+    // Delayed gateway disconnects can leave both fact reads saying Proceed.
+    // Neither a 400 nor a 404 proves missing bot grants in that state.
+    for status in [400, 404] {
+        let mock = MockVoiceApi::start(MockVoiceApiConfig {
+            patch_status: status,
+            ..MockVoiceApiConfig::default()
+        })
+        .await;
+        let body = voice_move_body(VOICE_MOVE_STALE_ID, VOICE_MOVE_TARGET_ID);
+        let request = VoiceMoveRequest::validate(&body).expect("shaped move validates");
+        let error = voice_move_executor(&mock, seeded_voice_move_cache_for(VOICE_MOVE_STALE_ID))
+            .execute_move(&request)
+            .await
+            .expect_err("unexplained stale PATCH cannot diagnose bot grants");
+        assert_eq!(error.code, ErrorCode::DiscordUnavailable);
+        assert_eq!(mock.patch_calls(), 1, "the regather never re-sends");
+    }
+}
+
+#[tokio::test]
+async fn voice_move_executor_stale_patch_preserves_proven_fresh_refusals() {
+    for (config, expected) in [
+        (
+            MockVoiceApiConfig {
+                target_status_after_patch: Some(404),
+                ..MockVoiceApiConfig::default()
+            },
+            VoiceMoveOutcome::RoomGone,
+        ),
+        (
+            MockVoiceApiConfig {
+                target_overwrites_after_patch: vec![
+                    json!({"id": VOICE_MOVE_BOT_ID, "type": 1, "allow": "0", "deny": PERM_MOVE_MEMBERS.to_string()}),
+                ],
+                ..MockVoiceApiConfig::default()
+            },
+            VoiceMoveOutcome::BotNotPermitted,
+        ),
+        (
+            MockVoiceApiConfig {
+                target_overwrites_after_patch: vec![
+                    json!({"id": VOICE_MOVE_STALE_ID, "type": 1, "allow": "0", "deny": PERM_CONNECT.to_string()}),
+                ],
+                ..MockVoiceApiConfig::default()
+            },
+            VoiceMoveOutcome::NotPermitted,
+        ),
+    ] {
+        let mock = MockVoiceApi::start(MockVoiceApiConfig {
+            patch_status: 400,
+            ..config
+        })
+        .await;
+        let body = voice_move_body(VOICE_MOVE_STALE_ID, VOICE_MOVE_TARGET_ID);
+        let request = VoiceMoveRequest::validate(&body).unwrap();
+        assert_eq!(
+            voice_move_executor(&mock, seeded_voice_move_cache_for(VOICE_MOVE_STALE_ID))
+                .execute_move(&request)
+                .await
+                .unwrap()
+                .outcome,
+            expected
+        );
+        assert_eq!(mock.patch_calls(), 1);
+    }
+}
+
+#[tokio::test]
+async fn voice_move_executor_uncertain_patch_keeps_last_seat_reserved() {
+    let cache = seeded_voice_move_cache();
+    cache.update(&Event::VoiceStateUpdate(Box::new(voice_state(
+        VOICE_MOVE_SECOND_ID,
+        Some(VOICE_MOVE_SOURCE_ID),
+    ))));
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        patch_status: 500,
+        target_limit: 1,
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let executor = voice_move_executor(&mock, cache);
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).unwrap();
+    assert_eq!(
+        executor.execute_move(&request).await.unwrap_err().code,
+        ErrorCode::DiscordUnavailable
+    );
+    assert_eq!(
+        executor.execute_move(&request).await.unwrap_err().code,
+        ErrorCode::DiscordUnavailable
+    );
+    let body = voice_move_body(VOICE_MOVE_SECOND_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).unwrap();
+    assert_eq!(
+        executor.execute_move(&request).await.unwrap().outcome,
+        VoiceMoveOutcome::RoomFull
+    );
+    assert_eq!(
+        mock.patch_calls(),
+        1,
+        "an uncertain effect still owns its seat"
+    );
+}
+
+#[tokio::test]
+async fn voice_move_executor_last_seat_counts_unobserved_moves() {
+    for concurrent in [false, true] {
+        let cache = seeded_voice_move_cache();
+        cache.update(&Event::VoiceStateUpdate(Box::new(voice_state(
+            VOICE_MOVE_SECOND_ID,
+            Some(VOICE_MOVE_SOURCE_ID),
+        ))));
+        let mock = MockVoiceApi::start(MockVoiceApiConfig {
+            target_limit: 1,
+            ..MockVoiceApiConfig::default()
+        })
+        .await;
+        let executor = voice_move_executor(&mock, cache.clone());
+        let pipeline = two_bot_discord::MemPipeline::with_shared_cache(
+            two_bot_core::MemStore::new(),
+            Some(two_bot_core::NoopLeveling),
+            Some(two_bot_core::NoopFacts),
+            two_bot_discord::ScriptedInvites::new(),
+            two_bot_discord::NoClassification,
+            two_bot_discord::PipelineSnapshots::new(),
+            cache.clone(),
+        );
+        pipeline.set_voice_transition_observer(executor.voice_clock.clone());
+        let first_body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+        let second_body = voice_move_body(VOICE_MOVE_SECOND_ID, VOICE_MOVE_TARGET_ID);
+        let first = VoiceMoveRequest::validate(&first_body).unwrap();
+        let second = VoiceMoveRequest::validate(&second_body).unwrap();
+        let (a, b) = if concurrent {
+            tokio::join!(
+                executor.execute_move(&first),
+                executor.execute_move(&second)
+            )
+        } else {
+            (
+                executor.execute_move(&first).await,
+                executor.execute_move(&second).await,
+            )
+        };
+        let outcomes = [a.unwrap().outcome, b.unwrap().outcome];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| **o == VoiceMoveOutcome::Moved)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| **o == VoiceMoveOutcome::RoomFull)
+                .count(),
+            1
+        );
+        assert_eq!(
+            mock.patch_calls(),
+            1,
+            "REST success did not update the gateway cache"
+        );
+        let (moved, waiting) = if outcomes[0] == VoiceMoveOutcome::Moved {
+            (VOICE_MOVE_MEMBER_ID, &second)
+        } else {
+            (VOICE_MOVE_SECOND_ID, &first)
+        };
+        pipeline.handle_at(
+            &Event::VoiceStateUpdate(Box::new(voice_state(moved, Some(VOICE_MOVE_TARGET_ID)))),
+            "2026-11-03T10:00:01Z",
+        );
+        assert_eq!(
+            executor.execute_move(waiting).await.unwrap().outcome,
+            VoiceMoveOutcome::RoomFull
+        );
+        pipeline.handle_at(
+            &Event::VoiceStateUpdate(Box::new(voice_state(moved, None))),
+            "2026-11-03T10:00:02Z",
+        );
+        assert_eq!(
+            executor.execute_move(waiting).await.unwrap().outcome,
+            VoiceMoveOutcome::Moved
+        );
+        assert_eq!(
+            mock.patch_calls(),
+            2,
+            "observed departure releases the seat"
+        );
+    }
+}
+
+#[test]
+fn voice_move_timeout_parsing_is_strict_and_time_bounded() {
+    let now = 1_800_000_000_000;
+    for value in [
+        json!({}),
+        json!({"communication_disabled_until": null}),
+        json!({"communication_disabled_until": "2020-01-01T00:00:00Z"}),
+        json!({"communication_disabled_until": "2020-01-01T00:00:00.123456+00:00"}),
+        json!({"communication_disabled_until": "1960-01-01T00:00:00Z"}),
+    ] {
+        assert_eq!(member_timed_out(&value, now), Some(false));
+    }
+    assert_eq!(
+        member_timed_out(
+            &json!({"communication_disabled_until": "2099-01-01T00:00:00Z"}),
+            now
+        ),
+        Some(true)
+    );
+    let boundary_ms = 1_577_836_800_000;
+    for until in [
+        "2020-01-01T00:00:00Z",
+        "2020-01-01T00:00:00.000000+00:00",
+        "2020-01-01T01:00:00+01:00",
+    ] {
+        let member = json!({"communication_disabled_until": until});
+        assert_eq!(member_timed_out(&member, boundary_ms - 1), Some(true));
+        assert_eq!(member_timed_out(&member, boundary_ms), Some(false));
+        assert_eq!(member_timed_out(&member, boundary_ms + 1), Some(false));
+    }
+    assert_eq!(
+        member_timed_out(
+            &json!({"communication_disabled_until": "2020-01-01T00:00:00.000001Z"}),
+            boundary_ms,
+        ),
+        Some(true)
+    );
+    for value in [
+        json!(7),
+        json!("not-a-timestamp"),
+        json!({}),
+        json!("2020-01-01T00:00:00"),
+        json!("2020-02-30T00:00:00Z"),
+    ] {
+        assert_eq!(
+            member_timed_out(&json!({"communication_disabled_until": value}), now),
+            None
+        );
+    }
+}
+
+#[tokio::test]
+async fn voice_move_executor_timeout_refuses_without_patch() {
+    let mock = MockVoiceApi::start(MockVoiceApiConfig {
+        member_timeout: json!("2099-01-01T00:00:00Z"),
+        ..MockVoiceApiConfig::default()
+    })
+    .await;
+    let body = voice_move_body(VOICE_MOVE_MEMBER_ID, VOICE_MOVE_TARGET_ID);
+    let request = VoiceMoveRequest::validate(&body).unwrap();
+    assert_eq!(
+        voice_move_executor(&mock, seeded_voice_move_cache())
+            .execute_move(&request)
+            .await
+            .unwrap()
+            .outcome,
+        VoiceMoveOutcome::NotPermitted
+    );
+    assert_eq!(mock.patch_calls(), 0);
 }
 
 fn mutate_app(pool: sqlx::PgPool, api: &MockEventApi) -> Router {

@@ -34,11 +34,12 @@ ingress "staging-only, dark by default" (`wrangler/src/index.ts:882-883`).
 ## Scope and current exposure
 
 The historical contract has **18 actions**. The current core allowlist has
-**20** (rechecked 2026-11-03 for the `voice.snapshot` addition): those 18 plus
-`event.read` and the keyless `voice.snapshot` gateway-cache read
+**21** (rechecked 2026-11-03 for the `voice.move_member` addition): those 18 plus
+`event.read`, the keyless `voice.snapshot` gateway-cache read, and the self-only
+`voice.move_member` voice move
 (`crates/core/src/internal_actions.rs:675`; nine moderation verbs at `:686`,
-14 idempotency-bound at `:703`). All 20 are assessed below. `docs/parity.md:226`
-records the same 20 actions with `event.read` and the `settings.set`
+14 idempotency-bound at `:703`). All 21 are assessed below. `docs/parity.md:226`
+records the same 21 actions with `event.read` and the `settings.set`
 compare-and-set (`expected_version`); the core constants above are
 authoritative. The legacy `docs/INTERNAL_ACTIONS.md` is not in this checkout;
 the ported core, [parity inventory](parity.md) and
@@ -253,6 +254,7 @@ policy; that fence must not be taken from a caller-supplied guild ID.
 | `moderation.unlock` | Restore participation; bad overwrite restoration can widen access | Same policy; read live masks, restore only the recorded lockdown bits (thread/reaction bits only while still locked), preserve other live bits, refuse send-bit drift; serialize with lockdown. External admin GET/write races are not fenced. | Yes |
 | `event.read` (additional nineteenth) | Disclose one mapped event's status/details | `ALLOW_EVENT_READ`; mapped event and guild ownership checks, minimal response, no arbitrary event enumeration. | No |
 | `voice.snapshot` (twentieth) | Disclose live voice-room occupancy: channel names and occupant member IDs | `ALLOW_VOICE_SNAPSHOT`; guild voice channels only (stage excluded), bots excluded, AFK occupants listed but untotaled, relay-budget-capped, member IDs only (no usernames or presence). Rooms add `occupied_since` (Zulu instant the room's current continuous occupancy began, `null` when unknown) and, only on the room bound to a currently-windowed event, `event_key` (the site's own key echoed back, omitted elsewhere): both are room-level, neither names a member's join time. Refuses `discord_unavailable` unless the gateway supervisor reports `Connected`, so a warm cache never serves stale occupancy mid-reconnect. | No |
+| `voice.move_member` (twenty-first) | Move the signed subject. The website must derive it from the authenticated session, never browser input; the schema alone proves no consent against a compromised signer. | `ALLOW_VOICE_MOVE`; guild voice target, never AFK/stage; live member View Channel + Connect; room cap; bot Move Members + View Channel + Connect on both rooms. Member bucket: capacity six, one token/50 s, not rolling-window. Scalar audit. `discord_unavailable` unless gateway `Connected` and guild/channel/voice cache proves occupancy. | No |
 
 The nine moderation actions require **both** `TWO_INTERNAL_ALLOW_MODERATION=1`
 and `TWO_MODERATION=1`. The policy library checks actor permissions, self-target,

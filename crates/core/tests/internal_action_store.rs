@@ -7,7 +7,7 @@ use two_bot_core::clock_guard::ClockGuard;
 use two_bot_core::internal_action_store::{
     AuditSubject, DiscordId, EventOutcome, ExecutionClaim, InternalActionStore, InternalClaim,
     InternalStoreError, ReconciliationEvidence, RequestIdentity, TerminalFailure, TerminalResponse,
-    UnknownEventIntent,
+    UnknownEventIntent, VoiceMoveAudit,
 };
 use two_bot_core::secret::Secret;
 use two_bot_core::{body_hash, CLAIM_STALE_SECONDS, NONCE_TTL_SECONDS, SKEW_SECONDS};
@@ -2917,5 +2917,373 @@ async fn resolve_event_intent_refuses_invalid_evidence_and_mappings() {
             .await,
         Err(InternalStoreError::InvalidInput)
     );
+    db.cleanup().await;
+}
+
+/// Independent oracle for the voice audit identity: a NUL-delimited domain
+/// prefix that no ordinary idempotency key (alphanumeric plus `._:-`) can
+/// contain, so the digest cannot equal any ordinary `key_hash`.
+fn voice_audit_key_hash(nonce_hash: &str) -> String {
+    body_hash(format!("voice.move_member\0nonce\0{nonce_hash}").as_bytes())
+}
+
+#[tokio::test]
+async fn voice_move_nonce_coexists_with_same_text_idempotency_key_in_both_orders() {
+    use two_bot_core::internal_actions::{new_request_id, VoiceMoveOutcome};
+
+    let db = TestDb::new().await;
+    let store = db.store();
+    let payload = br#"{"action":"voice.move_member"}"#;
+    let (guild, member) = ("123456789012345678", "100000000000000011");
+    let (source, target) = ("100000000000000012", "100000000000000013");
+    let now_ms = db_now_secs(&db.pool).await as u64 * 1000;
+    // The raw nonce and ordinary key share text. Previously each stored
+    // sha256(text), colliding without any cryptographic hash collision.
+    let shared = "shared-key-and-nonce";
+    let other = "reverse-key-and-nonce";
+    let shared_nonce_hash = body_hash(shared.as_bytes());
+    let other_nonce_hash = body_hash(other.as_bytes());
+    let request_id = new_request_id(now_ms, &[7u8; 16]);
+    let request = request_id.as_str();
+    let voice = |reverse: bool| VoiceMoveAudit {
+        caller: "website",
+        nonce_hash: if reverse {
+            &other_nonce_hash
+        } else {
+            &shared_nonce_hash
+        },
+        authenticated_payload: payload,
+        guild_id: guild,
+        member_id: member,
+        from_channel_id: Some(source),
+        to_channel_id: target,
+        request_id: request,
+        outcome: VoiceMoveOutcome::Moved,
+    };
+    // Ordinary key first, then a fresh voice delivery whose raw nonce has
+    // the same text: both must persist, under different actions.
+    let ordinary = claimed(
+        store
+            .claim(
+                &identity(shared, "guild.add_member", br#"{"a":1}"#),
+                &subject(),
+            )
+            .await
+            .unwrap(),
+    );
+    let voice_id = store.record_voice_move(voice(false)).await.unwrap();
+    assert_ne!(ordinary.intent_id(), voice_id);
+    // Voice first, then an ordinary claim with the same text.
+    let voice_first = store.record_voice_move(voice(true)).await.unwrap();
+    let ordinary_after = claimed(
+        store
+            .claim(
+                &identity(other, "guild.add_member", br#"{"a":1}"#),
+                &subject(),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_ne!(ordinary_after.intent_id(), voice_first);
+    // The same voice delivery still refuses, and so does an ordinary replay
+    // of its own key (the ordinary identity is untouched).
+    assert_eq!(
+        store.record_voice_move(voice(false)).await,
+        Err(InternalStoreError::TransitionRefused)
+    );
+    assert_eq!(
+        store.record_voice_move(voice(true)).await,
+        Err(InternalStoreError::TransitionRefused)
+    );
+    assert!(!matches!(
+        store
+            .claim(
+                &identity(shared, "guild.add_member", br#"{"a":1}"#),
+                &subject()
+            )
+            .await
+            .unwrap(),
+        InternalClaim::Claimed(_)
+    ));
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM internal_idempotency")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 4);
+    let ordinary_key: String =
+        sqlx::query_scalar("SELECT key_hash FROM internal_idempotency WHERE intent_id = $1")
+            .bind(ordinary.intent_id())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(ordinary_key, body_hash(shared.as_bytes()));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn voice_move_records_completed_intent_and_terminal_audit() {
+    use two_bot_core::internal_actions::{new_request_id, VoiceMoveOutcome};
+
+    let db = TestDb::new().await;
+    let store = db.store();
+    let payload = br#"{"action":"voice.move_member","discord_id":"100000000000000011","channel_id":"100000000000000013"}"#;
+    let guild = "123456789012345678";
+    let member = "100000000000000011";
+    let source = "100000000000000012";
+    let target = "100000000000000013";
+    let now_ms = db_now_secs(&db.pool).await as u64 * 1000;
+    // (outcome, from, response_code, http_status, affected): each delivery
+    // carries its own nonce so no two rows share audit key material.
+    let cases = [
+        (
+            VoiceMoveOutcome::Moved,
+            Some(source),
+            "success",
+            200,
+            Some(1),
+        ),
+        (
+            VoiceMoveOutcome::AlreadyInRoom,
+            Some(target),
+            "success",
+            200,
+            Some(0),
+        ),
+        (
+            VoiceMoveOutcome::NotConnected,
+            None,
+            "success",
+            200,
+            Some(0),
+        ),
+        (
+            VoiceMoveOutcome::RateLimited,
+            Some(source),
+            "rate_limited",
+            429,
+            None,
+        ),
+        (
+            VoiceMoveOutcome::DiscordUnavailable,
+            Some(source),
+            "discord_unavailable",
+            502,
+            None,
+        ),
+    ];
+    for (seq, (outcome, from, code, status, affected)) in cases.into_iter().enumerate() {
+        let nonce_hash = body_hash(format!("move-nonce-{seq}").as_bytes());
+        let request_id = new_request_id(now_ms + seq as u64, &[seq as u8; 16]);
+        let intent_id = store
+            .record_voice_move(VoiceMoveAudit {
+                caller: "website",
+                nonce_hash: &nonce_hash,
+                authenticated_payload: payload,
+                guild_id: guild,
+                member_id: member,
+                from_channel_id: from,
+                to_channel_id: target,
+                request_id: &request_id,
+                outcome,
+            })
+            .await
+            .unwrap();
+        assert!(intent_id > 0);
+        // Named alias: the fifteen-column row trips `type_complexity` as an
+        // inline annotation.
+        type VoiceMoveTerminalRow = (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            i32,
+            Option<String>,
+            Option<i64>,
+            String,
+            Option<String>,
+            String,
+            String,
+        );
+        let row: VoiceMoveTerminalRow = sqlx::query_as(
+            "SELECT state, action, caller_hash, key_hash, guild_id, actor_id, target_id, \
+             response_code, http_status, resource_id, affected, outcome, \
+             from_channel_id, to_channel_id, request_id \
+             FROM internal_idempotency WHERE intent_id = $1",
+        )
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        // Fifteen columns exceed the tuple arity that implements
+        // `PartialEq`/`Debug` (twelve), so assert field by field.
+        let (
+            state,
+            action,
+            caller_hash,
+            key_hash,
+            guild_id,
+            actor_id,
+            target_id,
+            response_code,
+            http_status,
+            resource_id,
+            affected_got,
+            outcome_got,
+            from_channel_id,
+            to_channel_id,
+            request_id_got,
+        ) = row;
+        assert_eq!(state, "completed", "terminal state per delivery");
+        assert_eq!(action, "voice.move_member");
+        assert_eq!(caller_hash, body_hash(b"website"));
+        assert_eq!(key_hash, voice_audit_key_hash(&nonce_hash));
+        assert_ne!(key_hash, nonce_hash, "voice audit key is domain separated");
+        assert_eq!(guild_id, Some(guild.to_owned()));
+        assert_eq!(actor_id, None);
+        assert_eq!(target_id, member.to_owned());
+        assert_eq!(response_code, code.to_owned());
+        assert_eq!(http_status, status);
+        assert_eq!(resource_id, None);
+        assert_eq!(affected_got, affected);
+        assert_eq!(outcome_got, outcome.as_str().to_owned());
+        assert_eq!(from_channel_id, from.map(str::to_owned));
+        assert_eq!(to_channel_id, target.to_owned());
+        assert_eq!(request_id_got, request_id.clone());
+        let audits: Vec<(String, String, String, Option<i64>, String)> = sqlx::query_as(
+            "SELECT phase, evidence_code, response_code, affected, outcome \
+             FROM internal_action_log WHERE intent_id = $1",
+        )
+        .bind(intent_id)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            audits,
+            vec![(
+                "terminal".to_owned(),
+                "executor".to_owned(),
+                code.to_owned(),
+                affected,
+                outcome.as_str().to_owned(),
+            )],
+            "one terminal audit per move, no intent-phase row"
+        );
+        // The same delivery cannot write twice: the nonce burn already ran.
+        assert_eq!(
+            store
+                .record_voice_move(VoiceMoveAudit {
+                    caller: "website",
+                    nonce_hash: &nonce_hash,
+                    authenticated_payload: payload,
+                    guild_id: guild,
+                    member_id: member,
+                    from_channel_id: from,
+                    to_channel_id: target,
+                    request_id: &request_id,
+                    outcome,
+                })
+                .await,
+            Err(InternalStoreError::TransitionRefused)
+        );
+    }
+    // Untouched shape validation: every scalar is re-checked at the store
+    // boundary, and nothing but scalars reaches the row.
+    let good_nonce = body_hash(b"move-nonce-good");
+    let bad_nonce = "ABCDEF".to_owned();
+    let good_request = new_request_id(now_ms, &[9u8; 16]);
+    for (label, caller, nonce, guild_id, member_id, from, to, request) in [
+        (
+            "caller",
+            "",
+            good_nonce.as_str(),
+            guild,
+            member,
+            Some(source),
+            target,
+            good_request.as_str(),
+        ),
+        (
+            "nonce",
+            "website",
+            bad_nonce.as_str(),
+            guild,
+            member,
+            Some(source),
+            target,
+            good_request.as_str(),
+        ),
+        (
+            "guild",
+            "website",
+            good_nonce.as_str(),
+            "nope",
+            member,
+            Some(source),
+            target,
+            good_request.as_str(),
+        ),
+        (
+            "member",
+            "website",
+            good_nonce.as_str(),
+            guild,
+            "nope",
+            Some(source),
+            target,
+            good_request.as_str(),
+        ),
+        (
+            "from",
+            "website",
+            good_nonce.as_str(),
+            guild,
+            member,
+            Some("nope"),
+            target,
+            good_request.as_str(),
+        ),
+        (
+            "to",
+            "website",
+            good_nonce.as_str(),
+            guild,
+            member,
+            Some(source),
+            "nope",
+            good_request.as_str(),
+        ),
+        (
+            "request",
+            "website",
+            good_nonce.as_str(),
+            guild,
+            member,
+            Some(source),
+            target,
+            "not-a-request-id",
+        ),
+    ] {
+        assert_eq!(
+            store
+                .record_voice_move(VoiceMoveAudit {
+                    caller,
+                    nonce_hash: nonce,
+                    authenticated_payload: payload,
+                    guild_id,
+                    member_id,
+                    from_channel_id: from,
+                    to_channel_id: to,
+                    request_id: request,
+                    outcome: VoiceMoveOutcome::Moved,
+                })
+                .await,
+            Err(InternalStoreError::InvalidInput),
+            "{label}"
+        );
+    }
     db.cleanup().await;
 }
