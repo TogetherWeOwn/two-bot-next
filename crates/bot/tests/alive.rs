@@ -9,7 +9,16 @@ mod database_guard;
 mod common;
 use common::RestRequest;
 
-use std::{net::SocketAddr, panic::AssertUnwindSafe, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    panic::AssertUnwindSafe,
+    process::Stdio,
+    sync::{
+        atomic::{AtomicUsize, Ordering::SeqCst},
+        Arc,
+    },
+    time::Duration,
+};
 
 use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _};
 use serde_json::{json, Value};
@@ -210,15 +219,16 @@ struct Bot {
 
 impl Bot {
     fn spawn(db: &TestDb, addr: SocketAddr, gateway: &str, api: &str, logs: &Logs) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_two-bot"))
-            .env_clear()
+        let mut command = Command::new(env!("CARGO_BIN_EXE_two-bot"));
+        command.env_clear();
+        command.env("DISCORD_GATEWAY_URL", gateway);
+        let mut child = command
             .env("LISTEN_ADDR", addr.to_string())
             .env("DISCORD_TOKEN", "alive-synthetic-token")
             .env("GUILD_ID", GUILD)
             .env("DATABASE_URL", &db.child_url)
             // Website jobs open the same CI-service URL through cutover.
             .env("TWO_DATABASE_TLS", "local-only")
-            .env("DISCORD_GATEWAY_URL", gateway)
             .env("DISCORD_API_BASE", api)
             .env("TWO_ANNOUNCEMENTS", "1")
             .env("TWO_COMMUNITY_SCORECARD", "1")
@@ -265,18 +275,37 @@ impl Bot {
         self.drain().await;
     }
 
-    async fn cleanup(&mut self) {
+    async fn cleanup(&mut self) -> bool {
         let _ = self.child.start_kill();
-        let _ = timeout(STEP, self.child.wait()).await;
-        self.drain().await;
+        let mut complete = matches!(timeout(STEP, self.child.wait()).await, Ok(Ok(_)));
+        let mut pending = Vec::new();
+        for mut reader in self.readers.drain(..) {
+            match timeout(STEP, &mut reader).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    eprintln!("child log reader failed: {error}");
+                    complete = false;
+                }
+                Err(_) => {
+                    complete = false;
+                    reader.abort();
+                    if timeout(STEP, &mut reader).await.is_err() {
+                        pending.push(reader);
+                    }
+                }
+            }
+        }
+        self.readers = pending;
+        complete
     }
 
     async fn drain(&mut self) {
-        for reader in self.readers.drain(..) {
-            timeout(STEP, reader)
+        while !self.readers.is_empty() {
+            let result = timeout(STEP, &mut self.readers[0])
                 .await
-                .expect("child log drain deadline")
-                .expect("log reader");
+                .expect("child log drain deadline");
+            drop(self.readers.remove(0));
+            result.expect("log reader");
         }
     }
 }
@@ -296,8 +325,10 @@ struct MockDiscord {
     auth: mpsc::Receiver<Value>,
     release: mpsc::Sender<()>,
     rest_requests: Arc<Mutex<Vec<RestRequest>>>,
+    connections: Arc<AtomicUsize>,
     task: JoinHandle<()>,
     rest_task: JoinHandle<()>,
+    rest_handlers: Arc<Mutex<tokio::task::JoinSet<()>>>,
 }
 
 impl MockDiscord {
@@ -316,9 +347,12 @@ impl MockDiscord {
         let (auth_tx, auth) = mpsc::channel(2);
         let (release, mut gates) = mpsc::channel(4);
         let resume_url = url.clone();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = connections.clone();
         let task = tokio::spawn(async move {
             for boot in 0..2 {
                 let (stream, _) = ws_listener.accept().await.unwrap();
+                accepted.fetch_add(1, SeqCst);
                 let (_, mut ws) = ServerBuilder::new()
                     .accept(stream)
                     .await
@@ -374,16 +408,44 @@ impl MockDiscord {
         // Dedicated REST double: records registry bodies and website-job
         // reads so both full publication and a first-boot tick are observable.
         let rest_requests: Arc<Mutex<Vec<RestRequest>>> = Arc::default();
-        let rest_task = tokio::spawn(serve_rest(rest_listener, rest_requests.clone()));
+        let rest_handlers = Arc::new(Mutex::new(tokio::task::JoinSet::new()));
+        let rest_task = tokio::spawn(serve_rest(
+            rest_listener,
+            rest_requests.clone(),
+            rest_handlers.clone(),
+        ));
         Self {
             url,
             api,
             auth,
             release,
             rest_requests,
+            connections,
             task,
             rest_task,
+            rest_handlers,
         }
+    }
+
+    async fn stop(self) -> bool {
+        let mut complete = true;
+        for task in [self.task, self.rest_task] {
+            task.abort();
+            complete &= match timeout(STEP, task).await {
+                Ok(Ok(())) => true,
+                Ok(Err(error)) => error.is_cancelled(),
+                Err(_) => false,
+            };
+        }
+        let mut handlers = self.rest_handlers.lock().await;
+        handlers.abort_all();
+        let joined = timeout(STEP, async {
+            while let Some(result) = handlers.join_next().await {
+                complete &= result.is_ok() || result.is_err_and(|error| error.is_cancelled());
+            }
+        })
+        .await;
+        complete && joined.is_ok()
     }
 
     async fn authentication(&mut self) -> Value {
@@ -398,13 +460,17 @@ impl MockDiscord {
 /// paced website-job reads by route, recording full request bodies. The gateway
 /// listener must never see plain HTTP — a queued job tick previously consumed
 /// its second accept slot and broke resume with `MissingHeader("Upgrade")`.
-async fn serve_rest(listener: TcpListener, recorded: Arc<Mutex<Vec<RestRequest>>>) {
+async fn serve_rest(
+    listener: TcpListener,
+    recorded: Arc<Mutex<Vec<RestRequest>>>,
+    handlers: Arc<Mutex<tokio::task::JoinSet<()>>>,
+) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             break;
         };
         let recorded = recorded.clone();
-        tokio::spawn(async move {
+        handlers.lock().await.spawn(async move {
             let mut chunk = [0u8; 4096];
             let mut head = Vec::new();
             loop {
@@ -608,7 +674,21 @@ fn assert_ready_correlation(logs: &str) {
     assert!(seen > 0, "expected at least one ready commit in logs");
 }
 
-async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, logs: &Logs) {
+async fn raw_url(db: &TestDb) -> Option<String> {
+    sqlx::query_scalar("SELECT resume_url FROM gateway_sessions WHERE guild_id=$1 AND shard_id=0")
+        .bind(GUILD)
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap()
+}
+
+async fn lifecycle(
+    db: &TestDb,
+    discord: &mut MockDiscord,
+    bots: &mut Vec<Bot>,
+    logs: &Logs,
+    decoy: Option<&str>,
+) {
     let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = reserved.local_addr().unwrap();
     drop(reserved);
@@ -620,7 +700,7 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         let gateway = if boot == 0 {
             &discord.url
         } else {
-            "ws://127.0.0.1:1"
+            decoy.unwrap_or("ws://127.0.0.1:1")
         };
         bots.push(Bot::spawn(db, addr, gateway, &discord.api, logs));
         let bot = bots.last_mut().unwrap();
@@ -732,6 +812,11 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
         );
         discord.release.send(()).await.unwrap();
         checkpoint(db, if boot == 0 { 2 } else { 3 }).await;
+        assert_eq!(
+            raw_url(db).await.as_deref(),
+            Some(&*discord.url),
+            "persist the actual admitted wire URL"
+        );
         let ready = wait_http(bot, addr, "/readyz", 200).await;
         assert!(ready.contains("\"gateway\",\"ready\""));
         if boot == 0 {
@@ -807,27 +892,51 @@ async fn lifecycle(db: &TestDb, discord: &mut MockDiscord, bots: &mut Vec<Bot>, 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL; CI runs this under 60 seconds"]
 async fn real_binary_is_alive_and_resumes_after_sigterm() {
+    binary_lifecycle(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL; CI runs this under 60 seconds"]
+async fn real_binary_resumes_without_contacting_accepting_bootstrap_decoy() {
+    binary_lifecycle(true).await;
+}
+
+async fn binary_lifecycle(accepting_decoy: bool) {
     let started = Instant::now();
     let db = TestDb::new().await;
     let mut discord = MockDiscord::new().await;
     let logs = Logs::default();
     let mut bots = Vec::new();
-    let result = AssertUnwindSafe(timeout(
-        TOTAL,
-        lifecycle(&db, &mut discord, &mut bots, &logs),
-    ))
-    .catch_unwind()
-    .await;
+    let decoy = MockDiscord::new().await; // Accepting listener: any dial is counted.
+    let exercise = async {
+        let bootstrap = accepting_decoy.then_some(decoy.url.as_str());
+        lifecycle(&db, &mut discord, &mut bots, &logs, bootstrap).await;
+        assert_eq!(
+            decoy.connections.load(SeqCst),
+            0,
+            "no probe/decoy connections"
+        );
+    };
+    let result = AssertUnwindSafe(timeout(TOTAL, exercise))
+        .catch_unwind()
+        .await;
     // Retain ownership outside catch_unwind: reap BOTH subprocesses and drop
     // only this schema even when an assertion or the overall deadline fails.
+    let mut cleaned = true;
     for bot in &mut bots {
-        bot.cleanup().await;
+        cleaned &= bot.cleanup().await;
     }
-    discord.task.abort();
-    discord.rest_task.abort();
-    let _ = discord.task.await;
-    let _ = discord.rest_task.await;
-    db.close().await;
+    cleaned &= decoy.stop().await;
+    cleaned &= discord.stop().await;
+    if cleaned {
+        db.close().await;
+    } else {
+        eprintln!("uncertain child/task teardown; retain owned schemas");
+    }
+    if !cleaned {
+        eprintln!("captured child logs:\n{}", logs.lock().await);
+    }
+    assert!(cleaned, "all children reaped and log readers joined");
     match result {
         Ok(Ok(())) => eprintln!("real-binary lifecycle PASS in {:?}", started.elapsed()),
         other => {
@@ -959,4 +1068,90 @@ fn fixture_lost_commit_ack_retains_both_schemas() {
             .await
             .expect("admin close deadline");
     });
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outcome() {
+    for outcome in 0..4 {
+        let db = TestDb::new().await;
+        let discord = MockDiscord::new().await;
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let sockets = [
+            addr,
+            discord.url[5..].parse().unwrap(),
+            discord.api[7..].parse().unwrap(),
+        ];
+        let schema = db.schema.clone();
+        let logs = Logs::default();
+        let mut bot = Bot::spawn(&db, addr, &discord.url, &discord.api, &logs);
+        let exercised = AssertUnwindSafe(timeout(STEP, async {
+            wait_http(&mut bot, addr, "/healthz", 200).await;
+            match outcome {
+                1 => panic!("injected fixture assertion"),
+                2 => std::future::pending::<()>().await,
+                _ => {}
+            }
+        }))
+        .catch_unwind()
+        .await;
+        if outcome == 3 {
+            // The real capture future panics on invalid UTF-8 before cleanup joins it.
+            bot.readers
+                .insert(0, tokio::spawn(capture(&b"\xff\n"[..], logs.clone())));
+        }
+        let cleaned = bot.cleanup().await;
+        assert!(
+            discord.stop().await,
+            "mock tasks joined after reader failure"
+        );
+        assert!(bot.child.try_wait().unwrap().is_some(), "child was reaped");
+        assert!(bot.readers.is_empty(), "reader handles consumed");
+        if outcome == 3 {
+            assert!(!cleaned, "completed reader panic marks teardown incomplete");
+            let retained: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)")
+                    .bind(&schema)
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap();
+            assert!(retained, "incomplete cleanup retains its schema");
+            assert!(
+                bot.cleanup().await,
+                "completed handles are never polled again"
+            );
+        } else {
+            assert!(cleaned, "fixture cleanup after outcome {outcome}");
+        }
+        db.close().await;
+        assert_eq!(exercised.is_err(), outcome == 1);
+        if let Ok(result) = exercised {
+            assert_eq!(result.is_err(), outcome == 2);
+        }
+        for socket in sockets {
+            let rebound = TcpListener::bind(socket)
+                .await
+                .expect("owned socket released");
+            drop(rebound);
+        }
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(STEP)
+            .connect_with(database_guard::test_options())
+            .await
+            .unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pg_namespace WHERE nspname=$1 OR nspname=$2")
+                .bind(&schema)
+                .bind(format!("{schema}_web_v1"))
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+        timeout(STEP, admin.close()).await.unwrap();
+        assert_eq!(remaining, 0, "owned schemas released");
+    }
 }
