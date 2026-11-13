@@ -32,13 +32,8 @@ export async function pipelineUse(args, invoke = stagingUse, now = Date.now, emi
     "staging_identity_invalid");
   }
   const base = { url: args.url, token: args.token, runId: args.runId, runAttempt: args.runAttempt };
-  // Shared across both status reads, leaving the five-minute finish job time
-  // for the fenced release and its receipt. Never retry the mutation itself.
-  const statusRetryDeadline = ["restore-check", "finish"].includes(args.action)
-    ? performance.now() + 180000 : undefined;
   const call = async (action, binding = {}) => {
-    const retry = statusRetryDeadline === undefined ? {} : { statusRetryDeadline };
-    const result = await invoke({ ...base, ...binding, ...retry, action });
+    const result = await invoke({ ...base, ...binding, action });
     emit(result);
     return result;
   };
