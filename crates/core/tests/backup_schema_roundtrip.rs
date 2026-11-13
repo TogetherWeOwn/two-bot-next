@@ -20,7 +20,7 @@ use two_bot_core::backup::dump::{dump, restore, DbDumpError};
 use two_bot_core::backup::dump_file::{
     finish_gzip, inspect, is_destination_owned, new_encoder, write_line, DumpContents,
     DumpTableInfo, SequenceMark, DESTINATION_OWNED_COLUMNS, DUMP_TABLES, DUMP_VERSION,
-    EXCLUDED_TABLES, OPTIONAL_LEGACY_TABLES,
+    EXCLUDED_TABLES, OPTIONAL_LEGACY_TABLES, RETIRED_V16_TABLES,
 };
 use two_bot_core::voice_access::{
     may_create_room, may_use_command, AccessControls, AccessDecision, AccessDenyReason,
@@ -236,16 +236,91 @@ async fn seed(pool: &PgPool) {
 }
 
 /// Simulate a backup source that had not applied 0469 (and so not 0470
-/// either). The seed's legacy voice rows are the pre-0469/0470 shape, so the
-/// dump must record pre-0469 migration evidence; with the migrations
-/// recorded, restore (correctly) treats the archive as post-cutover and
-/// restores both voice stores verbatim instead of replaying the
-/// translations.
+/// either): the dump then records pre-0469 migration evidence. Archives that
+/// carry the retired legacy command-role tables are fabricated from a current
+/// dump by [`add_frozen_command_role_tables`]; with the migrations recorded,
+/// restore treats the archive as post-cutover and ignores those rows instead
+/// of replaying the translations.
 async fn forget_voice_authority_migration(pool: &PgPool) {
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version >= 469")
         .execute(pool)
         .await
         .unwrap();
+}
+
+/// Fabricate the pair of legacy command-role tables inside an archive taken
+/// from a current (v17) dump, as a v16-or-older writer produced them: manifest
+/// entries in their frozen position (right after `voice_guild_settings`) and
+/// the given rows. The live tables no longer exist, so these archives can only
+/// be synthesized, never dumped. The caller relabels the version.
+fn add_frozen_command_role_tables(
+    contents: &mut DumpContents,
+    roles: &[(&str, &str)],
+    members: &[(&str, &str, &str)],
+) {
+    assert_eq!(contents.manifest.version, DUMP_VERSION);
+    let text = |n: usize| vec!["text".to_owned(); n];
+    let row = |cells: &[(&str, &str)]| -> serde_json::Map<String, Value> {
+        cells
+            .iter()
+            .map(|(column, value)| ((*column).to_owned(), json!(value)))
+            .collect()
+    };
+    let role_rows: Vec<_> = roles
+        .iter()
+        .map(|(guild, command)| row(&[("guild_id", guild), ("command", command)]))
+        .collect();
+    let member_rows: Vec<_> = members
+        .iter()
+        .map(|(guild, command, role)| {
+            row(&[("guild_id", guild), ("command", command), ("role_id", role)])
+        })
+        .collect();
+    let at = contents
+        .manifest
+        .tables
+        .iter()
+        .position(|table| table.name == "voice_guild_settings")
+        .expect("voice_guild_settings is covered")
+        + 1;
+    let infos = [
+        DumpTableInfo {
+            name: RETIRED_V16_TABLES[0].to_owned(),
+            columns: vec!["guild_id".to_owned(), "command".to_owned()],
+            column_types: text(2),
+            count: role_rows.len() as u64,
+        },
+        DumpTableInfo {
+            name: RETIRED_V16_TABLES[1].to_owned(),
+            columns: vec![
+                "guild_id".to_owned(),
+                "command".to_owned(),
+                "role_id".to_owned(),
+            ],
+            column_types: text(3),
+            count: member_rows.len() as u64,
+        },
+    ];
+    contents.rows += (role_rows.len() + member_rows.len()) as u64;
+    for (offset, info) in infos.into_iter().enumerate() {
+        contents.manifest.tables.insert(at + offset, info);
+    }
+    contents
+        .buffers
+        .insert(RETIRED_V16_TABLES[0].to_owned(), role_rows);
+    contents
+        .buffers
+        .insert(RETIRED_V16_TABLES[1].to_owned(), member_rows);
+}
+
+/// The post-0469 shape a frozen older archive carries: a stale `kick` backout
+/// mirror. Restore must ignore it, never resurrect it.
+fn add_stale_command_role_mirror(contents: &mut DumpContents) {
+    add_frozen_command_role_tables(
+        contents,
+        &[("100000000000000001", "kick")],
+        &[("100000000000000001", "kick", "100000000000000043")],
+    );
 }
 
 /// The creation switch and guild-wide command role in
@@ -891,6 +966,22 @@ async fn migrated_tables_are_explicitly_classified_and_catalog_fks_are_parent_fi
             "migrated table {table} is neither DUMP_TABLES nor EXCLUDED_TABLES"
         );
     }
+    // The legacy command-role pair is retired: not migrated, not covered and
+    // not excluded. Only frozen v16-and-older archives mention it.
+    for table in RETIRED_V16_TABLES {
+        assert!(
+            !actual.contains(*table),
+            "{table} is dropped from the schema"
+        );
+        assert!(
+            !covered.contains(table),
+            "{table} left the current inventory"
+        );
+        assert!(
+            !excluded.contains(table),
+            "{table} is not an excluded live table"
+        );
+    }
     // Both chains share the backup. Inventory every persistent store CREATE,
     // plus the explicit quoted, same-file CREATE/DROP authority reference.
     // The helper is not a persistent exclusion. Its runtime success/refusal
@@ -1035,8 +1126,8 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     assert_settings_triggers(&guard_before);
     assert_guards_work(pool).await;
     let directory = ArchiveDirectory::new();
-    let original = directory.path("complete.ndjson.gz");
-    let manifest = dump(pool, &original).await.unwrap();
+    let current = directory.path("complete.ndjson.gz");
+    let manifest = dump(pool, &current).await.unwrap();
     assert_eq!(manifest.events_sequence, 107);
     assert_eq!(
         manifest.schema_migrations,
@@ -1046,13 +1137,50 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         !manifest.cutover_migrations.is_empty() && !manifest.applied_cutover(469),
         "the simulated pre-0469 source records pre-0469 cutover evidence"
     );
-    let contents = inspect(&original).unwrap();
+    let contents = inspect(&current).unwrap();
     assert_archive_matches(&contents, &before);
     assert!(contents
         .manifest
         .tables
         .iter()
-        .all(|table| !EXCLUDED_TABLES.contains(&table.name.as_str())));
+        .all(|table| !EXCLUDED_TABLES.contains(&table.name.as_str())
+            && !RETIRED_V16_TABLES.contains(&table.name.as_str())));
+    assert_eq!(contents.manifest.version, 17);
+    // The live tables are gone, so the pre-0469 shape is synthesized: a v16
+    // archive carrying the same legacy rows the old seed held. Guild ...001:
+    // 'kick' is restricted in both stores (the enforced list wins), 'limit'
+    // only here (added, empty member list), 'notavoicecommand' is not a voice
+    // command (dropped). Guild ...003 has no voice_access_controls row at
+    // all, so the translation inserts one.
+    let mut legacy = copy_contents(&contents);
+    add_frozen_command_role_tables(
+        &mut legacy,
+        &[
+            ("100000000000000001", "kick"),
+            ("100000000000000001", "limit"),
+            ("100000000000000001", "notavoicecommand"),
+            ("100000000000000003", "private"),
+        ],
+        &[
+            ("100000000000000001", "kick", "100000000000000043"),
+            (
+                "100000000000000001",
+                "notavoicecommand",
+                "100000000000000043",
+            ),
+            ("100000000000000003", "private", "100000000000000044"),
+        ],
+    );
+    legacy.manifest.version = 16;
+    let original = directory.path("complete-v16.ndjson.gz");
+    write_archive(&original, &legacy);
+    let legacy_inspected = inspect(&original).expect("frozen v16 archive inspects");
+    assert_eq!(legacy_inspected.manifest.version, 16);
+    assert_eq!(legacy_inspected.buffers["voice_command_roles"].len(), 4);
+    assert_eq!(
+        legacy_inspected.buffers["voice_command_role_members"].len(),
+        3
+    );
 
     // Independent, freshly migrated destination, not a wipe of the source DB.
     let target = database().await.expect("test bootstrap already configured");
@@ -1289,26 +1417,9 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         AccessDecision::Allow,
         "the creation switch is not a command gate"
     );
-    for legacy in ["voice_command_roles", "voice_command_role_members"] {
-        let count: i64 = sqlx::query_scalar(audited(format!(
-            "SELECT COUNT(*) FROM {}",
-            identifier(legacy)
-        )))
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(count, 0, "the replay empties legacy {legacy}");
-    }
     let restored_snapshot = snapshot(pool, &tables).await;
     for (table, expected) in &before {
-        if [
-            "voice_access_controls",
-            "voice_command_roles",
-            "voice_command_role_members",
-            "voice_guild_settings",
-        ]
-        .contains(&table.as_str())
-        {
+        if ["voice_access_controls", "voice_guild_settings"].contains(&table.as_str()) {
             continue;
         }
         assert_eq!(
@@ -1327,7 +1438,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     assert_eq!(cooldowns, 0, "excluded throttles are not replayed");
     assert_guards_work(pool).await;
 
-    let mut reversed = copy_contents(&contents);
+    let mut reversed = copy_contents(&legacy);
     reversed.manifest.tables.reverse();
     let reversed_path = directory.path("reversed.ndjson.gz");
     write_archive(&reversed_path, &reversed);
@@ -1422,27 +1533,30 @@ async fn post_0469_archive_restores_voice_stores_verbatim() {
     // The post-0469 import -> unrestrict shape: /import mirrored a 'kick'
     // restriction into the legacy tables, then /access unrestrict removed
     // it from the gate's store only. The gate's empty map is authoritative;
-    // the legacy row is a stale backout mirror that restore must not
-    // resurrect. The ledger still records 0469, unlike the pre-0469 seed.
+    // the legacy row is a stale backout mirror that a frozen v16 archive
+    // still carries and restore must discard, not resurrect. The ledger still
+    // records 0469, unlike the pre-0469 seed. The live tables are gone, so
+    // the archive is synthesized from a current dump.
     sqlx::raw_sql(
         "INSERT INTO voice_access_controls (guild_id, room_creation_enabled, required_role_id, \
              command_roles) \
-         VALUES ('100000000000000001', FALSE, '100000000000000040', '{}'::jsonb); \
-         INSERT INTO voice_command_roles (guild_id, command) \
-         VALUES ('100000000000000001', 'kick'); \
-         INSERT INTO voice_command_role_members (guild_id, command, role_id) \
-         VALUES ('100000000000000001', 'kick', '100000000000000043');",
+         VALUES ('100000000000000001', FALSE, '100000000000000040', '{}'::jsonb);",
     )
     .execute(pool)
     .await
     .unwrap();
     let directory = ArchiveDirectory::new();
-    let path = directory.path("post-0469.ndjson.gz");
-    let manifest = dump(pool, &path).await.unwrap();
+    let source = directory.path("post-0469-current.ndjson.gz");
+    let manifest = dump(pool, &source).await.unwrap();
     assert!(
         manifest.applied_cutover(469),
         "a migrated source records that 0469 was applied"
     );
+    let mut archive = inspect(&source).unwrap();
+    add_stale_command_role_mirror(&mut archive);
+    archive.manifest.version = 16;
+    let path = directory.path("post-0469.ndjson.gz");
+    write_archive(&path, &archive);
 
     let target = database().await.expect("test bootstrap already configured");
     let pool = target.pool();
@@ -1452,8 +1566,8 @@ async fn post_0469_archive_restores_voice_stores_verbatim() {
     assert_eq!(report.translated_voice_command_role_members, 0);
     assert_eq!(report.translated_voice_creation_gates, 0);
     assert_eq!(report.voice_access_controls_added, 0);
-    // Both stores restore verbatim: the lifted restriction stays lifted and
-    // the backout mirror survives untouched.
+    // The gate's store restores verbatim: the lifted restriction stays lifted
+    // and the stale legacy mirror rows are discarded.
     let controls: (bool, Option<String>, String) = sqlx::query_as(
         "SELECT room_creation_enabled, required_role_id, command_roles::text \
          FROM voice_access_controls WHERE guild_id = '100000000000000001'",
@@ -1490,20 +1604,6 @@ async fn post_0469_archive_restores_voice_stores_verbatim() {
         AccessDecision::Allow,
         "a member without the old role can use the lifted command after restore"
     );
-    let mirror: Vec<(String, String)> = sqlx::query_as(
-        "SELECT c.command, m.role_id FROM voice_command_roles c \
-         JOIN voice_command_role_members m \
-           ON m.guild_id = c.guild_id AND m.command = c.command \
-         WHERE c.guild_id = '100000000000000001'",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        mirror,
-        vec![("kick".to_owned(), "100000000000000043".to_owned())],
-        "the legacy backout mirror restores verbatim"
-    );
     target.close().await.unwrap();
     db.close().await.unwrap();
 }
@@ -1524,10 +1624,6 @@ async fn between_0469_and_0470_archive_replays_only_the_0470_translation() {
         "INSERT INTO voice_access_controls (guild_id, room_creation_enabled, required_role_id, \
              command_roles) \
          VALUES ('100000000000000001', TRUE, NULL, '{}'::jsonb); \
-         INSERT INTO voice_command_roles (guild_id, command) \
-         VALUES ('100000000000000001', 'kick'); \
-         INSERT INTO voice_command_role_members (guild_id, command, role_id) \
-         VALUES ('100000000000000001', 'kick', '100000000000000043'); \
          INSERT INTO voice_guild_settings (guild_id, creation_enabled, unique_names, \
              no_game_label, force_single_game, count_members_without_activity, time_zone, \
              text_channel_name, text_viewer_role_id, command_role_id) \
@@ -1539,12 +1635,18 @@ async fn between_0469_and_0470_archive_replays_only_the_0470_translation() {
     .await
     .unwrap();
     let directory = ArchiveDirectory::new();
-    let path = directory.path("between-0469-0470.ndjson.gz");
-    let manifest = dump(pool, &path).await.unwrap();
+    let source = directory.path("between-0469-0470-current.ndjson.gz");
+    let manifest = dump(pool, &source).await.unwrap();
     assert!(
         manifest.applied_cutover(469) && !manifest.applied_cutover(470),
         "the simulated source records 0469 applied and 0470 not"
     );
+    // A frozen v16 archive of that source still carries the stale mirror.
+    let mut archive = inspect(&source).unwrap();
+    add_stale_command_role_mirror(&mut archive);
+    archive.manifest.version = 16;
+    let path = directory.path("between-0469-0470.ndjson.gz");
+    write_archive(&path, &archive);
 
     let target = database().await.expect("test bootstrap already configured");
     let pool = target.pool();
@@ -1602,20 +1704,6 @@ async fn between_0469_and_0470_archive_replays_only_the_0470_translation() {
         ),
         AccessDecision::Allow,
         "the lifted command restriction stays lifted for role holders"
-    );
-    let mirror: Vec<(String, String)> = sqlx::query_as(
-        "SELECT c.command, m.role_id FROM voice_command_roles c \
-         JOIN voice_command_role_members m \
-           ON m.guild_id = c.guild_id AND m.command = c.command \
-         WHERE c.guild_id = '100000000000000001'",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        mirror,
-        vec![("kick".to_owned(), "100000000000000043".to_owned())],
-        "the post-0469 legacy mirror restores verbatim"
     );
     target.close().await.unwrap();
     db.close().await.unwrap();
@@ -2138,10 +2226,11 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
+    let current_path = directory.path("v17-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, 17);
+    add_stale_command_role_mirror(&mut old);
     for name in [
         "game_activity_guild_aggregates",
         "assistant_monthly_builds",
@@ -2232,10 +2321,11 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
+    let current_path = directory.path("v17-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, 17);
+    add_stale_command_role_mirror(&mut old);
     for name in [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
@@ -2320,10 +2410,11 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
+    let current_path = directory.path("v17-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, 17);
+    add_stale_command_role_mirror(&mut old);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
     // epoch-claim guard but predates the delete tombstones, token registry
     // event voice pair and starboard tables.
@@ -2416,10 +2507,11 @@ async fn v11_archive_restores_and_clears_newer_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
+    let current_path = directory.path("v17-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, 17);
+    add_stale_command_role_mirror(&mut old);
     // Frozen tombstone-only v11 shape: the merged v11 writer carried the
     // delete tombstones but predates the token registry event voice pair and starboard tables.
     for name in [
@@ -2508,10 +2600,11 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
+    let current_path = directory.path("v17-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, 17);
+    add_stale_command_role_mirror(&mut old);
     for table in [
         "event_voice_channels",
         "event_voice_presence",
@@ -2595,10 +2688,11 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
+    let current_path = directory.path("v17-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, 17);
+    add_stale_command_role_mirror(&mut old);
     // Frozen registry-present v12 shape: the released writer carried the
     // token registry but predates the event voice pair and starboard tables.
     for name in [
@@ -2722,10 +2816,11 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
+    let current_path = directory.path("v17-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, 17);
+    add_stale_command_role_mirror(&mut old);
     for name in [
         "starboard_config",
         "starboard_starrers",
@@ -2854,10 +2949,11 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
+    let current_path = directory.path("v17-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, 17);
+    add_stale_command_role_mirror(&mut old);
     for name in [
         "giveaways",
         "giveaway_entries",
@@ -2869,9 +2965,15 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         old.manifest.tables.retain(|table| table.name != name);
     }
     assert_eq!(old.manifest.tables.len(), 104, "released v14 inventory");
-    assert_eq!(&DUMP_TABLES[..101], FROZEN_V13_TABLES.as_slice());
+    // Frozen v13 keeps the retired pair; the current inventory dropped it.
+    let v13_without_retired: Vec<&str> = FROZEN_V13_TABLES
+        .iter()
+        .copied()
+        .filter(|name| !RETIRED_V16_TABLES.contains(name))
+        .collect();
+    assert_eq!(&DUMP_TABLES[..99], v13_without_retired.as_slice());
     assert_eq!(
-        &DUMP_TABLES[101..104],
+        &DUMP_TABLES[99..102],
         ["starboard_config", "starboard_starrers", "starboard_posts"]
     );
     old.manifest.version = 14;
@@ -2992,10 +3094,11 @@ async fn v15_archive_restores_and_clears_newer_event_instance_windows_without_ba
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
+    let current_path = directory.path("v17-source.ndjson.gz");
     dump(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, 17);
+    add_stale_command_role_mirror(&mut old);
     let windows = old.buffers.remove("event_instance_windows").unwrap();
     assert_eq!(
         windows.len(),
@@ -3360,7 +3463,9 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     };
     let source = db.pool();
     seed(source).await;
-    forget_voice_authority_migration(source).await;
+    // The migrated source records 0469/0470 as applied and has no legacy
+    // command-role tables, so the shipped backup is a current-format archive
+    // that restores the voice stores verbatim, without any replay.
     let control_fields_before = voice_control_fields(source).await;
     let tables = covered_tables(source).await;
     let before = snapshot(source, &tables).await;
@@ -3409,8 +3514,17 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
     assert_archive_matches(&contents, &before);
     assert_eq!(contents.manifest.events_sequence, 107);
     assert!(
-        !contents.manifest.applied_cutover(469),
-        "the shipped backup records the simulated pre-0469 source evidence"
+        contents.manifest.applied_cutover(469) && contents.manifest.applied_cutover(470),
+        "the shipped backup records the migrated source's voice authority migrations"
+    );
+    assert_eq!(contents.manifest.version, DUMP_VERSION);
+    assert!(
+        contents
+            .manifest
+            .tables
+            .iter()
+            .all(|table| !RETIRED_V16_TABLES.contains(&table.name.as_str())),
+        "the shipped backup no longer writes the retired legacy tables"
     );
 
     // Each run allocates a NEW migrated scratch database and retains its
@@ -3498,26 +3612,18 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
             json!(false),
             "month {month}: ban ownership evidence present"
         );
-        assert_eq!(
-            receipt["translated_voice_command_roles"],
-            json!(4),
-            "month {month}: legacy restrictions translated"
-        );
-        assert_eq!(
-            receipt["translated_voice_command_role_members"],
-            json!(3),
-            "month {month}: legacy restriction members translated"
-        );
-        assert_eq!(
-            receipt["translated_voice_creation_gates"],
-            json!(3),
-            "month {month}: legacy creation gates tightened for three guilds"
-        );
-        assert_eq!(
-            receipt["voice_access_controls_added"],
-            json!(2),
-            "month {month}: translations inserted two guild controls rows"
-        );
+        for field in [
+            "translated_voice_command_roles",
+            "translated_voice_command_role_members",
+            "translated_voice_creation_gates",
+            "voice_access_controls_added",
+        ] {
+            assert_eq!(
+                receipt[field],
+                json!(0),
+                "month {month}: a current archive replays no legacy translation ({field})"
+            );
+        }
         assert!(
             receipt["restored"].as_object().is_some(),
             "month {month}: receipt reports per-table restored counts"
@@ -3549,83 +3655,11 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
             }
         }
         assert_eq!(
-            after["voice_command_roles"].rows.len(),
-            0,
-            "month {month}: the 0469 replay empties the legacy tables"
-        );
-        assert_eq!(after["voice_command_role_members"].rows.len(), 0);
-        let controls_before = before["voice_access_controls"].rows.len();
-        assert_eq!(
-            after["voice_access_controls"].rows.len(),
-            controls_before + 2,
-            "month {month}: the voice replays add the legacy-only guilds"
-        );
-        let command_roles: Vec<(String, String)> = sqlx::query_as(
-            "SELECT guild_id, command_roles::text FROM voice_access_controls \
-             ORDER BY guild_id COLLATE \"C\"",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        let command_roles: Vec<(String, Value)> = command_roles
-            .into_iter()
-            .map(|(guild, roles)| (guild, serde_json::from_str(&roles).unwrap()))
-            .collect();
-        assert_eq!(
-            command_roles,
-            vec![
-                (
-                    "100000000000000001".to_owned(),
-                    json!({"kick": ["100000000000000041", "100000000000000042"],
-                           "limit": [], "template": []}),
-                ),
-                ("100000000000000002".to_owned(), json!({})),
-                (
-                    "100000000000000003".to_owned(),
-                    json!({"private": ["100000000000000044"]}),
-                ),
-                ("100000000000000004".to_owned(), json!({})),
-            ],
-            "month {month}: the 0469 replay merges legacy restrictions"
-        );
-        let control_fields_after = voice_control_fields(&pool).await;
-        assert_eq!(
-            control_fields_after[0], control_fields_before[0],
-            "month {month}: guild ...001's enforced gates were already tighter"
-        );
-        assert_eq!(
-            control_fields_after,
-            vec![
-                (
-                    "100000000000000001".to_owned(),
-                    false,
-                    Some("100000000000000040".to_owned()),
-                ),
-                (
-                    "100000000000000002".to_owned(),
-                    false,
-                    Some("100000000000000045".to_owned()),
-                ),
-                (
-                    "100000000000000003".to_owned(),
-                    true,
-                    Some("100000000000000046".to_owned()),
-                ),
-                ("100000000000000004".to_owned(), false, None),
-            ],
-            "month {month}: the 0470 replay merges the legacy creation gates"
+            voice_control_fields(&pool).await,
+            control_fields_before,
+            "month {month}: the voice controls restore verbatim"
         );
         for (table, expected_table) in &expected {
-            if [
-                "voice_access_controls",
-                "voice_command_roles",
-                "voice_command_role_members",
-                "voice_guild_settings",
-            ]
-            .contains(&table.as_str())
-            {
-                continue;
-            }
             assert_eq!(
                 &after[table], expected_table,
                 "month {month}: every archived row in {table}"

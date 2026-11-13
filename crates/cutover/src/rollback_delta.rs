@@ -343,14 +343,6 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)", DISPOSITION_ACCEPT_WITH_REASON),
     },
     TableSpec {
-        table: "voice_command_roles",
-        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)", DISPOSITION_ACCEPT_WITH_REASON),
-    },
-    TableSpec {
-        table: "voice_command_role_members",
-        measure: TableMeasure::Unmeasurable("no timestamp column; configuration is replaced wholesale (see PgVoiceConfigStore::apply)", DISPOSITION_ACCEPT_WITH_REASON),
-    },
-    TableSpec {
         table: "voice_logging_settings",
         measure: TableMeasure::Unmeasurable("mutable per-guild settings row with no timestamp column; no member IDs", DISPOSITION_ACCEPT_WITH_REASON),
     },

@@ -492,8 +492,8 @@ pub fn validate_configuration(
     let mut commands = BTreeSet::new();
     for (i, restriction) in settings.command_roles.iter().enumerate() {
         let path = format!("settings.command_roles[{i}]");
-        // Config import writes voice_command_roles, not the live access-policy
-        // store. Only names from the restrictable vocabulary (`VOICE_COMMANDS`)
+        // Config import shares the live access-policy store. Only names
+        // from the restrictable vocabulary (`VOICE_COMMANDS`)
         // may be imported; `myroom` is not in it and refuses here.
         if !is_voice_command(&restriction.command) {
             return Err(invalid(

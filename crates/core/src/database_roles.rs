@@ -140,6 +140,64 @@ mod tests {
         assert!("".parse::<Phase>().is_err());
     }
 
+    fn migrated_tables<'a>(
+        migrations: impl IntoIterator<Item = (&'a std::path::Path, &'a str)>,
+    ) -> std::collections::BTreeMap<String, std::path::PathBuf> {
+        let mut tables = std::collections::BTreeMap::new();
+        for (path, sql) in migrations {
+            for line in sql.lines() {
+                let (rest, create) = if let Some(rest) = line.strip_prefix("CREATE TABLE ") {
+                    (rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest), true)
+                } else if let Some(rest) = line.strip_prefix("DROP TABLE ") {
+                    (rest.strip_prefix("IF EXISTS ").unwrap_or(rest), false)
+                } else {
+                    continue;
+                };
+                let raw = rest
+                    .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+                    .next()
+                    .expect("table name");
+                let raw = raw.strip_prefix("public.").unwrap_or(raw);
+                let name = raw.trim_matches('"');
+                if create {
+                    tables.insert(name.to_owned(), path.to_owned());
+                } else {
+                    tables.remove(name);
+                }
+            }
+        }
+        tables
+    }
+
+    #[test]
+    fn table_inventory_tracks_contract_drops_and_later_recreation() {
+        let expand = std::path::Path::new("0001_expand.sql");
+        let contract = std::path::Path::new("0002_contract.sql");
+        let recreate = std::path::Path::new("0003_recreate.sql");
+        let migrations = [
+            (
+                expand,
+                "CREATE TABLE live (id BIGINT);\nCREATE TABLE IF NOT EXISTS public.retired(id BIGINT);\nCREATE TABLE replaced (id BIGINT);",
+            ),
+            (
+                contract,
+                "DROP TABLE IF EXISTS public.\"retired\";\nDROP TABLE replaced;",
+            ),
+            (recreate, "CREATE TABLE \"replaced\" (id BIGINT);"),
+        ];
+        assert_eq!(
+            migrated_tables(migrations[..2].iter().copied()),
+            std::collections::BTreeMap::from([("live".to_owned(), expand.to_owned())])
+        );
+        assert_eq!(
+            migrated_tables(migrations),
+            std::collections::BTreeMap::from([
+                ("live".to_owned(), expand.to_owned()),
+                ("replaced".to_owned(), recreate.to_owned()),
+            ])
+        );
+    }
+
     #[test]
     fn matrix_covers_every_migrated_object_and_contract_view() {
         // New tables, sequences and trigger functions must be deliberately
@@ -163,8 +221,37 @@ mod tests {
         }
         paths.sort();
         assert!(!paths.is_empty(), "no migrations found");
-        for path in paths {
-            let migration = std::fs::read_to_string(&path).expect("migration file readable");
+        let migrations: Vec<_> = paths
+            .into_iter()
+            .map(|path| {
+                let sql = std::fs::read_to_string(&path).expect("migration file readable");
+                (path, sql)
+            })
+            .collect();
+        // A contract drop retires the table's matrix row. New and recreated
+        // tables must still be explicitly covered after the full chain.
+        for (name, path) in migrated_tables(
+            migrations
+                .iter()
+                .map(|(path, sql)| (path.as_path(), sql.as_str())),
+        ) {
+            let kind = if matches!(
+                name.as_str(),
+                "discord_send_admission" | "voice_create_reservations"
+            ) {
+                "admission"
+            } else if name == "member_erasure_audit" || name == "invite_campaigns" {
+                "migrator"
+            } else {
+                "table"
+            };
+            assert!(
+                MATRIX.contains(&format!("'public', '{name}', '{kind}'")),
+                "missing matrix row for {name} ({kind}) from {}",
+                path.display()
+            );
+        }
+        for (path, migration) in migrations {
             let mut table: Option<String> = None;
             for line in migration.lines() {
                 if let Some(rest) = line.strip_prefix("CREATE TABLE ") {
@@ -175,21 +262,6 @@ mod tests {
                         .trim_matches(|c| c == '"' || c == '(')
                         .trim_end_matches('(')
                         .to_owned();
-                    let kind = if matches!(
-                        name.as_str(),
-                        "discord_send_admission" | "voice_create_reservations"
-                    ) {
-                        "admission"
-                    } else if name == "member_erasure_audit" || name == "invite_campaigns" {
-                        "migrator"
-                    } else {
-                        "table"
-                    };
-                    assert!(
-                        MATRIX.contains(&format!("'public', '{name}', '{kind}'")),
-                        "missing matrix row for {name} ({kind}) from {}",
-                        path.display()
-                    );
                     table = Some(name);
                 } else if let Some(rest) = line.strip_prefix("CREATE SEQUENCE ") {
                     let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);

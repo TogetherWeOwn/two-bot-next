@@ -458,9 +458,8 @@ pub struct RestoreReport {
 impl RestoreReport {
     /// Rows the count check expects in `table` after this restore: the
     /// manifest count, adjusted for rows restore itself initialized or
-    /// moved. The 0469 replay empties the legacy voice tables and the
-    /// 0469/0470 replays can add `voice_access_controls` guild rows, so
-    /// those three tables legitimately differ from the manifest.
+    /// moved. Retired archive tables are consumed without restoring them;
+    /// the 0469/0470 translations can add authority guild rows.
     pub fn expected_count(&self, table: &str) -> u64 {
         let archived = self
             .manifest
@@ -472,14 +471,101 @@ impl RestoreReport {
                 |t| t.count,
             );
         match table {
-            "voice_command_roles" => archived.saturating_sub(self.translated_voice_command_roles),
-            "voice_command_role_members" => {
-                archived.saturating_sub(self.translated_voice_command_role_members)
-            }
+            "voice_command_roles" | "voice_command_role_members" => 0,
             "voice_access_controls" => archived + self.voice_access_controls_added,
             _ => archived,
         }
     }
+}
+
+/// Historical archive adapter only: these relations no longer exist after
+/// 0476. Decode and validate their 0229 row shape without creating, querying or
+/// writing a legacy relation. A post-0469 mirror is stale, never authority.
+#[derive(Default)]
+struct LegacyVoiceRestrictions {
+    by_guild: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    commands: u64,
+    members: u64,
+}
+
+fn legacy_voice_restrictions(
+    contents: &DumpContents,
+) -> Result<LegacyVoiceRestrictions, DbDumpError> {
+    let mut commands = BTreeMap::new();
+    let mut members = std::collections::BTreeSet::new();
+    for (table, is_member) in [
+        ("voice_command_roles", false),
+        ("voice_command_role_members", true),
+    ] {
+        let text_encoded = contents
+            .manifest
+            .tables
+            .iter()
+            .find(|info| info.name == table)
+            .is_some_and(|info| !info.column_types.is_empty());
+        for row in contents.buffers.get(table).into_iter().flatten() {
+            let field = |name: &str, snowflake: bool| -> Result<String, DbDumpError> {
+                let value = row.get(name).ok_or_else(|| {
+                    DbDumpError::Refused(format!("{table}: missing historical voice field {name}"))
+                })?;
+                let value = cell_input(value, "text", text_encoded)?.ok_or_else(|| {
+                    DbDumpError::Refused(format!("{table}: null historical voice field {name}"))
+                })?;
+                // Match the frozen 0229 CHECKs, including its 20-digit bound.
+                let valid = if snowflake {
+                    !value.is_empty()
+                        && value.len() <= 20
+                        && !value.starts_with('0')
+                        && value.bytes().all(|byte| byte.is_ascii_digit())
+                } else {
+                    !value.trim_matches(' ').is_empty()
+                };
+                if !valid {
+                    return Err(DbDumpError::Refused(format!(
+                        "{table}: invalid historical voice field {name}"
+                    )));
+                }
+                Ok(value)
+            };
+            let guild = field("guild_id", true)?;
+            let command = field("command", false)?;
+            let duplicate = if is_member {
+                !members.insert((guild, command, field("role_id", true)?))
+            } else {
+                commands.insert((guild, command), Vec::new()).is_some()
+            };
+            if duplicate {
+                return Err(DbDumpError::Refused(format!(
+                    "{table}: duplicate historical voice key"
+                )));
+            }
+        }
+    }
+    if contents.manifest.applied_cutover(469) {
+        return Ok(LegacyVoiceRestrictions::default());
+    }
+    let mut result = LegacyVoiceRestrictions {
+        commands: commands.len() as u64,
+        members: members.len() as u64,
+        ..LegacyVoiceRestrictions::default()
+    };
+    for (guild, command, role) in members {
+        // 0229 has no FK: orphan member rows were ignored by 0469 too.
+        if let Some(roles) = commands.get_mut(&(guild, command)) {
+            roles.push(role);
+        }
+    }
+    for ((guild, command), mut roles) in commands {
+        if crate::voice_access::is_voice_command(&command) {
+            roles.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+            result
+                .by_guild
+                .entry(guild)
+                .or_default()
+                .insert(command, roles);
+        }
+    }
+    Ok(result)
 }
 
 /// Replace the contents of the bot-owned tables with a dump.
@@ -491,6 +577,7 @@ impl RestoreReport {
 /// snapshot acceptance is historical evidence, not current Discord ownership.
 pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbDumpError> {
     let contents: DumpContents = inspect(in_path)?;
+    let legacy_voice = legacy_voice_restrictions(&contents)?;
     let manifest = contents.manifest;
     let missing = manifest.missing_tables();
     if !missing.is_empty() {
@@ -759,93 +846,45 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         .await?;
     }
 
-    // Pre-0469 archives hold per-command voice restrictions only in the
-    // legacy voice_command_roles tables. Since 0469 the command gate reads
-    // only voice_access_controls.command_roles, so restoring the legacy rows
-    // as they are would silently leave those restrictions unenforced.
-    // Replay the 0469 translation over the restored rows, like the 0142
-    // backfill above: same recognised-command filter (the live
-    // VOICE_COMMANDS the gate accepts, frozen identically in 0469) and same
-    // merge rule (a command already restricted in voice_access_controls
-    // keeps its enforced role list; a legacy-only command is added, an empty
-    // member list landing as deny-every-non-admin). Unknown legacy command
-    // names are dropped, as in 0469. The legacy tables are then emptied so
-    // the move happens once: a dump of the restored database carries the
-    // restrictions only where the gate reads them. Targets predating either
-    // store fail the column guards and take no translation.
-    //
-    // Only a source that had not applied 0469 holds authoritative
-    // restrictions in the legacy tables. After 0469, /import mirrors its
-    // restrictions into both stores but /access updates only the gate's, so
-    // a post-0469 archive can carry a legacy row for a restriction an admin
-    // has since lifted; replaying it would resurrect that restriction.
-    // Archives proving 0469 was applied therefore restore both voice stores
-    // verbatim. Archives without recorded evidence predate the evidence
-    // field and replay fail-closed; the report names the translated counts.
-    let archive_pre_voice_authority = !manifest.applied_cutover(469);
-    let mut translated_voice_command_roles = 0;
-    let mut translated_voice_command_role_members = 0;
+    // Translate pre-0469 archive rows directly into the current authority.
+    // Existing enforced entries win, exactly as in 0469. Post-0469 archives
+    // discard stale mirrors, so lifted restrictions cannot be resurrected.
+    let translated_voice_command_roles = legacy_voice.commands;
+    let translated_voice_command_role_members = legacy_voice.members;
     let mut voice_access_controls_added = 0;
     let has_columns = |columns: &[(String, String)], names: &[&str]| {
         names
             .iter()
             .all(|name| columns.iter().any(|(column, _)| column == name))
     };
-    if archive_pre_voice_authority
-        && has_columns(
-            &columns_of(&mut tx, "voice_command_roles").await?,
-            &["guild_id", "command"],
-        )
-        && has_columns(
-            &columns_of(&mut tx, "voice_command_role_members").await?,
-            &["guild_id", "command", "role_id"],
-        )
-        && has_columns(
+    if !legacy_voice.by_guild.is_empty() {
+        if !has_columns(
             &columns_of(&mut tx, "voice_access_controls").await?,
             &["guild_id", "command_roles"],
-        )
-    {
-        let legacy_rows = count_of(&mut tx, "voice_command_roles").await?
-            + count_of(&mut tx, "voice_command_role_members").await?;
-        if legacy_rows > 0 {
-            let controls_before = count_of(&mut tx, "voice_access_controls").await?;
-            // VOICE_COMMANDS entries are compile-time constants; the quote
-            // escaping keeps the interpolation safe regardless.
-            let recognised = crate::voice_access::VOICE_COMMANDS
-                .iter()
-                .map(|name| format!("'{}'", name.replace('\'', "''")))
-                .collect::<Vec<_>>()
-                .join(", ");
-            sqlx::query(audited(format!(
+        ) {
+            return Err(DbDumpError::Refused(
+                "target lacks voice command authority; refusing to lose historical restrictions"
+                    .to_owned(),
+            ));
+        }
+        let controls_before = count_of(&mut tx, "voice_access_controls").await?;
+        for (guild, restrictions) in legacy_voice.by_guild {
+            let encoded = serde_json::to_string(&restrictions).map_err(|_| {
+                DbDumpError::Refused("cannot encode historical voice restrictions".to_owned())
+            })?;
+            sqlx::query(
                 "INSERT INTO voice_access_controls (guild_id, command_roles)
-                 SELECT c.guild_id,
-                        jsonb_object_agg(
-                          c.command,
-                          COALESCE(
-                            (SELECT jsonb_agg(m.role_id ORDER BY length(m.role_id), m.role_id)
-                               FROM voice_command_role_members m
-                              WHERE m.guild_id = c.guild_id AND m.command = c.command),
-                            '[]'::jsonb))
-                   FROM voice_command_roles c
-                  WHERE c.command IN ({recognised})
-                  GROUP BY c.guild_id
+                 VALUES ($1, $2::jsonb)
                  ON CONFLICT (guild_id) DO UPDATE
-                   SET command_roles = EXCLUDED.command_roles || voice_access_controls.command_roles"
-            )))
+                   SET command_roles = EXCLUDED.command_roles || voice_access_controls.command_roles",
+            )
+            .bind(guild)
+            .bind(encoded)
             .execute(&mut *tx)
             .await?;
-            voice_access_controls_added =
-                (count_of(&mut tx, "voice_access_controls").await? - controls_before) as u64;
-            translated_voice_command_role_members =
-                sqlx::query("DELETE FROM voice_command_role_members")
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected();
-            translated_voice_command_roles = sqlx::query("DELETE FROM voice_command_roles")
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
         }
+        voice_access_controls_added =
+            (count_of(&mut tx, "voice_access_controls").await? - controls_before) as u64;
     }
 
     // Pre-0470 archives can hold the guild creation switch and guild-wide
@@ -1087,11 +1126,136 @@ mod tests {
         let report = report(0, 0, 0);
         assert_eq!(report.expected_count("members"), 3);
         assert_eq!(report.expected_count("voice_access_controls"), 2);
-        assert_eq!(report.expected_count("voice_command_roles"), 4);
-        assert_eq!(report.expected_count("voice_command_role_members"), 5);
+        assert_eq!(report.expected_count("voice_command_roles"), 0);
+        assert_eq!(report.expected_count("voice_command_role_members"), 0);
         // Absent from the manifest: initialized baseline, else zero.
         assert_eq!(report.expected_count("guild_settings_revision"), 1);
         assert_eq!(report.expected_count("events"), 0);
+    }
+
+    fn historical_voice_archive(commands: Value, members: Value) -> DumpContents {
+        let rows = |value: Value| {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row.as_object().unwrap().clone())
+                .collect()
+        };
+        DumpContents {
+            manifest: report(0, 0, 0).manifest,
+            buffers: BTreeMap::from([
+                ("voice_command_roles".to_owned(), rows(commands)),
+                ("voice_command_role_members".to_owned(), rows(members)),
+            ]),
+            rows: 0,
+        }
+    }
+
+    #[test]
+    fn historical_voice_rows_translate_without_legacy_relations() {
+        let archive = historical_voice_archive(
+            serde_json::json!([
+                {"guild_id": "42", "command": "kick"},
+                {"guild_id": "42", "command": "limit"},
+                {"guild_id": "42", "command": "retired"}
+            ]),
+            serde_json::json!([
+                {"guild_id": "42", "command": "kick", "role_id": "101"},
+                {"guild_id": "42", "command": "kick", "role_id": "9"},
+                {"guild_id": "42", "command": "retired", "role_id": "5"},
+                {"guild_id": "43", "command": "kick", "role_id": "5"}
+            ]),
+        );
+        let decoded = legacy_voice_restrictions(&archive).unwrap();
+        assert_eq!(decoded.commands, 3);
+        assert_eq!(decoded.members, 4);
+        assert_eq!(
+            decoded.by_guild,
+            BTreeMap::from([(
+                "42".to_owned(),
+                BTreeMap::from([
+                    ("kick".to_owned(), vec!["9".to_owned(), "101".to_owned()]),
+                    ("limit".to_owned(), Vec::new()),
+                ])
+            )])
+        );
+        let mut post_authority = archive;
+        post_authority.manifest.cutover_migrations = vec![469];
+        let ignored = legacy_voice_restrictions(&post_authority).unwrap();
+        assert!(
+            ignored.by_guild.is_empty(),
+            "stale mirrors cannot resurrect a lifted gate"
+        );
+        assert_eq!((ignored.commands, ignored.members), (0, 0));
+    }
+
+    #[test]
+    fn historical_voice_decoder_preserves_row_validation() {
+        let valid = serde_json::json!({"guild_id": "42", "command": "kick"});
+        for bad in [
+            serde_json::json!({"guild_id": null, "command": "kick"}),
+            serde_json::json!({"guild_id": "042", "command": "kick"}),
+            serde_json::json!({"guild_id": "0", "command": "kick"}),
+            serde_json::json!({"guild_id": "123456789012345678901", "command": "kick"}),
+            serde_json::json!({"guild_id": "42", "command": "  "}),
+            serde_json::json!({"guild_id": "42"}),
+            serde_json::json!({"guild_id": {}, "command": "kick"}),
+        ] {
+            assert!(legacy_voice_restrictions(&historical_voice_archive(
+                serde_json::json!([bad]),
+                serde_json::json!([]),
+            ))
+            .is_err());
+        }
+        assert!(
+            legacy_voice_restrictions(&historical_voice_archive(
+                serde_json::json!([valid, valid]),
+                serde_json::json!([]),
+            ))
+            .is_err(),
+            "duplicate parent key refused"
+        );
+        let member = serde_json::json!({"guild_id": "42", "command": "kick", "role_id": "9"});
+        assert!(
+            legacy_voice_restrictions(&historical_voice_archive(
+                serde_json::json!([valid]),
+                serde_json::json!([member, member]),
+            ))
+            .is_err(),
+            "duplicate member key refused"
+        );
+        assert!(legacy_voice_restrictions(&historical_voice_archive(
+            serde_json::json!([valid]),
+            serde_json::json!([{"guild_id": "42", "command": "kick", "role_id": "01"}]),
+        ))
+        .is_err());
+        let mut native = historical_voice_archive(
+            serde_json::json!([{"guild_id": 42, "command": "kick"}]),
+            serde_json::json!([]),
+        );
+        assert!(
+            legacy_voice_restrictions(&native).is_ok(),
+            "v3 native numeric cells supported"
+        );
+        native
+            .manifest
+            .tables
+            .iter_mut()
+            .find(|table| table.name == "voice_command_roles")
+            .unwrap()
+            .column_types = vec!["text".to_owned(), "text".to_owned()];
+        assert!(
+            legacy_voice_restrictions(&native).is_err(),
+            "typed cells must be text encoded"
+        );
+        assert!(legacy_voice_restrictions(&historical_voice_archive(
+            serde_json::json!([]),
+            serde_json::json!([]),
+        ))
+        .unwrap()
+        .by_guild
+        .is_empty());
     }
 
     #[test]

@@ -1047,8 +1047,8 @@ fn input_size_cap_is_exact_at_boundary() {
 }
 
 // --- myroom config-import refusal -------------------------------------------
-// Config writes `voice_command_roles`; the runtime reads
-// `voice_access_controls`. Until this import route enforces `myroom`, the
+// Config and runtime share `voice_access_controls`. Since the runtime
+// does not enforce `myroom`, the
 // codec must refuse it in parse/import, preview and forged Confirm, with no
 // saved success and no writes. Established valid commands (e.g. `kick`) are
 // the controls that still preview and confirm.

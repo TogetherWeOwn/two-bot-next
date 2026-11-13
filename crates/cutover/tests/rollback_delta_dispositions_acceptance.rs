@@ -61,8 +61,6 @@ const EXPECTED_DISPOSITIONS: &[(&str, &str)] = &[
     // Voice window: wholesale-replaced configuration, accepted with the
     // freeze/rollback configuration export pair as alternate evidence.
     ("voice_channel_templates", ACCEPT_WITH_REASON),
-    ("voice_command_role_members", ACCEPT_WITH_REASON),
-    ("voice_command_roles", ACCEPT_WITH_REASON),
     // Voice window: accepted with the export pair plus full-row dump
     // comparison as alternate evidence.
     ("voice_creators", ACCEPT_WITH_REASON),

@@ -1,7 +1,7 @@
 # Backups, restore drills, and sealed guild-config snapshots (TOG-9881)
 
 Rust port of the legacy `two-bot` cutover-data surface (frozen source
-`two-bot` `main @ d5d11793`): v15 dump format with v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14 read compatibility,
+`two-bot` `main @ d5d11793`): v17 dump format with v3/v4/v5/v6/v7/v8/v9/v10/v11/v12/v13/v14/v15/v16 read compatibility,
 SigV4 off-box upload, retention
 math, sealed guild-config snapshot + restore planner, and the three timer
 equivalents. Code: `crates/core/src/backup/`, CLI: `two-bot backup |
@@ -102,18 +102,19 @@ upload command; argv and child output never echoed):
 ## The format
 
 Gzipped NDJSON, one object per line: `manifest` / `row` / `end`. New dumps
-write **v16** (including durable voice-create reservations, the retention
+write **v17** (including durable voice-create reservations, the retention
 queues, the seasonal XP projection, the event store: voice capture plus
 presence capture plus member-capture deltas plus message/reaction capture
 plus thread lifecycle plus stage/interaction-observe/audit-log capture plus
 invite/scheduled-event capture, the stream go-live ledger, guild game-activity
 aggregates, the assistant monthly-cap ledger, the scheduled-event
 epoch-claim guard, the scheduled-event delete tombstones and the admin API
-token registry, event voice pair, three starboard tables, three giveaway tables and the event instance windows); the reader also accepts
+token registry, event voice pair, three starboard tables, three giveaway tables and the event instance windows, but no longer the retired legacy command-role tables); the reader also accepts
 frozen **v3**, pre-reservation **v4**, pre-v6-tables **v5**, pre-seasonal **v6**,
 pre-stream-ledger **v7**, pre-guild-counters **v8**, pre-epoch-claim **v9**,
 pre-tombstone **v10**, pre-registry **v11**, pre-event-voice **v12** and
-pre-starboard **v13**, pre-giveaways **v14** and pre-instance-windows **v15**.
+pre-starboard **v13**, pre-giveaways **v14**, pre-instance-windows **v15** and
+**v16**, the last format that carries the legacy command-role tables.
 Other versions refuse.
 The manifest carries per-table `{name, columns, column_types, count}` taken
 inside one `REPEATABLE READ` transaction, the `events` high-water mark, the
@@ -150,10 +151,10 @@ unsupported. A failed write or validation leaves existing published recovery
 points untouched; a crash may leave a temporary file, but retention and drill
 selectors ignore it.
 
-### Coverage and recovery semantics (v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14 and v15)
+### Coverage and recovery semantics (v4 through v17)
 
 `DUMP_TABLES` in `crates/core/src/backup/dump_file.rs` is the single ordered
-inventory for both dump and restore. It includes **104 durable tables from the
+inventory for both dump and restore. It includes **102 durable tables from the
 current cutover migrations**, including the bot-owned website-contract backing
 tables, the member-moderation ledger, the self-role send receipts
 (`self_role_exchanges`) plus their uncertainty baselines
@@ -185,13 +186,13 @@ entries and draw rounds (`giveaways`, `giveaway_entries`, `giveaway_draws`: 0460
 plus the non-member event instance lifecycle, order and revocation evidence
 (`event_instance_windows`: 0472).
 The [registry contract](admin-registry.md) adds no table or archive version:
-new v16 dumps discover `holder_id` / `holder_kind` dynamically. Populated
+new v17 dumps discover `holder_id` / `holder_kind` dynamically. Populated
 pre-holder archives refuse transactionally on the required authority columns
 instead of inventing holders; older readable archives that omit the table
 retain their versioned clearing behavior.
 `OPTIONAL_LEGACY_TABLES` is empty: the coverage
 test fails if a covered table is not migrated. A dump from a fresh Rust schema
-has 108 table entries. A missing current table refuses a dump/restore: migrate
+has 106 table entries. A missing current table refuses a dump/restore: migrate
 the target first.
 Each readable version requires its historical inventory and waives only
 versioned additions introduced later:
@@ -210,7 +211,17 @@ versioned additions introduced later:
 | v13 | `V14_ADDED_TABLES`: `starboard_config`, `starboard_starrers`, `starboard_posts`, `V15_ADDED_TABLES` (giveaway tables), `V16_ADDED_TABLES` (event instance windows) |
 | v14 | `V15_ADDED_TABLES`: `giveaways`, `giveaway_entries`, `giveaway_draws`, `V16_ADDED_TABLES` (event instance windows) |
 | v15 | `V16_ADDED_TABLES`: `event_instance_windows` |
-| v16 | None: the full current inventory is required |
+| v16 | None: its frozen inventory is required, including the retired `voice_command_roles` and `voice_command_role_members` |
+| v17 | None: the full current inventory is required, and the retired legacy command-role tables must be absent |
+
+The legacy `voice_command_roles` / `voice_command_role_members` tables
+(`RETIRED_V16_TABLES`) are no longer part of `DUMP_TABLES` and are not dumped
+from v17 on. Every frozen v4 through v16 inventory still declares both and
+refuses without them (v3 predates their coverage and does not require them);
+a v17 or later manifest that declares either one refuses. The read path still
+accepts their rows from v16 and older archives so restore can translate them;
+restore never writes the dropped tables. The frozen 85-table v4 fixture and the
+released v12 and v13 inventories keep the pair unchanged.
 
 These are narrow waivers, not permission to omit arbitrary tables. An
 incomplete new archive refuses at inspection. The frozen 85-table v4 fixture
@@ -240,7 +251,7 @@ binding or timestamp alone cannot prove a live window, so a restored pre-v16
 recovery point fails closed (no instance is treated as live, and the revocation
 and order fences are gone) until a fresh accepted Discord observation
 re-establishes each instance. Use v16 to preserve that evidence.
-Current v16 archives must include the monthly cap, both mirror-fence tables,
+Current v17 archives must include the monthly cap, both mirror-fence tables,
 the registry, event voice pair, starboard, giveaway and event instance window
 tables, so routine restores retain their archived state. Tombstone `deleted_at` cells must be real dates in
 exact `YYYY-MM-DDTHH:MM:SS.sssZ` form: inspection refuses missing, null,
@@ -370,23 +381,25 @@ destructive in-place override is provided by this slice.
 
 Backups taken before migration 0469 can hold per-command voice restrictions
 only in the legacy `voice_command_roles` / `voice_command_role_members`
-tables. The command gate reads only `voice_access_controls.command_roles`,
-so after loading the rows restore replays the 0469 translation over them —
-same recognised-command filter (unknown legacy command names are dropped)
-and same merge rule (a command already restricted in
-`voice_access_controls` keeps its enforced role list) — then empties the
-legacy tables so the move happens once. The row-count check expects the
-legacy tables empty and any inserted `voice_access_controls` guild rows on
-top of the manifest count; the CLI names the translation in both dry-run
-and apply output.
+tables. Those tables are dropped from the live schema (issue 1934), but
+v16-and-older archives still carry them. The command gate reads only
+`voice_access_controls.command_roles`, so restore translates the archived
+legacy rows from the archive itself, never from live tables: same
+recognised-command filter (unknown legacy command names are dropped) and same
+merge rule (a command already restricted in `voice_access_controls` keeps its
+enforced role list). The translation reports how many archived legacy rows it
+consumed; the row-count check expects any inserted `voice_access_controls`
+guild rows on top of the manifest count and expects no rows for the retired
+tables. The CLI names the translation in both dry-run and apply output.
 
 The replay runs only for archives whose recorded cutover migrations
 (`cutoverMigrations` in the manifest, written from the source's
 `_sqlx_migrations` ledger) prove the source had **not** applied 0469.
 After 0469, `/import` mirrors restrictions into both stores but `/access`
 updates only the gate's, so a post-0469 archive can hold a legacy row for
-a restriction an admin has since lifted; those archives restore both
-voice stores verbatim and the lifted restriction stays lifted. Archives
+a restriction an admin has since lifted; for those archives the gate's
+store restores verbatim and the lifted restriction stays lifted: the stale
+legacy rows are discarded, not resurrected. Archives
 written before the evidence field existed carry no proof either way and
 replay fail-closed; the restore report and CLI name the translated counts,
 so check them after restoring such an archive taken shortly after 0469
