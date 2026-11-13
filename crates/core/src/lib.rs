@@ -120,6 +120,7 @@ pub mod moderation_recent;
 #[cfg(feature = "db")]
 pub mod moderation_recent_store;
 pub mod music_voice;
+pub mod notification_budget;
 pub mod onboarding;
 pub mod onboarding_destination;
 #[cfg(feature = "db")]
