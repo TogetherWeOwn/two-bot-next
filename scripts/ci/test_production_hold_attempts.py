@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import incident_issue
 import production_hold_attempts as attempts
 import production_hold_history as reader
-from production_hold_import_probe import assert_inert_import
+from test_production_hold_import_probe import assert_inert_import
 from test_production_hold_history import ENV, REPO, FakeGitHub, paged
 
 RUN = "actions/runs/7"
