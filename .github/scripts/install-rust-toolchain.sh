@@ -23,7 +23,22 @@ for component in "${components[@]}"; do
   flags+=(--component "$component")
 done
 export RUSTUP_PERMIT_COPY_RENAME=1
-rustup toolchain install "$RUST_TOOLCHAIN" "${flags[@]}" --profile minimal --no-self-update --force-non-host
+# Match the pinned rust-toolchain action's bounded release-server retry policy.
+log=$(mktemp)
+trap 'rm -f "$log"' EXIT
+for attempt in 1 2 3 4 5; do
+  if rustup toolchain install "$RUST_TOOLCHAIN" "${flags[@]}" --profile minimal --no-self-update --force-non-host 2>&1 | tee "$log"; then
+    break
+  else
+    status=$?
+  fi
+  if [[ $attempt == 5 ]] || ! grep -Fq 'checksum failed for ' "$log" \
+      || ! grep -Fq 'this is likely due to an ongoing update of the official release server' "$log"; then
+    exit "$status"
+  fi
+  printf 'Retrying rustup toolchain install in 30 seconds (retry %s of 4)\n' "$attempt" >&2
+  sleep 30
+done
 rustup default "$RUST_TOOLCHAIN" --force-non-host
 rustc +"$RUST_TOOLCHAIN" --version --verbose
 

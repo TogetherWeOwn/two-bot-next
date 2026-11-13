@@ -146,11 +146,9 @@ jobs:
       - name: Guarded fixture routing and doc references (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
       - name: Install Rust toolchain
-        shell: bash
-        env:
-          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
-          RUST_COMPONENTS: ''
-        run: bash .github/scripts/install-rust-toolchain.sh
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
+        with:
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -469,11 +467,9 @@ jobs:
       - name: Guarded fixture routing and doc references (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
       - name: Install Rust toolchain
-        shell: bash
-        env:
-          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
-          RUST_COMPONENTS: ""
-        run: bash .github/scripts/install-rust-toolchain.sh
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
+        with:
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -588,11 +584,9 @@ jobs:
       - name: Guarded fixture routing and doc references (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
       - name: Install Rust toolchain
-        shell: bash
-        env:
-          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
-          RUST_COMPONENTS: ""
-        run: bash .github/scripts/install-rust-toolchain.sh
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
+        with:
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -801,11 +795,9 @@ jobs:
       - name: Guarded fixture routing and doc references (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_nightly_routing.py' -v
       - name: Install Rust toolchain
-        shell: bash
-        env:
-          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
-          RUST_COMPONENTS: ""
-        run: bash .github/scripts/install-rust-toolchain.sh
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
+        with:
+          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

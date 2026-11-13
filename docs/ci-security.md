@@ -442,6 +442,10 @@ The former `if: ${{ false }}` staging suspension (and its narrow
 carries no such suppression. The offline regression now requires the deploy
 job to carry no job condition at all.
 
+Pedantic zizmor may report informational `superfluous-actions` advisories for
+existing pinned Rust toolchain Actions. They are intentionally retained; all
+existing Action SHAs and pin comments are preserved.
+
 ## Public-hosted runner contract
 
 Every ordinary job defined in this repository selects `runs-on: ubuntu-latest`
@@ -539,16 +543,15 @@ python3 -m unittest discover -s scripts -p 'test_staging_ownership_status.py' -v
 
 ## Native Rust setup
 
-All former Rust setup action calls now execute
-`.github/scripts/install-rust-toolchain.sh` with an exact `RUST_TOOLCHAIN` and
-explicit `RUST_COMPONENTS`. The split nightly sweep has four compiling jobs,
-bringing the installer inventory to 21 job definitions. Stable lanes match
-`rust-toolchain.toml`; the three libFuzzer lanes retain `nightly-2026-10-01` and
-`rust-src`. Setup installs the minimal profile without self-update, selects the
-same default, and verifies the explicit toolchain. Existing fail-closed retry
-steps and their conditions remain. No lane requested extra targets or a directory
-override, and no lane consumed the former action's outputs. The Cargo
-incremental/color defaults are preserved.
+Rust setup in `check.yml` executes `.github/scripts/install-rust-toolchain.sh`
+with an exact `RUST_TOOLCHAIN` and explicit `RUST_COMPONENTS`. Other workflows
+retain their pinned Rust setup action. Stable lanes match `rust-toolchain.toml`;
+the libFuzzer lanes retain `nightly-2026-10-01` and `rust-src`. Native setup
+installs the minimal profile without self-update, selects the same default, and
+verifies the explicit toolchain. Existing fail-closed retry steps and their
+conditions remain. No migrated lane requested extra targets or a directory
+override, or consumed the former action's outputs. The Cargo incremental/color
+defaults are preserved.
 
 Hosted Ubuntu and the pinned Rust job containers must supply `rustup`, `cargo`
 and `rustc` on PATH. Missing tools fail explicitly; setup never runs a downloaded
