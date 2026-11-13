@@ -1,11 +1,12 @@
 # Docs map
 
-Rows: `- [Purpose](relative.md)`. Run `python3 scripts/check_docs_index.py --json`.
+Run `python3 scripts/check_docs_index.py --json`.
 Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 ## References
 
 - [Find a doc](README.md)
+- [Public direction](ROADMAP.md)
 - [Framework](adr/0001-discord-framework.md)
 - [Commands](commands.md)
 - [Settings](configuration.md)
