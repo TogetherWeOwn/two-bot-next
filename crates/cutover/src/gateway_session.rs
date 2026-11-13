@@ -550,7 +550,7 @@ impl GatewaySessionStore {
              session_id = EXCLUDED.session_id, seq = EXCLUDED.seq,
              resume_url = EXCLUDED.resume_url, updated_at = EXCLUDED.updated_at",
         ).bind(&self.guild_id).bind(self.shard_id).bind(&session.session_id)
-            .bind(sequence).bind(self.resume_policy.normalize(&session.resume_url)).bind(session.updated_at_ms)
+            .bind(sequence).bind(&session.resume_url).bind(session.updated_at_ms)
             .execute(&mut *tx).await?;
         tx.commit().await?;
         Ok((DispatchAction::Apply, job_id))

@@ -239,7 +239,7 @@ async fn write_case(
 }
 
 async fn writer_cases(db: &TestDb, store: &GatewaySessionStore, url: &str, expected: &str) {
-    for (with_job, baseline_uses, committed_uses) in [(false, 2, 3), (true, 3, 4)] {
+    for (with_job, baseline_uses, committed_uses) in [(true, 2, 3), (false, 3, 4)] {
         assert_eq!(
             store.invite_snapshots().await.unwrap()[0].uses,
             baseline_uses
