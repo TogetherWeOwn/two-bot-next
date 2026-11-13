@@ -20,9 +20,10 @@
 //!   never 0.
 //! - `errors.ts` — the typed `{code, status, retryable}` envelope and the one
 //!   message every auth failure returns.
-//! - `actions.ts` — the 20-verb allowlist (the card's 18 plus `event.read`,
+//! - `actions.ts` — the 21-verb allowlist (the card's 18 plus `event.read`,
 //!   which landed later under TOG-5510, plus the keyless `voice.snapshot`
-//!   gateway-cache read), the idempotency-key set, the
+//!   gateway-cache read and the keyless `botlog.read` log projection), the
+//!   idempotency-key set, the
 //!   settings-store set, the role/channel key maps, and the per-field
 //!   validators (snowflakes, reason, event input, moderation bounds, settings
 //!   guard).
@@ -669,10 +670,11 @@ pub fn auth_failure(log_reason: impl Into<String>) -> ActionError {
 
 /// Every verb the endpoint will run, in legacy publish order: the card's 18
 /// plus `event.read`, the narrow mapped-event verifier that landed later
-/// (TOG-5510), plus `voice.snapshot`, the keyless gateway-cache read. Adding
-/// a verb here without deciding which side of [`NEEDS_IDEMPOTENCY_KEY`] it
-/// falls on is the mistake that set exists to prevent.
-pub const IMPLEMENTED_ACTIONS: [&str; 20] = [
+/// (TOG-5510), plus `voice.snapshot`, the keyless gateway-cache read, plus
+/// `botlog.read`, the keyless public-log projection. Adding a verb here
+/// without deciding which side of [`NEEDS_IDEMPOTENCY_KEY`] it falls on is
+/// the mistake that set exists to prevent.
+pub const IMPLEMENTED_ACTIONS: [&str; 21] = [
     "role.assign",
     "guild.add_member",
     "announcement.post",
@@ -693,6 +695,7 @@ pub const IMPLEMENTED_ACTIONS: [&str; 20] = [
     "moderation.lockdown",
     "moderation.unlock",
     "voice.snapshot",
+    "botlog.read",
 ];
 
 /// Actions where a repeat is not harmless, so the caller must send an
@@ -844,6 +847,11 @@ impl InternalFlags {
         // every other post-launch verb; absent or non-`1` stays refused.
         if flag("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT") {
             enabled.insert("voice.snapshot".to_owned());
+        }
+        // Keyless public-log projection over the internal audit. Default off
+        // like every other post-launch verb; absent or non-`1` stays refused.
+        if flag("TWO_INTERNAL_ALLOW_BOTLOG_READ") {
+            enabled.insert("botlog.read".to_owned());
         }
         // Merely shipping the implementation must not widen the allowlist.
         if flag("TWO_INTERNAL_ALLOW_AUTOMATIONS") {
@@ -1350,6 +1358,39 @@ pub fn validate_guild_add_member(body: &Map<String, Value>) -> Result<(), Action
     require_snowflake(body, "discord_id")?;
     require_field_str(body, "access_token")?;
     Ok(())
+}
+
+/// Exactly the legacy result object, without a provider response or secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberOutcome {
+    Added,
+    AlreadyMember,
+    Assigned,
+    AlreadyHeld,
+}
+
+impl MemberOutcome {
+    #[must_use]
+    pub fn result(self) -> serde_json::Value {
+        serde_json::json!({"outcome": self})
+    }
+
+    /// Legacy successBody insertion order is part of the website wire contract.
+    #[must_use]
+    pub fn success_body(self, request_id: &str) -> serde_json::Value {
+        serde_json::json!({"ok": true, "result": self.result(), "request_id": request_id})
+    }
+}
+
+/// Local executor evidence, never deserialized from the signed request. The rank
+/// is resolved from the same authoritative Discord snapshot used for hierarchy.
+/// Raw role names are transient and never enter this report or the durable audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleAssignmentReport {
+    pub outcome: MemberOutcome,
+    pub resolved_role_id: String,
+    pub rank_key: Option<crate::community_snapshots::RankKey>,
 }
 
 /// Resolved allowlisted role assignment. No caller can supply an arbitrary role ID.
@@ -2108,7 +2149,7 @@ pub const ADMIN_SCOPE_ADMIN: &str = "admin";
 impl InternalFlags {
     /// Scope the admin API requires for `action` (scope map v0).
     ///
-    /// Covers the 20 verbs the endpoint runs today: 4 read, 8 moderate and
+    /// Covers the 21 verbs the endpoint runs today: 5 read, 8 moderate and
     /// 8 admin. `role.assign` is deliberately admin (a privilege grant, not
     /// membership tooling). Later slices extend the map with new verbs;
     /// anything unmapped — including strings that can never be verbs —
@@ -2116,9 +2157,8 @@ impl InternalFlags {
     #[must_use]
     pub fn required_admin_scope(action: &str) -> Option<&'static str> {
         match action {
-            "settings.get" | "event.read" | "automations.export" | "voice.snapshot" => {
-                Some(ADMIN_SCOPE_READ)
-            }
+            "settings.get" | "event.read" | "automations.export" | "voice.snapshot"
+            | "botlog.read" => Some(ADMIN_SCOPE_READ),
             "moderation.warn"
             | "moderation.timeout"
             | "moderation.kick"
@@ -2913,6 +2953,9 @@ mod tests {
         assert!(on("TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT").is_enabled("voice.snapshot"));
         // No flag, no read: the voice snapshot stays dark by default.
         assert!(!InternalFlags::from_map(&HashMap::new()).is_enabled("voice.snapshot"));
+        assert!(on("TWO_INTERNAL_ALLOW_BOTLOG_READ").is_enabled("botlog.read"));
+        // No flag, no read: the public-log projection stays dark by default.
+        assert!(!InternalFlags::from_map(&HashMap::new()).is_enabled("botlog.read"));
         let auto = on("TWO_INTERNAL_ALLOW_AUTOMATIONS");
         assert!(auto.is_enabled("automations.import"));
         assert!(auto.is_enabled("automations.export"));
@@ -3041,11 +3084,12 @@ mod tests {
         // slices add two env-only keys
         // (TWO_ASSISTANT_API_KEY, TWO_EVENT_VOICE_CATEGORY_ID). The
         // voice.snapshot read adds one env-only key
-        // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT).
+        // (TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT). The botlog.read projection
+        // adds one env-only key (TWO_INTERNAL_ALLOW_BOTLOG_READ).
         for (class, expected) in [
             (SettingClass::Hot, 52),
             (SettingClass::Cold, 18),
-            (SettingClass::EnvOnly, 67),
+            (SettingClass::EnvOnly, 68),
         ] {
             assert_eq!(
                 SETTING_CLASSES.iter().filter(|(_, c)| *c == class).count(),

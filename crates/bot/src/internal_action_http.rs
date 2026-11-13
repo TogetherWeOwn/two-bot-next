@@ -6,6 +6,7 @@
 //!
 //! Wired effects: `announcement.post` (single-attempt send), `event.read`
 //! (keyless mapped GET), `voice.snapshot` (keyless gateway-cache projection),
+//! `botlog.read` (keyless public-log projection over the internal audit),
 //! `event.upsert`/`event.cancel` (Guild Scheduled Event
 //! mutations through the shared event executor), `settings.get`/`settings.set`
 //! (settings executors), `automations.export` (keyless redacted read) /
@@ -51,6 +52,7 @@ use two_bot_core::{
         diff_import, export_document, max_import_entries, parse_import_document, ImportOutcome,
         ImportParseError,
     },
+    botlog::{assemble_botlog_page, validate_botlog_read, BOTLOG_READ_ACTION},
     channel_moderation_store::ChannelModerationStore,
     clock_guard::ClockGuard,
     commands::{
@@ -81,7 +83,7 @@ use two_bot_core::{
     ModerationAction, ModerationActor, ModerationGates, ModerationPolicy, ModerationTarget,
 };
 use two_bot_cutover::{internal_settings::execute_settings, settings::SettingsStore};
-use two_bot_discord::executor::member::MemberOutcome;
+use two_bot_discord::executor::member::{MemberOutcome, RoleAssignmentReport};
 use two_bot_discord::internal_actions::{
     supports_event_mutation, AnnouncementExecutor, ExecutionOutcome, Refusal,
 };
@@ -112,9 +114,10 @@ const EVENT_GATE_WAIT: Duration = Duration::from_secs(8);
 /// Bounded receiver family for `two_bot_internal_actions_total{family,outcome}`
 /// (TOG-20119). Maps the already-bounded [`ActionLabel`] to one of
 /// `metrics::INTERNAL_ACTION_FAMILIES`: `announcement.post` to
-/// `announcement`, `event.*` to `event`, `settings.*` to `settings`,
-/// `moderation.*` to `moderation`, `role.assign`/`guild.add_member` to
-/// `membership`, `voice.snapshot` to `voice`; anything else (including
+/// `announcement`, `event.*` plus `botlog.read` to `event`, `settings.*` to
+/// `settings`, `moderation.*` to `moderation`,
+/// `role.assign`/`guild.add_member` to `membership`, `voice.snapshot` to
+/// `voice`; anything else (including
 /// unwired catalog verbs and unknown verbs) to `other`. Takes only the
 /// bounded label, never raw request bytes, so no secret, token, key id or
 /// body can become a metric label.
@@ -122,7 +125,7 @@ fn internal_family(action: ActionLabel) -> &'static str {
     match action {
         ActionLabel::Known(name) => match name {
             "announcement.post" => "announcement",
-            "event.read" | "event.upsert" | "event.cancel" => "event",
+            "event.read" | "event.upsert" | "event.cancel" | "botlog.read" => "event",
             "settings.get" | "settings.set" => "settings",
             "role.assign" | "guild.add_member" => "membership",
             "voice.snapshot" => "voice",
@@ -208,7 +211,7 @@ trait MemberEffect: Send + Sync {
         guild_id: &'a str,
         bot_user_id: &'a str,
         request: &'a RoleAssignRequest<'a>,
-    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>>;
+    ) -> BoxFuture<'a, Result<RoleAssignmentReport, ActionError>>;
     fn execute_add<'a>(
         &'a self,
         guild_id: &'a str,
@@ -224,9 +227,9 @@ impl MemberEffect for ActionExecutor {
         guild_id: &'a str,
         bot_user_id: &'a str,
         request: &'a RoleAssignRequest<'a>,
-    ) -> BoxFuture<'a, Result<MemberOutcome, ActionError>> {
+    ) -> BoxFuture<'a, Result<RoleAssignmentReport, ActionError>> {
         Box::pin(async move {
-            self.assign_internal_role(guild_id, bot_user_id, request)
+            self.assign_internal_role_report(guild_id, bot_user_id, request)
                 .await
         })
     }
@@ -1589,6 +1592,11 @@ async fn receive(
     if decision.action == "voice.snapshot" {
         return read_voice_snapshot(state, id, key, action).await;
     }
+    // Keyless public-log projection: no durable claim, no Idempotency-Key,
+    // same as the reads above. The committed nonce is the replay guard.
+    if decision.action == BOTLOG_READ_ACTION {
+        return read_botlog(state, &decision, id, key, action).await;
+    }
     // Mutating event verbs take the same durable claim/audit path as
     // announcements below, with their own validation and key mapping.
     if supports_event_mutation(&decision.action) {
@@ -1852,6 +1860,60 @@ async fn read_voice_snapshot(
     }
 }
 
+/// Keyless `botlog.read`: project the contract §6 page over the internal
+/// audit for the staging guild. A disabled flag refuses earlier in
+/// `authorize`. Field validation runs before the store page, so malformed
+/// cursors and limits refuse with no database read. The channel map inverts
+/// here (configured keys run key→channel): an unnamed or ambiguously named
+/// channel publishes nothing rather than a raw snowflake. The read itself is the
+/// only effect: no store write, no audit row, no Discord call.
+async fn read_botlog(
+    state: &ReceiverState,
+    decision: &AuthDecision,
+    id: &str,
+    key: KeyLabel,
+    action: ActionLabel,
+) -> Response {
+    let reject = |failure| state.reject(failure, key.clone(), action, id);
+    let request = match validate_botlog_read(&decision.body) {
+        Ok(request) => request,
+        Err(error) => return reject(Failure::from_action(error)),
+    };
+    let mut channel_by_id = std::collections::HashMap::new();
+    for (name, channel_id) in state.config.channel_keys() {
+        channel_by_id
+            .entry(channel_id.clone())
+            .and_modify(|key| *key = None)
+            .or_insert_with(|| Some(name.clone()));
+    }
+    let channel_by_id = channel_by_id
+        .into_iter()
+        .filter_map(|(channel, key)| key.map(|key| (channel, key)))
+        .collect();
+    let guild_id = two_bot_core::backup::guild_config::TWO_STAGING_GUILD_ID;
+    let rows = match state
+        .store
+        .list_botlog_page(
+            guild_id,
+            request.after.after_micros,
+            request.after.after_audit_id,
+            request.limit,
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return reject(Failure::code(ErrorCode::Internal)),
+    };
+    let page = assemble_botlog_page(rows, &channel_by_id, &request);
+    match serde_json::to_value(&page) {
+        Ok(result) => {
+            metrics::global().internal_action(internal_family(action), "executed");
+            event_read_response(result, id)
+        }
+        Err(_) => reject(Failure::code(ErrorCode::Internal)),
+    }
+}
+
 /// Membership family: `role.assign` resolves a caller-supplied key through the
 /// configured role map (never a raw snowflake), `guild.add_member` carries a
 /// transient OAuth token that never enters audit rows, stored receipts, logs,
@@ -1943,6 +2005,7 @@ async fn execute_member(
             target_id: Some(target),
             actor_id: None,
             resolved_role_id: role,
+            ..AuditSubject::default()
         }
     };
     let Some(caller) = state.config.caller_for(&decision.key_id) else {
@@ -2005,6 +2068,7 @@ async fn execute_member(
                 .member
                 .execute_assign(guild_id, &bot_user_id, &request)
                 .await
+                .map(|report| (report.outcome, Some(report)))
         }
         Validated::Add { .. } => {
             let request = match GuildAddMemberRequest::validate(&decision.body) {
@@ -2055,11 +2119,11 @@ async fn execute_member(
             let result = state.member.execute_add(guild_id, &request, &token).await;
             // Drop the secret at once; the `String` lives only for this call.
             drop(token);
-            result
+            result.map(|outcome| (outcome, None))
         }
     };
     match outcome {
-        Ok(member_outcome) => {
+        Ok((member_outcome, role_report)) => {
             let affected = u32::from(matches!(
                 member_outcome,
                 MemberOutcome::Added | MemberOutcome::Assigned
@@ -2070,7 +2134,15 @@ async fn execute_member(
                 outcome: None,
                 stop_reason: None,
             };
-            if let Err(finish_error) = state.store.finish(&claim, &response).await {
+            let finished = if let Some(report) = role_report {
+                state
+                    .store
+                    .finish_role_assignment(&claim, &response, &report)
+                    .await
+            } else {
+                state.store.finish(&claim, &response).await
+            };
+            if let Err(finish_error) = finished {
                 log_terminal_persist_failed(action, "finish", finish_error);
                 mark_unknown_best_effort(&state.store, &claim, action).await;
                 return reject(Failure::reconciliation());
@@ -2623,6 +2695,7 @@ async fn mutate_event(
     let subject = AuditSubject {
         guild_id: Some(DiscordId::new(guild_id).expect("staging guild ID")),
         target_id,
+        audit_event_key: Some(event_key.clone()),
         ..AuditSubject::default()
     };
     let Some(caller) = state.config.caller_for(&decision.key_id) else {

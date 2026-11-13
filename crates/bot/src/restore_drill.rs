@@ -126,6 +126,7 @@ async fn restore_fresh(
             "target_database": name,
             "archive": identity["archive"],
             "restored": report.restored,
+            "preserved_tables": report.preserved_tables,
             "dropped_columns": report.dropped_columns,
             "quarantined_unbans": report.quarantined_unbans,
             "missing_member_ban_ownership": report.missing_member_ban_ownership,

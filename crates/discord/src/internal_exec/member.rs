@@ -53,28 +53,7 @@ impl MemberError {
     }
 }
 
-/// Exactly the legacy result object, without a provider response or secret.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemberOutcome {
-    Added,
-    AlreadyMember,
-    Assigned,
-    AlreadyHeld,
-}
-
-impl MemberOutcome {
-    #[must_use]
-    pub fn result(self) -> serde_json::Value {
-        serde_json::json!({"outcome": self})
-    }
-
-    /// Legacy successBody insertion order is part of the website wire contract.
-    #[must_use]
-    pub fn success_body(self, request_id: &str) -> serde_json::Value {
-        serde_json::json!({"ok": true, "result": self.result(), "request_id": request_id})
-    }
-}
+pub use two_bot_core::internal_actions::{MemberOutcome, RoleAssignmentReport};
 
 /// Legacy internal/discordActions.ts throwForStatus, not moderation's body-based
 /// retry parser. Only safe status/header scalars reach the public error.
@@ -150,6 +129,8 @@ fn unreadable() -> ActionError {
 #[derive(Deserialize)]
 struct RoleSnapshot {
     id: String,
+    #[serde(default)]
+    name: serde_json::Value,
     position: i64,
     managed: bool,
 }
@@ -276,6 +257,18 @@ impl ActionExecutor {
         bot_user_id: &str,
         request: &RoleAssignRequest<'_>,
     ) -> Result<MemberOutcome, ActionError> {
+        self.assign_internal_role_report(guild_id, bot_user_id, request)
+            .await
+            .map(|report| report.outcome)
+    }
+
+    /// Durable callers retain typed rank evidence without changing the wire result.
+    pub async fn assign_internal_role_report(
+        &self,
+        guild_id: &str,
+        bot_user_id: &str,
+        request: &RoleAssignRequest<'_>,
+    ) -> Result<RoleAssignmentReport, ActionError> {
         self.assign_internal_role_once(guild_id, bot_user_id, request)
             .await
             .map_err(MemberError::into_action_error)
@@ -286,7 +279,7 @@ impl ActionExecutor {
         guild_id: &str,
         bot_user_id: &str,
         request: &RoleAssignRequest<'_>,
-    ) -> Result<MemberOutcome, MemberError> {
+    ) -> Result<RoleAssignmentReport, MemberError> {
         let guild = numeric_id(guild_id)?.cast();
         let user = numeric_id(request.discord_id())?.cast();
         let role = numeric_id(request.role_id())?.cast();
@@ -299,7 +292,11 @@ impl ActionExecutor {
             .await
         {
             Ok(Some(held)) if held.iter().any(|id| id == request.role_id()) => {
-                return Ok(MemberOutcome::AlreadyHeld);
+                return Ok(RoleAssignmentReport {
+                    outcome: MemberOutcome::AlreadyHeld,
+                    resolved_role_id: request.role_id().to_owned(),
+                    rank_key: None,
+                });
             }
             Err(error @ MemberError::Guard(_)) => return Err(error),
             Err(MemberError::Action(error)) if error.code == ErrorCode::RateLimited => {
@@ -330,6 +327,20 @@ impl ActionExecutor {
         if !ids.contains(guild_id) || bot_roles.iter().any(|id| !ids.contains(id.as_str())) {
             return Err(unreadable().into());
         }
+        // Reuse the whole-ladder resolver, not the allowlist key or the mutable
+        // website snapshot table. Unusable ladders do not alter authorization.
+        let rank_key = two_bot_core::community_snapshots::match_rank_roles(
+            &roles
+                .iter()
+                .map(|r| (r.id.clone(), r.name.as_str().unwrap_or_default().to_owned()))
+                .collect::<Vec<_>>(),
+        )
+        .and_then(|ladder| {
+            ladder
+                .into_iter()
+                .find(|r| r.role_id == request.role_id())
+                .map(|r| r.key)
+        });
         let target = roles
             .iter()
             .find(|r| r.id == request.role_id())
@@ -363,7 +374,11 @@ impl ActionExecutor {
             return Err(unreadable().into());
         }
         response.complete().await;
-        Ok(MemberOutcome::Assigned)
+        Ok(RoleAssignmentReport {
+            outcome: MemberOutcome::Assigned,
+            resolved_role_id: request.role_id().to_owned(),
+            rank_key,
+        })
     }
 }
 

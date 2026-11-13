@@ -175,6 +175,18 @@ const SUCCESSES: { name: string; value: Record<string, unknown> }[] = [
       request_id: REQUEST_ID,
     },
   },
+  {
+    name: "botlog.read",
+    value: {
+      ok: true,
+      result: {
+        v: 1,
+        entries: [{ seq: "synthetic-cursor", at: "2026-11-03T10:00:00Z", kind: "event.opened", event_key: "synthetic-raid-night" }],
+        next: "synthetic-cursor",
+      },
+      request_id: REQUEST_ID,
+    },
+  },
 ];
 
 function captureLogs(t: TestContext): string[] {

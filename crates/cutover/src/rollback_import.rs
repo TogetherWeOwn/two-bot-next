@@ -45,7 +45,8 @@ use std::collections::BTreeMap;
 use sqlx::{Executor, PgPool};
 use thiserror::Error;
 use two_bot_core::backup::dump_file::{
-    is_canonical_tombstone_timestamp, DESTINATION_OWNED_COLUMNS,
+    is_canonical_tombstone_timestamp, AUDIT_LOG_TABLE, AUDIT_ORDER_TRIGGER_INSTALLED_SQL,
+    DESTINATION_OWNED_COLUMNS,
 };
 use two_bot_core::backup::DUMP_TABLES;
 
@@ -104,6 +105,11 @@ pub enum ImportApplyError {
     InvalidTable(String),
     #[error("scheduled_events_tombstone row requires canonical millisecond UTC deleted_at")]
     InvalidTombstoneTimestamp,
+    /// The file carries audit rows but the target's ordering trigger would
+    /// rewrite their identity. Refused before any write; the import is not
+    /// qualified for offline identity-preserving audit recovery.
+    #[error("refusing to import {rows} internal_action_log rows: the target has the audit ordering trigger installed, which would rewrite their audit_id/created_at; identity-preserving audit recovery is not qualified, nothing was changed")]
+    AuditOrderingInstalled { rows: u64 },
 }
 
 /// True when the exporter can emit rows for `table`: a measured table (one
@@ -566,6 +572,31 @@ pub async fn apply_import(
             sqlx::query("LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE")
                 .execute(&mut *tx)
                 .await?;
+        }
+    }
+    // Audit identity fence, before the first write. With audit rows in the
+    // file, hold off concurrent trigger installation (CREATE TRIGGER takes the
+    // same lock mode), then refuse if the ordering trigger is present. A
+    // failed catalog query propagates as a database error, never a refusal.
+    let audit_rows = rows
+        .iter()
+        .filter(|row| row.table == AUDIT_LOG_TABLE)
+        .count() as u64;
+    if audit_rows > 0 {
+        let audit_exists: bool =
+            sqlx::query_scalar("SELECT pg_catalog.to_regclass('internal_action_log') IS NOT NULL")
+                .fetch_one(&mut *tx)
+                .await?;
+        if audit_exists {
+            sqlx::query("LOCK TABLE internal_action_log IN SHARE ROW EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await?;
+        }
+        let installed: bool = sqlx::query_scalar(AUDIT_ORDER_TRIGGER_INSTALLED_SQL)
+            .fetch_one(&mut *tx)
+            .await?;
+        if installed {
+            return Err(ImportApplyError::AuditOrderingInstalled { rows: audit_rows });
         }
     }
     let mut inserted: u64 = 0;

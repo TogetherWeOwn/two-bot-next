@@ -54,6 +54,16 @@ A duplicate still cannot execute: reconciliation must inspect the persisted
 role, never infer it from today's map. Migration `0351` leaves older intents NULL
 rather than pretending their historical role is known.
 
+Rank identity for the public log comes from the Discord hierarchy role snapshot
+this executor already reads, with no extra REST call. The whole ladder is
+matched by `match_rank_roles`, and the typed `RoleAssignmentReport` is kept
+across the PUT and persisted atomically at `finish_role_assignment` as
+`audit_rank_key` (migration `0473`). The wire result and replay are unchanged.
+A missing or ambiguous ladder and a non-rank grant stay authorized as before
+but record no rank key and publish no rank line. `already_held` makes no extra
+reads and publishes nothing. A crash or lost local proof, and a legacy or
+reconciled row, leaves the rank key NULL and suppressed.
+
 Definitive Discord refusals terminalize as `discord_rejected`. Replay preserves
 the code, HTTP status, and retryability but uses a generic rejection message;
 provider/status-detail text is not in the store. The website branches on codes,

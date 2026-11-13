@@ -262,8 +262,17 @@ and revoking grants; do not copy a credential from another service if it fails.
 The plan is transactional and refuses unsafe existing groups instead of changing
 their login status or silently removing memberships. It contains no passwords.
 
-1. For the first bootstrap, the order is fixed: (a) the authorized
-   provisioning identity applies the rendered bootstrap phase
+1. For the first bootstrap, the order is fixed: first apply `sql/web_v1.sql`
+   as described below. Then the existing authorized provisioning identity
+   prints/reviews/applies `sql/internal_audit_bootstrap_helpers.sql` before
+   either introducing audit migration (0473/0474) is recorded. This explicit
+   artifact installs only the three real, private SECURITY INVOKER trigger
+   definitions; it installs no columns, triggers, state or ledger entries.
+   It refuses definition/security/ownership/ACL drift, overloads, dependencies
+   or a recorded introducing migration; an identical unactivated preparation
+   may be repeated. It cannot repair missing post-migration functions and is
+   never invoked by startup, a plan or verification. No new credential or grant
+   is needed. Next: (a) the authorized provisioning identity applies the rendered bootstrap phase
    (`two-bot db roles plan --phase bootstrap`), which transfers the existing
    allowlisted objects and skips relations/sequences the pending migrations
    have not created yet; (b) the operator provisions the dedicated migrator
@@ -272,7 +281,9 @@ their login status or silently removing memberships. It contains no passwords.
    migrations with `SET ROLE two_bot_migrator`, so new objects are
    migrator-owned from creation; (e) the provisioning identity applies the
    full phase (`two-bot db roles plan`, the default), idempotently; (f) verify
-   reads 0 findings. For later migrations, the order is fixed: (a) dispatch the
+   reads 0 findings. For later migrations, do not run the bootstrap artifact:
+   the ordinary self-contained migrations create the same private helpers and
+   activate them as the migrator. The order is fixed: (a) dispatch the
    matching migration workflow plan (`staging-migrate.yml` with
    `--target staging` for staging, `production-migrate.yml` with
    `--target production` for PlanetScale main `two_bot`, passing
@@ -285,6 +296,16 @@ their login status or silently removing memberships. It contains no passwords.
    plan after migrations and view updates, then `verify` reads 0 findings.
    `sql/web_v1.sql` is applied with `public` as the bot-table search
    path before the bootstrap phase; functions stay strict in both phases.
+   The self-contained audit migrations resolve and validate their current data
+   schema, refuse shadowed tables, overloads, foreign helper owners and existing
+   allocator state, and install helpers/state/triggers only there. Their single
+   schema-token templates render byte-identically to the public preparation
+   artifact for `public`, preserving prepared helper OIDs during replacement.
+   Non-public disposable regression schemas get independent catalog-first,
+   schema-qualified helpers and allocator state, not access to public's state.
+   This does not broaden the production role matrix: its three exact `public`
+   signatures, missing-function refusals, private ACLs and read-only verification
+   remain unchanged. See [audit migration boundaries](migrations.md#private-audit-helpers-migrations-0473-and-0474).
 2. Review and apply the rendered role plan with the authorized provisioning
    identity. It transfers only allowlisted objects to `two_bot_migrator`; unrelated
    tables are not transferred or granted to the runtime.

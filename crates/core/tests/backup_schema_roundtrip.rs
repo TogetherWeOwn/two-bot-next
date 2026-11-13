@@ -388,6 +388,27 @@ fn assert_archive_matches(contents: &DumpContents, expected: &Snapshot) {
     );
 }
 
+// Full audit-bearing backups remain mandatory and are tested separately.
+// These restore-specific fixtures deliberately carry no audit rows: the new
+// identity-preserving import boundary refuses those rows before any mutation.
+async fn dump_audit_free(
+    pool: &PgPool,
+    path: &Path,
+) -> Result<two_bot_core::backup::dump_file::DumpManifest, DbDumpError> {
+    let complete = path.with_extension("complete.gz");
+    dump(pool, &complete).await?;
+    let mut contents = inspect(&complete)?;
+    for table in &mut contents.manifest.tables {
+        if table.name == "internal_action_log" {
+            contents.rows -= table.count;
+            table.count = 0;
+        }
+    }
+    contents.buffers.remove("internal_action_log");
+    write_archive(path, &contents);
+    Ok(contents.manifest)
+}
+
 fn copy_contents(contents: &DumpContents) -> DumpContents {
     DumpContents {
         manifest: contents.manifest.clone(),
@@ -437,8 +458,8 @@ async fn triggers(pool: &PgPool) -> Vec<(String, String, String, String)> {
     .unwrap()
 }
 
-/// Migrated settings triggers. Restore suspends only the two guards; the CAS
-/// allocator stays enabled so restored rows receive fresh tokens.
+/// Migrated triggers. Restore suspends only the two settings guards; the CAS
+/// allocator and immutable internal-audit guards stay enabled.
 fn assert_settings_triggers(triggers: &[(String, String, String, String)]) {
     assert_eq!(
         triggers
@@ -452,8 +473,16 @@ fn assert_settings_triggers(triggers: &[(String, String, String, String)]) {
                 "guild_settings_audit",
                 "trg_guild_settings_audit_append_only"
             ),
+            ("internal_action_log", "internal_audit_allocate_order"),
+            ("internal_action_log", "internal_log_identity_immutable"),
+            ("internal_audit_order", "internal_audit_order_guard"),
+            (
+                "internal_audit_order",
+                "internal_audit_order_truncate_guard"
+            ),
+            ("internal_idempotency", "internal_intent_identity_immutable"),
         ],
-        "every migrated settings trigger exists"
+        "every migrated trigger exists"
     );
 }
 
@@ -705,7 +734,7 @@ async fn allocate_owned_sequences(
         .unwrap();
         assert_eq!(
             maximum.is_none(),
-            empty,
+            empty || sequence.table == "internal_action_log",
             "{}.{} emptiness",
             sequence.table,
             sequence.column
@@ -779,13 +808,20 @@ async fn assert_default_inserts(
         else {
             continue;
         };
+        let expected = if table == "internal_action_log" {
+            sqlx::query_scalar::<_, i64>("SELECT last_audit_id + 1 FROM internal_audit_order")
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        } else {
+            allocated + increment
+        };
         let inserted: i64 = sqlx::query_scalar(audited(statement.to_owned()))
             .fetch_one(pool)
             .await
             .unwrap();
         assert_eq!(
-            inserted,
-            allocated + increment,
+            inserted, expected,
             "{table}.{column} default INSERT must not collide"
         );
     }
@@ -1026,7 +1062,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     forget_voice_authority_migration(pool).await;
     let control_fields_before = voice_control_fields(pool).await;
     let tables = covered_tables(pool).await;
-    let before = snapshot(pool, &tables).await;
+    let mut before = snapshot(pool, &tables).await;
     let ledgers = vec![
         "_sqlx_migrations".to_owned(),
         "schema_migrations".to_owned(),
@@ -1069,6 +1105,36 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     let ledger_before = snapshot(pool, &ledgers).await;
     dirty_target(pool).await;
     let cas_before = next_cas_token(pool).await;
+    let unchanged = snapshot(pool, &tables).await;
+    for mode in ["ENABLE", "DISABLE"] {
+        sqlx::raw_sql(audited(format!(
+            "ALTER TABLE internal_action_log {mode} TRIGGER internal_audit_allocate_order"
+        )))
+        .execute(pool)
+        .await
+        .unwrap();
+        let error = restore(pool, &original)
+            .await
+            .expect_err("audit identities must never be rewritten");
+        assert!(
+            matches!(error, DbDumpError::AuditOrderingInstalled { rows: 3 }),
+            "{error}"
+        );
+        assert_eq!(snapshot(pool, &tables).await, unchanged);
+    }
+    sqlx::raw_sql("ALTER TABLE internal_action_log ENABLE TRIGGER internal_audit_allocate_order")
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_eq!(triggers(pool).await, guard_before);
+    let original = directory.path("audit-free-restore.ndjson.gz");
+    dump_audit_free(db.pool(), &original).await.unwrap();
+    let contents = inspect(&original).unwrap();
+    before.get_mut("internal_action_log").unwrap().rows.clear();
+    before.insert(
+        "internal_audit_order".into(),
+        unchanged["internal_audit_order"].clone(),
+    );
     let report = restore(pool, &original).await.unwrap();
     assert!(report.ok);
     assert!(report.dropped_columns.is_empty());
@@ -1413,6 +1479,172 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     db.close().await.unwrap();
 }
 
+/// Schema that owns the full migrated target in the non-public audit tests.
+const NON_PUBLIC_SCHEMA: &str = "audit_nonpublic";
+
+/// A fully migrated target whose only schema on the search path is
+/// [`NON_PUBLIC_SCHEMA`], with `public` removed afterwards. The real migration
+/// set runs while `public` still exists because 0361/0419/0420 name it for
+/// the send-admission table (which backups exclude); nothing a restore reads
+/// or writes lives there. Unqualified names, which restore resolves through
+/// the search path, therefore reach only this schema.
+async fn non_public_target() -> Option<(TestDatabase, PgPool)> {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").ok()?;
+    let fixture = TestDatabase::create(&url, &sqlx::migrate::Migrator::with_migrations(Vec::new()))
+        .await
+        .expect("create isolated test database");
+    sqlx::raw_sql(audited(format!("CREATE SCHEMA {NON_PUBLIC_SCHEMA}")))
+        .execute(fixture.pool())
+        .await
+        .unwrap();
+    let pool = fixture
+        .pool_with_search_path(NON_PUBLIC_SCHEMA)
+        .await
+        .expect("pool pinned to the non-public schema");
+    sqlx::migrate!("../cutover/migrations")
+        .run(&pool)
+        .await
+        .expect("real migrations apply inside the non-public schema");
+    sqlx::raw_sql("DROP SCHEMA public CASCADE")
+        .execute(fixture.pool())
+        .await
+        .unwrap();
+    let public_absent: bool = sqlx::query_scalar("SELECT to_regnamespace('public') IS NULL")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(public_absent, "the audit allocator must not be in public");
+    let activated: bool = sqlx::query_scalar(
+        "SELECT to_regclass('internal_audit_order') IS NOT NULL AND EXISTS (\
+         SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = current_schema() AND c.relname = 'internal_action_log' \
+           AND t.tgname = 'internal_audit_allocate_order' AND NOT t.tgisinternal)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(activated, "migration 0474 activated the non-public target");
+    Some((fixture, pool))
+}
+
+/// Audit-bearing restore into a target whose allocator lives outside `public`
+/// refuses in every trigger state and under catalog damage, before any write.
+#[tokio::test]
+async fn audit_bearing_restore_refuses_when_allocator_is_outside_public() {
+    let Some(db) = database().await else {
+        return;
+    };
+    seed(db.pool()).await;
+    forget_voice_authority_migration(db.pool()).await;
+    let directory = ArchiveDirectory::new();
+    let archive = directory.path("complete.ndjson.gz");
+    dump(db.pool(), &archive).await.unwrap();
+
+    let (target, pool) = non_public_target()
+        .await
+        .expect("test bootstrap already configured");
+    seed(&pool).await;
+    dirty_target(&pool).await;
+    // A non-initial allocator position, so a reset or overwrite is visible.
+    sqlx::raw_sql("DO $$ BEGIN WHILE (SELECT last_audit_id FROM internal_audit_order) < 41 LOOP UPDATE internal_audit_order SET last_audit_id = last_audit_id + 1; END LOOP; END $$")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let tables = covered_tables(&pool).await;
+    let unchanged = snapshot(&pool, &tables).await;
+    assert_eq!(
+        unchanged["internal_audit_order"].rows.len(),
+        1,
+        "the allocator singleton is part of the compared state"
+    );
+    assert!(
+        unchanged["members"].rows.len() > 1,
+        "unrelated target rows are part of the compared state"
+    );
+    let helper = format!("{NON_PUBLIC_SCHEMA}.internal_audit_allocate_order");
+    for mode in ["ENABLE", "DISABLE"] {
+        sqlx::raw_sql(audited(format!(
+            "ALTER TABLE internal_action_log {mode} TRIGGER internal_audit_allocate_order"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let error = restore(&pool, &archive)
+            .await
+            .expect_err("audit identities must never be rewritten");
+        assert!(
+            matches!(error, DbDumpError::AuditOrderingInstalled { rows: 3 }),
+            "{mode}: {error}"
+        );
+        assert_eq!(snapshot(&pool, &tables).await, unchanged, "{mode}");
+    }
+    // Schema-qualified catalog damage: the trigger is gone and the helper is
+    // renamed, but the retained allocator state still proves activation.
+    sqlx::raw_sql(audited(format!(
+        "DROP TRIGGER internal_audit_allocate_order ON internal_action_log; \
+         ALTER FUNCTION {helper}() RENAME TO hidden_allocator"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let error = restore(&pool, &archive)
+        .await
+        .expect_err("damaged installation stays fenced");
+    assert!(
+        matches!(error, DbDumpError::AuditOrderingInstalled { rows: 3 }),
+        "damaged: {error}"
+    );
+    assert_eq!(snapshot(&pool, &tables).await, unchanged, "damaged");
+    target.close().await.unwrap();
+    db.close().await.unwrap();
+}
+
+/// Control: the same non-public target still accepts an audit-free archive,
+/// and the restore leaves the installed allocator position alone.
+#[tokio::test]
+async fn audit_free_restore_into_non_public_allocator_target_keeps_the_allocator() {
+    let Some(db) = database().await else {
+        return;
+    };
+    seed(db.pool()).await;
+    forget_voice_authority_migration(db.pool()).await;
+    let directory = ArchiveDirectory::new();
+    let archive = directory.path("audit-free.ndjson.gz");
+    dump_audit_free(db.pool(), &archive).await.unwrap();
+
+    let (target, pool) = non_public_target()
+        .await
+        .expect("test bootstrap already configured");
+    sqlx::raw_sql(
+        "CREATE TABLE schema_migrations (id TEXT PRIMARY KEY); \
+         ALTER TABLE members ADD COLUMN backup_identity BIGINT GENERATED ALWAYS AS IDENTITY \
+             (START WITH 17 INCREMENT BY 3) UNIQUE;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql("DO $$ BEGIN WHILE (SELECT last_audit_id FROM internal_audit_order) < 41 LOOP UPDATE internal_audit_order SET last_audit_id = last_audit_id + 1; END LOOP; END $$")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let report = restore(&pool, &archive).await.unwrap();
+    assert!(report.ok);
+    let allocator: i64 =
+        sqlx::query_scalar("SELECT last_audit_id FROM internal_audit_order WHERE singleton")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(allocator, 41, "restore preserves the installed allocator");
+    let audit_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM internal_action_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(audit_rows, 0, "an audit-free archive writes no audit rows");
+    target.close().await.unwrap();
+    db.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn post_0469_archive_restores_voice_stores_verbatim() {
     let Some(db) = database().await else {
@@ -1438,7 +1670,7 @@ async fn post_0469_archive_restores_voice_stores_verbatim() {
     .unwrap();
     let directory = ArchiveDirectory::new();
     let path = directory.path("post-0469.ndjson.gz");
-    let manifest = dump(pool, &path).await.unwrap();
+    let manifest = dump_audit_free(pool, &path).await.unwrap();
     assert!(
         manifest.applied_cutover(469),
         "a migrated source records that 0469 was applied"
@@ -1540,7 +1772,7 @@ async fn between_0469_and_0470_archive_replays_only_the_0470_translation() {
     .unwrap();
     let directory = ArchiveDirectory::new();
     let path = directory.path("between-0469-0470.ndjson.gz");
-    let manifest = dump(pool, &path).await.unwrap();
+    let manifest = dump_audit_free(pool, &path).await.unwrap();
     assert!(
         manifest.applied_cutover(469) && !manifest.applied_cutover(470),
         "the simulated source records 0469 applied and 0470 not"
@@ -1647,7 +1879,7 @@ async fn post_0470_archive_restores_creation_gates_verbatim() {
     .unwrap();
     let directory = ArchiveDirectory::new();
     let path = directory.path("post-0470.ndjson.gz");
-    let manifest = dump(pool, &path).await.unwrap();
+    let manifest = dump_audit_free(pool, &path).await.unwrap();
     assert!(
         manifest.applied_cutover(470),
         "a migrated source records that 0470 was applied"
@@ -1710,7 +1942,7 @@ async fn empty_archived_sequence_tables_keep_the_target_position() {
     seed(pool).await;
     let directory = ArchiveDirectory::new();
     let path = directory.path("seeded.ndjson.gz");
-    dump(pool, &path).await.unwrap();
+    dump_audit_free(pool, &path).await.unwrap();
     let mut empty = inspect(&path).unwrap();
     let sequences = owned_sequences(pool).await;
     let sequence_tables: BTreeSet<_> = sequences
@@ -1763,7 +1995,10 @@ async fn empty_archived_sequence_tables_keep_the_target_position() {
     let intent: i64 = sqlx::query_scalar("INSERT INTO internal_idempotency (caller_hash, key_hash, action, payload_hash, state) VALUES (repeat('4', 64), repeat('5', 64), 'event.read', repeat('6', 64), 'in_flight') RETURNING intent_id").fetch_one(pool).await.unwrap();
     assert_eq!(intent, 2);
     let audit: i64 = sqlx::query_scalar("INSERT INTO internal_action_log (intent_id, phase, caller_hash, action) VALUES ($1, 'intent', repeat('4', 64), 'event.read') RETURNING audit_id").bind(intent).fetch_one(pool).await.unwrap();
-    assert_eq!(audit, 2);
+    assert_eq!(
+        audit, 4,
+        "the installed audit allocator, not its discarded serial default, survives restore"
+    );
     let identity: i64 = sqlx::query_scalar("INSERT INTO members (guild_id, member_id) VALUES ('100000000000000001', 'empty-default-member') RETURNING backup_identity").fetch_one(pool).await.unwrap();
     assert_eq!(identity, 26);
     db.close().await.unwrap();
@@ -1836,7 +2071,7 @@ async fn restore_never_reissues_values_handed_out_before_their_rows_were_deleted
 
     let directory = ArchiveDirectory::new();
     let path = directory.path("deleted-top-rows.ndjson.gz");
-    let manifest = dump(source, &path).await.unwrap();
+    let manifest = dump_audit_free(source, &path).await.unwrap();
     let mut expected = BTreeMap::new();
     for sequence in owned_sequences(source).await {
         let next = sequence_next(source, &sequence.name).await;
@@ -1965,7 +2200,7 @@ async fn restore_sql_failures_and_late_sequence_exhaustion_roll_back_data_guards
     seed(pool).await;
     let directory = ArchiveDirectory::new();
     let source = directory.path("source.ndjson.gz");
-    dump(pool, &source).await.unwrap();
+    dump_audit_free(pool, &source).await.unwrap();
     let contents = inspect(&source).unwrap();
     let mut bad_check = copy_contents(&contents);
     bad_check
@@ -1976,8 +2211,8 @@ async fn restore_sql_failures_and_late_sequence_exhaustion_roll_back_data_guards
     let bad_check_path = directory.path("valid-envelope-bad-check.ndjson.gz");
     write_archive(&bad_check_path, &bad_check);
     let mut bad_fk = copy_contents(&contents);
-    bad_fk.buffers.get_mut("internal_action_log").unwrap()[0]
-        .insert("intent_id".into(), json!("123456789"));
+    bad_fk.buffers.get_mut("ticket_transcripts").unwrap()[0]
+        .insert("ticket_id".into(), json!("absent-parent-ticket"));
     let bad_fk_path = directory.path("valid-envelope-bad-fk.ndjson.gz");
     write_archive(&bad_fk_path, &bad_fk);
     dirty_target(pool).await;
@@ -2138,10 +2373,10 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
-    dump(pool, &current_path).await.unwrap();
+    let current_path = directory.path("v17-source.ndjson.gz");
+    dump_audit_free(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, DUMP_VERSION);
     for name in [
         "game_activity_guild_aggregates",
         "assistant_monthly_builds",
@@ -2232,10 +2467,10 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
-    dump(pool, &current_path).await.unwrap();
+    let current_path = directory.path("v17-source.ndjson.gz");
+    dump_audit_free(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, DUMP_VERSION);
     for name in [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
@@ -2320,10 +2555,10 @@ async fn v10_archive_restores_and_clears_newer_tombstone() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
-    dump(pool, &current_path).await.unwrap();
+    let current_path = directory.path("v17-source.ndjson.gz");
+    dump_audit_free(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, DUMP_VERSION);
     // Frozen claim-only v10 shape: the merged v10 writer carried the
     // epoch-claim guard but predates the delete tombstones, token registry
     // event voice pair and starboard tables.
@@ -2416,10 +2651,10 @@ async fn v11_archive_restores_and_clears_newer_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
-    dump(pool, &current_path).await.unwrap();
+    let current_path = directory.path("v17-source.ndjson.gz");
+    dump_audit_free(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, DUMP_VERSION);
     // Frozen tombstone-only v11 shape: the merged v11 writer carried the
     // delete tombstones but predates the token registry event voice pair and starboard tables.
     for name in [
@@ -2508,10 +2743,10 @@ async fn v12_archive_restores_and_clears_newer_event_voice() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
-    dump(pool, &current_path).await.unwrap();
+    let current_path = directory.path("v17-source.ndjson.gz");
+    dump_audit_free(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, DUMP_VERSION);
     for table in [
         "event_voice_channels",
         "event_voice_presence",
@@ -2595,10 +2830,10 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
     let pool = db.pool();
     seed(pool).await;
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
-    dump(pool, &current_path).await.unwrap();
+    let current_path = directory.path("v17-source.ndjson.gz");
+    dump_audit_free(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, DUMP_VERSION);
     // Frozen registry-present v12 shape: the released writer carried the
     // token registry but predates the event voice pair and starboard tables.
     for name in [
@@ -2611,6 +2846,7 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
         "giveaway_entries",
         "giveaway_draws",
         "event_instance_windows",
+        "internal_audit_order",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -2639,7 +2875,8 @@ async fn v12_archive_restores_and_clears_newer_starboard_preserving_registry() {
             "giveaways",
             "giveaway_entries",
             "giveaway_draws",
-            "event_instance_windows"
+            "event_instance_windows",
+            "internal_audit_order"
         ]
     );
     assert_eq!(
@@ -2722,10 +2959,10 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
-    dump(pool, &current_path).await.unwrap();
+    let current_path = directory.path("v17-source.ndjson.gz");
+    dump_audit_free(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, DUMP_VERSION);
     for name in [
         "starboard_config",
         "starboard_starrers",
@@ -2734,6 +2971,7 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
         "giveaway_entries",
         "giveaway_draws",
         "event_instance_windows",
+        "internal_audit_order",
     ] {
         assert!(
             !old.buffers.remove(name).unwrap().is_empty(),
@@ -2768,7 +3006,8 @@ async fn v13_archive_restores_voice_and_registry_and_clears_newer_starboard() {
             "giveaways",
             "giveaway_entries",
             "giveaway_draws",
-            "event_instance_windows"
+            "event_instance_windows",
+            "internal_audit_order"
         ]
     );
     for name in &restored_tables {
@@ -2854,15 +3093,16 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
-    dump(pool, &current_path).await.unwrap();
+    let current_path = directory.path("v17-source.ndjson.gz");
+    dump_audit_free(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, DUMP_VERSION);
     for name in [
         "giveaways",
         "giveaway_entries",
         "giveaway_draws",
         "event_instance_windows",
+        "internal_audit_order",
     ] {
         let rows = old.buffers.remove(name).unwrap();
         assert!(!rows.is_empty(), "fixture must populate newer {name}");
@@ -2886,7 +3126,8 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
             "giveaways",
             "giveaway_entries",
             "giveaway_draws",
-            "event_instance_windows"
+            "event_instance_windows",
+            "internal_audit_order"
         ]
     );
     sqlx::query("DELETE FROM starboard_starrers")
@@ -2992,19 +3233,22 @@ async fn v15_archive_restores_and_clears_newer_event_instance_windows_without_ba
         );
     }
     let directory = ArchiveDirectory::new();
-    let current_path = directory.path("v16-source.ndjson.gz");
-    dump(pool, &current_path).await.unwrap();
+    let current_path = directory.path("v17-source.ndjson.gz");
+    dump_audit_free(pool, &current_path).await.unwrap();
     let mut old = inspect(&current_path).unwrap();
-    assert_eq!(old.manifest.version, 16);
+    assert_eq!(old.manifest.version, DUMP_VERSION);
     let windows = old.buffers.remove("event_instance_windows").unwrap();
     assert_eq!(
         windows.len(),
         2,
         "fixture must populate the instance windows"
     );
-    old.manifest
-        .tables
-        .retain(|table| table.name != "event_instance_windows");
+    let allocator = old.buffers.remove("internal_audit_order").unwrap();
+    assert_eq!(allocator.len(), 1, "fixture must populate allocator state");
+    let allocator_before = snapshot(pool, &["internal_audit_order".to_owned()]).await;
+    old.manifest.tables.retain(|table| {
+        table.name != "event_instance_windows" && table.name != "internal_audit_order"
+    });
     old.manifest.version = 15;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-instance-windows-v15.ndjson.gz");
@@ -3013,7 +3257,7 @@ async fn v15_archive_restores_and_clears_newer_event_instance_windows_without_ba
     assert_eq!(inspected.manifest.version, 15);
     assert_eq!(
         inspected.manifest.missing_tables(),
-        ["event_instance_windows"]
+        ["event_instance_windows", "internal_audit_order"]
     );
     // The v15 archive carries no windows. A destination window must not
     // survive, and no window may be invented from the restored bindings.
@@ -3032,6 +3276,11 @@ async fn v15_archive_restores_and_clears_newer_event_instance_windows_without_ba
     assert_eq!(
         windows, 0,
         "a pre-v16 restore clears the windows and never backfills liveness"
+    );
+    assert_eq!(
+        snapshot(pool, &["internal_audit_order".to_owned()]).await,
+        allocator_before,
+        "legacy restore preserves target allocator state"
     );
     db.close().await.unwrap();
 }
@@ -3053,7 +3302,7 @@ async fn v3_prefix_restores_into_migrated_schema_without_retaining_newer_target_
     let guards = triggers(pool).await;
     let directory = ArchiveDirectory::new();
     let source = directory.path("v4-source.ndjson.gz");
-    dump(pool, &source).await.unwrap();
+    dump_audit_free(pool, &source).await.unwrap();
     let mut legacy = inspect(&source).unwrap();
     legacy.manifest.version = 3;
     legacy.manifest.sequence_marks.clear();
@@ -3157,6 +3406,11 @@ async fn v3_prefix_restores_into_migrated_schema_without_retaining_newer_target_
             assert_eq!(
                 &after[table], archived,
                 "{table}: native v3 cells survive on real schema"
+            );
+        } else if table == "internal_audit_order" {
+            assert_eq!(
+                &after[table], archived,
+                "the target audit allocator is never reset"
             );
         } else if table == "guild_settings_revision" {
             assert_eq!(
@@ -3413,10 +3667,79 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
         "the shipped backup records the simulated pre-0469 source evidence"
     );
 
+    // The real CLI refuses the complete audit-bearing archive before changing
+    // a freshly migrated destination. No trigger is disabled for recovery.
+    let refused_target = database().await.expect("test bootstrap already configured");
+    let unchanged = snapshot(refused_target.pool(), &tables).await;
+    let refused = shipped_cli(
+        Command::new(&binary)
+            .arg("restore")
+            .arg(archive)
+            .arg("--force")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TWO_RESTORE_URL", fixture_url(&refused_target))
+            .env("TWO_DATABASE_TLS", "local-only"),
+        "two-bot restore audit identity refusal",
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr)
+        .contains("identity-preserving audit recovery is not qualified"));
+    assert_eq!(snapshot(refused_target.pool(), &tables).await, unchanged);
+    refused_target.close().await.unwrap();
+    // Continue the existing two-month end-to-end drill with a separately
+    // published, explicitly audit-free source. Keep the full backup above.
+    sqlx::query("DELETE FROM internal_action_log")
+        .execute(source)
+        .await
+        .unwrap();
+    let before = snapshot(source, &tables).await;
+    let audit_free_dir = directory.path("audit-free");
+    std::fs::create_dir(&audit_free_dir).unwrap();
+    let decoy_copy = audit_free_dir.join(decoy.file_name().unwrap());
+    std::fs::copy(&decoy, &decoy_copy).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&decoy_copy)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(946_684_800))
+        .unwrap();
+    let backup = shipped_cli(
+        Command::new(&binary)
+            .arg("backup")
+            .current_dir(&audit_free_dir)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TWO_DATABASE_URL", fixture_url(&db))
+            .env("TWO_DATABASE_TLS", "local-only")
+            .env("TWO_BACKUP_DIR", &audit_free_dir)
+            .env("TWO_BACKUP_KEEP", "14"),
+        "two-bot backup audit-free drill fixture",
+    );
+    assert!(backup.status.success());
+    let published: Vec<PathBuf> = std::fs::read_dir(&audit_free_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| *path != decoy_copy)
+        .collect();
+    let [archive] = published.as_slice() else {
+        panic!("one audit-free archive expected");
+    };
+    let contents = inspect(archive).unwrap();
+    assert_eq!(
+        contents
+            .manifest
+            .tables
+            .iter()
+            .find(|t| t.name == "internal_action_log")
+            .unwrap()
+            .count,
+        0
+    );
     // Each run allocates a NEW migrated scratch database and retains its
     // evidence, as the drill unit does. Nothing restores into a reused target.
     let guard_before = triggers(source).await;
-    let script = shipped_drill_script(&directory.0, &binary);
+    let script = shipped_drill_script(&audit_free_dir, &binary);
     let evidence_root = directory.path("drill-evidence");
     std::fs::create_dir(&evidence_root).expect("pre-provision retained drill evidence root");
     let mut evidence_dirs = Vec::new();
@@ -3536,6 +3859,17 @@ async fn shipped_backup_and_restore_drill_recover_the_complete_migrated_schema()
         // migrated target column; restore drops it (see receipt above) while
         // every real column round-trips exactly.
         let mut expected = before.clone();
+        let allocator: (bool, i64) = sqlx::query_as("SELECT last_created_at = TIMESTAMPTZ '1970-01-01 00:00:00+00', last_audit_id FROM internal_audit_order")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            allocator,
+            (true, 0),
+            "fresh drill target keeps its installed allocator, not the source mark"
+        );
+        expected.insert(
+            "internal_audit_order".into(),
+            after["internal_audit_order"].clone(),
+        );
         if let Some(members) = expected.get_mut("members") {
             if let Some(index) = members
                 .columns
@@ -3738,7 +4072,7 @@ async fn restore_refences_pre_0142_pending_scheduled_rows() {
     .unwrap();
     let directory = ArchiveDirectory::new();
     let fresh = directory.path("scheduled.ndjson.gz");
-    dump(pool, &fresh).await.unwrap();
+    dump_audit_free(pool, &fresh).await.unwrap();
 
     // A current archive restores the recorded fence faithfully.
     let report = restore(pool, &fresh).await.unwrap();

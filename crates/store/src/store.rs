@@ -829,9 +829,10 @@ mod privacy_lock_tests {
             .expect("system clock")
             .as_nanos();
         let schema = format!("{prefix}_{nonce}_{}", std::process::id());
+        // Match the schema-relative audit migrations' 59-byte identifier bound.
         assert!(
             !schema.is_empty()
-                && schema.len() <= 63
+                && schema.len() <= 59
                 && schema
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
@@ -1040,7 +1041,7 @@ mod privacy_lock_tests {
     /// iteration fails with no timing dependence.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn touch_activity_deterministic_race_create_no_row() {
-        let Some((pool, schema)) = test_pool("store_privacy_touch_deterministic").await else {
+        let Some((pool, schema)) = test_pool("store_privacy_touch_det").await else {
             return;
         };
         let guild: u64 = GUILD.parse().unwrap();
@@ -1093,7 +1094,7 @@ mod privacy_lock_tests {
     /// absorb the wait and leave this lock unpinned.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mark_bot_deterministic_race_create_no_row() {
-        let Some((pool, schema)) = test_pool("store_privacy_mark_deterministic").await else {
+        let Some((pool, schema)) = test_pool("store_privacy_mark_det").await else {
             return;
         };
         let guild: u64 = GUILD.parse().unwrap();
@@ -1140,7 +1141,7 @@ mod privacy_lock_tests {
     /// the insert lands after the purge.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn record_deterministic_race_never_persists() {
-        let Some((pool, schema)) = test_pool("store_privacy_record_deterministic").await else {
+        let Some((pool, schema)) = test_pool("store_privacy_record_det").await else {
             return;
         };
         let guild: u64 = GUILD.parse().unwrap();

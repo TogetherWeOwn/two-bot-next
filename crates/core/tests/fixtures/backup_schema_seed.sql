@@ -388,28 +388,26 @@ INSERT INTO internal_clock_high_water (domain, high_water_ms, observed_at)
 VALUES ('internal_nonce_db', 1785578400000, '2026-08-01T10:00:00Z');
 INSERT INTO internal_idempotency
     (intent_id, caller_hash, key_hash, action, payload_hash, state, guild_id, actor_id,
-     target_id, created_at, updated_at, response_code, http_status, resource_id, affected)
+     target_id, created_at, updated_at, response_code, http_status, resource_id, affected, resolved_role_id, audit_rank_key)
 VALUES
     (83, repeat('b', 64), repeat('c', 64), 'role.assign', repeat('d', 64), 'completed',
      '100000000000000001', '100000000000000002', '100000000000000004',
-     '2026-08-01T10:00:00Z', '2026-08-01T10:00:01Z', 'success', 200, '100000000000000010', 1),
+     '2026-08-01T10:00:00Z', '2026-08-01T10:00:01Z', 'success', 200, '100000000000000010', 1, '100000000000000010', 'prospect'),
     (89, repeat('b', 64), repeat('e', 64), 'announcement.post', repeat('f', 64), 'unknown',
      '100000000000000001', '100000000000000002', '100000000000000003',
-     '2026-08-01T11:00:00Z', '2026-08-01T11:00:01Z', NULL, NULL, NULL, NULL),
+     '2026-08-01T11:00:00Z', '2026-08-01T11:00:01Z', NULL, NULL, NULL, NULL, NULL, NULL),
     (97, repeat('b', 64), repeat('1', 64), 'event.read', repeat('2', 64), 'in_flight',
-     NULL, NULL, NULL, '2026-08-01T12:00:00Z', '2026-08-01T12:00:01Z', NULL, NULL, NULL, NULL);
+     NULL, NULL, NULL, '2026-08-01T12:00:00Z', '2026-08-01T12:00:01Z', NULL, NULL, NULL, NULL, NULL, NULL);
 INSERT INTO internal_action_log
     (audit_id, intent_id, phase, caller_hash, action, guild_id, actor_id, target_id,
-     response_code, http_status, evidence_code, created_at)
+     response_code, http_status, evidence_code, created_at, resolved_role_id, audit_rank_key)
 VALUES
     (101, 83, 'terminal', repeat('b', 64), 'role.assign', '100000000000000001',
-     '100000000000000002', '100000000000000004', 'success', 200, 'discord_confirmed_effect', '2026-08-01T10:00:01Z'),
+     '100000000000000002', '100000000000000004', 'success', 200, 'discord_confirmed_effect', '2026-08-01T10:00:01Z', '100000000000000010', 'prospect'),
     (103, 89, 'unknown', repeat('b', 64), 'announcement.post', '100000000000000001',
-     '100000000000000002', '100000000000000003', NULL, NULL, NULL, '2026-08-01T11:00:01Z'),
+     '100000000000000002', '100000000000000003', NULL, NULL, NULL, '2026-08-01T11:00:01Z', NULL, NULL),
     (109, 97, 'intent', repeat('b', 64), 'event.read', NULL, NULL, NULL,
-     NULL, NULL, NULL, '2026-08-01T12:00:00Z');
-UPDATE internal_idempotency SET resolved_role_id = '100000000000000010' WHERE intent_id = 83;
-UPDATE internal_action_log SET resolved_role_id = '100000000000000010' WHERE intent_id = 83;
+     NULL, NULL, NULL, '2026-08-01T12:00:00Z', NULL, NULL);
 INSERT INTO internal_discord_events (event_hash, claimed_at)
 VALUES (repeat('3', 64), '2026-08-01T10:00:00.123456Z');
 INSERT INTO internal_event_keys (guild_id, event_key, event_id, created_at, updated_at)

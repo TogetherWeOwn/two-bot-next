@@ -90,6 +90,19 @@ also consumes mismatched attempts; do not undo a burn on later validation/error.
 committed intent/audit transaction before REST. Every later audit copies that
 original scalar, not a newly evaluated role map. Migration `0351` adds nullable
 columns; older intents remain NULL and must not be guessed from current config.
+Migration `0473` likewise adds nullable `audit_event_key` and `audit_rank_key`
+to `internal_idempotency` and `internal_action_log`. The validated event
+request key is pinned at claim and copied into the terminal audit; reconcile
+must match a non-null pinned key when repairing the mapping. A legacy NULL
+intent may still have its operational mapping repaired, but its audit stays
+unnamed with no reverse-map fallback. A pre-upgrade event released as `not_sent`
+may be reclaimed with the validated request key only after action, exact payload
+hash and all other subject scalars match. Its NULL event identity stays NULL
+through retry and completion; this does not enrich historical publication facts.
+Already-pinned non-null keys still require exact equality. The rank key is persisted
+atomically by `finish_role_assignment` from the retained `RoleAssignmentReport`
+(see `internal-member-execution.md`). Audit UPDATEs cannot change these
+identity or publication facts; the authorized erasure DELETE is retained.
 `TerminalResponse` is `Success { resource_id: Option<DiscordId>, affected: u32,
 outcome: Option<EventOutcome>, stop_reason: Option<PurgeStopReason> }` (HTTP 200)
 or `Failure(TerminalFailure)` with

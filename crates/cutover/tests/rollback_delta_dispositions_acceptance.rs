@@ -46,6 +46,8 @@ const EXPECTED_DISPOSITIONS: &[(&str, &str)] = &[
     ("gateway_onboarding_jobs", ACCEPT_WITH_REASON),
     // Changes are visible via guild_settings.updated_at.
     ("guild_settings_revision", ACCEPT_WITH_REASON),
+    // Audit high-water state is retained on rollback, never blindly imported.
+    ("internal_audit_order", MANUAL_RECONCILE_REQUIRED),
     // Wholesale-replaced configuration with no alternate evidence named.
     ("level_role_rewards", MANUAL_RECONCILE_REQUIRED),
     // Child rows are created and updated with the parent lfg_posts row.

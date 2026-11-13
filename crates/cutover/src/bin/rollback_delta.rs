@@ -236,6 +236,14 @@ async fn run_import(args: Args) -> i32 {
             );
             1
         }
+        Err(
+            refusal @ two_bot_cutover::rollback_import::ImportApplyError::AuditOrderingInstalled {
+                ..
+            },
+        ) => {
+            eprintln!("rollback-delta import: {refusal}");
+            1
+        }
         Err(_) => {
             eprintln!("rollback-delta import: database error (details omitted)");
             1

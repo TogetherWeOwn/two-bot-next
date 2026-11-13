@@ -79,6 +79,7 @@
   "TWO_INTERNAL_ALLOW_ADD_MEMBER": "Capability gate for internal member-add actions.",
   "TWO_INTERNAL_ALLOW_AUTOMATIONS": "Capability gate for internal automation actions.",
   "TWO_INTERNAL_ALLOW_AUTOMATIONS_OVERWRITE": "Separate capability gate for overwriting automations.",
+  "TWO_INTERNAL_ALLOW_BOTLOG_READ": "Capability gate for bot log reads.",
   "TWO_INTERNAL_ALLOW_EVENT_CANCEL": "Capability gate for event cancellation.",
   "TWO_INTERNAL_ALLOW_EVENT_READ": "Capability gate for event reads.",
   "TWO_INTERNAL_ALLOW_MODERATION": "Capability gate for internal moderation actions.",

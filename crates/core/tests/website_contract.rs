@@ -37,6 +37,9 @@ use two_bot_core::{
 };
 use two_bot_testsupport::{guard_database_url, TestDatabase};
 
+#[path = "support/audit_schema_contract.rs"]
+mod audit_schema_contract;
+
 const GUILD: &str = "326474832151838730";
 const OBSERVED_AT: &str = "2026-08-25T20:00:00.000Z";
 
@@ -256,6 +259,12 @@ async fn isolated_contracts_keep_their_own_tables_and_leave_public_untouched() {
     write_counter(&public, GUILD, &fresh, 333)
         .await
         .expect("public reading");
+    // The migrated public audit schema carries rows and allocator state that
+    // no isolated migration or reapply may touch.
+    audit_schema_contract::assert_schema_bound(&public, "public").await;
+    audit_schema_contract::insert_audit(&public, "public", '1').await;
+    audit_schema_contract::insert_audit(&public, "public", '2').await;
+    let public_audit_before = audit_schema_contract::snapshot(&public, "public").await;
 
     let mut isolated = Vec::new();
     for (schema, count) in [("tog10090_a", 111), ("tog10090_b", 222)] {
@@ -273,6 +282,29 @@ async fn isolated_contracts_keep_their_own_tables_and_leave_public_untouched() {
     }
     // Reapplying A must not rebind B or public either (idempotence).
     apply_web_contract(&isolated[0]).await.expect("reapply A");
+    assert_eq!(
+        audit_schema_contract::snapshot(&public, "public").await,
+        public_audit_before,
+        "isolated migrations and reapply must leave public audit objects, ACLs, owners, state and log untouched"
+    );
+    for schema in ["tog10090_a", "tog10090_b"] {
+        audit_schema_contract::assert_schema_bound(&public, schema).await;
+    }
+    let audit_pools = [
+        ("public", &public),
+        ("tog10090_a", &isolated[0]),
+        ("tog10090_b", &isolated[1]),
+    ];
+    audit_schema_contract::assert_insert_advances_only(
+        &isolated[0],
+        "tog10090_a",
+        '3',
+        &audit_pools,
+    )
+    .await;
+    audit_schema_contract::assert_insert_advances_only(&public, "tog10090_b", '4', &audit_pools)
+        .await;
+    audit_schema_contract::assert_insert_advances_only(&public, "public", '5', &audit_pools).await;
     for (contract, query, expected_count) in [
         (
             "web_v1",
@@ -314,6 +346,20 @@ async fn isolated_contracts_keep_their_own_tables_and_leave_public_untouched() {
     .execute(&public)
     .await
     .expect("remove isolated scratch schemas");
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn raw_audit_migrations_refuse_hostile_installs_without_catalog_change() {
+    let fixture = connect().await;
+    audit_schema_contract::refuses_hostile_installs_without_catalog_change(&fixture).await;
+    fixture.close().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn raw_audit_migrations_bind_catalog_builtins_under_shadowing_search_path() {
+    let fixture = connect().await;
+    audit_schema_contract::install_and_insert_bind_catalog_builtins(&fixture).await;
     fixture.close().await.expect("drop test database");
 }
 

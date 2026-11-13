@@ -28,6 +28,7 @@ pub mod automod_runtime;
 #[cfg(feature = "db")]
 pub mod automod_store;
 pub mod backup;
+pub mod botlog;
 pub mod channel_moderation;
 #[cfg(feature = "db")]
 pub mod channel_moderation_release;

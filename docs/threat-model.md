@@ -34,11 +34,12 @@ ingress "staging-only, dark by default" (`wrangler/src/index.ts:882-883`).
 ## Scope and current exposure
 
 The historical contract has **18 actions**. The current core allowlist has
-**20** (rechecked 2026-11-03 for the `voice.snapshot` addition): those 18 plus
-`event.read` and the keyless `voice.snapshot` gateway-cache read
+**21** (rechecked 2026-11-03 for the `botlog.read` addition): those 18 plus
+`event.read`, the keyless `voice.snapshot` gateway-cache read and the keyless
+`botlog.read` publishable-log projection
 (`crates/core/src/internal_actions.rs:675`; nine moderation verbs at `:686`,
-14 idempotency-bound at `:703`). All 20 are assessed below. `docs/parity.md:226`
-records the same 20 actions with `event.read` and the `settings.set`
+14 idempotency-bound at `:703`). All 21 are assessed below. `docs/parity.md:226`
+records the same 21 actions with `event.read` and the `settings.set`
 compare-and-set (`expected_version`); the core constants above are
 authoritative. The legacy `docs/INTERNAL_ACTIONS.md` is not in this checkout;
 the ported core, [parity inventory](parity.md) and
@@ -50,7 +51,9 @@ announcement receiver (#343), the staging-only ingress (#370), `event.read`
 settings get/set (#679), event upsert/cancel (#680), membership (#686) and
 channel moderation (#687) are wired through the signed receiver
 (`crates/bot/src/internal_action_http.rs:1180`), alongside the keyless
-`voice.snapshot` gateway-cache read (`crates/bot/src/voice_snapshot.rs`):
+`voice.snapshot` gateway-cache read (`crates/bot/src/voice_snapshot.rs`) and
+the keyless `botlog.read` publishable-log projection
+(`crates/core/src/botlog.rs`):
 announcement execution
 (`crates/discord/src/internal_actions.rs:115`), member join/role assignment
 (`crates/discord/src/internal_exec/member.rs`), guild settings CAS,
@@ -253,6 +256,7 @@ policy; that fence must not be taken from a caller-supplied guild ID.
 | `moderation.unlock` | Restore participation; bad overwrite restoration can widen access | Same policy; read live masks, restore only the recorded lockdown bits (thread/reaction bits only while still locked), preserve other live bits, refuse send-bit drift; serialize with lockdown. External admin GET/write races are not fenced. | Yes |
 | `event.read` (additional nineteenth) | Disclose one mapped event's status/details | `ALLOW_EVENT_READ`; mapped event and guild ownership checks, minimal response, no arbitrary event enumeration. | No |
 | `voice.snapshot` (twentieth) | Disclose live voice-room occupancy: channel names and occupant member IDs | `ALLOW_VOICE_SNAPSHOT`; guild voice channels only (stage excluded), bots excluded, AFK occupants listed but untotaled, relay-budget-capped, member IDs only (no usernames or presence). Rooms add `occupied_since` (Zulu instant the room's current continuous occupancy began, `null` when unknown) and, only on the room bound to a currently-windowed event, `event_key` (the site's own key echoed back, omitted elsewhere): both are room-level, neither names a member's join time. Refuses `discord_unavailable` unless the gateway supervisor reports `Connected`, so a warm cache never serves stale occupancy mid-reconnect. | No |
+| `botlog.read` (twenty-first) | Disclose the publishable bot log: event, announcement, rank and join entries | `ALLOW_BOTLOG_READ`; closed projection over terminal successes only — failures, refusals, in-flight rows, moves/DMs, moderation/settings/automations and no-ops never publish; events name `event_key` only, announcements name the configured channel key only, unnameable rows drop while still advancing `next`; `privacy_opt_outs` subjects keep their entry but omit `subject_id`. | No |
 
 The nine moderation actions require **both** `TWO_INTERNAL_ALLOW_MODERATION=1`
 and `TWO_MODERATION=1`. The policy library checks actor permissions, self-target,

@@ -86,6 +86,7 @@ from this map, and the acceptance battery pins the JSON encoding):
 | `community_scorecard_attempts` | `accept-with-reason` | A completed week is visible via `community_scorecard_runs.generated_at` |
 | `gateway_onboarding_jobs` | `accept-with-reason` | Transient restart-recovery queue; rows hold no durable member state |
 | `guild_settings_revision` | `accept-with-reason` | Changes are visible via `guild_settings.updated_at` |
+| `internal_audit_order` | `manual-reconcile-required` | Monotonic audit high-water state is not a wall-clock write time; retain it on image rollback. Audit-bearing offline recovery must reconcile state and tuples through a separately qualified procedure, not ordinary import |
 | `level_role_rewards` | `manual-reconcile-required` | Wholesale-replaced configuration with no alternate evidence named |
 | `lfg_roles` | `accept-with-reason` | Child rows are created and updated with the parent `lfg_posts` row |
 | `moderation_channel_executions` | `accept-with-reason` | Written with its parent `moderation_idempotency` claim (measured via `claimed_at`) |
