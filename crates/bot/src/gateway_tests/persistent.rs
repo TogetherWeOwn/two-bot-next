@@ -238,7 +238,11 @@ async fn write_case(
 }
 
 async fn writer_cases(db: &TestDb, store: &GatewaySessionStore, url: &str, expected: &str) {
-    for with_job in [false, true] {
+    for (with_job, baseline_uses, committed_uses) in [(false, 2, 3), (true, 3, 4)] {
+        assert_eq!(
+            store.invite_snapshots().await.unwrap()[0].uses,
+            baseline_uses
+        );
         store.clear().await.unwrap();
         sqlx::query("DELETE FROM gateway_onboarding_jobs")
             .execute(&db.pool)
@@ -258,7 +262,7 @@ async fn writer_cases(db: &TestDb, store: &GatewaySessionStore, url: &str, expec
             ..Default::default()
         };
         for (seq, uses, fail, action) in [
-            (1, 3, false, Some(DispatchAction::Apply)),
+            (1, committed_uses, false, Some(DispatchAction::Apply)),
             (2, 99, true, None),
             (1, 99, false, Some(DispatchAction::Duplicate)),
         ] {
@@ -275,7 +279,10 @@ async fn writer_cases(db: &TestDb, store: &GatewaySessionStore, url: &str, expec
                 raw().await,
                 ("atomic".into(), 1, expected.into(), saved.updated_at_ms)
             );
-            assert_eq!(store.invite_snapshots().await.unwrap()[0].uses, 3);
+            assert_eq!(
+                store.invite_snapshots().await.unwrap()[0].uses,
+                committed_uses
+            );
             let jobs: Vec<(String, i64)> =
                 sqlx::query_as("SELECT session_id, seq FROM gateway_onboarding_jobs")
                     .fetch_all(&db.pool)
