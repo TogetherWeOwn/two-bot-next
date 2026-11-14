@@ -403,6 +403,11 @@ fn copy_contents(contents: &DumpContents) -> DumpContents {
 }
 
 fn write_archive(path: &Path, contents: &DumpContents) {
+    write_raw_archive(path, contents);
+    inspect(path).expect("test archive must pass file validation before reaching restore");
+}
+
+fn write_raw_archive(path: &Path, contents: &DumpContents) {
     let mut encoder = new_encoder();
     write_line(
         &mut encoder,
@@ -427,7 +432,6 @@ fn write_archive(path: &Path, contents: &DumpContents) {
         .open(path)
         .unwrap();
     std::io::Write::write_all(&mut file, &finish_gzip(encoder).unwrap()).unwrap();
-    inspect(path).expect("test archive must pass file validation before reaching restore");
 }
 
 async fn triggers(pool: &PgPool) -> Vec<(String, String, String, String)> {
