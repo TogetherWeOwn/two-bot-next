@@ -255,6 +255,27 @@ class NativeRustToolchainTest(unittest.TestCase):
                                             for s in job["steps"][:index]))
         self.assertEqual(actual, expected)
 
+    def test_rust_action_inventory_is_closed(self):
+        # Preserve the pinned one-off writer's historical provenance without
+        # permitting another Rust action caller or an unreviewed pin change.
+        expected = [("configuration-reference.yml", "configuration-reference",
+                     "dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8")]
+
+        def inventory(workflows):
+            return sorted((name, job_id, step["uses"])
+                          for name, doc in workflows.items()
+                          for job_id, job in (doc.get("jobs") or {}).items()
+                          for step in job.get("steps", [])
+                          if str(step.get("uses", "")).lower().startswith("dtolnay/rust-toolchain@"))
+
+        workflows = {path.name: yaml.safe_load(path.read_text()) or {}
+                     for pattern in ("*.yml", "*.yaml")
+                     for path in (ROOT / ".github/workflows").glob(pattern)}
+        self.assertEqual(inventory(workflows), expected)
+        extra = {"new.yml": {"jobs": {"new": {"steps": [{"uses": expected[0][2]}]}}}}
+        self.assertNotEqual(inventory(workflows | extra), expected)
+        self.assertNotEqual(inventory({}), expected)
+
     def test_no_workflow_consumes_installer_outputs(self):
         # The action exposed cachekey/name/... outputs; the native installer
         # has none, so no step may read outputs from an installer step.
