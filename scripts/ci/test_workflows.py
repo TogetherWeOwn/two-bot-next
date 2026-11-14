@@ -34,7 +34,7 @@ STATIC_FALSE = "${{ false }}"
 JOB_INVENTORY = {
     # The nextest branch adds its required lane; main adds the production schema gate.
     # The inventory pin must retain both changes.
-    "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
+    "check.yml": {"check", "deploy-id-fixtures", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
                   "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok",
                   # `check` is now the lint lane; the test steps it used to
                   # carry run in these parallel lanes, all gated by ci-ok.
