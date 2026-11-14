@@ -487,13 +487,15 @@ class PromotionCleanExecutionTests(unittest.TestCase):
             "Snapshot staging identity and generate per-deploy image provenance")
         return run_of(prepare)
 
-    def run_prepare(self, gateway="false", voice="false", unpaired="false"):
+    def run_prepare(self, gateway="false", voice="false", unpaired="false",
+                    avatar="false"):
         box = Sandbox(self)
         result = box.run(self.prepare_body(), extra_env={
             "GITHUB_SHA": SHA,
             "INJECT_GATEWAY_FAILURE": gateway,
             "INJECT_VOICE_STALL": voice,
             "INJECT_UNPAIRED_DISCONNECT": unpaired,
+            "SET_BOT_AVATAR_ONCE": avatar,
             "ROLLOUT_DIR": str(box.runner_temp),
             "WRANGLER_OUTPUT_FILE_PATH": str(box.runner_temp / "wrangler-output.ndjson"),
         })
@@ -501,6 +503,13 @@ class PromotionCleanExecutionTests(unittest.TestCase):
 
     def test_clean_run_marks_promotion_clean(self):
         box, result = self.run_prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(box.output_vars().get("promotion_clean"), "true")
+
+    def test_one_shot_avatar_sync_keeps_promotion_clean(self):
+        # The avatar switch serves identical bytes, so it must not feed the
+        # dirty branch (see the comment on SET_BOT_AVATAR_ONCE in the workflow).
+        box, result = self.run_prepare(avatar="true")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(box.output_vars().get("promotion_clean"), "true")
 

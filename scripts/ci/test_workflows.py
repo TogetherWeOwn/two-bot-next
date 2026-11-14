@@ -593,7 +593,7 @@ def staging_push_filter_errors(name, push):
 
 
 def staging_dispatch_errors(workflow):
-    """The active staging workflow keeps exactly six fenced dispatch inputs.
+    """The active staging workflow keeps exactly seven fenced dispatch inputs.
 
     `release_fence` exists on main (TOG-11143) so post-handoff release of an
     uninitialized/parked singleton is explicit and auditable; it defaults to
@@ -606,12 +606,14 @@ def staging_dispatch_errors(workflow):
     expression in staging_error_rate_gate_errors. `inject_voice_stall` and
     `inject_unpaired_disconnect` are the remediation-drill switches with the
     same shape, readable only through the pinned dispatch-only expressions
-    in staging_fault_injection_errors. `sha` pins the deployed commit for
-    arm/disarm at one exact revision: an optional string, empty by default
-    (empty deploys the workflow head), readable only through the pinned
-    dispatch-or-head expression in staging_pinned_sha_errors. Anything else
-    in the dispatch block (an arming switch, a deploy flag, a default of
-    true) is an unreviewed deploy route outside the pinned shape.
+    in staging_fault_injection_errors. `set_bot_avatar_once` is the staging
+    bot avatar one-shot with the same shape, readable only through the pinned
+    dispatch-only expression in staging_avatar_sync_errors. `sha` pins the
+    deployed commit for arm/disarm at one exact revision: an optional string,
+    empty by default (empty deploys the workflow head), readable only through
+    the pinned dispatch-or-head expression in staging_pinned_sha_errors.
+    Anything else in the dispatch block (an arming switch, a deploy flag, a
+    default of true) is an unreviewed deploy route outside the pinned shape.
     """
     name = "deploy-staging.yml"
     errors = []
@@ -621,10 +623,11 @@ def staging_dispatch_errors(workflow):
     errors.extend(staging_push_filter_errors(name, on.get("push")))
     dispatch = on.get("workflow_dispatch") or {}
     expected_booleans = {"release_fence", "inject_gateway_failure", "inject_error_rate_spike",
-                         "inject_voice_stall", "inject_unpaired_disconnect"}
+                         "inject_voice_stall", "inject_unpaired_disconnect",
+                         "set_bot_avatar_once"}
     expected = expected_booleans | {"sha"}
     if set(dispatch) != {"inputs"} or set(dispatch.get("inputs") or {}) != expected:
-        errors.append(f"{name}: workflow_dispatch must carry only the release_fence, drill and sha inputs")
+        errors.append(f"{name}: workflow_dispatch must carry only the release_fence, drill, avatar and sha inputs")
     else:
         for input_name in expected_booleans:
             spec = dispatch["inputs"][input_name] or {}
@@ -652,6 +655,13 @@ FAULT_MARKERS = (
     "TWO_VOICE_STALL_FAULT_INJECTION", "--inject-voice-stall",
     "inject_unpaired_disconnect", "INJECT_UNPAIRED_DISCONNECT",
     "TWO_GATEWAY_UNPAIRED_FAULT_INJECTION", "--inject-unpaired-disconnect",
+)
+# Staging bot avatar one-shot (docs/runbook.md#staging-bot-avatar-one-shot): same
+# dispatch-only, staging-only shape as the drill switches above.
+AVATAR_SYNC_EXPRESSION = "${{ github.event_name == 'workflow_dispatch' && inputs.set_bot_avatar_once && 'true' || 'false' }}"
+AVATAR_SYNC_MARKERS = (
+    "set_bot_avatar_once", "SET_BOT_AVATAR_ONCE",
+    "TWO_SET_BOT_AVATAR_ONCE", "--set-bot-avatar-once",
 )
 # Pinned-SHA arm/disarm: a dispatch names its exact commit, anything else
 # deploys the workflow head. Every checkout ref and every SHA-step env in
@@ -886,6 +896,46 @@ def staging_fault_injection_errors(workflows):
                    '[ "$INJECT_UNPAIRED_DISCONNECT" = "true" ]'):
         if run.count(needle) != 1:
             errors.append(f"deploy-staging.yml: fault step must contain exactly one {needle}")
+    return errors
+
+
+def staging_avatar_sync_errors(workflows):
+    """The bot avatar one-shot is dispatch-only, staging-only plumbing.
+
+    Same shape as the drill injections above: the input is read by exactly
+    one pinned dispatch-only expression in exactly one staging step, the step
+    hands only the prepare flag to the generated staging deploy config (kept
+    out of the drill `inject` array so the served bytes still certify), and
+    every other workflow — deploy-production above all — must not mention any
+    avatar-sync marker at all, so no route can forward it to production.
+    """
+    errors = []
+    for name, workflow in workflows.items():
+        if name == "deploy-staging.yml":
+            continue
+        text = str(workflow)
+        for marker in AVATAR_SYNC_MARKERS:
+            if marker in text:
+                errors.append(f"{name}: bot-avatar-sync marker {marker} outside deploy-staging")
+    staging = workflows.get("deploy-staging.yml") or {}
+    text = str(staging)
+    if text.count("inputs.set_bot_avatar_once") != 1:
+        errors.append("deploy-staging.yml: set_bot_avatar_once must be read exactly once")
+    steps = ((staging.get("jobs") or {}).get("deploy") or {}).get("steps") or []
+    armed = [step for step in steps
+             if isinstance(step, dict) and "SET_BOT_AVATAR_ONCE" in str(step)]
+    if len(armed) != 1:
+        errors.append("deploy-staging.yml: exactly one deploy step may carry the avatar-sync switch")
+        return errors
+    step = armed[0]
+    env = step.get("env") or {}
+    if env.get("SET_BOT_AVATAR_ONCE") != AVATAR_SYNC_EXPRESSION:
+        errors.append("deploy-staging.yml: avatar sync must use the pinned dispatch-only expression")
+    run = str(step.get("run") or "")
+    for needle in ("staging_rollout.py prepare", "--set-bot-avatar-once",
+                   '[ "$SET_BOT_AVATAR_ONCE" = "true" ]'):
+        if run.count(needle) != 1:
+            errors.append(f"deploy-staging.yml: avatar-sync step must contain exactly one {needle}")
     return errors
 
 
@@ -4542,6 +4592,7 @@ def workflow_policy_errors(workflows):
     errors.extend(staging_gateway_injection_errors(workflows))
     errors.extend(staging_error_rate_gate_errors(workflows))
     errors.extend(staging_fault_injection_errors(workflows))
+    errors.extend(staging_avatar_sync_errors(workflows))
     errors.extend(scheduled_binding_audit_errors(workflows))
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
     # An intentional addition needs an explicit policy change and independent review.
@@ -7581,6 +7632,7 @@ class WorkflowTests(unittest.TestCase):
         text = (ROOT / ".github/workflows/deploy-production.yml").read_text()
         self.assertNotIn("inject_error_rate_spike", text.lower())
         self.assertNotIn("inject_gateway_failure", text.lower())
+        self.assertNotIn("set_bot_avatar_once", text.lower())
         self.assertNotIn("--rehearsal-firing", text)
         original = self.workflows["deploy-production.yml"]
         self.assertEqual(production_error_rate_gate_errors(original), [])
@@ -7643,6 +7695,48 @@ class WorkflowTests(unittest.TestCase):
                 job = next(iter(changed[name]["jobs"].values()))
                 job.setdefault("env", {})["FORWARD"] = "${{ inputs.inject_voice_stall }}"
                 self.assertTrue(staging_fault_injection_errors(changed))
+                self.assertTrue(workflow_policy_errors(changed))
+
+    def test_bot_avatar_sync_is_dispatch_only_and_never_forwarded(self):
+        workflows = self.workflows
+        self.assertEqual(staging_avatar_sync_errors(workflows), [])
+        self.assertEqual(staging_dispatch_errors(workflows["deploy-staging.yml"]), [])
+        steps = workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
+        armed = [s for s in steps if "SET_BOT_AVATAR_ONCE" in str(s)]
+        self.assertEqual(len(armed), 1)
+        index = steps.index(armed[0])
+        mutations = {
+            # Push could read it / default armed.
+            "expression without dispatch guard": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
+                .__setitem__("SET_BOT_AVATAR_ONCE", "${{ inputs.set_bot_avatar_once }}"),
+            "expression constant true": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
+                .__setitem__("SET_BOT_AVATAR_ONCE", "true"),
+            "prepare flag unconditional": lambda w: w["jobs"]["deploy"]["steps"][index]
+                .__setitem__("run", "python3 ../scripts/staging_rollout.py prepare --set-bot-avatar-once"),
+            "input defaults true": lambda w: w["on"]["workflow_dispatch"]["inputs"]["set_bot_avatar_once"]
+                .__setitem__("default", True),
+            "input removed": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("set_bot_avatar_once"),
+            "second reader step": lambda w: w["jobs"]["deploy"]["steps"][0]
+                .setdefault("env", {}).__setitem__("SET_BOT_AVATAR_ONCE", "true"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                changed = deepcopy(workflows)
+                mutate(changed["deploy-staging.yml"])
+                self.assertTrue(
+                    staging_avatar_sync_errors(changed)
+                    or staging_dispatch_errors(changed["deploy-staging.yml"]),
+                    label,
+                )
+                self.assertTrue(workflow_policy_errors(changed), label)
+        # Production (or any other workflow) mentioning any avatar-sync marker
+        # at all is a forwarding route, whatever the surrounding shape.
+        for name in ("deploy-production.yml", "check.yml"):
+            with self.subTest(forwarded=name):
+                changed = deepcopy(workflows)
+                job = next(iter(changed[name]["jobs"].values()))
+                job.setdefault("env", {})["FORWARD"] = "${{ inputs.set_bot_avatar_once }}"
+                self.assertTrue(staging_avatar_sync_errors(changed))
                 self.assertTrue(workflow_policy_errors(changed))
 
     def test_cloudflare_secrets_stay_environment_scoped(self):

@@ -2328,6 +2328,54 @@ disarms the drill by redeploy.
    the hold: `gh variable delete STAGING_SOAK_HOLD_UNTIL`. Letting it expire
    works too: expiry fails open and the next push deploys normally.
 
+#### Staging bot avatar one-shot
+
+The staging bot sets its own avatar to the owner's Icon 1 once, from inside
+its own boot, using the token it already holds at runtime: it `PATCH`es
+`/users/@me` with the committed 512px PNG
+(`assets/brand/two-icon-1-dark-512.png`, bundled into the binary, never read
+from disk) as a data URI and logs only the HTTP status plus the
+before/after avatar hashes. No portal login, no token copy, no new secret.
+Arming is a manual `deploy-staging` dispatch with `set_bot_avatar_once`
+(default false; a push can never arm it, and the switch is never a committed
+var). The prepare step stamps `TWO_SET_BOT_AVATAR_ONCE=1` into the generated
+staging deploy config only. The Worker requires the exact staging marker
+and switch, then persists `two-bot:avatar-sync:icon-1:v1` and flushes storage
+**before** forwarding the switch to one cold start. Class defaults stay
+unarmed; any existing receipt (including malformed state) refuses another
+attempt across container restarts, Worker reconstruction and later deploys.
+Reattaching a running container does not consume the receipt. Storage
+failure logs `bot_avatar_sync_disarmed` with a fixed reason and boots normally
+without the switch. The Rust fence independently requires `TWO_DEPLOY_ENV`
+exactly `"staging"` and the switch exactly `"1"`, so production refuses it.
+
+The SDK keeps its normal acquisition and port-readiness budgets. Only its
+first start-loop iteration receives the armed environment; any internal
+restart uses an unarmed environment. The avatar operation has a 15-second
+total deadline, and the Discord PATCH is never automatically replayed,
+including on HTTP 429. Discord rate-limits avatar changes: run the
+dispatch once, then leave the input off. The switch is not a drill flag and
+does not mark the run promotion-unclean — the served bytes are identical.
+
+Procedure (Operator):
+
+1. `gh workflow run deploy-staging.yml --ref main -f
+   set_bot_avatar_once=true` (empty `sha` deploys the workflow head).
+2. Read the staging boot log for one `bot avatar sync applied` line and
+   record its `http_status` and new `avatar` hash. A `bot avatar sync
+   failed` line (fixed reason code, no token or image bytes) never blocks
+   boot — the gateway still starts. `avatar_sync_unconfirmed` means the
+   PATCH returned no hash; `avatar_sync_timed_out` can also mean the write
+   applied without a confirmed response. Neither permits a retry. A 429
+   likewise consumes the attempt: do not redispatch or clear the receipt.
+3. Pin the observed public hash in `EXPECTED_ICON_HASH` through a reviewed
+   change. Do not invent a hash or infer it from the PNG digest. This is an
+   extra no-write guard, not a replacement for durable consumption.
+4. If the result is failed, missing or uncertain, reconcile the public avatar
+   and staging status first. Keep the durable receipt. Any new authorization
+   requires an explicit, reviewed recovery decision; this path has no reset
+   endpoint or automatic retry.
+
 #### Staging guard receipts (persisted remediation evidence)
 
 Each keepalive tick writes the evaluator guard to DO storage at

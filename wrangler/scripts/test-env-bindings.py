@@ -286,6 +286,21 @@ class AlertBindingTests(unittest.TestCase):
                     )
         self.assertEqual(self.check_config(BASE), [])
 
+    def test_avatar_sync_switch_is_never_a_committed_var(self):
+        # Same generated-only rule as the drill switches: the avatar one-shot
+        # switch committed anywhere — staging included — fails, so only the
+        # generated per-deploy staging config from a manual dispatch may
+        # carry it.
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nTWO_SET_BOT_AVATAR_ONCE = "1"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(
+                    any("TWO_SET_BOT_AVATAR_ONCE must never be a committed var" in e for e in errors),
+                    errors,
+                )
+        self.assertEqual(self.check_config(BASE), [])
+
     def test_dashboard_secrets_are_never_toml_vars(self):
         # TOG-22861: the dashboard service-token pair gates human access; a
         # committed value would hand out that access. Both keys must stay
