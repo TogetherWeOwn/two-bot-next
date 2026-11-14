@@ -1,0 +1,33 @@
+# Separate Worker: never import this rule into the bot or attach DB bindings.
+# Registration is manual after Security acceptance; no automatic deployment.
+name = "two-bot-staging-migration-protection"
+main = "src/staging-protection/worker.ts"
+compatibility_date = "2026-09-29"
+workers_dev = true
+
+[limits]
+cpu_ms = 50
+subrequests = 40
+
+[observability]
+enabled = true
+
+[[durable_objects.bindings]]
+name = "PROTECTION_GATES"
+class_name = "StagingProtectionGate"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["StagingProtectionGate"]
+
+[vars]
+PROTECTION_ENABLED = "0"
+GITHUB_APP_ID = ""
+GITHUB_INSTALLATION_ID = ""
+GITHUB_REPOSITORY_ID = ""
+STAGING_HOST = ""
+STAGING_DATABASE = ""
+STAGING_BRANCH_ID = ""
+
+# GITHUB_APP_PRIVATE_KEY (PKCS#8 PEM) and GITHUB_WEBHOOK_SECRET are Worker
+# secret bindings, placed only through the approved credential/App process.

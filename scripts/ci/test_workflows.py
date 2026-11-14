@@ -35,7 +35,7 @@ JOB_INVENTORY = {
     # The nextest branch adds its required lane; main adds the production schema gate.
     # The inventory pin must retain both changes.
     "check.yml": {"check", "moderation-db", "parity-docs", "self-role-store", "job-inputs", "container-inputs", "container",
-                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok",
+                  "community-db", "feeds-db", "tickets-postgres", "worker", "supply-chain", "ci-ok", "staging-migrate-python",
                   # `check` is now the lint lane; the test steps it used to
                   # carry run in these parallel lanes, all gated by ci-ok.
                   # The HARD patch-coverage measurement is sharded: the plan
@@ -1705,10 +1705,12 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
             errors.append(f"{name}:apply: must pass the {branch_label} branch pin to the runner")
     apply_fetch = [step for step in apply.get("steps", [])
                    if str(step.get("uses", "")).startswith("actions/download-artifact@")]
-    if len(apply_fetch) != 1:
-        errors.append(f"{name}:apply: must fetch exactly one artifact (the producing plan manifest)")
+    expected_fetch_count = 3 if name == "staging-migrate.yml" else 1
+    provenance_fetch = [step for step in apply_fetch if "run-id" in step.get("with", {})]
+    if len(apply_fetch) != expected_fetch_count or len(provenance_fetch) != 1:
+        errors.append(f"{name}:apply: must fetch exactly one producing plan manifest with the expected evidence artifacts")
     else:
-        fetch = apply_fetch[0]
+        fetch = provenance_fetch[0]
         fetch_with = fetch.get("with", {})
         if fetch_with.get("name") != manifest:
             errors.append(f"{name}:apply: must fetch the {manifest} artifact")
@@ -1716,6 +1718,32 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
             errors.append(f"{name}:apply: must fetch the artifact from the plan_run_id run")
         if fetch.get("continue-on-error") is True:
             errors.append(f"{name}:apply: the provenance fetch must fail the job, never continue-on-error")
+    if name == "staging-migrate.yml":
+        steps = apply.get("steps", [])
+        expected = [
+            ("Checkout workflow verifier", {"persist-credentials": "false", "ref": "${{ github.sha }}", "path": "workflow-verifier"}),
+            ("Fetch this dispatch's plan for claim verification", {"name": manifest, "path": "claim-plan"}),
+            ("Fetch this dispatch's apply claim", {"name": "staging-migrate-apply-claim", "path": "apply-claim"}),
+        ]
+        for index, (step_name, options) in enumerate(expected):
+            action = "actions/checkout@" if index == 0 else "actions/download-artifact@"
+            if (len(steps) <= index or steps[index].get("name") != step_name
+                    or not str(steps[index].get("uses", "")).startswith(action)
+                    or steps[index].get("with") != options
+                    or "if" in steps[index] or "continue-on-error" in steps[index]):
+                errors.append(f"{name}:apply: invalid attempt verification input {step_name}")
+        claim_steps = claim.get("steps", [])
+        expected_env = claim_steps[2].get("env") if len(claim_steps) > 2 else None
+        verify_run = ("python3 workflow-verifier/scripts/ci/staging_migrate_claim.py "
+                      "--manifest claim-plan/staging-migrate-manifest.json "
+                      "--verify apply-claim/staging-migrate-apply-claim.json")
+        if (len(steps) < 4 or steps[3].get("name") != "Verify claim for this apply attempt"
+                or steps[3].get("env") != expected_env
+                or " ".join(str(steps[3].get("run", "")).replace("\\\n", " ").split()) != verify_run
+                or "if" in steps[3] or "continue-on-error" in steps[3]):
+            errors.append(f"{name}:apply: must verify the current-attempt claim before credentials")
+        if any(migrator_secret in str(step) for step in steps[:4]):
+            errors.append(f"{name}:apply: must not expose migration credentials before claim verification")
     plan_uses = [step.get("uses", "") for step in plan.get("steps", [])]
     if not any(str(u).startswith("actions/upload-artifact@") for u in plan_uses):
         errors.append(f"{name}:plan: must upload the {manifest}.json run artifact")
@@ -8831,15 +8859,24 @@ class WorkflowTests(unittest.TestCase):
                         step["run"] = step["run"].replace(
                             " --plan-manifest-path producing-plan/production-migrate-manifest.json", "")
             self.assertTrue(mutated(drop_path))
-        # Production and staging stay mirrors: same job ids, same step counts,
-        # same pinned actions and container, differing only by the documented
-        # production prefix (names, envs, secrets, artifacts, flags).
+        # The staging-only independent consumer needs a plan-dispatch marker.
+        # Pin its entire shape rather than adding it to production policy or
+        # ignoring arbitrary staging steps in the mirror comparison.
         staging = self.workflows["staging-migrate.yml"]
+        marker = {
+            "name": "Confirm read-only plan dispatch",
+            "if": "inputs.mode == 'plan'",
+            "run": "true",
+        }
+        markers = [step for step in staging["jobs"]["plan"]["steps"]
+                   if step.get("name") == marker["name"]]
+        self.assertEqual(markers, [marker])
         self.assertEqual(set(migrate["jobs"]), set(staging["jobs"]))
         for job_id in ("plan", "claim", "apply"):
             with self.subTest(mirror=job_id):
                 prod_job, stag_job = migrate["jobs"][job_id], staging["jobs"][job_id]
-                self.assertEqual(len(prod_job.get("steps", [])), len(stag_job.get("steps", [])))
+                self.assertEqual(len(prod_job.get("steps", [])) + (job_id == "plan"),
+                                 len(stag_job.get("steps", [])))
                 self.assertEqual(prod_job.get("permissions"), stag_job.get("permissions"))
                 self.assertEqual(prod_job.get("if"), stag_job.get("if"))
                 self.assertEqual(prod_job.get("runs-on"), stag_job.get("runs-on"))

@@ -2639,11 +2639,15 @@ It has no database secrets or environment; a step inside the waiting apply job
 cannot publish evidence before approval. Both artifact uploads disable compression
 for the bounded stored-ZIP reader. The [claim contract](staging-migrate-claim.md)
 defines the exact versioned fields, serialization vector and consumer requirements.
-The claim is a request, not proof of producer provenance or CEO GO; the independent
-protection-rule consumer must authenticate both runs and the prior plan artifact.
+The claim is a request, not approval or proof of producer provenance. Under the
+staging-only automated policy, the independent protection rule authenticates both
+runs and both read-only plans; it does not fabricate a human CEO GO receipt.
 The `apply` job runs only for `mode: apply`, after a green plan **and claim**, and
-reads the binding from the `staging-migrate-apply` environment, which must have a
-required reviewer and a main-only deployment-branch rule. Both bindings must be
+reads the binding from the `staging-migrate-apply` environment, which must have the
+[registered custom deployment-protection rule](staging-migrate-protection.md) and
+a main-only deployment-branch rule, not a human required reviewer. The gap remains
+open until registration and a live staging decision are evidenced. Production's
+required-reviewer policy is unchanged. Both bindings must be
 environment secrets, not repository secrets; otherwise a workflow edited on
 another branch could read them. This change does not create the environments or
 the secrets: create both before dispatch, or the jobs fail instead of running.

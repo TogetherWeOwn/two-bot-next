@@ -125,6 +125,11 @@ jobs:
             --recovery-evidence-ref "$RECOVERY_REF" --acl-plan-ref "$ACL_REF" \
             --expected-pending "$EXPECTED_PENDING" \
             | tee staging-migrate-manifest.json
+      - name: Confirm read-only plan dispatch
+        # Authenticated attempt-scoped job steps distinguish plan dispatches
+        # from apply dispatches, which also produce a plan-shaped manifest.
+        if: inputs.mode == 'plan'
+        run: 'true'
       - name: Upload plan manifest
         # The apply dispatch binds to this artifact by hash: the reviewer
         # reads plan_manifest_sha256/plan_run_id off this run, and the apply
@@ -202,7 +207,7 @@ jobs:
       actions: read # Provenance gate downloads the producing plan run manifest artifact.
     # Dispatch from main only, mode=apply only, and only after a green plan.
     # The binding must be scoped to the staging-migrate-apply environment
-    # (required reviewer, main-only deployment branches) so a workflow edited
+    # (independent custom protection rule, main-only branches) so a workflow edited
     # on another branch cannot read it.
     # Required follow-up (fail-closed deploy gate): migrations create tables
     # but grant nothing. After the apply, the operator reapplies the full role
@@ -218,6 +223,40 @@ jobs:
     container:
       image: rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137
     steps:
+      - name: Checkout workflow verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: workflow-verifier
+      - name: Fetch this dispatch's plan for claim verification
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: staging-migrate-manifest
+          path: claim-plan
+      - name: Fetch this dispatch's apply claim
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: staging-migrate-apply-claim
+          path: apply-claim
+      - name: Verify claim for this apply attempt
+        env:
+          MODE: ${{ inputs.mode }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          STAGING_HOST: ${{ inputs.staging_host }}
+          STAGING_DATABASE: ${{ inputs.staging_database }}
+          STAGING_BRANCH_ID: ${{ inputs.staging_branch_id }}
+          RECOVERY_REF: ${{ inputs.recovery_evidence_ref }}
+          ACL_REF: ${{ inputs.acl_plan_ref }}
+          EXPECTED_PENDING: ${{ inputs.expected_pending }}
+          EXPECTED_STORE_PENDING: ${{ inputs.expected_store_pending }}
+          PLAN_MANIFEST_SHA256: ${{ inputs.plan_manifest_sha256 }}
+          STORE_PLAN_MANIFEST_SHA256: ${{ inputs.store_plan_manifest_sha256 }}
+          PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+        run: |
+          python3 workflow-verifier/scripts/ci/staging_migrate_claim.py \
+            --manifest claim-plan/staging-migrate-manifest.json \
+            --verify apply-claim/staging-migrate-apply-claim.json
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Publish a non-secret apply request before its Environment can be approved.
 
-The protection-rule consumer must still authenticate both runs/artifacts and
-require independent CEO GO. This publisher is request transport, not approval.
+The independent staging protection rule must authenticate both runs/artifacts
+under the automated staging policy. This publisher is transport, not approval.
 """
 import argparse
 import hashlib
@@ -232,15 +232,23 @@ def unique_object(pairs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    destination = parser.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--output", type=Path)
+    destination.add_argument("--verify", type=Path)
     args = parser.parse_args()
     try:
         require(args.manifest.stat().st_size <= MAX_MANIFEST_BYTES, "manifest is too large")
         manifest = json.loads(args.manifest.read_text(), object_pairs_hook=unique_object)
         claim = build_claim(manifest, os.environ)
-        # Exclusive create: a refusal never leaves a claim, nor reuses an old one.
-        with args.output.open("x") as output:
-            output.write(json.dumps(claim, indent=2) + "\n")
+        if args.verify:
+            require(args.verify.stat().st_size <= MAX_MANIFEST_BYTES, "claim is too large")
+            actual = json.loads(args.verify.read_text(), object_pairs_hook=unique_object)
+            require(type(actual) is dict and json.dumps(actual, sort_keys=True) == json.dumps(claim, sort_keys=True),
+                    "claim does not match this attempt and request")
+        else:
+            # Exclusive create: a refusal never leaves a claim, nor reuses an old one.
+            with args.output.open("x") as output:
+                output.write(json.dumps(claim, indent=2) + "\n")
     except (OSError, UnicodeError, json.JSONDecodeError, Refused) as error:
         message = str(error) if isinstance(error, Refused) else "manifest or output is unavailable/invalid"
         print(f"staging migration claim refused: {message}", file=sys.stderr)
