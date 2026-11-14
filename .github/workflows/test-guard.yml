@@ -32,4 +32,4 @@ jobs:
     permissions:
       contents: read
       pull-requests: read # Shared test guard reads the marker-label actor audit via issue events.
-    uses: TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95
+    uses: TogetherWeOwn/.github/.github/workflows/test-guard.yml@97cadcb231e55fad95cbc6468be078ecef571bc2
