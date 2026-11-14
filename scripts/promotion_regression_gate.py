@@ -267,7 +267,12 @@ def compare(staging, prod_probe, prod_rest):
             staging_pair = delta
     prod_ratio = ratio(prod_pair) if prod_pair and prod_pair[1] >= MIN_REQUESTS else None
     threshold = max(RATIO_MARGIN * prod_ratio, FLOOR_RATIO) if prod_ratio is not None else FLOOR_RATIO
-    if staging_pair is None or staging_pair[1] < MIN_REQUESTS:
+    if (coverage == "bookended" and staging_pair is not None
+            and staging_pair[0] >= MIN_5XX and ratio(staging_pair) > threshold):
+        # A sparse but measurable regression must not be mistaken for a
+        # harmless lack of traffic if sparse deferral is introduced later.
+        rate_verdict = "fail"
+    elif staging_pair is None or staging_pair[1] < MIN_REQUESTS:
         rate_verdict = "insufficient_data"
     elif staging_pair[0] >= MIN_5XX and ratio(staging_pair) > threshold:
         # A measured regression refuses even across a restart: the

@@ -195,6 +195,25 @@ class CompareTests(unittest.TestCase):
                 self.assertEqual(evidence["rest_5xx"]["verdict"], "insufficient_data")
                 self.assertEqual(evidence["verdict"], "fail")
 
+    def test_bookended_sparse_regression_is_reported_before_insufficient_data(self):
+        for errors, total, verdict in [(3, 9, "fail"), (2, 9, "insufficient_data"),
+                                       (0, 0, "insufficient_data")]:
+            with self.subTest(errors=errors, total=total):
+                evidence = gate.compare(staged(counters=(errors, total)), probe(), rest(0, 1000))
+                self.assertEqual(evidence["rest_5xx"]["verdict"], verdict)
+                self.assertEqual(evidence["verdict"], "fail")
+        evidence = gate.compare(staged(counters=(13, 109), baseline=(10, 100)),
+                                probe(), rest(0, 1000))
+        self.assertEqual(evidence["code"], "rest_5xx_regression")
+        self.assertEqual(evidence["rest_5xx"]["staging"]["rest5xx"], 3)
+        # A high baseline can put the sparse ratio below the frozen threshold.
+        evidence = gate.compare(staged(counters=(3, 9)), probe(), rest(300, 1000))
+        self.assertEqual(evidence["rest_5xx"]["verdict"], "insufficient_data")
+        # An invalid delta is never classified as a valid sparse regression.
+        evidence = gate.compare(staged(counters=(3, 9), baseline=(4, 8)), probe(), rest(0, 1000))
+        self.assertEqual(evidence["rest_5xx"]["coverage"], "counters_inconsistent")
+        self.assertEqual(evidence["rest_5xx"]["verdict"], "insufficient_data")
+
     def test_a_thin_or_missing_production_baseline_falls_back_to_the_floor(self):
         for baseline in (rest(9, 9), {"available": False, "code": "token_absent"}, None):
             with self.subTest(baseline=baseline):
