@@ -74,5 +74,77 @@ class Snapshot(unittest.TestCase):
             inventory.snapshot(pr)
 
 
+class Freshness(unittest.TestCase):
+    def test_equal_snapshot_and_encoded_base_route(self):
+        pr = pull_request()
+        pr["base"]["ref"] = "release/candidate"
+        routes = []
+
+        def api(route):
+            routes.append(route)
+            return copy.deepcopy(pr) if len(routes) == 1 else {"object": {"sha": "a" * 40}}
+
+        self.assertIsNone(inventory.require_fresh(api, pr))
+        self.assertEqual(routes, ["repos/org/repo/pulls/1",
+                                  "repos/org/repo/git/ref/heads/release%2Fcandidate"])
+
+    def test_changed_snapshot_fields_fail_closed(self):
+        for path, value in (("title", "new"), ("body", "new"), ("updated_at", "later"),
+                            ("number", 2), ("changed_files", 1), ("user.login", "other"),
+                            ("head.sha", "c" * 40), ("head.ref", "other"),
+                            ("head.repo.id", 5), ("base.sha", "d" * 40),
+                            ("base.ref", "other"), ("base.repo.full_name", "other/repo")):
+            pr = pull_request()
+            changed = copy.deepcopy(pr)
+            keys = path.split(".")
+            target = changed
+            for key in keys[:-1]:
+                target = target[key]
+            target[keys[-1]] = value
+            with self.subTest(path=path), self.assertRaises(inventory.InventoryError):
+                inventory.require_fresh(lambda route: changed, pr)
+
+    def test_missing_malformed_and_failed_reads_are_redacted(self):
+        pr = pull_request()
+        for response in (None, {}, [], {"object": None}, {"object": {}},
+                         {"object": {"sha": "c" * 40}}):
+            for bad_read in (0, 1):
+                responses = [copy.deepcopy(pr), {"object": {"sha": "a" * 40}}]
+                responses[bad_read] = response
+                with self.subTest(response=response, bad_read=bad_read):
+                    with self.assertRaises(inventory.InventoryError) as error:
+                        inventory.require_fresh(lambda route: responses.pop(0), pr)
+                    self.assertEqual(str(error.exception), "Freshness comparison failed")
+                    self.assertIsNone(error.exception.__cause__)
+        for bad_read in (0, 1):
+            calls = []
+
+            def failing(route):
+                calls.append(route)
+                if len(calls) - 1 == bad_read:
+                    raise RuntimeError("sensitive sentinel")
+                return copy.deepcopy(pr)
+
+            with self.assertRaises(inventory.InventoryError) as error:
+                inventory.require_fresh(failing, pr)
+            self.assertNotIn("sensitive sentinel", str(error.exception))
+            self.assertTrue(error.exception.__suppress_context__)
+
+    def test_invalid_baseline_does_not_read_and_mutation_cannot_change_base(self):
+        pr = pull_request()
+        del pr["body"]
+        with self.assertRaises(inventory.InventoryError):
+            inventory.require_fresh(lambda route: self.fail("unexpected read"), pr)
+        pr = pull_request()
+
+        def api(route):
+            result = copy.deepcopy(pr)
+            pr["base"]["sha"] = "c" * 40
+            return result if "/pulls/" in route else {"object": {"sha": "c" * 40}}
+
+        with self.assertRaises(inventory.InventoryError):
+            inventory.require_fresh(api, pr)
+
+
 if __name__ == "__main__":
     unittest.main()
