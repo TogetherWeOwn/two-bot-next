@@ -3906,7 +3906,10 @@ def help_embed_synthetic_errors(workflow):
             or gate.get("id") != "gate" or "configured" not in str(gate.get("run") or "") \
             or steps[2].get("run") != "bash .github/scripts/install-rust-toolchain.sh" \
             or steps[2].get("shell") != "bash" \
-            or steps[2].get("env") != {"RUST_TOOLCHAIN": "1.99.1", "RUST_COMPONENTS": ""} \
+            or steps[2].get("env") != {
+                "RUST_TOOLCHAIN": tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"],
+                "RUST_COMPONENTS": "",
+            } \
             or "help_embed_smoke_payloads" not in runs[2]["run"] \
             or "scripts/staging_help_embed_smoke.py" not in runs[-1]["run"]:
         errors.append(f"{name}:help-embed-smoke: must be checkout, binding gate, toolchain, "
@@ -7235,6 +7238,7 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["help-embed-smoke"]["steps"][4].__setitem__(
                 "run", w["jobs"]["help-embed-smoke"]["steps"][4]["run"].replace('"$status" = 3', '"$status" = 9')),
             lambda w: w["jobs"]["help-embed-smoke"]["steps"][2].pop("if"),
+            lambda w: w["jobs"]["help-embed-smoke"]["steps"][2]["env"].__setitem__("RUST_TOOLCHAIN", "1.0.0"),
             lambda w: w["jobs"]["help-embed-smoke"]["steps"][1]["env"].__setitem__(
                 "HAS_TOKEN", "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"),
         ):
