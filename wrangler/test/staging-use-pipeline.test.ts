@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { pipelineUse } from "../scripts/staging-use-pipeline.mjs";
-import { StagingUseError } from "../scripts/staging-use.mjs";
+import { StagingUseError, stagingUse } from "../scripts/staging-use.mjs";
 
 const NOW = 1_700_000_000_000;
 const MINUTE = 60_000;
@@ -36,6 +36,7 @@ function fixture(initial: { use?: Use | null; deploymentId?: string; sha?: strin
   };
   const log: string[] = [];
   const calls: any[] = [];
+  const retryDeadlines: (number | undefined)[] = [];
   const emitted: any[] = [];
   const receipt = (action: string) => ({
     schema: "two-bot-staging-use.v1", action, environment: "staging",
@@ -44,7 +45,9 @@ function fixture(initial: { use?: Use | null; deploymentId?: string; sha?: strin
   });
   const invoke = async (args: any) => {
     log.push(`call:${args.action}`);
-    calls.push(args);
+    const { statusRetryDeadline, ...recorded } = args;
+    retryDeadlines.push(statusRetryDeadline);
+    calls.push(recorded);
     if (failOn === args.action) throw new StagingUseError(`injected_${args.action}_failure`);
     if (args.action === "acquire") {
       state.use = grant({ runId: args.runId, runAttempt: args.runAttempt, expiresAt: args.expiresAt,
@@ -57,7 +60,7 @@ function fixture(initial: { use?: Use | null; deploymentId?: string; sha?: strin
   };
   const emit = (value: any) => { log.push(`emit:${value.action}`); emitted.push(value); };
   const names = (prefix: string) => log.filter((entry) => entry.startsWith(prefix)).map((entry) => entry.slice(prefix.length));
-  return { invoke, emit, log, calls, emitted, state, called: () => names("call:") };
+  return { invoke, emit, log, calls, retryDeadlines, emitted, state, called: () => names("call:") };
 }
 
 const base = { url: URL_, token: TOKEN, runId: RUN, runAttempt: 1 };
@@ -77,6 +80,8 @@ test("rollback preflight asserts only the current retained grant without readine
   const result = await pipelineUse({ ...base, action: "restore-check", expiresAt: use.expiresAt },
     f.invoke, clock, f.emit);
   assert.deepEqual(f.called(), ["status", "assert"]);
+  assert.equal(typeof f.retryDeadlines[0], "number");
+  assert.equal(f.retryDeadlines[0], f.retryDeadlines[1]);
   assert.deepEqual(f.calls[1], { ...binding(), action: "assert" });
   assert.equal(result.action, "assert");
   assert.deepEqual(f.state.use, use);
@@ -448,9 +453,57 @@ test("finish releases the same window using the current identity, even when expi
     { ...base, action: "release", sha: SHA, deploymentId: "dep-1", expiresAt },
   ]);
   assert.deepEqual(f.log, ["emit:attempt", "call:status", "emit:status", "call:release", "emit:release"]);
+  assert.equal(typeof f.retryDeadlines[0], "number");
+  assert.equal(f.retryDeadlines[0], f.retryDeadlines[1]);
   assert.equal(result.action, "release");
   assert.equal(result.use.phase, "released");
   assert.equal(result.running, false);
+});
+
+test("finish integrates bounded status retries with fenced cleanup", async () => {
+  const expiresAt = NOW + 10 * MINUTE;
+  const use = grant({ expiresAt });
+  const state = { deploymentId: "dep-1", sha: SHA, running: true, use,
+    owner: { deploymentId: "dep-1", epoch: 7, phase: "active", actor: "fixture",
+      oldEpoch: 6, oldDeploymentId: "old", timestamp: "2026-11-07T00:00:00Z" } };
+  for (const exhausted of [false, true]) {
+    const methods: string[] = [];
+    const emitted: any[] = [];
+    const deadlines: number[] = [];
+    let reads = 0;
+    const send = async (_url: URL, init: RequestInit) => {
+      methods.push(init.method!);
+      if (init.method === "POST") {
+        assert.equal(JSON.parse(String(init.body)).expiresAt, expiresAt);
+        return Response.json({ ...state, running: false, use: { ...use, phase: "released" } });
+      }
+      reads++;
+      if (reads === 1 || (exhausted && reads === 3)) return new Response(null, { status: 503 });
+      return Response.json(state);
+    };
+    const deadline = performance.now() + (exhausted ? 1000 : 30000);
+    const invoke = (args: any) => {
+      deadlines.push(args.statusRetryDeadline);
+      // Shorten the common deadline to exercise exhaustion without a real wait.
+      return stagingUse({ ...args, statusRetryDeadline: deadline }, send, async () => {}, clock);
+    };
+    if (exhausted) {
+      // First status succeeds; the second read gets 503 with no retry budget.
+      reads = 1;
+      await assert.rejects(pipelineUse({ ...base, action: "finish", expiresAt }, invoke, clock,
+        (value: any) => emitted.push(value)), code("staging_control_refused"));
+      assert.deepEqual(methods, ["GET", "GET"]);
+      assert.equal(emitted.some((value) => value.action === "release"), false);
+    } else {
+      const result = await pipelineUse({ ...base, action: "finish", expiresAt }, invoke, clock,
+        (value: any) => emitted.push(value));
+      assert.deepEqual(methods, ["GET", "GET", "GET", "POST"]);
+      assert.equal(result.use.expiresAt, expiresAt);
+      assert.equal(result.running, false);
+      assert.equal(emitted.at(-1).action, "release");
+    }
+    assert.equal(deadlines[0], deadlines[1]);
+  }
 });
 
 test("finish after a rebind releases with the rebound deployment and original expiry", async () => {

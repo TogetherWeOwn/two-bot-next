@@ -128,6 +128,14 @@ stop a different attempt's singleton; it is **not** proof that this run never
 acquired a grant, or that staging is now stopped/idle. The parent's release and
 native expiry receipts supply the stop evidence.
 
+Authenticated staging status GETs return a non-cacheable 503 with unknown state
+if the Durable Object cannot answer within 10 seconds. This is neither readiness
+nor proof of ownership or cleanup. `restore-check` and `finish` share a
+180-second monotonic retry budget across their status reads; each request remains
+bounded to 15 seconds. Other errors fail closed, and release POSTs are never
+retried by this mechanism. Exhaustion leaves cleanup unconfirmed; native expiry
+remains the backstop. The original expiry and identity checks are unchanged.
+
 The staging Worker/container rollback now refuses a target unless its immutable
 Worker-version bindings prove `STAGING_RUNTIME_POLICY=bounded`,
 `TWO_DEPLOY_ENV=staging` and the receipt's exact `CONTAINER_RELEASE` SHA. Missing,
