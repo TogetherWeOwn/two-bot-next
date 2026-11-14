@@ -50,4 +50,8 @@ def changed_paths(api, prefix, expected):
                     raise InventoryError("Rename inventory repeats its destination")
                 paths.add(old)
         seen += len(batch)
+    if expected < MAX_FILES and expected % 100 == 0:
+        successor = api(f"{prefix}/files?per_page=100&page={expected // 100 + 1}")
+        if not isinstance(successor, list) or successor:
+            raise InventoryError("Incomplete or inconsistent file inventory")
     return sorted(paths)

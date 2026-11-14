@@ -27,6 +27,37 @@ class Inventory(unittest.TestCase):
         self.assertEqual(calls, ["/pulls/1/files?per_page=100&page=1", "/pulls/1/files?per_page=100&page=2"])
         self.assertEqual(paths, sorted({r["filename"] for r in rows} | {"src/old", "src/copied"}))
 
+    def test_full_page_requires_empty_successor(self):
+        rows = [{"filename": f"src/{i}", "status": "modified"} for i in range(101)]
+        calls = []
+
+        def api(route):
+            calls.append(route)
+            page = int(route.rsplit("=", 1)[1])
+            return rows[(page - 1) * 100:page * 100]
+
+        with self.assertRaises(inventory.InventoryError):
+            inventory.changed_paths(api, "/pulls/1", 100)
+        self.assertEqual(calls[-1], "/pulls/1/files?per_page=100&page=2")
+        rows.pop()
+        self.assertEqual(inventory.changed_paths(api, "/pulls/1", 100),
+                         sorted(row["filename"] for row in rows))
+        self.assertEqual(calls[-1], "/pulls/1/files?per_page=100&page=2")
+        with self.assertRaises(inventory.InventoryError):
+            inventory.changed_paths(lambda route: rows if route.endswith("=1") else None, "/pulls/1", 100)
+
+    def test_maximum_inventory_stays_within_api_limit(self):
+        calls = []
+
+        def api(route):
+            page = int(route.rsplit("=", 1)[1])
+            calls.append(page)
+            return [{"filename": f"src/{i}", "status": "modified"}
+                    for i in range((page - 1) * 100, page * 100)]
+
+        self.assertEqual(len(inventory.changed_paths(api, "/pulls/1", 3000)), 3000)
+        self.assertEqual(calls, list(range(1, 31)))
+
     def test_count_and_page_integrity(self):
         for count in (0, -1, True, 3001, "1", None):
             with self.subTest(count=count), self.assertRaises(inventory.InventoryError):
