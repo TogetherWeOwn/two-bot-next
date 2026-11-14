@@ -2961,6 +2961,58 @@ async fn v14_archive_restores_and_clears_newer_giveaways() {
 }
 
 #[tokio::test]
+async fn v16_archive_restores_populated_instance_windows() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let names = vec!["event_instance_windows".to_owned()];
+    let archived = snapshot(pool, &names).await;
+    assert_eq!(archived[&names[0]].rows.len(), 2);
+
+    // Freeze the released table names independently of the current inventory.
+    // Rows and column metadata still come from the migrated database.
+    let released: BTreeSet<&str> = FROZEN_V13_TABLES
+        .iter()
+        .copied()
+        .chain([
+            "starboard_config",
+            "starboard_starrers",
+            "starboard_posts",
+            "giveaways",
+            "giveaway_entries",
+            "giveaway_draws",
+            "event_instance_windows",
+        ])
+        .collect();
+    assert_eq!(released.len(), 108);
+    let directory = ArchiveDirectory::new();
+    let mut old = current_archive(pool, &directory).await;
+    old.manifest
+        .tables
+        .retain(|table| released.contains(table.name.as_str()));
+    old.buffers
+        .retain(|name, _| released.contains(name.as_str()));
+    assert_eq!(old.manifest.tables.len(), released.len());
+    old.manifest.version = 16;
+    old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
+    let path = directory.path("released-v16-populated.ndjson.gz");
+    write_archive(&path, &old);
+    assert_eq!(inspect(&path).unwrap().manifest.version, 16);
+
+    sqlx::query("DELETE FROM event_instance_windows")
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(snapshot(pool, &names).await[&names[0]].rows.is_empty());
+    forget_moderation_history(pool).await;
+    assert!(restore(pool, &path).await.unwrap().ok);
+    assert_eq!(snapshot(pool, &names).await, archived);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v15_archive_restores_and_clears_newer_event_instance_windows_without_backfill() {
     let Some(db) = database().await else {
         return;
