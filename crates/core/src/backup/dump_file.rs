@@ -3566,11 +3566,23 @@ mod tests {
 
     #[test]
     fn released_v16_inventory_keeps_instance_windows_mandatory() {
-        // Freeze the released prefix instead of using the current inventory:
-        // later formats may append tables without changing a v16 archive.
-        let tables: Vec<Value> = complete_tables(&BTreeMap::new())
-            .into_iter()
-            .take(108)
+        // Extend the frozen v13 inventory with the literal v14–v16 additions;
+        // neither the current inventory nor version waivers define this fixture.
+        let tables: Vec<Value> = FROZEN_V13_TABLES
+            .iter()
+            .copied()
+            .chain([
+                "starboard_config",
+                "starboard_starrers",
+                "starboard_posts",
+                "giveaways",
+                "giveaway_entries",
+                "giveaway_draws",
+                "event_instance_windows",
+            ])
+            .map(|name| {
+                serde_json::json!({"name": name, "columns": [], "column_types": [], "count": 0})
+            })
             .collect();
         assert_eq!(tables.len(), 108);
         assert_eq!(tables[107]["name"], "event_instance_windows");
