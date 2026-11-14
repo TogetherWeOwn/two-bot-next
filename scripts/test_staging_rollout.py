@@ -1352,7 +1352,7 @@ class OrchestrationTests(OfflineTestCase):
             "worker_version": VERSION, "application_id": APPLICATION_ID,
             "rollout_id": NEW_ROLLOUT, "target_version": 8, "image": IMAGE,
             "revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
-            "readyz": 200, "health": 200,
+            "readyz": 200, "health": 200, "verification_elapsed_seconds": 0,
         })
         self.docker.assert_called_once_with(VERSION, REVISION, BUILD_ID, DEPLOY_ID)
         self.assertEqual(client.calls, [
@@ -1363,6 +1363,157 @@ class OrchestrationTests(OfflineTestCase):
         ])
         self.assertEqual(self.clock.sleeps, [])
         self.assert_no_secret_saved_or_printed()
+
+    def test_rollout_deadline_allows_slow_success_and_refuses_late_completion(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for duration, succeeds in ((390, True), (605, False)):
+            with self.subTest(duration=duration):
+                self.clock.now = 100
+                client = verify_client()
+                client.deadline = self.clock.now + rollout.VERIFY_TIMEOUT_SECONDS
+                original_api = client.api
+
+                def timed_api(path):
+                    result = original_api(path)
+                    if path == DETAIL_PATH and self.clock.now < 100 + duration:
+                        result["status"] = "progressing"
+                        result["health"]["instances"].update(active=0, healthy=0, starting=1)
+                        result["progress"]["updated_instances"] = 0
+                    return result
+
+                client.api = timed_api
+                if succeeds:
+                    rollout.verify(self.args, client)
+                    evidence = json.loads(Path(self.args.evidence).read_text())
+                    self.assertEqual(evidence["verification_elapsed_seconds"], duration)
+                    Path(self.args.evidence).unlink()
+                else:
+                    self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+                    self.assert_no_evidence()
+
+    def test_final_control_plane_read_cannot_accept_after_deadline(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        original_api = client.api
+        app_reads = 0
+
+        def delayed_api(path):
+            nonlocal app_reads
+            result = original_api(path)
+            if path == APP_PATH:
+                app_reads += 1
+                if app_reads == 2:
+                    self.clock.now = client.deadline
+            return result
+
+        client.api = delayed_api
+        self.assert_gate("rollout_timeout", rollout.verify, self.args, client)
+        self.assert_no_evidence()
+
+    def test_final_stale_listing_read_past_deadline_reports_drift(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+        original_api = client.api
+        rollout_reads = 0
+
+        def delayed_api(path):
+            nonlocal rollout_reads
+            result = original_api(path)
+            if path == ROWS_PATH:
+                rollout_reads += 1
+                if rollout_reads == 2:
+                    self.clock.now = client.deadline
+            return result
+
+        client.api = delayed_api
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        self.assertEqual(caught.exception.detail, "listing_image=baseline later_rollouts=0")
+        self.assert_no_evidence()
+
+    def test_final_stale_application_expiry_hits_request_budget_guard(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        client = verify_client()
+        client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+        original_api = client.api
+        app_reads = 0
+        rollout_reads = 0
+
+        def delayed_api(path):
+            nonlocal app_reads, rollout_reads
+            if path == ROWS_PATH:
+                rollout_reads += 1
+                if rollout_reads == 2:
+                    rollout.Client.request(client, "https://example.invalid", authenticated=True)
+            result = original_api(path)
+            if path == APP_PATH:
+                app_reads += 1
+                if app_reads == 2:
+                    self.clock.now = client.deadline
+            return result
+
+        client.api = delayed_api
+        with self.assertRaises(rollout.GateError) as caught:
+            rollout.verify(self.args, client)
+        self.assertEqual(str(caught.exception), "application_image_drift")
+        self.assertEqual(caught.exception.detail, "listing_image=baseline later_rollouts=0")
+        self.assert_no_evidence()
+
+    def test_final_control_plane_expiry_classifies_stale_listing(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for target in (DEPLOYMENTS_PATH, DETAIL_PATH, APP_PATH):
+            with self.subTest(target=target):
+                self.clock.now = 100
+                client = verify_client()
+                client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+                original_api = client.api
+                reads = 0
+
+                def delayed_api(path):
+                    nonlocal reads
+                    if path == target:
+                        reads += 1
+                        if reads == 2:
+                            self.clock.now = client.deadline
+                            rollout.Client.request(client, "https://example.invalid", authenticated=True)
+                    return original_api(path)
+
+                client.api = delayed_api
+                with self.assertRaises(rollout.GateError) as caught:
+                    rollout.verify(self.args, client)
+                self.assertEqual(str(caught.exception), "application_image_drift")
+                self.assertEqual(caught.exception.detail, "listing_image=baseline later_rollouts=0")
+                self.assert_no_evidence()
+
+    def test_final_control_plane_transport_failure_before_deadline_is_preserved(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for target in (DEPLOYMENTS_PATH, DETAIL_PATH, APP_PATH):
+            with self.subTest(target=target):
+                self.clock.now = 100
+                client = verify_client()
+                client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+                original_api = client.api
+                reads = 0
+
+                def failing_api(path):
+                    nonlocal reads
+                    if path == target:
+                        reads += 1
+                        if reads == 2:
+                            raise rollout.GateError("api_transport_failure")
+                    return original_api(path)
+
+                client.api = failing_api
+                self.assert_gate("api_transport_failure", rollout.verify, self.args, client)
+                self.assert_no_evidence()
 
     def lag_client(self, readyz_routes):
         lagged = lag_row()
@@ -1382,7 +1533,7 @@ class OrchestrationTests(OfflineTestCase):
             "rollout_id": NEW_ROLLOUT, "target_version": 8, "image": IMAGE,
             "revision": REVISION, "build_id": BUILD_ID, "deploy_id": DEPLOY_ID,
             "readyz": 200, "health": 200,
-            "active_lag": True,
+            "active_lag": True, "verification_elapsed_seconds": 5,
         })
         self.assertEqual(self.clock.sleeps, [5])
         self.assert_no_secret_saved_or_printed()
