@@ -174,6 +174,18 @@ A missing test alone is not a runtime bug. These are blocking findings:
 
 ## This repository: where defects hide
 
+- **CI and deploy wiring** (`.github/workflows/deploy-staging.yml`,
+  `deploy-production.yml`, `production-migrate.yml`, `supply-chain.yml`): when a
+  PR adds or tightens a CI, deploy, or gate check, or edits a workflow, trace each
+  new input, env, and output to its supplying job and verify `needs:` ordering.
+  Judge merge-commit and post-merge deploy paths, not only PR-head checks; compare
+  migration, history, and allowlist gates with current `main`, preserving gates
+  intentionally defined against the fork point or base-branch policy. Verify
+  GitHub API assumptions with documentation or a read-only reproduction: do not
+  assume REST `pulls/N` `base.sha` stays fixed until a PR event. For publish or
+  artifact jobs, verify keys, tokens, and secrets cannot reach uploaded artifacts
+  or public output. Report a violation as Severe only with the exact job/line
+  and failing path, subject to the existing severity and security-disclosure rules.
 - **Gateway lifecycle** (`crates/bot/src/gateway*.rs`, `audit_gateway.rs`,
   `automod_gateway.rs`): session persistence and resume, duplicate-event
   deduplication keys, poison-event handling, and backoff that cannot spin or
