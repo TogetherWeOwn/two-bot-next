@@ -33,6 +33,17 @@ class EvidenceClassificationTests(unittest.TestCase):
                     hold.classify_jobs([valid, row])
                 self.assertEqual(hold.classify_jobs([valid])[1], "production waiting")
 
+    def test_unfinished_jobs_with_conclusions_fail_before_classification(self):
+        valid = job(status="waiting", conclusion=None)
+        for status in hold.ACTIVE_STATES:
+            for name in (hold.PRODUCTION_JOB, "other"):
+                contradictory = job(name, status, "failure")
+                for rows in ([contradictory], [valid, contradictory]):
+                    with self.subTest(status=status, name=name, rows=rows):
+                        with self.assertRaisesRegex(incident_issue.IncidentError,
+                                                    "^production hold active job is malformed$"):
+                            hold.classify_jobs(rows)
+
     def test_unsuccessful_terminal_outcomes_are_not_skipped(self):
         for conclusion in ("failure", "cancelled", "timed_out", "action_required",
                            "startup_failure", "stale"):

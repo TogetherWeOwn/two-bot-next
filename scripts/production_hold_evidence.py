@@ -37,7 +37,7 @@ def classify_jobs(jobs):
         if (not isinstance(job, dict) or not isinstance(job.get("name"), str)
                 or not job["name"] or job.get("status") not in (*ACTIVE_STATES, "completed")
                 or "conclusion" not in job or job["conclusion"] not in CONCLUSIONS
-                or (job["status"] == "completed" and job["conclusion"] is None)):
+                or (job["status"] == "completed") != (job["conclusion"] is not None)):
             raise incident_issue.IncidentError("production hold active job is malformed")
     for job in jobs:
         if job["name"] in (PRODUCTION_JOB, ROLLBACK_JOB) and job["status"] in ACTIVE_STATES:
