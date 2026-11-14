@@ -133,8 +133,10 @@ class Freshness(unittest.TestCase):
     def test_invalid_baseline_does_not_read_and_mutation_cannot_change_base(self):
         pr = pull_request()
         del pr["body"]
+        calls = []
         with self.assertRaises(inventory.InventoryError):
-            inventory.require_fresh(lambda route: self.fail("unexpected read"), pr)
+            inventory.require_fresh(lambda route: calls.append(route), pr)
+        self.assertEqual(calls, [])
         pr = pull_request()
 
         def api(route):
