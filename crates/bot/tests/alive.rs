@@ -10,6 +10,8 @@ mod common;
 use common::RestRequest;
 
 use std::{
+    any::Any,
+    cell::Cell,
     net::SocketAddr,
     panic::AssertUnwindSafe,
     process::Stdio,
@@ -1118,6 +1120,24 @@ fn fixture_lost_commit_ack_retains_both_schemas() {
     });
 }
 
+fn is_injected_assertion(reached_outcome: bool, panic: &(dyn Any + Send)) -> bool {
+    reached_outcome && panic.downcast_ref::<&str>().copied() == Some("injected fixture assertion")
+}
+
+#[test]
+#[ignore = "run with the lifecycle fixture cases in CI"]
+fn fixture_injected_assertion_rejects_unrelated_panics() {
+    for (reached_outcome, message, expected) in [
+        (false, "child exited during startup", false),
+        (false, "injected fixture assertion", false),
+        (true, "unrelated panic", false),
+        (true, "injected fixture assertion", true),
+    ] {
+        let panic = std::panic::catch_unwind(|| std::panic::panic_any(message)).unwrap_err();
+        assert_eq!(is_injected_assertion(reached_outcome, &*panic), expected);
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outcome() {
@@ -1137,11 +1157,13 @@ async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outc
         let schema = db.schema.clone();
         let logs = Logs::default();
         let mut bot = Bot::spawn(&db, addr, Some(&discord.url), &discord.api, &logs);
+        let reached_outcome = Cell::new(false);
         let exercised = AssertUnwindSafe(timeout(STEP, async {
             wait_http(&mut bot, addr, "/healthz", 200).await;
             // Health precedes gateway initialization. Finish the upgrade before
             // intentionally killing the child, but keep HELLO gated.
             discord.handshakes.recv().await.expect("mock handshake");
+            reached_outcome.set(true);
             match outcome {
                 1 => panic!("injected fixture assertion"),
                 2 => std::future::pending::<()>().await,
@@ -1180,8 +1202,12 @@ async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outc
         }
         db.close().await;
         assert_eq!(exercised.is_err(), outcome == 1);
-        if let Ok(result) = exercised {
-            assert_eq!(result.is_err(), outcome == 2);
+        match exercised {
+            Ok(result) => assert_eq!(result.is_err(), outcome == 2),
+            Err(panic) => assert!(
+                is_injected_assertion(reached_outcome.get(), &*panic),
+                "expected the injected assertion after startup"
+            ),
         }
         for socket in sockets {
             let rebound = TcpListener::bind(socket)
