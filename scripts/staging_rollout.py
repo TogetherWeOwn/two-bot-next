@@ -1001,8 +1001,12 @@ def verify(args, client):
                     if health == 200 and health_headers.get("x-two-worker-version") == version:
                         # Re-read control plane after the runtime probes; neither
                         # Worker activation nor container rollout is transactional.
-                        active_worker(client, version)
-                        final = client.api(f"/containers/applications/{app['id']}/rollouts/{pinned['id']}")
+                        deadline_aware_read(
+                            client, lambda: active_worker(client, version), app, row, image,
+                            drift_candidate, verification_started)
+                        final = deadline_aware_read(
+                            client, lambda: client.api(f"/containers/applications/{app['id']}/rollouts/{pinned['id']}"),
+                            app, row, image, drift_candidate, verification_started)
                         require(mapping(final).get("id") == pinned["id"], "rollout_identity_drift")
                         # The instance counters can wobble between the `converged`
                         # and lag shapes while the exact build keeps serving, so
@@ -1011,7 +1015,9 @@ def verify(args, client):
                         require(converged(final, image, pinned["target_version"])
                                 or active_lag(final, image, pinned["target_version"]),
                                 "rollout_not_converged")
-                        final_app = application(client)
+                        final_app = deadline_aware_read(
+                            client, lambda: application(client), app, final, image,
+                            drift_candidate, verification_started)
                         require(final_app["id"] == app["id"]
                                 and final_app["durable_objects"]["namespace_id"] == baseline["namespace_id"],
                                 "application_identity_drift")

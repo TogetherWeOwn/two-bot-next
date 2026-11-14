@@ -1465,6 +1465,56 @@ class OrchestrationTests(OfflineTestCase):
         self.assertEqual(caught.exception.detail, "listing_image=baseline later_rollouts=0")
         self.assert_no_evidence()
 
+    def test_final_control_plane_expiry_classifies_stale_listing(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for target in (DEPLOYMENTS_PATH, DETAIL_PATH, APP_PATH):
+            with self.subTest(target=target):
+                self.clock.now = 100
+                client = verify_client()
+                client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+                original_api = client.api
+                reads = 0
+
+                def delayed_api(path):
+                    nonlocal reads
+                    if path == target:
+                        reads += 1
+                        if reads == 2:
+                            self.clock.now = client.deadline
+                            rollout.Client.request(client, "https://example.invalid", authenticated=True)
+                    return original_api(path)
+
+                client.api = delayed_api
+                with self.assertRaises(rollout.GateError) as caught:
+                    rollout.verify(self.args, client)
+                self.assertEqual(str(caught.exception), "application_image_drift")
+                self.assertEqual(caught.exception.detail, "listing_image=baseline later_rollouts=0")
+                self.assert_no_evidence()
+
+    def test_final_control_plane_transport_failure_before_deadline_is_preserved(self):
+        self.prepare_baseline()
+        self.write_deploy_output()
+        for target in (DEPLOYMENTS_PATH, DETAIL_PATH, APP_PATH):
+            with self.subTest(target=target):
+                self.clock.now = 100
+                client = verify_client()
+                client.api_routes[APP_PATH] = [[app(OLD_IMAGE)]]
+                original_api = client.api
+                reads = 0
+
+                def failing_api(path):
+                    nonlocal reads
+                    if path == target:
+                        reads += 1
+                        if reads == 2:
+                            raise rollout.GateError("api_transport_failure")
+                    return original_api(path)
+
+                client.api = failing_api
+                self.assert_gate("api_transport_failure", rollout.verify, self.args, client)
+                self.assert_no_evidence()
+
     def lag_client(self, readyz_routes):
         lagged = lag_row()
         client = verify_client()
