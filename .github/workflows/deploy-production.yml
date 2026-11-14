@@ -1114,7 +1114,8 @@ jobs:
           STAGING_USE_DEPLOYMENT: ${{ steps.staging-use-begin.outputs.deployment_id }}
           STAGING_USE_EXPIRES_AT: ${{ steps.staging-use-begin.outputs.expires_at }}
           STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-soak-use.ndjson
-          AUTO: ${{ needs.guard.outputs.auto }}
+          # Duration is not authorization: keep the true trigger mode for the judge.
+          FULL_SOAK: ${{ needs.guard.outputs.auto == 'true' || (github.event_name == 'workflow_dispatch' && needs.guard.outputs.takeover == 'true' && needs.guard.outputs.allow_unstaged != 'true') }}
         run: node wrangler/scripts/staging-soak-window.mjs
       - name: Read the candidate's staging journeys and soak REST counters
         id: judge

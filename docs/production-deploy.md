@@ -282,8 +282,8 @@ changing trigger routing. No staging-poll retry loop is needed.
 
 Otherwise the `soak` job takes the canonical `staging-lifecycle` lock,
 acquires a 40-minute run/attempt grant for the guarded SHA and proves readiness
-before the baseline. Automatic promotion measures a **fresh full 30 minutes**
-after that baseline, rechecking exact-build readiness at most every minute
+before the baseline. Automatic promotion and manual staged takeover measure a
+**fresh full 30 minutes** after that baseline, rechecking exact-build readiness at most every minute
 and at the boundaries. Historical staging-green age, runner queues and idle
 time supply no credit; the guard's historical remainder is advisory only.
 The 30min interval is required continuous coverage on the same exact build and
@@ -293,21 +293,14 @@ least 10 judged requests, the final pinned user-flow/readiness/original-grant
 proof and confirmed release. These are policy requirements, not a claim that
 the shipped gates enforce all of them.
 
-**Current enforcement gap — warning-only insufficient evidence.**
-`scripts/promotion_regression_gate.py::compare` reports `rest_5xx.verdict:
-"insufficient_data"` for fewer than ten judged requests, or a changed process
-incarnation with a clean post-restart window. With healthy journeys it still
-reports overall `verdict: "pass"`; `main` warns and exits zero, and
-`deploy-production.yml` consumes that exit as success. The separate
-`wrangler/scripts/promotion-error-gate.mjs` also treats insufficient data as a
-non-blocking warning. Thus nine clean requests, or clean counters after a
-restart, can leave the workflow green without the required evidence. This is an
-**unsupported enforcement/qualification gap**, not rate PASS or an authorized
-exception. Workflow green alone is not qualification proof: retain the hold and
-route the missing evidence/enforcement to the technical and release owners;
-do not authorize promotion without the required proof. This source-only
-correction does not repair the runtime or pipeline.
-Manual ordinary deploys retain their no-delay policy but use the same finite
+The production regression consumer refuses `insufficient_data`: the baseline
+and final counters must have a valid matching process identity, a consistent
+counter delta and at least ten judged requests in that delta. A measured
+post-restart regression still refuses. The separate diagnostic
+`wrangler/scripts/promotion-error-gate.mjs` retains its warning-only behavior;
+it cannot authorize production. A successful workflow alone is not release
+approval, and existing holds remain in force.
+Manual cutover-hold deploys retain their no-delay policy but use the same finite
 grant, baseline, final sample and release. Rollback and live-SHA cures skip
 the staging holder entirely. A superseded SHA refuses before acquisition;
 select the current verified candidate on the next promotion rather than
@@ -418,8 +411,9 @@ soaked candidate on staging with production as it serves now:
 - The `soak` job acquires and readies the guarded SHA in its finite window,
   then records a soak-baseline `/ops/metrics` scrape
   (`wrangler/scripts/rest-5xx-counters.mjs`, same `staging` Environment
-  bearer). Automatic runs measure the full fresh interval with
-  `wrangler/scripts/staging-soak-window.mjs`; manual runs do not add a delay.
+  bearer). Automatic runs and manual staged takeovers measure the full fresh
+  interval with `wrangler/scripts/staging-soak-window.mjs`; a manual
+  cutover-hold deploy retains its distinct no-delay policy.
 - Under that same job's staging lock, it runs the final staging user-flow
   probe pinned to the guarded SHA and bound to
   the guarded run-attempt build (a same-SHA redeploy no longer proves the
@@ -447,8 +441,9 @@ soaked candidate on staging with production as it serves now:
   (`health`, `readyz`, `build`) passes on production but failed on staging,
   or when staging's REST 5xx ratio exceeds max(1.5 × production's ratio, 5%)
   with at least 3 staging 5xx responses. Fewer than 10 judged staging
-  requests (or no bearer) records `insufficient_data` with a warning, never a
-  pass; a production baseline below 10 requests falls back to the 5% floor.
+  requests in the valid same-process counter delta, or missing baseline or
+  identity, refuses as `insufficient_data`; a production baseline below 10
+  requests falls back to the 5% floor.
 
 A failing production journey lowers the baseline, never the bar: the gate
 only asks that the candidate is no worse than what serves now. The

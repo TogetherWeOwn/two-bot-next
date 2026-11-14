@@ -130,7 +130,7 @@ class StagingStepTests(unittest.TestCase):
                 self.assertIsNone(evidence["rest"])
 
 
-def staged(checks=None, counters=(0, 200), incarnation=None, baseline="absent"):
+def staged(checks=None, counters=(0, 200), incarnation=OLD_INC, baseline=(0, 0)):
     def block(pair):
         if pair is None:
             return None
@@ -144,7 +144,7 @@ def staged(checks=None, counters=(0, 200), incarnation=None, baseline="absent"):
 
 
 def bookended(checks=None, counters=(0, 200), incarnation=OLD_INC):
-    return staged(checks, counters, incarnation=incarnation, baseline=counters)
+    return staged(checks, counters, incarnation=incarnation, baseline=(0, 0))
 
 
 class CompareTests(unittest.TestCase):
@@ -193,7 +193,7 @@ class CompareTests(unittest.TestCase):
             with self.subTest(counters=counters):
                 evidence = gate.compare(staged(counters=counters), probe(), rest(0, 1000))
                 self.assertEqual(evidence["rest_5xx"]["verdict"], "insufficient_data")
-                self.assertEqual(evidence["verdict"], "pass")
+                self.assertEqual(evidence["verdict"], "fail")
 
     def test_a_thin_or_missing_production_baseline_falls_back_to_the_floor(self):
         for baseline in (rest(9, 9), {"available": False, "code": "token_absent"}, None):
@@ -219,7 +219,7 @@ class SoakCoverageTests(unittest.TestCase):
         evidence = gate.compare(staging, probe(), rest(0, 1000))
         self.assertEqual(evidence["rest_5xx"]["coverage"], "incarnation_changed")
         self.assertEqual(evidence["rest_5xx"]["verdict"], "insufficient_data")
-        self.assertEqual(evidence["verdict"], "pass")
+        self.assertEqual(evidence["verdict"], "fail")
         # Journeys still judge: a restart hides counters, not a broken build.
         staging = bookended({"health": "fail"}, counters=(1, 200))
         staging["baseline"] = {"rest5xx": 20, "restTotal": 1000, "incarnation": NEW_INC}
@@ -238,10 +238,29 @@ class SoakCoverageTests(unittest.TestCase):
         self.assertEqual((evidence["verdict"], evidence["code"]), ("fail", "rest_5xx_regression"))
 
     def test_a_missing_baseline_or_identity_names_its_coverage(self):
-        evidence = gate.compare(staged(counters=(6, 100)), probe(), rest(0, 1000))
+        evidence = gate.compare(staged(counters=(0, 100), baseline="absent"), probe(), rest(0, 1000))
         self.assertEqual(evidence["rest_5xx"]["coverage"], "baseline_unavailable")
-        evidence = gate.compare(bookended(counters=(6, 100), incarnation=None), probe(), rest(0, 1000))
+        self.assertEqual((evidence["verdict"], evidence["code"]), ("fail", "insufficient_data"))
+        evidence = gate.compare(bookended(counters=(0, 100), incarnation=None), probe(), rest(0, 1000))
         self.assertEqual(evidence["rest_5xx"]["coverage"], "identity_unavailable")
+        self.assertEqual((evidence["verdict"], evidence["code"]), ("fail", "insufficient_data"))
+
+    def test_only_the_bookended_delta_counts(self):
+        for baseline, final, verdict in [((0, 1000), (0, 1009), "insufficient_data"),
+                                         ((0, 1000), (0, 1010), "pass"),
+                                         ((0, 1000), (6, 1100), "fail"),
+                                         ((6, 1000), (6, 1100), "pass"),
+                                         ((1, 100), (0, 110), "insufficient_data"),
+                                         ((0, 100), (3, 102), "insufficient_data")]:
+            with self.subTest(baseline=baseline, final=final):
+                evidence = gate.compare(staged(counters=final, baseline=baseline), probe(), rest(0, 1000))
+                self.assertEqual(evidence["rest_5xx"]["verdict"], verdict)
+
+    def test_threshold_boundaries(self):
+        for errors, total, expected in [(2, 20, "pass"), (3, 60, "pass"), (3, 59, "fail")]:
+            with self.subTest(errors=errors, total=total):
+                evidence = gate.compare(bookended(counters=(errors, total)), probe(), rest(0, 1000))
+                self.assertEqual(evidence["rest_5xx"]["verdict"], expected)
 
 
 class MainTests(unittest.TestCase):
@@ -323,6 +342,13 @@ class MainTests(unittest.TestCase):
         code, _ = self.run_main(self.compare_args(staged()))
         self.assertEqual(code, 0)
         self.assertIn("Regression vs production: `no_regression`", self.summary.read_text())
+
+    def test_compare_refuses_insufficient_data_at_the_consumer(self):
+        code, stdout = self.run_main(self.compare_args(bookended(counters=(0, 9))))
+        self.assertEqual(code, 1)
+        self.assertIn("insufficient_data", stdout)
+        self.assertEqual(json.loads((self.dir / "regression.json").read_text())["verdict"], "fail")
+        self.assertIn("insufficient_data", self.summary.read_text())
 
     def test_compare_refuses_a_regression(self):
         code, stdout = self.run_main(self.compare_args(staged(counters=(50, 100))))

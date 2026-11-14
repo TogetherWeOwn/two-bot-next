@@ -78,6 +78,15 @@ test("automatic soak measures a fresh full 30 minutes after the first successful
   assert.equal(h.events[0].durationMs, SOAK);
 });
 
+test("the full-window selection for a manual staged takeover measures 30 minutes", async () => {
+  // The workflow selects this duration without changing the judge's manual mode.
+  const h = harness();
+  await h.run(args({ automatic: true }));
+  assert.equal(h.events.at(-1).durationMs, SOAK);
+  assert.equal(h.pauses.reduce((sum, ms) => sum + ms, 0), SOAK);
+  assert.equal(h.consumes.length, 32);
+});
+
 test("each consume is bound to the exact original arguments and nothing else", async () => {
   const h = harness();
   await h.run(args({ expiresAt: NOW + 40 * MINUTE }));
