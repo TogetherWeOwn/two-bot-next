@@ -4,12 +4,47 @@ Adapted from base_attestation_gate.py at commit 3935a2c82e780fad7e923f427c43299b
 This module does not enforce an attestation policy or schedule a workflow.
 """
 
+import re
+
+
 STATUSES = {"added", "removed", "modified", "renamed", "copied", "changed"}
 MAX_FILES = 3000
 
 
 class InventoryError(ValueError):
     """Reject an incomplete or unrepresentable inventory without echoing input."""
+
+
+def snapshot(pr):
+    """Capture identity fields; callers must independently establish freshness."""
+    def text(value):
+        return isinstance(value, str) and bool(value)
+
+    def positive_int(value):
+        return type(value) is int and value > 0
+
+    if not (isinstance(pr, dict) and pr.get("state") == "open"
+            and positive_int(pr.get("number"))
+            and type(pr.get("changed_files")) is int and 0 < pr["changed_files"] <= MAX_FILES
+            and text(pr.get("title")) and "body" in pr
+            and isinstance(pr["body"], (str, type(None))) and text(pr.get("updated_at"))
+            and isinstance(pr.get("user"), dict) and text(pr["user"].get("login"))):
+        raise InventoryError("Invalid pull request metadata")
+    identity = [pr["number"], pr["state"], pr["title"], pr["body"],
+                pr["user"]["login"], pr["updated_at"], pr["changed_files"]]
+    for side in ("base", "head"):
+        value = pr.get(side)
+        if not (isinstance(value, dict) and text(value.get("ref"))
+                and isinstance(value.get("sha"), str)
+                and re.fullmatch(r"[0-9a-f]{40}", value["sha"])):
+            raise InventoryError("Invalid head or base identity")
+        repo = value.get("repo")
+        if not (isinstance(repo, dict) and positive_int(repo.get("id"))
+                and isinstance(repo.get("full_name"), str)
+                and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo["full_name"])):
+            raise InventoryError("Invalid repository identity")
+        identity.extend((value["ref"], value["sha"], (repo["id"], repo["full_name"])))
+    return tuple(identity)
 
 
 def inventory_path(value):
