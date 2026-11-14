@@ -10,6 +10,7 @@ mod common;
 use common::RestRequest;
 
 use std::{
+    any::Any,
     cell::Cell,
     net::SocketAddr,
     panic::AssertUnwindSafe,
@@ -1119,9 +1120,26 @@ fn fixture_lost_commit_ack_retains_both_schemas() {
     });
 }
 
+fn is_injected_assertion(reached_outcome: bool, panic: &(dyn Any + Send)) -> bool {
+    reached_outcome && panic.downcast_ref::<&str>().copied() == Some("injected fixture assertion")
+}
+
+fn assert_injected_assertion_rejects_unrelated_panics() {
+    for (reached_outcome, message, expected) in [
+        (false, "child exited during startup", false),
+        (false, "injected fixture assertion", false),
+        (true, "unrelated panic", false),
+        (true, "injected fixture assertion", true),
+    ] {
+        let panic = std::panic::catch_unwind(|| std::panic::panic_any(message)).unwrap_err();
+        assert_eq!(is_injected_assertion(reached_outcome, &*panic), expected);
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outcome() {
+    assert_injected_assertion_rejects_unrelated_panics();
     for outcome in 0..6 {
         let db = TestDb::new().await;
         let mut discord = MockDiscord::new().await;
@@ -1195,19 +1213,25 @@ async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outc
             "outcome {outcome}, phase {}",
             phase.get()
         );
-        if let Ok(result) = exercised {
-            assert_eq!(
-                result.is_err(),
-                matches!(outcome, 2 | 4 | 5),
-                "outcome {outcome}, phase {}",
-                phase.get()
-            );
-            match outcome {
-                2 => assert_eq!(phase.get(), "injected outcome", "timeout during startup"),
-                4 => assert_eq!(phase.get(), "health readiness"),
-                5 => assert_eq!(phase.get(), "gateway upgrade"),
-                _ => {}
+        match exercised {
+            Ok(result) => {
+                assert_eq!(
+                    result.is_err(),
+                    matches!(outcome, 2 | 4 | 5),
+                    "outcome {outcome}, phase {}",
+                    phase.get()
+                );
+                match outcome {
+                    2 => assert_eq!(phase.get(), "injected outcome", "timeout during startup"),
+                    4 => assert_eq!(phase.get(), "health readiness"),
+                    5 => assert_eq!(phase.get(), "gateway upgrade"),
+                    _ => {}
+                }
             }
+            Err(panic) => assert!(
+                is_injected_assertion(phase.get() == "injected outcome", &*panic),
+                "expected the injected assertion after startup"
+            ),
         }
         for socket in sockets {
             let rebound = TcpListener::bind(socket)
