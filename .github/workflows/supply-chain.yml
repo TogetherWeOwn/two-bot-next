@@ -211,10 +211,25 @@ jobs:
               output.write(f"body_file<<{delimiter}\n{body_path}\n{delimiter}\n")
 
           PY
+      # The files API stops at 3000 entries. Large same-repository PRs use
+      # the existing head-ref-fenced manual route with complete git history.
+      # This checkout supplies data only; no PR code runs before the gate.
+      - name: Check out complete dispatch history
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: pr-diff
+          fetch-depth: 0
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: true
+          persist-credentials: false
+
       # Count file entries before expanding rename paths, and require a
       # stable PR snapshot. Empty, truncated or inconsistent inventories fail
-      # closed. Push and merge_group have no inventory here and keep their
-      # existing checks.
+      # closed. Dispatch uses a complete immutable merge-base diff instead,
+      # never a skip of the same base-branch attestation floor. Push and
+      # merge_group have no inventory here and keep their existing checks.
       - name: List changed files
         if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
         id: changed
@@ -249,31 +264,56 @@ jobs:
                       or head != os.environ["GITHUB_SHA"]
                       or f"refs/heads/{pr['head']['ref']}" != os.environ["GITHUB_REF"]):
                   raise SystemExit("Dispatch ref/SHA must match an open same-repository PR targeting main")
-          elif head != os.environ["EVENT_HEAD_SHA"] or base != os.environ["EVENT_BASE_SHA"]:
-              raise SystemExit("PR inventory no longer matches this event's head/base SHA")
-          pages = json.loads(subprocess.check_output([
-              "gh", "api", endpoint + "/files?per_page=100", "--paginate", "--slurp",
-          ], text=True))
-          if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
-              raise SystemExit("Malformed PR file pages")
-          entries = [entry for page in pages for entry in page]
-          if len(entries) != count:
-              raise SystemExit("Incomplete PR file inventory; split oversized PRs into "
-                               "independently reviewable smaller PRs (see CONTRIBUTING.md)")
-          paths, filenames = [], set()
-          for entry in entries:
-              if (not isinstance(entry, dict) or entry.get("status") not in
-                      ("added", "removed", "modified", "renamed", "copied", "changed", "unchanged")):
-                  raise SystemExit("Missing or invalid PR file status")
-              if entry["status"] == "renamed" and not entry.get("previous_filename"):
-                  raise SystemExit("Renamed PR file is missing its source path")
-              name = entry["filename"]
-              if not isinstance(name, str) or not name or name in filenames:
-                  raise SystemExit("Missing or duplicate PR filename")
-              filenames.add(name)
-              paths.append(name)
-              if entry.get("previous_filename") is not None:
-                  paths.append(entry["previous_filename"])
+              # The PR API can retain an old base SHA after main advances.
+              # Capture current main for both the diff and the trusted gate;
+              # the gate checkout equality check still rejects later drift.
+              main = json.loads(subprocess.check_output([
+                  "gh", "api", f"repos/{repo}/git/ref/heads/main",
+              ], text=True))
+              base = main["object"]["sha"]
+              if (main.get("ref") != "refs/heads/main" or main["object"].get("type") != "commit"
+                      or not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base)):
+                  raise SystemExit("Missing or invalid main snapshot SHA")
+              diff_repo = str(Path(os.environ["GITHUB_WORKSPACE"]) / "pr-diff")
+              if subprocess.check_output(["git", "-C", diff_repo, "rev-parse", "--is-shallow-repository"], text=True).strip() != "false":
+                  raise SystemExit("Dispatch requires complete git history")
+              merge_base = subprocess.check_output([
+                  "git", "-C", diff_repo, "merge-base", base, head,
+              ], text=True).strip()
+              raw = subprocess.check_output([
+                  "git", "-C", diff_repo, "diff", "--no-ext-diff", "--no-textconv",
+                  "--ignore-submodules=none", "--name-only", "--no-renames", "-z", merge_base, head, "--",
+              ])
+              if not raw or not raw.endswith(b"\0"):
+                  raise SystemExit("Changed-file diff is empty or malformed")
+              paths = [name.decode("utf-8") for name in raw[:-1].split(b"\0")]
+          else:
+              if (head != os.environ["EVENT_HEAD_SHA"] or base != os.environ["EVENT_BASE_SHA"]):
+                  raise SystemExit("PR inventory no longer matches this event's head/base SHA")
+              pages = json.loads(subprocess.check_output([
+                  "gh", "api", endpoint + "/files?per_page=100", "--paginate", "--slurp",
+              ], text=True))
+              if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+                  raise SystemExit("Malformed PR file pages")
+              entries = [entry for page in pages for entry in page]
+              if len(entries) != count:
+                  raise SystemExit("Incomplete PR file inventory; validate large same-repository PRs "
+                                   "with supply-chain.yml workflow_dispatch on the PR head branch "
+                                   "and pr_number (see CONTRIBUTING.md)")
+              paths, filenames = [], set()
+              for entry in entries:
+                  if (not isinstance(entry, dict) or entry.get("status") not in
+                          ("added", "removed", "modified", "renamed", "copied", "changed", "unchanged")):
+                      raise SystemExit("Missing or invalid PR file status")
+                  if entry["status"] == "renamed" and not entry.get("previous_filename"):
+                      raise SystemExit("Renamed PR file is missing its source path")
+                  name = entry["filename"]
+                  if not isinstance(name, str) or not name or name in filenames:
+                      raise SystemExit("Missing or duplicate PR filename")
+                  filenames.add(name)
+                  paths.append(name)
+                  if entry.get("previous_filename") is not None:
+                      paths.append(entry["previous_filename"])
 
           # A line-based gate cannot represent embedded line separators.
           if not paths or any(not isinstance(name, str) or not name or "\0" in name
@@ -300,10 +340,9 @@ jobs:
           # neuter attestation_findings) and pass itself with no attestation.
           # Same shape as the gitleaks base-branch policy below: a weakened
           # gate merges first as its own small reviewed PR carrying a T0
-          # attestation, and only then judges others. Dispatch runs validate a
-          # PR targeting main, so an empty base SHA falls back to main. On pull
-          # requests, verify the checked-out commit against the immutable
-          # inventory snapshot before running any gate code.
+          # attestation, and only then judges others. Dispatch uses the trusted
+          # main ref, never an API-derived checkout ref. Verify its commit below
+          # against the immutable inventory snapshot before running any gate code.
           ref: ${{ github.event.pull_request.base.sha || 'main' }}
           path: base-gate
           sparse-checkout: .github/scripts
@@ -311,7 +350,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify base-branch gate snapshot
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
         env:
           EXPECTED_BASE_SHA: ${{ steps.changed.outputs.base_sha }}
         shell: python3 -I {0}

@@ -467,7 +467,8 @@ class BaseGateSnapshotTests(unittest.TestCase):
 
 class ChangedFileInventoryTests(unittest.TestCase):
     def inventory(self, entries, count=None, success=True, event="pull_request",
-                  metadata_overrides=None, after_overrides=None, **env_overrides):
+                  metadata_overrides=None, after_overrides=None, git_changes=None,
+                  gitlink=None, pr_base_revision=None, main_sha=None, **env_overrides):
         with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
             root = Path(tmp)
             metadata = {
@@ -476,6 +477,33 @@ class ChangedFileInventoryTests(unittest.TestCase):
                          "repo": {"full_name": "TogetherWeOwn/two-bot-next"}},
                 "base": {"sha": "b" * 40, "ref": "main"},
             }
+            if git_changes is not None:
+                repo = root / "pr-diff"
+                repo.mkdir()
+                def git(*args):
+                    return subprocess.check_output(["git", "-C", str(repo), *args],
+                                                   text=True, stderr=subprocess.PIPE).strip()
+                git("init", "--quiet")
+                git("config", "user.name", "Fixture")
+                git("config", "user.email", "fixture@example.invalid")
+                for index, changes in enumerate(git_changes):
+                    for name, content in changes.items():
+                        path = repo / name
+                        if content is None:
+                            path.unlink()
+                        else:
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_text(content)
+                    git("add", "--all")
+                    if index == 1 and gitlink:
+                        git("update-index", "--add", "--cacheinfo",
+                            f"160000,{git('rev-parse', 'HEAD')},{gitlink}")
+                    git("commit", "--quiet", "--allow-empty", "-m", "fixture")
+                metadata["base"]["sha"] = git("rev-parse", "HEAD~1")
+                metadata["head"]["sha"] = git("rev-parse", "HEAD")
+            current_main = metadata["base"]["sha"] if main_sha is None else main_sha
+            if pr_base_revision is not None:
+                metadata["base"]["sha"] = git("rev-parse", pr_base_revision)
             overrides = dict(metadata_overrides or {})
             # Retain real fixture SHAs when changing only a nested identity field.
             for key in ("head", "base"):
@@ -485,9 +513,11 @@ class ChangedFileInventoryTests(unittest.TestCase):
             entries = [{"status": "modified", **entry} for entry in entries]
             fixture = root / "fixture.json"
             fixture.write_text(json.dumps({"before": metadata, "after": after,
+                                           "main": {"ref": "refs/heads/main", "object":
+                                                    {"type": "commit", "sha": current_main}},
                                            "pages": [entries[i:i + 100] for i in range(0, len(entries), 100)] or [[]]}))
-            # Only gh is stubbed. The actual inline step runs as a child
-            # process; no GitHub credentials or network are used.
+            # Only gh is stubbed. The actual inline step and (on dispatch) git
+            # run as child processes; no GitHub credentials or network are used.
             gh = root / "gh"
             gh.write_text("#!/usr/bin/python3\n" + textwrap.dedent('''\
                 import json, pathlib, sys
@@ -495,7 +525,9 @@ class ChangedFileInventoryTests(unittest.TestCase):
                 fixture = json.loads((root / "fixture.json").read_text())
                 with (root / "calls").open("a") as calls:
                     calls.write(json.dumps(sys.argv[1:]) + "\\n")
-                if "/files?" in sys.argv[2]:
+                if sys.argv[2].endswith("/git/ref/heads/main"):
+                    print(json.dumps(fixture["main"]))
+                elif "/files?" in sys.argv[2]:
                     if "--slurp" in sys.argv:
                         print(json.dumps(fixture["pages"]))
                     else:
@@ -517,12 +549,12 @@ class ChangedFileInventoryTests(unittest.TestCase):
                    "EVENT_HEAD_SHA": metadata["head"]["sha"],
                    "EVENT_BASE_SHA": metadata["base"]["sha"],
                    "GITHUB_SHA": metadata["head"]["sha"],
-                   "GITHUB_REF": "refs/heads/fix/inventory",
+                   "GITHUB_REF": "refs/heads/fix/inventory", "GITHUB_WORKSPACE": tmp,
                    "GITHUB_OUTPUT": str(output), "RUNNER_TEMP": tmp, **env_overrides}
             script = root / "list-step"
             script.write_text(LIST_FILES)
-            result = subprocess.run([sys.executable, "-I", str(script)],
-                                    env=env, capture_output=True, text=True)
+            command = ([sys.executable, "-I"] if "import json" in LIST_FILES else ["bash"])
+            result = subprocess.run([*command, str(script)], env=env, capture_output=True, text=True)
             if not success:
                 self.assertNotEqual(result.returncode, 0, "Incomplete inventory passed the gate")
                 self.assertEqual(output.read_text(), "", "Failure must not publish an inventory")
@@ -575,6 +607,14 @@ class ChangedFileInventoryTests(unittest.TestCase):
                                success=False)
         self.inventory([{"filename": "docs/new.md", "status": "unknown"}], success=False)
 
+    def test_dispatch_includes_gitlinks_despite_submodule_ignore_policy(self):
+        paths, _, _ = self.inventory(
+            [], count=3, event="workflow_dispatch", gitlink="auth",
+            git_changes=[{}, {"docs/page.md": "ordinary change", ".gitmodules":
+                             '[submodule "fixture"]\n\tpath = auth\n'
+                             '\turl = https://example.invalid/fixture\n\tignore = all\n'}])
+        self.assertEqual(set(paths), {".gitmodules", "auth", "docs/page.md"})
+
     def test_stale_or_changing_inventory_fails_closed(self):
         entries = [{"filename": "a.rs"}]
         for overrides in ({"EVENT_HEAD_SHA": "c" * 40}, {"EVENT_BASE_SHA": "c" * 40}):
@@ -585,8 +625,53 @@ class ChangedFileInventoryTests(unittest.TestCase):
             with self.subTest(after=after):
                 self.inventory(entries, after_overrides=after, success=False)
 
+    def test_dispatch_uses_complete_pinned_diff_beyond_api_limit(self):
+        changes = {f"docs/page-{n}.md": str(n) for n in range(3000)}
+        changes["auth/policy.rs"] = "critical change"
+        paths, emitted, calls = self.inventory(
+            [], count=3001, event="workflow_dispatch", git_changes=[{}, changes])
+        self.assertEqual(set(paths), set(changes))
+        self.assertRegex(emitted["base_sha"], r"^[0-9a-f]{40}$")
+        self.assertFalse(any("/files?" in call[1] for call in calls))
+        # The complete diff still feeds the same base-branch T0 floor.
+        metadata = PRLintTests().resolve(EVENT_NAME="pull_request", EVENT_HEAD_REF="fix/inventory",
+                                         EVENT_AUTHOR="contributor")
+        output = PRLintTests().validate({**metadata, "changed_files": "\n".join(paths)}, success=False)
+        self.assertIn("::error title=Attestation::", output)
+
+    def test_dispatch_uses_current_main_when_pr_base_is_stale(self):
+        paths, emitted, calls = self.inventory(
+            [], count=2, event="workflow_dispatch", pr_base_revision="HEAD~2",
+            git_changes=[{"base.md": "base"}, {"main-only.md": "merged"}, {"head.md": "pr"}])
+        self.assertEqual(paths, ["head.md"])
+        self.assertIn(["api", "repos/TogetherWeOwn/two-bot-next/git/ref/heads/main"], calls)
+        # The gate must accept this captured main SHA, but reject later drift.
+        script = inline_script("Verify base-branch gate snapshot", heredoc=False)
+        env = {"GITHUB_WORKSPACE": "/fixture", "EXPECTED_BASE_SHA": emitted["base_sha"]}
+        with patch.dict(os.environ, env, clear=True), patch(
+                "subprocess.check_output", return_value=emitted["base_sha"] + "\n"):
+            exec(script, {})
+        with patch.dict(os.environ, env, clear=True), patch(
+                "subprocess.check_output", return_value="c" * 40 + "\n"):
+            with self.assertRaisesRegex(SystemExit, "no longer matches the inventory snapshot"):
+                exec(script, {})
+        for invalid in ("", "main", "c" * 39):
+            with self.subTest(main_sha=invalid):
+                error = self.inventory(
+                    [], count=1, event="workflow_dispatch", main_sha=invalid, success=False,
+                    git_changes=[{}, {"head.md": "pr"}])
+                self.assertEqual(error, "Missing or invalid main snapshot SHA\n")
+
+    def test_dispatch_diff_preserves_old_and_new_rename_paths(self):
+        paths, _, _ = self.inventory(
+            [], count=1, event="workflow_dispatch",
+            git_changes=[{"auth/old.rs": "unchanged"},
+                         {"auth/old.rs": None, "docs/new.md": "unchanged"}])
+        self.assertEqual(set(paths), {"auth/old.rs", "docs/new.md"})
+
     def test_dispatch_rejects_stale_fork_closed_or_wrong_ref(self):
-        fixture = {"entries": [{"filename": "a.rs"}], "event": "workflow_dispatch"}
+        fixture = {"entries": [{"filename": "a.rs"}], "event": "workflow_dispatch",
+                   "git_changes": [{}, {"a.rs": "change"}]}
         paths, _, _ = self.inventory(**fixture)
         self.assertEqual(paths, ["a.rs"])
         diagnostic = "Dispatch ref/SHA must match an open same-repository PR targeting main\n"
@@ -599,6 +684,15 @@ class ChangedFileInventoryTests(unittest.TestCase):
             with self.subTest(metadata=metadata):
                 error = self.inventory(**fixture, metadata_overrides=metadata, success=False)
                 self.assertEqual(error, diagnostic)
+
+    def test_dispatch_rejects_missing_history_or_empty_diff(self):
+        error = self.inventory(
+            [{"filename": "a.rs"}], event="workflow_dispatch", success=False,
+            git_changes=[{}, {"a.rs": "change"}], main_sha="c" * 40)
+        self.assertIn("Not a valid commit name", error)
+        error = self.inventory([], count=1, event="workflow_dispatch",
+                               git_changes=[{}, {}], success=False)
+        self.assertEqual(error, "Changed-file diff is empty or malformed\n")
 
 
 if __name__ == "__main__":
