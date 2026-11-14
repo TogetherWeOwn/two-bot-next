@@ -10,6 +10,7 @@ mod common;
 use common::RestRequest;
 
 use std::{
+    cell::Cell,
     net::SocketAddr,
     panic::AssertUnwindSafe,
     process::Stdio,
@@ -1137,11 +1138,14 @@ async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outc
         let schema = db.schema.clone();
         let logs = Logs::default();
         let mut bot = Bot::spawn(&db, addr, Some(&discord.url), &discord.api, &logs);
+        let phase = Cell::new("health readiness");
         let exercised = AssertUnwindSafe(timeout(STEP, async {
             wait_http(&mut bot, addr, "/healthz", 200).await;
             // Health precedes gateway initialization. Finish the upgrade before
             // intentionally killing the child, but keep HELLO gated.
+            phase.set("gateway upgrade");
             discord.handshakes.recv().await.expect("mock handshake");
+            phase.set("injected outcome");
             match outcome {
                 1 => panic!("injected fixture assertion"),
                 2 => std::future::pending::<()>().await,
@@ -1179,9 +1183,22 @@ async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outc
             assert!(cleaned, "fixture cleanup after outcome {outcome}");
         }
         db.close().await;
-        assert_eq!(exercised.is_err(), outcome == 1);
+        assert_eq!(
+            exercised.is_err(),
+            outcome == 1,
+            "outcome {outcome}, phase {}",
+            phase.get()
+        );
         if let Ok(result) = exercised {
-            assert_eq!(result.is_err(), outcome == 2);
+            assert_eq!(
+                result.is_err(),
+                outcome == 2,
+                "outcome {outcome}, phase {}",
+                phase.get()
+            );
+            if outcome == 2 {
+                assert_eq!(phase.get(), "injected outcome", "timeout during startup");
+            }
         }
         for socket in sockets {
             let rebound = TcpListener::bind(socket)
