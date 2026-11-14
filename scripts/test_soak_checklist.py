@@ -52,19 +52,16 @@ class SoakChecklistTests(unittest.TestCase):
                 self.assertIn(requirement, rendered)
         self.assertIn("[Evidence-bounded timing exits](#evidence-bounded-timing-exits)", rendered)
 
-    def test_promotion_policy_discloses_warning_only_enforcement(self):
+    def test_promotion_policy_discloses_fail_closed_enforcement(self):
         instructions = "\n".join(self.checklist["instructions"])
         for requirement in (
-            "at least 10 judged requests",
+            "at least 10 judged requests in the counter delta",
             "same exact build/process incarnation",
-            "not a claim of current gate enforcement",
-            "`insufficient_data` for fewer than 10 judged requests",
-            "changed process incarnation with a clean post-restart window",
-            "overall `pass`, warns and exits zero",
-            "workflow consumes that exit",
-            "separate error-rate gate also treats insufficient data as warning-only",
-            "unsupported enforcement/qualification gap remains held",
-            "workflow green alone is not the required proof",
+            "manual staged takeover",
+            "production regression consumer refuses insufficient count",
+            "missing baseline or identity, and reset/restart",
+            "separate diagnostic error-rate gate remains warning-only",
+            "Workflow green alone is not release authorization and existing holds remain",
         ):
             with self.subTest(requirement=requirement):
                 self.assertIn(requirement, instructions)
