@@ -10,6 +10,7 @@ mod common;
 use common::RestRequest;
 
 use std::{
+    cell::Cell,
     net::SocketAddr,
     panic::AssertUnwindSafe,
     process::Stdio,
@@ -1121,7 +1122,7 @@ fn fixture_lost_commit_ack_retains_both_schemas() {
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outcome() {
-    for outcome in 0..4 {
+    for outcome in 0..6 {
         let db = TestDb::new().await;
         let mut discord = MockDiscord::new().await;
         let addr = TcpListener::bind("127.0.0.1:0")
@@ -1137,11 +1138,20 @@ async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outc
         let schema = db.schema.clone();
         let logs = Logs::default();
         let mut bot = Bot::spawn(&db, addr, Some(&discord.url), &discord.api, &logs);
+        let phase = Cell::new("health readiness");
         let exercised = AssertUnwindSafe(timeout(STEP, async {
+            if outcome == 4 {
+                std::future::pending::<()>().await;
+            }
             wait_http(&mut bot, addr, "/healthz", 200).await;
             // Health precedes gateway initialization. Finish the upgrade before
             // intentionally killing the child, but keep HELLO gated.
+            phase.set("gateway upgrade");
+            if outcome == 5 {
+                std::future::pending::<()>().await;
+            }
             discord.handshakes.recv().await.expect("mock handshake");
+            phase.set("injected outcome");
             match outcome {
                 1 => panic!("injected fixture assertion"),
                 2 => std::future::pending::<()>().await,
@@ -1179,9 +1189,25 @@ async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outc
             assert!(cleaned, "fixture cleanup after outcome {outcome}");
         }
         db.close().await;
-        assert_eq!(exercised.is_err(), outcome == 1);
+        assert_eq!(
+            exercised.is_err(),
+            outcome == 1,
+            "outcome {outcome}, phase {}",
+            phase.get()
+        );
         if let Ok(result) = exercised {
-            assert_eq!(result.is_err(), outcome == 2);
+            assert_eq!(
+                result.is_err(),
+                matches!(outcome, 2 | 4 | 5),
+                "outcome {outcome}, phase {}",
+                phase.get()
+            );
+            match outcome {
+                2 => assert_eq!(phase.get(), "injected outcome", "timeout during startup"),
+                4 => assert_eq!(phase.get(), "health readiness"),
+                5 => assert_eq!(phase.get(), "gateway upgrade"),
+                _ => {}
+            }
         }
         for socket in sockets {
             let rebound = TcpListener::bind(socket)
