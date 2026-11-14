@@ -3032,7 +3032,8 @@ def production_errors(workflow):
         for index, command, env in (
                 (2, "node wrangler/scripts/staging-use-pipeline.mjs begin", {**control,
                     "STAGING_USE_EXPECTED_SHA": "${{ needs.guard.outputs.sha }}", "STAGING_USE_MINUTES": "40"}),
-                (4, "node wrangler/scripts/staging-soak-window.mjs", {**retained, "AUTO": "${{ needs.guard.outputs.auto }}"}),
+                (4, "node wrangler/scripts/staging-soak-window.mjs", {**retained, "FULL_SOAK":
+                    "${{ needs.guard.outputs.auto == 'true' || (github.event_name == 'workflow_dispatch' && needs.guard.outputs.takeover == 'true' && needs.guard.outputs.allow_unstaged != 'true') }}"}),
                 (6, "node wrangler/scripts/staging-use-pipeline.mjs consume", retained),
                 (7, "node wrangler/scripts/staging-use-pipeline.mjs finish", {**control,
                     "STAGING_USE_EXPIRES_AT": "${{ steps.staging-use-begin.outputs.expires_at }}"})):

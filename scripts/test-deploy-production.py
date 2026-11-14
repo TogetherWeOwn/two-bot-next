@@ -730,8 +730,8 @@ class StaticGuardTests(unittest.TestCase):
         self.assertNotIn("OWNERSHIP_CONTROL_TOKEN", baseline)
         interval = "\n".join(self.soak_step(order[2]))
         self.assertIn("node wrangler/scripts/staging-soak-window.mjs", interval)
-        # Automatic runs measure the full 30 minutes; manual runs add no delay.
-        self.assertIn("AUTO: ${{ needs.guard.outputs.auto }}", interval)
+        # Duration selection is separate from the trigger authority used by the judge.
+        self.assertIn("FULL_SOAK: ${{ needs.guard.outputs.auto == 'true' || ", interval)
         # Every consumer is bound to the exact original grant from begin.
         for text in (interval, "\n".join(self.soak_step(order[4])), "\n".join(self.soak_step(order[5]))):
             self.assertIn("STAGING_USE_EXPIRES_AT: ${{ steps.staging-use-begin.outputs.expires_at }}", text)
@@ -860,6 +860,11 @@ class StaticGuardTests(unittest.TestCase):
                        '--baseline-counters "$RUNNER_TEMP/staging-soak-baseline.json"',
                        '--out "$RUNNER_TEMP/staging-soak-evidence.json"'):
             self.assertIn(needle, staging)
+        # The staged takeover gets the full duration without changing the
+        # independent manual/automatic authority passed to the judge.
+        self.assertIn("FULL_SOAK: ${{ needs.guard.outputs.auto == 'true' || "
+                      "(github.event_name == 'workflow_dispatch' && needs.guard.outputs.takeover == 'true' "
+                      "&& needs.guard.outputs.allow_unstaged != 'true') }}", text)
         # The run binding and runs listing arrive here; the baseline is a
         # file written earlier by this same bounded job, never an output.
         for needle in ("RUN_ID: ${{ needs.guard.outputs.staging_run_id }}",

@@ -53,8 +53,8 @@ if (isDirectInvocation(process.argv[1], import.meta.url)) {
   };
   try {
     require(path, "staging_receipt_required");
-    require(["true", "false"].includes(process.env.AUTO), "staging_pipeline_mode_invalid");
-    await soakWindow({ automatic: process.env.AUTO === "true",
+    require(["true", "false"].includes(process.env.FULL_SOAK), "staging_pipeline_mode_invalid");
+    await soakWindow({ automatic: process.env.FULL_SOAK === "true",
       url: process.env.STAGING_WORKER_URL, token: process.env.OWNERSHIP_CONTROL_TOKEN,
       runId: process.env.GITHUB_RUN_ID, runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
       sha: process.env.STAGING_USE_SHA, deploymentId: process.env.STAGING_USE_DEPLOYMENT,

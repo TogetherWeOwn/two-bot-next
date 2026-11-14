@@ -703,8 +703,10 @@ def soak_step_errors(job):
         errors.append("soak: original grant must be rechecked after final sampling, before release")
     if "--baseline-counters" not in runs[judge]:
         errors.append("soak: final probe must be judged against this window's baseline")
-    if squash(steps[window].get("env", {}).get("AUTO")) != squash(expr("needs.guard.outputs.auto")):
-        errors.append("soak: interval length must follow the guarded run's automatic flag")
+    full_soak = ("needs.guard.outputs.auto == 'true' || (github.event_name == 'workflow_dispatch' "
+                 "&& needs.guard.outputs.takeover == 'true' && needs.guard.outputs.allow_unstaged != 'true')")
+    if squash(steps[window].get("env", {}).get("FULL_SOAK")) != squash(expr(full_soak)):
+        errors.append("soak: automatic and manual staged takeover require the full interval")
     for i in [window, *after, release]:
         step = steps[i]
         senv = step.get("env") or {}
@@ -906,7 +908,9 @@ def soak_fixture(lock):
                                     "STAGING_USE_RECEIPT": FIXTURE_RECEIPT},
              "run": "node wrangler/scripts/staging-use-pipeline.mjs begin"},
             {"env": metrics, "run": "node wrangler/scripts/rest-5xx-counters.mjs --out b.json"},
-            {"env": {**grant, "AUTO": expr("needs.guard.outputs.auto")},
+            {"env": {**grant, "FULL_SOAK": expr("needs.guard.outputs.auto == 'true' || "
+                "(github.event_name == 'workflow_dispatch' && needs.guard.outputs.takeover == 'true' "
+                "&& needs.guard.outputs.allow_unstaged != 'true')")},
              "run": "node wrangler/scripts/staging-soak-window.mjs"},
             {"id": "verdict", "env": metrics,
              "run": "python3 scripts/promotion_regression_gate.py staging --baseline-counters b.json"},
@@ -1648,8 +1652,9 @@ class PromotionSoakControls(unittest.TestCase):
                 lambda w, j, s, p, n=needle: s["steps"][step_index(s, n)].update({"if": "false"}),
                 "can skip a lifecycle assertion")
         self.assert_mutation_rejected(
-            lambda w, j, s, p: s["steps"][step_index(s, SOAK_WINDOW)]["env"].update(AUTO="true"),
-            "automatic flag")
+            lambda w, j, s, p: s["steps"][step_index(s, SOAK_WINDOW)]["env"].update(
+                FULL_SOAK=expr("needs.guard.outputs.auto")),
+            "manual staged takeover require the full interval")
         def unjudged(w, j, s, p):
             step = s["steps"][step_index(s, FINAL_PROBE)]
             step["run"] = step["run"].replace("--baseline-counters", "--counters")
