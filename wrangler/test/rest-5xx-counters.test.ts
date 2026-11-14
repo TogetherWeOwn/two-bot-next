@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseArgs, runCli } from "../scripts/rest-5xx-counters.mjs";
+import { countersFrom, parseArgs, runCli } from "../scripts/rest-5xx-counters.mjs";
 import { metricsLines } from "./fixtures/metrics.ts";
 
 const ORIGIN = "https://two-bot-next-staging.example.workers.dev";
@@ -108,6 +108,25 @@ test("scrape failures fail closed with a fixed code", async () => {
   const decode = await run({ STAGING_WORKER_URL: ORIGIN, METRICS_SCRAPE_TOKEN: TOKEN }, garbage);
   assert.equal(decode.code, 1);
   assert.deepEqual(decode.receipt, { available: false, code: "decode_failed" });
+});
+
+test("REST counter receipts reject invalid integers and unsafe sums", () => {
+  const sample = (value: number, result = "2xx") => ({
+    name: "two_bot_rest_requests_total", labels: { route: "other", result }, value,
+  });
+  for (const value of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => countersFrom([sample(value)]));
+  }
+  assert.throws(() => countersFrom([sample(Number.MAX_SAFE_INTEGER), sample(1, "5xx")]));
+});
+
+test("an invalid REST counter produces an unavailable receipt", async () => {
+  const fetchImpl = async () => ({ ok: true, status: 200, text: async () => restBody(Number.MAX_SAFE_INTEGER + 1, 0) });
+  const { code, receipt } = await run(
+    { STAGING_WORKER_URL: ORIGIN, METRICS_SCRAPE_TOKEN: TOKEN }, fetchImpl,
+  );
+  assert.equal(code, 1);
+  assert.deepEqual(receipt, { available: false, code: "invalid_rest_counters" });
 });
 
 test("arguments are strict", () => {

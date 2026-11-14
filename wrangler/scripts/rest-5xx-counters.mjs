@@ -53,8 +53,15 @@ export function parseArgs(argv) {
  * counters and breaks the judged window.
  */
 export function countersFrom(samples) {
+  const rest = samples.filter((s) => s.name === "two_bot_rest_requests_total");
+  if (rest.some((s) => !Number.isSafeInteger(s.value) || s.value < 0)) {
+    throw new Error("invalid REST counter");
+  }
   const { state } = evaluateMetrics(samples, EMPTY_STATE, 0);
   const receipt = { restTotal: state.restTotal, rest5xx: state.rest5xx ?? 0 };
+  if (!Number.isSafeInteger(receipt.restTotal) || !Number.isSafeInteger(receipt.rest5xx)) {
+    throw new Error("invalid REST counter sum");
+  }
   const incarnation = processIncarnation(samples.filter((s) => s.name === "two_bot_process_incarnation"));
   if (incarnation !== undefined) receipt.incarnation = incarnation;
   return receipt;
@@ -100,7 +107,15 @@ export async function runCli(argv, env, deps = {}) {
     console.log(`::error::rest 5xx counters: scrape failed (${code})`);
     return 1;
   }
-  const receipt = { available: true, code: "scraped", ...countersFrom(scraped.samples) };
+  let receipt;
+  try {
+    receipt = { available: true, code: "scraped", ...countersFrom(scraped.samples) };
+  } catch {
+    receipt = { available: false, code: "invalid_rest_counters" };
+    writeFileSync(config.out, `${JSON.stringify(receipt)}\n`);
+    console.log("::error::rest 5xx counters: invalid REST counters");
+    return 1;
+  }
   writeFileSync(config.out, `${JSON.stringify(receipt)}\n`);
   console.log(JSON.stringify(receipt));
   return 0;
