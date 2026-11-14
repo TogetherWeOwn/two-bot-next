@@ -3,11 +3,10 @@
 `rust-toolchain.toml` is the single source of truth (currently 1.99.1).
 Every installer step in `check.yml`, `nightly.yml`,
 `pipeline-benchmark.yml` and `reusable-rust-nextest.yml` must request that
-exact channel. `check.yml` has migrated to the native installer
+exact channel. These workflows use the native installer
 (`bash .github/scripts/install-rust-toolchain.sh` with `RUST_TOOLCHAIN` in its
-env) and must not use the `dtolnay/rust-toolchain` action again; the other
-three still use the action (`with.toolchain`) until they migrate, and either
-shape is pinned there (the fuzz-compile job alone uses pinned nightly), every covered
+env) and must not use the `dtolnay/rust-toolchain` action again. The fuzz-compile
+job alone uses pinned nightly. Every covered
 Dockerfile (`Dockerfile` and `crates/voice-probe/Dockerfile`) must build
 `FROM rust:<major>.<minor>-trixie`, and the selected workflow job containers
 must use the matching pinned Rust trixie image. Runs offline via the existing
@@ -26,7 +25,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ("check.yml", "nightly.yml", "pipeline-benchmark.yml", "reusable-rust-nextest.yml")
-NATIVE_WORKFLOWS = ("check.yml",)
+NATIVE_WORKFLOWS = WORKFLOWS
 ACTION_WORKFLOWS = tuple(name for name in WORKFLOWS if name not in NATIVE_WORKFLOWS)
 CONTAINER_WORKFLOWS = {
     "deploy-staging.yml": ("schema-gate", "roles-gate"),
@@ -505,12 +504,8 @@ class ToolchainParityTests(unittest.TestCase):
             root = make_fixture_root(scratch)
             path = root / ".github/workflows/pipeline-benchmark.yml"
             original = path.read_text()
-            self.assertIn('toolchain: "1.99.1" # Match rust-toolchain.toml', original)
-            path.write_text(original + (
-                '      - uses: dtolnay/rust-toolchain@master\n'
-                '        with:\n'
-                '          toolchain: "1.98.0"\n'
-            ))
+            self.assertIn('RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml', original)
+            path.write_text(original + PINNED_WORKFLOW.split('    steps:\n', 1)[1].format(toolchain="1.98.0"))
             self.assertEqual(
                 toolchain_parity_errors(root),
                 ["pipeline-benchmark.yml#job: expected '1.99.1', got '1.98.0'"],
