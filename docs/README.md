@@ -286,6 +286,7 @@ Bytes: index <12,000; others <=65,536 except LARGE_DOCS.
 
 - [Quality gates](quality-gates.md)
 - [CI security](ci-security.md)
+- [Trusted attestation](base-attestation-gate.md)
 - [CI speed rollout](ci-speed-rollout.md)
 - [Delivery](dora-metrics.md)
 - [Docs queue](ci-docs-only-queue-note.md)
