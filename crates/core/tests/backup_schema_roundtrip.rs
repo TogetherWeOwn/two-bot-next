@@ -394,6 +394,30 @@ fn assert_archive_matches(contents: &DumpContents, expected: &Snapshot) {
     );
 }
 
+fn omit_populated_newer_tables(contents: &mut DumpContents, names: &[&str]) {
+    for &name in names {
+        let rows = contents.buffers.remove(name).unwrap();
+        assert!(!rows.is_empty(), "fixture must populate newer {name}");
+        contents.manifest.tables.retain(|table| table.name != name);
+    }
+}
+
+async fn assert_newer_tables_cleared(pool: &PgPool, names: &[&str], version: u32) {
+    for &name in names {
+        let count: i64 = sqlx::query_scalar(audited(format!(
+            "SELECT COUNT(*) FROM {}",
+            identifier(name)
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 0,
+            "v{version} restore clears newer {name} target rows"
+        );
+    }
+}
+
 fn copy_contents(contents: &DumpContents) -> DumpContents {
     DumpContents {
         manifest: contents.manifest.clone(),
@@ -2150,7 +2174,7 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
     let directory = ArchiveDirectory::new();
     let mut old = current_archive(pool, &directory).await;
     assert_eq!(old.manifest.version, 16);
-    for name in [
+    let newer = [
         "game_activity_guild_aggregates",
         "assistant_monthly_builds",
         "scheduled_events_claim",
@@ -2165,65 +2189,20 @@ async fn v8_archive_restores_and_clears_newer_guild_counters() {
         "giveaway_entries",
         "giveaway_draws",
         "event_instance_windows",
-    ] {
-        let rows = old.buffers.remove(name).unwrap();
-        assert!(!rows.is_empty(), "fixture must populate newer {name}");
-        old.manifest.tables.retain(|table| table.name != name);
-    }
+    ];
+    omit_populated_newer_tables(&mut old, &newer);
     old.manifest.version = 8;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-guild-counters-v8.ndjson.gz");
     write_archive(&old_path, &old);
     let inspected = inspect(&old_path).expect("pre-change v8 archive remains readable");
     assert_eq!(inspected.manifest.version, 8);
-    assert_eq!(
-        inspected.manifest.missing_tables(),
-        [
-            "game_activity_guild_aggregates",
-            "assistant_monthly_builds",
-            "scheduled_events_claim",
-            "scheduled_events_tombstone",
-            "event_voice_channels",
-            "event_voice_presence",
-            "admin_api_tokens",
-            "starboard_config",
-            "starboard_starrers",
-            "starboard_posts",
-            "giveaways",
-            "giveaway_entries",
-            "giveaway_draws",
-            "event_instance_windows"
-        ]
-    );
+    assert_eq!(inspected.manifest.missing_tables(), newer);
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    for name in [
-        "game_activity_guild_aggregates",
-        "assistant_monthly_builds",
-        "scheduled_events_claim",
-        "scheduled_events_tombstone",
-        "event_voice_channels",
-        "event_voice_presence",
-        "admin_api_tokens",
-        "starboard_config",
-        "starboard_starrers",
-        "starboard_posts",
-        "giveaways",
-        "giveaway_entries",
-        "giveaway_draws",
-        "event_instance_windows",
-    ] {
-        let count: i64 = sqlx::query_scalar(audited(format!(
-            "SELECT COUNT(*) FROM {}",
-            identifier(name)
-        )))
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(count, 0, "v8 restore clears newer {name} target rows");
-    }
+    assert_newer_tables_cleared(pool, &newer, 8).await;
     let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
         .fetch_one(pool)
         .await
@@ -2242,7 +2221,7 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
     let directory = ArchiveDirectory::new();
     let mut old = current_archive(pool, &directory).await;
     assert_eq!(old.manifest.version, 16);
-    for name in [
+    let newer = [
         "scheduled_events_claim",
         "scheduled_events_tombstone",
         "event_voice_channels",
@@ -2255,61 +2234,20 @@ async fn v9_archive_restores_and_clears_newer_epoch_claim() {
         "giveaway_entries",
         "giveaway_draws",
         "event_instance_windows",
-    ] {
-        let rows = old.buffers.remove(name).unwrap();
-        assert!(!rows.is_empty(), "fixture must populate newer {name}");
-        old.manifest.tables.retain(|table| table.name != name);
-    }
+    ];
+    omit_populated_newer_tables(&mut old, &newer);
     old.manifest.version = 9;
     old.rows = old.manifest.tables.iter().map(|table| table.count).sum();
     let old_path = directory.path("pre-epoch-claim-v9.ndjson.gz");
     write_archive(&old_path, &old);
     let inspected = inspect(&old_path).expect("pre-change v9 archive remains readable");
     assert_eq!(inspected.manifest.version, 9);
-    assert_eq!(
-        inspected.manifest.missing_tables(),
-        [
-            "scheduled_events_claim",
-            "scheduled_events_tombstone",
-            "event_voice_channels",
-            "event_voice_presence",
-            "admin_api_tokens",
-            "starboard_config",
-            "starboard_starrers",
-            "starboard_posts",
-            "giveaways",
-            "giveaway_entries",
-            "giveaway_draws",
-            "event_instance_windows"
-        ]
-    );
+    assert_eq!(inspected.manifest.missing_tables(), newer);
     // This test deliberately replaces a reused isolated rehearsal target.
     forget_moderation_history(pool).await;
     let report = restore(pool, &old_path).await.unwrap();
     assert!(report.ok);
-    for name in [
-        "scheduled_events_claim",
-        "scheduled_events_tombstone",
-        "event_voice_channels",
-        "event_voice_presence",
-        "admin_api_tokens",
-        "starboard_config",
-        "starboard_starrers",
-        "starboard_posts",
-        "giveaways",
-        "giveaway_entries",
-        "giveaway_draws",
-        "event_instance_windows",
-    ] {
-        let count: i64 = sqlx::query_scalar(audited(format!(
-            "SELECT COUNT(*) FROM {}",
-            identifier(name)
-        )))
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(count, 0, "v9 restore clears newer {name} target rows");
-    }
+    assert_newer_tables_cleared(pool, &newer, 9).await;
     let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members")
         .fetch_one(pool)
         .await
