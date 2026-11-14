@@ -157,6 +157,36 @@ test("tools/call get_audit proxies one container GET to /ops/audit and returns t
   );
 });
 
+test("get_audit accepts mixed legacy and diagnostics without allowing private metadata", async () => {
+  const diagnosticActions = [
+    ["channel_change", "channel_create"], ["channel_change", "channel_delete"],
+    ["role_change", "role_create"], ["role_change", "role_update"], ["role_change", "role_delete"],
+    ["guild_change", "guild_update"], ["member_join", "member_join"], ["member_join", "bot_add"],
+    ["member_leave", "member_leave"], ["member_update", "baseline_missing"],
+    ["command_action", "command"], ["automation_action", "voice_room_rename"], ["automation_action", "automation"],
+    ["message_delete", "message_bulk_delete"],
+  ];
+  const rows = [AUDIT_ROWS[0]!, ...diagnosticActions.map(([kind, action], index) => ({
+    ...AUDIT_ROWS[0]!, entry_id: `synthetic-diagnostic-${index}`, kind, action,
+  }))];
+  const excerpt = { available: true, rows, truncated: false };
+  const h = harness(() => Response.json(excerpt));
+  const body = await rpcBody(await worker.fetch(callGetAudit(), h.env, h.ctx));
+  assert.equal(body.error, undefined);
+  assert.deepEqual(body.result?.structuredContent, excerpt);
+  assert.equal(h.forwarded.length, 1);
+  for (const invalidRow of [
+    { ...rows[1]!, metadata_json: "private-diagnostic-marker" },
+    { ...rows[1]!, action: "unapproved_diagnostic_action" },
+  ]) {
+    const invalid = harness(() => Response.json({ ...excerpt, rows: [rows[0], invalidRow] }));
+    const failed = await rpcBody(await worker.fetch(callGetAudit(), invalid.env, invalid.ctx));
+    assert.ok(failed.error, "unknown actions and metadata columns still fail closed");
+    assert.equal(failed.result, undefined);
+    assert.ok(!JSON.stringify(failed).includes("private-diagnostic-marker"));
+  }
+});
+
 test("tools/call get_audit returns an unavailable excerpt as a plain success, never the stub", async () => {
   const unavailable = { available: false, rows: [], truncated: false };
   const h = harness(() => Response.json(unavailable));

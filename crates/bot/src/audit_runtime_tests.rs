@@ -445,6 +445,229 @@ fn delivered(entry: &str, message_id: &str) -> (String, DeliverOutcome) {
 
 // --------------------------------------------------------------- sweeping --
 
+#[tokio::test]
+async fn capture_admission_never_connects_and_connect_failure_keeps_rows() {
+    let runtime = unconnected_runtime(all_vars());
+    runtime.submit(event("queued-without-io"));
+    assert_eq!(runtime.capture.counts(), (1, 0));
+    assert_eq!(
+        runtime.capture.front().unwrap().entry_id,
+        "queued-without-io"
+    );
+    assert!(runtime.sweep().await.is_err());
+    assert_eq!(runtime.capture.counts(), (1, 0));
+}
+
+#[tokio::test]
+async fn bulk_delete_diagnostics_queue_without_connecting_and_survive_connect_failure() {
+    use twilight_gateway::Event;
+    use twilight_model::{gateway::payload::incoming::MessageDeleteBulk, id::Id};
+    let connects = Arc::new(AtomicUsize::new(0));
+    let attempts = connects.clone();
+    let runtime: AuditRuntime<ScriptMirror> = AuditRuntime::new(
+        all_vars(),
+        GUILD.to_owned(),
+        Box::new(move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(ErrorClass::Database) })
+        }),
+    )
+    .unwrap();
+    let packet = Event::MessageDeleteBulk(MessageDeleteBulk {
+        guild_id: Some(Id::new(GUILD.parse().unwrap())),
+        channel_id: Id::new(4444),
+        ids: vec![Id::new(5555), Id::new(5556)],
+    });
+    let rows = crate::audit_gateway::translate(
+        &packet,
+        &two_bot_discord::build_cache(),
+        "2026-11-08T00:00:00.000Z",
+        42,
+        "synthetic-session",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, AuditKind::MessageDelete);
+    assert_eq!(rows[0].action.as_deref(), Some("message_bulk_delete"));
+    crate::audit_gateway::record_into(&runtime, &rows).await;
+    assert_eq!(connects.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.capture.counts(), (1, 0));
+    assert_eq!(runtime.capture.front().as_ref(), Some(&rows[0]));
+    assert!(matches!(runtime.sweep().await, Err(ErrorClass::Database)));
+    assert_eq!(connects.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.capture.front().as_ref(), Some(&rows[0]));
+}
+
+#[tokio::test]
+async fn capture_flush_bounds_batch_replays_ack_loss_and_roundtrips_new_kinds() {
+    let Some(db) =
+        database("capture_flush_bounds_batch_replays_ack_loss_and_roundtrips_new_kinds").await
+    else {
+        return;
+    };
+    let mirror = ScriptMirror::default();
+    let runtime = runtime(db.pool(), &mirror);
+    let wired = runtime.wired().await.unwrap();
+    let kinds = [
+        AuditKind::ChannelChange,
+        AuditKind::RoleChange,
+        AuditKind::GuildChange,
+        AuditKind::MemberJoin,
+        AuditKind::MemberLeave,
+        AuditKind::CommandAction,
+        AuditKind::AutomationAction,
+    ];
+    for (index, kind) in kinds.into_iter().enumerate() {
+        let mut row = event(&format!("new-kind-{index}"));
+        row.kind = kind;
+        // Simulate insert success followed by lost acknowledgement: capture
+        // must replay the same identity, not emit another durable row.
+        wired.service.record(&row).await.unwrap();
+        runtime.submit(row.clone());
+        assert_eq!(
+            AuditStore::new(db.pool())
+                .get(&row.entry_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .event
+                .kind,
+            kind
+        );
+    }
+    for id in 0..crate::audit_capture::BATCH {
+        runtime.submit(event(&format!("batch-{id}")));
+    }
+    runtime.flush_capture(&wired).await.unwrap();
+    assert_eq!(runtime.capture.counts(), (kinds.len(), 0));
+    assert!(
+        mirror.posts().is_empty(),
+        "capture only stores; delivery owns Discord"
+    );
+    runtime.flush_capture(&wired).await.unwrap();
+    assert_eq!(runtime.capture.counts(), (0, 0));
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM operational_audit_log")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, (kinds.len() + crate::audit_capture::BATCH) as i64);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn gateway_legacy_rows_bypass_a_full_diagnostic_queue() {
+    let Some(db) = database("gateway_legacy_rows_bypass_a_full_diagnostic_queue").await else {
+        return;
+    };
+    let mirror = ScriptMirror::default();
+    let runtime = runtime(db.pool(), &mirror);
+    for id in 0..crate::audit_capture::CAPACITY {
+        let mut row = event(&format!("diagnostic-{id}"));
+        row.kind = AuditKind::ChannelChange;
+        runtime.submit(row);
+    }
+    let mut rows: Vec<_> = [
+        AuditKind::VoiceJoin,
+        AuditKind::VoiceLeave,
+        AuditKind::VoiceMove,
+        AuditKind::MessageEdit,
+        AuditKind::MessageDelete,
+        AuditKind::MemberUpdate,
+        AuditKind::ModerationAction,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(id, kind)| {
+        AuditEvent::new(
+            format!("legacy-{id}"),
+            kind,
+            GUILD.to_owned(),
+            two_bot_core::now_iso(),
+        )
+    })
+    .collect();
+    // The constructor sets the matching moderation channel family; changing
+    // only the kind on a member-update fixture would be rejected by the store.
+    let mut bulk_moderation = AuditEvent::new(
+        "legacy-bulk-moderation".to_owned(),
+        AuditKind::ModerationAction,
+        GUILD.to_owned(),
+        two_bot_core::now_iso(),
+    );
+    bulk_moderation.action = Some("message_bulk_delete".to_owned());
+    rows.push(bulk_moderation);
+    let legacy_count = rows.len();
+    let mut diagnostic = event("new-diagnostic");
+    diagnostic.action = Some("baseline_missing".to_owned());
+    rows.push(diagnostic);
+    let mut bulk_diagnostic = event("new-bulk-diagnostic");
+    bulk_diagnostic.kind = AuditKind::MessageDelete;
+    bulk_diagnostic.action = Some("message_bulk_delete".to_owned());
+    rows.push(bulk_diagnostic);
+    crate::audit_gateway::record_into(&runtime, &rows).await;
+    let store = AuditStore::new(db.pool());
+    for row in &rows[..legacy_count] {
+        let stored = store.get(&row.entry_id).await.unwrap();
+        assert!(stored.is_some(), "missing legacy row: {}", row.entry_id);
+        assert_eq!(stored.unwrap().event, *row);
+    }
+    assert!(store.get("new-diagnostic").await.unwrap().is_none());
+    assert!(store.get("new-bulk-diagnostic").await.unwrap().is_none());
+    assert_eq!(
+        runtime.capture.counts(),
+        (crate::audit_capture::CAPACITY, 2)
+    );
+    assert!(
+        mirror.posts().is_empty(),
+        "gateway recording never posts to Discord"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_capture_insert_does_not_starve_durable_delivery_or_halt() {
+    let Some(db) = database("failed_capture_insert_does_not_starve_durable_delivery_or_halt").await
+    else {
+        return;
+    };
+    let mirror = ScriptMirror::default();
+    let metrics: &'static Metrics = Box::leak(Box::new(Metrics::default()));
+    let runtime = runtime_with_metrics(db.pool(), &mirror, metrics);
+    record(&runtime, "already-durable").await;
+    sqlx::query("ALTER TABLE operational_audit_log ADD CONSTRAINT reject_capture_poison CHECK (entry_id <> 'capture-poison')")
+        .execute(db.pool()).await.unwrap();
+    runtime.submit(event("capture-poison"));
+    assert!(matches!(runtime.sweep().await, Err(ErrorClass::Database)));
+    assert_eq!(runtime.capture.counts(), (1, 0));
+    assert_eq!(mirror.posts().len(), 1);
+    assert_eq!(
+        AuditStore::new(db.pool())
+            .get("already-durable")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        DeliveryState::Delivered
+    );
+    assert_eq!(halt_gauge(metrics), "two_bot_audit_delivery_halt 0");
+
+    record(&runtime, "halted-durable").await;
+    assert!(AuditStore::new(db.pool())
+        .engage_halt(OPERATOR)
+        .await
+        .unwrap());
+    let calls = mirror.calls();
+    assert!(matches!(runtime.sweep().await, Err(ErrorClass::Database)));
+    assert_eq!(runtime.halted_for_test(), Some(true));
+    assert_eq!(halt_gauge(metrics), "two_bot_audit_delivery_halt 1");
+    assert_eq!(
+        mirror.calls(),
+        calls,
+        "failed capture never bypasses the halt"
+    );
+    assert_eq!(runtime.capture.counts(), (1, 0));
+    db.close().await.unwrap();
+}
+
 #[test]
 fn halt_transitions_cover_engage_disengage_and_clear() {
     // M4.48: the same booleans the sweep feeds to `two_bot_audit_delivery_halt`

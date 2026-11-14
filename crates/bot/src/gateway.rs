@@ -1127,9 +1127,9 @@ fn apply_dispatch<I: InviteSource>(
     let mut dispatch_error: Option<sqlx::Error> = None;
     // Staff audit rows: translated pre-update (member deltas and
     // voice boundaries need the rows the funnel is about to
-    // mutate), stored before the checkpoint commits. The store
-    // write is idempotent, so a crash between the two replays
-    // safely; a failed write never stalls this worker.
+    // mutate). Legacy rows retain their awaited pre-checkpoint storage path.
+    // Added diagnostics enter the bounded capture queue without I/O; the retry
+    // job owns their insert, and loss before insertion is a documented gap.
     let mut audit_events = Vec::new();
     if let Some(dispatch) = dispatch {
         // A cold voice RESUME is followed by IDENTIFY; READY connects.
@@ -1147,6 +1147,7 @@ fn apply_dispatch<I: InviteSource>(
             pipeline.cache(),
             &dispatch.observed_at,
             checkpoint.sequence,
+            &checkpoint.session_id,
         );
         // Stored channel and exclusion sets reclassify live: refresh
         // before the funnel and deferred writers classify this dispatch's facts.

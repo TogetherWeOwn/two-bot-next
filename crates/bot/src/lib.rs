@@ -1,5 +1,6 @@
 //! Runtime services shared by the gateway and interaction server.
 
+pub mod audit_rename;
 mod voice_room_plan;
 pub mod voice_rooms;
 

@@ -448,6 +448,13 @@ impl AuditRow {
                     | "voice_leave"
                     | "voice_move"
                     | "moderation_action"
+                    | "channel_change"
+                    | "role_change"
+                    | "guild_change"
+                    | "member_join"
+                    | "member_leave"
+                    | "command_action"
+                    | "automation_action"
             )
             && matches!(
                 self.delivery_state.as_str(),
@@ -458,6 +465,22 @@ impl AuditRow {
                     .iter()
                     .any(|value| value.as_str() == action)
                     || two_bot_core::mac::is_auditable_action(action)
+                    || matches!(
+                        action,
+                        "baseline_missing"
+                            | "channel_create"
+                            | "channel_delete"
+                            | "role_create"
+                            | "role_update"
+                            | "role_delete"
+                            | "guild_update"
+                            | "member_join"
+                            | "member_leave"
+                            | "bot_add"
+                            | "command"
+                            | "voice_room_rename"
+                            | "automation"
+                    )
             })
     }
 }
@@ -550,6 +573,44 @@ mod tests {
             action: None,
             delivery_state: "none".to_owned(),
         }
+    }
+
+    #[test]
+    fn mixed_legacy_and_diagnostic_rows_keep_the_operator_excerpt_available() {
+        let mut rows = vec![audit_row()];
+        for (kind, action) in [
+            ("channel_change", "channel_create"),
+            ("channel_change", "channel_delete"),
+            ("role_change", "role_create"),
+            ("role_change", "role_update"),
+            ("role_change", "role_delete"),
+            ("guild_change", "guild_update"),
+            ("member_join", "member_join"),
+            ("member_join", "bot_add"),
+            ("member_leave", "member_leave"),
+            ("member_update", "baseline_missing"),
+            ("command_action", "command"),
+            ("automation_action", "voice_room_rename"),
+            ("automation_action", "automation"),
+            ("message_delete", "message_bulk_delete"),
+        ] {
+            let mut row = audit_row();
+            row.kind = kind.to_owned();
+            row.action = Some(action.to_owned());
+            rows.push(row);
+        }
+        let excerpt = AuditExcerpt::bounded(rows);
+        assert!(excerpt.available);
+        assert_eq!(excerpt.rows.len(), 15);
+        assert!(!excerpt.truncated);
+        let body = serde_json::to_value(&excerpt).unwrap();
+        for row in body["rows"].as_array().unwrap() {
+            assert_eq!(row.as_object().unwrap().len(), 11);
+            assert!(row.get("metadata_json").is_none());
+        }
+        let mut invalid = audit_row();
+        invalid.action = Some("unapproved_diagnostic_action".to_owned());
+        assert!(!AuditExcerpt::bounded(vec![audit_row(), invalid]).available);
     }
 
     #[test]

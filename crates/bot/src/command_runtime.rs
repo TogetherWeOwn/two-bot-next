@@ -330,6 +330,35 @@ pub(crate) enum RegistrySyncError {
     Publish,
 }
 
+fn audit_command_reply(
+    interaction: &Interaction,
+    phase: &str,
+    result: &Result<(), two_bot_discord::executor::DiscordError>,
+) {
+    let outcome = result.as_ref().err().map_or("accepted", discord_class);
+    audit_command_state(interaction, phase, outcome);
+}
+
+fn audit_command_state(interaction: &Interaction, phase: &str, outcome: &str) {
+    if let Some(event) =
+        crate::audit_changes::command_event(interaction, outcome, phase, &two_bot_core::now_iso())
+    {
+        crate::audit_capture::submit(event);
+    }
+}
+
+pub(crate) fn command_route_outcome(routed: &RoutedInteraction) -> &'static str {
+    match routed {
+        RoutedInteraction::Slash { outcome, .. } => match outcome {
+            SlashOutcome::Handled { .. } => "handler_selected",
+            SlashOutcome::Refuse { .. } => "router_refused",
+            SlashOutcome::Unknown => "unknown_command",
+            SlashOutcome::Ignore => "ignored",
+        },
+        _ => "not_a_slash_route",
+    }
+}
+
 impl CommandRuntime {
     /// Compose all feature slices over the same router, executor and pool.
     #[allow(clippy::too_many_arguments)]
@@ -1447,11 +1476,19 @@ impl CommandRuntime {
             return;
         }
         if ChannelModerationRuntime::accepts(interaction) {
-            if let Err(error) = self
+            let result = self
                 .channel
                 .respond(&self.interactions.router, interaction)
-                .await
-            {
+                .await;
+            audit_command_state(
+                interaction,
+                "channel_handler_return",
+                result
+                    .as_ref()
+                    .err()
+                    .map_or("returned", channel_response_class),
+            );
+            if let Err(error) = result {
                 warn!(interaction_id = %interaction.id.get(), reason = channel_response_class(&error), "channel response failed; no effect retry");
             }
             return;
@@ -1484,6 +1521,7 @@ impl CommandRuntime {
             }
             other => other,
         };
+        audit_command_state(interaction, "router", command_route_outcome(&routed));
         if matches!(
             &routed,
             RoutedInteraction::Slash {
@@ -1501,12 +1539,13 @@ impl CommandRuntime {
                 ..
             }
         ) {
-            if self
-                .interactions
-                .handle_routed(interaction, routed)
-                .await
-                .is_err()
-            {
+            let result = self.interactions.handle_routed(interaction, routed).await;
+            audit_command_state(
+                interaction,
+                "lfg_handler_return",
+                if result.is_ok() { "returned" } else { "error" },
+            );
+            if result.is_err() {
                 warn!(
                     interaction_id = interaction.id.get().to_string(),
                     "LFG execution failed; details withheld"
@@ -2680,7 +2719,7 @@ impl CommandRuntime {
     /// Answer an interaction through the shared executor. The token never
     /// appears in logs — only the interaction id and error.
     async fn defer(&self, interaction: &Interaction, command: &str) -> bool {
-        match self
+        let result = self
             .executor
             .answer_interaction_with_blocked_retry(
                 interaction.id.get(),
@@ -2693,8 +2732,9 @@ impl CommandRuntime {
                     }),
                 },
             )
-            .await
-        {
+            .await;
+        audit_command_reply(interaction, "defer", &result);
+        match result {
             Ok(()) => true,
             Err(err) => {
                 warn!(interaction_id = %interaction.id.get(), command, reason = discord_class(&err), "command defer failed");
@@ -2704,30 +2744,32 @@ impl CommandRuntime {
     }
 
     async fn answer(&self, interaction: &Interaction, response: InteractionResponse) {
-        if let Err(err) = self
+        let result = self
             .executor
             .answer_interaction_with_blocked_retry(
                 interaction.id.get(),
                 &interaction.token,
                 &response,
             )
-            .await
-        {
+            .await;
+        audit_command_reply(interaction, "answer", &result);
+        if let Err(err) = result {
             warn!(interaction_id = %interaction.id.get(), reason = discord_class(&err), "sticky reply failed");
         }
     }
 
     /// Complete the original ephemeral defer, never issue a second callback.
     async fn finish(&self, interaction: &Interaction, content: impl AsRef<str>) {
-        if let Err(err) = self
+        let result = self
             .executor
             .edit_interaction_response_with_blocked_retry(
                 interaction.application_id.get(),
                 &interaction.token,
                 content.as_ref(),
             )
-            .await
-        {
+            .await;
+        audit_command_reply(interaction, "finish", &result);
+        if let Err(err) = result {
             warn!(interaction_id = %interaction.id.get(), reason = discord_class(&err), "sticky reply edit failed");
         }
     }
@@ -2836,6 +2878,15 @@ impl CommandRuntime {
         outcome: StickyAuditOutcome,
         reason: Option<&str>,
     ) {
+        if action == StickyAuditAction::Run {
+            crate::audit_actions::record(
+                crate::audit_actions::Family::Sticky,
+                guild_id,
+                target_key,
+                target_key.unwrap_or_default(),
+                outcome.as_str(),
+            );
+        }
         let row = StickyAudit {
             guild_id,
             actor_id,

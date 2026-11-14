@@ -502,6 +502,119 @@ fn lfg_select(values: Vec<String>) -> Interaction {
     interaction
 }
 
+#[test]
+fn private_command_routing_diagnostics_do_not_promote_dispatch_to_business_success() {
+    use two_bot_core::{HandlerId, SlashOutcome};
+    use two_bot_discord::RoutedInteraction;
+    for (outcome, expected) in [
+        (
+            SlashOutcome::Handled {
+                handler: HandlerId::Help,
+            },
+            "handler_selected",
+        ),
+        (
+            SlashOutcome::Refuse {
+                refusal: RouterRefusal::GuildRestricted,
+            },
+            "router_refused",
+        ),
+        (SlashOutcome::Unknown, "unknown_command"),
+        (SlashOutcome::Ignore, "ignored"),
+    ] {
+        let routed = RoutedInteraction::Slash {
+            name: "PRIVATE NAME SENTINEL".to_owned(),
+            outcome,
+        };
+        assert_eq!(
+            crate::command_runtime::command_route_outcome(&routed),
+            expected
+        );
+        let row = crate::audit_changes::command_event(
+            &slash("help", Some(CHANNEL), vec![]),
+            crate::command_runtime::command_route_outcome(&routed),
+            "router",
+            "2026-11-08T00:00:00.000Z",
+        )
+        .unwrap();
+        assert!(row.metadata_json.contains(expected));
+        assert!(row.metadata_json.contains("not_business_success"));
+        assert!(!row.metadata_json.contains("SENTINEL"));
+    }
+    assert_eq!(
+        crate::command_runtime::command_route_outcome(&RoutedInteraction::Ignore),
+        "not_a_slash_route"
+    );
+}
+
+#[test]
+fn private_command_diagnostics_exclude_options_tokens_names_and_dm() {
+    let mut interaction = slash(
+        "COMMAND NAME SENTINEL",
+        Some(CHANNEL),
+        vec![CommandDataOption {
+            name: "input".to_owned(),
+            value: CommandOptionValue::String("PRIVATE ARGUMENT SENTINEL".to_owned()),
+        }],
+    );
+    interaction.token = "PRIVATE TOKEN SENTINEL".to_owned();
+    let at = "2026-11-08T00:00:00.000Z";
+    let received =
+        crate::audit_changes::command_event(&interaction, "received", "gateway", at).unwrap();
+    assert_eq!(received.actor_id.as_deref(), Some("88"));
+    assert_eq!(
+        received.source_channel_id.as_deref(),
+        Some(CHANNEL.to_string().as_str())
+    );
+    let mut channel_object_only: serde_json::Value = serde_json::to_value(&interaction).unwrap();
+    channel_object_only["channel"] = serde_json::json!({"id": "1234", "type": 0});
+    channel_object_only
+        .as_object_mut()
+        .unwrap()
+        .remove("channel_id");
+    let object_only: Interaction = serde_json::from_value(channel_object_only.clone()).unwrap();
+    assert_eq!(
+        crate::audit_changes::command_event(&object_only, "received", "gateway", at)
+            .unwrap()
+            .source_channel_id
+            .as_deref(),
+        Some("1234")
+    );
+    channel_object_only["channel_id"] = serde_json::json!(CHANNEL.to_string());
+    let both: Interaction = serde_json::from_value(channel_object_only).unwrap();
+    assert_eq!(
+        crate::audit_changes::command_event(&both, "received", "gateway", at)
+            .unwrap()
+            .source_channel_id
+            .as_deref(),
+        Some("1234")
+    );
+    let no_channel = slash("help", None, vec![]);
+    assert!(
+        crate::audit_changes::command_event(&no_channel, "received", "gateway", at)
+            .unwrap()
+            .source_channel_id
+            .is_none()
+    );
+    let body = serde_json::to_string(&received).unwrap();
+    assert!(!body.contains("SENTINEL"));
+    let reply = crate::audit_changes::command_event(&interaction, "timeout", "finish", at).unwrap();
+    assert_ne!(received.entry_id, reply.entry_id);
+    assert!(reply.metadata_json.contains("timeout"));
+    assert!(reply.metadata_json.contains("not_business_success"));
+    assert_eq!(
+        crate::audit_changes::command_event(&interaction, "received", "gateway", at)
+            .unwrap()
+            .entry_id,
+        received.entry_id
+    );
+    interaction.guild_id = None;
+    assert!(crate::audit_changes::command_event(&interaction, "received", "gateway", at).is_none());
+    interaction.guild_id = Some(Id::new(GUILD));
+    interaction.data = None;
+    assert!(crate::audit_changes::command_event(&interaction, "received", "gateway", at).is_none());
+}
+
 /// The same interaction as `member` with `permissions`, with its own id/token.
 fn from_member(mut interaction: Interaction, member: u64, permissions: Permissions) -> Interaction {
     interaction.id = Id::new(member);

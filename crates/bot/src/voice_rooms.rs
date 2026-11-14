@@ -6915,6 +6915,27 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 self.dispatch_join(action, now_ms, started).await;
             }
             RoomAction::RenameRoom { channel_id, name } => {
+                let audit = {
+                    let live = self.live.read_state();
+                    crate::audit_rename::snapshot(crate::audit_rename::RenameSnapshot {
+                        guild_id: self.live.guild_id,
+                        channel_id,
+                        bot_id: live.bot.as_ref().map(|bot| bot.member_id),
+                        old_name: live
+                            .channels
+                            .get(&channel_id)
+                            .and_then(|channel| channel.name.as_deref()),
+                        new_name: &name,
+                        human_count: live.occupants(channel_id).len(),
+                        ready: live.ready,
+                        generation: live.generation,
+                        reason: if self.custom_names.contains_key(&channel_id) {
+                            "custom_name_reconcile"
+                        } else {
+                            "template_reconcile"
+                        },
+                    })
+                };
                 let skip = {
                     let live = self.live.read_state();
                     match live.channels.get(&channel_id) {
@@ -6937,6 +6958,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                 };
                 if let Some(reason) = skip {
+                    crate::audit_rename::decision(&audit, reason, 0);
                     log_rename_decision(
                         self.live.guild_id,
                         channel_id,
@@ -6970,6 +6992,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         user_id: owner_id.to_string(),
                     };
                     if filter_channel_name(&name, &self.name_policy, &context).is_err() {
+                        crate::audit_rename::decision(&audit, "name_blocked", 0);
                         log_rename_decision(
                             self.live.guild_id,
                             channel_id,
@@ -7003,6 +7026,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     }
                 };
                 if duplicate {
+                    crate::audit_rename::decision(&audit, "duplicate_name", 0);
                     log_rename_decision(
                         self.live.guild_id,
                         channel_id,
@@ -7032,6 +7056,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 // One rename per channel at a time: a newer name waits for
                 // the outcome of the one still running.
                 if self.renames_in_flight.contains_key(&channel_id) {
+                    crate::audit_rename::decision(
+                        &audit,
+                        "in_flight_deferred",
+                        RENAME_IN_FLIGHT_RECHECK_MS,
+                    );
                     log_rename_decision(
                         self.live.guild_id,
                         channel_id,
@@ -7048,6 +7077,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                     );
                     return true;
                 }
+                crate::audit_rename::decision(&audit, "attempted", 0);
                 log_rename_decision(self.live.guild_id, channel_id, "attempted", "", 0, false);
                 metrics::global().voice_name("rename_sent");
                 let result = match self.http.detached_rename(channel_id, &name) {
@@ -7057,6 +7087,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         let detached = name.clone();
                         tokio::spawn(async move {
                             let result = task.await.unwrap_or(Err(RoomHttpError::UnknownOutcome));
+                            crate::audit_rename::outcome(&audit, &result);
                             let _ = outcomes.send(RenameOutcome {
                                 channel_id,
                                 name: detached,
@@ -7067,7 +7098,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                         self.queue.mark_succeeded(&action);
                         return true;
                     }
-                    None => self.http.rename(channel_id, &name).await,
+                    None => {
+                        let result = self.http.rename(channel_id, &name).await;
+                        crate::audit_rename::outcome(&audit, &result);
+                        result
+                    }
                 };
                 match result {
                     Ok(()) => {

@@ -2,13 +2,15 @@
 //!
 //! [`translate`] runs on the serial dispatch worker before the funnel mutates
 //! the cache: member role/nickname deltas and voice channel boundaries need
-//! the pre-update rows. [`record_all`] stores the translated rows through the
-//! shared [`crate::audit_runtime`] handle before the gateway checkpoint
-//! commits; the store write is idempotent, so a crash between the two replays
-//! safely. A failed write logs the entry id only (never content or error
-//! text) and the dispatch continues — recording never stalls the gateway.
+//! the pre-update rows. [`record_all`] preserves the existing durable-before-
+//! checkpoint path for legacy voice/member/message/moderation rows; diagnostic
+//! load cannot evict them. Only added diagnostics enter the bounded volatile
+//! queue through the shared [`crate::audit_runtime`] handle. Queue overflow or
+//! a process loss before insertion can lose those diagnostics after a gateway
+//! checkpoint. Durable rows use replay-stable keys and the existing recovery.
+//! Legacy storage errors still log a scalar and continue, as before.
 //!
-//! Rows carry IDs, counts and flags only. Correlation to the in-process
+//! Rows carry IDs, counts and flags plus bounded channel name diffs only. Correlation to the in-process
 //! moderation service (the `moderation-success:` rows) lands with the
 //! moderation wiring; without a bot id the audit-log rows stay uncorrelated
 //! `discord-audit:` rows, which is exactly the legacy shape for foreign
@@ -18,7 +20,7 @@ use std::sync::OnceLock;
 
 use twilight_cache_inmemory::InMemoryCache;
 use twilight_gateway::Event;
-use two_bot_core::audit::AuditEvent;
+use two_bot_core::audit::{AuditEvent, AuditKind};
 use two_bot_core::audit_mirror::AuditMirror;
 use two_bot_core::classify::{
     classify_member_update, classify_moderation_audit, classify_raw_message,
@@ -51,17 +53,56 @@ pub(crate) fn translate(
     cache: &InMemoryCache,
     observed_at: &str,
     sequence: u64,
+    session_id: &str,
 ) -> Vec<AuditEvent> {
     let secret = cached_secret();
     let bot_id = cache.current_user().map(|user| user.id.get().to_string());
-    translate_with(
+    let mut rows = translate_with(
         event,
         cache,
         observed_at,
         sequence,
         secret.as_deref(),
         bot_id.as_deref(),
-    )
+    );
+    if let Event::MemberUpdate(update) = event {
+        if cache.member(update.guild_id, update.user.id).is_none() {
+            let mut gap = AuditEvent::new(
+                String::new(),
+                two_bot_core::audit::AuditKind::MemberUpdate,
+                update.guild_id.to_string(),
+                observed_at.to_owned(),
+            );
+            gap.target_id = Some(update.user.id.to_string());
+            gap.action = Some("baseline_missing".to_owned());
+            gap.metadata_json = r#"{"baseline":"missing","delta":"unknown"}"#.to_owned();
+            rows.push(gap);
+        }
+    }
+    for row in &mut rows {
+        identify_dispatch(row, session_id, sequence);
+        crate::audit_changes::decorate(row, event, sequence, bot_id.as_deref(), observed_at);
+    }
+    rows
+}
+
+/// Receipt wall time changes on RESUME replay. Session digest + sequence is
+/// stable across that replay and distinguishes rapid A→B→A chains, without
+/// persisting the resumable session credential itself. Intrinsically keyed
+/// Discord audit and command entries retain their stronger identities.
+fn identify_dispatch(row: &mut AuditEvent, session_id: &str, sequence: u64) {
+    if row.entry_id.starts_with("discord-audit:")
+        || row.entry_id.starts_with("moderation-success:")
+        || row.entry_id.starts_with("command:")
+        || row.message_id.is_some()
+    {
+        return;
+    }
+    row.entry_id = format!(
+        "gateway:{}:{sequence}:{}",
+        two_bot_core::audit::delivery_nonce(session_id),
+        row.kind.as_str()
+    );
 }
 
 /// [`translate`] with explicit correlation inputs (the tests pin these; the
@@ -167,10 +208,15 @@ pub(crate) fn translate_with(
                     .map(serde_json::Value::String),
             };
             classify_moderation_audit(&raw, &guild, bot_id, secret)
+                .or_else(|| {
+                    crate::audit_changes::translate(event, cache, observed_at, sequence)
+                        .into_iter()
+                        .next()
+                })
                 .into_iter()
                 .collect()
         }
-        _ => Vec::new(),
+        _ => crate::audit_changes::translate(event, cache, observed_at, sequence),
     }
 }
 
@@ -201,9 +247,8 @@ fn raw_message(
     classify_raw_message(&packet, observed_at)
 }
 
-/// Store translated rows through the shared handle. A failed write logs the
-/// entry id only and the dispatch continues; no handle (audit unconfigured)
-/// is a silent no-op.
+/// Preserve legacy durable recording before the checkpoint; only added
+/// diagnostics use volatile admission. No configured handle is a silent no-op.
 pub(crate) async fn record_all(events: &[AuditEvent]) {
     if events.is_empty() {
         return;
@@ -214,14 +259,32 @@ pub(crate) async fn record_all(events: &[AuditEvent]) {
     record_into(&runtime, events).await;
 }
 
-/// [`record_all`] against an explicit runtime (the tests inject a double).
+/// The production recording policy, with an explicit runtime for tests.
 pub(crate) async fn record_into<M: AuditMirror + Clone>(
     runtime: &AuditRuntime<M>,
     events: &[AuditEvent],
 ) {
     for event in events {
-        if runtime.record(event).await.is_err() {
-            tracing::warn!(entry_id = %event.entry_id, "audit_gateway_store_failed");
+        let legacy = matches!(
+            event.kind,
+            AuditKind::VoiceJoin
+                | AuditKind::VoiceLeave
+                | AuditKind::VoiceMove
+                | AuditKind::MessageEdit
+                | AuditKind::MessageDelete
+                | AuditKind::MemberUpdate
+                | AuditKind::ModerationAction
+        ) && !matches!(
+            (event.kind, event.action.as_deref()),
+            (AuditKind::MemberUpdate, Some("baseline_missing"))
+                | (AuditKind::MessageDelete, Some("message_bulk_delete"))
+        );
+        if legacy {
+            if runtime.record(event).await.is_err() {
+                tracing::warn!(entry_id = %event.entry_id, "audit_gateway_store_failed");
+            }
+        } else {
+            runtime.submit(event.clone());
         }
     }
 }

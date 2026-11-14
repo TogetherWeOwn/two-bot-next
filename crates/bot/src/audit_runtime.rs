@@ -156,7 +156,17 @@ pub(crate) fn register(context: Arc<Context>, shutdown: watch::Receiver<bool>) -
             return None;
         }
     };
-    let runtime = HANDLE.get_or_init(|| Arc::new(runtime)).clone();
+    let runtime = HANDLE
+        .get_or_init(|| {
+            tracing::info!(
+                capacity = crate::audit_capture::CAPACITY,
+                capture_retention = "volatile_until_recorded",
+                "audit_capture_started"
+            );
+            Arc::new(runtime)
+        })
+        .clone();
+    crate::audit_rename::install_recorder(crate::audit_capture::submit);
     Some(retry_job(
         runtime,
         shutdown,
@@ -289,6 +299,8 @@ pub(crate) struct AuditRuntime<M: AuditMirror> {
     /// Sink for `two_bot_audit_delivery_halt`: the process-global registry in
     /// production, an isolated registry in tests so sweeps pin exact values.
     metrics: &'static Metrics,
+    capture: crate::audit_capture::CaptureQueue,
+    capture_flush: AsyncMutex<()>,
 }
 
 impl<M: AuditMirror + Clone> AuditRuntime<M> {
@@ -322,6 +334,8 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
             wired: AsyncMutex::new(None),
             halted: Mutex::new(None),
             metrics,
+            capture: crate::audit_capture::CaptureQueue::default(),
+            capture_flush: AsyncMutex::new(()),
         })
     }
 
@@ -493,7 +507,44 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
             .map_err(|_| ErrorClass::Database)
     }
 
-    /// One retry sweep: read the halt, then drain at most one bounded batch.
+    /// Nonblocking volatile admission. Only the retry job performs I/O; queue
+    /// overflow is an explicit gap, never a gateway/voice/command stall.
+    pub(crate) fn submit(&self, event: AuditEvent) {
+        self.capture.submit(event);
+    }
+
+    async fn flush_capture(&self, wired: &Wired<M>) -> Result<(), ErrorClass> {
+        let _flush = self.capture_flush.lock().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut recorded = 0;
+        for _ in 0..crate::audit_capture::BATCH {
+            let Some(event) = self.capture.front() else {
+                break;
+            };
+            match tokio::time::timeout_at(deadline, wired.service.record(&event)).await {
+                Ok(Ok(_)) => {
+                    self.capture.recorded(&event.entry_id);
+                    recorded += 1;
+                }
+                _ => {
+                    // Keep the exact row on uncertain writes. The store's
+                    // entry-id insert makes retries after an ack loss safe.
+                    let (depth, dropped) = self.capture.counts();
+                    tracing::warn!(job = JOB, depth, dropped, "audit_capture_retry");
+                    return Err(ErrorClass::Database);
+                }
+            }
+        }
+        let (depth, dropped) = self.capture.counts();
+        if recorded > 0 || depth > 0 || dropped > 0 {
+            tracing::info!(job = JOB, recorded, depth, dropped, "audit_capture_swept");
+        }
+        Ok(())
+    }
+
+    /// One retry sweep: record a bounded capture batch, then read the halt and
+    /// drain at most one bounded delivery batch. A capture insert failure is
+    /// reported after delivery, so it cannot starve already-durable rows.
     /// Every readable halt also sets `two_bot_audit_delivery_halt` (1 while
     /// engaged, 0 once cleared) so the kill-switch state is visible to
     /// staleness evaluation; an unreadable halt keeps the last reported
@@ -501,6 +552,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
     pub(crate) async fn sweep(&self) -> Result<Sweep, ErrorClass> {
         let deadline = tokio::time::Instant::now() + (TIMEOUT - CHECKPOINT_RESERVE);
         let wired = self.wired().await?;
+        let capture_result = self.flush_capture(&wired).await;
         let Ok(halt) = wired.store.delivery_halt().await else {
             tracing::warn!(job = JOB, "audit_retry_halt_unreadable");
             return Err(ErrorClass::Database);
@@ -508,7 +560,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
         self.metrics.set_audit_delivery_halt(halt.is_some());
         if self.note_halt(halt.is_some()) {
             tracing::debug!(job = JOB, "audit_retry_halted");
-            return Ok(Sweep::Halted);
+            return capture_result.map(|()| Sweep::Halted);
         }
         let report = wired
             .service
@@ -516,7 +568,7 @@ impl<M: AuditMirror + Clone> AuditRuntime<M> {
             .await
             .map_err(|_| ErrorClass::Database)?;
         log_report(&report);
-        Ok(Sweep::Drained(report))
+        capture_result.map(|()| Sweep::Drained(report))
     }
 
     /// Log halt transitions between sweeps; returns `halted`.

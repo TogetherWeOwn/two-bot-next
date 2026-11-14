@@ -8,7 +8,11 @@
 mod activation;
 #[cfg(test)]
 mod admission_test_support;
+mod audit_actions;
+mod audit_capture;
+mod audit_changes;
 mod audit_gateway;
+use two_bot::audit_rename;
 mod audit_runtime;
 mod automod_gateway;
 #[cfg(test)]
