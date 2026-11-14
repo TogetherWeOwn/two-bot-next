@@ -1124,9 +1124,7 @@ fn is_injected_assertion(reached_outcome: bool, panic: &(dyn Any + Send)) -> boo
     reached_outcome && panic.downcast_ref::<&str>().copied() == Some("injected fixture assertion")
 }
 
-#[test]
-#[ignore = "run with the lifecycle fixture cases in CI"]
-fn fixture_injected_assertion_rejects_unrelated_panics() {
+fn assert_injected_assertion_rejects_unrelated_panics() {
     for (reached_outcome, message, expected) in [
         (false, "child exited during startup", false),
         (false, "injected fixture assertion", false),
@@ -1141,6 +1139,7 @@ fn fixture_injected_assertion_rejects_unrelated_panics() {
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL"]
 async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outcome() {
+    assert_injected_assertion_rejects_unrelated_panics();
     for outcome in 0..4 {
         let db = TestDb::new().await;
         let mut discord = MockDiscord::new().await;
