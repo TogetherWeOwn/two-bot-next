@@ -443,8 +443,8 @@ carries no such suppression. The offline regression now requires the deploy
 job to carry no job condition at all.
 
 Pedantic zizmor may report informational `superfluous-actions` advisories for
-existing pinned Rust toolchain Actions. They are intentionally retained; all
-existing Action SHAs and pin comments are preserved.
+remaining pinned Rust toolchain Actions. Their Action SHAs and pin comments
+are preserved until those callers migrate.
 
 ## Public-hosted runner contract
 
@@ -543,8 +543,9 @@ python3 -m unittest discover -s scripts -p 'test_staging_ownership_status.py' -v
 
 ## Native Rust setup
 
-Rust setup in `check.yml` and the helix-token and vote-kick fuzz smoke workflows
-executes `.github/scripts/install-rust-toolchain.sh` with an exact
+Rust setup in `check.yml`, `nightly.yml`, `pipeline-benchmark.yml`,
+`reusable-rust-nextest.yml`, `help-embed-synthetic.yml` and the two fuzz smoke
+workflows executes `.github/scripts/install-rust-toolchain.sh` with an exact
 `RUST_TOOLCHAIN` and explicit `RUST_COMPONENTS`. Other workflows retain their
 pinned Rust setup action. Stable lanes match `rust-toolchain.toml`;
 the libFuzzer lanes retain `nightly-2026-10-01` and `rust-src`. Native setup

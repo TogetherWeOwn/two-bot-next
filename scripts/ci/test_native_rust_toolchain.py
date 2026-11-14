@@ -230,6 +230,10 @@ class NativeRustToolchainTest(unittest.TestCase):
             },
             "helix-token-fuzz-smoke.yml": {"helix-token-smoke": "rust-src"},
             "vote-kick-fuzz-smoke.yml": {"vote-kick-smoke": "rust-src"},
+            "nightly.yml": {job: "" for job in ("sweep-plan", "sweep-partition", "sweep-guarded", "sweep-docs")},
+            "pipeline-benchmark.yml": {"benchmark": ""},
+            "reusable-rust-nextest.yml": {"nextest": ""},
+            "help-embed-synthetic.yml": {"help-embed-smoke": ""},
         }
         actual = {}
         for path in (ROOT / ".github/workflows").glob("*.yml"):
