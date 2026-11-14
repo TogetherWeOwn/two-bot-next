@@ -1179,7 +1179,8 @@ async fn onboarding_gateway_interrupted_callback_is_token_free_and_requires_rese
 async fn onboarding_gateway_feature_pool_exhaustion_preserves_checkpoint_and_heartbeat() {
     let db = TestDb::with_pool_max(crate::gateway::FEATURE_POOL_MAX).await;
     let gateway_pool = db.independent_pool(crate::gateway::GATEWAY_POOL_MAX).await;
-    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0);
+    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0)
+        .with_resume_policy(db.store.resume_policy());
     let mock = discord(Arc::new(AtomicBool::new(false)), PauseAt::PermissionRead).await;
     let result = bounded(async {
         assert_eq!(
@@ -1256,7 +1257,8 @@ async fn onboarding_gateway_feature_pool_exhaustion_preserves_checkpoint_and_hea
 async fn onboarding_gateway_worker_admission_bounds_held_game_transactions() {
     let db = TestDb::with_pool_max(crate::gateway::FEATURE_POOL_MAX).await;
     let gateway_pool = db.independent_pool(crate::gateway::GATEWAY_POOL_MAX).await;
-    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0);
+    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0)
+        .with_resume_policy(db.store.resume_policy());
     let mock = discord(
         Arc::new(AtomicBool::new(true)),
         PauseAt::HeldGameTransaction,

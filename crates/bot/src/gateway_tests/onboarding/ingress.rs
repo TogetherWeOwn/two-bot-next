@@ -43,7 +43,8 @@ async fn wait_unready(runner: &Runner) {
 async fn onboarding_gateway_ingress_ack_precedes_blocked_sql_but_selection_waits_for_commit() {
     let db = TestDb::exclusive_with_pool_max(crate::gateway::FEATURE_POOL_MAX).await;
     let gateway_pool = db.independent_pool(crate::gateway::GATEWAY_POOL_MAX).await;
-    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0);
+    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0)
+        .with_resume_policy(db.store.resume_policy());
     let mock = discord(Arc::new(AtomicBool::new(false)), PauseAt::PermissionRead).await;
     let result = bounded(async {
         let mut ws = gateway(false).await;
@@ -261,7 +262,8 @@ async fn onboarding_gateway_ingress_unconfirmed_ack_has_no_selection_effects_or_
 async fn onboarding_gateway_cooperative_shutdown_drains_accepted_selection() {
     let db = TestDb::exclusive_with_pool_max(crate::gateway::FEATURE_POOL_MAX).await;
     let gateway_pool = db.independent_pool(crate::gateway::GATEWAY_POOL_MAX).await;
-    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0);
+    let store = GatewaySessionStore::new(gateway_pool.clone(), GUILD.into(), 0)
+        .with_resume_policy(db.store.resume_policy());
     let mock = discord(Arc::new(AtomicBool::new(false)), PauseAt::PermissionRead).await;
     let result = bounded(async {
         let (shutdown, receiver) = tokio::sync::watch::channel(false);

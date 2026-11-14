@@ -66,13 +66,46 @@ pub fn is_valid_resume_url(value: &str) -> bool {
         })
 }
 
+/// Admission derives only from an independently checked bootstrap override.
+#[derive(Clone, Copy, Default)]
+pub struct ResumePolicy(bool);
+
+impl ResumePolicy {
+    pub fn for_bootstrap(override_url: Option<&str>) -> Self {
+        Self(override_url.is_some_and(is_loopback_gateway))
+    }
+
+    pub fn normalize(self, value: &str) -> &str {
+        if is_valid_resume_url(value) || (self.0 && is_loopback_gateway(value)) {
+            value
+        } else {
+            ""
+        }
+    }
+}
+
+/// Literal, nonzero loopback sockets only; never DNS, credentials or suffixes.
+pub fn is_loopback_gateway(url: &str) -> bool {
+    url.strip_prefix("ws://")
+        .and_then(|socket| socket.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|socket| socket.ip().is_loopback() && socket.port() != 0)
+}
+
 pub fn boot_action(saved: Option<&GatewaySession>, now_ms: i64) -> BootAction {
+    boot_action_for(saved, now_ms, ResumePolicy::default())
+}
+
+fn boot_action_for(
+    saved: Option<&GatewaySession>,
+    now_ms: i64,
+    policy: ResumePolicy,
+) -> BootAction {
     let Some(saved) = saved else {
         return BootAction::Identify;
     };
     let age = now_ms.checked_sub(saved.updated_at_ms);
     if saved.session_id.is_empty()
-        || saved.resume_url.is_empty()
+        || policy.normalize(&saved.resume_url).is_empty()
         || !matches!(age, Some(0..=SESSION_MAX_AGE_MS))
     {
         BootAction::DiscardAndIdentify
@@ -95,9 +128,18 @@ pub fn boot_action_with(
     directive: BootDirective,
     now_ms: i64,
 ) -> BootAction {
+    boot_action_with_policy(saved, directive, now_ms, ResumePolicy::default())
+}
+
+pub fn boot_action_with_policy(
+    saved: Option<&GatewaySession>,
+    directive: BootDirective,
+    now_ms: i64,
+    policy: ResumePolicy,
+) -> BootAction {
     match directive {
         BootDirective::ForceIdentify => BootAction::DiscardAndIdentify,
-        BootDirective::None => boot_action(saved, now_ms),
+        BootDirective::None => boot_action_for(saved, now_ms, policy),
     }
 }
 

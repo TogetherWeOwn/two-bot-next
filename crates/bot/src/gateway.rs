@@ -27,8 +27,8 @@ use twilight_gateway::{Event, EventTypeFlags, Intents, Message, Session, Shard, 
 use two_bot::voice_rooms::{build_production_runtime, VoiceEventSink};
 use two_bot_core::gateway_funnel::GatewayFunnelBuffer;
 use two_bot_core::gateway_session::{
-    boot_action_with, dispatch_action, invalidates_session, BootAction, DispatchAction,
-    GatewaySession,
+    boot_action_with_policy, dispatch_action, invalidates_session, BootAction, DispatchAction,
+    GatewaySession, ResumePolicy,
 };
 use two_bot_core::{AutomodPolicy, ComponentStatus, Config, InviteState, Snowflake};
 use two_bot_cutover::gateway_session::{GatewayJob, GatewaySessionStore};
@@ -213,10 +213,11 @@ pub async fn load_boot_session(
 ) -> Result<Option<GatewaySession>, sqlx::Error> {
     tokio::time::timeout(CHECKPOINT_IO_MAX, async {
         let (saved, directive) = store.load_for_boot().await?;
-        match boot_action_with(
+        match boot_action_with_policy(
             saved.as_ref(),
             directive,
             two_bot_core::funnel::now_millis_for_test(),
+            store.resume_policy(),
         ) {
             BootAction::Resume => Ok(saved),
             BootAction::DiscardAndIdentify => {
@@ -1572,6 +1573,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
     // Twilight owns reconnect backoff; add only a small decorrelation spread,
     // reseeded per run, not a second growing retry schedule.
     let reconnect_seed = two_bot_core::jitter_seed();
+    let resume_policy = store.resume_policy();
     let events = futures_util::stream::unfold(
         (
             shard,
@@ -1683,7 +1685,7 @@ pub async fn run_shard<I: InviteSource + 'static>(
                         if header.op != 0 { continue; }
                         let sequence = header.s.ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing sequence".into()))?;
                         let session = session_snapshot(&shard).ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing session".into()))?;
-                        let resume_url = shard.resume_url().or_else(|| received.as_ref().filter(|saved| saved.session_id == session.id()).map(|saved| saved.resume_url.as_str()))
+                        let resume_url = checkpoint_resume_url(resume_policy, shard.resume_url(), received.as_ref(), session.id())
                             .ok_or_else(|| sqlx::Error::InvalidArgument("dispatch missing resume URL".into()))?;
                         let checkpoint = GatewaySession { session_id: session.id().to_owned(), sequence, resume_url: resume_url.to_owned(), updated_at_ms: two_bot_core::funnel::now_millis_for_test() };
                         // A dispatch with a valid session proves Discord accepted
@@ -2272,6 +2274,21 @@ async fn onboarding_queue(
     }
 }
 
+pub(crate) fn checkpoint_resume_url<'a>(
+    policy: ResumePolicy,
+    current: Option<&'a str>,
+    received: Option<&'a GatewaySession>,
+    session_id: &str,
+) -> Option<&'a str> {
+    current
+        .or_else(|| {
+            received
+                .filter(|saved| saved.session_id == session_id)
+                .map(|saved| saved.resume_url.as_str())
+        })
+        .map(|url| policy.normalize(url))
+}
+
 /// Build the supervisor's shard: single-shard deployment (one guild, ADR
 /// 0001) over [`intents_from_env`].
 ///
@@ -2284,34 +2301,48 @@ pub fn build_shard(
     session: Option<&GatewaySession>,
     gateway_url: Option<&str>,
 ) -> Shard {
-    let config = build_shard_config(token, intents, session);
+    let config = if gateway_url.is_none() {
+        build_shard_config(token, intents, session)
+    } else {
+        build_shard_config_with_policy(
+            token,
+            intents,
+            session,
+            ResumePolicy::for_bootstrap(gateway_url),
+        )
+    };
     let config = match gateway_url {
-        Some(url) => twilight_gateway::ConfigBuilder::from(config)
+        Some(url) if is_loopback_gateway(url) => twilight_gateway::ConfigBuilder::from(config)
             .proxy_url(url.to_owned())
             .build(),
-        None => config,
+        _ => config,
     };
     Shard::with_config(ShardId::ONE, config)
 }
 
 /// The opt-in binary acceptance seam must never send a token to a remote host.
 /// Accept literal loopback sockets only; no DNS, credentials, paths or queries.
-pub fn is_loopback_gateway(url: &str) -> bool {
-    url.strip_prefix("ws://")
-        .and_then(|socket| socket.parse::<std::net::SocketAddr>().ok())
-        .is_some_and(|socket| socket.ip().is_loopback() && socket.port() != 0)
-}
+pub use two_bot_core::gateway_session::is_loopback_gateway;
 
 pub fn build_shard_config(
     token: String,
     intents: Intents,
     session: Option<&GatewaySession>,
 ) -> twilight_gateway::Config {
+    build_shard_config_with_policy(token, intents, session, Default::default())
+}
+
+pub fn build_shard_config_with_policy(
+    token: String,
+    intents: Intents,
+    session: Option<&GatewaySession>,
+    policy: ResumePolicy,
+) -> twilight_gateway::Config {
     use twilight_gateway::ConfigBuilder;
     let mut builder = ConfigBuilder::new(token, intents);
     // Both fields are required to resume the saved session at its proper URL.
     // Source: https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.ConfigBuilder.html#method.session
-    if let Some(session) = session {
+    if let Some(session) = session.filter(|saved| !policy.normalize(&saved.resume_url).is_empty()) {
         builder = builder
             .session(Session::new(session.sequence, session.session_id.clone()))
             .resume_url(session.resume_url.clone());

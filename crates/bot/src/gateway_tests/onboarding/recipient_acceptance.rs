@@ -52,7 +52,9 @@ impl Case {
     }
 
     fn store(&self) -> GatewaySessionStore {
-        GatewaySessionStore::new(self.pool().clone(), GUILD.into(), 0)
+        GatewaySessionStore::new(self.pool().clone(), GUILD.into(), 0).with_resume_policy(
+            two_bot_core::gateway_session::ResumePolicy::for_bootstrap(Some("ws://127.0.0.1:1")),
+        )
     }
 
     async fn prompts(&self) -> i64 {

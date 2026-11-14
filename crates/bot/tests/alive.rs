@@ -682,12 +682,45 @@ fn assert_ready_correlation(logs: &str) {
     assert!(seen > 0, "expected at least one ready commit in logs");
 }
 
+async fn seed_raw(db: &TestDb, url: &str) {
+    sqlx::query("INSERT INTO gateway_sessions (guild_id, shard_id, session_id, seq, resume_url, updated_at) VALUES ($1,0,$2,42,$3,now()) ON CONFLICT (guild_id,shard_id) DO UPDATE SET resume_url=EXCLUDED.resume_url")
+        .bind(GUILD).bind(SESSION).bind(url).execute(&db.pool).await.unwrap();
+}
+
 async fn raw_url(db: &TestDb) -> Option<String> {
     sqlx::query_scalar("SELECT resume_url FROM gateway_sessions WHERE guild_id=$1 AND shard_id=0")
         .bind(GUILD)
         .fetch_optional(&db.pool)
         .await
         .unwrap()
+}
+
+async fn strict_boot_probes(db: &TestDb, api: &str, bots: &mut Vec<Bot>, logs: &Logs, saved: &str) {
+    for url in [saved, "wss://remote.invalid"] {
+        logs.lock().await.clear();
+        seed_raw(db, url).await;
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        bots.push(Bot::spawn(db, addr, None, api, logs));
+        let bot = bots.last_mut().unwrap();
+        timeout(STEP, async {
+            while !logs.lock().await.lines().any(|line| {
+                line.contains("\"error_class\":\"onboarding_gates_invalid\"")
+                    && line.contains("\"failed_step\":\"onboarding_gates\"")
+            }) {
+                bot.assert_alive();
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("positive post-load onboarding failure deadline");
+        assert!(db.store().load().await.unwrap().is_none());
+        assert_eq!(raw_url(db).await, None, "boot rejected raw checkpoint");
+        assert!(bot.cleanup().await, "probe teardown");
+    }
 }
 
 async fn lifecycle(
@@ -917,6 +950,13 @@ async fn binary_lifecycle(accepting_decoy: bool) {
     let mut bots = Vec::new();
     let decoy = MockDiscord::new().await; // Accepting listener: any dial is counted.
     let exercise = async {
+        strict_boot_probes(&db, &discord.api, &mut bots, &logs, &decoy.url).await;
+        let owned = discord.connections.load(SeqCst) + decoy.connections.load(SeqCst);
+        assert_eq!(owned, 0, "no override-absent listener connections");
+        logs.lock().await.clear();
+        discord.rest_requests.lock().await.clear();
+        // Inadmissible checkpoint under a checked local bootstrap must IDENTIFY.
+        seed_raw(&db, &format!("{}/invalid", decoy.url)).await;
         let bootstrap = accepting_decoy.then_some(decoy.url.as_str());
         lifecycle(&db, &mut discord, &mut bots, &logs, bootstrap).await;
         assert_eq!(

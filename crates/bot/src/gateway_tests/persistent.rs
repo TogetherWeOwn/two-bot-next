@@ -25,6 +25,7 @@ async fn snapshot_bot_activity_and_checkpoint_commit_or_roll_back_together() {
         std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(25), async {
             snapshot_case(&db).await;
             writer_cases(&db, &db.store, RESUME_URL, RESUME_URL).await;
+            writer_policies(&db).await;
         }))
         .catch_unwind()
         .await;
@@ -302,5 +303,80 @@ async fn writer_cases(db: &TestDb, store: &GatewaySessionStore, url: &str, expec
         if let Some(loaded) = loaded {
             assert!(loaded == saved, "valid fields survive boot unchanged");
         }
+    }
+}
+
+async fn writer_policies(db: &TestDb) {
+    use two_bot_core::gateway_session::ResumePolicy;
+    for bootstrap in [None, Some("ws://127.0.0.1:1")] {
+        let store = GatewaySessionStore::new(db.pool.clone(), GUILD.into(), 0);
+        let store = if bootstrap.is_some() {
+            store.with_resume_policy(ResumePolicy::for_bootstrap(bootstrap))
+        } else {
+            store
+        };
+        for url in [
+            RESUME_URL,
+            "ws://127.0.0.1:1234",
+            "wss://remote.invalid",
+            "ws://localhost:1234",
+        ] {
+            let expected =
+                if url == RESUME_URL || (bootstrap.is_some() && url == "ws://127.0.0.1:1234") {
+                    url
+                } else {
+                    ""
+                };
+            sqlx::query("UPDATE invite_snapshots SET uses = 2 WHERE guild_id = $1 AND code = $2")
+                .bind(GUILD)
+                .bind("fixture")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            writer_cases(db, &store, url, expected).await;
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn received_invalid_endpoint_keeps_effects_but_not_usable_url() {
+    let db = TestDb::new().await;
+    let mut mock = MockGateway::scripted(false, false, None, true).await;
+    let (mut runner, _) = spawn_runner(&db, &mock.url).await;
+    let exercise = async {
+        assert_eq!(mock.authentication().await["op"], 2);
+        wait_sequence(&db.store, 2).await;
+        let row: (String, i64, String) =
+            sqlx::query_as("SELECT session_id,seq,resume_url FROM gateway_sessions")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(row, ("fresh-session".into(), 2, "".into()));
+        assert_eq!(db.count().await, 1);
+    };
+    let result =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(25), exercise))
+            .catch_unwind()
+            .await;
+    runner.abort();
+    mock.task.abort();
+    let runner_joined = tokio::time::timeout(Duration::from_secs(5), &mut runner).await;
+    let mock_joined = tokio::time::timeout(Duration::from_secs(5), &mut mock.task).await;
+    let runner_cleaned = matches!(&runner_joined, Ok(Ok(Ok(()))))
+        || matches!(&runner_joined, Ok(Err(error)) if error.is_cancelled());
+    let mock_cleaned = matches!(&mock_joined, Ok(Ok(())))
+        || matches!(&mock_joined, Ok(Err(error)) if error.is_cancelled());
+    let cleaned = runner_cleaned && mock_cleaned;
+    if cleaned {
+        db.close().await;
+    } else {
+        eprintln!("ingress teardown incomplete; retain schemas: runner={runner_joined:?}, mock={mock_joined:?}");
+    }
+    assert!(cleaned, "ingress teardown incomplete; schemas retained");
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => panic!("invalid ingress deadline"),
+        Err(panic) => std::panic::resume_unwind(panic),
     }
 }

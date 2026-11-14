@@ -72,7 +72,7 @@ async fn concurrent_boot_reads_consume_the_directive_exactly_once() {
     let db = TestDb::new().await;
     db.store
         .commit_dispatch(
-            &checkpoint("current-session", 42, "ws://mock"),
+            &checkpoint("current-session", 42, RESUME_URL),
             FunnelBatch::default(),
         )
         .await
@@ -147,7 +147,7 @@ async fn arming_keeps_a_pending_directive_and_rearms_after_consumption() {
     let db = TestDb::new().await;
     db.store
         .commit_dispatch(
-            &checkpoint("current-session", 7, "ws://mock"),
+            &checkpoint("current-session", 7, RESUME_URL),
             FunnelBatch::default(),
         )
         .await

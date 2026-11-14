@@ -130,7 +130,9 @@ impl TestDb {
             .run(&pool)
             .await
             .expect("migrations");
-        let store = GatewaySessionStore::new(pool.clone(), GUILD.to_owned(), 0);
+        let store = GatewaySessionStore::new(pool.clone(), GUILD.to_owned(), 0).with_resume_policy(
+            two_bot_core::gateway_session::ResumePolicy::for_bootstrap(Some("ws://127.0.0.1:1")),
+        );
         Self {
             pool,
             admin,

@@ -745,19 +745,6 @@ fn assert_startup_probe(probes: &str) {
     );
 }
 
-fn startup_probe_fixture() -> &'static str {
-    r#"timeout(STEP, async {
-        while !logs.lock().await.lines().any(|line| {
-            line.contains("onboarding_gates_invalid")
-        }) {
-            bot.assert_alive();
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-        .await
-        .expect("positive post-load onboarding failure deadline");"#
-}
-
 #[test]
 fn alive_polling_uses_bounded_backoff_under_deadline() {
     assert_alive_step_deadline(ALIVE);
@@ -772,6 +759,9 @@ fn alive_polling_uses_bounded_backoff_under_deadline() {
         "checkpoint must poll inside its STEP deadline",
         10,
     );
+
+    let probes = function_body(ALIVE, "strict_boot_probes");
+    assert_startup_probe(&probes);
 
     let lifecycle = function_body(ALIVE, "lifecycle");
     let events_tick = source_between(
@@ -819,7 +809,7 @@ fn alive_polling_uses_bounded_backoff_under_deadline() {
     assert_settle_window(&settle);
     assert_settle_ungated(&lifecycle);
 
-    assert_sleep_inventory(ALIVE, 4, "alive.rs sleep inventory");
+    assert_sleep_inventory(ALIVE, 5, "alive.rs sleep inventory");
     assert_no_code_contains(
         ALIVE,
         "yield_now",
@@ -926,8 +916,8 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
     })
     .is_err());
 
-    let probes = startup_probe_fixture();
-    assert_startup_probe(probes);
+    let probes = function_body(ALIVE, "strict_boot_probes");
+    assert_startup_probe(&probes);
     for (before, after) in [
         ("sleep(Duration::from_millis(10)).await;", ""),
         ("from_millis(10)", "from_millis(50)"),
@@ -1029,14 +1019,14 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
 
     // A stray long sleep outside every named poll loop breaks the
     // whole-file inventory even though each named site still passes.
-    assert_sleep_inventory(ALIVE, 4, "alive.rs sleep inventory");
+    assert_sleep_inventory(ALIVE, 5, "alive.rs sleep inventory");
     let stray_long_sleep = ALIVE.replacen(
         "bot.assert_alive();",
         "sleep(Duration::from_secs(5)).await;\n            bot.assert_alive();",
         1,
     );
     assert!(std::panic::catch_unwind(|| {
-        assert_sleep_inventory(&stray_long_sleep, 4, "alive.rs sleep inventory");
+        assert_sleep_inventory(&stray_long_sleep, 5, "alive.rs sleep inventory");
     })
     .is_err());
     let spaced_stray_sleep = ALIVE.replacen(
@@ -1045,7 +1035,7 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
         1,
     );
     assert!(std::panic::catch_unwind(|| {
-        assert_sleep_inventory(&spaced_stray_sleep, 4, "alive.rs sleep inventory");
+        assert_sleep_inventory(&spaced_stray_sleep, 5, "alive.rs sleep inventory");
     })
     .is_err());
     let stray_sleep_until = ALIVE.replacen(
@@ -1054,7 +1044,7 @@ fn polling_guard_rejects_missing_or_unbounded_site_backoffs() {
         1,
     );
     assert!(std::panic::catch_unwind(|| {
-        assert_sleep_inventory(&stray_sleep_until, 4, "alive.rs sleep inventory");
+        assert_sleep_inventory(&stray_sleep_until, 5, "alive.rs sleep inventory");
     })
     .is_err());
 }

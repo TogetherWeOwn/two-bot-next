@@ -38,9 +38,16 @@ five-second step deadlines. Assertion failures print captured stdout/stderr.
 | JSON logging | Request `LOG_FORMAT=json` (the binary defaults to JSON: `crates/bot/src/logging.rs:28-32`); validate every emitted line as a JSON object with a string `msg` (`crates/bot/tests/alive.rs:678-689`) |
 
 The mock uses one stable endpoint across boots. Separate tests restart with an
-unreachable bootstrap or a distinct accepting loopback decoy. Both require
-RESUME at the unchanged saved endpoint, raw wire-URL persistence and no decoy
-connections. HELLO and READY/RESUMED remain separately gated.
+unreachable bootstrap or a distinct accepting bootstrap decoy; both must RESUME
+at the unchanged persisted literal-loopback endpoint, with zero decoy connections.
+Raw SQL verifies the actual wire endpoint. Override-absent probes seed fresh
+literal-loopback and non-Discord rows, positively observe the post-load onboarding
+configuration failure, assert row deletion and zero owned gateway connections,
+and reap the children. These prove boot rejection, not a wire IDENTIFY. A separate
+checked-local-bootstrap boot over a non-Discord row must send opcode 2, not 6.
+HELLO and READY/RESUMED remain separately gated. Both default and all-feature
+executions run in the existing ignored-runtime Actions lane; execution evidence
+must name the exact integration head.
 
 ## Binary lifecycle seams
 
