@@ -3,6 +3,7 @@ import copy
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest import mock
 
 
 spec = importlib.util.spec_from_file_location(
@@ -101,8 +102,29 @@ class Freshness(unittest.TestCase):
             for key in keys[:-1]:
                 target = target[key]
             target[keys[-1]] = value
-            with self.subTest(path=path), self.assertRaises(inventory.InventoryError):
-                inventory.require_fresh(lambda route: changed, pr)
+            routes = []
+
+            def api(route):
+                routes.append(route)
+                if route == "repos/org/repo/pulls/1":
+                    return changed
+                return {"object": {"sha": "a" * 40}}
+
+            with self.subTest(path=path):
+                with self.assertRaises(inventory.InventoryError):
+                    inventory.require_fresh(api, pr)
+                self.assertEqual(routes, ["repos/org/repo/pulls/1"])
+
+    def test_changed_snapshot_regression_detects_comparison_bypass(self):
+        expected = inventory.snapshot(pull_request())
+        result = unittest.TestResult()
+        # Force equal snapshots to model bypassing the inequality rejection.
+        with mock.patch.object(inventory, "snapshot", return_value=expected):
+            Freshness("test_changed_snapshot_fields_fail_closed").run(result)
+        self.assertEqual(len(result.failures), 12)
+        self.assertEqual(result.errors, [])
+        for _, failure in result.failures:
+            self.assertIn("InventoryError not raised", failure)
 
     def test_missing_malformed_and_failed_reads_are_redacted(self):
         pr = pull_request()
