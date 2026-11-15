@@ -189,6 +189,21 @@ class ControlGuardTest(unittest.TestCase):
         self.assertEqual(seen, [(self.controls, self.record, 10100)])
         self.assertEqual(self.record, {"handoff_id": "handoff"})
 
+    def test_decision_uses_authenticated_snapshot(self):
+        self.controls["ownership"] = False
+        seen = []
+        def verify(controls, record, tick):
+            seen.append(copy.deepcopy(controls))
+            self.controls["ownership"] = True
+            return True
+        self.verify = verify
+        guard = self.guard()
+        self.tick = 101
+        with self.assertRaises(EvidenceError):
+            guard.observe(self.controls, deadline=20000)
+        self.assertFalse(seen[0]["ownership"])
+        self.assertTrue(guard.failed)
+
     def test_invalid_observations_and_clock_are_terminal(self):
         for case in ("missing", "bool", "gap", "domain", "deadline", "rejected", "error"):
             with self.subTest(case=case):

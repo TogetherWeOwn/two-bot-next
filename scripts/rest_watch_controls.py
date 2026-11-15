@@ -43,6 +43,7 @@ class ControlGuard:
         if self.failed:
             raise EvidenceError("control guard is terminal")
         try:
+            controls = copy.deepcopy(controls)
             tick, domain = self._clock()
             if (type(tick) is not int or type(deadline) is not int
                     or not self._last_tick < tick <= MAX_COUNTER
