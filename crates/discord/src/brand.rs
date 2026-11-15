@@ -142,9 +142,51 @@ pub fn brand_embed(kind: EmbedKind, mut embed: Embed) -> Embed {
     embed
 }
 
+/// Build a text-only-footer embed for an ephemeral reply (kit Discord spec §7).
+#[must_use]
+pub fn ephemeral_reply_embed(kind: EmbedKind, surface: &str, text: String) -> Embed {
+    let mut footer = brand_footer_for(surface);
+    footer.icon_url = None;
+    let mut embed = brand_embed(
+        kind,
+        Embed {
+            author: None,
+            color: None,
+            description: Some(text),
+            fields: Vec::new(),
+            footer: None,
+            image: None,
+            kind: "rich".to_owned(),
+            provider: None,
+            thumbnail: None,
+            timestamp: None,
+            title: None,
+            url: None,
+            video: None,
+        },
+    );
+    embed.footer = Some(footer);
+    embed
+}
+
 #[cfg(test)]
 mod brand_tests {
     use super::*;
+
+    #[test]
+    fn ephemeral_replies_use_outcome_colors_and_text_only_surface_footers() {
+        for surface in ["Voice", "Events"] {
+            for kind in [EmbedKind::Ok, EmbedKind::Warn, EmbedKind::Danger] {
+                let embed = ephemeral_reply_embed(kind, surface, "Reply".to_owned());
+                assert_eq!(embed.color, Some(kind.color()));
+                assert_eq!(embed.description.as_deref(), Some("Reply"));
+                assert!(embed.title.is_none());
+                let footer = embed.footer.as_ref().expect("footer");
+                assert_eq!(footer.text, format!("Together We Own · {surface}"));
+                assert!(footer.icon_url.is_none());
+            }
+        }
+    }
 
     /// FNV-1a 64 over bytes, the same algorithm
     /// `scripts/vendor_brand_tokens.py` uses to print the drift value.
