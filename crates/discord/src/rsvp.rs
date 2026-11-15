@@ -20,6 +20,7 @@ use two_bot_core::{
 };
 
 use crate::{
+    brand::{ephemeral_reply_embed, EmbedKind},
     executor::{ActionExecutor, DiscordError},
     interactions::{response_for_slash, route_interaction, RoutedInteraction},
 };
@@ -148,17 +149,50 @@ pub async fn complete_rsvp_interaction(
     let Some((handler, interaction)) = prepared.deferred else {
         return Ok(prepared.handled);
     };
-    let content = execute(handler, pool, executor, classifier, &interaction)
-        .await
-        .unwrap_or_else(|message| message);
+    let result = execute(handler, pool, executor, classifier, &interaction).await;
+    let embed = rsvp_reply_embed(result);
     executor
-        .edit_interaction_response_with_blocked_retry(
+        .edit_interaction_response_embed_with_blocked_retry(
             interaction.application_id.get(),
             &interaction.token,
-            &content,
+            &embed,
         )
         .await?;
     Ok(true)
+}
+
+fn rsvp_reply_embed(
+    result: Result<String, String>,
+) -> twilight_model::channel::message::embed::Embed {
+    let (kind, text) = match result {
+        Ok(text) => (EmbedKind::Ok, text),
+        Err(text) => (EmbedKind::Danger, text),
+    };
+    // Preserve the existing content sanitizer and its 2000-character bound.
+    ephemeral_reply_embed(kind, "Events", two_bot_core::message_safety::content(&text))
+}
+
+#[cfg(test)]
+mod reply_embed_tests {
+    use super::*;
+
+    #[test]
+    fn outcomes_keep_the_existing_bound_and_text_only_footer() {
+        for (result, kind) in [
+            (Ok("Saved <t:123:f>".to_owned()), EmbedKind::Ok),
+            (Err("Unable to save RSVP.".to_owned()), EmbedKind::Danger),
+        ] {
+            let embed = rsvp_reply_embed(result);
+            assert_eq!(embed.color, Some(kind.color()));
+            let footer = embed.footer.expect("footer");
+            assert_eq!(footer.text, "Together We Own · Events");
+            assert!(footer.icon_url.is_none());
+        }
+        let embed = rsvp_reply_embed(Ok("x".repeat(3000)));
+        assert!(embed.description.expect("description").chars().count() <= 2000);
+        let embed = rsvp_reply_embed(Ok("Saved <t:123:f>".to_owned()));
+        assert_eq!(embed.description.as_deref(), Some("Saved <t:123:f>"));
+    }
 }
 
 /// Returns false for another feature; authorization and acknowledgement must
