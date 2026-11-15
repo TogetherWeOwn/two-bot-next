@@ -60,3 +60,6 @@ class SampleSequence:
         except Exception:
             self._failed = True
             raise EvidenceError("invalid or unverified sample sequence") from None
+        except BaseException:
+            self._failed = True
+            raise

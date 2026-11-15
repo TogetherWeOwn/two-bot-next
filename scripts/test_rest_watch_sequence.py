@@ -91,6 +91,23 @@ class SampleSequenceTest(unittest.TestCase):
                 with self.assertRaisesRegex(EvidenceError, "terminal"):
                     self.accept(sequence)
 
+    def test_interrupted_ledger_is_terminal_before_or_after_commit(self):
+        for commit in (False, True):
+            with self.subTest(commit=commit):
+                self.setUp()
+                def interrupted(*args):
+                    if commit:
+                        self.ledger(*args)
+                    raise KeyboardInterrupt()
+                sequence = self.sequence(ledger=interrupted)
+                with self.assertRaises(KeyboardInterrupt):
+                    self.accept(sequence)
+                verified = copy.deepcopy(self.verified)
+                with self.assertRaisesRegex(EvidenceError, "terminal"):
+                    self.accept(sequence)
+                self.assertEqual(self.verified, verified)
+                self.assertEqual(self.claims, int(commit))
+
     def test_missing_dependencies_and_non_boolean_ledger(self):
         for proof, ledger, verifier in ((None, self.ledger, self.verify),
                                         ({"tick": 10}, None, self.verify),
