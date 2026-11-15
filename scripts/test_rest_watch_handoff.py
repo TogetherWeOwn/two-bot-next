@@ -3,6 +3,7 @@ import json
 import unittest
 
 from rest_evidence_continuity import EvidenceError
+from rest_watch_controls import ControlGuard
 from rest_watch_handoff import claim_handoff
 
 
@@ -160,3 +161,97 @@ class HandoffTest(unittest.TestCase):
                 with self.assertRaises(EvidenceError):
                     claim_handoff(raw, **options)
                 self.assertFalse(self.claimed)
+
+
+class ControlGuardTest(unittest.TestCase):
+    def setUp(self):
+        self.tick = 100
+        self.domain = "clock"
+        self.controls = {"readiness": True, "journeys": True, "ownership": True}
+        self.record = {"handoff_id": "handoff"}
+        self.verify = lambda controls, record, tick: True
+
+    def guard(self):
+        return ControlGuard(self.record, 100, "clock",
+                            lambda: (self.tick, self.domain), self.verify)
+
+    def test_authenticated_observations_are_bound_and_copied(self):
+        seen = []
+        def verify(controls, record, tick):
+            seen.append((copy.deepcopy(controls), copy.deepcopy(record), tick))
+            controls.clear()
+            record.clear()
+            return True
+        self.verify = verify
+        guard = self.guard()
+        self.tick = 10100
+        self.assertTrue(guard.observe(self.controls, deadline=10100))
+        self.assertEqual(seen, [(self.controls, self.record, 10100)])
+        self.assertEqual(self.record, {"handoff_id": "handoff"})
+
+    def test_invalid_observations_and_clock_are_terminal(self):
+        for case in ("missing", "bool", "gap", "domain", "deadline", "rejected", "error"):
+            with self.subTest(case=case):
+                self.tick, self.domain = 101, "clock"
+                self.verify = lambda *args: True
+                if case == "rejected":
+                    self.verify = lambda *args: 1
+                if case == "error":
+                    def fail(*args):
+                        raise ValueError("private provider details")
+                    self.verify = fail
+                guard = self.guard()
+                controls = copy.deepcopy(self.controls)
+                if case == "missing":
+                    controls.pop("ownership")
+                if case == "bool":
+                    controls["journeys"] = 1
+                if case == "gap":
+                    self.tick = 10101
+                if case == "domain":
+                    self.domain = "other"
+                deadline = 100 if case == "deadline" else 20000
+                with self.assertRaises(EvidenceError):
+                    guard.observe(controls, deadline=deadline)
+                self.assertTrue(guard.failed)
+                with self.assertRaises(EvidenceError):
+                    guard.observe(self.controls, deadline=20000)
+
+    def test_verifier_latency_and_clock_regression_fail_closed(self):
+        for after in (99, 10200, 10102):
+            with self.subTest(after=after):
+                self.tick = 101
+                def delayed(*args):
+                    self.tick = after
+                    return True
+                self.verify = delayed
+                guard = self.guard()
+                with self.assertRaises(EvidenceError):
+                    guard.observe(self.controls, deadline=10101)
+                self.assertTrue(guard.failed)
+
+    def test_ownership_and_journey_failure_are_terminal(self):
+        for key in ("ownership", "journeys"):
+            with self.subTest(key=key):
+                self.tick = 101
+                guard = self.guard()
+                controls = dict(self.controls, **{key: False})
+                with self.assertRaises(EvidenceError):
+                    guard.observe(controls, deadline=20000)
+                self.assertTrue(guard.failed)
+
+    def test_readiness_misses_are_consecutive_and_eighteen_fail(self):
+        guard = self.guard()
+        missing = dict(self.controls, readiness=False)
+        for _ in range(17):
+            self.tick += 1
+            self.assertFalse(guard.observe(missing, deadline=20000))
+        self.tick += 1
+        self.assertTrue(guard.observe(self.controls, deadline=20000))
+        for _ in range(17):
+            self.tick += 1
+            self.assertFalse(guard.observe(missing, deadline=20000))
+        self.tick += 1
+        with self.assertRaises(EvidenceError):
+            guard.observe(missing, deadline=20000)
+        self.assertTrue(guard.failed)
