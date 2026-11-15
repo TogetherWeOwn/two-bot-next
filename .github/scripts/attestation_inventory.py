@@ -57,9 +57,9 @@ def require_fresh(api, pr):
     expected = snapshot(pr)
     repository = pr["base"]["repo"]["full_name"]
     prefix = f"repos/{repository}/pulls/{pr['number']}"
-    base_route = f"repos/{repository}/git/ref/heads/{quote(pr['base']['ref'], safe='')}"
     base_sha = pr["base"]["sha"]
     try:
+        base_route = f"repos/{repository}/git/ref/heads/{quote(pr['base']['ref'], safe='')}"
         current = api(prefix)
         if snapshot(current) != expected:
             raise InventoryError("Stale pull request metadata")

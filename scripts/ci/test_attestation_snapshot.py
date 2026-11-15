@@ -152,6 +152,17 @@ class Freshness(unittest.TestCase):
             self.assertNotIn("sensitive sentinel", str(error.exception))
             self.assertTrue(error.exception.__suppress_context__)
 
+    def test_unencodable_base_ref_is_rejected_without_reads(self):
+        pr = pull_request()
+        pr["base"]["ref"] = "release\ud800"
+        calls = []
+        with self.assertRaises(inventory.InventoryError) as error:
+            inventory.require_fresh(lambda route: calls.append(route), pr)
+        self.assertEqual(str(error.exception), "Freshness comparison failed")
+        self.assertIsNone(error.exception.__cause__)
+        self.assertTrue(error.exception.__suppress_context__)
+        self.assertEqual(calls, [])
+
     def test_invalid_baseline_does_not_read_and_mutation_cannot_change_base(self):
         pr = pull_request()
         del pr["body"]
