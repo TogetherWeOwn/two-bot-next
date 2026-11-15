@@ -48,6 +48,33 @@ def snapshot(pr):
     return tuple(identity)
 
 
+def validate_event_identity(event, repository, run_sha):
+    """Bind a synthetic event to a trusted repository name and base-run SHA.
+
+    Return the immutable snapshot tuple on success; raise InventoryError with a
+    constant message otherwise. No API reads or policy evaluation are performed.
+    The caller must supply trusted run context and independently fence evaluation.
+    A fork head is allowed; it is not used as the base repository identity.
+    """
+    if not (isinstance(event, dict) and isinstance(repository, str)
+            and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+            and isinstance(run_sha, str) and re.fullmatch(r"[0-9a-f]{40}", run_sha)):
+        raise InventoryError("Invalid event identity")
+    repo = event.get("repository")
+    if not (isinstance(repo, dict) and type(repo.get("id")) is int and repo["id"] > 0
+            and repo.get("full_name") == repository):
+        raise InventoryError("Invalid event identity")
+    pr = event.get("pull_request")
+    identity = snapshot(pr)
+    if not (type(event.get("number")) is int and event["number"] == pr["number"]
+            and pr["base"]["ref"] == "main"
+            and pr["base"]["sha"] == run_sha
+            and (repo["id"], repository) == (pr["base"]["repo"]["id"],
+                                               pr["base"]["repo"]["full_name"])):
+        raise InventoryError("Invalid event identity")
+    return identity
+
+
 def require_fresh(api, pr):
     """Compare one PR snapshot and its base ref; this is not an evaluation fence.
 
