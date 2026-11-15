@@ -10,6 +10,16 @@ from urllib.parse import quote
 
 STATUSES = {"added", "removed", "modified", "renamed", "copied", "changed"}
 MAX_FILES = 3000
+SELF_GATE_PATHS = frozenset({
+    ".github/workflows/base-attestation.yml",
+    ".github/scripts/base_attestation_gate.py",
+    "scripts/ci/test_base_attestation_gate.py",
+    ".github/scripts/attestation_inventory.py",
+    "scripts/ci/test_attestation_inventory.py",
+    "scripts/ci/test_attestation_snapshot.py",
+    "scripts/ci/test_attestation_event_identity.py",
+    "scripts/ci/test_attestation_policy.py",
+})
 
 
 class InventoryError(ValueError):
@@ -73,6 +83,42 @@ def validate_event_identity(event, repository, run_sha):
                                                pr["base"]["repo"]["full_name"])):
         raise InventoryError("Invalid event identity")
     return identity
+
+
+def evaluate_metadata(event, repository, run_sha, paths, policy):
+    """Evaluate synthetic metadata with the caller's trusted base policy module.
+
+    paths must be the complete expanded result of changed_paths for this snapshot.
+    The caller must establish policy provenance and bracket inventory/evaluation
+    with trusted live-read fences; this function is not enforcement.
+    Returns only identity and counts; every refusal has the same safe message.
+    """
+    try:
+        validate_event_identity(event, repository, run_sha)
+        pr = event["pull_request"]
+        if not (type(paths) is list and pr["changed_files"] <= len(paths)
+                <= 2 * pr["changed_files"]):
+            raise ValueError
+        validated = [inventory_path(path) for path in paths]
+        if len(set(validated)) != len(validated):
+            raise ValueError
+        body = pr["body"] or ""
+        if body.strip().startswith("This release is too large to preview in the pull request body."):
+            raise ValueError
+        findings = list(policy.evaluate({
+            "EVENT": "pull_request", "TITLE": pr["title"], "BODY": body,
+            "AUTHOR": pr["user"]["login"], "HEAD_REF": pr["head"]["ref"],
+            "CHANGED_FILES": "\n".join(validated), "REPO_PRIVATE": "false",
+            "REQUIRE_CARD_REF": "false", "PR_STANDARDS_MODE": "warn",
+        }))
+        if SELF_GATE_PATHS.intersection(validated):
+            findings.extend(policy.attestation_findings(body, [".github/workflows/supply-chain.yml"]))
+        if any(finding.level != "warning" for finding in findings):
+            raise ValueError
+        return {"head_sha": pr["head"]["sha"], "base_sha": run_sha,
+                "file_count": pr["changed_files"], "path_count": len(validated)}
+    except Exception:
+        raise InventoryError("Metadata policy evaluation refused") from None
 
 
 def require_fresh(api, pr):
