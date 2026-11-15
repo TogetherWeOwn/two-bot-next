@@ -10,7 +10,7 @@ const ORIGIN = "https://two-bot-next-staging.example.workers.dev";
 const TOKEN = "t".repeat(32);
 
 /** Full valid exposition with the `other` REST route counters overridden. */
-function restBody(twoXx: number, fiveXx: number): string {
+function restBody(twoXx: number | string, fiveXx: number | string): string {
   return metricsLines()
     .map((line) => {
       if (line === `two_bot_rest_requests_total{route="other",result="2xx"} 0`) {
@@ -127,6 +127,29 @@ test("an invalid REST counter produces an unavailable receipt", async () => {
   );
   assert.equal(code, 1);
   assert.deepEqual(receipt, { available: false, code: "invalid_rest_counters" });
+});
+
+test("raw REST counter tokens cannot round or underflow into valid receipts", async () => {
+  for (const token of ["1.0000000000000001", "9007199254740990.9", "-1e-400", "1e-400", "-0.0001"]) {
+    const fetchImpl = async () => ({ ok: true, status: 200, text: async () => restBody(0, token) });
+    const { code, receipt } = await run(
+      { STAGING_WORKER_URL: ORIGIN, METRICS_SCRAPE_TOKEN: TOKEN }, fetchImpl,
+    );
+    assert.equal(code, 1, token);
+    assert.deepEqual(receipt, { available: false, code: "decode_failed" }, token);
+  }
+});
+
+test("valid decimal and exponent REST counter tokens remain accepted", async () => {
+  for (const token of ["1.0", "10e-1", ".1e1", "+1e0", "-0e-400"]) {
+    const fetchImpl = async () => ({ ok: true, status: 200, text: async () => restBody(0, token) });
+    const { code, receipt } = await run(
+      { STAGING_WORKER_URL: ORIGIN, METRICS_SCRAPE_TOKEN: TOKEN }, fetchImpl,
+    );
+    assert.equal(code, 0, token);
+    assert.equal(receipt.available, true, token);
+    assert.equal(receipt.rest5xx, token === "-0e-400" ? 0 : 1, token);
+  }
 });
 
 test("arguments are strict", () => {
