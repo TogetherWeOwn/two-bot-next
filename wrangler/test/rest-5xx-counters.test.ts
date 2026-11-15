@@ -152,6 +152,27 @@ test("valid decimal and exponent REST counter tokens remain accepted", async () 
   }
 });
 
+test("long padded REST tokens preserve integer validation", async () => {
+  const padding = "0".repeat(12_000);
+  for (const [token, valid] of [
+    [padding + "1", true],
+    ["1" + padding + "e-12000", true],
+    ["1" + padding + "1e-12001", false],
+    ["1e-12001", false],
+  ] as const) {
+    const fetchImpl = async () => ({ ok: true, status: 200, text: async () => restBody(0, token) });
+    const { code, receipt } = await run(
+      { STAGING_WORKER_URL: ORIGIN, METRICS_SCRAPE_TOKEN: TOKEN }, fetchImpl,
+    );
+    assert.equal(code, valid ? 0 : 1);
+    if (valid) {
+      assert.equal(receipt.rest5xx, 1);
+    } else {
+      assert.deepEqual(receipt, { available: false, code: "decode_failed" });
+    }
+  }
+});
+
 test("arguments are strict", () => {
   assert.throws(() => parseArgs(["--metrics-url", ORIGIN]), Error);
   assert.throws(() => parseArgs(["--out", "x", "--unknown", "y"]), Error);

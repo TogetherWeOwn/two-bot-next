@@ -177,8 +177,13 @@ function nonnegativeIntegerToken(text: string): boolean {
   if (!/[1-9]/.test(digits)) return true;
   if (match[1] === "-") return false;
   const decimalShift = Number(match[4] ?? "0") - fraction.length;
-  const trailingZeros = /0*$/.exec(digits)![0].length;
-  return decimalShift >= 0 || -decimalShift <= trailingZeros;
+  if (decimalShift >= 0) return true;
+  const requiredZeros = -decimalShift;
+  if (requiredZeros > digits.length) return false;
+  for (let i = digits.length - 1; i >= digits.length - requiredZeros; i--) {
+    if (digits[i] !== "0") return false;
+  }
+  return true;
 }
 
 /** Reject partial or invalid scrapes before any baseline/streak/firing-state write. */
