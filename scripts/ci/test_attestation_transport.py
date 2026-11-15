@@ -1,5 +1,7 @@
 """Synthetic transport regressions; no network requests are made."""
+import http.client
 import importlib.util
+import io
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -19,6 +21,7 @@ class MetadataTransport(unittest.TestCase):
         self.reader._opener = mock.MagicMock()
         self.response = self.reader._opener.open.return_value.__enter__.return_value
         self.response.status = 200
+        self.response.length = None
         self.response.read.return_value = b'{"ok": true}'
 
     def refused(self, route):
@@ -73,6 +76,29 @@ class MetadataTransport(unittest.TestCase):
         self.reader._opener.open.side_effect = None
         self.response.status = 302
         self.refused(route)
+
+    def test_fixed_length_response_must_be_complete(self):
+        for length, succeeds in ((2, True), (100, False)):
+            with self.subTest(length=length):
+                sock = mock.Mock()
+                sock.makefile.return_value = io.BytesIO(
+                    b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(length).encode() + b'\r\n\r\n{}'
+                )
+                response = http.client.HTTPResponse(sock)
+                response.begin()
+                self.reader._opener.open.return_value = response
+                if succeeds:
+                    self.assertEqual(self.reader('repos/org/repo/pulls/1'), {})
+                else:
+                    self.refused('repos/org/repo/pulls/1')
+
+    def test_http_error_closes_stream_when_exception_is_retained(self):
+        stream = io.BytesIO(b'private body')
+        self.reader._opener.open.side_effect = HTTPError('private url', 403, 'private', {}, stream)
+        with self.assertRaises(transport.TransportError) as caught:
+            self.reader('repos/org/repo/pulls/1')
+        self.assertEqual(str(caught.exception), 'Metadata request refused')
+        self.assertTrue(stream.closed)
 
     def test_redirect_handler_refuses_redirects(self):
         handler = transport._NoRedirect()

@@ -6,6 +6,7 @@ provides neither freshness nor atomic consistency; callers must establish both.
 
 import json
 import re
+from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
@@ -68,6 +69,8 @@ class RestReader:
                 if response.status != 200:
                     raise ValueError
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
+                if response.length not in (None, 0):
+                    raise ValueError
             if len(raw) > MAX_RESPONSE_BYTES:
                 raise ValueError
             value = json.loads(raw.decode("utf-8"), object_pairs_hook=_object,
@@ -76,5 +79,11 @@ class RestReader:
             if not isinstance(value, expected_type):
                 raise ValueError
             return value
+        except HTTPError as error:
+            try:
+                error.close()
+            except Exception:
+                pass
+            raise TransportError("Metadata request refused") from None
         except Exception:
             raise TransportError("Metadata request refused") from None
