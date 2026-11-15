@@ -88,6 +88,7 @@ JOB_INVENTORY = {
     # fixture lands); pinned shape below.
     "gradual-promote-proof.yml": {"proof"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
+    "base-attestation.yml": {"metadata"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
     # runs the local validation/evidence/preflight scripts without ever
@@ -10580,7 +10581,8 @@ class WorkflowTests(unittest.TestCase):
                         # Read workflow/job history to debounce alerts and detect
                         # recovery; open, comment on and close the incident issue.
                         expected = {"contents": "read", "actions": "read", "issues": "write"}
-                    elif (name, job_id) == ("supply-chain.yml", "pr-lint"):
+                    elif (name, job_id) in (("supply-chain.yml", "pr-lint"),
+                                            ("base-attestation.yml", "metadata")):
                         expected["pull-requests"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
                         # Marker-label actor audit via the issue-events API.
@@ -10733,6 +10735,44 @@ class WorkflowTests(unittest.TestCase):
                         self.assertGreaterEqual(int(ceiling), 1)
                         self.assertLessEqual(int(ceiling), 360)
 
+    def test_base_attestation_only_executes_verified_base(self):
+        workflow = self.workflows["base-attestation.yml"]
+        self.assertEqual(set(workflow), {"name", "on", "permissions", "jobs"})
+        self.assertEqual(set(workflow["jobs"]), {"metadata"})
+        self.assertEqual(workflow["on"], {"pull_request_target": {"types": [
+            "opened", "edited", "synchronize", "reopened", "ready_for_review"]}})
+        self.assertNotIn("concurrency", workflow)
+        job = workflow["jobs"]["metadata"]
+        self.assertEqual(set(job), {"name", "permissions", "runs-on", "timeout-minutes", "steps"})
+        self.assertEqual(job["permissions"], {"contents": "read", "pull-requests": "read"})
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["timeout-minutes"], "5")
+        checkout, execute = job["steps"]
+        self.assertEqual(checkout["uses"], "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
+        self.assertEqual(checkout["with"], {
+            "ref": "${{ github.event.pull_request.base.sha }}", "persist-credentials": "false",
+            "sparse-checkout": ".github/scripts", "sparse-checkout-cone-mode": "false"})
+        self.assertEqual(execute["shell"], "python3 -I {0}")
+        self.assertEqual(execute["env"], {"GH_TOKEN": "${{ github.token }}"})
+        self.assertEqual(set(execute), {"name", "env", "shell", "run"})
+        script = compile(execute["run"], "workflow", "exec")
+        environment = {"GITHUB_SHA": "a" * 40, "GITHUB_WORKSPACE": "/synthetic",
+                       "GITHUB_EVENT_PATH": "/synthetic-event"}
+        for actual, allowed in (("a" * 40, True), ("b" * 40, False)):
+            with self.subTest(allowed=allowed), patch.dict(os.environ, environment, clear=True), \
+                    patch("subprocess.check_output", return_value=actual + "\n"), \
+                    patch("runpy.run_path") as run, patch.object(sys, "path", list(sys.path)), \
+                    patch.object(sys, "argv", list(sys.argv)):
+                if allowed:
+                    exec(script, {})
+                    run.assert_called_once_with("/synthetic/.github/scripts/base_attestation_gate.py",
+                                                run_name="__main__")
+                    self.assertEqual(sys.argv[1:], ["--event", "/synthetic-event"])
+                else:
+                    with self.assertRaises(SystemExit):
+                        exec(script, {})
+                    run.assert_not_called()
+
     def test_own_trigger_workflows_serialize_at_the_top_level(self):
         # A workflow with its own triggers (anything beyond a pure
         # `workflow_call` callee) declares top-level `concurrency`, so two
@@ -10751,6 +10791,8 @@ class WorkflowTests(unittest.TestCase):
             # Read-only staging observation and production alerting each use
             # an independent queue, never the lifecycle holders' pending slot.
             "synthetic-user-flow.yml",
+            # Independent target runs must not cancel or queue required runs.
+            "base-attestation.yml",
         }
         for name, workflow in self.workflows.items():
             on = workflow.get("on") or {}
