@@ -198,6 +198,41 @@ async fn ephemeral_defer_then_edit_original_use_token_only_and_no_mentions() {
 }
 
 #[tokio::test]
+async fn voice_embed_edit_is_bounded_token_only_and_not_retried() {
+    let mock = Mock::start(vec![response(500, json!({})), response(200, json!({}))]).await;
+    let content = format!("@everyone {}", "x".repeat(2100));
+    assert!(mock
+        .api
+        .complete_voice_embed(
+            Id::new(1),
+            "interaction-token",
+            crate::brand::EmbedKind::Warn,
+            &content
+        )
+        .await
+        .is_err());
+    let requests = mock.state.recorded.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.method, Method::PATCH);
+    assert_eq!(
+        request.path,
+        "/api/v10/webhooks/1/interaction-token/messages/@original"
+    );
+    assert!(!request.bot_authenticated);
+    assert_eq!(request.body["content"], "");
+    assert_eq!(request.body["allowed_mentions"]["parse"], json!([]));
+    let embed = &request.body["embeds"][0];
+    let description = embed["description"].as_str().unwrap();
+    assert!(two_bot_core::message_safety::text_len(description) <= 2000);
+    assert!(!description.contains("@everyone"));
+    assert_eq!(embed["footer"]["text"], "Together We Own · Voice");
+    assert!(embed["footer"].get("icon_url").is_none());
+    assert!(request.body.get("attachments").is_none());
+    assert!(request.body.get("components").is_none());
+}
+
+#[tokio::test]
 async fn callback_429_is_single_attempt_and_does_not_set_bot_global_backoff() {
     let mock = Mock::start(vec![
         response(429, json!({"retry_after": 600, "global": true})),
