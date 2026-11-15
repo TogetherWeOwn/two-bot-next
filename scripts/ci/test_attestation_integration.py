@@ -39,7 +39,7 @@ class SyntheticOpener:
             value["head"]["sha"] = "c" * 40
         raw = json.dumps(value).encode()
         if self.mutation == "malformed" and call == 3:
-            raw = b'{"duplicate": 1, "duplicate": 2}'
+            raw = b'[{"status":"modified","filename":"sql/change.sql","filename":"sql/change.sql"}]'
         length = len(raw) + (1 if self.mutation == "truncated" and call == 3 else 0)
         sock = mock.Mock()
         sock.makefile.return_value = io.BytesIO(
