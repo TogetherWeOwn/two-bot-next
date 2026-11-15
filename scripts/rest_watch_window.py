@@ -127,9 +127,14 @@ class WindowSchedule:
                 raise WindowFailure("deadline_or_coverage")
             # Intermediate endpoints cannot hide a per-series reset.
             assess_window(self.previous, rows, self.routes, self.baseline)
-            result = assess_window(self.opening, rows, self.routes, self.baseline)
+            opening = copy.deepcopy(self.opening)
+            opening_keys = _rows(opening)
+            opening.extend(copy.deepcopy(row) for row in rows
+                           if (row["route"], row["result"]) not in opening_keys)
+            result = assess_window(opening, rows, self.routes, self.baseline)
             if result["assessment"] == "regression":
                 raise WindowFailure("regression", result)
+            self.opening = opening
             if tick == self.deadline:
                 if result["assessment"] != "qualified":
                     raise WindowFailure("deadline_or_coverage", result)
@@ -149,6 +154,6 @@ class WindowSchedule:
         if self.failed or self.complete:
             raise EvidenceError("window schedule is terminal")
         if (type(tick) is not int or tick < self.last_tick
-                or tick >= self.deadline or tick >= self.last_tick + 30000):
+                or tick > self.deadline or tick > self.last_tick + 30000):
             self.failed = True
             raise WindowFailure("deadline_or_coverage")

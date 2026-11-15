@@ -3,6 +3,7 @@ import unittest
 
 from rest_evidence_continuity import (
     MAX_COUNTER,
+    MAX_SERIES,
     EvidenceError,
     parse_samples,
     validate_continuity,
@@ -169,6 +170,7 @@ class WindowScheduleTest(unittest.TestCase):
         tick = 0
         while tick < self.schedule.end:
             tick = min(tick + 30000, self.schedule.deadline)
+            self.schedule.check_deadline(tick)
             outcome = self.schedule.observe(self.rows(1000 + tick // 1000), tick)
         self.assertEqual(outcome, "complete")
         self.assertEqual(len(self.schedule.windows), 8)
@@ -179,8 +181,70 @@ class WindowScheduleTest(unittest.TestCase):
         self.assertEqual(self.schedule.deadline, 240000)
         self.schedule.observe(self.rows(1000), 30000)
         self.assertEqual(self.schedule.deadline, 240000)
+        self.schedule.check_deadline(60000)
+        self.assertEqual(self.schedule.deadline, 240000)
         with self.assertRaises(EvidenceError):
-            self.schedule.check_deadline(60000)
+            self.schedule.check_deadline(60001)
+        self.assertTrue(self.schedule.failed)
+        with self.assertRaises(EvidenceError):
+            self.schedule.observe(self.rows(1030), 60001)
+
+    def test_zero_series_growth_is_counted_and_retained(self):
+        def rows(count, limited, transport):
+            return self.rows(count) + [
+                {"route": "GET /a", "result": "429", "count": limited},
+                {"route": "GET /a", "result": "transport", "count": transport}]
+
+        self.schedule.observe(rows(1030, 0, 0), 30000)
+        self.schedule.observe(rows(1060, 2, 100), 60000)
+        for tick in range(90000, 240001, 30000):
+            self.schedule.observe(rows(1000 + tick // 1000, 2, 100), tick)
+        for route in ("global", "GET /a"):
+            self.assertEqual(self.schedule.windows[0]["counts"][route],
+                             {"errors": 0, "total": 242})
+        for tick in range(270000, 480001, 30000):
+            self.schedule.observe(rows(1000 + tick // 1000, 4, 200), tick)
+        self.assertEqual(self.schedule.windows[1]["counts"]["global"],
+                         {"errors": 0, "total": 242})
+
+    def test_new_series_still_requires_continuity(self):
+        row = {"route": "GET /a", "result": "429", "count": 0}
+        for bad in ("missing", "reset", "positive", "overflow"):
+            with self.subTest(bad=bad):
+                self.setUp()
+                if bad == "positive":
+                    row["count"] = 1
+                    with self.assertRaises(EvidenceError):
+                        self.schedule.observe(self.rows(1030) + [row], 30000)
+                else:
+                    row["count"] = 0
+                    self.schedule.observe(self.rows(1030) + [row], 30000)
+                    row["count"] = 2
+                    self.schedule.observe(self.rows(1060) + [row], 60000)
+                    if bad == "missing":
+                        endpoint = self.rows(1090)
+                    else:
+                        row["count"] = 1 if bad == "reset" else MAX_COUNTER + 1
+                        endpoint = self.rows(1090) + [row]
+                    with self.assertRaises(EvidenceError):
+                        self.schedule.observe(endpoint, 90000)
+                self.assertTrue(self.schedule.failed)
+
+    def test_series_bound_and_late_window_are_terminal(self):
+        rows = self.rows(1030) + [
+            {"route": f"GET /r{i}", "result": "2xx", "count": 0}
+            for i in range(MAX_SERIES)]
+        with self.assertRaises(EvidenceError):
+            self.schedule.observe(rows, 30000)
+        self.assertTrue(self.schedule.failed)
+
+        self.setUp()
+        for tick in range(30000, 240000, 30000):
+            self.schedule.observe(self.rows(1000 + tick // 1000), tick)
+        self.schedule.check_deadline(240000)
+        with self.assertRaises(EvidenceError):
+            self.schedule.check_deadline(240001)
+        self.assertEqual(self.schedule.deadline, 240000)
         self.assertTrue(self.schedule.failed)
 
     def test_thin_window_and_intermediate_reset_are_terminal(self):
