@@ -21,10 +21,12 @@ Two steps in deploy-production, both before any production mutation:
                 staging for the candidate, or
               - staging's REST 5xx ratio exceeds max(1.5 x production's
                 ratio, a 5% floor), with at least 3 staging 5xx responses.
-            Fewer than 10 judged staging REST requests, or missing continuous
-            same-process baseline evidence, refuses as `insufficient_data`;
-            a production baseline below 10
-            requests (or without a bearer) falls back to the floor alone.
+            A valid same-process delta with fewer than 10 requests still
+            refuses as `rest_5xx_regression` if it meets the regression
+            threshold above; otherwise it refuses as `insufficient_data`.
+            Missing continuous same-process evidence cannot produce a pass.
+            A production baseline below 10 requests (or without a bearer)
+            falls back to the floor alone.
             A process restart between the baseline and the post-soak sample
             (different `two_bot_process_incarnation`) breaks the cumulative
             window: a measured regression in the post-restart counters still
