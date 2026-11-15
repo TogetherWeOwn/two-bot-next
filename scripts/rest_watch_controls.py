@@ -29,6 +29,7 @@ class ControlGuard:
         self._clock = clock
         self._verify = verify
         self._last_tick = transition_tick
+        self._last_clock = transition_tick
         self._misses = 0
         self.failed = False
 
@@ -45,6 +46,7 @@ class ControlGuard:
             tick, domain = self._clock()
             if (type(tick) is not int or type(deadline) is not int
                     or not self._last_tick < tick <= MAX_COUNTER
+                    or tick < self._last_clock
                     or not 0 <= deadline <= MAX_COUNTER or tick > deadline
                     or tick - self._last_tick > 10000 or domain != self._domain
                     or type(controls) is not dict
@@ -63,6 +65,7 @@ class ControlGuard:
             if self._misses >= 18:
                 raise EvidenceError("readiness failure")
             self._last_tick = tick
+            self._last_clock = finished
             return controls["readiness"]
         except Exception:
             self.failed = True

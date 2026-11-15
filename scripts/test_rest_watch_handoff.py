@@ -230,6 +230,22 @@ class ControlGuardTest(unittest.TestCase):
                     guard.observe(self.controls, deadline=10101)
                 self.assertTrue(guard.failed)
 
+    def test_clock_regression_between_observations_is_terminal(self):
+        def delayed(*args):
+            self.tick = 1000
+            return True
+        self.verify = delayed
+        guard = self.guard()
+        self.tick = 101
+        self.assertTrue(guard.observe(self.controls, deadline=20000))
+        self.tick = 102
+        with self.assertRaises(EvidenceError):
+            guard.observe(self.controls, deadline=20000)
+        self.assertTrue(guard.failed)
+        self.tick = 1001
+        with self.assertRaises(EvidenceError):
+            guard.observe(self.controls, deadline=20000)
+
     def test_ownership_and_journey_failure_are_terminal(self):
         for key in ("ownership", "journeys"):
             with self.subTest(key=key):
