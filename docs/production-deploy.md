@@ -440,10 +440,11 @@ soaked candidate on staging with production as it serves now:
   `scripts/promotion_regression_gate.py compare` refuses when a journey
   (`health`, `readyz`, `build`) passes on production but failed on staging,
   or when staging's REST 5xx ratio exceeds max(1.5 × production's ratio, 5%)
-  with at least 3 staging 5xx responses. Fewer than 10 judged staging
-  requests in the valid same-process counter delta, or missing baseline or
-  identity, refuses as `insufficient_data`; a production baseline below 10
-  requests falls back to the 5% floor.
+  with at least 3 staging 5xx responses. A valid same-process counter delta
+  with fewer than 10 requests still refuses as `rest_5xx_regression` when it
+  meets that regression threshold; otherwise it refuses as `insufficient_data`.
+  Missing baseline or identity cannot produce a pass. A production baseline
+  below 10 requests falls back to the 5% floor.
 
 A failing production journey lowers the baseline, never the bar: the gate
 only asks that the candidate is no worse than what serves now. The

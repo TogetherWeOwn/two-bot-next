@@ -21,10 +21,12 @@ Two steps in deploy-production, both before any production mutation:
                 staging for the candidate, or
               - staging's REST 5xx ratio exceeds max(1.5 x production's
                 ratio, a 5% floor), with at least 3 staging 5xx responses.
-            Fewer than 10 judged staging REST requests, or missing continuous
-            same-process baseline evidence, refuses as `insufficient_data`;
-            a production baseline below 10
-            requests (or without a bearer) falls back to the floor alone.
+            A valid same-process delta with fewer than 10 requests still
+            refuses as `rest_5xx_regression` if it meets the regression
+            threshold above; otherwise it refuses as `insufficient_data`.
+            Missing continuous same-process evidence cannot produce a pass.
+            A production baseline below 10 requests (or without a bearer)
+            falls back to the floor alone.
             A process restart between the baseline and the post-soak sample
             (different `two_bot_process_incarnation`) breaks the cumulative
             window: a measured regression in the post-restart counters still
@@ -267,7 +269,12 @@ def compare(staging, prod_probe, prod_rest):
             staging_pair = delta
     prod_ratio = ratio(prod_pair) if prod_pair and prod_pair[1] >= MIN_REQUESTS else None
     threshold = max(RATIO_MARGIN * prod_ratio, FLOOR_RATIO) if prod_ratio is not None else FLOOR_RATIO
-    if staging_pair is None or staging_pair[1] < MIN_REQUESTS:
+    if (coverage == "bookended" and staging_pair is not None
+            and staging_pair[0] >= MIN_5XX and ratio(staging_pair) > threshold):
+        # A sparse but measurable regression must not be mistaken for a
+        # harmless lack of traffic if sparse deferral is introduced later.
+        rate_verdict = "fail"
+    elif staging_pair is None or staging_pair[1] < MIN_REQUESTS:
         rate_verdict = "insufficient_data"
     elif staging_pair[0] >= MIN_5XX and ratio(staging_pair) > threshold:
         # A measured regression refuses even across a restart: the
