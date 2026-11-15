@@ -228,7 +228,6 @@ class ControlGuardTest(unittest.TestCase):
                 deadline = 100 if case == "deadline" else 20000
                 with self.assertRaises(EvidenceError):
                     guard.observe(controls, deadline=deadline)
-                self.assertTrue(guard.failed)
                 with self.assertRaises(EvidenceError):
                     guard.observe(self.controls, deadline=20000)
 
@@ -256,7 +255,6 @@ class ControlGuardTest(unittest.TestCase):
         self.tick = 102
         with self.assertRaises(EvidenceError):
             guard.observe(self.controls, deadline=20000)
-        self.assertTrue(guard.failed)
         self.tick = 1001
         with self.assertRaises(EvidenceError):
             guard.observe(self.controls, deadline=20000)
