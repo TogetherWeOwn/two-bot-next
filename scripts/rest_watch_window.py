@@ -49,7 +49,7 @@ def _regression(errors, total, baseline):
     prior_errors, prior_total = baseline
     absolute = errors * 20 > total
     relative = errors * 2 * prior_total > 3 * prior_errors * total
-    return absolute or (errors >= 3 and absolute and relative)
+    return (total >= 10 and absolute) or (errors >= 3 and absolute and relative)
 
 
 def assess_window(opening, closing, required_routes, baseline):
@@ -84,7 +84,7 @@ def assess_window(opening, closing, required_routes, baseline):
             if status == "5xx":
                 totals[target][0] += delta
     regression = [route for route, (errors, total) in totals.items()
-                  if total >= 10 and _regression(errors, total, baseline[route])]
+                  if _regression(errors, total, baseline[route])]
     thin = [route for route, (_, total) in totals.items() if total < 10]
     return {"assessment": "regression" if regression else "thin" if thin else "qualified",
             "counts": {key: {"errors": value[0], "total": value[1]}

@@ -191,6 +191,16 @@ class WindowScheduleTest(unittest.TestCase):
         with self.assertRaises(EvidenceError):
             self.schedule.observe(self.rows(1010), 240001)
 
+    def test_sparse_regression_is_terminal_before_healthy_traffic(self):
+        rows = self.rows(1000)
+        rows[1]["count"] = 3
+        with self.assertRaises(EvidenceError):
+            self.schedule.observe(rows, 30000)
+        self.assertTrue(self.schedule.failed)
+        rows[0]["count"] += 97
+        with self.assertRaises(EvidenceError):
+            self.schedule.observe(rows, 60000)
+
     def test_reset_cannot_be_concealed_by_later_growth(self):
         self.schedule.observe(self.rows(1030), 30000)
         with self.assertRaises(EvidenceError):
