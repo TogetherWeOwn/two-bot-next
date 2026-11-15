@@ -5,6 +5,7 @@ This module does not enforce an attestation policy or schedule a workflow.
 """
 
 import re
+from urllib.parse import quote
 
 
 STATUSES = {"added", "removed", "modified", "renamed", "copied", "changed"}
@@ -45,6 +46,30 @@ def snapshot(pr):
             raise InventoryError("Invalid repository identity")
         identity.extend((value["ref"], value["sha"], (repo["id"], repo["full_name"])))
     return tuple(identity)
+
+
+def require_fresh(api, pr):
+    """Compare one PR snapshot and its base ref; this is not an evaluation fence.
+
+    The caller must bind event/run identities, bracket evaluation with comparisons,
+    and establish the reader's trust, consistency and freshness guarantees.
+    """
+    expected = snapshot(pr)
+    repository = pr["base"]["repo"]["full_name"]
+    prefix = f"repos/{repository}/pulls/{pr['number']}"
+    base_sha = pr["base"]["sha"]
+    try:
+        base_route = f"repos/{repository}/git/ref/heads/{quote(pr['base']['ref'], safe='')}"
+        current = api(prefix)
+        if snapshot(current) != expected:
+            raise InventoryError("Stale pull request metadata")
+        ref = api(base_route)
+        if not (isinstance(ref, dict) and isinstance(ref.get("object"), dict)
+                and ref["object"].get("sha") == base_sha):
+            raise InventoryError("Stale or invalid base reference")
+    except Exception:
+        # Reader exceptions and remote content may contain credentials or PR text.
+        raise InventoryError("Freshness comparison failed") from None
 
 
 def inventory_path(value):
