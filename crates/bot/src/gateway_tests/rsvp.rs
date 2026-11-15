@@ -15,6 +15,58 @@ use crate::discord_test_common::{MockRest, ScriptedResponse};
 
 const EVENT: &str = "1546451670500642999";
 
+fn assert_saved_reply(body: &[u8], expected: &str) {
+    let reply: Value = serde_json::from_slice(body).expect("deferred reply JSON");
+    assert_eq!(reply["allowed_mentions"]["parse"], json!([]));
+    assert_eq!(reply["allowed_mentions"]["users"], json!([]));
+    assert_eq!(reply["allowed_mentions"]["roles"], json!([]));
+    let content = reply["content"].as_str().expect("reply content");
+    if content.is_empty() {
+        let embed = two_bot_discord::brand::ephemeral_reply_embed(
+            two_bot_discord::brand::EmbedKind::Ok,
+            "Events",
+            expected.to_owned(),
+        );
+        assert_eq!(reply["embeds"], json!([embed]));
+    } else {
+        assert_eq!(content, expected);
+        assert!(reply["embeds"].is_null(), "text reply has no embeds");
+    }
+}
+
+#[test]
+fn saved_reply_accepts_only_the_expected_safe_shape() {
+    let text = "RSVP saved: going.";
+    let mentions = json!({"parse": [], "users": [], "roles": []});
+    let embed = two_bot_discord::brand::ephemeral_reply_embed(
+        two_bot_discord::brand::EmbedKind::Ok,
+        "Events",
+        text.to_owned(),
+    );
+    let plain = json!({"content": text, "allowed_mentions": mentions});
+    let rich = json!({"content": "", "embeds": [embed], "allowed_mentions": mentions});
+    for reply in [&plain, &rich] {
+        assert_saved_reply(reply.to_string().as_bytes(), text);
+    }
+    let mut wrong_text = rich.clone();
+    wrong_text["embeds"][0]["description"] = json!("wrong");
+    let mut extra_embed = rich.clone();
+    extra_embed["embeds"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({}));
+    let mut unsafe_mentions = plain.clone();
+    unsafe_mentions["allowed_mentions"]["parse"] = json!(["users"]);
+    let mut mixed = plain;
+    mixed["embeds"] = rich["embeds"].clone();
+    for reply in [wrong_text, extra_embed, unsafe_mentions, mixed] {
+        assert!(std::panic::catch_unwind(|| {
+            assert_saved_reply(reply.to_string().as_bytes(), text);
+        })
+        .is_err());
+    }
+}
+
 pub(super) fn interaction(sequence: u64, status: &str) -> Value {
     json!({"op":0,"s":sequence,"t":"INTERACTION_CREATE","d":{
         "application_id":"1111", "authorizing_integration_owners":{"0":GUILD},
@@ -564,10 +616,7 @@ async fn queued_commands(
             .filter(|request| request.method == "PATCH" && request.path.contains(token))
             .collect();
         assert_eq!(edits.len(), 1, "one completion edit for {token}");
-        assert_eq!(
-            serde_json::from_slice::<Value>(&edits[0].body).unwrap()["content"],
-            content
-        );
+        assert_saved_reply(&edits[0].body, content);
     }
     if let Some(runner) = runner {
         // Replayed committed dispatches must not send duplicate callbacks or effects.
@@ -854,13 +903,10 @@ async fn receipt_callback_waits_out_brief_lane_occupancy() {
     assert_eq!(edits.len(), 2);
     assert!(edits[0].path.contains("mock-rsvp-2"));
     assert!(edits[1].path.contains("mock-rsvp-3"));
-    assert_eq!(
-        serde_json::from_slice::<Value>(&edits[0].body).unwrap()["content"],
-        "RSVP saved: going."
-    );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&edits[1].body).unwrap()["content"],
-        "RSVP saved: interested (changed from going)."
+    assert_saved_reply(&edits[0].body, "RSVP saved: going.");
+    assert_saved_reply(
+        &edits[1].body,
+        "RSVP saved: interested (changed from going).",
     );
     let status: String = tokio::time::timeout(
         Duration::from_secs(60),
@@ -1069,10 +1115,7 @@ async fn governed_sticky_defers_through_rsvp_lane_hold() {
         })
         .collect();
     assert_eq!(rsvp_edits.len(), 1);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&rsvp_edits[0].body).unwrap()["content"],
-        "RSVP saved: going."
-    );
+    assert_saved_reply(&rsvp_edits[0].body, "RSVP saved: going.");
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM announcements_audit_log")
             .fetch_one(&db.pool)
