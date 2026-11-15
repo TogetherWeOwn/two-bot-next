@@ -1160,7 +1160,7 @@ async fn help_embed_followup_is_ephemeral_sanitized_single_attempt_and_token_saf
     assert_eq!(requests[0].method, "POST");
     assert_eq!(
         requests[0].path,
-        "/api/v10/webhooks/1111/routing-test-token"
+        "/api/v10/webhooks/1111/routing-test-token?with_components=false"
     );
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["flags"], 64);
