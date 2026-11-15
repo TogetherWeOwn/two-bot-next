@@ -74,6 +74,8 @@ class MetadataTransport(unittest.TestCase):
                 self.reader._opener.open.side_effect = exc
                 self.refused(route)
         self.reader._opener.open.side_effect = None
+        self.response.read.return_value = b'{}'
+        self.assertEqual(self.reader(route), {})
         self.response.status = 302
         self.refused(route)
 
