@@ -3984,6 +3984,46 @@ impl ActionExecutor {
         }
     }
 
+    /// Send one ordered ephemeral embed followup for an acknowledged
+    /// interaction (the `/help` continuation pages). The embeds pass the same
+    /// outbound sanitizer as the callback. Exactly one attempt and no retry,
+    /// not even for an admission block: a lost response may already be a
+    /// created message, so repeating it could duplicate a page. Errors carry
+    /// only the bounded class; the interaction token never appears in them.
+    pub async fn send_ephemeral_embed_followup(
+        &self,
+        application_id: u64,
+        interaction_token: &str,
+        embeds: &[twilight_model::channel::message::Embed],
+    ) -> Result<(), DiscordError> {
+        use twilight_model::channel::message::{AllowedMentions, MessageFlags};
+        let application = Id::<ApplicationMarker>::new_checked(application_id)
+            .ok_or_else(|| DiscordError::Rejected("bad application id".to_owned()))?;
+        let mut body = serde_json::json!({ "embeds": embeds });
+        crate::message_safety::sanitize_message(&mut body);
+        crate::message_safety::validate_create(&body)?;
+        let safe: Vec<twilight_model::channel::message::Embed> =
+            serde_json::from_value(body["embeds"].take())
+                .map_err(|_| DiscordError::Rejected("decode safe followup embeds".to_owned()))?;
+        let mentions = AllowedMentions::default();
+        let client = self.inner.factory.interaction(application);
+        let req = Self::request_of(
+            client
+                .create_followup(interaction_token)
+                .embeds(&safe)
+                .flags(MessageFlags::EPHEMERAL)
+                .allowed_mentions(Some(&mentions)),
+        )?;
+        let (mut res, _) = self.send_with_timeout(&req, None).await?;
+        match res.status {
+            200..=299 => {
+                res.complete().await;
+                Ok(())
+            }
+            _ => Err(throw_for_status(&res)),
+        }
+    }
+
     /// Complete an acknowledged interaction by editing its original response.
     /// Like the initial callback, this bypasses the paced moderation lane.
     /// One attempt: a lost reply must not repeat already-committed store effects.
