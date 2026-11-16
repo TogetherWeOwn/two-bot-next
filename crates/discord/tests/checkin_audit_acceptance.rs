@@ -20,6 +20,8 @@
 //! discarding the `write_audit` boolean fails this suite.
 #![cfg(feature = "db")]
 
+#[path = "common/attendance_reply.rs"]
+mod attendance_reply;
 #[allow(dead_code)]
 mod common;
 
@@ -233,8 +235,13 @@ fn assert_reply(mock: &MockRest, content: &str, deferred: bool) {
             last.path,
             "/api/v10/webhooks/1111/mock-checkin-token/messages/@original"
         );
-        assert_eq!(body["content"], content);
-        assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+        let kind = if content.starts_with("Recorded <@") || content.starts_with("Attendance for <@")
+        {
+            two_bot_discord::brand::EmbedKind::Ok
+        } else {
+            two_bot_discord::brand::EmbedKind::Danger
+        };
+        assert_eq!(attendance_reply::deferred_text(&body, kind), content);
     } else {
         assert_eq!(last.method, "POST");
         assert_eq!(body["type"], 4);
