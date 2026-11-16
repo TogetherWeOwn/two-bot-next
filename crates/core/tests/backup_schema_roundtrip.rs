@@ -2955,6 +2955,130 @@ async fn v16_archive_restores_populated_instance_windows() {
 }
 
 #[tokio::test]
+async fn recovery_boundary_migration_fences_existing_rows_and_allows_null() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    // Reconstruct the pre-0475 shape only in this disposable database.
+    sqlx::query("ALTER TABLE event_instance_windows DROP COLUMN attendance_recovered_at")
+        .execute(pool)
+        .await
+        .unwrap();
+    let names = vec!["event_instance_windows".to_owned()];
+    let before = snapshot(pool, &names).await;
+    assert_eq!(before[&names[0]].rows.len(), 2);
+    let started: String = sqlx::query_scalar("SELECT clock_timestamp()::text")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../cutover/migrations/0475_attendance_recovery_boundary.sql"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    let fenced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_instance_windows WHERE attendance_recovered_at >= $1::timestamptz AND attendance_recovered_at <= clock_timestamp()")
+        .bind(started)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(fenced, 2, "existing rows receive a migration-time fence");
+    let mut after = snapshot(pool, &names).await;
+    let windows = after.get_mut(&names[0]).unwrap();
+    let index = windows
+        .columns
+        .iter()
+        .position(|(name, _)| name == "attendance_recovered_at")
+        .unwrap();
+    windows.columns.remove(index);
+    for row in &mut windows.rows {
+        row.remove(index);
+    }
+    assert_eq!(after, before, "migration preserves all existing evidence");
+    sqlx::query("UPDATE event_instance_windows SET attendance_recovered_at = NULL")
+        .execute(pool)
+        .await
+        .unwrap();
+    let nulls: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_instance_windows WHERE attendance_recovered_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        nulls, 2,
+        "explicit NULL remains available for new instances"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v16_archive_without_recovery_boundary_receives_restore_time_fence() {
+    let Some(db) = database().await else {
+        return;
+    };
+    let pool = db.pool();
+    seed(pool).await;
+    let names = vec!["event_instance_windows".to_owned()];
+    let mut expected = snapshot(pool, &names).await;
+    assert_eq!(expected[&names[0]].rows.len(), 2);
+    let directory = ArchiveDirectory::new();
+    let mut old = current_archive(pool, &directory).await;
+    assert_eq!(old.manifest.version, 16);
+    let table = old
+        .manifest
+        .tables
+        .iter_mut()
+        .find(|table| table.name == names[0])
+        .unwrap();
+    let index = table
+        .columns
+        .iter()
+        .position(|name| name == "attendance_recovered_at")
+        .unwrap();
+    table.columns.remove(index);
+    table.column_types.remove(index);
+    for row in old.buffers.get_mut(&names[0]).unwrap() {
+        row.remove("attendance_recovered_at");
+    }
+    let path = directory.path("v16-before-recovery-boundary.ndjson.gz");
+    write_archive(&path, &old);
+    assert_eq!(inspect(&path).unwrap().manifest.version, 16);
+    forget_moderation_history(pool).await;
+    let started: String = sqlx::query_scalar("SELECT clock_timestamp()::text")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(restore(pool, &path).await.unwrap().ok);
+    let fenced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_instance_windows WHERE attendance_recovered_at >= $1::timestamptz AND attendance_recovered_at <= clock_timestamp()")
+        .bind(started)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(fenced, 2, "older archive rows receive a restore-time fence");
+    let mut restored = snapshot(pool, &names).await;
+    for snapshot in [&mut restored, &mut expected] {
+        let windows = snapshot.get_mut(&names[0]).unwrap();
+        let index = windows
+            .columns
+            .iter()
+            .position(|(name, _)| name == "attendance_recovered_at")
+            .unwrap();
+        windows.columns.remove(index);
+        for row in &mut windows.rows {
+            row.remove(index);
+        }
+    }
+    assert_eq!(
+        restored, expected,
+        "restore preserves all archived evidence"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v15_archive_restores_and_clears_newer_event_instance_windows_without_backfill() {
     let Some(db) = database().await else {
         return;
