@@ -9,6 +9,8 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { setImmediate } from "node:timers/promises";
 import worker, { TwoBotContainer, gatewayComponentReady, type Env } from "../src/index.ts";
 import { OWNER_KEY, AUDIT_PREFIX, DEPLOYMENT_HEADER, CONTROL_PATH } from "../src/ownership.ts";
@@ -364,6 +366,20 @@ test("bounded staging: deployment identity is CF_VERSION_METADATA's Worker versi
   assert.equal(h.starts.length, 0, "acquisition is not startup");
 });
 
+test("bounded staging: offline pipeline ownership and standalone behavior", () => {
+  const fixture = fileURLToPath(new URL("../../scripts/ci/staging_admission_behavior.mjs", import.meta.url));
+  execFileSync(process.execPath, [fixture], { timeout: 10_000 });
+});
+
+async function assertNativeExpiryStopped(h: {
+  runtime: { running: boolean }; pending: () => unknown[];
+  bot: { listSchedules: (name: string) => Promise<unknown[]> };
+}) {
+  assert.equal(h.runtime.running, false, "expiry stopped runtime");
+  assert.equal(h.pending().length, 0, "expiry drained keepalive");
+  assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 0, "expiry drained alarm");
+}
+
 test("bounded staging: native expiry stops a lost runner's container, consumes schedules, and never resurrects", async (t) => {
   t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_800_000_000_000 });
   const h = await harness(t, BOUNDED_STAGING_ENV);
@@ -375,9 +391,7 @@ test("bounded staging: native expiry stops a lost runner's container, consumes s
   assert.ok(oldTick);
   t.mock.timers.tick(120_000);
   await h.bot.alarm();
-  assert.equal(h.runtime.running, false);
-  assert.equal(h.pending().length, 0);
-  assert.equal((await h.bot.listSchedules("stagingExpiry")).length, 0);
+  await assertNativeExpiryStopped(h);
   const receipt = h.logs.filter((line) => line.startsWith("{"))
     .map((line) => JSON.parse(line)).find((event) => event.event === "staging_use" && event.action === "expiry");
   assert.ok(receipt, "a lost/cancelled runner still gets a native stop receipt");
@@ -393,6 +407,20 @@ test("bounded staging: native expiry stops a lost runner's container, consumes s
   assert.equal(h.starts.length, 1);
   assert.equal((await h.bot.fetch(probeRequest("https://worker.invalid/health"))).status, 503);
   assert.equal(h.starts.length, 1);
+});
+
+test("bounded staging: expiry assertions detect running, pending, and armed corruptions", async () => {
+  const state = { runtime: { running: false }, pending: (): unknown[] => [],
+    bot: { listSchedules: async (): Promise<unknown[]> => [] } };
+  await assertNativeExpiryStopped(state);
+  state.runtime.running = true;
+  await assert.rejects(assertNativeExpiryStopped(state), /expiry stopped runtime/);
+  state.runtime.running = false;
+  state.pending = () => [1];
+  await assert.rejects(assertNativeExpiryStopped(state), /expiry drained keepalive/);
+  state.pending = () => [];
+  state.bot.listSchedules = async () => [1];
+  await assert.rejects(assertNativeExpiryStopped(state), /expiry drained alarm/);
 });
 
 test("bounded staging: DO reconstruction after expiry stops a reattached process before ingress", async (t) => {
