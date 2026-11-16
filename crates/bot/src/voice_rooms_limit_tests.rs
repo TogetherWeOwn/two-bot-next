@@ -98,6 +98,57 @@ async fn myroom_cold_worker_returns_warning_embed() {
 }
 
 #[tokio::test]
+async fn myroom_missing_invoker_returns_danger_embed() {
+    let runtime = test_runtime(Trace::default());
+    let mut interaction = voice_interaction(
+        Some(command_data("myroom", Vec::new())),
+        Some(Permissions::empty()),
+        true,
+    );
+    interaction.member.as_mut().unwrap().user = None;
+    let seen = Arc::new(Mutex::new(None));
+    let capture = seen.clone();
+    assert!(
+        handle_voice_interaction(&runtime, &interaction, move |response| {
+            *capture.lock().unwrap() = Some(response);
+            async {}
+        })
+        .await
+    );
+    let response = seen.lock().unwrap().clone().expect("reply");
+    assert_limit_embed(
+        &response,
+        two_bot_discord::brand::EmbedKind::Danger,
+        "I couldn't tell who invoked /myroom — try again.",
+    );
+    assert!(limit_completion_embed(&interaction, &response).is_some());
+}
+
+#[tokio::test]
+async fn myroom_owned_room_returns_success_embed() {
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data("myroom", Vec::new())),
+        Some(Permissions::empty()),
+        MEMBER,
+    );
+    let seen = Arc::new(Mutex::new(None));
+    let capture = seen.clone();
+    assert!(
+        handle_voice_interaction(&runtime, &interaction, move |response| {
+            *capture.lock().unwrap() = Some(response);
+            async {}
+        })
+        .await
+    );
+    let response = seen.lock().unwrap().clone().expect("reply");
+    let text = response_text(&response);
+    assert!(text.contains("<#500>"));
+    assert_limit_embed(&response, two_bot_discord::brand::EmbedKind::Ok, &text);
+    assert!(limit_completion_embed(&interaction, &response).is_some());
+}
+
+#[tokio::test]
 async fn registered_limit_names_reach_embed_completion() {
     struct RoutingReplies(Mutex<Vec<bool>>);
 
