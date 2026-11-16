@@ -152,6 +152,7 @@ pub mod event_instance_store;
 pub mod self_roles;
 pub mod send_admission;
 pub mod settings;
+pub mod staging_reads;
 pub mod sticky;
 pub mod stream_funnel;
 pub mod stream_live;
