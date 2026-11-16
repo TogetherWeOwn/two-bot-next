@@ -2360,7 +2360,7 @@ mod tests {
                 objs[0]["version"] = serde_json::json!(introduced);
                 let err =
                     inspect_bytes(&gzip_lines(&objs)).expect_err("new version requires table");
-                assert!(err.to_string().contains(table), "{introduced}: {err}");
+                assert!(err.to_string().contains(*table), "{introduced}: {err}");
             }
         }
         for (index, required) in [(21, true), (22, false)] {
