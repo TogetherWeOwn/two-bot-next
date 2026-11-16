@@ -352,11 +352,14 @@ async fn registered_voice_id_with_rsvp_payload_has_one_voice_callback() {
         .find(|request| request.method == "PATCH")
         .unwrap();
     let edit: Value = serde_json::from_slice(&edit.body).unwrap();
-    assert!(edit["content"]
+    assert!(edit["content"].as_str().is_none_or(str::is_empty));
+    let embeds = edit["embeds"].as_array().expect("voice reply embeds");
+    assert_eq!(embeds.len(), 1);
+    assert!(embeds[0]["description"]
         .as_str()
         .unwrap()
-        .to_lowercase()
-        .contains("pong"));
+        .starts_with("Pong! "));
+    assert_eq!(embeds[0]["footer"]["text"], "Together We Own · Voice");
     rest.shutdown().await;
     db.close().await;
 }
