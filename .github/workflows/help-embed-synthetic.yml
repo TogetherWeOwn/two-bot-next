@@ -182,7 +182,7 @@ jobs:
         if: steps.gate.outputs.configured == 'true'
         shell: bash
         env:
-          RUST_TOOLCHAIN: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_TOOLCHAIN: "1.100.0" # Match rust-toolchain.toml; floating stable can drift.
           RUST_COMPONENTS: ""
         run: bash .github/scripts/install-rust-toolchain.sh
       - name: Generate the help embed payloads from the Rust builders

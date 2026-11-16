@@ -37,7 +37,7 @@ BROAD_STEP = "Full workspace sweep including ignored tests"
 PUBLIC_RUNNER = "ubuntu-latest"
 
 TIMEOUT_EXPR = "${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || 45 }}"
-CONTAINER_IMAGE = 'rust:1.99-trixie@sha256:09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137'
+CONTAINER_IMAGE = 'rust:1.100-trixie@sha256:e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31'
 POSTGRES_IMAGE = 'postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722'
 REQUIRED_ENV = {'TWO_LFG_TESTDB_CI': '1',
  'TWO_GATEWAY_TEST_DATABASE_URL': 'postgresql://agent_test@localhost:5432/agent_test',
@@ -429,7 +429,7 @@ class NightlyPartitionWorkflow(unittest.TestCase):
             job = self.job(name)
             tc = [s for s in job["steps"] if s.get("run") == "bash .github/scripts/install-rust-toolchain.sh"]
             self.assertEqual(len(tc), 1, name)
-            self.assertEqual(tc[0]["env"], {"RUST_TOOLCHAIN": "1.99.1", "RUST_COMPONENTS": ""}, name)
+            self.assertEqual(tc[0]["env"], {"RUST_TOOLCHAIN": "1.100.0", "RUST_COMPONENTS": ""}, name)
             self.assertEqual(tc[0].get("shell"), "bash", name)
             self.assertIn("generate_command_reference.py", self.all_runs(name), name)
             # Generation must precede the first step that compiles or runs tests.

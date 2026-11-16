@@ -3326,8 +3326,8 @@ def staging_active_errors(workflow):
 
 # Pinned build image shared with the migration plan jobs (same runner
 # binary, same toolchain). A digest bump must move all consumers together.
-SCHEMA_GATE_IMAGE = ("rust:1.99-trixie@sha256:"
-                     "09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137")
+SCHEMA_GATE_IMAGE = ("rust:1.100-trixie@sha256:"
+                     "e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31")
 
 
 def schema_gate_errors(workflow, name="deploy-staging.yml"):
@@ -4742,8 +4742,8 @@ BOOKWORM_JOBS = {
     "reusable-rust-nextest.yml": ("nextest",),
     "pipeline-benchmark.yml": ("benchmark",),
 }
-BOOKWORM_IMAGE = ("rust:1.99-bookworm@sha256:"
-                  "9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b")
+BOOKWORM_IMAGE = ("rust:1.100-bookworm@sha256:"
+                  "ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea")
 # (workflow, job, cache key prefix). The nightly sweep is split into four
 # compiling jobs; the `sweep` aggregate compiles nothing and has no cache.
 CACHE_JOBS = (("nightly.yml", "sweep-plan", "nightly-cargo"),
@@ -5144,7 +5144,12 @@ class WorkflowTests(unittest.TestCase):
                  "93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e")
         for workflow, jobs in BOOKWORM_JOBS.items():
             for job in jobs:
-                for image in (stale, "rust:1.99-bookworm@sha256:" + "0" * 64):
+                for image in (
+                    stale,
+                    "rust:1.100-bookworm@sha256:" + "0" * 64,
+                    "rust:1.99-bookworm@sha256:"
+                    "9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b",
+                ):
                     with self.subTest(workflow=workflow, job=job, image=image):
                         mutated = deepcopy(fixed)
                         mutated[workflow]["jobs"][job]["container"]["image"] = image
