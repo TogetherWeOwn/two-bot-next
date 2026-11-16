@@ -10648,6 +10648,9 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("deploy-production.yml", "promotion-skipped"):
                         # No checkout or API access: only report and upload a receipt.
                         expected = {}
+                    elif (name, job_id) == ("gradual-promote-proof.yml", "admission-hold"):
+                        # Refuses before checkout or API access.
+                        expected = {}
                     elif (name, job_id) == ("daily-digest.yml", "digest"):
                         # Cuts the vYYYY.MM.DD tag and its release, reads the
                         # production Deployments fallback, and dispatches the
