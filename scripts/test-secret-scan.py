@@ -151,8 +151,12 @@ class SecretScanSurfaceTests(unittest.TestCase):
         # Context values reach the shell as env vars, never interpolated into `run:`.
         self.assertIn("EVENT_NAME: ${{ github.event_name }}", scan)
         # base_ref is empty on merge_group; the queue target arrives as a full
-        # ref and the wrapper strips the prefix.
-        self.assertIn("BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}", scan)
+        # ref and the wrapper strips the prefix. Dispatch uses trusted main.
+        self.assertIn(
+            "BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref || "
+            "(github.event_name == 'workflow_dispatch' && 'refs/heads/main') }}",
+            scan,
+        )
         run_lines = [line for line in scan.splitlines() if line.strip().startswith("run:")]
         self.assertFalse(any("${{" in line for line in run_lines))
         self_test = self.gitleaks_step("Self-test the PR scan policy")

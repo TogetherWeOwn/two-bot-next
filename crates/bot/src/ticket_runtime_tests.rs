@@ -1,5 +1,8 @@
 //! Mock-only proofs; lazy testdb pool never connects in these tests.
 //! Timer proofs use Tokio's paused clock, not elapsed wall time.
+#[path = "live_ticket_refresh_race_acceptance_tests.rs"]
+mod live_ticket_refresh_race_acceptance_tests;
+
 use super::*;
 use crate::command_runtime::CommandRuntime;
 use crate::discord_test_common::{MockRest, ScriptedResponse};

@@ -315,6 +315,29 @@ test("bounded staging: control authentication, version stamping and bounded body
   assert.equal(h.starts.length, 0);
 });
 
+test("bounded staging: queued status returns unknown without asserting cleanup", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let calls = 0;
+  let markCalled!: () => void;
+  const called = new Promise<void>((resolve) => { markCalled = resolve; });
+  const env = { ...BOUNDED_STAGING_ENV, TWO_BOT: { getByName: () => ({ fetch: () => {
+    calls++;
+    markCalled();
+    return new Promise<Response>(() => {});
+  } }) } } as unknown as Env;
+  const request = new Request(`https://worker.invalid${STAGING_USE_PATH}`, {
+    headers: { authorization: `Bearer ${CONTROL_TOKEN}` },
+  });
+  const result = worker.fetch(request, env, {} as ExecutionContext);
+  await called;
+  assert.equal(calls, 1);
+  t.mock.timers.tick(10_000);
+  const response = await result;
+  assert.equal(response.status, 503);
+  assert.equal(await response.text(), "staging_status_unknown");
+  assert.equal(response.headers.get("content-type")?.includes("application/json"), false);
+});
+
 test("bounded staging: deployment identity is CF_VERSION_METADATA's Worker version UUID", async (t) => {
   const versionId = "11111111-1111-4111-8111-111111111111";
   const deploymentResourceId = "22222222-2222-4222-8222-222222222222";

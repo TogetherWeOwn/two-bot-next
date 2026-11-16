@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Offline self-test for gitleaks-scan.sh: a pull request or merge-queue commit
-# must not be able to silence the secret scan that gates it.
+# Offline self-test for gitleaks-scan.sh: a pull request, merge-queue commit
+# or PR-validation dispatch must not silence the secret scan that gates it.
 #
 # Builds throwaway git repos (a "base" commit on main plus a PR commit on top,
 # with refs/remotes/origin/main standing in for the fetched base branch) and
@@ -283,6 +283,78 @@ printf 'more docs\n' >> "${repo}/README.md"
 pr_commit
 expect "merge_group: unfetched base branch fails the scan" 2 \
   "$(scan_rc merge_group refs/heads/missing-branch)"
+
+# -- PR-validation dispatch uses the merged main policy -----------------------
+new_repo dispatch-config
+write_stock_config
+base_commit
+plant_token
+write_allowlist_config
+pr_commit
+expect "dispatch: PR-added config exclusion is ignored" 1 "$(scan_rc workflow_dispatch)"
+
+new_repo dispatch-ignore
+write_stock_config
+base_commit
+plant_token
+pr_commit
+fp="$(fingerprint_of "${work}/stock.toml")"
+if [[ -z "${fp}" ]]; then
+  failures=$((failures + 1))
+  echo "FAIL dispatch: could not derive the fingerprint of the planted token"
+else
+  printf '%s\n' "${fp}" > "${repo}/.gitleaksignore"
+  pr_commit
+  expect "dispatch: PR-added ignore exclusion is ignored" 1 "$(scan_rc workflow_dispatch)"
+fi
+
+new_repo dispatch-clean
+write_stock_config
+base_commit
+printf 'more docs\n' >> "${repo}/README.md"
+pr_commit
+expect "dispatch: clean change passes" 0 "$(scan_rc workflow_dispatch refs/heads/main)"
+
+new_repo dispatch-base-config
+write_allowlist_config
+base_commit
+plant_token
+pr_commit
+expect "dispatch: merged config exclusion is honoured" 0 "$(scan_rc workflow_dispatch)"
+
+new_repo dispatch-base-ignore
+write_stock_config
+plant_token
+git -C "${repo}" add -A
+git -C "${repo}" commit -q -m "synthetic fixture on base"
+fp="$(fingerprint_of "${work}/stock.toml")"
+if [[ -z "${fp}" ]]; then
+  failures=$((failures + 1))
+  echo "FAIL dispatch: could not derive the base fingerprint"
+else
+  printf '%s\n' "${fp}" > "${repo}/.gitleaksignore"
+  base_commit
+  printf 'more docs\n' >> "${repo}/README.md"
+  pr_commit
+  expect "dispatch: merged ignore exclusion is honoured" 0 "$(scan_rc workflow_dispatch)"
+fi
+
+new_repo dispatch-no-base
+write_stock_config
+base_commit
+printf 'more docs\n' >> "${repo}/README.md"
+pr_commit
+git -C "${repo}" update-ref -d refs/remotes/origin/main
+expect "dispatch: missing trusted main fails closed" 2 "$(scan_rc workflow_dispatch)"
+
+new_repo dispatch-wrong-base
+write_stock_config
+base_commit
+printf 'more docs\n' >> "${repo}/README.md"
+pr_commit
+git -C "${repo}" update-ref refs/remotes/origin/feature HEAD
+expect "dispatch: fetched non-main policy is refused" 2 "$(scan_rc workflow_dispatch feature)"
+expect "dispatch: revision syntax in base ref is refused" 2 "$(scan_rc workflow_dispatch 'main~1')"
 
 printf '\n%d cases, %d failed\n' "${cases}" "${failures}"
 [[ "${failures}" -eq 0 ]]

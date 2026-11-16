@@ -1738,6 +1738,16 @@ mod tests {
         enc.finish().unwrap()
     }
 
+    fn complete_current_manifest() -> Value {
+        let current = manifest(complete_tables(&BTreeMap::new()));
+        inspect_bytes(&gzip_lines(&[
+            current.clone(),
+            serde_json::json!({"kind":"end","rows":0}),
+        ]))
+        .expect("complete v17 archive inspects");
+        current
+    }
+
     fn good_dump() -> Vec<Value> {
         let mut over = BTreeMap::new();
         over.insert("events", (vec!["id", "guild_id"], 1));
@@ -2949,12 +2959,7 @@ mod tests {
                 .contains("missing tables: events"));
         }
         assert_eq!(DUMP_VERSION, 17, "new dumps require both guild counters");
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v17 archive inspects");
+        let current = complete_current_manifest();
         for name in ["assistant_monthly_builds", "game_activity_guild_aggregates"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -3029,12 +3034,7 @@ mod tests {
                 .contains("missing tables: events"));
         }
         assert_eq!(DUMP_VERSION, 17, "new dumps require the epoch-claim guard");
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v17 archive inspects");
+        let current = complete_current_manifest();
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -3167,12 +3167,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("scheduled_events_tombstone"));
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v17 archive inspects");
+        let current = complete_current_manifest();
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -3254,12 +3249,7 @@ mod tests {
             .to_string()
             .contains("admin_api_tokens"));
         assert_eq!(DUMP_VERSION, 17, "new dumps require the token registry");
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v17 archive inspects");
+        let current = complete_current_manifest();
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()
@@ -3330,12 +3320,7 @@ mod tests {
                 .contains("missing tables: events"));
         }
         assert_eq!(DUMP_VERSION, 17, "new dumps require the event voice pair");
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v17 archive inspects");
+        let current = complete_current_manifest();
         for name in ["event_voice_channels", "event_voice_presence"] {
             let mut gap = current.clone();
             gap["tables"]
@@ -3436,12 +3421,7 @@ mod tests {
                 "event_voice_sessions"
             ]
         );
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v17 archive inspects");
+        let current = complete_current_manifest();
         for name in [
             "starboard_config",
             "starboard_starrers",
@@ -3633,6 +3613,50 @@ mod tests {
                 "{field}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn released_v16_inventory_keeps_instance_windows_mandatory() {
+        // Extend the frozen v13 inventory with the literal v14–v16 additions;
+        // neither the current inventory nor version waivers define this fixture.
+        let tables: Vec<Value> = FROZEN_V13_TABLES
+            .iter()
+            .copied()
+            .chain([
+                "starboard_config",
+                "starboard_starrers",
+                "starboard_posts",
+                "giveaways",
+                "giveaway_entries",
+                "giveaway_draws",
+                "event_instance_windows",
+            ])
+            .map(|name| {
+                serde_json::json!({"name": name, "columns": [], "column_types": [], "count": 0})
+            })
+            .collect();
+        assert_eq!(tables.len(), 108);
+        assert_eq!(tables[107]["name"], "event_instance_windows");
+        let mut released = manifest(tables);
+        released["version"] = serde_json::json!(16);
+        let end = serde_json::json!({"kind": "end", "rows": 0});
+        let contents = inspect_bytes(&gzip_lines(&[released.clone(), end.clone()]))
+            .expect("released v16 inventory remains readable");
+        assert_eq!(contents.manifest.version, 16);
+        assert!(contents
+            .manifest
+            .tables
+            .iter()
+            .any(|table| table.name == "event_instance_windows"));
+
+        released["tables"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|table| table["name"] != "event_instance_windows");
+        let error = inspect_bytes(&gzip_lines(&[released, end]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("event_instance_windows"), "{error}");
     }
 
     #[test]
@@ -3838,12 +3862,7 @@ mod tests {
             assert!(error.contains(name), "{error}");
         }
         assert_eq!(DUMP_VERSION, 17, "new dumps require the giveaway tables");
-        let current = manifest(complete_tables(&BTreeMap::new()));
-        inspect_bytes(&gzip_lines(&[
-            current.clone(),
-            serde_json::json!({"kind":"end","rows":0}),
-        ]))
-        .expect("complete v17 archive inspects");
+        let current = complete_current_manifest();
         let mut gap = current.clone();
         gap["tables"]
             .as_array_mut()

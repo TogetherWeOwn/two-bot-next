@@ -1,7 +1,7 @@
 //! Hand-computed legacy row contracts: docs/member-journey-parity.md.
 //! This uses the real pipeline and dispatch transaction, never seeded events.
 
-use super::{checkpoint, TestDb, GUILD};
+use super::{checkpoint, TestDb, GUILD, RESUME_URL};
 use futures_util::FutureExt as _;
 use serde_json::{json, Value};
 use std::panic::{resume_unwind, AssertUnwindSafe};
@@ -79,7 +79,7 @@ async fn dispatch(
     data: Value,
     clock: &str,
 ) -> DispatchAction {
-    let saved = checkpoint("journey", seq, "ws://fixture");
+    let saved = checkpoint("journey", seq, RESUME_URL);
     // Same guard as the shard runner: redelivery must not mutate cache/trackers.
     if dispatch_action(
         store.load().await.expect("checkpoint").as_ref(),
@@ -419,7 +419,7 @@ async fn invite_snapshot_contract(db: &TestDb) {
     });
     assert!(db
         .store
-        .commit_dispatch(&checkpoint("journey", 3, "ws://fixture"), batch)
+        .commit_dispatch(&checkpoint("journey", 3, RESUME_URL), batch)
         .await
         .is_err());
     assert_eq!(db.count().await, before);
@@ -445,7 +445,7 @@ async fn invite_snapshot_contract(db: &TestDb) {
     };
     assert!(db
         .store
-        .commit_dispatch(&checkpoint("journey", 3, "ws://fixture"), foreign)
+        .commit_dispatch(&checkpoint("journey", 3, RESUME_URL), foreign)
         .await
         .is_err());
     assert_eq!(rows(db, INVITES).await, baseline);

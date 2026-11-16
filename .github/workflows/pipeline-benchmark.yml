@@ -8,6 +8,9 @@ on:
     paths:
       - '.github/workflows/pipeline-benchmark.yml'
       - 'crates/discord/examples/pipeline_bench.rs'
+      - 'crates/testsupport/src/pipeline_integrity.rs'
+      - 'crates/testsupport/tests/pipeline_integrity.rs'
+      - 'crates/cutover/tests/pipeline_durability.rs'
       - 'scripts/*pipeline_bench*'
       - 'docs/pipeline-benchmark-baseline.json'
 
@@ -19,14 +22,15 @@ concurrency:
 
 jobs:
   benchmark:
+    name: benchmark
     permissions:
       contents: read
     # Runner routing: see the note on `check` in check.yml.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'benchmark') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     # Service DNS and loopback stay job-private; no shared host port is published.
     container:
-      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
+      image: rust:1.100-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
     services:
       agent-testdb:
         image: postgres:18.6@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
@@ -34,6 +38,12 @@ jobs:
           POSTGRES_USER: agent_test
           POSTGRES_DB: two_bot_test_pipeline_bench
           POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: >-
+            -c shared_preload_libraries=pg_stat_statements
+            -c logging_collector=on -c log_destination=jsonlog
+            -c log_min_duration_statement=0
+            -c log_rotation_age=0 -c log_rotation_size=0
+            -c autovacuum=off
         options: >-
           --health-cmd "pg_isready -U agent_test -d two_bot_test_pipeline_bench"
           --health-interval 5s --health-timeout 5s --health-retries 12
@@ -51,9 +61,12 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends python3 >/dev/null
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+      - name: Install Rust toolchain
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.100.0" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: ""
+        run: bash .github/scripts/install-rust-toolchain.sh
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -66,13 +79,18 @@ jobs:
       - name: Benchmark fixture and guard regressions (CI job container only)
         run: |
           cargo test -p two-bot-discord --example pipeline_bench --locked
-          cargo test -p two-bot-testsupport --lib --locked
+          cargo test -p two-bot-testsupport --lib --locked -- --test-threads=1
+          cargo test -p two-bot-testsupport --test pipeline_integrity --locked -- --test-threads=1
+          cargo test -p two-bot-cutover --test pipeline_durability --locked --no-run
+          timeout 120s cargo test -p two-bot-cutover --test pipeline_durability --locked -- --test-threads=1
       - name: Build benchmark (CI job container only)
         run: cargo build -p two-bot-discord --example pipeline_bench --locked
       - name: Measure bounded synthetic pipeline
         run: |
           timeout 240s target/debug/examples/pipeline_bench > pipeline-benchmark.json
           python3 -m json.tool pipeline-benchmark.json
+      - name: Validate independent counter and profile evidence
+        run: python3 scripts/pipeline_bench_profile.py pipeline-benchmark.json pipeline-benchmark.json
       - name: Compare committed baseline
         # The first evidence run bootstraps the measured baseline; no invented numbers.
         if: hashFiles('docs/pipeline-benchmark-baseline.json') != ''

@@ -131,11 +131,20 @@ export async function stagingUse(args, send = fetch, pause = wait, now = Date.no
   if (!["status", "observe"].includes(args.action)) binding(args, args.action === "release" ? Math.min(now(), args.expiresAt - 1) : now());
   const headers = { authorization: `Bearer ${args.token}`, "cache-control": "no-cache" };
   const control = async (init) => {
-    const response = await request(send, new URL(PATH, base), { ...init, headers }, performance.now() + MAX_REQUEST_MS);
-    require(response.status === 200, "staging_control_refused");
-    const state = parseStagingState(response.body);
-    require(state, "staging_response_invalid");
-    return state;
+    for (;;) {
+      const deadline = args.statusRetryDeadline === undefined || init.method !== "GET"
+        ? performance.now() + MAX_REQUEST_MS : args.statusRetryDeadline;
+      const response = await request(send, new URL(PATH, base), { ...init, headers }, deadline);
+      if (response.status === 503 && init.method === "GET" && args.statusRetryDeadline !== undefined
+        && performance.now() + 5000 < deadline) {
+        await pause(5000);
+        continue;
+      }
+      require(response.status === 200, "staging_control_refused");
+      const state = parseStagingState(response.body);
+      require(state, "staging_response_invalid");
+      return state;
+    }
   };
   let state = await control({ method: "GET" });
   if (args.action === "status") return receipt(args.action, state, now());

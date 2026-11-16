@@ -97,7 +97,7 @@ separate authorization.
    returning success alone does not prove recovery.
 
 All npm commands below run **from the repository root** and use the pinned
-Wrangler 4.152.0 through `wrangler/package.json`. Use only the already-authorized
+Wrangler 4.156.0 through `wrangler/package.json`. Use only the already-authorized
 Cloudflare connection. An authentication/permission failure is a stop: report
 it, do not try another credential, elevate access, or use a personal token.
 Examples target `staging`; do not substitute `production` without its own gate.
@@ -2820,7 +2820,7 @@ The workflow mirrors the staging shape with the `production-migrate-` prefix:
 three jobs (`plan`, `claim`, `apply`), environments
 `production-migrate-plan` (no reviewer, plan only) and
 `production-migrate-apply` (required reviewer, main-only), the same pinned
-actions, routed runner, pipefail shell, and artifact names
+actions, explicit `ubuntu-latest` runner, pipefail shell, and artifact names
 (`production-migrate-manifest`, `production-migrate-apply-claim`, 14-day
 retention, stored ZIP entries). The `claim` job runs
 `scripts/ci/production_migrate_claim.py`, which binds the same projection hash

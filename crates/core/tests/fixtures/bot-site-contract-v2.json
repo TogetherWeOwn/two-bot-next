@@ -1,0 +1,102 @@
+{
+  "comment": "Golden request/result pairs for the bot-site contract v2 (docs/bot-site-contract.md section 2). Test-only values: snowflakes, timestamps, cursors and keys are invented and carry no real member data. Validators exercised here are the ones that exist in crates/core/src/internal_actions.rs today: voice.snapshot is allowlisted and flag-gated; the other five verbs are shape-only JSON until their implementations land, and the test pins is_implemented == false so each landing forces this fixture and its test to tighten.",
+  "verbs": {
+    "voice.snapshot": {
+      "request": {"action": "voice.snapshot"},
+      "request_id": "00000000000000000000000001",
+      "implemented": true,
+      "needs_idempotency_key": false,
+      "gate_flag": "TWO_INTERNAL_ALLOW_VOICE_SNAPSHOT",
+      "results": {
+        "full": {"v": 1, "observed_at": "2026-11-03T19:04:11Z", "total_in_voice": 3, "rooms": [
+          {"channel_id": "100000000000000011", "name": "Raid 1", "position": 0, "user_limit": 10, "member_ids": ["100000000000000001", "100000000000000002"], "occupied_since": "2026-11-03T18:40:00Z", "event_key": "test-raid-night-1"},
+          {"channel_id": "100000000000000012", "name": "Lobby", "position": 1, "user_limit": 0, "member_ids": ["100000000000000003"], "occupied_since": null},
+          {"channel_id": "100000000000000013", "name": "Empty", "position": 2, "user_limit": 0, "member_ids": []}
+        ]},
+        "legacy": {"v": 1, "observed_at": "2026-11-03T19:04:11Z", "total_in_voice": 1, "rooms": [
+          {"channel_id": "100000000000000012", "name": "Lobby", "position": 1, "user_limit": 0, "member_ids": ["100000000000000003"]}
+        ]},
+        "refusal": {"ok": false, "request_id": "00000000000000000000000001", "error": {"code": "discord_unavailable", "message": "request refused", "retryable": true}}
+      }
+    },
+    "voice.move_member": {
+      "request": {"action": "voice.move_member", "discord_id": "100000000000000001", "channel_id": "100000000000000011"},
+      "implemented": false,
+      "needs_idempotency_key": false,
+      "gate_flag": "TWO_INTERNAL_ALLOW_VOICE_MOVE",
+      "outcomes": ["moved", "already_in_room", "not_connected", "not_permitted", "room_full", "room_gone", "bot_not_permitted", "discord_unavailable", "rate_limited"],
+      "results": {
+        "moved": {"outcome": "moved", "from_channel_id": "100000000000000012"},
+        "already_in_room": {"outcome": "already_in_room"},
+        "not_connected": {"outcome": "not_connected"},
+        "not_permitted": {"outcome": "not_permitted"},
+        "room_full": {"outcome": "room_full"},
+        "room_gone": {"outcome": "room_gone"},
+        "bot_not_permitted": {"outcome": "bot_not_permitted"},
+        "discord_unavailable": {"outcome": "discord_unavailable"},
+        "rate_limited": {"outcome": "rate_limited"}
+      }
+    },
+    "reminder.send": {
+      "request": {"action": "reminder.send", "discord_id": "100000000000000001", "event_key": "test-raid-night-1", "kind": "starting_soon", "starts_at": "2026-11-07T19:00:00Z", "event_name": "Raid Night"},
+      "idempotency_key": "550e8400-e29b-41d4-a716-446655440001",
+      "implemented": false,
+      "needs_idempotency_key": true,
+      "gate_flag": "TWO_INTERNAL_ALLOW_MEMBER_NOTIFY",
+      "kinds": ["starting_soon"],
+      "outcomes": ["sent", "dm_unavailable"],
+      "results": {
+        "sent": {"outcome": "sent"},
+        "dm_unavailable": {"outcome": "dm_unavailable"}
+      }
+    },
+    "place_offer.send": {
+      "request": {"action": "place_offer.send", "discord_id": "100000000000000002", "event_key": "test-raid-night-1", "event_name": "Raid Night", "expires_at": "2026-11-07T18:00:00Z"},
+      "idempotency_key": "550e8400-e29b-41d4-a716-446655440002",
+      "implemented": false,
+      "needs_idempotency_key": true,
+      "gate_flag": "TWO_INTERNAL_ALLOW_MEMBER_NOTIFY",
+      "outcomes": ["sent", "dm_unavailable"],
+      "results": {
+        "sent": {"outcome": "sent"},
+        "dm_unavailable": {"outcome": "dm_unavailable"}
+      }
+    },
+    "event.attendance.read": {
+      "request": {"action": "event.attendance.read", "event_key": "test-raid-night-1"},
+      "implemented": false,
+      "needs_idempotency_key": false,
+      "gate_flag": "TWO_INTERNAL_ALLOW_ATTENDANCE_READ",
+      "outcomes": ["read", "not_found"],
+      "results": {
+        "read": {"v": 1, "event_key": "test-raid-night-1", "window": {"starts_at": "2026-11-07T18:45:00Z", "ends_at": "2026-11-07T21:15:00Z"}, "threshold_minutes": 10, "peak_concurrent": 5, "rooms": [
+          {"channel_id": "100000000000000011", "name_at_close": "Raid 1"}
+        ], "members": [
+          {"discord_id": "100000000000000001", "minutes": 42, "sessions": 2, "first_joined_at": "2026-11-07T18:50:00Z"},
+          {"discord_id": "100000000000000002", "minutes": 11, "sessions": 1, "first_joined_at": "2026-11-07T19:20:00Z"}
+        ], "final": true},
+        "not_found": {"outcome": "not_found"}
+      }
+    },
+    "botlog.read": {
+      "request": {"action": "botlog.read", "after": "test-publication-origin", "limit": 200},
+      "initial_request": {"action": "botlog.read", "after": null, "limit": 200},
+      "implemented": false,
+      "needs_idempotency_key": false,
+      "gate_flag": "TWO_INTERNAL_ALLOW_BOTLOG_READ",
+      "kinds": ["event.opened", "event.updated", "event.cancelled", "announcement.posted", "rank.assigned", "member.joined"],
+      "results": {
+        "first_page": {"v": 1, "entries": [
+          {"seq": "test-publication-origin", "at": "2026-11-03T19:02:00Z", "kind": "member.joined", "subject_id": "100000000000000003"}
+        ], "next": "test-publication-origin"},
+        "initially_empty": {"v": 1, "entries": [], "next": null},
+        "page": {"v": 1, "entries": [
+          {"seq": "test-publication-z", "at": "2026-11-03T19:04:11Z", "kind": "event.opened", "event_key": "test-raid-night-1"},
+          {"seq": "test-publication-a", "at": "2026-11-03T19:05:02Z", "kind": "rank.assigned", "subject_id": "100000000000000001", "detail": "soldier"},
+          {"seq": "test-publication-m", "at": "2026-11-03T19:03:00Z", "kind": "member.joined", "subject_id": "100000000000000002"}
+        ], "next": "test-publication-m"},
+        "empty": {"v": 1, "entries": [], "next": "test-publication-origin"}
+      }
+    }
+  }
+}

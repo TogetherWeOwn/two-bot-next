@@ -651,6 +651,39 @@ class MainValidationTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("--target-version needs --target-image", out)
 
+    def test_staging_rollback_rejects_other_application_before_client(self):
+        url = "https://two-bot-next-staging.acct.workers.dev"
+        for source in (["--snapshot", "s.json"],
+                       ["--target-version", GOOD_VERSION, "--target-image", good_image()]):
+            with self.subTest(source=source[0]):
+                factory = mock.Mock()
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = rollback.main(
+                        ["rollback", "--variant", "staging", "--worker-url", url,
+                         "--application", "two-bot-next-twobotcontainer-production",
+                         "--actor", "a:b", "--evidence", "e.json", *source],
+                        environ=self.base_env(), client_factory=factory)
+                self.assertEqual(code, 1)
+                self.assertIn("staging_application_invalid", output.getvalue())
+                factory.assert_not_called()
+
+    def test_application_guard_preserves_staging_and_production_target_selection(self):
+        cases = [("staging", []), ("staging", ["--application", APPLICATION]),
+                 ("production", ["--application", "custom-production"])]
+        for variant, override in cases:
+            with self.subTest(variant=variant, override=override):
+                factory = mock.Mock()
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = rollback.main(
+                        ["rollback", "--variant", variant, "--worker-url", "invalid",
+                         "--actor", "a:b", "--evidence", "e.json", *override],
+                        environ=self.base_env(), client_factory=factory)
+                self.assertEqual(code, 1)
+                self.assertNotIn("staging_application_invalid", output.getvalue())
+                factory.assert_called_once()
+
     def test_rejects_bad_identity_before_any_call(self):
         url = "https://two-bot-next-staging.acct.workers.dev"
         code, out = self.run_main(

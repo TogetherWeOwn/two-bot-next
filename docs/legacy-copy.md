@@ -182,7 +182,14 @@ has a same-named table.
 
 ## Verification
 
+These commands describe hosted-CI coverage, not a local checklist. Push the PR
+branch and use exact-head Actions run/job links as evidence. Local execution is
+only for one failing test or crate under the
+[focused reproduction policy](../CONTRIBUTING.md#focused-failure-reproduction-only);
+heavy focused builds use guarded Boat, never heavy raw-host fallback.
+
 ```sh
+# Ephemeral hosted CI only.
 cargo test -p two-bot-cutover --lib --bins --locked
 cargo test -p two-bot-cutover --test legacy_copy_db --locked -- --ignored
 cargo clippy -p two-bot-cutover --all-targets --locked -- -D warnings

@@ -895,12 +895,37 @@ impl TicketRuntime {
     /// Serialize the read/compare/apply so concurrent refreshes cannot overwrite
     /// a newer config with an earlier read. Malformed values keep the last good.
     pub(crate) fn refresh_config_with(&self, live: Option<&LiveSettings>) {
-        let mut current = self.config.lock().expect("ticket config");
+        let current = self.config.lock().expect("ticket config");
+        Self::apply_refresh(&self.deployment, &self.live_vars, current, live);
+    }
+
+    /// Non-blocking refresh over the SAME applied-state lock and resolver as
+    /// [`Self::refresh_config_with`]: `false` when a concurrent refresh holds
+    /// the lock, never waits. The overlap regression pins that a paused older
+    /// refresh cannot overwrite a newer cooldown.
+    #[cfg(test)]
+    pub(crate) fn try_refresh_config_with_for_test(&self, live: Option<&LiveSettings>) -> bool {
+        let Ok(current) = self.config.try_lock() else {
+            return false;
+        };
+        Self::apply_refresh(&self.deployment, &self.live_vars, current, live);
+        true
+    }
+
+    /// Resolve and publish under the caller's applied-state lock: the
+    /// revision/effective-vars comparison and the config write share one
+    /// critical section, so a newer publication always wins.
+    fn apply_refresh(
+        deployment: &HashMap<String, String>,
+        live_vars: &TaskMutex<Option<HashMap<String, String>>>,
+        mut current: std::sync::MutexGuard<'_, TicketConfig>,
+        live: Option<&LiveSettings>,
+    ) {
         let Ok(guild_id) = current.guild_id.parse::<u64>() else {
             return;
         };
-        let vars = layered_vars(&self.deployment, &current.guild_id, live);
-        let mut previous = self.live_vars.lock().expect("ticket effective vars");
+        let vars = layered_vars(deployment, &current.guild_id, live);
+        let mut previous = live_vars.lock().expect("ticket effective vars");
         if previous.as_ref() == Some(&vars) {
             return;
         }

@@ -20,13 +20,92 @@ pub enum BootAction {
     DiscardAndIdentify,
 }
 
+// Twilight 0.17.1 appends this query before tokio-websockets parses an HTTP
+// URI (http 1.x caps it at u16::MAX - 1 bytes). zstd uses the same suffix length;
+// reserving compression space is also safe for builds without compression.
+const RESUME_CONNECT_SUFFIX: &str = "/?v=10&encoding=json&compress=zlib-stream";
+const MAX_RESUME_URL_LEN: usize = (u16::MAX - 1) as usize - RESUME_CONNECT_SUFFIX.len();
+
+/// Persisted endpoints must use Discord's secure gateway domain. Reject raw
+/// authority forms that URL parsing would otherwise normalize before checking,
+/// and require the original string to be usable by the connection URI parser.
+pub fn is_valid_resume_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("wss://") else {
+        return false;
+    };
+    if value.len() > MAX_RESUME_URL_LEN
+        || !value.is_ascii()
+        || value
+            .bytes()
+            .any(|b| b.is_ascii_control() || b == b' ' || b == b'\\')
+    {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains(['@', '%']) {
+        return false;
+    }
+    if format!("{value}{RESUME_CONNECT_SUFFIX}")
+        .parse::<http::Uri>()
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "wss"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.host_str().is_some_and(|host| {
+            host == "discord.gg"
+                || host
+                    .strip_suffix(".discord.gg")
+                    .is_some_and(|prefix| !prefix.is_empty())
+        })
+}
+
+/// Admission derives only from an independently checked bootstrap override.
+#[derive(Clone, Copy, Default)]
+pub struct ResumePolicy(bool);
+
+impl ResumePolicy {
+    pub fn for_bootstrap(override_url: Option<&str>) -> Self {
+        Self(override_url.is_some_and(is_loopback_gateway))
+    }
+
+    pub fn normalize(self, value: &str) -> &str {
+        if is_valid_resume_url(value) || (self.0 && is_loopback_gateway(value)) {
+            value
+        } else {
+            ""
+        }
+    }
+}
+
+/// Literal, nonzero loopback sockets only; never DNS, credentials or suffixes.
+pub fn is_loopback_gateway(url: &str) -> bool {
+    url.strip_prefix("ws://")
+        .and_then(|socket| socket.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|socket| socket.ip().is_loopback() && socket.port() != 0)
+}
+
 pub fn boot_action(saved: Option<&GatewaySession>, now_ms: i64) -> BootAction {
+    boot_action_for(saved, now_ms, ResumePolicy::default())
+}
+
+fn boot_action_for(
+    saved: Option<&GatewaySession>,
+    now_ms: i64,
+    policy: ResumePolicy,
+) -> BootAction {
     let Some(saved) = saved else {
         return BootAction::Identify;
     };
     let age = now_ms.checked_sub(saved.updated_at_ms);
     if saved.session_id.is_empty()
-        || saved.resume_url.is_empty()
+        || policy.normalize(&saved.resume_url).is_empty()
         || !matches!(age, Some(0..=SESSION_MAX_AGE_MS))
     {
         BootAction::DiscardAndIdentify
@@ -49,9 +128,18 @@ pub fn boot_action_with(
     directive: BootDirective,
     now_ms: i64,
 ) -> BootAction {
+    boot_action_with_policy(saved, directive, now_ms, ResumePolicy::default())
+}
+
+pub fn boot_action_with_policy(
+    saved: Option<&GatewaySession>,
+    directive: BootDirective,
+    now_ms: i64,
+    policy: ResumePolicy,
+) -> BootAction {
     match directive {
         BootDirective::ForceIdentify => BootAction::DiscardAndIdentify,
-        BootDirective::None => boot_action(saved, now_ms),
+        BootDirective::None => boot_action_for(saved, now_ms, policy),
     }
 }
 
@@ -100,9 +188,74 @@ mod tests {
         GatewaySession {
             session_id: "mock-session".into(),
             sequence: 42,
-            resume_url: "ws://mock-gateway".into(),
+            resume_url: "wss://gateway.discord.gg".into(),
             updated_at_ms: 1000,
         }
+    }
+
+    #[test]
+    fn resume_url_policy_accepts_discord_secure_endpoints() {
+        for resume_url in [
+            "wss://discord.gg",
+            "wss://gateway.discord.gg/",
+            "wss://us-east.gateway.discord.gg/?v=10&encoding=json",
+            "wss://GATEWAY.DISCORD.GG:443/",
+        ] {
+            assert!(is_valid_resume_url(resume_url), "{resume_url}");
+        }
+    }
+
+    #[test]
+    fn resume_url_policy_discards_other_endpoints() {
+        for resume_url in [
+            "",
+            "not a URL",
+            "wss://",
+            "wss://[invalid",
+            "ws://gateway.discord.gg",
+            "https://gateway.discord.gg",
+            "wss:gateway.discord.gg",
+            "wss:///gateway.discord.gg",
+            "wss://discord.gg.example.com",
+            "wss://notdiscord.gg",
+            "wss://gateway.example.com/discord.gg",
+            "wss://127.0.0.1",
+            "wss://[::1]",
+            "wss://.discord.gg",
+            "wss://gateway.discord.gg.",
+            "wss://gateway.discord.gg:444",
+            "wss://gateway.discord.gg:0",
+            "wss://gateway.discord.gg:invalid",
+            "wss://user@gateway.discord.gg",
+            "wss://user:password@gateway.discord.gg",
+            "wss://@gateway.discord.gg",
+            "wss://gateway.discord.gg@example.com",
+            "wss://gateway.discord.gg\\@example.com",
+            "wss://%67ateway.discord.gg",
+            "wss://gateway。discord.gg",
+            " wss://gateway.discord.gg",
+            "wss://gateway.discord.gg\n",
+            "wss://gate\tway.discord.gg",
+            "wss://gateway.discord.gg/<",
+            "wss://gateway.discord.gg/>",
+        ] {
+            assert!(!is_valid_resume_url(resume_url), "{resume_url:?}");
+        }
+    }
+
+    #[test]
+    fn resume_url_policy_leaves_room_for_twilight_connection_suffix() {
+        let prefix = "wss://gateway.discord.gg/";
+        let max = (u16::MAX - 1) as usize - "/?v=10&encoding=json&compress=zlib-stream".len();
+        let mut resume_url = format!("{prefix}{}", "a".repeat(max - prefix.len()));
+        assert!(is_valid_resume_url(&resume_url));
+        for compression in ["", "&compress=zlib-stream", "&compress=zstd-stream"] {
+            assert!(format!("{resume_url}/?v=10&encoding=json{compression}")
+                .parse::<http::Uri>()
+                .is_ok());
+        }
+        resume_url.push('a');
+        assert!(!is_valid_resume_url(&resume_url));
     }
 
     #[test]

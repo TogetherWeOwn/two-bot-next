@@ -92,9 +92,9 @@ npm run test:smoke
 
 ## Passive status (read before claiming proof)
 
-- The proof workflow's target-lock step refuses before any Cloudflare call
-  until the synthetic fixture lands. The pinned caller is therefore the exact
-  future invocation, not a completed rollout.
+- An unconditional admission hold fails before the staging environment is entered.
+  The retained target-lock step also refuses before any Cloudflare call. The
+  pinned caller is a future invocation, not a completed rollout.
 - What runs today: `bin/smoke.mjs` against staging, plus its contract tests.
 - What remains: the isolated synthetic fixture, the success-mode sweep, the
   rollback-mode sweep, and only then any production caller discussion.

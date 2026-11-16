@@ -35,13 +35,22 @@ threshold or query, no rollback procedure of its own.
   executor records it in UTC (ISO-8601) in the watch header on the execution
   card, with the deployed commit, the new and previous Worker version IDs,
   and the named coverage for the whole watch.
-- The watch deadline is `T_0 + 48 h`. Checkpoints sit at +15 min, +1 h,
-  +6 h, +24 h, and +48 h. Each checkpoint records GO, EXTEND (with a new
-  deadline), or ROLLBACK on the execution card.
-- At +48 h the lead records sign-off or extends the watch on the execution
-  card. A failed watch keeps the execution card open and the legacy image,
-  configuration, and recovery points warm; nothing is retired at watch
-  close on the basis of this file.
+- The maximum initial watch deadline is `T_0 + 48 h`; it is not a mandatory
+  idle calendar. Checkpoints sit at +15 min, +1 h, +6 h, +24 h, and +48 h
+  while the watch remains open. Each due checkpoint records GO, EXTEND (with
+  a new deadline), or ROLLBACK on the execution card.
+- Evidence-complete closure may occur earlier: all approved receipts, actual
+  prescribed timer/workload coverage and independent B2 are complete, with
+  no unexplained gap and fences, watermarks, permissions, rollback proof and
+  a warm reverse-reconciliation manifest retained. Record the actual close
+  UTC; checkpoints after it are N/A with that reason, and no later
+  observation is invented.
+- At +48 h, incomplete evidence stays INCOMPLETE: the cutover lead, Release
+  Manager and data lead record hold/incident/rollback with owner, deadline
+  and next action. Any continuation is separately authorized and bounded;
+  there is no automatic extension or pass by timeout. A failed watch keeps
+  the execution card open and the legacy image, configuration, and recovery
+  points warm; nothing is retired at watch close on the basis of this file.
 - Shift changes never move a boundary: handover transfers responsibility
   inside the window, it does not reset `T_0` or the deadline.
 
@@ -75,7 +84,8 @@ every line. The incoming watcher replies with acceptance before the
 outgoing watcher stands down. No line may say "same as last time".
 
 - [ ] Current window position: `T_0`, now (UTC), next checkpoint and time
-  remaining to the `T_0 + 48 h` deadline.
+  remaining to the `T_0 + 48 h` maximum (or the actual close UTC, after
+  which later checkpoints are N/A).
 - [ ] Watch header location on the execution card (deployed commit,
   new/previous Worker version IDs, named coverage) and confirmation it
   is unchanged since the last checkpoint.
@@ -117,8 +127,11 @@ budgets; this path only says who acts.
    the lead declares rollback with UTC time and reason and works the
    rollback runbook in document order. Any proposed loss or
    irreversible recovery needs its separate authority; the lead cannot
-   waive the zero-loss gate. If the window stays held, record EXTEND
-   with the new deadline.
+   waive the zero-loss gate. If the window stays held, record the owner,
+   next action and bounded deadline. This is not an automatic extension:
+   at +48 h incomplete stays INCOMPLETE and the cutover lead, Release Manager
+   and data lead decide hold/incident/rollback and any separately bounded
+   continuation under §1. Normal monitoring continues after watch closure.
 
 A missed budget at any level is an incident, never permission to skip
 reconciliation.

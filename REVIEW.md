@@ -17,31 +17,34 @@ not a cosmetic one.
 
 Apply [the contribution policy](CONTRIBUTING.md#production-merge-evidence) when
 reviewing production merge readiness; this advisory guide grants no merge or
-deploy permission. Exact-head staging is the default. It is not required only
-when **all** artifact-identical conditions are verified:
+deploy permission. For two-web-next and two-bot-next, staging qualification is the
+automatic **post-merge, pre-production exact-main staging/e2e/soak gate** (owner
+decision 2026-11-06), enforced by the promotion guard. Staging accepts only
+main-ancestor SHAs. Unmerged-head staging and artifact-equality proofs are not
+substitute merge prerequisites; the earlier artifact-identical exception is
+superseded. Neither CI nor artifact equality replaces post-merge qualification
+or the pipeline's exact-SHA artifact and promotion evidence.
 
-- The actual diff is only tests (`test/`, `e2e/`, `*.test.*`, fixtures), docs
-  (`docs/`, `*.md`), or CI unrelated to build/deploy/release/promotion. Inspect
-  content, not labels. Exclude deploy/release workflows, Wrangler/Worker config,
-  Dockerfiles, migrations, package manifests and lockfiles; any runtime,
-  dependency or deployment change disqualifies the PR.
-- Complete production artifacts for the exact PR head and current `main` are
-  byte-identical. The confirmation card records both full head SHAs and both
-  bundle/image hashes for every deployed component, covering the container image,
-  Worker bundle, deployed assets and image metadata. Source-tree equality, a file
-  label, PR title or a partial output is not proof.
-- Required CI and Devin Review pass on that exact PR head, with findings fixed
-  or answered with evidence.
+Automatic qualification starts on runtime-input pushes to `main`;
+`deploy-staging.yml` ignores docs-only merges. Before promoting an otherwise
+unqualified exact main SHA (including a docs-only squash SHA), an authorized
+staging dispatch must qualify it through the same gate. Use the existing
+[dispatch/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
+and retain its exact-SHA receipts; this is not pre-merge staging or permission
+to dispatch through a hold.
 
-The Release Manager must record the verified classification and paired hashes in
-a new exact-head, per-PR confirmation. Missing proof, a mismatch or a non-qualifying
-diff keeps the full exact-head staging requirement. Preserve every required
-check, review gate, incident/freeze/hold safeguard, identity/capability hold,
-SHA-pinned squash merge and release-log requirement; no red deterministic gate
-is waived. A new head needs a fresh confirmation; a changed comparison `main`
-needs revalidated artifact evidence. Historical rejections are not retroactive
-approvals: submit qualifying candidates afresh with hashes. No pipeline skip,
-no-op implementation or production action is authorized by this rule.
+Before merge, verify required GitHub Actions checks and Devin Review on the
+exact PR head, all applicable specialist and native review, and finding
+dispositions. Require fresh per-PR exact-head Release Manager acceptance with
+the migration ledger entry (or `no migration`) and rollback target. Preserve
+every incident/freeze/hold safeguard, identity/capability hold and red staging
+drill or other deterministic gate. A new head needs fresh review/check evidence
+and a new confirmation. Historical rejections are not retroactive approvals;
+their remaining conditions must be met before resubmission. The final-stage
+reviewer performs the SHA-pinned squash merge before final approval and records
+the squash SHA and decision in the release log; the author merges only without
+a review stage. This policy claims no staging pass or hold lift and authorizes
+no pipeline skip, no-op implementation, deployment or other production action.
 
 ## What merits a finding
 
@@ -171,6 +174,18 @@ A missing test alone is not a runtime bug. These are blocking findings:
 
 ## This repository: where defects hide
 
+- **CI and deploy wiring** (`.github/workflows/deploy-staging.yml`,
+  `deploy-production.yml`, `production-migrate.yml`, `supply-chain.yml`): when a
+  PR adds or tightens a CI, deploy, or gate check, or edits a workflow, trace each
+  new input, env, and output to its supplying job and verify `needs:` ordering.
+  Judge merge-commit and post-merge deploy paths, not only PR-head checks; compare
+  migration, history, and allowlist gates with current `main`, preserving gates
+  intentionally defined against the fork point or base-branch policy. Verify
+  GitHub API assumptions with documentation or a read-only reproduction: do not
+  assume REST `pulls/N` `base.sha` stays fixed until a PR event. For publish or
+  artifact jobs, verify keys, tokens, and secrets cannot reach uploaded artifacts
+  or public output. Report a violation as Severe only with the exact job/line
+  and failing path, subject to the existing severity and security-disclosure rules.
 - **Gateway lifecycle** (`crates/bot/src/gateway*.rs`, `audit_gateway.rs`,
   `automod_gateway.rs`): session persistence and resume, duplicate-event
   deduplication keys, poison-event handling, and backoff that cannot spin or
@@ -208,6 +223,12 @@ A missing test alone is not a runtime bug. These are blocking findings:
 - **The `wrangler/` Worker wrapper** is TypeScript with its own gates; apply
   its conventions there, not Rust ones.
 
+## Dependency-bump PRs
+- For Dependabot/Renovate PRs, generated-body omissions alone are not code defects. Cite the applicable repository or adoption requirement when reporting missing Verification/Attestation evidence; do not assume a bot-wide exemption.
+- The adopting agent must supply real Verification, truthful Attestation and Model Used, preserving bot authorship and provenance. Set the attestation `risk_tier` to the applicable T0/T1/T2 template tier (including the T0 floor); dependency changes retain separate Sensitive Security → QA review routing. Missing required adoption evidence remains a review/gate finding even if the checker returns early; never attest to unperformed work.
+- T0 attestation remains mandatory: PR-standards enforces it before the Dependabot/Renovate early return. That return does not waive adopter evidence or review requirements.
+- For a version bump, compare the changelog with actual repository call sites. Request a new behavior-regression test only for a named affected call site and a concrete adverse behavior change; existing mandatory testing, security and regression-evidence obligations remain unchanged. Report concrete install, build, output and other regression defects too.
+- Read the repository's actual `.github/dependabot.yml`: a deliberately excluded lockfile is not a missed update. Do not infer exclusions from another repository or assume all standalone lockfiles are excluded. Cargo updates include `/fuzz`.
 ## Skip
 
 Style, formatting, naming, and lint findings `cargo fmt`, clippy, or ast-grep

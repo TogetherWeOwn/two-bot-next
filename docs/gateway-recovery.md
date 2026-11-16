@@ -7,11 +7,11 @@ The single-guild, single-shard runner requires `DATABASE_URL` and `GUILD_ID` whe
 Migration `0320_gateway_sessions.sql` is embedded in the existing `crates/cutover/migrations` runner (the S6 migration location). `gateway_sessions` is keyed by `guild_id, shard_id`; `session_id`, `seq`, `resume_url`, and `updated_at` describe the last **committed** dispatch.
 
 1. Boot loads the checkpoint and restores only the funnel's message milestones and first-voice marker from the existing `events` table.
-2. A checkpoint at most 15 minutes old is offered to Twilight with both `ConfigBuilder::session` and `resume_url`. The 15-minute limit is a conservative local policy, not a Discord session lifetime guarantee. Expired, future-dated, or incomplete state is removed before IDENTIFY.
+2. A checkpoint at most 15 minutes old is offered to Twilight with both `ConfigBuilder::session` and `resume_url`. The 15-minute limit is a conservative local policy, not a Discord session lifetime guarantee. Expired, future-dated, incomplete, or inadmissible endpoint state is removed before IDENTIFY. Default admission retains only validated secure Discord endpoints. Only an independently checked literal-loopback bootstrap override admits literal-loopback saved endpoints; saved data cannot enable that mode.
 3. The existing `Pipeline` handles each dispatch using `GatewayFunnelBuffer`, which stages its funnel rows and activity updates. The existing cutover members projection is reused. One sqlx transaction commits the rows, projection, activity and sequence. The core's legacy idempotency keys, including voice-channel suffixes, arbitrate row insertion.
 4. Dispatches at or below the committed sequence in the same session are ignored **before** entering the pipeline. A new session can reset its sequence. Raw packet access lets unrecognized dispatch types advance a no-op checkpoint without losing ordering.
 5. Opcode 9 with `d: false` clears durable state; Twilight reconnects and IDENTIFYs. With `d: true`, the checkpoint remains available for a RESUME retry. Gateway close codes 4007 (invalid sequence) and 4009 (expired session) also clear the checkpoint and reconstruct a fresh shard for IDENTIFY: Twilight 0.17.1 does not clear its session for gateway-initiated closes. READY and RESUMED both mark readiness only after the dispatch commits.
-6. If the saved endpoint fails, Twilight clears its URL but may successfully RESUME at the bootstrap endpoint. Since RESUMED carries no new URL, checkpointing retains the last committed READY URL only when the active session ID still matches. A new session must supply its own READY URL.
+6. If the saved endpoint fails, Twilight clears its URL but may successfully RESUME at the bootstrap endpoint. Since RESUMED carries no new URL, checkpointing retains the last committed READY URL only when the active session ID still matches. A new session must supply its own READY URL. Builders and the shared transactional writer apply the same explicit admission context. Invalid received or fallback URLs persist as an empty unusable sentinel without changing session, sequence, timestamp, effects, job identity or duplicate handling.
 7. While the shard loop awaits any checkpoint read, clear or dispatch transaction, readiness is Starting (HTTP 503), not Connected. A **total** deadline includes pool acquisition, locks, every query and COMMIT: at most 5 seconds, reduced to one quarter of the latest HELLO heartbeat interval. Twilight heartbeats require shard polling, so SQL cannot remain pending across multiple heartbeat intervals. Timeout cancels the operation and terminates the runner for Container restart, rather than continuing with mutated in-memory pipeline state. A COMMIT acknowledgement timeout may have an unknown outcome; restart reads durable state, whose transaction still couples effects and sequence atomically. No promise is made that a timed-out COMMIT did not reach Postgres.
 8. Parse, compression or database errors stop the runner rather than advancing past uncommitted effects. The entrypoint supervises the essential gateway task: any termination (including initialization failure, fatal stream end or panic) cancels HTTP and exits nonzero, allowing the Container supervisor to restart it. It cannot remain a health-200 zombie. After database recovery, a new process reconstructs the pipeline and shard from committed storage. No in-process credential retry/substitution is attempted. Twilight retains ownership of recoverable network reconnect attempts and heartbeats.
 
@@ -159,32 +159,30 @@ choice from its timer effect:
 - `reconnect_delay(policy, attempt)` is the separate, bounded exponential
   schedule for the test-only supervised runner, not the live receive loop.
 
-Before changing this boundary, run the pure `gateway_backoff::spread_tests`
-unit tests and the existing `reconnect_spread_runtime_acceptance` and
-`reconnect_adoption_guard` integration targets through the bounded cache.
-Together they check seeded draws and extreme attempts, the actual awaited
-500 ms–1 s timer, and receive-loop adoption. Keep exact-head CI and independent
-review as gates; this seam does not enable broader automation or retry authority.
+Changes to this boundary need exact-head GitHub Actions coverage from the pure
+`gateway_backoff::spread_tests` unit tests and the existing
+`reconnect_spread_runtime_acceptance` and `reconnect_adoption_guard` integration
+targets, not a routine local bounded-cache run. Together they check seeded draws
+and extreme attempts, the actual awaited 500 ms–1 s timer, and receive-loop
+adoption. Local execution remains limited to one failing test or crate under the
+[focused reproduction policy](../CONTRIBUTING.md#focused-failure-reproduction-only).
+Keep exact-head CI and independent review as gates; this seam does not enable
+broader automation or retry authority.
 
 ## Verification (test containers only)
 
-On the persistent controller, compiling commands use the bounded cache wrapper
-from the isolated worktree; a refused lease is not permission to bypass it.
-Ephemeral CI retains its existing direct Cargo commands.
+The full suite and CI gates are GitHub Actions-owned. Push the PR branch and
+record exact-head run/job links; keep the PR a draft while incomplete. The
+commands below describe hosted-CI coverage, not a local checklist or controller
+fallback. Local execution is only for one failing test or crate under the
+[focused reproduction policy](../CONTRIBUTING.md#focused-failure-reproduction-only),
+including guarded Boat for heavy focused work and no heavy raw-host fallback.
+A refused cache lease is never permission to bypass admission.
 
 ```sh
-cargo fmt --all -- --check
-python3 scripts/cargo_cache.py run -- clippy --workspace --all-targets --locked -- -D warnings
-python3 scripts/cargo_cache.py run -- test --workspace --locked
-TWO_GATEWAY_TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/agent_test \
-  python3 scripts/cargo_cache.py run -- test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
-# Ephemeral CI only — on the persistent controller use the wrapper form above.
+# Ephemeral hosted CI only, not a shared-host CI mirror.
 TWO_GATEWAY_TEST_DATABASE_URL=postgresql://agent_test@agent-testdb:5432/agent_test \
   cargo test -p two-bot --locked gateway_tests -- --ignored --test-threads=1
-# Persistent controller: bounded wrapper.
-TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
-  python3 scripts/cargo_cache.py run -- test -p two-bot-cutover --locked --test gateway_force_identify_cli
-# Ephemeral CI only — on the persistent controller use the wrapper form above.
 TWO_TEST_DATABASE_URL=postgres://agent_test:@agent-testdb:5432/postgres \
   cargo test -p two-bot-cutover --locked --test gateway_force_identify_cli
 ```

@@ -57,6 +57,8 @@ JOB_INVENTORY = {
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep-plan",
                     "sweep-partition", "sweep-guarded", "sweep-docs", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
+    # One-off read-only reference writer for the fixed source snapshot.
+    "configuration-reference.yml": {"configuration-reference"},
     "release.yml": {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"},
     # Daily digest release (docs/releases.md): at most one vYYYY.MDD.P tag a day,
     # plus the missing-digest alert; pinned shape below.
@@ -84,7 +86,7 @@ JOB_INVENTORY = {
     "staging-ownership-status.yml": {"status"},
     # Manual gradual-promote proof caller (passive until the synthetic
     # fixture lands); pinned shape below.
-    "gradual-promote-proof.yml": {"proof"},
+    "gradual-promote-proof.yml": {"admission-hold", "proof"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
@@ -124,9 +126,12 @@ JOB_INVENTORY = {
     # Shared nextest lane, called by check.yml; org-level home is
     # TogetherWeOwn/.github with a pinned SHA like test-guard.
     "reusable-rust-nextest.yml": {"nextest"},
-    # Advisory PR-size labels (org reusable, advisory only, never required):
-    # thin caller to the central labeller + weekly tally.
-    "pr-size.yml": {"pr-size", "pr-size-weekly"},
+    # PR-size labels + required size gate (org reusable): thin caller to
+    # the central labeller, the required gate and the weekly tally. The
+    # advisory `pr-size` job is never required; `pr-size-gate` fails PRs
+    # too large for the automated reviewer and is added to the ruleset
+    # only after it reports on the default branch.
+    "pr-size.yml": {"pr-size", "pr-size-gate", "pr-size-weekly"},
     # Weekly DORA delivery metrics (docs/dora-metrics.md): the read-only
     # compute job reads 30 days of production Deployments; the main-only
     # publish job commits one JSON file plus a markdown summary to
@@ -150,15 +155,27 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    # caller to the shared nextest lane (local path until
                    # the central move).
                    ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
-                   # Advisory PR-size labels: thin caller to the central
-                   # reusable, pinned SHA (repin both refs together).
-                   ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2",
-                   ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@82c5b367c6e3e8032666029dc22d206fff39c3f2"}
-# Main's runner routing (#265, 2026-10-02): the repo is public and the org's
-# self-hosted runner group refuses public repos, so every job routes through
-# one expression — public repo -> GitHub-hosted, private -> CI_OVERFLOW_* switch
-# for this named job, then the self-hosted pool. Mirrors scripts/test-runner-routing.py.
-ROUTED_RUNNER = (
+                   # PR-size labels + required size gate: thin caller to
+                   # the central reusables, pinned SHA (repin all three
+                   # refs together).
+                   ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
+                   ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
+                   ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964"}
+# PR-size activation (pinned below): the labeller and the required gate run
+# on PR events, plus a manual dispatch carrying an explicit PR number; the
+# weekly tally runs on schedule or a blank manual dispatch. Pinning these
+# conditions prevents the gate from being silently disabled while its
+# inventory entry and reusable ref stay intact.
+PR_SIZE_JOB_IF = "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''"
+PR_SIZE_WEEKLY_IF = "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')"
+PR_SIZE_IF_CONDITIONS = {("pr-size.yml", "pr-size"): PR_SIZE_JOB_IF,
+                         ("pr-size.yml", "pr-size-gate"): PR_SIZE_JOB_IF,
+                         ("pr-size.yml", "pr-size-weekly"): PR_SIZE_WEEKLY_IF}
+# Every ordinary job in this public repository selects standard free hosted
+# Ubuntu directly. A private conversion needs fresh runner/cost qualification.
+PUBLIC_RUNNER = "ubuntu-latest"
+# Negative fixture only: even a public-first route retains dormant source paths.
+LEGACY_ROUTED_RUNNER = (
     "${{{{ fromJSON((!github.event.repository.private && '[\"ubuntu-latest\"]') || "
     "(contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), '{job}') && "
     "contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && "
@@ -214,8 +231,8 @@ def load_workflows():
 
 
 def runner_allowed(job_id, runs_on):
-    # The routing expression must name this job, so one job's switch cannot move another.
-    return runs_on == ROUTED_RUNNER.format(job=job_id)
+    # Job ids remain at call sites for per-job diagnostics; no indirect selector is allowed.
+    return runs_on == PUBLIC_RUNNER
 
 
 def shell_logical_lines(script):
@@ -1053,7 +1070,7 @@ def staging_full_window_errors(workflow, name="deploy-staging.yml"):
     if "continue-on-error" in release or any("continue-on-error" in step for step in release.get("steps") or []):
         errors.append(f"{name}:staging-use-release: a failed stop must fail the run")
     if not runner_allowed("staging-use-release", release.get("runs-on")):
-        errors.append(f"{name}:staging-use-release: must use the routed runner expression for job "
+        errors.append(f"{name}:staging-use-release: must use the explicit ubuntu-latest runner for job "
                       "'staging-use-release'")
     commands = [str(step.get("run") or "") for step in release.get("steps") or []]
     if not any(command in ("node wrangler/scripts/staging-use-pipeline.mjs finish",
@@ -1088,7 +1105,7 @@ def soak_hold_errors(workflow, name="deploy-staging.yml"):
     if job.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:soak-hold: must keep contents:read only")
     if not runner_allowed("soak-hold", job.get("runs-on")):
-        errors.append(f"{name}:soak-hold: must use the routed runner expression for job 'soak-hold'")
+        errors.append(f"{name}:soak-hold: must use the explicit ubuntu-latest runner for job 'soak-hold'")
     if job.get("timeout-minutes") != "5":
         errors.append(f"{name}:soak-hold: timeout must stay 5 minutes")
     for key in ("if", "needs", "uses", "environment", "services", "container",
@@ -1182,7 +1199,7 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
     if job.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:user-flow-synthetic: must keep contents:read only")
     if not runner_allowed("user-flow-synthetic", job.get("runs-on")):
-        errors.append(f"{name}:user-flow-synthetic: must use the routed runner expression "
+        errors.append(f"{name}:user-flow-synthetic: must use the explicit ubuntu-latest runner "
                       "for job 'user-flow-synthetic'")
     for key in ("if", "uses", "services", "container",
                 "continue-on-error", "strategy", "concurrency"):
@@ -1241,7 +1258,7 @@ def pinned_history_guard_errors(workflow, name="deploy-staging.yml"):
     if job.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:pinned-history-guard: must keep contents:read only")
     if not runner_allowed("pinned-history-guard", job.get("runs-on")):
-        errors.append(f"{name}:pinned-history-guard: must use the routed runner expression "
+        errors.append(f"{name}:pinned-history-guard: must use the explicit ubuntu-latest runner "
                       "for job 'pinned-history-guard'")
     if job.get("timeout-minutes") != "5":
         errors.append(f"{name}:pinned-history-guard: timeout must stay 5 minutes")
@@ -1441,7 +1458,7 @@ def staging_claim_errors(claim, name="staging-migrate.yml",
     if claim.get("needs") != "plan" or claim.get("if") != "github.ref == 'refs/heads/main' && inputs.mode == 'apply'":
         errors.append(f"{prefix} must wait for a green plan, main and mode=apply")
     if not runner_allowed("claim", claim.get("runs-on")):
-        errors.append(f"{prefix} must use the claim routed runner")
+        errors.append(f"{prefix} must use the claim public-hosted runner")
     steps = claim.get("steps", [])
     if len(steps) != 4 or any("if" in s or "continue-on-error" in s for s in steps):
         errors.append(f"{prefix} must execute four fail-closed transport steps")
@@ -1518,7 +1535,7 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
     (plan always runs through the no-reviewer plan environment, unprotected
     claim transports the apply request, apply runs only for mode=apply after a
     green plan and claim through the reviewed apply environment), each job with
-    its own routed runner and pipefail Run step. No push/pull_request/schedule
+    its own public-hosted runner and pipefail Run step. No push/pull_request/schedule
     trigger, no wrangler/probe markers. The caller supplies the workflow file
     name, environment names, secret names, host/database/branch input names,
     artifact prefix, runner target/host/database/branch flags and the other
@@ -1616,7 +1633,7 @@ def migrate_errors(workflow, *, name, plan_env, apply_env, plan_secret,
         errors.append(f"{name}:apply: must wait for a green plan and pre-approval claim")
     for job_id, job in (("plan", plan), ("apply", apply)):
         if not runner_allowed(job_id, job.get("runs-on")):
-            errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
+            errors.append(f"{name}:{job_id}: must use the explicit ubuntu-latest runner for job '{job_id}'")
         text = str(job).lower()
         if job.get("uses") is not None or any(marker in text for marker in DEPLOY_MARKERS):
             errors.append(f"{name}:{job_id}: deployment/probe alternative outside approved deploy workflows")
@@ -1776,6 +1793,12 @@ ROLLBACK_DRILL_ENV = {
 }
 
 
+ADMISSION_REFUSAL = {
+    "name": "Refuse staging use without enforced admission",
+    "run": 'echo "::error::enforced exact-SHA admission is unavailable"\nexit 1\n',
+}
+
+
 def rollback_proof_job_errors(job, mode):
     """Pin the dispatcher/observer to reviewed tooling and the smallest token."""
     errors = []
@@ -1795,12 +1818,16 @@ def rollback_proof_job_errors(job, mode):
             errors.append(f"rollback proof {mode}: must not set {key}")
     job_id = {"run": "proof", "watch": "rollback-proof-watch", "alert": "alert"}[mode]
     if not runner_allowed(job_id, job.get("runs-on")):
-        errors.append(f"rollback proof {mode}: must use the routed public-hosted runner")
+        errors.append(f"rollback proof {mode}: must use the explicit public-hosted runner")
     if str(job.get("timeout-minutes")) != ("80" if mode == "run" else "5"):
         errors.append(f"rollback proof {mode}: bounded job timeout changed")
     steps = job.get("steps") or []
-    if len(steps) != (3 if mode == "run" else 2):
+    if len(steps) != (4 if mode == "run" else 2):
         return errors + [f"rollback proof {mode}: unexpected steps"]
+    if mode == "run":
+        if steps[0] != ADMISSION_REFUSAL:
+            errors.append("rollback proof run: first step must unconditionally refuse admission")
+        steps = steps[1:]
     if any("if" in step or "continue-on-error" in step for step in steps):
         errors.append(f"rollback proof {mode}: steps must run and fail closed")
     checkout, command = steps[:2]
@@ -1862,7 +1889,7 @@ def staging_rollback_drill_errors(workflow):
                          "&& inputs.target_version != ''"):
         errors.append(f"{name}:drill: must run only from main with a manual target")
     if not runner_allowed("drill", job.get("runs-on")):
-        errors.append(f"{name}:drill: must use the routed runner expression for job 'drill'")
+        errors.append(f"{name}:drill: must use the explicit ubuntu-latest runner for job 'drill'")
     for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
         if key in job:
             errors.append(f"{name}:drill: must not set {key} (bindings stay on the single Run step)")
@@ -1969,7 +1996,7 @@ def staging_container_drill_errors(workflow):
     if job.get("if") != "github.ref == 'refs/heads/main'":
         errors.append(f"{name}:container-drill: must run only from main")
     if not runner_allowed("container-drill", job.get("runs-on")):
-        errors.append(f"{name}:container-drill: must use the routed runner expression for job 'container-drill'")
+        errors.append(f"{name}:container-drill: must use the explicit ubuntu-latest runner for job 'container-drill'")
     for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
         if key in job:
             errors.append(f"{name}:container-drill: must not set {key} (bindings stay on the single Run step)")
@@ -2039,7 +2066,7 @@ def staging_events_read_errors(workflow):
     prints variable values on the public run page). The read-only database
     login, the independently pinned staging host and the fixture member are
     environment secrets. One job runs only from main
-    through the `staging-events-read` environment, on the routed runner for job
+    through the `staging-events-read` environment, on the public-hosted runner for job
     `read`, with its own non-cancelling concurrency group and a 5 minute
     timeout. Exactly three unconditional steps: pinned checkout without
     persisted credentials, one Run step that passes the inputs through the
@@ -2083,7 +2110,7 @@ def staging_events_read_errors(workflow):
     if job.get("timeout-minutes") != "5":
         errors.append(f"{name}:read: timeout must stay 5 minutes")
     if not runner_allowed("read", job.get("runs-on")):
-        errors.append(f"{name}:read: must use the routed runner expression for job 'read'")
+        errors.append(f"{name}:read: must use the explicit ubuntu-latest runner for job 'read'")
     for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
         if key in job:
             errors.append(f"{name}:read: must not set {key} (bindings stay on the single Run step)")
@@ -2140,7 +2167,7 @@ def staging_privacy_verify_read_errors(workflow):
     read-only database login, the independently pinned staging host, the
     fixture member and the H pin are environment secrets. One job runs only
     from main through the `staging-privacy-verify-read` environment, on the
-    routed runner for job `read`, with its own non-cancelling concurrency
+    public-hosted runner for job `read`, with its own non-cancelling concurrency
     group and a 5 minute timeout. Exactly three unconditional steps: pinned
     checkout without persisted credentials, one Run step that passes the
     input through the environment (never an inline expression) to the
@@ -2182,7 +2209,7 @@ def staging_privacy_verify_read_errors(workflow):
     if job.get("timeout-minutes") != "5":
         errors.append(f"{name}:read: timeout must stay 5 minutes")
     if not runner_allowed("read", job.get("runs-on")):
-        errors.append(f"{name}:read: must use the routed runner expression for job 'read'")
+        errors.append(f"{name}:read: must use the explicit ubuntu-latest runner for job 'read'")
     for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
         if key in job:
             errors.append(f"{name}:read: must not set {key} (bindings stay on the single Run step)")
@@ -2234,7 +2261,7 @@ def staging_retention_census_errors(workflow):
 
     Dispatch-only with no inputs. One job runs only from main through the
     existing no-reviewer `staging-migrate-plan` environment (the plan
-    binding's login holds only two_bot_migrator_ro), on the routed runner
+    binding's login holds only two_bot_migrator_ro), on the public-hosted runner
     for job `census`, with its own non-cancelling concurrency group and a
     30 minute timeout covering the script's single ~900 s in-job sleep.
     Exactly two unconditional steps: pinned checkout without persisted
@@ -2271,7 +2298,7 @@ def staging_retention_census_errors(workflow):
     if job.get("timeout-minutes") != "30":
         errors.append(f"{name}:census: timeout must stay 30 minutes")
     if not runner_allowed("census", job.get("runs-on")):
-        errors.append(f"{name}:census: must use the routed runner expression for job 'census'")
+        errors.append(f"{name}:census: must use the explicit ubuntu-latest runner for job 'census'")
     for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
         if key in job:
             errors.append(f"{name}:census: must not set {key} (bindings stay on the single Run step)")
@@ -2289,8 +2316,8 @@ def staging_retention_census_errors(workflow):
         errors.append(f"{name}:census: must run exactly checkout and the census, unconditionally")
         return errors
     checkout, run = steps
-    # Scoped to the Run step: the routed runner expression names its own
-    # CI_OVERFLOW_* vars, which must not count as census pins.
+    # Scoped to the Run step: the explicit ubuntu-latest runner names its own
+    # Runner selectors must not count as census pins.
     if set(re.findall(r"vars\.([a-z0-9_]+)", str(run).lower())) != {"two_bot_staging_host",
                                                                    "two_bot_staging_database",
                                                                    "two_bot_staging_branch_id"}:
@@ -2315,7 +2342,7 @@ def staging_fixture_census_errors(workflow):
 
     Dispatch-only with no inputs. One job runs only from main through the
     existing no-reviewer `staging-migrate-plan` environment (the plan
-    binding's login holds only two_bot_migrator_ro), on the routed runner
+    binding's login holds only two_bot_migrator_ro), on the public-hosted runner
     for job `fixture-census`, with its own non-cancelling concurrency group
     and a 10 minute timeout (no in-job sleep: one observation instant).
     Exactly two unconditional steps: pinned checkout without persisted
@@ -2353,7 +2380,7 @@ def staging_fixture_census_errors(workflow):
     if job.get("timeout-minutes") != "10":
         errors.append(f"{name}:fixture-census: timeout must stay 10 minutes")
     if not runner_allowed("fixture-census", job.get("runs-on")):
-        errors.append(f"{name}:fixture-census: must use the routed runner expression for job 'fixture-census'")
+        errors.append(f"{name}:fixture-census: must use the explicit ubuntu-latest runner for job 'fixture-census'")
     for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
         if key in job:
             errors.append(f"{name}:fixture-census: must not set {key} (bindings stay on the single Run step)")
@@ -2371,8 +2398,8 @@ def staging_fixture_census_errors(workflow):
         errors.append(f"{name}:fixture-census: must run exactly checkout and the census, unconditionally")
         return errors
     checkout, run = steps
-    # Scoped to the Run step: the routed runner expression names its own
-    # CI_OVERFLOW_* vars, which must not count as census pins.
+    # Scoped to the Run step: the explicit ubuntu-latest runner names its own
+    # Runner selectors must not count as census pins.
     if set(re.findall(r"vars\.([a-z0-9_]+)", str(run).lower())) != {"two_bot_staging_host",
                                                                    "two_bot_staging_database",
                                                                    "two_bot_staging_branch_id"}:
@@ -2432,7 +2459,7 @@ def staging_mcp_proveout_errors(workflow):
     if job.get("timeout-minutes") != "10":
         errors.append(f"{name}:proveout: timeout must stay 10 minutes")
     if not runner_allowed("proveout", job.get("runs-on")):
-        errors.append(f"{name}:proveout: must use the routed runner expression for job 'proveout'")
+        errors.append(f"{name}:proveout: must use the explicit ubuntu-latest runner for job 'proveout'")
     for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy", "concurrency"):
         if key in job:
             errors.append(f"{name}:proveout: must not set {key} (credentials stay step-local; no nested lock)")
@@ -2482,7 +2509,7 @@ def staging_ownership_status_errors(workflow):
     """Manual staging-only read-only ownership status read.
 
     Dispatch-only with no inputs. One job runs only from main through the
-    `staging` environment, on the routed runner for job `status`, with its
+    `staging` environment, on the public-hosted runner for job `status`, with its
     own non-cancelling concurrency group and a 10 minute timeout. Exactly
     four unconditional steps: pinned checkout without persisted credentials,
     pinned setup-node, the ownership-control preflight, and one Run step that
@@ -2521,7 +2548,7 @@ def staging_ownership_status_errors(workflow):
     if job.get("defaults") != {"run": {"working-directory": "wrangler"}}:
         errors.append(f"{name}:status: must run steps from the wrangler directory")
     if not runner_allowed("status", job.get("runs-on")):
-        errors.append(f"{name}:status: must use the routed runner expression for job 'status'")
+        errors.append(f"{name}:status: must use the explicit ubuntu-latest runner for job 'status'")
     for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
         if key in job:
             errors.append(f"{name}:status: must not set {key} (bindings stay on the Run steps)")
@@ -2587,7 +2614,7 @@ def gradual_promote_proof_errors(workflow):
     Dispatch-only with exactly the mode, confirm_worker, candidate_tag and
     domain inputs. One job runs only from main through the `staging`
     environment (staging credentials only; production secret names never
-    appear), on the routed runner for job `proof`, with its own
+    appear), on the public-hosted runner for job `proof`, with its own
     non-cancelling concurrency group and a 30 minute timeout. Exactly five
     steps: pinned checkout, pinned setup-node, the target-lock step (which
     refuses before any Cloudflare call until the synthetic fixture lands),
@@ -2623,10 +2650,17 @@ def gradual_promote_proof_errors(workflow):
     if workflow.get("concurrency") != {"group": "gradual-promote-proof", "cancel-in-progress": "false"}:
         errors.append(f"{name}: must use its own gradual-promote-proof group without cancelling")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"proof"}:
-        errors.append(f"{name}: jobs must be exactly proof")
+    if set(jobs) != {"admission-hold", "proof"}:
+        errors.append(f"{name}: jobs must be exactly admission-hold and proof")
         return errors
+    if jobs["admission-hold"] != {
+        "permissions": {}, "runs-on": "ubuntu-latest", "timeout-minutes": "2",
+        "steps": [ADMISSION_REFUSAL],
+    }:
+        errors.append(f"{name}: admission hold must unconditionally fail without credentials")
     job = jobs["proof"]
+    if job.get("needs") != "admission-hold":
+        errors.append(f"{name}: proof must depend on the admission hold")
     if job.get("name") != "gradual-promote-proof":
         errors.append(f"{name}:proof: job name must stay gradual-promote-proof")
     if job.get("if") != "github.ref == 'refs/heads/main'":
@@ -2638,8 +2672,8 @@ def gradual_promote_proof_errors(workflow):
     if job.get("timeout-minutes") != "30":
         errors.append(f"{name}:proof: timeout must stay 30 minutes")
     if not runner_allowed("proof", job.get("runs-on")):
-        errors.append(f"{name}:proof: must use the routed runner expression for job 'proof'")
-    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+        errors.append(f"{name}:proof: must use the explicit ubuntu-latest runner for job 'proof'")
+    for key in ("env", "uses", "services", "container", "continue-on-error", "strategy"):
         if key in job:
             errors.append(f"{name}:proof: must not set {key}")
     steps = job.get("steps") or []
@@ -2801,7 +2835,7 @@ def release_errors(workflow):
     if verdict.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:verdict: must keep contents:read only")
     if not runner_allowed("verdict", verdict.get("runs-on")):
-        errors.append(f"{name}:verdict: must use the routed runner expression for job 'verdict'")
+        errors.append(f"{name}:verdict: must use the explicit ubuntu-latest runner for job 'verdict'")
     if verdict.get("timeout-minutes") != "5":
         errors.append(f"{name}:verdict: timeout must stay 5 minutes")
     for key in ("uses", "environment", "services", "container",
@@ -2893,7 +2927,7 @@ def daily_digest_errors(workflow):
     if digest.get("permissions") != {"contents": "write", "deployments": "read", "actions": "write"}:
         errors.append(f"{name}:digest: must tag the release, read Deployments and dispatch SBOM only")
     if not runner_allowed("digest", digest.get("runs-on")):
-        errors.append(f"{name}:digest: must use the routed runner expression for job 'digest'")
+        errors.append(f"{name}:digest: must use the explicit ubuntu-latest runner for job 'digest'")
     digest_text = str(digest)
     for required in ("PRODUCTION_WORKER_URL", "python3 scripts/digest_resolve.py",
                      "daily-digest.cjs", "gh workflow run release.yml --ref main -f release_tag="):
@@ -2928,7 +2962,7 @@ def daily_digest_errors(workflow):
     if "environment" in alert:
         errors.append(f"{name}:alert: the incident issue sink needs no environment")
     if not runner_allowed("alert", alert.get("runs-on")):
-        errors.append(f"{name}:alert: must use the routed runner expression for job 'alert'")
+        errors.append(f"{name}:alert: must use the explicit ubuntu-latest runner for job 'alert'")
     alert_text = str(alert)
     for required in ("${{ secrets.GITHUB_TOKEN }}", "scripts/digest_alert.py",
                      "needs.digest.outputs.live_sha", "needs.digest.outputs.prev_tag"):
@@ -3018,7 +3052,8 @@ def production_errors(workflow):
         for index, command, env in (
                 (2, "node wrangler/scripts/staging-use-pipeline.mjs begin", {**control,
                     "STAGING_USE_EXPECTED_SHA": "${{ needs.guard.outputs.sha }}", "STAGING_USE_MINUTES": "40"}),
-                (4, "node wrangler/scripts/staging-soak-window.mjs", {**retained, "AUTO": "${{ needs.guard.outputs.auto }}"}),
+                (4, "node wrangler/scripts/staging-soak-window.mjs", {**retained, "FULL_SOAK":
+                    "${{ needs.guard.outputs.auto == 'true' || (github.event_name == 'workflow_dispatch' && needs.guard.outputs.takeover == 'true' && needs.guard.outputs.allow_unstaged != 'true') }}"}),
                 (6, "node wrangler/scripts/staging-use-pipeline.mjs consume", retained),
                 (7, "node wrangler/scripts/staging-use-pipeline.mjs finish", {**control,
                     "STAGING_USE_EXPIRES_AT": "${{ steps.staging-use-begin.outputs.expires_at }}"})):
@@ -3084,8 +3119,8 @@ def production_errors(workflow):
     if (recheck.get("outputs") or {}).get("skip") != "${{ steps.recheck.outputs.skip }}":
         errors.append(f"{name}:recheck: must publish the skip output for production")
     recheck_text = str(recheck)
-    for required in ("vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL", "needs.guard.outputs.sha",
-                     'skip = "live"', 'skip = "older-than-live"',
+    for required in ("vars.PRODUCTION_AUTO_PROMOTE_HOLD_UNTIL", "vars.PRODUCTION_AUTO_PROMOTE_DISABLED", "needs.guard.outputs.sha",
+                     'skip = "auto-promote-disabled"', 'skip = "live"', 'skip = "older-than-live"',
                      'skip = "operator-dispatch-active"',
                      'skip = "dispatch-check-unreadable"',
                      "compare/{target}...{live}",
@@ -3125,6 +3160,16 @@ def production_errors(workflow):
     # run on that SHA that concluded `success` (a `skipped` run does not
     # satisfy the guard).
     script = "\n".join(step.get("run", "") for step in guard.get("steps", []))
+    guard_env = (guard.get("steps") or [{}])[0].get("env", {})
+    # The dedicated non-expiring automatic-new-build disable: exactly
+    # "true" skips automatic runs green; manual dispatch never reaches
+    # the auto branch, so recovery is preserved.
+    if guard_env.get("AUTO_DISABLED") != "${{ vars.PRODUCTION_AUTO_PROMOTE_DISABLED }}":
+        errors.append(f"{name}:guard: must receive the dedicated auto-promote disable as an env")
+    if 'skip = "auto-promote-disabled"' not in script:
+        errors.append(f"{name}:guard: missing dedicated auto-promote disable skip")
+    if 'os.environ.get("AUTO_DISABLED", "") == "true"' not in script:
+        errors.append(f"{name}:guard: missing exact-true auto-promote disable check")
     for required in ("actions/workflows/deploy-staging.yml/runs", 'status="success"',
                      'refuse(f"deploy-staging has no successful run on {sha}")',
                      'rule.get("type") == "required_reviewers"',
@@ -3133,7 +3178,6 @@ def production_errors(workflow):
             errors.append(f"{name}:guard: missing check {required}")
     # Fault switches are absent from the entire production workflow, not
     # forwarded to a guard that promises to refuse them.
-    guard_env = (guard.get("steps") or [{}])[0].get("env", {})
     # A deploy always takes over (10-20 13:31Z: a manual deploy without
     # takeover left production fenced); only the explicit cutover_hold
     # input keeps the fence held.
@@ -3261,7 +3305,7 @@ def staging_active_errors(workflow):
 
     The job must carry no `if:` at all — unconditional on both the push/main
     and workflow_dispatch triggers — while keeping the `staging` environment
-    scope, the routed runner for job 'deploy', the fenced `release_fence`
+    scope, the public-hosted runner for job 'deploy', the fenced `release_fence`
     dispatch shape, default-deny top-level permissions and the least-privilege
     per-job grant. A job-level condition would silently skip deploys on some
     SHAs and leave the production guard refusing those SHAs; step-level
@@ -3275,7 +3319,7 @@ def staging_active_errors(workflow):
     if job.get("environment") != "staging":
         errors.append(f"{name}:deploy: must stay scoped to the staging environment")
     if not runner_allowed("deploy", job.get("runs-on")):
-        errors.append(f"{name}:deploy: must use the routed runner expression for job 'deploy'")
+        errors.append(f"{name}:deploy: must use the explicit ubuntu-latest runner for job 'deploy'")
     for step in job.get("steps", []):
         if step.get("if") == STATIC_FALSE:
             errors.append(f"{name}:deploy: a statically-disabled step would report success without deploying")
@@ -3285,8 +3329,8 @@ def staging_active_errors(workflow):
 
 # Pinned build image shared with the migration plan jobs (same runner
 # binary, same toolchain). A digest bump must move all consumers together.
-SCHEMA_GATE_IMAGE = ("rust:1.99-trixie@sha256:"
-                     "09027f873d45b8ecd1dc86f1fa13b7a62b875c961f017a0e331267b350430137")
+SCHEMA_GATE_IMAGE = ("rust:1.100-trixie@sha256:"
+                     "e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31")
 
 
 def schema_gate_errors(workflow, name="deploy-staging.yml"):
@@ -3311,7 +3355,7 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
     if gate.get("needs") != "soak-hold":
         errors.append(f"{name}:schema-gate: must wait only for the soak hold (it is the wait after the hold)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
-        errors.append(f"{name}:schema-gate: must use the routed runner expression for job 'schema-gate'")
+        errors.append(f"{name}:schema-gate: must use the explicit ubuntu-latest runner for job 'schema-gate'")
     if gate.get("timeout-minutes") != "30":
         errors.append(f"{name}:schema-gate: timeout must stay 30 minutes")
     if (gate.get("container") or {}).get("image") != SCHEMA_GATE_IMAGE:
@@ -3384,7 +3428,7 @@ def production_schema_gate_errors(workflow, name="deploy-production.yml"):
     if gate.get("needs") != "guard":
         errors.append(f"{name}:schema-gate: must wait for the guard (it gates the guarded SHA)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
-        errors.append(f"{name}:schema-gate: must use the routed runner expression for job 'schema-gate'")
+        errors.append(f"{name}:schema-gate: must use the explicit ubuntu-latest runner for job 'schema-gate'")
     if gate.get("timeout-minutes") != "30":
         errors.append(f"{name}:schema-gate: timeout must stay 30 minutes")
     if (gate.get("container") or {}).get("image") != SCHEMA_GATE_IMAGE:
@@ -3472,7 +3516,7 @@ def roles_gate_errors(workflow, name="deploy-staging.yml"):
     if gate.get("needs") != "soak-hold":
         errors.append(f"{name}:roles-gate: must wait only for the soak hold (it is the wait after the hold)")
     if not runner_allowed("roles-gate", gate.get("runs-on")):
-        errors.append(f"{name}:roles-gate: must use the routed runner expression for job 'roles-gate'")
+        errors.append(f"{name}:roles-gate: must use the explicit ubuntu-latest runner for job 'roles-gate'")
     if gate.get("timeout-minutes") != "30":
         errors.append(f"{name}:roles-gate: timeout must stay 30 minutes")
     if (gate.get("container") or {}).get("image") != SCHEMA_GATE_IMAGE:
@@ -3551,7 +3595,7 @@ def production_roles_gate_errors(workflow, name="deploy-production.yml"):
     if gate.get("needs") != "guard":
         errors.append(f"{name}:roles-gate: must wait for the guard (it gates the guarded SHA)")
     if not runner_allowed("roles-gate", gate.get("runs-on")):
-        errors.append(f"{name}:roles-gate: must use the routed runner expression for job 'roles-gate'")
+        errors.append(f"{name}:roles-gate: must use the explicit ubuntu-latest runner for job 'roles-gate'")
     if gate.get("timeout-minutes") != "30":
         errors.append(f"{name}:roles-gate: timeout must stay 30 minutes")
     if (gate.get("container") or {}).get("image") != SCHEMA_GATE_IMAGE:
@@ -3669,7 +3713,7 @@ def staging_callee_window_errors(name, workflow, consumer):
     if window.get("timeout-minutes") != "8":
         errors.append(f"{name}:staging-window: timeout must stay 8 minutes")
     if not runner_allowed("staging-window", window.get("runs-on")):
-        errors.append(f"{name}:staging-window: must use the routed runner expression for job 'staging-window'")
+        errors.append(f"{name}:staging-window: must use the explicit ubuntu-latest runner for job 'staging-window'")
     steps = window.get("steps") or []
     output_name = None
     kind = "voice" if consumer == "synthetic" else "help"
@@ -3736,7 +3780,7 @@ def staging_callee_window_errors(name, workflow, consumer):
     if str(release.get("timeout-minutes")) not in {str(n) for n in range(1, 11)}:
         errors.append(f"{name}:staging-use-release: needs a timeout of at most 10 minutes")
     if not runner_allowed("staging-use-release", release.get("runs-on")):
-        errors.append(f"{name}:staging-use-release: must use the routed runner expression for job "
+        errors.append(f"{name}:staging-use-release: must use the explicit ubuntu-latest runner for job "
                       "'staging-use-release'")
     rsteps = release.get("steps") or []
     if len(rsteps) != 4:
@@ -3779,7 +3823,7 @@ def voice_synthetic_errors(workflow):
 
     Runs on workflow_call (deploy-staging), a 6-hourly schedule and dispatch,
     only from main, through the `voice-synthetic` environment whose single
-    secret is the dedicated test bot token, on the routed runner for job
+    secret is the dedicated test bot token, on the public-hosted runner for job
     `synthetic`, behind the pinned `staging-window` assert job (needs it) and
     the standalone `staging-use-release` job (staging_callee_window_errors),
     with the called-disjoint / standalone-canonical non-cancelling group and a
@@ -3811,7 +3855,7 @@ def voice_synthetic_errors(workflow):
     if job.get("timeout-minutes") != "10":
         errors.append(f"{name}:synthetic: timeout must stay 10 minutes")
     if not runner_allowed("synthetic", job.get("runs-on")):
-        errors.append(f"{name}:synthetic: must use the routed runner expression for job 'synthetic'")
+        errors.append(f"{name}:synthetic: must use the explicit ubuntu-latest runner for job 'synthetic'")
     for key in ("env", "uses", "services", "container", "continue-on-error", "strategy", "concurrency"):
         if key in job:
             errors.append(f"{name}:synthetic: must not set {key}")
@@ -3836,7 +3880,7 @@ def help_embed_synthetic_errors(workflow):
     Runs on workflow_call (deploy-staging) and dispatch, only from main,
     through the existing `voice-synthetic` environment whose single secret
     is the dedicated test bot token (the staging product bot token never
-    enters GitHub), on the routed runner for job `help-embed-smoke`, with
+    enters GitHub), on the public-hosted runner for job `help-embed-smoke`, with
     the called-disjoint / standalone-canonical non-cancelling group, the pinned
     `staging-window` / `staging-use-release` jobs and a 25 minute timeout (it
     builds the payload example). Exactly six steps: pinned checkout
@@ -3872,16 +3916,22 @@ def help_embed_synthetic_errors(workflow):
     if job.get("timeout-minutes") != "25":
         errors.append(f"{name}:help-embed-smoke: timeout must stay 25 minutes")
     if not runner_allowed("help-embed-smoke", job.get("runs-on")):
-        errors.append(f"{name}:help-embed-smoke: must use the routed runner expression for job 'help-embed-smoke'")
+        errors.append(f"{name}:help-embed-smoke: must use the explicit ubuntu-latest runner for job 'help-embed-smoke'")
     for key in ("env", "uses", "services", "container", "continue-on-error", "strategy", "concurrency"):
         if key in job:
             errors.append(f"{name}:help-embed-smoke: must not set {key}")
     steps = job.get("steps") or []
     runs = [step for step in steps if "run" in step]
     gate = steps[1] if len(steps) > 1 else {}
-    if len(steps) != 6 or len(runs) != 3 \
+    if len(steps) != 6 or len(runs) != 4 \
             or gate.get("id") != "gate" or "configured" not in str(gate.get("run") or "") \
-            or "help_embed_smoke_payloads" not in runs[1]["run"] \
+            or steps[2].get("run") != "bash .github/scripts/install-rust-toolchain.sh" \
+            or steps[2].get("shell") != "bash" \
+            or steps[2].get("env") != {
+                "RUST_TOOLCHAIN": tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"],
+                "RUST_COMPONENTS": "",
+            } \
+            or "help_embed_smoke_payloads" not in runs[2]["run"] \
             or "scripts/staging_help_embed_smoke.py" not in runs[-1]["run"]:
         errors.append(f"{name}:help-embed-smoke: must be checkout, binding gate, toolchain, "
                       "payload generation, one smoke step of the reviewed script, evidence upload")
@@ -4032,7 +4082,7 @@ def synthetic_user_flow_errors(workflow):
         if job.get("timeout-minutes") != "10":
             errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
         if not runner_allowed(job_id, job.get("runs-on")):
-            errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
+            errors.append(f"{name}:{job_id}: must use the explicit ubuntu-latest runner for job '{job_id}'")
         for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy", "defaults"):
             if key in job:
                 errors.append(f"{name}:{job_id}: must not set {key}")
@@ -4265,7 +4315,7 @@ def slow_burn_tracker_errors(workflow):
         if job.get("timeout-minutes") != "10":
             errors.append(f"{name}:{job_id}: timeout must stay 10 minutes")
         if not runner_allowed(job_id, job.get("runs-on")):
-            errors.append(f"{name}:{job_id}: must use the routed runner expression for job '{job_id}'")
+            errors.append(f"{name}:{job_id}: must use the explicit ubuntu-latest runner for job '{job_id}'")
         for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy", "defaults"):
             if key in job:
                 errors.append(f"{name}:{job_id}: must not set {key}")
@@ -4518,6 +4568,22 @@ def workflow_policy_errors(workflows):
     # An intentional addition needs an explicit policy change and independent review.
     if set(workflows) != set(JOB_INVENTORY):
         errors.append("workflow inventory changed")
+    # Every allowed reusable call must still exist with its pinned ref:
+    # converting a caller to an ordinary job keeps the inventory intact
+    # while evading the ref checks below, which only fire when `uses` is
+    # present. Same for the PR-size activation conditions.
+    for (name, job_id), expected_uses in REUSABLE_CALLS.items():
+        job = workflows.get(name, {}).get("jobs", {}).get(job_id)
+        if job is None:
+            errors.append(f"{name}:{job_id}: missing reusable call")
+        elif job.get("uses") != expected_uses:
+            errors.append(f"{name}:{job_id}: reusable call missing or retargeted")
+    for (name, job_id), expected_if in PR_SIZE_IF_CONDITIONS.items():
+        job = workflows.get(name, {}).get("jobs", {}).get(job_id)
+        if job is None:
+            errors.append(f"{name}:{job_id}: missing PR-size job")
+        elif job.get("if") != expected_if:
+            errors.append(f"{name}:{job_id}: PR-size activation condition changed")
     for name, workflow in workflows.items():
         jobs = workflow.get("jobs", {})
         if set(jobs) != JOB_INVENTORY.get(name, set()):
@@ -4679,8 +4745,8 @@ BOOKWORM_JOBS = {
     "reusable-rust-nextest.yml": ("nextest",),
     "pipeline-benchmark.yml": ("benchmark",),
 }
-BOOKWORM_IMAGE = ("rust:1.99-bookworm@sha256:"
-                  "9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b")
+BOOKWORM_IMAGE = ("rust:1.100-bookworm@sha256:"
+                  "ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea")
 # (workflow, job, cache key prefix). The nightly sweep is split into four
 # compiling jobs; the `sweep` aggregate compiles nothing and has no cache.
 CACHE_JOBS = (("nightly.yml", "sweep-plan", "nightly-cargo"),
@@ -4688,8 +4754,6 @@ CACHE_JOBS = (("nightly.yml", "sweep-plan", "nightly-cargo"),
               ("nightly.yml", "sweep-guarded", "nightly-cargo"),
               ("nightly.yml", "sweep-docs", "nightly-cargo"),
               ("pipeline-benchmark.yml", "benchmark", "pipeline-bench"))
-NIGHTLY_SWEEP_SPLIT_JOBS = {("nightly.yml", "sweep-plan"), ("nightly.yml", "sweep-partition"),
-                            ("nightly.yml", "sweep-guarded"), ("nightly.yml", "sweep-docs")}
 CACHE_PATHS = "~/.cargo/registry\n~/.cargo/git\ntarget\n"
 
 
@@ -5083,7 +5147,12 @@ class WorkflowTests(unittest.TestCase):
                  "93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e")
         for workflow, jobs in BOOKWORM_JOBS.items():
             for job in jobs:
-                for image in (stale, "rust:1.99-bookworm@sha256:" + "0" * 64):
+                for image in (
+                    stale,
+                    "rust:1.100-bookworm@sha256:" + "0" * 64,
+                    "rust:1.99-bookworm@sha256:"
+                    "9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b",
+                ):
                     with self.subTest(workflow=workflow, job=job, image=image):
                         mutated = deepcopy(fixed)
                         mutated[workflow]["jobs"][job]["container"]["image"] = image
@@ -5137,6 +5206,21 @@ class WorkflowTests(unittest.TestCase):
         for name in ("deploy-staging.yml", "deploy-production.yml"):
             self.assertNotIn("merge_group", self.workflows[name]["on"])
 
+    def test_gitleaks_dispatch_uses_trusted_main_policy(self):
+        steps = self.workflows["supply-chain.yml"]["jobs"]["gitleaks"]["steps"]
+        checkout = next(s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"]["fetch-depth"], "0")
+        self.assertEqual(checkout["with"]["persist-credentials"], "false")
+        scan = next(s for s in steps if s.get("name") == "Scan the full history")
+        self.assertEqual(scan["env"]["EVENT_NAME"], "${{ github.event_name }}")
+        self.assertEqual(scan["env"]["BASE_REF"],
+                         "${{ github.base_ref || github.event.merge_group.base_ref || "
+                         "(github.event_name == 'workflow_dispatch' && 'refs/heads/main') }}")
+        self.assertEqual(scan["run"], "bash .github/scripts/gitleaks-scan.sh")
+        selftest = next(s for s in steps if s.get("name") == "Self-test the PR scan policy")
+        self.assertEqual(selftest["run"], "bash .github/scripts/test-gitleaks-scan.sh")
+        self.assertLess(steps.index(selftest), steps.index(scan))
+
     def test_pr_lint_feeds_changed_files_to_the_t0_gate(self):
         # The T0 attestation floor in pr_standards.py needs the PR file list.
         # Pin the step and its wiring so the gate cannot be silently starved.
@@ -5148,6 +5232,28 @@ class WorkflowTests(unittest.TestCase):
                          "github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'")
         self.assertIn("pulls/", listed["run"])
         self.assertIn("previous_filename", listed["run"])
+        self.assertEqual(listed["shell"], "python3 -I {0}")
+        self.assertEqual(listed["env"]["EVENT_HEAD_SHA"], "${{ github.event.pull_request.head.sha }}")
+        self.assertEqual(listed["env"]["EVENT_BASE_SHA"], "${{ github.event.pull_request.base.sha }}")
+        self.assertIn('"--paginate", "--slurp"', listed["run"])
+        self.assertIn('len(entries) != count', listed["run"])
+        self.assertLess(listed["run"].index('len(entries) != count'),
+                        listed["run"].index('entry.get("previous_filename")'))
+        self.assertIn('"--ignore-submodules=none"', listed["run"])
+        self.assertIn('"--no-renames", "-z", merge_base, head', listed["run"])
+        self.assertIn('"merge-base", base, head', listed["run"])
+        self.assertIn('f"repos/{repo}/git/ref/heads/main"', listed["run"])
+        self.assertLess(listed["run"].index('base = main["object"]["sha"]'),
+                        listed["run"].index('"merge-base", base, head'))
+        self.assertIn('identity(snapshot()) != identity(pr)', listed["run"])
+        history = next(s for s in steps if s.get("name") == "Check out complete dispatch history")
+        self.assertEqual(history["if"], "github.event_name == 'workflow_dispatch'")
+        self.assertTrue(history["uses"].startswith("actions/checkout@"))
+        self.assertEqual(history["with"]["ref"], "${{ github.sha }}")
+        self.assertEqual(history["with"]["path"], "pr-diff")
+        self.assertEqual(history["with"]["fetch-depth"], "0")
+        self.assertEqual(history["with"]["persist-credentials"], "false")
+        self.assertLess(steps.index(history), steps.index(listed))
         check = next(s for s in steps if s.get("name") == "Check title, body, branch and commits")
         self.assertEqual(check["env"]["CHANGED_FILES_FILE"],
                          "${{ steps.changed.outputs.changed_files_file }}")
@@ -5165,11 +5271,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(str(base.get("uses", "")).startswith("actions/checkout@"))
         self.assertEqual(base["with"]["ref"],
                          "${{ github.event.pull_request.base.sha || 'main' }}")
+        verify = next(s for s in steps if s.get("name") == "Verify base-branch gate snapshot")
+        self.assertEqual(verify["if"], base["if"])
+        self.assertEqual(verify["env"]["EXPECTED_BASE_SHA"], "${{ steps.changed.outputs.base_sha }}")
+        self.assertEqual(verify["shell"], "python3 -I {0}")
+        self.assertIn('if actual != expected:', verify["run"])
+        self.assertLess(steps.index(base), steps.index(verify))
         self.assertEqual(base["with"]["path"], "base-gate")
         self.assertEqual(base["with"]["sparse-checkout"], ".github/scripts")
         self.assertEqual(base["with"]["persist-credentials"], "false")
         check = next(s for s in steps if s.get("name") == "Check title, body, branch and commits")
         self.assertLess(steps.index(base), steps.index(check))
+        self.assertLess(steps.index(verify), steps.index(check))
         self.assertIn("base-gate", check["run"])
         self.assertIn("Base-branch gate checkout is missing", check["run"])
 
@@ -6777,7 +6890,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(job.get("permissions"), {"contents": "read"})
         self.assertIn("job-inputs", job.get("needs", []))
         self.assertIn("needs.job-inputs.outputs.rust != 'false'", job.get("if", ""))
-        self.assertIn("coverage-plan", job.get("runs-on", ""))
+        self.assertEqual(job.get("runs-on"), PUBLIC_RUNNER)
         outputs = job.get("outputs", {})
         for key in ("matrix", "expected-shards", "legs", "widened", "reason"):
             self.assertIn(key, outputs)
@@ -6807,7 +6920,7 @@ class WorkflowTests(unittest.TestCase):
         # every shard reports its own verdict and timing.
         self.assertEqual(strategy.get("fail-fast"), "false")
         self.assertIn("needs.coverage-plan.outputs.matrix", strategy.get("matrix", ""))
-        self.assertIn("coverage-shard", job.get("runs-on", ""))
+        self.assertEqual(job.get("runs-on"), PUBLIC_RUNNER)
         upload = next(
             step for step in job["steps"]
             if step.get("name") == "Upload shard coverage report"
@@ -7021,7 +7134,7 @@ class WorkflowTests(unittest.TestCase):
                 "window wrong environment": lambda w: window(w).update({"environment": "voice-synthetic"}),
                 "window writes": lambda w: window(w).update({"permissions": {"contents": "write"}}),
                 "window timeout": lambda w: window(w).update({"timeout-minutes": "30"}),
-                "window runner": lambda w: window(w).update({"runs-on": "ubuntu-latest"}),
+                "window runner": lambda w: window(w).update({"runs-on": "ubuntu-latest-16-cores"}),
                 "window tolerated": lambda w: window(w).update({"continue-on-error": "true"}),
                 "window unpinned checkout": lambda w: window(w)["steps"][0].update({"uses": "actions/checkout@v4"}),
                 "window persists credentials": lambda w: window(w)["steps"][0]["with"].update(
@@ -7078,7 +7191,7 @@ class WorkflowTests(unittest.TestCase):
                     {"STAGING_USE_EXPIRES_AT": "${{ inputs.staging_use_expires_at }}"}),
                 "release releases instead of finishing": lambda w: release(w)["steps"][2].update(
                     {"run": "node wrangler/scripts/staging-use.mjs release"}),
-                "release runner": lambda w: release(w).update({"runs-on": "ubuntu-latest"}),
+                "release runner": lambda w: release(w).update({"runs-on": "ubuntu-latest-16-cores"}),
             }
             for label, mutate in mutations.items():
                 changed = copy.deepcopy(workflow)
@@ -7167,6 +7280,7 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["jobs"]["help-embed-smoke"]["steps"][4].__setitem__(
                 "run", w["jobs"]["help-embed-smoke"]["steps"][4]["run"].replace('"$status" = 3', '"$status" = 9')),
             lambda w: w["jobs"]["help-embed-smoke"]["steps"][2].pop("if"),
+            lambda w: w["jobs"]["help-embed-smoke"]["steps"][2]["env"].__setitem__("RUST_TOOLCHAIN", "1.0.0"),
             lambda w: w["jobs"]["help-embed-smoke"]["steps"][1]["env"].__setitem__(
                 "HAS_TOKEN", "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"),
         ):
@@ -8183,6 +8297,56 @@ class WorkflowTests(unittest.TestCase):
                 workflows["nightly.yml"]["jobs"]["pipeline-benchmark"]["uses"] = target
                 self.assertTrue(workflow_policy_errors(workflows))
 
+    def test_reusable_calls_inventory_is_complete(self):
+        # Deliberately independent of REUSABLE_CALLS: deleting an entry
+        # must not delete its oracle.
+        self.assertEqual(REUSABLE_CALLS, {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pipeline-benchmark.yml",
+                                          ("check.yml", "supply-chain"): "./.github/workflows/sbom.yml",
+                                          ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
+                                          ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
+                                          ("deploy-staging.yml", "help-embed-synthetic"): "./.github/workflows/help-embed-synthetic.yml",
+                                          ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
+                                          ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@63699075b492914c137281acffd4c89e51cc1c4c",
+                                          ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
+                                          ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
+                                          ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
+                                          ("pr-size.yml", "pr-size-weekly"): "TogetherWeOwn/.github/.github/workflows/pr-size-weekly.yml@ac9ce8d63e0cebd19ede904ac79137190c329964"})
+        for (name, job_id), expected_uses in REUSABLE_CALLS.items():
+            with self.subTest(workflow=name, job=job_id):
+                job = self.workflows[name]["jobs"].get(job_id, {})
+                self.assertEqual(job.get("uses"), expected_uses)
+
+    def test_reusable_call_cannot_be_removed(self):
+        # Replacing a caller with an ordinary ubuntu-latest job keeps the
+        # job inventory intact while evading the ref checks, which only
+        # fire when `uses` is present.
+        for name, job_id in REUSABLE_CALLS:
+            with self.subTest(workflow=name, job=job_id):
+                workflows = deepcopy(self.workflows)
+                workflows[name]["jobs"][job_id] = {"runs-on": "ubuntu-latest",
+                                                   "steps": [{"run": "echo stub"}]}
+                self.assertTrue(workflow_policy_errors(workflows))
+        workflows = deepcopy(self.workflows)
+        del workflows["pr-size.yml"]["jobs"]["pr-size-gate"]
+        self.assertTrue(workflow_policy_errors(workflows))
+
+    def test_pr_size_activation_conditions_are_pinned(self):
+        jobs = self.workflows["pr-size.yml"]["jobs"]
+        expected = {"pr-size": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
+                    "pr-size-gate": "github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || inputs.pr_number != ''",
+                    "pr-size-weekly": "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')"}
+        for job_id, condition in expected.items():
+            with self.subTest(job=job_id):
+                self.assertEqual(jobs[job_id]["if"], condition)
+        for job_id in expected:
+            with self.subTest(job=job_id, mutation="neutered"):
+                workflows = deepcopy(self.workflows)
+                workflows["pr-size.yml"]["jobs"][job_id]["if"] = "${{ false }}"
+                self.assertTrue(workflow_policy_errors(workflows))
+        workflows = deepcopy(self.workflows)
+        workflows["pr-size.yml"]["jobs"]["pr-size-gate"]["if"] = expected["pr-size-weekly"]
+        self.assertTrue(workflow_policy_errors(workflows))
+
     def test_production_dispatch_safety_rules_are_pinned(self):
         # 10-20 incidents: a manual deploy without takeover left production
         # fenced (13:31Z), the rollback then refused for want of a human
@@ -8427,7 +8591,7 @@ class WorkflowTests(unittest.TestCase):
         for job_id in ("plan", "apply"):
             for key, value in (("environment", None), ("environment", "production"),
                                ("if", None), ("if", "${{ always() }}"),
-                               ("runs-on", "ubuntu-latest")):
+                               ("runs-on", "ubuntu-latest-16-cores")):
                 with self.subTest(job=job_id, job_key=key, value=value):
                     def change(w, key=key, value=value, job_id=job_id):
                         job = w["jobs"][job_id]
@@ -8593,7 +8757,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_production_migrate_runner_shape_is_pinned(self):
         # Production mirror of the staging runner: same three jobs, same pinned
-        # actions, routed runner, pipefail and provenance gates, with
+        # actions, public-hosted runner, pipefail and provenance gates, with
         # production names, environments, secrets and --target production.
         migrate = self.workflows["production-migrate.yml"]
         self.assertEqual(production_migrate_errors(migrate), [])
@@ -8634,7 +8798,7 @@ class WorkflowTests(unittest.TestCase):
                                ("environment", "staging-migrate-plan"),
                                ("environment", "staging-migrate-apply"),
                                ("if", None), ("if", "${{ always() }}"),
-                               ("runs-on", "ubuntu-latest")):
+                               ("runs-on", "ubuntu-latest-16-cores")):
                 with self.subTest(job=job_id, job_key=key, value=value):
                     def change(w, key=key, value=value, job_id=job_id):
                         job = w["jobs"][job_id]
@@ -8720,7 +8884,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(len(prod_job.get("steps", [])), len(stag_job.get("steps", [])))
                 self.assertEqual(prod_job.get("permissions"), stag_job.get("permissions"))
                 self.assertEqual(prod_job.get("if"), stag_job.get("if"))
-                self.assertEqual(prod_job.get("runs-on"), stag_job.get("runs-on").replace("staging", "production") if "staging" in str(stag_job.get("runs-on")) else stag_job.get("runs-on"))
+                self.assertEqual(prod_job.get("runs-on"), stag_job.get("runs-on"))
 
     def test_staging_rollback_drill_shape_is_pinned(self):
         workflows = self.workflows
@@ -8748,7 +8912,7 @@ class WorkflowTests(unittest.TestCase):
             "no environment": lambda w: job(w).pop("environment"),
             "branch condition removed": lambda w: job(w).pop("if"),
             "any branch": lambda w: job(w).update({"if": "github.ref != ''"}),
-            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
+            "nonstandard runner": lambda w: job(w).update({"runs-on": "ubuntu-latest-16-cores"}),
             "job-level secret": lambda w: job(w).update({"env": {"T": "${{ secrets.CLOUDFLARE_API_TOKEN }}"}}),
             "wrangler action": lambda w: job(w)["steps"].insert(
                 2, {"uses": "cloudflare/wrangler-action@pinned"}),
@@ -8793,7 +8957,11 @@ class WorkflowTests(unittest.TestCase):
             "dispatcher deadlocks staging lane": lambda w: w["jobs"]["proof"].update(
                 {"concurrency": {"group": "staging-lifecycle", "cancel-in-progress": False}}),
             "dispatcher reads production secrets": lambda w: w["jobs"]["proof"].update({"environment": "production"}),
-            "dispatcher extra bindings": lambda w: w["jobs"]["proof"]["steps"][1]["env"].update({"URL": "production"}),
+            "dispatcher extra bindings": lambda w: w["jobs"]["proof"]["steps"][2]["env"].update({"URL": "production"}),
+            "refusal removed": lambda w: w["jobs"]["proof"]["steps"].pop(0),
+            "refusal made successful": lambda w: w["jobs"]["proof"]["steps"][0].update({"run": "exit 0\n"}),
+            "refusal conditional": lambda w: w["jobs"]["proof"]["steps"][0].update({"if": "false"}),
+            "refusal tolerated": lambda w: w["jobs"]["proof"]["steps"][0].update({"continue-on-error": "true"}),
             "missing evidence": lambda w: w["jobs"]["proof"]["steps"].pop(),
             "alert on success": lambda w: w["jobs"]["alert"].update({"if": "always()"}),
             "alert cannot write the incident issue": lambda w: w["jobs"]["alert"]["permissions"].pop("issues"),
@@ -8859,7 +9027,7 @@ class WorkflowTests(unittest.TestCase):
             "no environment": lambda w: job(w).pop("environment"),
             "branch condition removed": lambda w: job(w).pop("if"),
             "any branch": lambda w: job(w).update({"if": "github.ref != ''"}),
-            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
+            "nonstandard runner": lambda w: job(w).update({"runs-on": "ubuntu-latest-16-cores"}),
             "job-level secret": lambda w: job(w).update({"env": {"T": "${{ secrets.CLOUDFLARE_API_TOKEN }}"}}),
             "wrangler action": lambda w: job(w)["steps"].insert(
                 2, {"uses": "cloudflare/wrangler-action@pinned"}),
@@ -8931,9 +9099,9 @@ class WorkflowTests(unittest.TestCase):
             "any branch": lambda w: job(w).update({"if": "github.ref != ''"}),
             "write grant": lambda w: job(w).update({"permissions": {"contents": "write"}}),
             "longer timeout": lambda w: job(w).update({"timeout-minutes": "30"}),
-            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
-            "other job's routing": lambda w: job(w).update(
-                {"runs-on": ROUTED_RUNNER.format(job="check")}),
+            "nonstandard runner": lambda w: job(w).update({"runs-on": "ubuntu-latest-16-cores"}),
+            "legacy routing": lambda w: job(w).update(
+                {"runs-on": LEGACY_ROUTED_RUNNER.format(job="check")}),
             "job-level secret": lambda w: job(w).update(
                 {"env": {"T": "${{ secrets.TWO_BOT_STAGING_EVENTS_RO_DATABASE_URL }}"}}),
             "container": lambda w: job(w).update({"container": {"image": "postgres"}}),
@@ -9043,9 +9211,9 @@ class WorkflowTests(unittest.TestCase):
             "any branch": lambda w: job(w).update({"if": "github.ref != ''"}),
             "write grant": lambda w: job(w).update({"permissions": {"contents": "write"}}),
             "longer timeout": lambda w: job(w).update({"timeout-minutes": "30"}),
-            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
-            "other job's routing": lambda w: job(w).update(
-                {"runs-on": ROUTED_RUNNER.format(job="check")}),
+            "nonstandard runner": lambda w: job(w).update({"runs-on": "ubuntu-latest-16-cores"}),
+            "legacy routing": lambda w: job(w).update(
+                {"runs-on": LEGACY_ROUTED_RUNNER.format(job="check")}),
             "job-level secret": lambda w: job(w).update(
                 {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PRIVACY_RO_DATABASE_URL }}"}}),
             "container": lambda w: job(w).update({"container": {"image": "postgres"}}),
@@ -9122,9 +9290,9 @@ class WorkflowTests(unittest.TestCase):
             "write grant": lambda w: job(w).update({"permissions": {"contents": "write"}}),
             "shorter timeout": lambda w: job(w).update({"timeout-minutes": "5"}),
             "longer timeout": lambda w: job(w).update({"timeout-minutes": "60"}),
-            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
-            "other job's routing": lambda w: job(w).update(
-                {"runs-on": ROUTED_RUNNER.format(job="check")}),
+            "nonstandard runner": lambda w: job(w).update({"runs-on": "ubuntu-latest-16-cores"}),
+            "legacy routing": lambda w: job(w).update(
+                {"runs-on": LEGACY_ROUTED_RUNNER.format(job="check")}),
             "job-level secret": lambda w: job(w).update(
                 {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"}}),
             "container": lambda w: job(w).update({"container": {"image": "postgres"}}),
@@ -9195,11 +9363,11 @@ class WorkflowTests(unittest.TestCase):
             "write grant": lambda w: job(w).update({"permissions": {"contents": "write"}}),
             "shorter timeout": lambda w: job(w).update({"timeout-minutes": "5"}),
             "longer timeout": lambda w: job(w).update({"timeout-minutes": "60"}),
-            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
-            "other job's routing": lambda w: job(w).update(
-                {"runs-on": ROUTED_RUNNER.format(job="check")}),
-            "sibling routing": lambda w: job(w).update(
-                {"runs-on": ROUTED_RUNNER.format(job="census")}),
+            "nonstandard runner": lambda w: job(w).update({"runs-on": "ubuntu-latest-16-cores"}),
+            "legacy routing": lambda w: job(w).update(
+                {"runs-on": LEGACY_ROUTED_RUNNER.format(job="check")}),
+            "legacy sibling routing": lambda w: job(w).update(
+                {"runs-on": LEGACY_ROUTED_RUNNER.format(job="census")}),
             "job-level secret": lambda w: job(w).update(
                 {"env": {"T": "${{ secrets.TWO_BOT_STAGING_PLAN_DATABASE_URL }}"}}),
             "container": lambda w: job(w).update({"container": {"image": "postgres"}}),
@@ -9269,9 +9437,9 @@ class WorkflowTests(unittest.TestCase):
             "any branch": lambda w: job(w).update({"if": "github.ref != ''"}),
             "write grant": lambda w: job(w).update({"permissions": {"contents": "write"}}),
             "longer timeout": lambda w: job(w).update({"timeout-minutes": "30"}),
-            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
-            "other job's routing": lambda w: job(w).update(
-                {"runs-on": ROUTED_RUNNER.format(job="check")}),
+            "nonstandard runner": lambda w: job(w).update({"runs-on": "ubuntu-latest-16-cores"}),
+            "legacy routing": lambda w: job(w).update(
+                {"runs-on": LEGACY_ROUTED_RUNNER.format(job="check")}),
             "job-level secret": lambda w: job(w).update(
                 {"env": {"T": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}}),
             "step condition": lambda w: job(w)["steps"][3].update({"if": "always()"}),
@@ -9451,9 +9619,9 @@ class WorkflowTests(unittest.TestCase):
                 {"ref": "evil-branch"}),
             "fixture checkout repository swap": lambda w: fixture_job(w)["steps"][0]["with"].update(
                 {"repository": "evil/repo"}),
-            "fixture unrouted runner": lambda w: fixture_job(w).update({"runs-on": "ubuntu-latest"}),
+            "fixture nonstandard runner": lambda w: fixture_job(w).update({"runs-on": "ubuntu-latest-16-cores"}),
             "fixture on tracker routing": lambda w: fixture_job(w).update(
-                {"runs-on": ROUTED_RUNNER.format(job="tracker")}),
+                {"runs-on": LEGACY_ROUTED_RUNNER.format(job="tracker")}),
         }
         for label, change in changes.items():
             with self.subTest(change=label):
@@ -9608,14 +9776,20 @@ class WorkflowTests(unittest.TestCase):
             "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
             "shared concurrency group": lambda w: w["concurrency"].update({"group": "staging-lifecycle"}),
             "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
+            "missing hold": lambda w: w["jobs"].pop("admission-hold"),
+            "hold succeeds": lambda w: w["jobs"]["admission-hold"]["steps"][0].update({"run": "exit 0\n"}),
+            "hold conditional": lambda w: w["jobs"]["admission-hold"].update({"if": "false"}),
+            "hold tolerated": lambda w: w["jobs"]["admission-hold"]["steps"][0].update({"continue-on-error": "true"}),
+            "proof bypasses hold": lambda w: job(w).pop("needs"),
+            "proof runs after failure": lambda w: job(w).update({"if": "always()"}),
             "production environment": lambda w: job(w).update({"environment": "production"}),
             "no environment": lambda w: job(w).pop("environment"),
             "branch condition removed": lambda w: job(w).pop("if"),
             "write grant": lambda w: job(w).update({"permissions": {"contents": "write"}}),
             "longer timeout": lambda w: job(w).update({"timeout-minutes": "60"}),
-            "unrouted runner": lambda w: job(w).update({"runs-on": "ubuntu-latest"}),
-            "other job's routing": lambda w: job(w).update(
-                {"runs-on": ROUTED_RUNNER.format(job="check")}),
+            "nonstandard runner": lambda w: job(w).update({"runs-on": "ubuntu-latest-16-cores"}),
+            "legacy routing": lambda w: job(w).update(
+                {"runs-on": LEGACY_ROUTED_RUNNER.format(job="check")}),
             "repinned action": lambda w: job(w)["steps"][3].update(
                 {"uses": "TogetherWeOwn/.github/actions/gradual-promote@main"}),
             "dropped error-rate threshold": lambda w: job(w)["steps"][3]["with"].pop("error-rate-threshold"),
@@ -9644,12 +9818,38 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
+    NATIVE_RUST_INSTALLER_RUN = "bash .github/scripts/install-rust-toolchain.sh"
+    NATIVE_RUST_WORKFLOWS = ("check.yml", "reusable-rust-nextest.yml")
+
+    def rust_installer(self, workflow_name, step):
+        """Return {"toolchain", "components"} for an installer step, else None.
+
+        Migrated workflows must use the native installer (bash step, pin and
+        components in env); a leftover action step fails rather than being
+        skipped by the enumeration.
+        """
+        is_action = str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")
+        if workflow_name in self.NATIVE_RUST_WORKFLOWS:
+            self.assertFalse(is_action, "dtolnay/rust-toolchain action must not return")
+            if str(step.get("run", "")).strip() != self.NATIVE_RUST_INSTALLER_RUN:
+                return None
+            self.assertEqual(step.get("shell"), "bash", "native installer must run under bash")
+            self.assertIsInstance(step.get("env", {}).get("RUST_TOOLCHAIN"), str)
+            self.assertIsInstance(step["env"].get("RUST_COMPONENTS"), str)
+            self.assertNotIn("with", step)
+            return {"toolchain": step["env"]["RUST_TOOLCHAIN"],
+                    "components": step["env"]["RUST_COMPONENTS"]}
+        if not is_action:
+            return None
+        with_ = step.get("with") or {}
+        return {"toolchain": with_.get("toolchain"), "components": with_.get("components", "")}
+
     def test_check_toolchains_match_the_repository_pin(self):
         channel = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
         self.assertRegex(channel, r"^\d+\.\d+\.\d+$")
         installers = {
             job_id: [step for step in job.get("steps", [])
-                     if step.get("uses", "").startswith("dtolnay/rust-toolchain@")]
+                     if self.rust_installer("check.yml", step)]
             for job_id, job in self.workflows["check.yml"]["jobs"].items()
         }
         installers = {job: steps for job, steps in installers.items() if steps}
@@ -9664,14 +9864,14 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(len(steps), 1)
                 if job_id == "fuzz-compile":
                     # libFuzzer needs nightly; pinned date, not floating stable.
-                    self.assertEqual(steps[0].get("with", {}).get("toolchain"), "nightly-2026-10-01")
-                    self.assertEqual(set(steps[0]["with"]["components"].replace(" ", "").split(",")),
+                    self.assertEqual(steps[0]["env"]["RUST_TOOLCHAIN"], "nightly-2026-10-01")
+                    self.assertEqual(set(steps[0]["env"]["RUST_COMPONENTS"].replace(" ", "").split(",")),
                                      {"rust-src"})
                     continue
                 # Floating stable can install a different fmt/clippy than Cargo
                 # selects from the repository pin inside the job container.
-                self.assertEqual(steps[0].get("with", {}).get("toolchain"), channel)
-        self.assertEqual(set(installers["check"][0]["with"]["components"].replace(" ", "").split(",")),
+                self.assertEqual(steps[0]["env"]["RUST_TOOLCHAIN"], channel)
+        self.assertEqual(set(installers["check"][0]["env"]["RUST_COMPONENTS"].replace(" ", "").split(",")),
                          {"rustfmt", "clippy"})
 
     def pinned_toolchain_lanes(self, channel):
@@ -9682,8 +9882,8 @@ class WorkflowTests(unittest.TestCase):
         lanes = []
         for workflow_name in ("check.yml", "reusable-rust-nextest.yml"):
             for job_id, job in self.workflows[workflow_name]["jobs"].items():
-                if any(str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")
-                       and step.get("with", {}).get("toolchain") == channel
+                if any((installer := self.rust_installer(workflow_name, step)) is not None
+                       and installer["toolchain"] == channel
                        for step in job.get("steps", [])):
                     lanes.append((workflow_name, job_id))
         # Sentinels: an enumeration that silently found nothing would pass
@@ -9714,7 +9914,7 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(workflow=workflow_name, job=job_id):
                 steps = self.workflows[workflow_name]["jobs"][job_id]["steps"]
                 installers = [index for index, step in enumerate(steps)
-                              if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
+                              if self.rust_installer(workflow_name, step)]
                 self.assertEqual(len(installers), 1)
                 index = installers[0]
                 installer = steps[index]
@@ -9732,7 +9932,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertNotEqual(retry.get("continue-on-error"), True,
                                     "the retry must fail the job when the toolchain stays missing")
                 self.assertIn(channel, retry["run"])
-                components = installer.get("with", {}).get("components", "")
+                components = self.rust_installer(workflow_name, installer)["components"]
                 for component in filter(None, components.replace(" ", "").split(",")):
                     with self.subTest(component=component):
                         self.assertIn(component, retry["run"])
@@ -9779,7 +9979,7 @@ class WorkflowTests(unittest.TestCase):
             for workflow_name, job_id in targets:
                 steps = self.workflows[workflow_name]["jobs"][job_id]["steps"]
                 installers = [index for index, step in enumerate(steps)
-                              if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@")]
+                              if self.rust_installer(workflow_name, step)]
                 self.assertEqual(len(installers), 1)
                 run_text = str(steps[installers[0] + 1]["run"])
                 for case_name, succeed_on, expected_status, expected_installs in (
@@ -9900,32 +10100,22 @@ class WorkflowTests(unittest.TestCase):
                         "no extra arguments or default command",
                     )
 
-    def test_overflow_runner_must_name_its_own_job(self):
+    def test_runner_must_be_explicit_standard_public_hosted(self):
         self.assertTrue(runner_allowed("worker", self.workflows["check.yml"]["jobs"]["worker"]["runs-on"]))
-        for runs_on in (ROUTED_RUNNER.format(job="check"), "ubuntu-latest", ["self-hosted"],
-                        "${{ vars.CI_OVERFLOW_RUNNER }}"):
+        for runs_on in (LEGACY_ROUTED_RUNNER.format(job="worker"),
+                        "ubuntu-latest-16-cores", ["ubuntu-latest"], ["self-hosted"],
+                        "${{ vars.CI_OVERFLOW_RUNNER }}", "${{ matrix.runner }}"):
             with self.subTest(runs_on=runs_on):
                 self.assertFalse(runner_allowed("worker", runs_on))
 
-    def test_certify_promotion_runner_must_use_its_own_routed_expression(self):
-        # Certification checks the existing live grant before packaging artifacts;
-        # that buys service/container isolation, not a runner waiver. The job must
-        # use the exact canonical routed expression naming certify-promotion,
-        # matching scripts/test-runner-routing.py::routed('certify-promotion').
-        canonical = ROUTED_RUNNER.format(job="certify-promotion")
+    def test_certify_promotion_runner_must_be_explicit_public_hosted(self):
+        # Artifact-only certification retains service/container isolation and
+        # the same direct hosted selector as every other ordinary job.
+        canonical = PUBLIC_RUNNER
         job = self.workflows["deploy-staging.yml"]["jobs"]["certify-promotion"]
         self.assertTrue(runner_allowed("certify-promotion", canonical))
-        # Public repositories reach GitHub-hosted runners before any variable
-        # or self-hosted label is read.
-        self.assertTrue(canonical.startswith(
-            "${{ fromJSON((!github.event.repository.private && '[\"ubuntu-latest\"]') || "))
-        missing_public_first = canonical.replace(
-            "(!github.event.repository.private && '[\"ubuntu-latest\"]') || ", "")
-        self.assertNotEqual(missing_public_first, canonical)
-        for runs_on in ("ubuntu-latest",
-                        ROUTED_RUNNER.format(job="deploy"),
-                        missing_public_first,
-                        ["self-hosted"],
+        for runs_on in (LEGACY_ROUTED_RUNNER.format(job="certify-promotion"),
+                        "ubuntu-latest-16-cores", ["self-hosted"],
                         ["self-hosted", "two-selfhosted"],
                         "${{ vars.CI_OVERFLOW_RUNNER }}"):
             with self.subTest(runs_on=runs_on):
@@ -9954,7 +10144,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("environment", job)
         self.assertEqual(job["uses"], REUSABLE_CALLS[("review-rules.yml", "review-rules")])
 
-    def test_private_runner_and_service_isolation(self):
+    def test_public_hosted_runner_and_service_isolation(self):
         for name, workflow in self.workflows.items():
             for job_id, job in workflow["jobs"].items():
                 with self.subTest(workflow=name, job=job_id):
@@ -9964,21 +10154,14 @@ class WorkflowTests(unittest.TestCase):
                         self.assertEqual(job["uses"], REUSABLE_CALLS[(name, job_id)])
                         continue
                     if (name, job_id) == ("deploy-staging.yml", "certify-promotion"):
-                        # Artifact-only certification has no host/container dependency,
-                        # but it still uses the canonical routed expression for its
-                        # own job id (public repo -> hosted first). A literal
-                        # ubuntu-latest would bill private hosted minutes if the
-                        # repo went private; see scripts/test-runner-routing.py.
-                        self.assertEqual(job["runs-on"], ROUTED_RUNNER.format(job=job_id))
+                        # Artifact-only certification still uses the direct
+                        # public-hosted selector without services or a container.
+                        self.assertEqual(job["runs-on"], PUBLIC_RUNNER)
                         self.assertNotIn("services", job)
                         self.assertNotIn("container", job)
                     else:
-                        # Main #183 returned container smoke to the shared pool.
-                        # The four split nightly sweep jobs deliberately keep the
-                        # original logical overflow key `sweep`, preserving the
-                        # runner allow-list behavior of the pre-split job.
-                        route_key = "sweep" if (name, job_id) in NIGHTLY_SWEEP_SPLIT_JOBS else job_id
-                        self.assertTrue(runner_allowed(route_key, job["runs-on"]))
+                        # All ordinary jobs share the explicit public-hosted contract.
+                        self.assertTrue(runner_allowed(job_id, job["runs-on"]))
                     if job.get("services"):
                         self.assertIn("container", job)
                         for service in job["services"].values():
@@ -10416,7 +10599,14 @@ class WorkflowTests(unittest.TestCase):
 
     def test_minimal_grants_and_no_persisted_checkout_credentials(self):
         for name, workflow in self.workflows.items():
-            self.assertEqual(workflow["permissions"], {})
+            if name == "pr-size.yml":
+                # The org caller template ships an explicit top-level
+                # `contents: read` (its header instructs a byte-exact
+                # copy); every job below still overrides with its own
+                # least-privilege grant, pinned under this test.
+                self.assertEqual(workflow["permissions"], {"contents": "read"})
+            else:
+                self.assertEqual(workflow["permissions"], {})
             for job_id, job in workflow["jobs"].items():
                 with self.subTest(workflow=name, job=job_id):
                     expected = {"contents": "read"}
@@ -10466,6 +10656,9 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("deploy-production.yml", "promotion-skipped"):
                         # No checkout or API access: only report and upload a receipt.
                         expected = {}
+                    elif (name, job_id) == ("gradual-promote-proof.yml", "admission-hold"):
+                        # Refuses before checkout or API access.
+                        expected = {}
                     elif (name, job_id) == ("daily-digest.yml", "digest"):
                         # Cuts the vYYYY.MM.DD tag and its release, reads the
                         # production Deployments fallback, and dispatches the
@@ -10484,9 +10677,12 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("release.yml", "attach-sbom"):
                         # TOG-10893: uploads verified SBOMs to the published tag.
                         expected = {"contents": "write"}
-                    elif (name, job_id) == ("pr-size.yml", "pr-size"):
-                        # Advisory labeller: writes the size/* label and keeps
-                        # the one advisory comment on the caller's PR.
+                    elif (name, job_id) in (("pr-size.yml", "pr-size"),
+                                            ("pr-size.yml", "pr-size-gate")):
+                        # Labeller writes the size/* label and keeps the
+                        # one advisory comment; the required gate posts
+                        # the split comment and ensures the exception
+                        # label. Both measure the caller's PR the same way.
                         expected = {"contents": "read", "issues": "write",
                                     "pull-requests": "write"}
                     elif (name, job_id) == ("pr-size.yml", "pr-size-weekly"):
@@ -10574,6 +10770,47 @@ class WorkflowTests(unittest.TestCase):
                     if re.fullmatch(r"\d+", str(ceiling)):
                         self.assertGreaterEqual(int(ceiling), 1)
                         self.assertLessEqual(int(ceiling), 360)
+
+    def test_base_attestation_only_executes_verified_base(self):
+        self.assertNotIn("base-attestation.yml", self.workflows)
+        self.assertNotIn("base-attestation.yaml", self.workflows)
+        fixture = ROOT / "scripts/ci/fixtures/base-attestation.yml"
+        workflow = yaml.load(fixture.read_text(), Loader=UniqueKeyLoader)
+        self.assertEqual(set(workflow), {"name", "on", "permissions", "jobs"})
+        self.assertEqual(set(workflow["jobs"]), {"metadata"})
+        self.assertEqual(workflow["on"], {"pull_request_target": {"types": [
+            "opened", "edited", "synchronize", "reopened", "ready_for_review"]}})
+        self.assertNotIn("concurrency", workflow)
+        job = workflow["jobs"]["metadata"]
+        self.assertEqual(set(job), {"name", "permissions", "runs-on", "timeout-minutes", "steps"})
+        self.assertEqual(job["permissions"], {"contents": "read", "pull-requests": "read"})
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["timeout-minutes"], "5")
+        checkout, execute = job["steps"]
+        self.assertEqual(checkout["uses"], "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
+        self.assertEqual(checkout["with"], {
+            "ref": "${{ github.sha }}", "persist-credentials": "false",
+            "sparse-checkout": ".github/scripts", "sparse-checkout-cone-mode": "false"})
+        self.assertEqual(execute["shell"], "python3 -I {0}")
+        self.assertEqual(execute["env"], {"GH_TOKEN": "${{ github.token }}"})
+        self.assertEqual(set(execute), {"name", "env", "shell", "run"})
+        script = compile(execute["run"], "workflow", "exec")
+        environment = {"GITHUB_SHA": "a" * 40, "GITHUB_WORKSPACE": "/synthetic",
+                       "GITHUB_EVENT_PATH": "/synthetic-event"}
+        for actual, allowed in (("a" * 40, True), ("b" * 40, False)):
+            with self.subTest(allowed=allowed), patch.dict(os.environ, environment, clear=True), \
+                    patch("subprocess.check_output", return_value=actual + "\n"), \
+                    patch("runpy.run_path") as run, patch.object(sys, "path", list(sys.path)), \
+                    patch.object(sys, "argv", list(sys.argv)):
+                if allowed:
+                    exec(script, {})
+                    run.assert_called_once_with("/synthetic/.github/scripts/base_attestation_gate.py",
+                                                run_name="__main__")
+                    self.assertEqual(sys.argv[1:], ["--event", "/synthetic-event"])
+                else:
+                    with self.assertRaises(SystemExit):
+                        exec(script, {})
+                    run.assert_not_called()
 
     def test_own_trigger_workflows_serialize_at_the_top_level(self):
         # A workflow with its own triggers (anything beyond a pure

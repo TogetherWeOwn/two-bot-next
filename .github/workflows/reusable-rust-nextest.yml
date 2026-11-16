@@ -45,16 +45,16 @@ jobs:
     name: rust nextest
     permissions:
       contents: read
-    # Runner routing (TOG-12339): public repo -> GitHub-hosted, private ->
-    # CI_OVERFLOW_* switch for this named job, then the self-hosted pool.
-    runs-on: ${{ fromJSON((!github.event.repository.private && '["ubuntu-latest"]') || (contains(fromJSON(vars.CI_OVERFLOW_JOBS || '[]'), 'nextest') && contains(fromJSON(vars.CI_OVERFLOW_EVENTS || '[]'), github.event_name) && vars.CI_OVERFLOW_RUNNER) || '["self-hosted","two-selfhosted"]') }}
+    # Runner routing: explicit standard GitHub-hosted ubuntu-latest; this is
+    # a public repository.
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     # Same job-container and disposable Postgres service as the `rust-tests`
     # lane in check.yml: the lib/bins run below needs the CI test database.
     # A job container gets its own network namespace, so no published host
-    # port collides on the shared self-hosted Docker host.
+    # port must not be published outside the isolated service network.
     container:
-      image: rust:1.99-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b
+      image: rust:1.100-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
     # NOTE: job-container steps default to sh (no pipefail), so every run
     # step below declares bash explicitly.
     env:
@@ -168,9 +168,11 @@ jobs:
 
       - name: Install Rust toolchain
         id: toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-09-12)
-        with:
-          toolchain: "1.99.1" # Match rust-toolchain.toml; floating stable can drift.
+        shell: bash
+        env:
+          RUST_TOOLCHAIN: "1.100.0" # Match rust-toolchain.toml; floating stable can drift.
+          RUST_COMPONENTS: ""
+        run: bash .github/scripts/install-rust-toolchain.sh
         # Continue so the retry below can reinstall the same pin; it fails closed.
         continue-on-error: true
 
@@ -183,8 +185,8 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5; do
-            if rustup toolchain install "1.99.1" --profile minimal --no-self-update --force-non-host; then
-              rustup default "1.99.1" --force-non-host
+            if rustup toolchain install "1.100.0" --profile minimal --no-self-update --force-non-host; then
+              rustup default "1.100.0" --force-non-host
               exit 0
             fi
             [ "$attempt" -lt 5 ] || exit 1

@@ -11,6 +11,7 @@ mod common;
 use anyhow::{bail, ensure, Context, Result};
 use common::{MockRest, ScriptedResponse};
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -25,6 +26,9 @@ use two_bot_core::gateway_funnel::GatewayFunnelBuffer;
 use two_bot_core::gateway_session::{DispatchAction, GatewaySession};
 use two_bot_cutover::gateway_session::GatewaySessionStore;
 use two_bot_discord::{ActionExecutor, NoClassification, NoInvites, Pipeline};
+use two_bot_testsupport::pipeline_integrity::{
+    add_observer, completed_statement_profile, verify_durable_events, ServerDelta, ServerSnapshot,
+};
 use two_bot_testsupport::TestDatabase;
 
 const GUILD: u64 = 2222;
@@ -175,7 +179,8 @@ async fn commit(
     event: Event,
     sequence: u64,
     at_ms: i64,
-) -> Result<()> {
+    expected: &mut BTreeSet<String>,
+) -> Result<Duration> {
     pipeline.handle_at(&event, &two_bot_core::format_iso_millis(at_ms));
     let checkpoint = GatewaySession {
         session_id: "pipeline-bench".into(),
@@ -183,14 +188,16 @@ async fn commit(
         resume_url: "ws://127.0.0.1:1".into(),
         updated_at_ms: at_ms,
     };
+    let batch = pipeline.handlers().store().take_batch();
+    // Exclude only the new oracle bookkeeping, not handling, drain or persistence.
+    let oracle_started = Instant::now();
+    expected.extend(batch.events.iter().map(two_bot_core::idempotency_key));
+    let oracle_elapsed = oracle_started.elapsed();
     ensure!(
-        store
-            .commit_dispatch(&checkpoint, pipeline.handlers().store().take_batch())
-            .await?
-            == DispatchAction::Apply,
+        store.commit_dispatch(&checkpoint, batch).await? == DispatchAction::Apply,
         "unexpected duplicate dispatch"
     );
-    Ok(())
+    Ok(oracle_elapsed)
 }
 
 fn percentiles(mut samples: Vec<f64>) -> Value {
@@ -214,7 +221,12 @@ fn peak_rss_mib() -> Result<f64> {
     Ok(kib / 1024.0)
 }
 
-async fn measure(config: &Config, db: &TestDatabase, queries: &Queries) -> Result<Value> {
+async fn measure(
+    config: &Config,
+    db: &TestDatabase,
+    observer: &TestDatabase,
+    queries: &Queries,
+) -> Result<Value> {
     let pipeline: Pipeline<GatewayFunnelBuffer> = Pipeline::new(
         GatewayFunnelBuffer::default(),
         None,
@@ -226,6 +238,7 @@ async fn measure(config: &Config, db: &TestDatabase, queries: &Queries) -> Resul
     let mock = MockRest::start(vec![], ScriptedResponse::json(200, json!({"id":"9999"}))).await;
     let executor = ActionExecutor::with_proxy("fixture-token".into(), Some(mock.origin()))
         .map_err(anyhow::Error::msg)?;
+    let mut expected = BTreeSet::new();
     let mut sequence = 0;
     for index in 0..config.channels {
         sequence += 1;
@@ -245,6 +258,7 @@ async fn measure(config: &Config, db: &TestDatabase, queries: &Queries) -> Resul
             dispatch(sequence, "GUILD_MEMBER_ADD", member(100 + index))?,
             sequence,
             EPOCH_MS,
+            &mut expected,
         )
         .await?;
     }
@@ -257,8 +271,24 @@ async fn measure(config: &Config, db: &TestDatabase, queries: &Queries) -> Resul
         "channel cache did not populate"
     );
 
+    // Flush seed/setup transaction statistics on every pool connection before
+    // the observer snapshot. Keep the leases together so no backend is missed.
+    let mut connections = Vec::new();
+    for _ in 0..db.pool().options().get_max_connections() {
+        let mut connection = db.pool().acquire().await?;
+        sqlx::query("SELECT pg_stat_force_next_flush()")
+            .execute(&mut *connection)
+            .await?;
+        connections.push(connection);
+    }
+    drop(connections);
+    let server_before = ServerSnapshot::read(observer.pool(), db.name()).await?;
+    sqlx::raw_sql("SELECT 'pipeline-accounting-start'")
+        .execute(db.pool())
+        .await?;
     let statements_before = queries.statements.load(Ordering::Relaxed);
     let commits_before = queries.commits.load(Ordering::Relaxed);
+    let mut event_profile: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
     let mut latency = Vec::with_capacity(config.events() as usize);
     let mut rest_latency = Vec::new();
     let replay_started = Instant::now();
@@ -292,9 +322,20 @@ async fn measure(config: &Config, db: &TestDatabase, queries: &Queries) -> Resul
             };
             // Event construction/parsing and rate pacing are outside handler latency.
             let event = dispatch(sequence, kind, data)?;
+            let before = queries.statements.load(Ordering::Relaxed);
             let started = Instant::now();
-            commit(&pipeline, &store, event, sequence, at_ms).await?;
-            latency.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+            let oracle_elapsed =
+                commit(&pipeline, &store, event, sequence, at_ms, &mut expected).await?;
+            latency.push(
+                started
+                    .elapsed()
+                    .saturating_sub(oracle_elapsed)
+                    .as_secs_f64()
+                    * 1_000_000.0,
+            );
+            let profile = event_profile.entry(kind).or_default();
+            profile.0 += 1;
+            profile.1 += queries.statements.load(Ordering::Relaxed) - before + 1;
             if (index + 1).is_multiple_of(config.rest_every) {
                 let started = Instant::now();
                 executor
@@ -320,11 +361,39 @@ async fn measure(config: &Config, db: &TestDatabase, queries: &Queries) -> Resul
         rest_calls == config.events() / config.rest_every,
         "unexpected REST request count"
     );
+    sqlx::raw_sql("SELECT 'pipeline-accounting-stop'")
+        .execute(db.pool())
+        .await?;
+    // Closing all writer backends drains work and publishes transaction stats.
+    // Observe from another database, so no verification query contaminates this
+    // window. Open the verification pool only after the server snapshot.
+    db.pool().close().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let active: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = $1")
+                    .bind(db.name())
+                    .fetch_one(observer.pool())
+                    .await?;
+            if active == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok::<_, sqlx::Error>(())
+    })
+    .await
+    .context("writer backends did not drain")??;
+    let statistics = ServerSnapshot::read(observer.pool(), db.name())
+        .await?
+        .delta(&server_before)?;
+    let verification = db.independent_pool().await?;
+    verify_durable_events(&verification, &expected).await?;
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM events")
-        .fetch_one(db.pool())
+        .fetch_one(&verification)
         .await?;
     let members: i64 = sqlx::query_scalar("SELECT count(*) FROM members")
-        .fetch_one(db.pool())
+        .fetch_one(&verification)
         .await?;
     ensure!(
         rows >= (config.members * 2) as i64 && members == config.members as i64,
@@ -337,18 +406,32 @@ async fn measure(config: &Config, db: &TestDatabase, queries: &Queries) -> Resul
          FROM rollback_journal j JOIN events e ON j.row_identity = e.id::text
          WHERE j.table_name = 'events' AND j.op = 'insert' AND j.pre_image IS NULL",
     )
-    .fetch_one(db.pool())
+    .fetch_one(&verification)
     .await?;
     ensure!(
         journal_rows == rows && journaled_events == rows,
         "benchmark requires exactly one insert journal entry per durable event"
     );
-    let checkpoint = store.load().await?.context("checkpoint missing")?;
+    let checkpoint = GatewaySessionStore::new(verification, GUILD.to_string(), 0)
+        .load()
+        .await?
+        .context("checkpoint missing")?;
     ensure!(
         checkpoint.sequence == sequence,
         "checkpoint did not reach final dispatch"
     );
     let peak = peak_rss_mib()?;
+    // Preserve the historical workload/row-verification RSS boundary. Completion
+    // log buffering/JSON decoding is new oracle work, not workload memory.
+    let server = ServerDelta {
+        commits: statistics
+            .commits
+            .checked_sub(2)
+            .context("missing boundary transactions")?,
+        rollbacks: statistics.rollbacks,
+        statements: completed_statement_profile(observer.pool(), db.name()).await?,
+    };
+    server.verify(config.events(), statements, commits)?;
     mock.shutdown().await;
     Ok(json!({
         "schema_version":1,
@@ -369,6 +452,12 @@ async fn measure(config: &Config, db: &TestDatabase, queries: &Queries) -> Resul
             "sqlx_statements":statements,"begin_exchanges":config.events(),"commits":commits,
             "mock_rest_calls":rest_calls,"durable_events":rows,"durable_members":members,
             "journal_rows":journal_rows,"journaled_events":journaled_events,
+            "expected_durable_events":expected.len(),"every_event_durable_after_drain":true,
+            "server_xact_commit":server.commits,"server_xact_rollback":server.rollbacks,
+            "server_statement_calls":server.statements.values().sum::<i64>(),
+            "server_statement_profile":server.statements,"event_statement_profile":event_profile,
+            "server_observer_transactions":2,
+            "pg_stat_statements_profile":statistics.statements,
             "cached_members":pipeline.cache().stats().guild_members(Id::new(GUILD)),
             "cached_channels":pipeline.cache().stats().channels(),"checkpoint_sequence":sequence
         }
@@ -386,19 +475,26 @@ async fn main() -> Result<()> {
     let raw = std::env::var("TWO_TEST_DATABASE_URL")
         .context("explicit TWO_TEST_DATABASE_URL required; no fallback")?;
     let db = TestDatabase::create(&raw, &sqlx::migrate!("../cutover/migrations")).await?;
+    let (db, observer) = add_observer(&raw, db).await?;
     let measured = tokio::time::timeout(Duration::from_secs(180), async {
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+            .execute(observer.pool())
+            .await
+            .context("observer requires pg_stat_statements on the disposable server")?;
         // Production applies both chains. Without the store chain every
         // journal write takes the savepoint failure path, not the measured
         // success path. Keep setup inside the timeout and teardown on errors.
         two_bot_store::migrate(db.pool())
             .await
             .context("store migrations required for benchmark journal coverage")?;
-        measure(&config, &db, &queries).await
+        measure(&config, &db, &observer, &queries).await
     })
     .await;
+    let observer_cleanup = observer.close().await;
     db.close()
         .await
         .context("verify disposable database teardown")?;
+    observer_cleanup.context("verify disposable observer database teardown")?;
     let mut report = measured.context("benchmark exceeded 180 seconds")??;
     let elapsed = process_started.elapsed().as_secs_f64();
     ensure!(

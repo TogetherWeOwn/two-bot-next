@@ -122,22 +122,61 @@ auto-leave, metrics).
 
 ## Experiment protocol
 
-Run from the staging bot against the staging guild, driven by a human with
-ears. Every step records its evidence in the run log linked below.
+This is the music-node placement experiment, not a second B4 voice executor or
+an authorization to run. Current qualification timing follows the
+[evidence-bounded checklist](soak-checklist.md#evidence-bounded-timing-exits):
+retain ≥49/50 audible joins, no4017, both rekeys and actual sustained playback
+in the exact-SHA music-placement run log. Two hours is the maximum
+investigation, not a minimum endurance wait or proof by elapsed time. Before an
+authorized attempt, record its UTC start, deadline and cleanup within the
+separate grant; no grant means no start. Exit as soon as all actual receipts and
+prescribed coverage are complete. Missing evidence at the maximum is NEEDS
+WORK: stop safely, clean up and route the gap, never pass or renew by timeout.
+
+Historical protocol provenance: the original step 3 was “2 hours continuous
+playback, no dropouts”, with a “2 h with no dropouts” pass checkbox. Those fixed
+waits are superseded by the current receipt-based exit below, not an additional
+qualification gate. No measured run is claimed by this correction.
+
+When separately authorized, run from the staging bot against the staging guild,
+driven by a human with ears. Every music step records its evidence in the
+music-placement run log linked below, for the Container-versus-VPS decision.
+That log is not the dedicated temporary-voice acceptance receipt. B4 consumes
+the existing exact-SHA dedicated voice evidence table and verdict named by the
+canonical checklist, with row/scenario IDs and UTC windows:
+
+- [s3-14 and s3-15](soak-checklist.md#3-gateway-event-handlers): channel-change
+  audit, leave→join ordering and XP hook, mute-only no-transition, and
+  restart/session-reset evidence with no outage-inflated duration or XP.
+- [s12-01](soak-checklist.md#12-baseline-additions-and-corrections): creator-room,
+  control-panel, `/voice` subcommand and leave/sweep evidence.
+
+Attach those existing dedicated receipts; do not repeat their live exercises.
+Missing or failing dedicated evidence leaves the applicable rows NEEDS WORK,
+even if music placement passes. These pointers appoint no executor and grant
+no restart, traffic or other exercise authority.
 
 1. Join reliability: 50 joins, expect at least 49 audible (98%), zero 4017.
-2. DAVE rekey: 2 humans join or leave mid-track; playback stays audible
-   across the key change.
-3. Soak: 2 hours continuous playback, no dropouts.
-4. Footprint: sample node CPU, RSS and bytes out hourly; report GB/hour.
+2. DAVE rekey: record both join and leave rekeys with 2 humans mid-track;
+   playback stays audible across both key changes.
+3. Playback: record actual sustained playback with no dropouts, including UTC
+   bounds and duration. Complete the receipt within the 2h maximum investigation;
+   neither a short join probe nor elapsed time alone proves sustained playback.
+4. Footprint: retain a timestamped series of node CPU, RSS and bytes-out samples
+   throughout actual playback, including entry, completion and each hourly point
+   due while open. Record sampling cadence, gaps, actual duration and measured
+   GB/hour; report statistics only for the observed samples, not as proof that
+   unsampled peaks were absent. Entry and completion alone are insufficient,
+   including for a run shorter than one hour: missing playback-series evidence
+   stays NEEDS WORK under the existing attempt maximum and cleanup rule.
 
 Pass criteria (all must hold):
 
 - [ ] no 4017 errors
 - [ ] at least 98% of 50 joins audible
-- [ ] still audible when 2 humans join or leave mid-track (DAVE key changes)
-- [ ] 2 h with no dropouts
-- [ ] CPU, RSS and GB per hour recorded
+- [ ] still audible across both join and leave rekeys with 2 humans mid-track
+- [ ] actual sustained playback without dropouts documented with UTC bounds and duration
+- [ ] CPU, RSS and measured GB per hour recorded with actual observation bounds
 
 ## Decision record: Container vs VPS
 
@@ -159,7 +198,7 @@ fails or the footprint does not fit `basic`. The numbers below decide.
 | 4017 count | — | — |
 | Audible joins / 50 | — | — |
 | Rekey audible | — | — |
-| 2 h soak dropouts | — | — |
+| Sustained-playback UTC bounds / duration / dropouts | — | — |
 | CPU (avg/p95) | — | — |
 | RSS (avg/max) | — | — |
 | GB/hour out | — | — |

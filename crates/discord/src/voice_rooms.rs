@@ -774,6 +774,55 @@ impl RoomHttp {
         Ok(())
     }
 
+    /// Complete a text-only voice reply as one ephemeral embed. Keep the
+    /// existing content bound and never retry an ambiguous interaction edit.
+    pub async fn complete_voice_embed(
+        &self,
+        application: Id<ApplicationMarker>,
+        token: &str,
+        kind: crate::brand::EmbedKind,
+        content: &str,
+    ) -> Result<(), RoomHttpError> {
+        let content = content.chars().take(2000).collect();
+        let embed = crate::brand::ephemeral_reply_embed(kind, "Voice", content);
+        self.complete_prebuilt_voice_embed(application, token, &embed)
+            .await
+    }
+
+    /// Send a classified voice reply built by the command handler.
+    pub async fn complete_prebuilt_voice_embed(
+        &self,
+        application: Id<ApplicationMarker>,
+        token: &str,
+        embed: &twilight_model::channel::message::Embed,
+    ) -> Result<(), RoomHttpError> {
+        let mut embed = embed.clone();
+        if let Some(description) = &mut embed.description {
+            *description = two_bot_core::message_safety::content(description);
+        }
+        let response = InteractionResponse {
+            kind: twilight_model::http::interaction::InteractionResponseType::UpdateMessage,
+            data: Some(twilight_model::http::interaction::InteractionResponseData {
+                embeds: Some(vec![embed]),
+                ..Default::default()
+            }),
+        };
+        let safe = crate::message_safety::interaction_response(&response)
+            .map_err(|_| RoomHttpError::InvalidRequest)?;
+        let embeds = safe.data.and_then(|data| data.embeds).unwrap_or_default();
+        let mentions = AllowedMentions::default();
+        let interaction = self.http.interaction(application);
+        let request = interaction
+            .update_response(token)
+            .content(Some(""))
+            .embeds(Some(&embeds))
+            .allowed_mentions(Some(&mentions))
+            .try_into_request()
+            .map_err(classify_http_error)?;
+        self.send_request(request, || true, false).await?;
+        Ok(())
+    }
+
     /// Download a Discord-hosted `/import` file, capped at `max_bytes`.
     /// Only the Discord CDN host is fetched, over HTTPS and without the bot
     /// credential: attachment URLs are signed and need no authorization.

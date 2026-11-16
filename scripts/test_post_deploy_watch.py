@@ -316,7 +316,8 @@ class GateProcessTests(unittest.TestCase):
                 self.assertIsNone(gate.poll())
                 gate.child = popen.return_value
                 popen.return_value.poll.return_value = 1
-                Path(tmp, "watch-error-rate-1.json").write_text(json.dumps({"verdict": "fail"}))
+                Path(tmp, "watch-error-rate-1.json").write_text(
+                    json.dumps({"verdict": "fail", "sha": SHA, "mode": "live"}))
                 self.assertEqual(gate.poll(), "fail")
                 # The child inherits the step environment (no env= override):
                 # PRODUCTION_WORKER_URL rides along, so the gate's origin
@@ -326,6 +327,32 @@ class GateProcessTests(unittest.TestCase):
                 gate.start()
                 gate.child = popen.return_value
                 Path(tmp, "watch-error-rate-2.json").write_text("not json")
+                self.assertEqual(gate.poll(), "error")
+
+    def test_gate_rejects_inconsistent_child_results_and_receipts(self):
+        cases = [
+            (0, {"mode": "live", "sha": SHA, "verdict": "pass"}, "pass"),
+            (1, {"mode": "live", "sha": SHA, "verdict": "pass"}, "error"),
+            (0, {"mode": "live", "sha": SHA, "verdict": "fail"}, "error"),
+            (1, {"mode": "live", "sha": SHA, "verdict": "fail"}, "fail"),
+            (0, {"mode": "live", "sha": "f" * 40, "verdict": "pass"}, "error"),
+            (0, {"mode": "rehearsal", "sha": SHA, "verdict": "pass"}, "error"),
+            (0, {"mode": "skip", "sha": SHA, "verdict": "pass"}, "error"),
+            (0, {"mode": "skip", "sha": SHA, "verdict": "skip"}, "skip"),
+            (0, {"mode": "live", "sha": SHA, "verdict": "insufficient_data"}, "insufficient_data"),
+        ]
+        with tempfile.TemporaryDirectory(dir=os.environ.get("PAPERCLIP_RUN_SCRATCH_DIR")) as tmp:
+            gate = watcher.Gate(URL, SHA, tmp, "/tooling")
+            for code, receipt, expected in cases:
+                with self.subTest(code=code, receipt=receipt), mock.patch("subprocess.Popen") as popen:
+                    gate.start()
+                    popen.return_value.poll.return_value = code
+                    gate.evidence.write_text(json.dumps(receipt))
+                    self.assertEqual(gate.poll(), expected)
+            with mock.patch("subprocess.Popen") as popen:
+                gate.start()
+                popen.return_value.poll.return_value = 0
+                gate.evidence.write_text('{"mode":"live","sha":"' + SHA + '","verdict":"pass","verdict":"pass"}')
                 self.assertEqual(gate.poll(), "error")
 
 
