@@ -143,6 +143,7 @@ fn assert_reply(mock: &MockRest, content: &str, kind: EmbedKind) {
         "/api/v10/webhooks/1111/mock-rsvp-token/messages/@original"
     );
     assert_eq!(attendance_reply::deferred_text(&body, kind), content);
+    assert_eq!(body["allowed_mentions"]["parse"], json!([]));
 }
 
 async fn counts(pool: &Pool<Postgres>) -> (i64, i64, i64) {
