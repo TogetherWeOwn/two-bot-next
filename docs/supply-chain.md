@@ -228,9 +228,9 @@ persisted in their checkout.
 
 ## Pins and maintenance
 
-The builder is `rust:1.99-trixie` and the runtime is
+The builder is `rust:1.100-trixie` and the runtime is
 `gcr.io/distroless/base-nossl-debian13:nonroot`, both pinned by multi-platform
-index SHA-256 (builder `sha256:09027f87…0137`, runtime `sha256:e6b0f825…5c67`;
+index SHA-256 (builder `sha256:e1984087…8c31`, runtime `sha256:e6b0f825…5c67`;
 full digests are in `Dockerfile`). Both are Debian 13, so the binary links
 against the glibc it runs on. Dependabot's weekly `docker` updates follow both
 references. The distroless `nonroot` tag is unversioned: if no digest bump
