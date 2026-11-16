@@ -673,6 +673,44 @@ fn open_access() -> Arc<Mutex<AccessControls>> {
 }
 
 #[tokio::test]
+async fn limit_unavailable_paths_keep_retry_and_refusal_replies_private() {
+    for name in ["limit", "unlimit"] {
+        let interaction = voice_interaction_as(Some(command_data(name, Vec::new())), None, MEMBER);
+        let trace = Trace::default();
+        let cold = test_runtime(trace.clone());
+        let (_, response) = handle_capture(&cold, &interaction).await;
+        assert_limit_embed(
+            response.as_ref().expect("cold reply"),
+            two_bot_discord::brand::EmbedKind::Warn,
+            "The voice worker isn't warmed up yet — try again in a moment.",
+        );
+
+        let failing = gated_runtime(
+            trace.clone(),
+            AccessControls::default(),
+            Some(StoreError::Unavailable),
+        );
+        let (_, response) = handle_capture(&failing, &interaction).await;
+        assert_limit_embed(
+            response.as_ref().expect("settings reply"),
+            two_bot_discord::brand::EmbedKind::Warn,
+            "Voice-room settings are unavailable right now. Try again shortly.",
+        );
+
+        let mut anonymous = interaction.clone();
+        anonymous.member = None;
+        anonymous.user = None;
+        let (_, response) = handle_capture(&cold, &anonymous).await;
+        assert_limit_embed(
+            response.as_ref().expect("missing invoker reply"),
+            two_bot_discord::brand::EmbedKind::Danger,
+            &format!("I couldn't tell who invoked /{name} — try again."),
+        );
+        assert!(limit_writes(&trace).is_empty());
+    }
+}
+
+#[tokio::test]
 async fn handle_limit_replies_after_the_write_lands() {
     let trace = Trace::default();
     let runtime = limit_room_runtime(trace.clone(), open_access(), Vec::new()).await;
