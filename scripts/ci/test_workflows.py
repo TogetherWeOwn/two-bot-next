@@ -88,7 +88,6 @@ JOB_INVENTORY = {
     # fixture lands); pinned shape below.
     "gradual-promote-proof.yml": {"proof"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
-    "base-attestation.yml": {"metadata"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
     # runs the local validation/evidence/preflight scripts without ever
@@ -10581,8 +10580,7 @@ class WorkflowTests(unittest.TestCase):
                         # Read workflow/job history to debounce alerts and detect
                         # recovery; open, comment on and close the incident issue.
                         expected = {"contents": "read", "actions": "read", "issues": "write"}
-                    elif (name, job_id) in (("supply-chain.yml", "pr-lint"),
-                                            ("base-attestation.yml", "metadata")):
+                    elif (name, job_id) == ("supply-chain.yml", "pr-lint"):
                         expected["pull-requests"] = "read"
                     elif (name, job_id) == ("test-guard.yml", "test-guard"):
                         # Marker-label actor audit via the issue-events API.
@@ -10736,7 +10734,10 @@ class WorkflowTests(unittest.TestCase):
                         self.assertLessEqual(int(ceiling), 360)
 
     def test_base_attestation_only_executes_verified_base(self):
-        workflow = self.workflows["base-attestation.yml"]
+        self.assertNotIn("base-attestation.yml", self.workflows)
+        self.assertNotIn("base-attestation.yaml", self.workflows)
+        fixture = ROOT / "scripts/ci/fixtures/base-attestation.yml"
+        workflow = yaml.load(fixture.read_text(), Loader=UniqueKeyLoader)
         self.assertEqual(set(workflow), {"name", "on", "permissions", "jobs"})
         self.assertEqual(set(workflow["jobs"]), {"metadata"})
         self.assertEqual(workflow["on"], {"pull_request_target": {"types": [
@@ -10791,8 +10792,6 @@ class WorkflowTests(unittest.TestCase):
             # Read-only staging observation and production alerting each use
             # an independent queue, never the lifecycle holders' pending slot.
             "synthetic-user-flow.yml",
-            # Independent target runs must not cancel or queue required runs.
-            "base-attestation.yml",
         }
         for name, workflow in self.workflows.items():
             on = workflow.get("on") or {}
