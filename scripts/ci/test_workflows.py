@@ -97,7 +97,7 @@ JOB_INVENTORY = {
     "voice-synthetic.yml": {"staging-window", "synthetic", "staging-use-release"},
     # Live staging /help embed smoke (docs/staging-help-embed-smoke.md);
     # pinned shape below.
-    "help-embed-synthetic.yml": {"staging-window", "help-embed-smoke", "staging-use-release"},
+    "help-embed-synthetic.yml": {"staging-window", "help-embed-smoke", "staging-use-release", "rerun-refusal"},
     # Five-minute user-flow synthetic (docs/synthetic-user-flow.md): staging
     # health-contract plus passive production probes; pinned shape below.
     "synthetic-user-flow.yml": {"staging", "prod-passive"},
@@ -3682,16 +3682,27 @@ def staging_callee_window_errors(name, workflow, consumer):
             "STAGING_OWNERSHIP_CONTROL_TOKEN": {"required": "true"}}:
         errors.append(f"{name}: workflow_call must declare only the optional test and required staging-control tokens")
     inputs = call.get("inputs")
-    if not isinstance(inputs, dict) or list(inputs) != list(STAGING_USE_INPUTS) or any(
-            field != {"type": "string", "required": "true"} for field in inputs.values()):
-        errors.append(f"{name}: workflow_call inputs must be exactly the three required string "
-                      "staging_use_expires_at, staging_use_sha and staging_use_deployment")
+    expected_inputs = {key: {"type": "string", "required": "true"} for key in STAGING_USE_INPUTS}
+    prepared = name == "help-embed-synthetic.yml"
+    if prepared:
+        expected_inputs["deploy_staging_call"] = {"type": "boolean", "required": "false", "default": "false"}
+    if inputs != expected_inputs:
+        errors.append(f"{name}: workflow_call inputs must match the exact call-mode profile")
     if workflow.get("concurrency") != {"group": STAGING_CALLEE_GROUPS[name], "cancel-in-progress": "false"}:
         errors.append(f"{name}: group must be disjoint when called and staging-lifecycle standalone, "
                       "never cancelling")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"staging-window", consumer, "staging-use-release"}:
-        errors.append(f"{name}: jobs must be exactly staging-window, {consumer} and staging-use-release")
+    expected_jobs = {"staging-window", consumer, "staging-use-release"}
+    if prepared:
+        expected_jobs.add("rerun-refusal")
+    if set(jobs) != expected_jobs:
+        errors.append(f"{name}: jobs must match the exact consumer inventory")
+    if prepared and jobs.get("rerun-refusal") != {
+            "needs": ["staging-window", consumer, "staging-use-release"],
+            "if": "always() && inputs.deploy_staging_call && github.run_attempt > 1",
+            "permissions": {}, "runs-on": "ubuntu-latest", "timeout-minutes": "5", "steps": [{"run": "exit 1"}]}:
+        errors.append(f"{name}:rerun-refusal: must be the secret-free terminal failure sentinel")
+    if not {"staging-window", consumer, "staging-use-release"} <= set(jobs):
         return errors
     for job_id, job in jobs.items():
         for key in ("concurrency", "continue-on-error", "uses", "services", "container", "strategy", "env"):
@@ -3701,8 +3712,11 @@ def staging_callee_window_errors(name, workflow, consumer):
     if set(window) - {"name"} != {"if", "permissions", "environment", "runs-on", "timeout-minutes",
                                   "outputs", "steps"}:
         errors.append(f"{name}:staging-window: unexpected job keys")
-    if window.get("if") != "github.ref == 'refs/heads/main'":
-        errors.append(f"{name}:staging-window: must run only from main")
+    window_if = "github.ref == 'refs/heads/main'"
+    if prepared:
+        window_if += " && (!inputs.deploy_staging_call || github.run_attempt == 1)"
+    if window.get("if") != window_if:
+        errors.append(f"{name}:staging-window: must run only from main with the required attempt guard")
     if window.get("environment") != "staging":
         errors.append(f"{name}:staging-window: must read the staging Environment")
     if window.get("permissions") != {"contents": "read"}:
@@ -3901,13 +3915,13 @@ def help_embed_synthetic_errors(workflow):
         errors.append(f"{name}: top-level permissions must stay empty")
     errors.extend(staging_callee_window_errors(name, workflow, "help-embed-smoke"))
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"staging-window", "help-embed-smoke", "staging-use-release"}:
+    if "help-embed-smoke" not in jobs:
         return errors
     job = jobs["help-embed-smoke"]
     if job.get("environment") != "voice-synthetic":
         errors.append(f"{name}:help-embed-smoke: must read only the voice-synthetic Environment")
-    if job.get("if") != "github.ref == 'refs/heads/main'":
-        errors.append(f"{name}:help-embed-smoke: must run only from main")
+    if job.get("if") != "github.ref == 'refs/heads/main' && (!inputs.deploy_staging_call || github.run_attempt == 1)":
+        errors.append(f"{name}:help-embed-smoke: must run only from main with the required attempt guard")
     if job.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:help-embed-smoke: must keep contents:read only")
     if job.get("timeout-minutes") != "25":
@@ -7284,6 +7298,28 @@ class WorkflowTests(unittest.TestCase):
             changed = copy.deepcopy(synthetic)
             mutate(changed)
             self.assertNotEqual(help_embed_synthetic_errors(changed), [])
+
+    def test_help_prepared_profile_and_consumer_diagnostics(self):
+        import copy
+        workflow = self.workflows["help-embed-synthetic.yml"]
+        consumer = lambda w: w["jobs"]["help-embed-smoke"]
+        mutations = (
+            (lambda w: w["on"]["workflow_call"]["inputs"]["deploy_staging_call"].update(default="true"), "call-mode profile"),
+            (lambda w: w["jobs"]["staging-window"].update({"if": "github.ref == 'refs/heads/main'"}), "attempt guard"),
+            (lambda w: w["jobs"]["rerun-refusal"].update(environment="staging"), "terminal failure sentinel"),
+            (lambda w: w["jobs"]["rerun-refusal"]["steps"][0].update(run="exit 0"), "terminal failure sentinel"),
+            (lambda w: w["jobs"]["rerun-refusal"]["needs"].remove("help-embed-smoke"), "terminal failure sentinel"),
+            (lambda w: consumer(w).update(environment="staging"), "must read only the voice-synthetic Environment"),
+            (lambda w: consumer(w).update(permissions={"contents": "write"}), "must keep contents:read only"),
+            (lambda w: consumer(w).update({"timeout-minutes": "30"}), "timeout must stay 25 minutes"),
+            (lambda w: consumer(w)["steps"][0].update(env={"TOKEN": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}), "only the smoke step may hold a secret"),
+            (lambda w: consumer(w)["steps"][4].update(run="wrangler deploy"), "one smoke step of the reviewed script"),
+        )
+        for mutate, diagnostic in mutations:
+            changed = copy.deepcopy(workflow)
+            mutate(changed)
+            with self.subTest(diagnostic=diagnostic):
+                self.assertTrue(any(diagnostic in error for error in help_embed_synthetic_errors(changed)))
 
     def test_staging_deploy_gates_on_the_help_embed_synthetic(self):
         staging = self.workflows["deploy-staging.yml"]
@@ -10706,6 +10742,8 @@ class WorkflowTests(unittest.TestCase):
                         # summary to the automation branch. This main-only
                         # job is the workflow's sole write grant.
                         expected = {"contents": "write"}
+                    if (name, job_id) == ("help-embed-synthetic.yml", "rerun-refusal"):
+                        expected = {}
                     self.assertEqual(job["permissions"], expected)
                     for step in job.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):

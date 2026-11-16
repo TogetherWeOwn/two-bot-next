@@ -387,7 +387,10 @@ def consumer_errors(callee_name, callee):
     text = str(consumer).lower()
     if "ownership_control" in text or "staging-use.mjs" in text:
         errors.append(f"{callee_name}: live consumer job holds the staging control credential")
-    if bare(consumer.get("if")) not in ("", MAIN_ONLY) or "continue-on-error" in consumer:
+    permitted_gates = ("", MAIN_ONLY)
+    if callee_name == HELP:
+        permitted_gates += (MAIN_ONLY + " && (!inputs.deploy_staging_call || github.run_attempt == 1)",)
+    if bare(consumer.get("if")) not in permitted_gates or "continue-on-error" in consumer:
         errors.append(f"{callee_name}: live consumer must keep the main-only, "
                       "success-gated, failure-propagating gate")
     needs = consumer.get("needs")
@@ -405,7 +408,7 @@ def consumer_errors(callee_name, callee):
             # Only the inherited-path guard may skip the assert; its job keeps
             # the plain main-only gate so a skip cannot silently skip consumers.
             gated_off = (bare(step.get("if")) not in ("", INHERITED_GUARD)
-                         or bare(owner.get("if")) not in ("", MAIN_ONLY))
+                         or bare(owner.get("if")) not in permitted_gates)
             if (before and bound
                     and str(env.get("OWNERSHIP_CONTROL_TOKEN", "")) == OWNERSHIP_TOKEN
                     and "continue-on-error" not in step and "continue-on-error" not in owner
