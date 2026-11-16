@@ -176,7 +176,8 @@ def claim_handoff(raw, *, clock_domain, clock, verify_handoff, claim, ledger, ve
                 or transition - mutation > 240000):
             raise EvidenceError("invalid handoff timing")
         expected = record["candidate_expected"]
-        if type(expected) is not dict or expected.get("environment") != "production":
+        _identity(expected)
+        if expected["environment"] != "production":
             raise EvidenceError("invalid candidate binding")
         prior, initial = record["prior"], record["initial"]
         for block in (prior, initial):

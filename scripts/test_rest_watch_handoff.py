@@ -81,6 +81,17 @@ class HandoffTest(unittest.TestCase):
                     self.start(record, **overrides)
                 self.assertFalse(self.claimed)
 
+    def test_candidate_identity_is_validated_before_claim(self):
+        for field in ("run", "attempt"):
+            for value in (True, 1.0):
+                with self.subTest(field=field, value=value):
+                    record = copy.deepcopy(self.record)
+                    record["candidate_expected"] = dict(record["candidate_expected"], **{field: value})
+                    self.assertEqual(record["candidate_expected"], record["initial"]["expected"])
+                    with self.assertRaises(EvidenceError):
+                        self.start(record)
+                    self.assertFalse(self.claimed)
+
     def test_prior_observed_route_cannot_be_omitted(self):
         record = copy.deepcopy(self.record)
         for sample in record["prior"]["samples"]:
