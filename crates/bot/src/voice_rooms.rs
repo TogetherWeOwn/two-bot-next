@@ -12368,13 +12368,29 @@ async fn command_gate<S: RoomPersistence + Send + 'static>(
     member: &AccessMember,
     command_name: &str,
 ) -> Option<InteractionResponse> {
+    command_gate_classified(store, guild_id, member, command_name)
+        .await
+        .map(|(response, _)| response)
+}
+
+async fn command_gate_classified<S: RoomPersistence + Send + 'static>(
+    store: &S,
+    guild_id: Snowflake,
+    member: &AccessMember,
+    command_name: &str,
+) -> Option<(InteractionResponse, two_bot_discord::brand::EmbedKind)> {
+    use two_bot_discord::brand::EmbedKind;
     match store.access_controls(guild_id).await {
         Ok(controls) => match may_use_command(&controls, member, command_name) {
             AccessDecision::Allow => None,
-            AccessDecision::Deny(reason) => Some(ephemeral_response(access_denied_text(reason))),
+            AccessDecision::Deny(reason) => Some((
+                ephemeral_response(access_denied_text(reason)),
+                EmbedKind::Danger,
+            )),
         },
-        Err(_) if !member.is_admin => Some(ephemeral_response(
-            "Voice-room settings are unavailable right now. Try again shortly.",
+        Err(_) if !member.is_admin => Some((
+            ephemeral_response("Voice-room settings are unavailable right now. Try again shortly."),
+            EmbedKind::Warn,
         )),
         Err(_) => None,
     }
@@ -14432,17 +14448,17 @@ where
     // members: only an admin proceeds without them.
     let member = access_member(interaction, runtime.guild_permissions(interaction));
     let (gate_store, _) = runtime.make_pair();
-    if let Some(denial) = command_gate(&gate_store, guild_id, &member, command.name()).await {
-        if matches!(command, VoiceCommand::Limit(_) | VoiceCommand::Unlimit) {
-            let text = denial.data.as_ref().and_then(|data| data.content.clone());
-            if let Some(text) = text {
-                let kind = if text
-                    == "Voice-room settings are unavailable right now. Try again shortly."
-                {
-                    two_bot_discord::brand::EmbedKind::Warn
-                } else {
-                    two_bot_discord::brand::EmbedKind::Danger
-                };
+    if let Some((denial, kind)) =
+        command_gate_classified(&gate_store, guild_id, &member, command.name()).await
+    {
+        if matches!(
+            command,
+            VoiceCommand::Limit(_)
+                | VoiceCommand::Unlimit
+                | VoiceCommand::Ping
+                | VoiceCommand::Invite
+        ) {
+            if let Some(text) = denial.data.as_ref().and_then(|data| data.content.clone()) {
                 reply(limit::limit_response(text, kind)).await;
                 return true;
             }
@@ -14453,11 +14469,20 @@ where
     match command {
         VoiceCommand::Ping => {
             let latency = interaction_latency_ms(interaction.id.get(), unix_now_ms());
-            reply(ephemeral_response(&ping_render(latency))).await;
+            reply(limit::limit_response(
+                ping_render(latency),
+                two_bot_discord::brand::EmbedKind::Ok,
+            ))
+            .await;
             true
         }
         VoiceCommand::Invite => {
-            reply(ephemeral_response(&invite_render(invite_code))).await;
+            let kind = match invite_code {
+                Some(code) if is_valid_invite_code(code) => two_bot_discord::brand::EmbedKind::Ok,
+                None | Some("") => two_bot_discord::brand::EmbedKind::Warn,
+                Some(_) => two_bot_discord::brand::EmbedKind::Danger,
+            };
+            reply(limit::limit_response(invite_render(invite_code), kind)).await;
             true
         }
         VoiceCommand::MyRoom => {
@@ -15542,7 +15567,12 @@ fn limit_completion_embed<'a>(
 ) -> Option<&'a twilight_model::channel::message::Embed> {
     if !matches!(
         parse_voice_command(interaction),
-        Some(VoiceCommand::Limit(_) | VoiceCommand::Unlimit)
+        Some(
+            VoiceCommand::Limit(_)
+                | VoiceCommand::Unlimit
+                | VoiceCommand::Ping
+                | VoiceCommand::Invite
+        )
     ) {
         return None;
     }
