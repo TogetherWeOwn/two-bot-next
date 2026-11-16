@@ -14462,26 +14462,28 @@ where
         }
         VoiceCommand::MyRoom => {
             let Some(actor_id) = invoker_member_id(interaction) else {
-                reply(ephemeral_response(
-                    "I couldn't tell who invoked /myroom — try again.",
+                reply(limit::limit_response(
+                    "I couldn't tell who invoked /myroom — try again.".to_owned(),
+                    two_bot_discord::brand::EmbedKind::Danger,
                 ))
                 .await;
                 return true;
             };
-            let text = runtime
-                .run_myrooms(guild_id, actor_id)
-                .await
-                .map(|answer| myroom_render(&answer.rooms, answer.creation_available))
-                .unwrap_or_else(|| {
-                    // A known worker that never answered is a transient
-                    // failure, not a cold cache.
-                    if runtime.has_actor(guild_id) {
-                        WORKER_LOST_REPLY.to_owned()
+            let (text, kind) = match runtime.run_myrooms(guild_id, actor_id).await {
+                Some(answer) => (
+                    myroom_render(&answer.rooms, answer.creation_available),
+                    two_bot_discord::brand::EmbedKind::Ok,
+                ),
+                None => {
+                    let text = if runtime.has_actor(guild_id) {
+                        WORKER_LOST_REPLY
                     } else {
-                        "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
-                    }
-                });
-            reply(ephemeral_response(&text)).await;
+                        "The voice worker isn't warmed up yet — try again in a moment."
+                    };
+                    (text.to_owned(), two_bot_discord::brand::EmbedKind::Warn)
+                }
+            };
+            reply(limit::limit_response(text, kind)).await;
             true
         }
         VoiceCommand::Access(action) => {
@@ -15542,7 +15544,7 @@ fn limit_completion_embed<'a>(
 ) -> Option<&'a twilight_model::channel::message::Embed> {
     if !matches!(
         parse_voice_command(interaction),
-        Some(VoiceCommand::Limit(_) | VoiceCommand::Unlimit)
+        Some(VoiceCommand::Limit(_) | VoiceCommand::Unlimit | VoiceCommand::MyRoom)
     ) {
         return None;
     }

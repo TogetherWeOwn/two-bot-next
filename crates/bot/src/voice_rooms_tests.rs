@@ -5480,7 +5480,11 @@ fn response_text(response: &InteractionResponse) -> String {
     response
         .data
         .as_ref()
-        .and_then(|data| data.content.clone())
+        .and_then(|data| {
+            data.content
+                .clone()
+                .or_else(|| data.embeds.as_ref()?.first()?.description.clone())
+        })
         .unwrap_or_default()
 }
 

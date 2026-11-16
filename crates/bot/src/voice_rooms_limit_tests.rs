@@ -37,12 +37,14 @@ fn completion_routes_only_single_embed_limit_replies() {
     let limit = limit_interaction(MEMBER, Vec::new());
     let unlimit = voice_interaction_as(Some(command_data("unlimit", Vec::new())), None, MEMBER);
     let other = voice_interaction_as(Some(command_data("lock", Vec::new())), None, MEMBER);
+    let myroom = voice_interaction_as(Some(command_data("myroom", Vec::new())), None, MEMBER);
     let response = super::super::limit::limit_response(
         "A reply".to_owned(),
         two_bot_discord::brand::EmbedKind::Ok,
     );
     assert!(limit_completion_embed(&limit, &response).is_some());
     assert!(limit_completion_embed(&unlimit, &response).is_some());
+    assert!(limit_completion_embed(&myroom, &response).is_some());
     assert!(limit_completion_embed(&other, &response).is_none());
 
     let mut mixed = response.clone();
@@ -67,6 +69,32 @@ fn completion_routes_only_single_embed_limit_replies() {
     embeds.push(embeds[0].clone());
     assert!(limit_completion_embed(&limit, &mixed).is_none());
     assert!(limit_completion_embed(&limit, &ephemeral_response("plain text")).is_none());
+}
+
+#[tokio::test]
+async fn myroom_cold_worker_returns_warning_embed() {
+    let runtime = test_runtime(Trace::default());
+    let interaction = voice_interaction_as(
+        Some(command_data("myroom", Vec::new())),
+        Some(Permissions::empty()),
+        MEMBER,
+    );
+    let seen = Arc::new(Mutex::new(None));
+    let capture = seen.clone();
+    assert!(
+        handle_voice_interaction(&runtime, &interaction, move |response| {
+            *capture.lock().unwrap() = Some(response);
+            async {}
+        })
+        .await
+    );
+    let response = seen.lock().unwrap().clone().expect("reply");
+    assert_limit_embed(
+        &response,
+        two_bot_discord::brand::EmbedKind::Warn,
+        "The voice worker isn't warmed up yet — try again in a moment.",
+    );
+    assert!(limit_completion_embed(&interaction, &response).is_some());
 }
 
 #[tokio::test]
