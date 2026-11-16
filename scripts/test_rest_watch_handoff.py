@@ -32,14 +32,14 @@ class HandoffTest(unittest.TestCase):
                        "evidence": {"reference": "verified-by-handoff-adapter"}}
         self.claimed = set()
 
-    def claim(self, record):
+    def claim(self, record, limits):
         if record["handoff_id"] in self.claimed:
             return False
         self.claimed.add(record["handoff_id"])
         return True
 
     def start(self, record=None, **overrides):
-        args = {"now_ms": 80001, "monotonic_ms": 80000, "clock_domain": "clock",
+        args = {"clock": lambda: (80001, 80000, "clock"), "clock_domain": "clock",
                 "verify_handoff": lambda item: True, "claim": self.claim,
                 "ledger": lambda *args: True, "verify_sample": lambda sample, proof, expected: True}
         args.update(overrides)
@@ -66,7 +66,7 @@ class HandoffTest(unittest.TestCase):
                 if case == "clock":
                     overrides["clock_domain"] = "different"
                 elif case == "stale":
-                    overrides["monotonic_ms"] = 109001
+                    overrides["clock"] = lambda: (109002, 109001, "clock")
                 elif case == "baseline":
                     record["baseline"]["global"] = [0, 11]
                 elif case == "sparse":
@@ -94,7 +94,54 @@ class HandoffTest(unittest.TestCase):
             self.start(verify_handoff=lambda item: False)
         self.assertFalse(self.claimed)
         with self.assertRaises(EvidenceError):
-            self.start(claim=lambda item: False)
+            self.start(claim=lambda item, limits: False)
+
+    def test_claim_receives_fixed_deadlines_and_lower_bounds(self):
+        readings = iter(((80001, 80000, "clock"), (81001, 81000, "clock"),
+                         (109001, 109000, "clock")))
+        seen = []
+        def claim(record, limits):
+            seen.append(limits)
+            return True
+        self.start(clock=lambda: next(readings), claim=claim)
+        self.assertEqual(seen, [{"clock_domain": "clock", "wall_not_before": 81001,
+                                 "tick_not_before": 81000, "wall_deadline": 109001,
+                                 "tick_deadline": 109000}])
+
+    def test_late_or_discontinuous_clock_never_returns_a_claim(self):
+        initial = (80001, 80000, "clock")
+        valid = (81001, 81000, "clock")
+        for readings in ((initial, (109002, 81000, "clock")),
+                         (initial, (81001, 109001, "clock")),
+                         (initial, (80000, 81000, "clock")),
+                         (initial, (81001, 79999, "clock")),
+                         (initial, (81001, 81000, "other")),
+                         (initial, valid, (109002, 81000, "clock")),
+                         (initial, valid, (81001, 109001, "clock")),
+                         (initial, valid, (81000, 81000, "clock")),
+                         (initial, valid, (81001, 80999, "clock")),
+                         (initial, valid, (81001, 81000, "other"))):
+            with self.subTest(readings=readings):
+                clock = iter(readings)
+                calls = []
+                with self.assertRaises(EvidenceError):
+                    self.start(clock=lambda: next(clock),
+                               claim=lambda *args: calls.append(args) or True)
+                self.assertEqual(len(calls), int(len(readings) == 3))
+
+    def test_claim_error_or_ambiguous_result_does_not_prove_no_transfer(self):
+        for outcome in (None, 1, ValueError("private")):
+            with self.subTest(outcome=outcome):
+                transferred = []
+                def claim(record, limits):
+                    transferred.append(record["handoff_id"])
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+                with self.assertRaises(EvidenceError) as caught:
+                    self.start(claim=claim)
+                self.assertEqual(transferred, ["handoff"])
+                self.assertNotIn("private", str(caught.exception))
 
     def test_original_proof_contexts_and_binding_are_verified(self):
         seen = []
@@ -150,7 +197,7 @@ class HandoffTest(unittest.TestCase):
                 self.assertFalse(self.claimed)
 
     def test_raw_input_is_bounded_and_duplicate_keys_are_refused(self):
-        options = dict(now_ms=80001, monotonic_ms=80000, clock_domain="clock",
+        options = dict(clock=lambda: (80001, 80000, "clock"), clock_domain="clock",
                        verify_handoff=lambda item: True, claim=self.claim,
                        ledger=lambda *args: True, verify_sample=lambda *args: True)
         nonfinite = copy.deepcopy(self.record)

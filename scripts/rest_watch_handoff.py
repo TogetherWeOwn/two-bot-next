@@ -27,23 +27,40 @@ def _id(value):
     return type(value) is str and IDENTIFIER.fullmatch(value) is not None
 
 
-def claim_handoff(raw, *, now_ms, monotonic_ms, clock_domain, verify_handoff,
-                  claim, ledger, verify_sample):
+def claim_handoff(raw, *, clock_domain, clock, verify_handoff, claim, ledger, verify_sample):
     """Verify a bounded record and atomically claim it once, or fail closed.
 
     ``verify_handoff(record)`` must authenticate the entire record and establish
     provenance, initial journeys, baseline admission, snapshot revalidation,
     ownership fencing, inventory completeness and trusted clock/timing. The
-    atomic ``claim(record)`` must persist exclusive transfer and replay state in
-    the same transaction (or recoverably), returning exactly True only on success.
-    At the transaction boundary it must recheck the trusted clock domain and
-    anchor deadline: verification time cannot extend the 30-second sample budget.
-    A crash or ambiguous claim is a failure requiring integrator-owned recovery;
-    neither callback is a production implementation. Sample proofs are passed to ``verify_sample(sample, proof, expected)`` in
-    their original contexts. These are trust-boundary contracts, not adapters.
-    The caller retains initial ownership until claim succeeds.
+    ``clock()`` supplies trusted (wall_ms, monotonic_ms, domain) readings.
+    ``claim(record, limits)`` must atomically check that same clock domain and
+    both inclusive deadlines, and persist exclusive transfer and replay state
+    together. It must reject clock regression from limits' lower bounds and
+    return exactly True only on a known committed claim. These transaction-boundary
+    requirements are adapter obligations: local readings cannot prove atomicity.
+    A late return, exception or ambiguous claim requires integrator-owned recovery;
+    failure does not prove that ownership stayed with the caller. Sample proofs
+    are passed to ``verify_sample(sample, proof, expected)`` in their original
+    contexts. None of these callbacks is a production implementation.
     """
     try:
+        if not callable(clock) or not _id(clock_domain):
+            raise EvidenceError("invalid clock")
+        previous = None
+
+        def read_clock():
+            nonlocal previous
+            wall, tick, domain = clock()
+            if (type(wall) is not int or type(tick) is not int
+                    or not 0 <= wall <= MAX_COUNTER or not 0 <= tick <= MAX_COUNTER
+                    or domain != clock_domain
+                    or (previous is not None and (wall < previous[0] or tick < previous[1]))):
+                raise EvidenceError("invalid clock reading")
+            previous = (wall, tick)
+            return wall, tick
+
+        now_ms, monotonic_ms = read_clock()
         record = parse_samples(raw)
         keys = {"kind", "version", "contract", "handoff_id", "clock_domain",
                 "mutation_tick", "transition_tick", "snapshot", "candidate_expected",
@@ -115,8 +132,18 @@ def claim_handoff(raw, *, now_ms, monotonic_ms, clock_domain, verify_handoff,
         sequence = SampleSequence(anchor, initial["proofs"][1], expected, ledger, verify_sample)
         if verify_handoff(copy.deepcopy(record)) is not True:
             raise EvidenceError("handoff authentication failed")
-        if claim(copy.deepcopy(record)) is not True:
-            raise EvidenceError("handoff claim failed")
+        wall_deadline = min(anchor["end_ms"] + 30000, MAX_COUNTER)
+        tick_deadline = min(anchor["monotonic_ms"] + 30000, MAX_COUNTER)
+        wall, tick = read_clock()
+        if wall > wall_deadline or tick > tick_deadline:
+            raise EvidenceError("handoff expired")
+        limits = {"clock_domain": clock_domain, "wall_not_before": wall,
+                  "tick_not_before": tick, "wall_deadline": wall_deadline,
+                  "tick_deadline": tick_deadline}
+        claimed = claim(copy.deepcopy(record), copy.deepcopy(limits))
+        wall, tick = read_clock()
+        if claimed is not True or wall > wall_deadline or tick > tick_deadline:
+            raise EvidenceError("handoff claim failed or expired")
         return record, sequence, schedule
     except Exception:
         raise EvidenceError("invalid or unverified watch handoff") from None
