@@ -387,7 +387,8 @@ def consumer_errors(callee_name, callee):
     text = str(consumer).lower()
     if "ownership_control" in text or "staging-use.mjs" in text:
         errors.append(f"{callee_name}: live consumer job holds the staging control credential")
-    if bare(consumer.get("if")) not in ("", MAIN_ONLY) or "continue-on-error" in consumer:
+    permitted_gates = ("", MAIN_ONLY, MAIN_ONLY + " && (!inputs.deploy_staging_call || github.run_attempt == 1)")
+    if bare(consumer.get("if")) not in permitted_gates or "continue-on-error" in consumer:
         errors.append(f"{callee_name}: live consumer must keep the main-only, "
                       "success-gated, failure-propagating gate")
     needs = consumer.get("needs")
@@ -402,10 +403,11 @@ def consumer_errors(callee_name, callee):
             env = step.get("env") or {}
             bound = all(str(env.get(var, "")).replace(" ", "") ==
                         f"${{{{inputs.{name}}}}}" for name, var in INHERITED.items())
-            # Only the inherited-path guard may skip the assert; its job keeps
-            # the plain main-only gate so a skip cannot silently skip consumers.
+            # The attempt guard also skips the consumer on a refused deploy rerun.
             gated_off = (bare(step.get("if")) not in ("", INHERITED_GUARD)
-                         or bare(owner.get("if")) not in ("", MAIN_ONLY))
+                         or bare(owner.get("if")) not in permitted_gates
+                         or (bare(owner.get("if")) == permitted_gates[2]
+                             and bare(consumer.get("if")) != permitted_gates[2]))
             if (before and bound
                     and str(env.get("OWNERSHIP_CONTROL_TOKEN", "")) == OWNERSHIP_TOKEN
                     and "continue-on-error" not in step and "continue-on-error" not in owner
@@ -940,6 +942,12 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_checked_in_workflows_meet_the_full_window_contract(self):
         self.assertEqual(lifecycle_errors(load_all()), [])
+
+    def test_prepared_window_cannot_skip_an_unguarded_consumer(self):
+        workflows = load_all()
+        workflows[VOICE]["jobs"]["synthetic"]["if"] = MAIN_ONLY
+        self.assertTrue(any("no authenticated window/readiness assert" in error
+                            for error in lifecycle_errors(workflows)))
 
 
 class LockOracleControls(unittest.TestCase):
