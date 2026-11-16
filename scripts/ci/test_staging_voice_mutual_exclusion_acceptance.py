@@ -1750,7 +1750,8 @@ class ExistingSafetyControls(unittest.TestCase):
         self.assertEqual(voice["on"]["schedule"], [{"cron": "41 */6 * * *"}])
         self.assertEqual(deploy["on"]["push"]["branches"], ["main"])
         job = voice["jobs"]["synthetic"]
-        self.assertEqual(job["if"], "github.ref == 'refs/heads/main'")
+        self.assertEqual(job["if"], "github.ref == 'refs/heads/main' && "
+                         "(!inputs.deploy_staging_call || github.run_attempt == 1)")
         self.assertEqual(job["environment"], "voice-synthetic")
         self.assertEqual(job["timeout-minutes"], "10")
         self.assertEqual(job["permissions"], {"contents": "read"})

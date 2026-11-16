@@ -10704,7 +10704,8 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("deploy-production.yml", "promotion-skipped"):
                         # No checkout or API access: only report and upload a receipt.
                         expected = {}
-                    elif (name, job_id) == ("gradual-promote-proof.yml", "admission-hold"):
+                    elif (name, job_id) in (("gradual-promote-proof.yml", "admission-hold"),
+                                            ("voice-synthetic.yml", "rerun-refusal")):
                         # Refuses before checkout or API access.
                         expected = {}
                     elif (name, job_id) == ("daily-digest.yml", "digest"):
