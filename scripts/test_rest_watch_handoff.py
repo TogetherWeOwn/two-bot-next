@@ -4,7 +4,7 @@ import unittest
 
 from rest_evidence_continuity import EvidenceError
 from rest_watch_controls import ControlGuard
-from rest_watch_handoff import claim_handoff
+from rest_watch_handoff import claim_handoff, claim_recovery
 
 
 class HandoffTest(unittest.TestCase):
@@ -208,6 +208,110 @@ class HandoffTest(unittest.TestCase):
                 with self.assertRaises(EvidenceError):
                     claim_handoff(raw, **options)
                 self.assertFalse(self.claimed)
+
+
+class RecoveryClaimTest(unittest.TestCase):
+    def setUp(self):
+        self.binding = {key: key for key in (
+            "contract", "handoff_id", "handoff_digest", "environment", "candidate", "prior",
+            "challenge", "snapshot_digest", "operation_id", "claimant", "incarnation", "owner", "clock_domain")}
+        candidate = {"environment": "production", "sha": "a" * 40, "build": "build",
+                     "deployment": "deploy", "worker": "worker", "image": "sha256:" + "b" * 64,
+                     "run": 1, "attempt": 1, "challenge": "challenge"}
+        self.binding.update(run=1, attempt=1, generation=1, environment="production",
+                            candidate=candidate, prior=dict(candidate, deployment="old"),
+                            handoff_digest="sha256:" + "c" * 64, snapshot_digest="sha256:" + "d" * 64)
+        self.record = {"kind": "sparse_rest_watch_recovery_claim", "version": 1,
+                       "binding": copy.deepcopy(self.binding),
+                       "timing": {"policy": "policy", "origin": "origin", "cutoffs": [
+                           {"wall_ms": 200, "tick_ms": 190}, {"wall_ms": 180, "tick_ms": 210}]},
+                       "evidence": {key: key for key in
+                                    ("readback", "controller_fence", "external_fence", "checkpoint")}}
+        self.calls = []
+
+    def start(self, record=None, **kwargs):
+        options = {"expected": self.binding, "clock": lambda: (100, 100, "clock_domain"),
+                   "verify_recovery": lambda *args: True,
+                   "claim": lambda record, limits: self.calls.append((record, limits)) or True}
+        options.update(kwargs)
+        return claim_recovery(json.dumps(self.record if record is None else record).encode(), **options)
+
+    def test_fixed_earliest_deadlines_and_boundary(self):
+        readings = iter(((100, 100, "clock_domain"), (150, 160, "clock_domain"),
+                         (180, 190, "clock_domain")))
+        self.assertTrue(self.start(clock=lambda: next(readings)))
+        self.assertEqual(self.calls[0][1], {"clock_domain": "clock_domain", "wall_not_before": 150,
+                                            "tick_not_before": 160, "wall_deadline": 180,
+                                            "tick_deadline": 190})
+
+    def test_missing_or_conflicting_prerequisites_fail_before_claim(self):
+        for case in ("binding", "generation", "bool_generation", "timing", "fence", "checkpoint", "auth"):
+            with self.subTest(case=case):
+                record = copy.deepcopy(self.record)
+                options = {}
+                if case == "binding":
+                    record["binding"]["operation_id"] = "other"
+                elif case == "generation":
+                    record["binding"]["generation"] = 2
+                elif case == "bool_generation":
+                    record["binding"]["generation"] = True
+                elif case == "timing":
+                    record["timing"]["cutoffs"] = []
+                elif case == "fence":
+                    record["evidence"].pop("external_fence")
+                elif case == "checkpoint":
+                    record["evidence"]["checkpoint"] = True
+                else:
+                    options["verify_recovery"] = lambda *args: False
+                with self.assertRaises(EvidenceError):
+                    self.start(record, **options)
+                self.assertFalse(self.calls)
+
+    def test_latency_regression_domain_and_overflow_fail_closed(self):
+        initial = (100, 100, "clock_domain")
+        valid = (150, 150, "clock_domain")
+        for readings in ((initial, (181, 150, "clock_domain")),
+                         (initial, (150, 191, "clock_domain")),
+                         (initial, (99, 150, "clock_domain")),
+                         (initial, (150, 99, "clock_domain")),
+                         (initial, (150, 150, "other")),
+                         (initial, (2**64, 150, "clock_domain")),
+                         (initial, valid, (181, 150, "clock_domain")),
+                         (initial, valid, (150, 191, "clock_domain"))):
+            with self.subTest(readings=readings):
+                clock = iter(readings)
+                with self.assertRaises(EvidenceError):
+                    self.start(clock=lambda: next(clock))
+                self.calls.clear()
+
+    def test_mock_claim_rejects_replay_without_extending_deadlines(self):
+        consumed = set()
+        limits_seen = []
+        def claim(record, limits):
+            limits_seen.append(limits)
+            operation = record["binding"]["operation_id"]
+            if operation in consumed:
+                return False
+            consumed.add(operation)
+            return True
+        self.assertTrue(self.start(claim=claim))
+        with self.assertRaises(EvidenceError):
+            self.start(claim=claim)
+        self.assertEqual(limits_seen[0], limits_seen[1])
+
+    def test_ambiguous_committed_claim_does_not_report_success(self):
+        for outcome in (False, 1, None, ValueError("private")):
+            with self.subTest(outcome=outcome):
+                committed = []
+                def claim(record, limits):
+                    committed.append(record["binding"]["operation_id"])
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+                with self.assertRaises(EvidenceError) as caught:
+                    self.start(claim=claim)
+                self.assertEqual(committed, ["operation_id"])
+                self.assertNotIn("private", str(caught.exception))
 
 
 class ControlGuardTest(unittest.TestCase):

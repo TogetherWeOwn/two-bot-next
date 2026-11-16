@@ -8,7 +8,7 @@ responsibility. It is never a watch or deployment pass.
 import copy
 import math
 
-from rest_evidence_continuity import EvidenceError, IDENTIFIER, MAX_COUNTER, MAX_SERIES, parse_samples, validate_continuity
+from rest_evidence_continuity import DIGEST, EvidenceError, IDENTIFIER, MAX_COUNTER, MAX_SERIES, _identity, parse_samples, validate_continuity
 from rest_watch_window import RESULTS, WindowSchedule, assess_window
 from rest_watch_sequence import SampleSequence
 
@@ -25,6 +25,102 @@ def _finite(value):
 
 def _id(value):
     return type(value) is str and IDENTIFIER.fullmatch(value) is not None
+
+
+def claim_recovery(raw, *, expected, clock, verify_recovery, claim):
+    """Validate an inactive recovery responsibility claim, not a recovery action.
+
+    The trusted expected binding is supplied independently of the envelope. The
+    verifier authenticates the complete envelope, its frozen timing provenance,
+    authoritative readback, effective controller and external fences, and the
+    reconciliation checkpoint. Evidence identifiers are references, not proof.
+    The claim adapter must revalidate all of those at one atomic CAS commit,
+    including authorization, generation, replay consumption and both inclusive
+    deadlines, then persist the new responsibility and immutable result together.
+    It returns exactly True only for a known committed claim. No adapter is supplied.
+
+    A failure after invoking the adapter may hide a committed claim. Reconcile by
+    operation and generation; never infer retained ownership or retry blindly. This
+    API does not reopen a watch or establish recovery, external fencing or health.
+    """
+    try:
+        if any(not callable(item) for item in (clock, verify_recovery, claim)):
+            raise EvidenceError("missing adapter")
+        binding_keys = {"contract", "handoff_id", "handoff_digest", "environment",
+                        "candidate", "prior", "run", "attempt", "challenge",
+                        "snapshot_digest", "operation_id", "claimant", "incarnation",
+                        "owner", "generation", "clock_domain"}
+        if (type(expected) is not dict or set(expected) != binding_keys
+                or any(not _id(expected[key]) for key in binding_keys - {
+                    "run", "attempt", "generation", "candidate", "prior", "handoff_digest", "snapshot_digest"})
+                or any(type(expected[key]) is not int or not 1 <= expected[key] < MAX_COUNTER
+                       for key in ("run", "attempt", "generation"))
+                or any(type(expected[key]) is not str or DIGEST.fullmatch(expected[key]) is None
+                       for key in ("handoff_digest", "snapshot_digest"))):
+            raise EvidenceError("invalid expected binding")
+        _identity(expected["candidate"])
+        _identity(expected["prior"])
+        if (expected["candidate"] == expected["prior"]
+                or any(expected["candidate"][key] != expected[key]
+                       for key in ("environment", "run", "attempt", "challenge"))):
+            raise EvidenceError("inconsistent identity")
+        expected = copy.deepcopy(expected)
+        previous = None
+
+        def read_clock():
+            nonlocal previous
+            wall, tick, domain = clock()
+            if (type(wall) is not int or type(tick) is not int
+                    or not 0 <= wall <= MAX_COUNTER or not 0 <= tick <= MAX_COUNTER
+                    or domain != expected["clock_domain"]
+                    or (previous is not None and (wall < previous[0] or tick < previous[1]))):
+                raise EvidenceError("invalid clock")
+            previous = wall, tick
+            return previous
+
+        wall, tick = read_clock()
+        record = parse_samples(raw)
+        if (type(record) is not dict or set(record) != {"kind", "version", "binding", "timing", "evidence"}
+                or record["kind"] != "sparse_rest_watch_recovery_claim"
+                or type(record["version"]) is not int or record["version"] != 1
+                or type(record["binding"]) is not dict or record["binding"] != expected
+                or any(type(record["binding"].get(key)) is not int for key in ("run", "attempt", "generation"))):
+            raise EvidenceError("invalid recovery envelope")
+        _identity(record["binding"]["candidate"])
+        _identity(record["binding"]["prior"])
+        timing = record["timing"]
+        if (type(timing) is not dict or set(timing) != {"policy", "origin", "cutoffs"}
+                or not _id(timing["policy"]) or not _id(timing["origin"])
+                or type(timing["cutoffs"]) is not list or not 1 <= len(timing["cutoffs"]) <= 16):
+            raise EvidenceError("missing frozen timing")
+        for cutoff in timing["cutoffs"]:
+            if (type(cutoff) is not dict or set(cutoff) != {"wall_ms", "tick_ms"}
+                    or any(type(cutoff[key]) is not int or not 0 <= cutoff[key] <= MAX_COUNTER
+                           for key in ("wall_ms", "tick_ms"))):
+                raise EvidenceError("invalid cutoff")
+        wall_deadline = min(item["wall_ms"] for item in timing["cutoffs"])
+        tick_deadline = min(item["tick_ms"] for item in timing["cutoffs"])
+        evidence = record["evidence"]
+        if (type(evidence) is not dict
+                or set(evidence) != {"readback", "controller_fence", "external_fence", "checkpoint"}
+                or any(not _id(value) for value in evidence.values())
+                or wall > wall_deadline or tick > tick_deadline):
+            raise EvidenceError("missing or expired prerequisites")
+        if verify_recovery(copy.deepcopy(record), copy.deepcopy(expected)) is not True:
+            raise EvidenceError("recovery authentication failed")
+        wall, tick = read_clock()
+        if wall > wall_deadline or tick > tick_deadline:
+            raise EvidenceError("recovery claim expired")
+        limits = {"clock_domain": expected["clock_domain"], "wall_not_before": wall,
+                  "tick_not_before": tick, "wall_deadline": wall_deadline,
+                  "tick_deadline": tick_deadline}
+        claimed = claim(copy.deepcopy(record), copy.deepcopy(limits))
+        wall, tick = read_clock()
+        if claimed is not True or wall > wall_deadline or tick > tick_deadline:
+            raise EvidenceError("recovery claim failed or expired")
+        return True
+    except Exception:
+        raise EvidenceError("invalid or unverified recovery claim") from None
 
 
 def claim_handoff(raw, *, clock_domain, clock, verify_handoff, claim, ledger, verify_sample):
