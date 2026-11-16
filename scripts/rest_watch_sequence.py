@@ -23,7 +23,7 @@ class SampleSequence:
         self._verifier = verifier
         self._failed = False
 
-    def accept(self, sample, proof, *, now_ms, monotonic_ms):
+    def accept(self, sample, proof, *, now_ms, monotonic_ms, before_claim=None):
         """Verify both bookends, then claim the endpoint before returning it.
 
         The ledger receives previous sample/proof, current sample/proof and
@@ -51,6 +51,8 @@ class SampleSequence:
 
             validate_continuity([previous, current], self._expected, now_ms=now_ms,
                                 monotonic_ms=monotonic_ms, verify_sample=verify)
+            if before_claim is not None:
+                before_claim(copy.deepcopy(current))
             if self._ledger(copy.deepcopy(previous), copy.deepcopy(old_proof),
                             copy.deepcopy(current), copy.deepcopy(new_proof),
                             copy.deepcopy(self._expected)) is not True:
