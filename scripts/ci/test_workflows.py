@@ -816,7 +816,7 @@ def staging_error_rate_gate_errors(workflows):
     if staging.get("run-name") != REHEARSAL_RUN_NAME:
         errors.append("deploy-staging.yml: rehearsal identity must be pinned to the dispatch-only switch")
     hold = ((staging.get("jobs") or {}).get("soak-hold") or {}).get("steps") or []
-    if len(hold) != 1 or hold[0].get("env") != SOAK_HOLD_ENV:
+    if len(hold) != 2 or hold[0].get("env") != SOAK_HOLD_ENV:
         errors.append("deploy-staging.yml: rehearsal must honor the soak hold")
     steps = ((staging.get("jobs") or {}).get("deploy") or {}).get("steps") or []
     armed = [step for step in steps
@@ -902,10 +902,9 @@ def staging_pinned_sha_errors(workflows):
     exit count so no refusal can go green. The workflow-ref refusal comes
     first: the job must itself run from `refs/heads/main`, an in-file
     fail-closed backstop behind the Environment branch policy (a job-level
-    `if:` would skip silently instead, so the job still carries none). Exactly nine reads exist (three checkout refs, three
-    SHA-step envs, the schema gate's --source-sha env, the user-flow
-    synthetic's expected SHA, the history guard's comparison env): eight use
-    the pinned expression and the ninth is the guard's raw pin-vs-head
+    `if:` would skip silently instead, so the job still carries none). Ten reads exist (three checkout refs, three
+    SHA-step envs, schema gate, user-flow, admission and history guard): nine use
+    the pinned expression and the last is the guard's raw pin-vs-head
     comparison, so no other step can resolve or judge a different commit. Build identity and provenance then follow the
     validated SHA through the deploy job's DEPLOY_SHA export, pinned by
     staging_deploy_identity_errors. Every other workflow must not mention the
@@ -920,11 +919,10 @@ def staging_pinned_sha_errors(workflows):
             errors.append(f"{name}: pinned-sha marker inputs.sha outside the deploy workflows")
     staging = workflows.get("deploy-staging.yml") or {}
     text = str(staging)
-    if text.count("inputs.sha") != 9:
-        errors.append("deploy-staging.yml: sha must be read exactly nine times "
-                      "(three checkouts, three SHA steps, the schema gate env, "
-                      "the user-flow synthetic expected SHA, the history guard comparison)")
-    if text.count(DEPLOY_SHA_EXPRESSION) != 8:
+    if text.count("inputs.sha") != 10:
+        errors.append("deploy-staging.yml: sha must be read exactly ten times "
+                      "(three checkouts, three SHA steps, schema, user-flow, admission and history guard)")
+    if text.count(DEPLOY_SHA_EXPRESSION) != 9:
         errors.append("deploy-staging.yml: every sha read but the history guard comparison "
                       "must use the pinned dispatch-or-head expression")
     jobs = staging.get("jobs") or {}
@@ -1085,7 +1083,7 @@ def soak_hold_errors(workflow, name="deploy-staging.yml"):
     production guard accepts a successful staging run as staging history, so
     a quiet skip would void that leg). Explicit arm/disarm dispatches
     proceed, but error-rate proofs honor the hold. One job runs first on every
-    trigger (no `if:`, no `needs:`, no environment, no checkout): a single step
+    trigger (no `if:`, no `needs:`, no environment, no checkout): the first step
     binds the hold deadline, event and pinned dispatch-only proof flag. It
     exits 0 for a non-proof dispatch, empty var or expired deadline (fail open),
     and exits 1 for an unparsable or over-long value
@@ -1114,9 +1112,23 @@ def soak_hold_errors(workflow, name="deploy-staging.yml"):
     if "secrets." in text:
         errors.append(f"{name}:soak-hold: must never read secrets")
     steps = job.get("steps", [])
-    if len(steps) != 1 or any("if" in step or "continue-on-error" in step for step in steps):
-        errors.append(f"{name}:soak-hold: must run exactly one unconditional check step")
+    if len(steps) != 2 or any("if" in step or "continue-on-error" in step for step in steps):
+        errors.append(f"{name}:soak-hold: must run both unconditional check steps")
         return errors
+    admission = {
+        "name": "Require admitted staging SHA",
+        "env": {"SOURCE_SHA": DEPLOY_SHA_EXPRESSION, "ADMITTED_SHA": "${{ vars.STAGING_ADMITTED_SHA }}"},
+        "run": 'set -euo pipefail\n'
+               'case "$SOURCE_SHA" in\n'
+               '  *[!0-9a-f]*|\'\') echo "::error::Staging SHA must be a full 40-hex commit SHA."; exit 1 ;;\n'
+               'esac\n'
+               'if [ "${#SOURCE_SHA}" -ne 40 ] || [ "$SOURCE_SHA" != "$ADMITTED_SHA" ]; then\n'
+               '  echo "::error::Staging deployment is held: commit is not admitted."\n'
+               '  exit 1\n'
+               'fi\n',
+    }
+    if steps[1] != admission:
+        errors.append(f"{name}:soak-hold: must require the exact admitted SHA")
     step = steps[0]
     if step.get("env") != SOAK_HOLD_ENV:
         errors.append(f"{name}:soak-hold: step must bind exactly the hold deadline, event and rehearsal "
@@ -7698,6 +7710,32 @@ class WorkflowTests(unittest.TestCase):
                 mutate(changed)
                 self.assertTrue(cloudflare_environment_errors(changed), label)
                 self.assertTrue(workflow_policy_errors(changed), label)
+
+    def test_deploy_staging_admission_refuses_unaccepted_sha(self):
+        workflow = self.workflows["deploy-staging.yml"]
+        jobs = workflow["jobs"]
+        self.assertEqual(jobs["schema-gate"]["needs"], "soak-hold")
+        self.assertEqual(jobs["roles-gate"]["needs"], "soak-hold")
+        self.assertEqual(set(jobs["deploy"]["needs"]), {"schema-gate", "roles-gate"})
+        self.assertNotIn("soak-hold", jobs["staging-use-release"]["needs"])
+        step = jobs["soak-hold"]["steps"][1]
+        sha = "a" * 40
+        for source, admitted, allowed in ((sha, sha, True), (sha, "", False),
+                                          (sha, "b" * 40, False), ("", "", False),
+                                          ("a" * 39, "a" * 39, False),
+                                          ("g" * 40, "g" * 40, False),
+                                          ("A" * 40, "A" * 40, False)):
+            with self.subTest(source=source, admitted=admitted):
+                result = subprocess.run(["bash", "-e", "-c", step["run"]],
+                                        env={**os.environ, "SOURCE_SHA": source, "ADMITTED_SHA": admitted},
+                                        capture_output=True, text=True, check=False, timeout=10)
+                self.assertEqual(result.returncode == 0, allowed)
+        for mutation in (lambda s: s.pop(), lambda s: s[-1].update({"if": "false"}),
+                         lambda s: s[-1].update({"continue-on-error": "true"}),
+                         lambda s: s[-1].update({"run": "exit 0\n"})):
+            changed = deepcopy(workflow)
+            mutation(changed["jobs"]["soak-hold"]["steps"])
+            self.assertTrue(soak_hold_errors(changed))
 
     def test_pinned_sha_is_dispatch_only_and_ancestor_checked(self):
         workflows = self.workflows

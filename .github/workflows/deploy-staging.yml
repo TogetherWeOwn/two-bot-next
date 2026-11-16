@@ -94,13 +94,13 @@ jobs:
   # armed, push deploys must not redeploy it. A held push fails fast here with
   # a deferral message instead of reporting success without deploying (the
   # production guard accepts a successful staging run as staging history, so a
-  # quiet skip would void that leg). Explicit arm/disarm dispatches proceed;
-  # error-rate rehearsals (including the daily automated proof) honor the hold.
+  # quiet skip would void that leg). Explicit arm/disarm dispatches pass this
+  # soak check; error-rate rehearsals also honor it. Admission is separate.
   # Reads only the Operator-owned repo variable STAGING_SOAK_HOLD_UNTIL (an
   # ISO-8601 UTC deadline, at most 4h out): unset or empty means no hold, a
   # past deadline fails open, and an unparsable or over-long value fails closed
   # with a fix-it message. Merges stay unblocked (this workflow is not a
-  # required check); the next push after expiry deploys normally.
+  # required check); expiry does not override the separate admission gate.
   soak-hold:
     name: soak hold (defer push deploys while armed)
     permissions:
@@ -129,16 +129,29 @@ jobs:
           fi
           now=$(date -u +%s)
           if [ "$deadline" -le "$now" ]; then
-            echo "Soak hold expired at $HOLD_UNTIL; deploying normally." >> "$GITHUB_STEP_SUMMARY"
+            echo "Soak hold expired at $HOLD_UNTIL; the separate admission gate still applies." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           if [ "$((deadline - now))" -gt 14400 ]; then
             echo "::error::Soak hold exceeds the 4h maximum: $HOLD_UNTIL. Shorten it or clear it."
             exit 1
           fi
-          echo "Staging deploy deferred by the soak hold until $HOLD_UNTIL. Merges are unaffected; the next push after expiry deploys normally." >> "$GITHUB_STEP_SUMMARY"
+          echo "Staging deploy deferred by the soak hold until $HOLD_UNTIL. Merges are unaffected; the separate admission gate remains after expiry." >> "$GITHUB_STEP_SUMMARY"
           echo "::error::Staging deploy deferred by the soak hold until $HOLD_UNTIL"
           exit 1
+      - name: Require admitted staging SHA
+        env:
+          SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          ADMITTED_SHA: ${{ vars.STAGING_ADMITTED_SHA }}
+        run: |
+          set -euo pipefail
+          case "$SOURCE_SHA" in
+            *[!0-9a-f]*|'') echo "::error::Staging SHA must be a full 40-hex commit SHA."; exit 1 ;;
+          esac
+          if [ "${#SOURCE_SHA}" -ne 40 ] || [ "$SOURCE_SHA" != "$ADMITTED_SHA" ]; then
+            echo "::error::Staging deployment is held: commit is not admitted."
+            exit 1
+          fi
   # Pre-deploy schema-drift gate: a drifted staging database fails this job
   # (and, through `needs`, the deploy below) instead of staying red silently.
   # Read-only `staging-migrate plan` through the no-reviewer

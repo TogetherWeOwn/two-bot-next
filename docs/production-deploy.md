@@ -400,8 +400,8 @@ runs `scripts/rollback_target_preflight.py`, which refuses the promotion
 Its receipt (version, image, SHA, the migrations it checked, refusal codes)
 goes to the log and the run summary; it never carries SQL text or API
 bodies. A rollback and the live-SHA redeploy skip it: recovery never waits on
-it. The daily `staging-rollback-drill` keeps exercising the restore path
-itself on staging.
+it. The scheduled `staging-rollback-drill` currently refuses before exercising
+the restore path; see the daily proof hold below.
 
 ## Regression gate against production
 
