@@ -1,7 +1,8 @@
 import copy
 import unittest
 
-from rest_evidence_continuity import EvidenceError
+from rest_evidence_continuity import EvidenceError, MAX_COUNTER
+from rest_watch_collection import CollectionDeadline
 from rest_watch_sequence import SampleSequence
 from rest_watch_window_policy import EvidenceGate
 
@@ -229,3 +230,70 @@ class SampleSequenceTest(unittest.TestCase):
                     SampleSequence(self.anchor, proof, self.binding, ledger, verifier)
         with self.assertRaises(EvidenceError):
             self.accept(self.sequence(ledger=lambda *args: 1))
+
+
+class CollectionDeadlineTest(unittest.TestCase):
+    def gate(self, reading, *, sample=100, window=50000, end=60000):
+        return CollectionDeadline(clock=lambda: tuple(reading), clock_domain="clock",
+                                  last_sample_tick=sample, window_deadline=window,
+                                  watch_end=end)
+
+    def test_earliest_frozen_limit_and_inclusive_finish(self):
+        for sample, window, end, expected in ((100, 50000, 60000, 15100),
+                                               (0, 50000, 60000, 15100),
+                                               (100, 10000, 60000, 10000),
+                                               (100, 50000, 9000, 9000)):
+            with self.subTest(expected=expected):
+                reading = [100, "clock"]
+                gate = self.gate(reading, sample=sample, window=window, end=end)
+                self.assertEqual(gate.deadline, expected)
+                reading[0] = expected - 1
+                gate.check()
+                reading[0] = expected
+                gate.finish()
+                with self.assertRaisesRegex(EvidenceError, "terminal"):
+                    gate.finish()
+
+    def test_sample_limit_and_no_deadline_extension(self):
+        reading = [20000, "clock"]
+        gate = self.gate(reading, sample=0)
+        self.assertEqual(gate.deadline, 30000)
+        reading[0] = 29999
+        gate.check()
+        self.assertEqual(gate.deadline, 30000)
+        reading[0] = 30000
+        with self.assertRaises(EvidenceError):
+            gate.check()
+        with self.assertRaisesRegex(EvidenceError, "terminal"):
+            gate.finish()
+
+    def test_bad_or_late_clock_is_terminal(self):
+        for value in ((99, "clock"), (101, "other"), (True, "clock"),
+                      (15101, "clock")):
+            with self.subTest(value=value):
+                reading = [100, "clock"]
+                gate = self.gate(reading)
+                reading[:] = value
+                with self.assertRaises(EvidenceError):
+                    gate.finish()
+                reading[:] = (100, "clock")
+                with self.assertRaisesRegex(EvidenceError, "terminal"):
+                    gate.check()
+
+    def test_invalid_initial_limits_and_due_time(self):
+        for sample, window, end in ((True, 50000, 60000), (101, 50000, 60000),
+                                    (100, 100, 60000), (100, 50000, MAX_COUNTER + 1)):
+            with self.subTest(sample=sample, window=window, end=end):
+                with self.assertRaises(EvidenceError):
+                    self.gate([100, "clock"], sample=sample, window=window, end=end)
+
+    def test_interrupted_clock_is_terminal(self):
+        reading = [100, "clock"]
+        gate = self.gate(reading)
+        def interrupted():
+            raise KeyboardInterrupt()
+        gate._clock = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            gate.check()
+        with self.assertRaisesRegex(EvidenceError, "terminal"):
+            gate.finish()
