@@ -3,6 +3,8 @@ import unittest
 
 from rest_evidence_continuity import EvidenceError
 from rest_watch_sequence import SampleSequence
+from rest_watch_window import WindowSchedule
+from rest_watch_window_policy import WindowPolicy
 
 
 class SampleSequenceTest(unittest.TestCase):
@@ -107,6 +109,74 @@ class SampleSequenceTest(unittest.TestCase):
                     self.accept(sequence)
                 self.assertEqual(self.verified, verified)
                 self.assertEqual(self.claims, int(commit))
+
+    def window_policy(self, clock, ledger=None):
+        schedule = WindowSchedule(self.anchor["series"], 10, 10, ["GET /a"],
+                                  {"global": (0, 10), "GET /a": (0, 10)})
+        return WindowPolicy(self.sequence(ledger=ledger), schedule, clock, "clock")
+
+    def test_window_policy_requires_complete_fixed_duration(self):
+        reading = [1010, 10, "clock"]
+        policy = self.window_policy(lambda: tuple(reading))
+        for index in range(1, 61):
+            tick = 10 + index * 30000
+            reading[:] = [tick + 1010, tick, "clock"]
+            endpoint = self.sample(tick + 1000, tick, 10 + index * 10)
+            result = policy.observe(endpoint, {"tick": tick})
+            self.assertEqual(result, "complete" if index == 60 else "pending")
+        self.assertTrue(policy.complete)
+        with self.assertRaisesRegex(EvidenceError, "terminal"):
+            policy.observe(endpoint, {"tick": tick})
+
+    def test_window_policy_fails_terminally_on_late_or_discontinuous_callbacks(self):
+        for final in ((4001, 30011, "clock"), (3999, 20, "clock"),
+                      (4001, 19, "clock"), (4001, 20, "other")):
+            with self.subTest(final=final):
+                self.setUp()
+                readings = iter(((4000, 20, "clock"), final))
+                policy = self.window_policy(lambda: next(readings))
+                with self.assertRaises(EvidenceError):
+                    policy.observe(self.current, {"tick": 20})
+                self.assertEqual(self.claims, 1)
+                with self.assertRaisesRegex(EvidenceError, "terminal"):
+                    policy.observe(self.current, {"tick": 20})
+
+    def test_window_policy_missing_endpoint_and_bad_clock_fail_closed(self):
+        reading = [4000, 30010, "clock"]
+        policy = self.window_policy(lambda: tuple(reading))
+        policy.check_deadline()
+        reading[1] += 1
+        with self.assertRaises(EvidenceError):
+            policy.check_deadline()
+        with self.assertRaisesRegex(EvidenceError, "terminal"):
+            policy.check_deadline()
+        for clock in (None, lambda: (True, 20, "clock")):
+            with self.subTest(clock=clock):
+                if clock is None:
+                    with self.assertRaises(EvidenceError):
+                        self.window_policy(clock)
+                else:
+                    policy = self.window_policy(clock)
+                    with self.assertRaises(EvidenceError):
+                        policy.check_deadline()
+                    self.assertTrue(policy.failed)
+
+    def test_window_policy_ambiguous_or_invalid_evidence_is_terminal(self):
+        for case in ("proof", "ledger", "interrupt"):
+            with self.subTest(case=case):
+                self.setUp()
+                def ledger(*args):
+                    self.ledger(*args)
+                    if case == "interrupt":
+                        raise KeyboardInterrupt()
+                    raise ValueError("private")
+                policy = self.window_policy(lambda: (4000, 20, "clock"), ledger=ledger)
+                error = KeyboardInterrupt if case == "interrupt" else EvidenceError
+                with self.assertRaises(error):
+                    policy.observe(self.current, {"tick": 99 if case == "proof" else 20})
+                self.assertEqual(self.claims, int(case != "proof"))
+                with self.assertRaisesRegex(EvidenceError, "terminal"):
+                    policy.observe(self.current, {"tick": 20})
 
     def test_missing_dependencies_and_non_boolean_ledger(self):
         for proof, ledger, verifier in ((None, self.ledger, self.verify),
