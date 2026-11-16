@@ -53,8 +53,9 @@ def claim_recovery(raw, *, expected, clock, verify_recovery, claim):
         if (type(expected) is not dict or set(expected) != binding_keys
                 or any(not _id(expected[key]) for key in binding_keys - {
                     "run", "attempt", "generation", "candidate", "prior", "handoff_digest", "snapshot_digest"})
-                or any(type(expected[key]) is not int or not 1 <= expected[key] < MAX_COUNTER
-                       for key in ("run", "attempt", "generation"))
+                or any(type(expected[key]) is not int or not 1 <= expected[key] <= MAX_COUNTER
+                       for key in ("run", "attempt"))
+                or type(expected["generation"]) is not int or not 1 <= expected["generation"] < MAX_COUNTER
                 or any(type(expected[key]) is not str or DIGEST.fullmatch(expected[key]) is None
                        for key in ("handoff_digest", "snapshot_digest"))):
             raise EvidenceError("invalid expected binding")
