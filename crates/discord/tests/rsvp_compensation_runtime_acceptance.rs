@@ -15,6 +15,8 @@
 //! editing it.
 #![cfg(feature = "db")]
 
+#[path = "common/attendance_reply.rs"]
+mod attendance_reply;
 #[allow(dead_code)]
 mod common;
 
@@ -26,7 +28,7 @@ use serde_json::{json, Value};
 use sqlx::{Pool, Postgres};
 use twilight_model::application::interaction::Interaction;
 use two_bot_core::{ClassifierConfig, InteractionRouter, RouterGates};
-use two_bot_discord::{interactions::InteractionRuntime, ActionExecutor};
+use two_bot_discord::{brand::EmbedKind, interactions::InteractionRuntime, ActionExecutor};
 use two_bot_testsupport::TestDatabase;
 
 const GUILD: &str = "1545644954272137297";
@@ -131,7 +133,7 @@ async fn run(pool: &Pool<Postgres>, mock: &MockRest, interaction: &Interaction) 
         .expect("handler execution"));
 }
 
-fn assert_reply(mock: &MockRest, content: &str) {
+fn assert_reply(mock: &MockRest, content: &str, kind: EmbedKind) {
     let requests = mock.requests();
     let last = requests.last().unwrap();
     let body: Value = serde_json::from_slice(&last.body).unwrap();
@@ -140,7 +142,7 @@ fn assert_reply(mock: &MockRest, content: &str) {
         last.path,
         "/api/v10/webhooks/1111/mock-rsvp-token/messages/@original"
     );
-    assert_eq!(body["content"], content);
+    assert_eq!(attendance_reply::deferred_text(&body, kind), content);
     assert_eq!(body["allowed_mentions"]["parse"], json!([]));
 }
 
@@ -270,6 +272,7 @@ async fn faulted_audit_delete_keeps_first_write_attempt_and_diagnostic() {
     assert_reply(
         &mock,
         "No scheduled event with that id exists in this server.",
+        EmbedKind::Danger,
     );
     assert_eq!(mock.requests().len(), 6);
     assert_eq!(
@@ -313,7 +316,7 @@ async fn faulted_audit_delete_keeps_refused_rewrite_attempt_and_history() {
     )
     .await;
     run(fixture.pool(), &saved, &rsvp(840, "going")).await;
-    assert_reply(&saved, "RSVP saved: going.");
+    assert_reply(&saved, "RSVP saved: going.", EmbedKind::Ok);
     saved.shutdown().await;
     let before: (String, String) = sqlx::query_as(
         "SELECT status, responded_at::text FROM event_rsvps WHERE guild_id=$1 AND event_id=$2 AND user_id=$3",
@@ -342,7 +345,11 @@ async fn faulted_audit_delete_keeps_refused_rewrite_attempt_and_history() {
     .await;
     let mark = log_mark();
     run(fixture.pool(), &refused, &rsvp(841, "interested")).await;
-    assert_reply(&refused, "Unable to verify server membership.");
+    assert_reply(
+        &refused,
+        "Unable to verify server membership.",
+        EmbedKind::Danger,
+    );
     assert_eq!(refused.requests().len(), 5);
     refused.shutdown().await;
 
