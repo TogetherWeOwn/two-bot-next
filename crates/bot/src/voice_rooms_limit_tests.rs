@@ -678,9 +678,28 @@ async fn limit_unavailable_paths_keep_retry_and_refusal_replies_private() {
         let interaction = voice_interaction_as(Some(command_data(name, Vec::new())), None, MEMBER);
         let trace = Trace::default();
         let cold = test_runtime(trace.clone());
-        let (_, response) = handle_capture(&cold, &interaction).await;
+        // `handle_capture` publishes a snapshot and starts the actor, so invoke
+        // the limit handler directly to exercise the genuinely cold runtime.
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let command = if name == "limit" {
+            LimitCommand::Limit(LimitArg::Absent)
+        } else {
+            LimitCommand::Unlimit
+        };
+        assert!(
+            super::super::limit::handle_limit(
+                &cold,
+                &interaction,
+                GUILD,
+                false,
+                command,
+                |response| async move { sender.send(response).unwrap() },
+            )
+            .await
+        );
+        let response = receiver.await.expect("cold reply");
         assert_limit_embed(
-            response.as_ref().expect("cold reply"),
+            &response,
             two_bot_discord::brand::EmbedKind::Warn,
             "The voice worker isn't warmed up yet — try again in a moment.",
         );
