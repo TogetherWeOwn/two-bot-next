@@ -3,6 +3,7 @@
 
 use super::*;
 use two_bot_core::{RsvpRecord, RsvpStatus};
+use two_bot_discord::brand::EmbedKind;
 
 const FOREIGN_GUILD: &str = "1545644954272137001";
 const OTHER_EVENT: &str = "1546451670500642001";
@@ -58,6 +59,14 @@ async fn snapshot(pool: &Pool<Postgres>) -> (String, String, (i64, i64, i64)) {
 /// A read may acknowledge privately and edit that reply, but may not GET the
 /// event/member or send to a channel/DM. Check controls before the RED UX oracle.
 async fn read(pool: &Pool<Postgres>, interaction: &Interaction) -> String {
+    read_with_kind(pool, interaction, EmbedKind::Ok).await
+}
+
+async fn read_with_kind(
+    pool: &Pool<Postgres>,
+    interaction: &Interaction,
+    kind: EmbedKind,
+) -> String {
     let before = snapshot(pool).await;
     let mock = MockRest::start(
         vec![
@@ -94,8 +103,10 @@ async fn read(pool: &Pool<Postgres>, interaction: &Interaction) -> String {
         "/api/v10/webhooks/1111/mock-rsvp-token/messages/@original"
     );
     let edit: Value = serde_json::from_slice(&requests[1].body).expect("reply JSON");
-    assert_eq!(edit["allowed_mentions"]["parse"], json!([]));
-    edit["content"].as_str().expect("text reply").to_owned()
+    assert_ne!(edit["allowed_mentions"]["replied_user"], true);
+    let text = attendance_reply::deferred_text(&edit, kind);
+    assert!(!text.is_empty(), "reply must have visible text");
+    text.to_owned()
 }
 
 fn assert_saved(text: &str, status: &str, timestamp: &str, totals: &str) {
@@ -503,7 +514,14 @@ async fn invalid_event_identifiers_refuse_without_link_or_personal_data() {
     .iter()
     .enumerate()
     {
-        replies.push(read(fixture.pool(), &totals(9200 + i as u64, event)).await);
+        replies.push(
+            read_with_kind(
+                fixture.pool(),
+                &totals(9200 + i as u64, event),
+                EmbedKind::Danger,
+            )
+            .await,
+        );
     }
     fixture.close().await;
     for text in replies {
@@ -572,10 +590,11 @@ async fn store_failure_is_not_reported_as_no_saved_response_or_zero_totals() {
     let requests = mock.requests();
     let edit: Value =
         serde_json::from_slice(&requests.last().expect("failure reply").body).expect("JSON");
-    let text = edit["content"]
-        .as_str()
-        .expect("failure content")
-        .to_owned();
+    let last = requests.last().expect("failure reply");
+    assert_eq!(last.method, "PATCH");
+    assert!(last.path.ends_with("/messages/@original"));
+    assert_ne!(edit["allowed_mentions"]["replied_user"], true);
+    let text = attendance_reply::deferred_text(&edit, EmbedKind::Danger).to_owned();
     mock.shutdown().await;
     sqlx::query("ALTER TABLE unavailable_event_rsvps RENAME TO event_rsvps")
         .execute(fixture.pool())
