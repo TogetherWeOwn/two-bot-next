@@ -72,6 +72,49 @@ fn completion_routes_only_single_embed_limit_replies() {
 }
 
 #[tokio::test]
+async fn ownership_replies_use_explicit_outcome_embeds() {
+    use two_bot_discord::brand::EmbedKind;
+
+    for (name, options, expected) in [
+        ("reclaim", vec![], "You're already the owner of this room."),
+        (
+            "transfer",
+            vec![user_option("member", 301)],
+            "Transferred ownership of this room to <@301>.",
+        ),
+    ] {
+        let interaction = voice_interaction_as(Some(command_data(name, options)), None, MEMBER);
+        let cold = test_runtime(Trace::default());
+        let (_, response) = handle_capture(&cold, &interaction).await;
+        let response = response.expect("cold reply");
+        assert_limit_embed(
+            &response,
+            EmbedKind::Warn,
+            "The voice worker isn't warmed up yet — try again in a moment.",
+        );
+        assert!(limit_completion_embed(&interaction, &response).is_some());
+
+        let runtime = ownership_room_runtime(Trace::default()).await;
+        let (_, response) = handle_capture(&runtime, &interaction).await;
+        let response = response.expect("success reply");
+        assert_limit_embed(&response, EmbedKind::Ok, expected);
+        assert!(limit_completion_embed(&interaction, &response).is_some());
+    }
+
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 301)])),
+        None,
+        302,
+    );
+    let (_, response) = handle_capture(&runtime, &interaction).await;
+    let response = response.expect("refusal reply");
+    let text = response_text(&response);
+    assert_limit_embed(&response, EmbedKind::Danger, &text);
+    assert!(limit_completion_embed(&interaction, &response).is_some());
+}
+
+#[tokio::test]
 async fn myroom_cold_worker_returns_warning_embed() {
     let runtime = test_runtime(Trace::default());
     let interaction = voice_interaction_as(

@@ -2769,7 +2769,7 @@ async fn suspended_room_transfer_reports_finalizing_and_keeps_the_handoff_queued
     let (reply, inbox) = oneshot::channel();
     apply_command(
         &mut worker,
-        ActorCommand::Ownership {
+        ActorCommand::OwnershipClassified {
             actor_id: MEMBER,
             is_admin: false,
             command: OwnershipCommand::Transfer { target_id: 301 },
@@ -2779,7 +2779,10 @@ async fn suspended_room_transfer_reports_finalizing_and_keeps_the_handoff_queued
         &ActorInboxBackpressure::default(),
     );
     worker.drive_staged_ownership(0).await;
-    assert_eq!(inbox.await.unwrap(), OWNERSHIP_FINALIZING);
+    assert_eq!(
+        inbox.await.unwrap(),
+        (OWNERSHIP_FINALIZING.to_owned(), EmbedKind::Warn)
+    );
     assert!(
         worker.ownership_queued.contains(&500),
         "an unconfirmed handoff stays queued for retry"
@@ -2795,7 +2798,7 @@ async fn held_owner_grant_reports_finalizing_before_the_write_finishes() {
     let (reply, inbox) = oneshot::channel();
     apply_command(
         &mut worker,
-        ActorCommand::Ownership {
+        ActorCommand::OwnershipClassified {
             actor_id: MEMBER,
             is_admin: false,
             command: OwnershipCommand::Transfer { target_id: 301 },
@@ -2810,9 +2813,10 @@ async fn held_owner_grant_reports_finalizing_before_the_write_finishes() {
         // Release even on failure so the queued action can finish, rather
         // than hiding a dropped in-flight dispatch behind test shutdown.
         gate.release.notify_one();
-        let text = response
+        let (text, kind) = response
             .expect("reply before the held grant finishes")
             .unwrap();
+        assert_eq!(kind, EmbedKind::Warn);
         assert!(
             text.contains("Recorded") && text.contains("finalized"),
             "{text}"
@@ -2849,7 +2853,7 @@ async fn held_owner_grant_with_slow_store_still_commits_after_finalizing() {
     let (reply, inbox) = oneshot::channel();
     apply_command(
         &mut worker,
-        ActorCommand::Ownership {
+        ActorCommand::OwnershipClassified {
             actor_id: MEMBER,
             is_admin: false,
             command: OwnershipCommand::Transfer { target_id: 301 },
@@ -2864,9 +2868,10 @@ async fn held_owner_grant_with_slow_store_still_commits_after_finalizing() {
         // Release even on failure so the queued action can finish, rather
         // than hiding a dropped in-flight dispatch behind test shutdown.
         gate.release.notify_one();
-        let text = response
+        let (text, kind) = response
             .expect("reply before the held grant finishes")
             .unwrap();
+        assert_eq!(kind, EmbedKind::Warn);
         assert!(
             text.contains("Recorded") && text.contains("finalized"),
             "{text}"

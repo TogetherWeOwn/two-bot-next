@@ -123,6 +123,7 @@ use two_bot_core::{
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
 use two_bot_cutover::voice_rooms::{CreateClaim, JoinGrantIntent, OwnerGrantIntent, PgRoomStore};
+use two_bot_discord::brand::EmbedKind;
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, MessageRef, RoomChannelAttributes,
     RoomHttp, RoomHttpError,
@@ -4349,16 +4350,30 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// `reconcile` succession pass; a retried interaction replays safely
     /// (reclaim is idempotent, a former owner's transfer replay fails
     /// authorization), so no interaction-ID dedupe is needed here.
+    #[cfg(test)]
     fn apply_ownership(
         &mut self,
         actor_id: Snowflake,
         is_admin: bool,
         command: OwnershipCommand,
     ) -> String {
+        self.apply_ownership_classified(actor_id, is_admin, command)
+            .0
+    }
+
+    fn apply_ownership_classified(
+        &mut self,
+        actor_id: Snowflake,
+        is_admin: bool,
+        command: OwnershipCommand,
+    ) -> (String, EmbedKind) {
         if self.halted {
-            return "Voice rooms are paused: Discord refused the bot credential. \
+            return (
+                "Voice rooms are paused: Discord refused the bot credential. \
                     Fix the token, then restart the bot."
-                .to_owned();
+                    .to_owned(),
+                EmbedKind::Danger,
+            );
         }
         let request = match command {
             OwnershipCommand::Reclaim => OwnershipRequest::Reclaim {
@@ -4375,7 +4390,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let (channel, room, occupants, actor_in_room) = {
             let live = self.live.read_state();
             if !live.ready {
-                return "The voice worker isn't warmed up yet — try again in a moment.".to_owned();
+                return (
+                    "The voice worker isn't warmed up yet — try again in a moment.".to_owned(),
+                    EmbedKind::Warn,
+                );
             }
             // Admins may use owner commands in any room: an admin invoking
             // `/transfer` with no tracked room of their own falls back to the
@@ -4397,17 +4415,23 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 (None, _, _) => None,
             };
             let Some(channel) = channel else {
-                return match command {
-                    OwnershipCommand::Reclaim => {
-                        "You need to be in a voice room to use /reclaim.".to_owned()
-                    }
-                    OwnershipCommand::Transfer { .. } => {
-                        "You need to be in a voice room to use /transfer.".to_owned()
-                    }
-                };
+                return (
+                    match command {
+                        OwnershipCommand::Reclaim => {
+                            "You need to be in a voice room to use /reclaim.".to_owned()
+                        }
+                        OwnershipCommand::Transfer { .. } => {
+                            "You need to be in a voice room to use /transfer.".to_owned()
+                        }
+                    },
+                    EmbedKind::Danger,
+                );
             };
             let Some(room) = self.rooms.get(&channel).cloned() else {
-                return "That voice channel isn't a temporary room I manage.".to_owned();
+                return (
+                    "That voice channel isn't a temporary room I manage.".to_owned(),
+                    EmbedKind::Danger,
+                );
             };
             let actor_in_room = own == Some(channel);
             (
@@ -4424,20 +4448,26 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let was_creator = room.original_creator_id == actor_id;
         let next = match decide_ownership(ownership, &occupants, request) {
             Ok(OwnershipDecision::Unchanged(_)) => {
-                return match command {
-                    OwnershipCommand::Reclaim => {
-                        "You're already the owner of this room.".to_owned()
-                    }
-                    OwnershipCommand::Transfer { target_id } => {
-                        format!("Ownership is already with <@{target_id}>.")
-                    }
-                };
+                return (
+                    match command {
+                        OwnershipCommand::Reclaim => {
+                            "You're already the owner of this room.".to_owned()
+                        }
+                        OwnershipCommand::Transfer { target_id } => {
+                            format!("Ownership is already with <@{target_id}>.")
+                        }
+                    },
+                    EmbedKind::Ok,
+                );
             }
             Ok(OwnershipDecision::Changed { next, .. }) => next,
             Ok(OwnershipDecision::EmptyRoom) | Err(OwnershipError::EmptyRoom) => {
-                return "There's nobody in this room right now.".to_owned();
+                return (
+                    "There's nobody in this room right now.".to_owned(),
+                    EmbedKind::Danger,
+                );
             }
-            Err(error) => return ownership_refusal(error),
+            Err(error) => return (ownership_refusal(error), EmbedKind::Danger),
         };
         let previous_owner_id = room.owner_id;
         let mut updated = room;
@@ -4457,19 +4487,24 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .or_default()
             .push(commit_tx);
         self.pending_commit_wait = Some(commit_rx);
-        match command {
-            OwnershipCommand::Reclaim if was_creator => {
-                "You're the owner of this room again.".to_owned()
-            }
-            OwnershipCommand::Reclaim => "The room's owner is gone, so it's yours now.".to_owned(),
-            OwnershipCommand::Transfer { target_id } => {
-                if actor_in_room {
-                    format!("Transferred ownership of this room to <@{target_id}>.")
-                } else {
-                    format!("Transferred ownership of <#{channel}> to <@{target_id}>.")
+        (
+            match command {
+                OwnershipCommand::Reclaim if was_creator => {
+                    "You're the owner of this room again.".to_owned()
                 }
-            }
-        }
+                OwnershipCommand::Reclaim => {
+                    "The room's owner is gone, so it's yours now.".to_owned()
+                }
+                OwnershipCommand::Transfer { target_id } => {
+                    if actor_in_room {
+                        format!("Transferred ownership of this room to <@{target_id}>.")
+                    } else {
+                        format!("Transferred ownership of <#{channel}> to <@{target_id}>.")
+                    }
+                }
+            },
+            EmbedKind::Ok,
+        )
     }
 
     fn queue_owner_handoff(&mut self, channel_id: Snowflake, previous_owner_id: Snowflake) {
@@ -4519,16 +4554,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         loop {
             if let Ok(outcome) = staged.waiter.try_recv() {
                 let StagedOwnershipReply { reply, success, .. } = staged;
-                let _ = reply.send(match outcome {
-                    OwnershipCommit::Committed => success,
-                    OwnershipCommit::Pending => OWNERSHIP_FINALIZING.to_owned(),
+                reply.send(match outcome {
+                    OwnershipCommit::Committed => (success, EmbedKind::Ok),
+                    OwnershipCommit::Pending => (OWNERSHIP_FINALIZING.to_owned(), EmbedKind::Warn),
                 });
                 self.ownership_commit_deadline = None;
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
                 let StagedOwnershipReply { reply, .. } = staged;
-                let _ = reply.send(OWNERSHIP_FINALIZING.to_owned());
+                reply.send((OWNERSHIP_FINALIZING.to_owned(), EmbedKind::Warn));
                 // Dropping the waiter keeps the attempt's late commit
                 // silent; the handoff itself stays queued for retry.
                 self.ownership_commit_deadline = None;
@@ -4553,7 +4588,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 // held write finishes unbounded instead of timing out
                 // against a budget nobody is waiting on.
                 drop(waiter);
-                let _ = reply.send(OWNERSHIP_FINALIZING.to_owned());
+                reply.send((OWNERSHIP_FINALIZING.to_owned(), EmbedKind::Warn));
                 // The reply is out; the attempt still owns its queued
                 // action, so run it to completion instead of cancelling.
                 // Awaiting consumes the heap-pinned pump, ending its
@@ -7904,6 +7939,12 @@ enum ActorCommand {
         command: OwnershipCommand,
         reply: oneshot::Sender<String>,
     },
+    OwnershipClassified {
+        actor_id: Snowflake,
+        is_admin: bool,
+        command: OwnershipCommand,
+        reply: oneshot::Sender<(String, EmbedKind)>,
+    },
     /// V3 `/limit` and `/unlimit`: the worker resolves the caller's room,
     /// decides, queues the Discord write and replies with the text (or a
     /// pending acknowledgement for the queued write).
@@ -8342,10 +8383,28 @@ enum OwnershipCommit {
     Pending,
 }
 
+enum OwnershipReply {
+    Text(oneshot::Sender<String>),
+    Classified(oneshot::Sender<(String, EmbedKind)>),
+}
+
+impl OwnershipReply {
+    fn send(self, outcome: (String, EmbedKind)) {
+        match self {
+            Self::Text(reply) => {
+                let _ = reply.send(outcome.0);
+            }
+            Self::Classified(reply) => {
+                let _ = reply.send(outcome);
+            }
+        }
+    }
+}
+
 /// An `Ownership` command parked while its commit attempt runs.
 struct StagedOwnershipReply {
     /// Where the final text goes, exactly once.
-    reply: oneshot::Sender<String>,
+    reply: OwnershipReply,
     /// Fires on the first commit attempt for the handoff's room.
     waiter: oneshot::Receiver<OwnershipCommit>,
     /// Success text, sent only when the commit confirms.
@@ -8930,6 +8989,30 @@ where
         actor
             .tx
             .send(ActorCommand::Ownership {
+                actor_id,
+                is_admin,
+                command,
+                reply,
+            })
+            .ok()?;
+        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
+            .await
+            .ok()?
+            .ok()
+    }
+
+    async fn run_ownership_classified(
+        &self,
+        guild: Snowflake,
+        actor_id: Snowflake,
+        is_admin: bool,
+        command: OwnershipCommand,
+    ) -> Option<(String, EmbedKind)> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::OwnershipClassified {
                 actor_id,
                 is_admin,
                 command,
@@ -10499,6 +10582,26 @@ async fn run_actor_inner<S: RoomPersistence, H: RoomWrites + 'static>(
     while worker.flush_kick_audit(u64::MAX).await {}
 }
 
+fn dispatch_ownership<S: RoomPersistence, H: RoomWrites>(
+    worker: &mut GuildRoomWorker<S, H>,
+    actor_id: Snowflake,
+    is_admin: bool,
+    command: OwnershipCommand,
+    reply: OwnershipReply,
+) {
+    let (text, kind) = worker.apply_ownership_classified(actor_id, is_admin, command);
+    match worker.pending_commit_wait.take() {
+        Some(waiter) => {
+            worker.staged_ownership_reply = Some(StagedOwnershipReply {
+                reply,
+                waiter,
+                success: text,
+            });
+        }
+        None => reply.send((text, kind)),
+    }
+}
+
 fn apply_command<S: RoomPersistence, H: RoomWrites>(
     worker: &mut GuildRoomWorker<S, H>,
     command: ActorCommand,
@@ -10592,24 +10695,25 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             is_admin,
             command,
             reply,
-        } => {
-            let text = worker.apply_ownership(actor_id, is_admin, command);
-            // An accepted handoff stages its reply on the commit: the actor
-            // loop drives it right after this dispatch. Anything else
-            // (refusal, halt, cold worker) answers immediately.
-            match worker.pending_commit_wait.take() {
-                Some(waiter) => {
-                    worker.staged_ownership_reply = Some(StagedOwnershipReply {
-                        reply,
-                        waiter,
-                        success: text,
-                    });
-                }
-                None => {
-                    let _ = reply.send(text);
-                }
-            }
-        }
+        } => dispatch_ownership(
+            worker,
+            actor_id,
+            is_admin,
+            command,
+            OwnershipReply::Text(reply),
+        ),
+        ActorCommand::OwnershipClassified {
+            actor_id,
+            is_admin,
+            command,
+            reply,
+        } => dispatch_ownership(
+            worker,
+            actor_id,
+            is_admin,
+            command,
+            OwnershipReply::Classified(reply),
+        ),
         ActorCommand::Limit {
             actor_id,
             is_admin,
@@ -14977,14 +15081,15 @@ where
         }
         VoiceCommand::Reclaim => {
             let Some(actor_id) = invoker_member_id(interaction) else {
-                reply(ephemeral_response(
-                    "I couldn't tell who invoked /reclaim — try again.",
+                reply(limit::limit_response(
+                    "I couldn't tell who invoked /reclaim — try again.".to_owned(),
+                    EmbedKind::Danger,
                 ))
                 .await;
                 return true;
             };
-            let text = runtime
-                .run_ownership(
+            let (text, kind) = runtime
+                .run_ownership_classified(
                     guild_id,
                     actor_id,
                     member.is_admin,
@@ -14994,19 +15099,21 @@ where
                 .unwrap_or_else(|| {
                     // A known worker that never answered is a transient
                     // failure, not a cold cache.
-                    if runtime.has_actor(guild_id) {
+                    let text = if runtime.has_actor(guild_id) {
                         WORKER_LOST_REPLY.to_owned()
                     } else {
                         "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
-                    }
+                    };
+                    (text, EmbedKind::Warn)
                 });
-            reply(ephemeral_response(&text)).await;
+            reply(limit::limit_response(text, kind)).await;
             true
         }
         VoiceCommand::Transfer { target_id } => {
             let Some(actor_id) = invoker_member_id(interaction) else {
-                reply(ephemeral_response(
-                    "I couldn't tell who invoked /transfer — try again.",
+                reply(limit::limit_response(
+                    "I couldn't tell who invoked /transfer — try again.".to_owned(),
+                    EmbedKind::Danger,
                 ))
                 .await;
                 return true;
@@ -15014,14 +15121,15 @@ where
             // Zero is a malformed payload, not a member (parse default): fail
             // closed before touching the worker.
             if target_id == 0 {
-                reply(ephemeral_response(
-                    "Choose a member in the room to transfer to.",
+                reply(limit::limit_response(
+                    "Choose a member in the room to transfer to.".to_owned(),
+                    EmbedKind::Danger,
                 ))
                 .await;
                 return true;
             }
-            let text = runtime
-                .run_ownership(
+            let (text, kind) = runtime
+                .run_ownership_classified(
                     guild_id,
                     actor_id,
                     member.is_admin,
@@ -15031,13 +15139,14 @@ where
                 .unwrap_or_else(|| {
                     // A known worker that never answered is a transient
                     // failure, not a cold cache.
-                    if runtime.has_actor(guild_id) {
+                    let text = if runtime.has_actor(guild_id) {
                         WORKER_LOST_REPLY.to_owned()
                     } else {
                         "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
-                    }
+                    };
+                    (text, EmbedKind::Warn)
                 });
-            reply(ephemeral_response(&text)).await;
+            reply(limit::limit_response(text, kind)).await;
             true
         }
         VoiceCommand::Name => {
@@ -15575,6 +15684,8 @@ fn limit_completion_embed<'a>(
                 | VoiceCommand::Ping
                 | VoiceCommand::Invite
                 | VoiceCommand::MyRoom
+                | VoiceCommand::Reclaim
+                | VoiceCommand::Transfer { .. }
         )
     ) {
         return None;
