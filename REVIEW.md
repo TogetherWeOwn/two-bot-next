@@ -223,6 +223,12 @@ A missing test alone is not a runtime bug. These are blocking findings:
 - **The `wrangler/` Worker wrapper** is TypeScript with its own gates; apply
   its conventions there, not Rust ones.
 
+## Dependency-bump PRs
+- For Dependabot/Renovate PRs, generated-body omissions alone are not code defects. Cite the applicable repository or adoption requirement when reporting missing Verification/Attestation evidence; do not assume a bot-wide exemption.
+- The adopting agent must supply real Verification, truthful Attestation and Model Used, preserving bot authorship and provenance. Set the attestation `risk_tier` to the applicable T0/T1/T2 template tier (including the T0 floor); dependency changes retain separate Sensitive Security → QA review routing. Missing required adoption evidence remains a review/gate finding even if the checker returns early; never attest to unperformed work.
+- T0 attestation remains mandatory: PR-standards enforces it before the Dependabot/Renovate early return. That return does not waive adopter evidence or review requirements.
+- For a version bump, compare the changelog with actual repository call sites. Request a new behavior-regression test only for a named affected call site and a concrete adverse behavior change; existing mandatory testing, security and regression-evidence obligations remain unchanged. Report concrete install, build, output and other regression defects too.
+- Read the repository's actual `.github/dependabot.yml`: a deliberately excluded lockfile is not a missed update. Do not infer exclusions from another repository or assume all standalone lockfiles are excluded. Cargo updates include `/fuzz`.
 ## Skip
 
 Style, formatting, naming, and lint findings `cargo fmt`, clippy, or ast-grep
