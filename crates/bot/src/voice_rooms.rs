@@ -15850,6 +15850,16 @@ where
             }
             return;
         }
+        // Retain the registry-resolved name through the deferred completion.
+        // The HTTP completion router has no registry of its own.
+        let identities = match runtime.command_identities.read() {
+            Ok(identities) => identities.clone(),
+            Err(_) => return,
+        };
+        let Some(resolved) = identities.resolve_interaction(interaction) else {
+            return;
+        };
+        let interaction = resolved.as_ref();
         if let Err(error) = replies.defer(interaction).await {
             warn!(interaction_id = interaction.id.get().to_string(), %error,
                 "voice acknowledgement failed; command not executed");

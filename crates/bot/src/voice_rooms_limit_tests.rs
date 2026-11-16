@@ -69,6 +69,60 @@ fn completion_routes_only_single_embed_limit_replies() {
     assert!(limit_completion_embed(&limit, &ephemeral_response("plain text")).is_none());
 }
 
+#[tokio::test]
+async fn registered_limit_names_reach_embed_completion() {
+    struct RoutingReplies(Mutex<Vec<bool>>);
+
+    impl InteractionReplies for RoutingReplies {
+        async fn defer(&self, _: &Interaction) -> Result<(), RoomHttpError> {
+            Ok(())
+        }
+
+        async fn complete(
+            &self,
+            interaction: &Interaction,
+            response: InteractionResponse,
+        ) -> Result<(), RoomHttpError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(limit_completion_embed(interaction, &response).is_some());
+            Ok(())
+        }
+
+        async fn respond(
+            &self,
+            _: &Interaction,
+            _: InteractionResponse,
+        ) -> Result<(), RoomHttpError> {
+            Ok(())
+        }
+    }
+
+    let runtime = test_runtime(Trace::default());
+    let identities = two_bot_discord::command_identity::CommandIdentities::default();
+    let mut commands = two_bot_discord::publish_commands(&[
+        CommandDefinition::new("limit", "Limit."),
+        CommandDefinition::new("unlimit", "Unlimit."),
+    ]);
+    for (index, command) in commands.iter_mut().enumerate() {
+        command.id = Some(Id::new(9000 + index as u64));
+        command.application_id = Some(Id::new(1));
+        command.guild_id = Some(Id::new(GUILD));
+    }
+    identities.replace_guild(1, GUILD, &commands).unwrap();
+    runtime.set_command_identities(identities);
+    let replies = RoutingReplies(Mutex::new(Vec::new()));
+    for id in [9000, 9001] {
+        let mut data = command_data("stale-name", Vec::new());
+        data.id = Id::new(id);
+        data.guild_id = Some(Id::new(GUILD));
+        let interaction = voice_interaction_as(Some(data), None, MEMBER);
+        VoiceResponder::respond_with(&runtime, &replies, &interaction, None, None).await;
+    }
+    assert_eq!(*replies.0.lock().unwrap(), [true, true]);
+}
+
 fn int_option(name: &str, value: i64) -> CommandDataOption {
     CommandDataOption {
         name: name.to_owned(),
