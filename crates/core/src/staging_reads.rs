@@ -1,5 +1,6 @@
 //! Inert staging-read lifecycle vocabulary; this does not admit or perform reads.
 
+pub mod canonical_candidate;
 pub mod canonical_prefix;
 pub mod canonical_tail;
 
