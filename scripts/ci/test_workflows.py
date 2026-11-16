@@ -10751,7 +10751,7 @@ class WorkflowTests(unittest.TestCase):
         checkout, execute = job["steps"]
         self.assertEqual(checkout["uses"], "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
         self.assertEqual(checkout["with"], {
-            "ref": "${{ github.event.pull_request.base.sha }}", "persist-credentials": "false",
+            "ref": "${{ github.sha }}", "persist-credentials": "false",
             "sparse-checkout": ".github/scripts", "sparse-checkout-cone-mode": "false"})
         self.assertEqual(execute["shell"], "python3 -I {0}")
         self.assertEqual(execute["env"], {"GH_TOKEN": "${{ github.token }}"})
