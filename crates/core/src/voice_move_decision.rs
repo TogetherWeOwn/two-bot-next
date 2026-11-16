@@ -55,6 +55,9 @@ pub fn decide(facts: &VoiceMoveFacts) -> VoiceMoveDecision {
     if current == facts.target.id {
         return VoiceMoveDecision::Refuse(VoiceMoveOutcome::AlreadyInRoom);
     }
+    if facts.source.id != current {
+        return VoiceMoveDecision::Incomplete;
+    }
     let member_perms = match effective_perms(
         &facts.guild_roles,
         &facts.target.overwrites,

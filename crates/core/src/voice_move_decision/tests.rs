@@ -60,6 +60,19 @@ fn decision_order_and_capacity() {
 }
 
 #[test]
+fn mismatched_source_fails_closed_after_connection_refusals() {
+    let mut f = facts();
+    f.source.id = 8;
+    assert_eq!(decide(&f), VoiceMoveDecision::Incomplete);
+    f.member_channel_id = Some(f.target.id);
+    refused(&f, VoiceMoveOutcome::AlreadyInRoom);
+    f.member_channel_id = None;
+    refused(&f, VoiceMoveOutcome::NotConnected);
+    f.target.is_afk = true;
+    refused(&f, VoiceMoveOutcome::RoomGone);
+}
+
+#[test]
 fn unknown_roles_fail_closed_and_both_bot_rooms_are_checked() {
     let mut f = facts();
     f.member_roles.push(99);
