@@ -50,13 +50,14 @@ fn completion_routes_only_single_embed_limit_replies() {
     assert!(limit_completion_embed(&limit, &mixed).is_none());
     mixed = response.clone();
     mixed.data.as_mut().unwrap().attachments = Some(vec![Attachment::from_bytes(
-        "reply.txt",
+        "reply.txt".to_owned(),
         b"reply".to_vec(),
         0,
     )]);
     assert!(limit_completion_embed(&limit, &mixed).is_none());
     mixed = response.clone();
     mixed.data.as_mut().unwrap().components = Some(vec![Component::ActionRow(ActionRow {
+        id: None,
         components: Vec::new(),
     })]);
     assert!(limit_completion_embed(&limit, &mixed).is_none());
