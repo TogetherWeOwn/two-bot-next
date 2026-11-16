@@ -1,77 +1,74 @@
-"""Inactive composition of claimed sample continuity and fixed windows.
+"""Inactive evidence handling with a fixed refusal cutoff, not a watch policy.
 
-The caller supplies the matching objects returned by claim_handoff and serializes
-calls. Authentication, durable ledger atomicity, clock trust and bounded callbacks
-remain adapter obligations. Nothing here starts a watch or authorizes recovery.
+The caller serializes calls and supplies the claimed sequence, trusted clock and
+fixed cutoff. Authentication, atomic durable claims and bounded callbacks remain
+adapter obligations. A result is not window coverage or watch completion.
 """
 
 from rest_evidence_continuity import EvidenceError, MAX_COUNTER
 
 
-class WindowPolicy:
-    """Feed authenticated endpoints into a fixed schedule, failing permanently.
-
-    Completion means only that the window schedule reached its original end;
-    controls and all other watch and release gates remain independent.
-    """
-
-    def __init__(self, sequence, schedule, clock, clock_domain):
-        if not callable(clock) or type(clock_domain) is not str or not clock_domain:
-            raise EvidenceError("invalid window policy dependencies")
+class EvidenceGate:
+    def __init__(self, sequence, clock, clock_domain, cutoff):
+        if (not callable(clock) or type(clock_domain) is not str or not clock_domain
+                or type(cutoff) is not int or not 0 <= cutoff <= MAX_COUNTER):
+            raise EvidenceError("invalid evidence gate dependencies")
         self._sequence = sequence
-        self._schedule = schedule
         self._clock = clock
         self._domain = clock_domain
+        self._cutoff = cutoff
         self._last_clock = None
         self.failed = False
-        self.complete = False
 
     def _time(self):
         wall, tick, domain = self._clock()
         if (type(wall) is not int or type(tick) is not int
                 or not 0 <= wall <= MAX_COUNTER or not 0 <= tick <= MAX_COUNTER
-                or domain != self._domain
+                or type(domain) is not str or domain != self._domain
                 or (self._last_clock is not None
-                    and (wall < self._last_clock[0] or tick < self._last_clock[1]))):
-            raise EvidenceError("invalid window clock")
+                    and (wall < self._last_clock[0] or tick < self._last_clock[1]))
+                or tick > self._cutoff):
+            raise EvidenceError("invalid or late evidence clock")
         self._last_clock = wall, tick
         return wall, tick
 
     def check_deadline(self):
-        """Fail on a missed deadline when the caller supplies no endpoint."""
-        if self.failed or self.complete:
-            raise EvidenceError("window policy is terminal")
+        """Refuse a missed cutoff even when no endpoint arrives."""
+        if self.failed:
+            raise EvidenceError("evidence gate is terminal")
         try:
-            _, tick = self._time()
-            self._schedule.check_deadline(tick)
+            self._time()
         except Exception:
             self.failed = True
-            raise EvidenceError("invalid or late window clock") from None
+            raise EvidenceError("invalid or late evidence clock") from None
         except BaseException:
             self.failed = True
             raise
 
-    def observe(self, sample, proof):
-        """Accept one endpoint without extending its original deadline.
+    def _fresh(self, sample):
+        wall, tick = self._time()
+        if (wall - sample["end_ms"] > 30000
+                or tick - sample["monotonic_ms"] > 30000):
+            raise EvidenceError("stale evidence")
 
-        Clock checks include verifier and ledger latency after they return; they
-        cannot interrupt a hung callback. A late or ambiguous ledger result may
-        already be committed and requires authoritative reconciliation, not retry.
+    def observe(self, sample, proof):
+        """Return claimed continuity evidence, never window or watch completion.
+
+        Post-return checks cannot interrupt a hung callback or enforce an atomic
+        transaction cutoff. A late or ambiguous claim requires authoritative
+        reconciliation of the same operation, not retry or ownership restoration.
         """
-        if self.failed or self.complete:
-            raise EvidenceError("window policy is terminal")
+        if self.failed:
+            raise EvidenceError("evidence gate is terminal")
         try:
             wall, tick = self._time()
-            self._schedule.check_deadline(tick)
-            accepted = self._sequence.accept(sample, proof, now_ms=wall, monotonic_ms=tick)
-            _, finished = self._time()
-            self._schedule.check_deadline(finished)
-            result = self._schedule.observe(accepted["series"], accepted["monotonic_ms"])
-            self.complete = result == "complete"
-            return result
+            accepted = self._sequence.accept(sample, proof, now_ms=wall, monotonic_ms=tick,
+                                             before_claim=self._fresh)
+            self._fresh(accepted)
+            return accepted
         except Exception:
             self.failed = True
-            raise EvidenceError("invalid or late window endpoint") from None
+            raise EvidenceError("invalid or late evidence") from None
         except BaseException:
             self.failed = True
             raise
