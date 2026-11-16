@@ -1,6 +1,8 @@
 //! Protected acceptance: unverified live bot flags cannot become human attendance.
 #![cfg(feature = "db")]
 
+#[path = "common/attendance_reply.rs"]
+mod attendance_reply;
 #[allow(dead_code)]
 mod common;
 
@@ -54,6 +56,11 @@ fn interaction(on_behalf: bool, occurrence: &str) -> Interaction {
 
 async fn checkin(pool: &PgPool, flag: Option<Value>, on_behalf: bool, label: &str) -> String {
     let target = if on_behalf { TARGET } else { HOST };
+    let kind = if flag.as_ref().is_none_or(Value::is_boolean) {
+        two_bot_discord::brand::EmbedKind::Ok
+    } else {
+        two_bot_discord::brand::EmbedKind::Danger
+    };
     let mut live_user = json!({"id": target, "username": "target", "discriminator": "0"});
     if let Some(flag) = flag {
         live_user["bot"] = flag;
@@ -100,16 +107,17 @@ async fn checkin(pool: &PgPool, flag: Option<Value>, on_behalf: bool, label: &st
     )
     .await
     .expect("attendance interaction completes"));
-    let reply: Value = serde_json::from_slice(
-        &mock
-            .requests()
-            .iter()
-            .find(|request| request.method == "PATCH")
-            .expect("deferred reply edited")
-            .body,
-    )
-    .expect("reply JSON");
-    let content = reply["content"].as_str().expect("reply content").to_owned();
+    let requests = mock.requests();
+    let edit = requests
+        .iter()
+        .find(|request| request.method == "PATCH")
+        .expect("deferred reply edited");
+    assert_eq!(
+        edit.path,
+        "/api/v10/webhooks/1111/attendance-fixture/messages/@original"
+    );
+    let reply: Value = serde_json::from_slice(&edit.body).expect("reply JSON");
+    let content = attendance_reply::deferred_text(&reply, kind).to_owned();
     mock.shutdown().await;
     content
 }
