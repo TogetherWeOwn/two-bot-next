@@ -70,8 +70,8 @@ fn completion_routes_only_single_embed_limit_replies() {
 }
 
 #[tokio::test]
-async fn registered_limit_names_reach_embed_completion() {
-    struct RoutingReplies(Mutex<Vec<bool>>);
+async fn registered_voice_names_reach_embed_completion() {
+    struct RoutingReplies(Mutex<Vec<Option<String>>>);
 
     impl InteractionReplies for RoutingReplies {
         async fn defer(&self, _: &Interaction) -> Result<(), RoomHttpError> {
@@ -83,10 +83,10 @@ async fn registered_limit_names_reach_embed_completion() {
             interaction: &Interaction,
             response: InteractionResponse,
         ) -> Result<(), RoomHttpError> {
-            self.0
-                .lock()
-                .unwrap()
-                .push(limit_completion_embed(interaction, &response).is_some());
+            self.0.lock().unwrap().push(
+                limit_completion_embed(interaction, &response)
+                    .map(|embed| embed.description.clone().expect("embed description")),
+            );
             Ok(())
         }
 
@@ -104,6 +104,8 @@ async fn registered_limit_names_reach_embed_completion() {
     let mut commands = two_bot_discord::publish_commands(&[
         CommandDefinition::new("limit", "Limit."),
         CommandDefinition::new("unlimit", "Unlimit."),
+        CommandDefinition::new("ping", "Ping."),
+        CommandDefinition::new("invite", "Invite."),
     ]);
     for (index, command) in commands.iter_mut().enumerate() {
         command.id = Some(Id::new(9000 + index as u64));
@@ -113,14 +115,22 @@ async fn registered_limit_names_reach_embed_completion() {
     identities.replace_guild(1, GUILD, &commands).unwrap();
     runtime.set_command_identities(identities);
     let replies = RoutingReplies(Mutex::new(Vec::new()));
-    for id in [9000, 9001] {
-        let mut data = command_data("stale-name", Vec::new());
+    for id in [9000, 9001, 9002, 9003] {
+        let mut data = command_data("rsvp", Vec::new());
         data.id = Id::new(id);
         data.guild_id = Some(Id::new(GUILD));
         let interaction = voice_interaction_as(Some(data), None, MEMBER);
         VoiceResponder::respond_with(&runtime, &replies, &interaction, None, None).await;
     }
-    assert_eq!(*replies.0.lock().unwrap(), [true, true]);
+    let selected = replies.0.lock().unwrap();
+    assert_eq!(selected.len(), 4);
+    assert!(selected[0].is_some());
+    assert!(selected[1].is_some());
+    assert!(selected[2].as_deref().unwrap().starts_with("Pong! "));
+    assert_eq!(
+        selected[3].as_deref(),
+        Some(two_bot_core::voice_utilities::NO_INVITE_CONFIGURED)
+    );
 }
 
 fn int_option(name: &str, value: i64) -> CommandDataOption {
