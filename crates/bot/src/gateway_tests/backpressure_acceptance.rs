@@ -78,6 +78,58 @@ fn rsvp_refused_counter_series_is_rendered() {
     );
 }
 
+pub(super) fn assert_saved_reply(body: &[u8], expected: &str) {
+    let reply: Value = serde_json::from_slice(body).expect("deferred reply JSON");
+    assert_eq!(reply["allowed_mentions"]["parse"], json!([]));
+    assert_eq!(reply["allowed_mentions"]["users"], json!([]));
+    assert_eq!(reply["allowed_mentions"]["roles"], json!([]));
+    let content = reply["content"].as_str().expect("reply content");
+    if content.is_empty() {
+        let embed = two_bot_discord::brand::ephemeral_reply_embed(
+            two_bot_discord::brand::EmbedKind::Ok,
+            "Events",
+            expected.to_owned(),
+        );
+        assert_eq!(reply["embeds"], json!([embed]));
+    } else {
+        assert_eq!(content, expected);
+        assert!(reply["embeds"].is_null(), "text reply has no embeds");
+    }
+}
+
+#[test]
+fn saved_reply_accepts_only_the_expected_safe_shape() {
+    let text = "RSVP saved: going.";
+    let mentions = json!({"parse": [], "users": [], "roles": []});
+    let embed = two_bot_discord::brand::ephemeral_reply_embed(
+        two_bot_discord::brand::EmbedKind::Ok,
+        "Events",
+        text.to_owned(),
+    );
+    let plain = json!({"content": text, "allowed_mentions": mentions});
+    let rich = json!({"content": "", "embeds": [embed], "allowed_mentions": mentions});
+    for reply in [&plain, &rich] {
+        assert_saved_reply(reply.to_string().as_bytes(), text);
+    }
+    let mut wrong_text = rich.clone();
+    wrong_text["embeds"][0]["description"] = json!("wrong");
+    let mut extra_embed = rich.clone();
+    extra_embed["embeds"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({}));
+    let mut unsafe_mentions = plain.clone();
+    unsafe_mentions["allowed_mentions"]["parse"] = json!(["users"]);
+    let mut mixed = plain;
+    mixed["embeds"] = rich["embeds"].clone();
+    for reply in [wrong_text, extra_embed, unsafe_mentions, mixed] {
+        assert!(std::panic::catch_unwind(|| {
+            assert_saved_reply(reply.to_string().as_bytes(), text);
+        })
+        .is_err());
+    }
+}
+
 fn callback_attempts(rest: &MockRest) -> usize {
     rest.requests()
         .iter()
@@ -149,10 +201,7 @@ async fn rsvp_burst_against_stalled_drain_refuses_and_counts() {
         .filter(|request| request.method == "PATCH" && request.path.contains("mock-rsvp-2"))
         .collect();
     assert_eq!(edits.len(), 1, "one completion edit for the burst head");
-    assert_eq!(
-        serde_json::from_slice::<Value>(&edits[0].body).unwrap()["content"],
-        "RSVP saved: going."
-    );
+    assert_saved_reply(&edits[0].body, "RSVP saved: going.");
     // Survival: cooperative shutdown drains admitted work and exits cleanly;
     // refusals must never wedge the funnel, checkpoint, or worker. A bare
     // `drop(ws)` cannot end reception (the shard maps a server-side drop to
@@ -417,10 +466,7 @@ async fn real_gateway_mixed_traffic_does_not_spend_rsvp_capacity_or_refusals() {
         } else {
             "RSVP saved: interested."
         };
-        assert_eq!(
-            serde_json::from_slice::<Value>(&edits[0].body).unwrap()["content"],
-            expected
-        );
+        assert_saved_reply(&edits[0].body, expected);
         completed.push(
             requests
                 .iter()
