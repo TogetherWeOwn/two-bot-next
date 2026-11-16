@@ -1,0 +1,44 @@
+name: base-attestation
+
+# Metadata only. A status name alone is not a required-workflow binding.
+# Do not activate or bind this workflow until the independent gates are met.
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+jobs:
+  metadata:
+    name: base-attestation-metadata
+    permissions:
+      contents: read
+      pull-requests: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out only the triggering commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+      - name: Verify checkout and evaluate metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python3 -I {0}
+        run: |
+          import os, re, runpy, subprocess, sys
+          from pathlib import Path
+
+          base = os.environ.get("GITHUB_SHA", "")
+          if not re.fullmatch(r"[0-9a-f]{40}", base):
+              raise SystemExit("Invalid base identity")
+          actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if actual != base:
+              raise SystemExit("Base checkout mismatch")
+          scripts = Path(os.environ["GITHUB_WORKSPACE"]) / ".github" / "scripts"
+          sys.path.insert(0, str(scripts))
+          sys.argv = [str(scripts / "base_attestation_gate.py"), "--event", os.environ["GITHUB_EVENT_PATH"]]
+          runpy.run_path(sys.argv[0], run_name="__main__")

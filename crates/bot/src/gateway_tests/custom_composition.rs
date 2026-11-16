@@ -491,10 +491,7 @@ async fn mixed_rsvp_custom_command_survives_brief_lane_contention() {
         .filter(|request| request.method == "PATCH" && request.path.contains("mock-rsvp-2"))
         .collect();
     assert_eq!(rsvp_edits.len(), 1);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&rsvp_edits[0].body).unwrap()["content"],
-        "RSVP saved: going."
-    );
+    super::backpressure_acceptance::assert_saved_reply(&rsvp_edits[0].body, "RSVP saved: going.");
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT status FROM event_rsvps")
             .fetch_one(&db.pool)

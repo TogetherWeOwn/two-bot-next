@@ -2,8 +2,9 @@ import copy
 import json
 import unittest
 
-from rest_evidence_continuity import EvidenceError
-from rest_watch_handoff import claim_handoff
+from rest_evidence_continuity import EvidenceError, MAX_COUNTER
+from rest_watch_controls import ControlGuard
+from rest_watch_handoff import claim_handoff, claim_recovery
 
 
 class HandoffTest(unittest.TestCase):
@@ -31,14 +32,14 @@ class HandoffTest(unittest.TestCase):
                        "evidence": {"reference": "verified-by-handoff-adapter"}}
         self.claimed = set()
 
-    def claim(self, record):
+    def claim(self, record, limits):
         if record["handoff_id"] in self.claimed:
             return False
         self.claimed.add(record["handoff_id"])
         return True
 
     def start(self, record=None, **overrides):
-        args = {"now_ms": 80001, "monotonic_ms": 80000, "clock_domain": "clock",
+        args = {"clock": lambda: (80001, 80000, "clock"), "clock_domain": "clock",
                 "verify_handoff": lambda item: True, "claim": self.claim,
                 "ledger": lambda *args: True, "verify_sample": lambda sample, proof, expected: True}
         args.update(overrides)
@@ -65,7 +66,7 @@ class HandoffTest(unittest.TestCase):
                 if case == "clock":
                     overrides["clock_domain"] = "different"
                 elif case == "stale":
-                    overrides["monotonic_ms"] = 109001
+                    overrides["clock"] = lambda: (109002, 109001, "clock")
                 elif case == "baseline":
                     record["baseline"]["global"] = [0, 11]
                 elif case == "sparse":
@@ -80,6 +81,17 @@ class HandoffTest(unittest.TestCase):
                     self.start(record, **overrides)
                 self.assertFalse(self.claimed)
 
+    def test_candidate_identity_is_validated_before_claim(self):
+        for field in ("run", "attempt"):
+            for value in (True, 1.0):
+                with self.subTest(field=field, value=value):
+                    record = copy.deepcopy(self.record)
+                    record["candidate_expected"] = dict(record["candidate_expected"], **{field: value})
+                    self.assertEqual(record["candidate_expected"], record["initial"]["expected"])
+                    with self.assertRaises(EvidenceError):
+                        self.start(record)
+                    self.assertFalse(self.claimed)
+
     def test_prior_observed_route_cannot_be_omitted(self):
         record = copy.deepcopy(self.record)
         for sample in record["prior"]["samples"]:
@@ -93,7 +105,54 @@ class HandoffTest(unittest.TestCase):
             self.start(verify_handoff=lambda item: False)
         self.assertFalse(self.claimed)
         with self.assertRaises(EvidenceError):
-            self.start(claim=lambda item: False)
+            self.start(claim=lambda item, limits: False)
+
+    def test_claim_receives_fixed_deadlines_and_lower_bounds(self):
+        readings = iter(((80001, 80000, "clock"), (81001, 81000, "clock"),
+                         (109001, 109000, "clock")))
+        seen = []
+        def claim(record, limits):
+            seen.append(limits)
+            return True
+        self.start(clock=lambda: next(readings), claim=claim)
+        self.assertEqual(seen, [{"clock_domain": "clock", "wall_not_before": 81001,
+                                 "tick_not_before": 81000, "wall_deadline": 109001,
+                                 "tick_deadline": 109000}])
+
+    def test_late_or_discontinuous_clock_never_returns_a_claim(self):
+        initial = (80001, 80000, "clock")
+        valid = (81001, 81000, "clock")
+        for readings in ((initial, (109002, 81000, "clock")),
+                         (initial, (81001, 109001, "clock")),
+                         (initial, (80000, 81000, "clock")),
+                         (initial, (81001, 79999, "clock")),
+                         (initial, (81001, 81000, "other")),
+                         (initial, valid, (109002, 81000, "clock")),
+                         (initial, valid, (81001, 109001, "clock")),
+                         (initial, valid, (81000, 81000, "clock")),
+                         (initial, valid, (81001, 80999, "clock")),
+                         (initial, valid, (81001, 81000, "other"))):
+            with self.subTest(readings=readings):
+                clock = iter(readings)
+                calls = []
+                with self.assertRaises(EvidenceError):
+                    self.start(clock=lambda: next(clock),
+                               claim=lambda *args: calls.append(args) or True)
+                self.assertEqual(len(calls), int(len(readings) == 3))
+
+    def test_claim_error_or_ambiguous_result_does_not_prove_no_transfer(self):
+        for outcome in (None, 1, ValueError("private")):
+            with self.subTest(outcome=outcome):
+                transferred = []
+                def claim(record, limits):
+                    transferred.append(record["handoff_id"])
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+                with self.assertRaises(EvidenceError) as caught:
+                    self.start(claim=claim)
+                self.assertEqual(transferred, ["handoff"])
+                self.assertNotIn("private", str(caught.exception))
 
     def test_original_proof_contexts_and_binding_are_verified(self):
         seen = []
@@ -149,7 +208,7 @@ class HandoffTest(unittest.TestCase):
                 self.assertFalse(self.claimed)
 
     def test_raw_input_is_bounded_and_duplicate_keys_are_refused(self):
-        options = dict(now_ms=80001, monotonic_ms=80000, clock_domain="clock",
+        options = dict(clock=lambda: (80001, 80000, "clock"), clock_domain="clock",
                        verify_handoff=lambda item: True, claim=self.claim,
                        ledger=lambda *args: True, verify_sample=lambda *args: True)
         nonfinite = copy.deepcopy(self.record)
@@ -160,3 +219,249 @@ class HandoffTest(unittest.TestCase):
                 with self.assertRaises(EvidenceError):
                     claim_handoff(raw, **options)
                 self.assertFalse(self.claimed)
+
+
+class RecoveryClaimTest(unittest.TestCase):
+    def setUp(self):
+        self.binding = {key: key for key in (
+            "contract", "handoff_id", "handoff_digest", "environment", "candidate", "prior",
+            "challenge", "snapshot_digest", "operation_id", "claimant", "incarnation", "owner", "clock_domain")}
+        candidate = {"environment": "production", "sha": "a" * 40, "build": "build",
+                     "deployment": "deploy", "worker": "worker", "image": "sha256:" + "b" * 64,
+                     "run": 1, "attempt": 1, "challenge": "challenge"}
+        self.binding.update(run=1, attempt=1, generation=1, environment="production",
+                            candidate=candidate, prior=dict(candidate, deployment="old"),
+                            handoff_digest="sha256:" + "c" * 64, snapshot_digest="sha256:" + "d" * 64)
+        self.record = {"kind": "sparse_rest_watch_recovery_claim", "version": 1,
+                       "binding": copy.deepcopy(self.binding),
+                       "timing": {"policy": "policy", "origin": "origin", "cutoffs": [
+                           {"wall_ms": 200, "tick_ms": 190}, {"wall_ms": 180, "tick_ms": 210}]},
+                       "evidence": {key: key for key in
+                                    ("readback", "controller_fence", "external_fence", "checkpoint")}}
+        self.calls = []
+
+    def start(self, record=None, **kwargs):
+        options = {"expected": self.binding, "clock": lambda: (100, 100, "clock_domain"),
+                   "verify_recovery": lambda *args: True,
+                   "claim": lambda record, limits: self.calls.append((record, limits)) or True}
+        options.update(kwargs)
+        return claim_recovery(json.dumps(self.record if record is None else record).encode(), **options)
+
+    def test_fixed_earliest_deadlines_and_boundary(self):
+        readings = iter(((100, 100, "clock_domain"), (150, 160, "clock_domain"),
+                         (180, 190, "clock_domain")))
+        self.assertTrue(self.start(clock=lambda: next(readings)))
+        self.assertEqual(self.calls[0][1], {"clock_domain": "clock_domain", "wall_not_before": 150,
+                                            "tick_not_before": 160, "wall_deadline": 180,
+                                            "tick_deadline": 190})
+
+    def test_identity_counter_endpoints_and_generation_reservation(self):
+        for field in ("run", "attempt", "generation"):
+            for value in (MAX_COUNTER - 1, MAX_COUNTER, MAX_COUNTER + 1):
+                with self.subTest(field=field, value=value):
+                    expected = copy.deepcopy(self.binding)
+                    expected[field] = value
+                    if field != "generation":
+                        expected["candidate"][field] = value
+                    record = copy.deepcopy(self.record)
+                    record["binding"] = copy.deepcopy(expected)
+                    self.calls.clear()
+                    if value <= MAX_COUNTER and (field != "generation" or value < MAX_COUNTER):
+                        self.assertTrue(self.start(record, expected=expected))
+                        self.assertEqual(len(self.calls), 1)
+                    else:
+                        with self.assertRaises(EvidenceError):
+                            self.start(record, expected=expected)
+                        self.assertFalse(self.calls)
+
+    def test_missing_or_conflicting_prerequisites_fail_before_claim(self):
+        for case in ("binding", "generation", "bool_generation", "timing", "fence", "checkpoint", "auth"):
+            with self.subTest(case=case):
+                record = copy.deepcopy(self.record)
+                options = {}
+                if case == "binding":
+                    record["binding"]["operation_id"] = "other"
+                elif case == "generation":
+                    record["binding"]["generation"] = 2
+                elif case == "bool_generation":
+                    record["binding"]["generation"] = True
+                elif case == "timing":
+                    record["timing"]["cutoffs"] = []
+                elif case == "fence":
+                    record["evidence"].pop("external_fence")
+                elif case == "checkpoint":
+                    record["evidence"]["checkpoint"] = True
+                else:
+                    options["verify_recovery"] = lambda *args: False
+                with self.assertRaises(EvidenceError):
+                    self.start(record, **options)
+                self.assertFalse(self.calls)
+
+    def test_latency_regression_domain_and_overflow_fail_closed(self):
+        initial = (100, 100, "clock_domain")
+        valid = (150, 150, "clock_domain")
+        for readings in ((initial, (181, 150, "clock_domain")),
+                         (initial, (150, 191, "clock_domain")),
+                         (initial, (99, 150, "clock_domain")),
+                         (initial, (150, 99, "clock_domain")),
+                         (initial, (150, 150, "other")),
+                         (initial, (2**64, 150, "clock_domain")),
+                         (initial, valid, (181, 150, "clock_domain")),
+                         (initial, valid, (150, 191, "clock_domain"))):
+            with self.subTest(readings=readings):
+                clock = iter(readings)
+                with self.assertRaises(EvidenceError):
+                    self.start(clock=lambda: next(clock))
+                self.calls.clear()
+
+    def test_mock_claim_rejects_replay_without_extending_deadlines(self):
+        consumed = set()
+        limits_seen = []
+        def claim(record, limits):
+            limits_seen.append(limits)
+            operation = record["binding"]["operation_id"]
+            if operation in consumed:
+                return False
+            consumed.add(operation)
+            return True
+        self.assertTrue(self.start(claim=claim))
+        with self.assertRaises(EvidenceError):
+            self.start(claim=claim)
+        self.assertEqual(limits_seen[0], limits_seen[1])
+
+    def test_ambiguous_committed_claim_does_not_report_success(self):
+        for outcome in (False, 1, None, ValueError("private")):
+            with self.subTest(outcome=outcome):
+                committed = []
+                def claim(record, limits):
+                    committed.append(record["binding"]["operation_id"])
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+                with self.assertRaises(EvidenceError) as caught:
+                    self.start(claim=claim)
+                self.assertEqual(committed, ["operation_id"])
+                self.assertNotIn("private", str(caught.exception))
+
+
+class ControlGuardTest(unittest.TestCase):
+    def setUp(self):
+        self.tick = 100
+        self.domain = "clock"
+        self.controls = {"readiness": True, "journeys": True, "ownership": True}
+        self.record = {"handoff_id": "handoff"}
+        self.verify = lambda controls, record, tick: True
+
+    def guard(self):
+        return ControlGuard(self.record, 100, "clock",
+                            lambda: (self.tick, self.domain), self.verify)
+
+    def test_authenticated_observations_are_bound_and_copied(self):
+        seen = []
+        def verify(controls, record, tick):
+            seen.append((copy.deepcopy(controls), copy.deepcopy(record), tick))
+            controls.clear()
+            record.clear()
+            return True
+        self.verify = verify
+        guard = self.guard()
+        self.tick = 10100
+        self.assertTrue(guard.observe(self.controls, deadline=10100))
+        self.assertEqual(seen, [(self.controls, self.record, 10100)])
+        self.assertEqual(self.record, {"handoff_id": "handoff"})
+
+    def test_decision_uses_authenticated_snapshot(self):
+        self.controls["ownership"] = False
+        seen = []
+        def verify(controls, record, tick):
+            seen.append(copy.deepcopy(controls))
+            self.controls["ownership"] = True
+            return True
+        self.verify = verify
+        guard = self.guard()
+        self.tick = 101
+        with self.assertRaises(EvidenceError):
+            guard.observe(self.controls, deadline=20000)
+        self.assertFalse(seen[0]["ownership"])
+        self.assertTrue(guard.failed)
+
+    def test_invalid_observations_and_clock_are_terminal(self):
+        for case in ("missing", "bool", "gap", "domain", "deadline", "rejected", "error"):
+            with self.subTest(case=case):
+                self.tick, self.domain = 101, "clock"
+                self.verify = lambda *args: True
+                if case == "rejected":
+                    self.verify = lambda *args: 1
+                if case == "error":
+                    def fail(*args):
+                        raise ValueError("private provider details")
+                    self.verify = fail
+                guard = self.guard()
+                controls = copy.deepcopy(self.controls)
+                if case == "missing":
+                    controls.pop("ownership")
+                if case == "bool":
+                    controls["journeys"] = 1
+                if case == "gap":
+                    self.tick = 10101
+                if case == "domain":
+                    self.domain = "other"
+                deadline = 100 if case == "deadline" else 20000
+                with self.assertRaises(EvidenceError):
+                    guard.observe(controls, deadline=deadline)
+                with self.assertRaises(EvidenceError):
+                    guard.observe(self.controls, deadline=20000)
+
+    def test_verifier_latency_and_clock_regression_fail_closed(self):
+        for after in (99, 10200, 10102):
+            with self.subTest(after=after):
+                self.tick = 101
+                def delayed(*args):
+                    self.tick = after
+                    return True
+                self.verify = delayed
+                guard = self.guard()
+                with self.assertRaises(EvidenceError):
+                    guard.observe(self.controls, deadline=10101)
+                self.assertTrue(guard.failed)
+
+    def test_clock_regression_between_observations_is_terminal(self):
+        def delayed(*args):
+            self.tick = 1000
+            return True
+        self.verify = delayed
+        guard = self.guard()
+        self.tick = 101
+        self.assertTrue(guard.observe(self.controls, deadline=20000))
+        self.tick = 102
+        with self.assertRaises(EvidenceError):
+            guard.observe(self.controls, deadline=20000)
+        self.tick = 1001
+        with self.assertRaises(EvidenceError):
+            guard.observe(self.controls, deadline=20000)
+
+    def test_ownership_and_journey_failure_are_terminal(self):
+        for key in ("ownership", "journeys"):
+            with self.subTest(key=key):
+                self.tick = 101
+                guard = self.guard()
+                controls = dict(self.controls, **{key: False})
+                with self.assertRaises(EvidenceError):
+                    guard.observe(controls, deadline=20000)
+                self.assertTrue(guard.failed)
+
+    def test_readiness_misses_are_consecutive_and_eighteen_fail(self):
+        guard = self.guard()
+        missing = dict(self.controls, readiness=False)
+        for _ in range(17):
+            self.tick += 1
+            self.assertFalse(guard.observe(missing, deadline=20000))
+        self.tick += 1
+        self.assertTrue(guard.observe(self.controls, deadline=20000))
+        for _ in range(17):
+            self.tick += 1
+            self.assertFalse(guard.observe(missing, deadline=20000))
+        self.tick += 1
+        with self.assertRaises(EvidenceError):
+            guard.observe(missing, deadline=20000)
+        self.assertTrue(guard.failed)

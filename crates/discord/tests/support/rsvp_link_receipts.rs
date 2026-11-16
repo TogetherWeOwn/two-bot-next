@@ -8,6 +8,7 @@
 
 use super::*;
 use two_bot_core::{put_rsvp, RsvpRecord, RsvpStatus};
+use two_bot_discord::brand::EmbedKind;
 
 fn link() -> String {
     format!("https://discord.com/events/{GUILD}/{EVENT}")
@@ -57,9 +58,18 @@ async fn link_save(pool: &Pool<Postgres>, status: &str) -> String {
     let requests = mock.requests();
     mock.shutdown().await;
     assert_eq!(requests.len(), 6, "a link adds no request to pick the copy");
+    assert_eq!(requests[0].method, "POST");
+    assert!(requests[0].path.ends_with("/callback"));
+    let ack: Value = serde_json::from_slice(&requests[0].body).expect("ack JSON");
+    assert_eq!(ack["type"], 5);
+    assert_eq!(ack["data"]["flags"], 64);
+    assert_eq!(requests[5].method, "PATCH");
+    assert!(requests[5].path.ends_with("/messages/@original"));
     let edit: Value = serde_json::from_slice(&requests[5].body).expect("edit JSON");
-    assert_eq!(edit["allowed_mentions"]["parse"], json!([]));
-    edit["content"].as_str().expect("text receipt").to_owned()
+    assert_ne!(edit["allowed_mentions"]["replied_user"], true);
+    let text = attendance_reply::deferred_text(&edit, EmbedKind::Ok);
+    assert!(!text.is_empty(), "receipt must have visible text");
+    text.to_owned()
 }
 
 #[tokio::test]
