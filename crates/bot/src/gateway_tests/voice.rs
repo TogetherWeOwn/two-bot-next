@@ -129,7 +129,11 @@ impl VoiceEventSink for RecordingVoice {
     }
 }
 
-struct GatewayVoiceReplies(two_bot_discord::ActionExecutor);
+struct GatewayVoiceReplies {
+    executor: two_bot_discord::ActionExecutor,
+    completion:
+        Arc<std::sync::Mutex<Option<twilight_model::http::interaction::InteractionResponse>>>,
+}
 
 impl two_bot::voice_rooms::InteractionReplies for GatewayVoiceReplies {
     async fn defer(
@@ -157,7 +161,8 @@ impl two_bot::voice_rooms::InteractionReplies for GatewayVoiceReplies {
         interaction: &twilight_model::application::interaction::Interaction,
         response: twilight_model::http::interaction::InteractionResponse,
     ) -> Result<(), RoomHttpError> {
-        self.0
+        *self.completion.lock().unwrap() = Some(response.clone());
+        self.executor
             .edit_interaction_response(
                 interaction.application_id.get(),
                 &interaction.token,
@@ -176,7 +181,7 @@ impl two_bot::voice_rooms::InteractionReplies for GatewayVoiceReplies {
         interaction: &twilight_model::application::interaction::Interaction,
         response: twilight_model::http::interaction::InteractionResponse,
     ) -> Result<(), RoomHttpError> {
-        self.0
+        self.executor
             .answer_interaction(interaction.id.get(), &interaction.token, &response)
             .await
             .map_err(|_| RoomHttpError::InvalidRequest)
@@ -251,13 +256,17 @@ async fn registered_voice_id_with_rsvp_payload_has_one_voice_callback() {
         false,
     );
     let rooms = PgRoomStore::new(db.pool.clone());
+    let completion = Arc::new(std::sync::Mutex::new(None));
     let voice = Arc::new(two_bot::voice_rooms::VoiceResponder::new(
         Arc::new(VoiceRuntime::new(
             move || (rooms.clone(), DeleteOnly::default()),
             Duration::from_secs(60),
             true,
         )),
-        Arc::new(GatewayVoiceReplies(executor)),
+        Arc::new(GatewayVoiceReplies {
+            executor,
+            completion: Arc::clone(&completion),
+        }),
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -347,16 +356,20 @@ async fn registered_voice_id_with_rsvp_payload_has_one_voice_callback() {
     );
     let callback: Value = serde_json::from_slice(&callbacks[0].body).unwrap();
     assert_eq!(callback["type"], 5, "the voice responder owns the defer");
-    let edit = requests
-        .iter()
-        .find(|request| request.method == "PATCH")
-        .unwrap();
-    let edit: Value = serde_json::from_slice(&edit.body).unwrap();
-    assert!(edit["content"]
-        .as_str()
+    let response = completion.lock().unwrap().take().expect("voice completion");
+    let data = response.data.expect("voice reply data");
+    assert!(data.content.as_deref().is_none_or(str::is_empty));
+    let embeds = data.embeds.expect("voice reply embeds");
+    assert_eq!(embeds.len(), 1);
+    assert!(embeds[0]
+        .description
+        .as_deref()
         .unwrap()
-        .to_lowercase()
-        .contains("pong"));
+        .starts_with("Pong! "));
+    assert_eq!(
+        embeds[0].footer.as_ref().unwrap().text,
+        "Together We Own · Voice"
+    );
     rest.shutdown().await;
     db.close().await;
 }

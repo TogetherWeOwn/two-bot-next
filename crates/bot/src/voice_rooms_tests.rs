@@ -5488,6 +5488,18 @@ fn response_text(response: &InteractionResponse) -> String {
         .unwrap_or_default()
 }
 
+fn assert_utility_embed(response: &InteractionResponse, kind: two_bot_discord::brand::EmbedKind) {
+    let data = response.data.as_ref().expect("response data");
+    assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+    assert!(data.content.is_none());
+    let embeds = data.embeds.as_ref().expect("embed");
+    assert_eq!(embeds.len(), 1);
+    assert_eq!(embeds[0].color, Some(kind.color()));
+    let footer = embeds[0].footer.as_ref().expect("footer");
+    assert_eq!(footer.text, "Together We Own · Voice");
+    assert!(footer.icon_url.is_none());
+}
+
 async fn handle_capture<S, H>(
     runtime: &VoiceRuntime<S, H>,
     interaction: &Interaction,
@@ -5699,10 +5711,8 @@ async fn ping_replies_ephemerally_without_touching_store_or_http() {
     assert!(owned);
     let response = response.expect("ping reply");
     assert!(response_text(&response).starts_with("Pong! "));
-    assert_eq!(
-        response.data.as_ref().and_then(|data| data.flags),
-        Some(MessageFlags::EPHEMERAL)
-    );
+    assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Ok);
+    assert!(limit_completion_embed(&interaction, &response).is_some());
     assert!(trace.lock().unwrap().is_empty());
 }
 
@@ -5713,10 +5723,12 @@ async fn invite_renders_the_vanity_code_or_the_fixed_notice() {
     let interaction = voice_interaction(Some(command_data("invite", Vec::new())), None, true);
     let (owned, response) = handle_capture(&runtime, &interaction).await;
     assert!(owned);
+    let response = response.expect("invite reply");
     assert_eq!(
-        response_text(&response.expect("invite reply")),
+        response_text(&response),
         two_bot_core::voice_utilities::NO_INVITE_CONFIGURED
     );
+    assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Warn);
     let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
     let writer = seen.clone();
     handle_voice_interaction_with(&runtime, &interaction, Some("abc-123"), None, |response| {
@@ -5729,6 +5741,28 @@ async fn invite_renders_the_vanity_code_or_the_fixed_notice() {
         response_text(&response),
         "Join the server: https://discord.gg/abc-123"
     );
+    assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Ok);
+    assert!(limit_completion_embed(&interaction, &response).is_some());
+
+    let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
+    let writer = seen.clone();
+    handle_voice_interaction_with(
+        &runtime,
+        &interaction,
+        Some("invalid/code"),
+        None,
+        |response| {
+            *writer.lock().unwrap() = Some(response);
+            async {}
+        },
+    )
+    .await;
+    let response = seen.lock().unwrap().clone().expect("invite reply");
+    assert_eq!(
+        response_text(&response),
+        two_bot_core::voice_utilities::INVALID_INVITE_CODE
+    );
+    assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Danger);
     assert!(trace.lock().unwrap().is_empty());
 }
 
@@ -6551,10 +6585,12 @@ async fn required_role_gates_members_but_never_admins() {
 
     let (owned, response) = handle_capture(&runtime, &ping()).await;
     assert!(owned);
+    let response = response.expect("denial");
     assert_eq!(
-        response_text(&response.expect("denial")),
+        response_text(&response),
         access_denied_text(AccessDenyReason::RequiredRole)
     );
+    assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Danger);
 
     let (_, response) = handle_capture(&runtime, &with_roles(ping(), &[9])).await;
     assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
@@ -6602,7 +6638,9 @@ async fn unreadable_settings_fail_closed_for_members_only() {
     let member = voice_interaction(Some(command_data("ping", Vec::new())), None, true);
     let (owned, response) = handle_capture(&runtime, &member).await;
     assert!(owned);
-    assert!(response_text(&response.expect("notice")).contains("unavailable"));
+    let response = response.expect("notice");
+    assert!(response_text(&response).contains("unavailable"));
+    assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Warn);
 
     let admin = voice_interaction(
         Some(command_data("ping", Vec::new())),
