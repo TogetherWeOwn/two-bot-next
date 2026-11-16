@@ -661,7 +661,11 @@ operator; a failed restore is never a reason to wait for the next deployment.
 ### Daily staging proof
 
 `staging-rollback-drill.yml` runs daily at **03:17 UTC** on `main`. With no manual
-`target_version`, its `proof` job calls `scripts/rollback_proof.py run`, which:
+`target_version`, its `proof` job currently fails before dispatch; its failure
+alert remains active. Retain this refusal until non-mutating Actions evidence and
+independent Security acceptance establish a replacement. No synthetic green is
+qualification. The retained, currently unreachable `scripts/rollback_proof.py run`
+would:
 
 1. Dispatches only `deploy-staging.yml` on `main`, with the existing staging
    error-rate gate rehearsal enabled. No production dispatch or traffic fault
@@ -708,18 +712,10 @@ scheduled proof passes. This independent
 schedule catches a missed drill trigger; an outage of GitHub Actions itself is
 outside these two scheduled checks.
 
-For a reviewed on-demand proof after a repair:
-
-```sh
-# No network, dispatch or mutation:
-python3 scripts/rollback_proof.py run --dry-run
-# Staging only; use the merged main workflow, never a production drill:
-gh workflow run staging-rollback-drill.yml --ref main
-```
-
-Inspect the exact child run and staging state before retrying a failed/timed-out
-proof. The dispatcher never cancels or blindly reruns a mutating child. A manual
-proof is useful evidence, but the freshness watcher requires a scheduled proof.
+Do not dispatch an on-demand proof while this refusal is in place. The local
+`python3 scripts/rollback_proof.py run --dry-run` does not dispatch or qualify a
+proof. Inspect any prior child run and staging state before recovery; the
+freshness watcher requires a scheduled proof, not a manual substitute.
 
 Both gate curls enforce `--max-filesize 65536` (64 KiB). Any transfer
 failure counts as `000`, even if curl reports HTTP 200 and leaves a valid

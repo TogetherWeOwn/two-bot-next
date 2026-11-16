@@ -86,7 +86,7 @@ JOB_INVENTORY = {
     "staging-ownership-status.yml": {"status"},
     # Manual gradual-promote proof caller (passive until the synthetic
     # fixture lands); pinned shape below.
-    "gradual-promote-proof.yml": {"proof"},
+    "gradual-promote-proof.yml": {"admission-hold", "proof"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
@@ -1790,6 +1790,12 @@ ROLLBACK_DRILL_ENV = {
 }
 
 
+ADMISSION_REFUSAL = {
+    "name": "Refuse staging use without enforced admission",
+    "run": 'echo "::error::enforced exact-SHA admission is unavailable"\nexit 1\n',
+}
+
+
 def rollback_proof_job_errors(job, mode):
     """Pin the dispatcher/observer to reviewed tooling and the smallest token."""
     errors = []
@@ -1813,8 +1819,12 @@ def rollback_proof_job_errors(job, mode):
     if str(job.get("timeout-minutes")) != ("80" if mode == "run" else "5"):
         errors.append(f"rollback proof {mode}: bounded job timeout changed")
     steps = job.get("steps") or []
-    if len(steps) != (3 if mode == "run" else 2):
+    if len(steps) != (4 if mode == "run" else 2):
         return errors + [f"rollback proof {mode}: unexpected steps"]
+    if mode == "run":
+        if steps[0] != ADMISSION_REFUSAL:
+            errors.append("rollback proof run: first step must unconditionally refuse admission")
+        steps = steps[1:]
     if any("if" in step or "continue-on-error" in step for step in steps):
         errors.append(f"rollback proof {mode}: steps must run and fail closed")
     checkout, command = steps[:2]
@@ -2637,10 +2647,17 @@ def gradual_promote_proof_errors(workflow):
     if workflow.get("concurrency") != {"group": "gradual-promote-proof", "cancel-in-progress": "false"}:
         errors.append(f"{name}: must use its own gradual-promote-proof group without cancelling")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"proof"}:
-        errors.append(f"{name}: jobs must be exactly proof")
+    if set(jobs) != {"admission-hold", "proof"}:
+        errors.append(f"{name}: jobs must be exactly admission-hold and proof")
         return errors
+    if jobs["admission-hold"] != {
+        "permissions": {}, "runs-on": "ubuntu-latest", "timeout-minutes": "2",
+        "steps": [ADMISSION_REFUSAL],
+    }:
+        errors.append(f"{name}: admission hold must unconditionally fail without credentials")
     job = jobs["proof"]
+    if job.get("needs") != "admission-hold":
+        errors.append(f"{name}: proof must depend on the admission hold")
     if job.get("name") != "gradual-promote-proof":
         errors.append(f"{name}:proof: job name must stay gradual-promote-proof")
     if job.get("if") != "github.ref == 'refs/heads/main'":
@@ -2653,7 +2670,7 @@ def gradual_promote_proof_errors(workflow):
         errors.append(f"{name}:proof: timeout must stay 30 minutes")
     if not runner_allowed("proof", job.get("runs-on")):
         errors.append(f"{name}:proof: must use the explicit ubuntu-latest runner for job 'proof'")
-    for key in ("env", "needs", "uses", "services", "container", "continue-on-error", "strategy"):
+    for key in ("env", "uses", "services", "container", "continue-on-error", "strategy"):
         if key in job:
             errors.append(f"{name}:proof: must not set {key}")
     steps = job.get("steps") or []
@@ -8932,7 +8949,11 @@ class WorkflowTests(unittest.TestCase):
             "dispatcher deadlocks staging lane": lambda w: w["jobs"]["proof"].update(
                 {"concurrency": {"group": "staging-lifecycle", "cancel-in-progress": False}}),
             "dispatcher reads production secrets": lambda w: w["jobs"]["proof"].update({"environment": "production"}),
-            "dispatcher extra bindings": lambda w: w["jobs"]["proof"]["steps"][1]["env"].update({"URL": "production"}),
+            "dispatcher extra bindings": lambda w: w["jobs"]["proof"]["steps"][2]["env"].update({"URL": "production"}),
+            "refusal removed": lambda w: w["jobs"]["proof"]["steps"].pop(0),
+            "refusal made successful": lambda w: w["jobs"]["proof"]["steps"][0].update({"run": "exit 0\n"}),
+            "refusal conditional": lambda w: w["jobs"]["proof"]["steps"][0].update({"if": "false"}),
+            "refusal tolerated": lambda w: w["jobs"]["proof"]["steps"][0].update({"continue-on-error": "true"}),
             "missing evidence": lambda w: w["jobs"]["proof"]["steps"].pop(),
             "alert on success": lambda w: w["jobs"]["alert"].update({"if": "always()"}),
             "alert cannot write the incident issue": lambda w: w["jobs"]["alert"]["permissions"].pop("issues"),
@@ -9747,6 +9768,12 @@ class WorkflowTests(unittest.TestCase):
             "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
             "shared concurrency group": lambda w: w["concurrency"].update({"group": "staging-lifecycle"}),
             "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
+            "missing hold": lambda w: w["jobs"].pop("admission-hold"),
+            "hold succeeds": lambda w: w["jobs"]["admission-hold"]["steps"][0].update({"run": "exit 0\n"}),
+            "hold conditional": lambda w: w["jobs"]["admission-hold"].update({"if": "false"}),
+            "hold tolerated": lambda w: w["jobs"]["admission-hold"]["steps"][0].update({"continue-on-error": "true"}),
+            "proof bypasses hold": lambda w: job(w).pop("needs"),
+            "proof runs after failure": lambda w: job(w).update({"if": "always()"}),
             "production environment": lambda w: job(w).update({"environment": "production"}),
             "no environment": lambda w: job(w).pop("environment"),
             "branch condition removed": lambda w: job(w).pop("if"),
@@ -10620,6 +10647,9 @@ class WorkflowTests(unittest.TestCase):
                         expected = {"contents": "read"}
                     elif (name, job_id) == ("deploy-production.yml", "promotion-skipped"):
                         # No checkout or API access: only report and upload a receipt.
+                        expected = {}
+                    elif (name, job_id) == ("gradual-promote-proof.yml", "admission-hold"):
+                        # Refuses before checkout or API access.
                         expected = {}
                     elif (name, job_id) == ("daily-digest.yml", "digest"):
                         # Cuts the vYYYY.MM.DD tag and its release, reads the

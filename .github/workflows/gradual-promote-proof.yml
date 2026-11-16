@@ -40,7 +40,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  admission-hold:
+    permissions: {}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Refuse staging use without enforced admission
+        run: |
+          echo "::error::enforced exact-SHA admission is unavailable"
+          exit 1
+
   proof:
+    needs: admission-hold
     name: gradual-promote-proof
     # Only the reviewed harness on main may run; a branch copy can never
     # dispatch against the synthetic target.
