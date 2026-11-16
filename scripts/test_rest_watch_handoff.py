@@ -2,7 +2,7 @@ import copy
 import json
 import unittest
 
-from rest_evidence_continuity import EvidenceError
+from rest_evidence_continuity import EvidenceError, MAX_COUNTER
 from rest_watch_controls import ControlGuard
 from rest_watch_handoff import claim_handoff, claim_recovery
 
@@ -80,6 +80,17 @@ class HandoffTest(unittest.TestCase):
                 with self.assertRaises(EvidenceError):
                     self.start(record, **overrides)
                 self.assertFalse(self.claimed)
+
+    def test_candidate_identity_is_validated_before_claim(self):
+        for field in ("run", "attempt"):
+            for value in (True, 1.0):
+                with self.subTest(field=field, value=value):
+                    record = copy.deepcopy(self.record)
+                    record["candidate_expected"] = dict(record["candidate_expected"], **{field: value})
+                    self.assertEqual(record["candidate_expected"], record["initial"]["expected"])
+                    with self.assertRaises(EvidenceError):
+                        self.start(record)
+                    self.assertFalse(self.claimed)
 
     def test_prior_observed_route_cannot_be_omitted(self):
         record = copy.deepcopy(self.record)
@@ -243,6 +254,25 @@ class RecoveryClaimTest(unittest.TestCase):
         self.assertEqual(self.calls[0][1], {"clock_domain": "clock_domain", "wall_not_before": 150,
                                             "tick_not_before": 160, "wall_deadline": 180,
                                             "tick_deadline": 190})
+
+    def test_identity_counter_endpoints_and_generation_reservation(self):
+        for field in ("run", "attempt", "generation"):
+            for value in (MAX_COUNTER - 1, MAX_COUNTER, MAX_COUNTER + 1):
+                with self.subTest(field=field, value=value):
+                    expected = copy.deepcopy(self.binding)
+                    expected[field] = value
+                    if field != "generation":
+                        expected["candidate"][field] = value
+                    record = copy.deepcopy(self.record)
+                    record["binding"] = copy.deepcopy(expected)
+                    self.calls.clear()
+                    if value <= MAX_COUNTER and (field != "generation" or value < MAX_COUNTER):
+                        self.assertTrue(self.start(record, expected=expected))
+                        self.assertEqual(len(self.calls), 1)
+                    else:
+                        with self.assertRaises(EvidenceError):
+                            self.start(record, expected=expected)
+                        self.assertFalse(self.calls)
 
     def test_missing_or_conflicting_prerequisites_fail_before_claim(self):
         for case in ("binding", "generation", "bool_generation", "timing", "fence", "checkpoint", "auth"):
