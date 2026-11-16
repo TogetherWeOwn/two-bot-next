@@ -10733,6 +10733,47 @@ class WorkflowTests(unittest.TestCase):
                         self.assertGreaterEqual(int(ceiling), 1)
                         self.assertLessEqual(int(ceiling), 360)
 
+    def test_base_attestation_only_executes_verified_base(self):
+        self.assertNotIn("base-attestation.yml", self.workflows)
+        self.assertNotIn("base-attestation.yaml", self.workflows)
+        fixture = ROOT / "scripts/ci/fixtures/base-attestation.yml"
+        workflow = yaml.load(fixture.read_text(), Loader=UniqueKeyLoader)
+        self.assertEqual(set(workflow), {"name", "on", "permissions", "jobs"})
+        self.assertEqual(set(workflow["jobs"]), {"metadata"})
+        self.assertEqual(workflow["on"], {"pull_request_target": {"types": [
+            "opened", "edited", "synchronize", "reopened", "ready_for_review"]}})
+        self.assertNotIn("concurrency", workflow)
+        job = workflow["jobs"]["metadata"]
+        self.assertEqual(set(job), {"name", "permissions", "runs-on", "timeout-minutes", "steps"})
+        self.assertEqual(job["permissions"], {"contents": "read", "pull-requests": "read"})
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["timeout-minutes"], "5")
+        checkout, execute = job["steps"]
+        self.assertEqual(checkout["uses"], "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
+        self.assertEqual(checkout["with"], {
+            "ref": "${{ github.event.pull_request.base.sha }}", "persist-credentials": "false",
+            "sparse-checkout": ".github/scripts", "sparse-checkout-cone-mode": "false"})
+        self.assertEqual(execute["shell"], "python3 -I {0}")
+        self.assertEqual(execute["env"], {"GH_TOKEN": "${{ github.token }}"})
+        self.assertEqual(set(execute), {"name", "env", "shell", "run"})
+        script = compile(execute["run"], "workflow", "exec")
+        environment = {"GITHUB_SHA": "a" * 40, "GITHUB_WORKSPACE": "/synthetic",
+                       "GITHUB_EVENT_PATH": "/synthetic-event"}
+        for actual, allowed in (("a" * 40, True), ("b" * 40, False)):
+            with self.subTest(allowed=allowed), patch.dict(os.environ, environment, clear=True), \
+                    patch("subprocess.check_output", return_value=actual + "\n"), \
+                    patch("runpy.run_path") as run, patch.object(sys, "path", list(sys.path)), \
+                    patch.object(sys, "argv", list(sys.argv)):
+                if allowed:
+                    exec(script, {})
+                    run.assert_called_once_with("/synthetic/.github/scripts/base_attestation_gate.py",
+                                                run_name="__main__")
+                    self.assertEqual(sys.argv[1:], ["--event", "/synthetic-event"])
+                else:
+                    with self.assertRaises(SystemExit):
+                        exec(script, {})
+                    run.assert_not_called()
+
     def test_own_trigger_workflows_serialize_at_the_top_level(self):
         # A workflow with its own triggers (anything beyond a pure
         # `workflow_call` callee) declares top-level `concurrency`, so two
