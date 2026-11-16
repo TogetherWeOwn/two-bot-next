@@ -16,6 +16,7 @@ pub struct HourBucket {
     /// Latest actual valid observation included in the hour, not flush time.
     /// Present iff `samples > 0`, including true zero-occupancy observations.
     pub last_observed_at: Option<OffsetDateTime>,
+    revision: u64,
 }
 
 /// Truncate a sample timestamp to its UTC hour start. Pure over the clock so
@@ -37,6 +38,7 @@ const MAX_BUFFERED_HOURS: usize = 336;
 #[derive(Debug, Default)]
 pub struct Accumulator {
     buckets: BTreeMap<time::OffsetDateTime, BufferedHour>,
+    revision: u64,
 }
 
 #[derive(Debug, Default)]
@@ -44,6 +46,7 @@ struct BufferedHour {
     slots: u16,
     occupancy_sum: i64,
     last_observed_at: Option<time::OffsetDateTime>,
+    revision: u64,
 }
 
 impl Accumulator {
@@ -59,6 +62,8 @@ impl Accumulator {
         if entry.slots & mask != 0 {
             return;
         }
+        self.revision = self.revision.checked_add(1).expect("revision exhausted");
+        entry.revision = self.revision;
         entry.slots |= mask;
         entry.occupancy_sum = entry.occupancy_sum.saturating_add(total.max(0));
         entry.last_observed_at = Some(
@@ -83,15 +88,23 @@ impl Accumulator {
                 samples: i64::from(entry.slots.count_ones()),
                 occupancy_sum: entry.occupancy_sum,
                 last_observed_at: entry.last_observed_at,
+                revision: entry.revision,
             })
             .collect()
     }
 
-    /// Forget buckets only after their flush succeeds. The caller must ensure
-    /// that its storage makes retries safe and does not acknowledge failed writes.
+    /// Forget unchanged buckets only after their flush succeeds. Changed buckets
+    /// remain complete snapshots for retry; storage must make retries safe.
+    /// Only acknowledge snapshots produced by this accumulator after successful writes.
     pub fn acknowledge(&mut self, buckets: &[HourBucket]) {
         for bucket in buckets {
-            self.buckets.remove(&bucket.hour_start);
+            if self
+                .buckets
+                .get(&bucket.hour_start)
+                .is_some_and(|entry| entry.revision == bucket.revision)
+            {
+                self.buckets.remove(&bucket.hour_start);
+            }
         }
     }
 
@@ -160,6 +173,31 @@ mod tests {
         assert!(acc.completed(hour(10)).is_empty());
     }
 
+    #[test]
+    fn acknowledgement_preserves_observations_after_snapshot() {
+        let mut acc = Accumulator::default();
+        acc.record(hour(10) + time::Duration::minutes(50), 4);
+        let snapshot = acc.completed(hour(11));
+        acc.record(hour(10) + time::Duration::minutes(55), 6);
+        acc.acknowledge(&snapshot);
+        let retry = acc.completed(hour(11));
+        assert_eq!(retry.len(), 1);
+        assert_eq!((retry[0].samples, retry[0].occupancy_sum), (2, 10));
+        acc.acknowledge(&retry);
+        assert!(acc.completed(hour(11)).is_empty());
+    }
+
+    #[test]
+    fn stale_acknowledgement_does_not_remove_recreated_hour() {
+        let mut acc = Accumulator::default();
+        acc.record(hour(10), 4);
+        let snapshot = acc.completed(hour(11));
+        acc.acknowledge(&snapshot);
+        acc.record(hour(10), 4);
+        acc.acknowledge(&snapshot);
+        assert_eq!(acc.completed(hour(11)).len(), 1);
+    }
+
     #[tokio::test]
     async fn cancelled_flush_keeps_completed_hours_buffered() {
         let accumulator = Arc::new(Mutex::new(Accumulator::default()));
@@ -185,6 +223,7 @@ mod tests {
                 samples: 1,
                 occupancy_sum: 4,
                 last_observed_at: Some(hour(9)),
+                revision: 1,
             }]
         );
     }
