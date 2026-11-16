@@ -58,6 +58,38 @@ fn permission_order_follows_discord_not_array_order() {
 }
 
 #[test]
+fn channel_overwrites_cannot_grant_administrator() {
+    let roles = [
+        GuildRoleFact {
+            id: 1,
+            position: 0,
+            permissions: 0,
+        },
+        GuildRoleFact {
+            id: 3,
+            position: 1,
+            permissions: 0,
+        },
+    ];
+    for (id, kind) in [
+        (1, OverrideKind::Role),
+        (3, OverrideKind::Role),
+        (5, OverrideKind::Member),
+    ] {
+        let overwrite = ChannelOverride {
+            id,
+            kind,
+            allow: PERM_ADMINISTRATOR | PERM_CONNECT,
+            deny: 0,
+        };
+        assert_eq!(
+            effective_perms(&roles, &[overwrite], 1, 2, 5, &[3]),
+            Some(PERM_CONNECT)
+        );
+    }
+}
+
+#[test]
 fn missing_facts_fail_closed_and_admin_and_owner_bypass() {
     let roles = [
         GuildRoleFact {

@@ -67,7 +67,8 @@ pub fn effective_perms(
             base = (base & !overwrite.deny) | overwrite.allow;
         }
     }
-    Some(base)
+    // Administrator is guild-only; channel overwrites cannot grant it.
+    Some(base & !PERM_ADMINISTRATOR)
 }
 
 #[cfg(test)]
