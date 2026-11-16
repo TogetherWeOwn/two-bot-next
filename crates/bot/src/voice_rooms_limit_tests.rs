@@ -7,6 +7,67 @@ use two_bot_core::voice_room_controls::RoomLimit;
 
 const OUTSIDER: u64 = 555;
 
+fn response_text(response: &InteractionResponse) -> String {
+    let data = response.data.as_ref().expect("response data");
+    data.content
+        .clone()
+        .or_else(|| data.embeds.as_ref()?.first()?.description.clone())
+        .unwrap_or_default()
+}
+
+fn assert_limit_embed(
+    response: &InteractionResponse,
+    kind: two_bot_discord::brand::EmbedKind,
+    text: &str,
+) {
+    let data = response.data.as_ref().expect("response data");
+    assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+    assert!(data.content.is_none());
+    let embeds = data.embeds.as_ref().expect("embed");
+    assert_eq!(embeds.len(), 1);
+    assert_eq!(embeds[0].description.as_deref(), Some(text));
+    assert_eq!(embeds[0].color, Some(kind.color()));
+    let footer = embeds[0].footer.as_ref().expect("footer");
+    assert_eq!(footer.text, "Together We Own · Voice");
+    assert!(footer.icon_url.is_none());
+}
+
+#[test]
+fn completion_routes_only_single_embed_limit_replies() {
+    let limit = limit_interaction(MEMBER, Vec::new());
+    let unlimit = voice_interaction_as(Some(command_data("unlimit", Vec::new())), None, MEMBER);
+    let other = voice_interaction_as(Some(command_data("lock", Vec::new())), None, MEMBER);
+    let response = super::super::limit::limit_response(
+        "A reply".to_owned(),
+        two_bot_discord::brand::EmbedKind::Ok,
+    );
+    assert!(limit_completion_embed(&limit, &response).is_some());
+    assert!(limit_completion_embed(&unlimit, &response).is_some());
+    assert!(limit_completion_embed(&other, &response).is_none());
+
+    let mut mixed = response.clone();
+    mixed.data.as_mut().unwrap().content = Some("text".to_owned());
+    assert!(limit_completion_embed(&limit, &mixed).is_none());
+    mixed = response.clone();
+    mixed.data.as_mut().unwrap().attachments = Some(vec![Attachment::from_bytes(
+        "reply.txt",
+        b"reply".to_vec(),
+        0,
+    )]);
+    assert!(limit_completion_embed(&limit, &mixed).is_none());
+    mixed = response.clone();
+    mixed.data.as_mut().unwrap().components = Some(vec![Component::ActionRow(ActionRow {
+        components: Vec::new(),
+    })]);
+    assert!(limit_completion_embed(&limit, &mixed).is_none());
+    mixed = response.clone();
+    let data = mixed.data.as_mut().unwrap();
+    let embeds = data.embeds.as_mut().unwrap();
+    embeds.push(embeds[0].clone());
+    assert!(limit_completion_embed(&limit, &mixed).is_none());
+    assert!(limit_completion_embed(&limit, &ephemeral_response("plain text")).is_none());
+}
+
 fn int_option(name: &str, value: i64) -> CommandDataOption {
     CommandDataOption {
         name: name.to_owned(),
@@ -27,7 +88,7 @@ async fn run_once(
     command: LimitCommand,
 ) -> (String, Option<LimitAck>) {
     match worker.apply_limit(actor, is_admin, command) {
-        LimitReply::Done(text) => (text, None),
+        LimitReply::Done(text) | LimitReply::Pending(text) => (text, None),
         LimitReply::Queued { limit, ack } => {
             assert!(worker.dispatch_one(0).await, "the queued write is due");
             let outcome = ack.await.ok();
@@ -620,12 +681,31 @@ async fn handle_limit_replies_after_the_write_lands() {
     let response = response.expect("reply");
     let text = response_text(&response);
     assert!(text.contains("limited to 5 people"), "{text}");
+    assert_limit_embed(
+        &response,
+        two_bot_discord::brand::EmbedKind::Ok,
+        "This room is now limited to 5 people.",
+    );
     // Ephemeral, like every voice reply.
     assert_eq!(
         response.data.as_ref().and_then(|data| data.flags),
         Some(twilight_model::channel::message::MessageFlags::EPHEMERAL)
     );
     assert_eq!(limit_writes(&trace), ["limit:500:5"]);
+}
+
+#[tokio::test]
+async fn handle_unlimit_reports_success_as_an_embed() {
+    let trace = Trace::default();
+    let runtime = limit_room_runtime(trace, open_access(), Vec::new()).await;
+    let interaction = voice_interaction_as(Some(command_data("unlimit", Vec::new())), None, MEMBER);
+    let (owned, response) = handle_capture(&runtime, &interaction).await;
+    assert!(owned);
+    assert_limit_embed(
+        response.as_ref().expect("reply"),
+        two_bot_discord::brand::EmbedKind::Ok,
+        "This room no longer has a user limit.",
+    );
 }
 
 #[tokio::test]
@@ -637,6 +717,11 @@ async fn handle_unlimit_by_a_non_owner_refuses() {
     assert!(owned);
     let text = response_text(response.as_ref().expect("reply"));
     assert!(text.contains("Only the room owner or an admin"), "{text}");
+    assert_limit_embed(
+        response.as_ref().expect("reply"),
+        two_bot_discord::brand::EmbedKind::Danger,
+        "Only the room owner or an admin can change this room's limit.",
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(limit_writes(&trace).is_empty());
 }
@@ -673,6 +758,11 @@ async fn handle_limit_reports_a_rate_limited_write_as_queued_then_applies_it() {
     let (_, response) = handle_capture(&runtime, &interaction).await;
     let text = response_text(response.as_ref().expect("reply"));
     assert!(text.contains("Discord is busy"), "{text}");
+    assert_limit_embed(
+        response.as_ref().expect("reply"),
+        two_bot_discord::brand::EmbedKind::Warn,
+        "Setting the room limit to 5. Discord is busy, so it will apply shortly.",
+    );
     // The retry after the 429 lands on a later tick.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while limit_writes(&trace).len() < 2 {
@@ -705,6 +795,11 @@ async fn the_per_command_role_gate_covers_limit_and_unlimit() {
         assert!(owned);
         let text = response_text(response.as_ref().expect("reply"));
         assert!(!text.is_empty() && !text.contains("limited to"), "{text}");
+        assert_limit_embed(
+            response.as_ref().expect("reply"),
+            two_bot_discord::brand::EmbedKind::Danger,
+            "You do not have a role that may use this command here.",
+        );
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(limit_writes(&trace).is_empty());

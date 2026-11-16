@@ -14425,7 +14425,15 @@ where
     // interactions keep their existing handling.
     let authority = runtime.guild_authority(interaction);
     if matches!(authority, GuildAuthority::WarmingUp) && requires_guild_authority(&command) {
-        reply(ephemeral_response(WARMING_UP_REPLY)).await;
+        if matches!(command, VoiceCommand::Limit(_) | VoiceCommand::Unlimit) {
+            reply(limit::limit_response(
+                WARMING_UP_REPLY.to_owned(),
+                two_bot_discord::brand::EmbedKind::Warn,
+            ))
+            .await;
+        } else {
+            reply(ephemeral_response(WARMING_UP_REPLY)).await;
+        }
         return true;
     }
     // Guild-level role gate first. Settings that cannot be read fail closed for
@@ -14433,6 +14441,20 @@ where
     let member = access_member(interaction, runtime.guild_permissions(interaction));
     let (gate_store, _) = runtime.make_pair();
     if let Some(denial) = command_gate(&gate_store, guild_id, &member, command.name()).await {
+        if matches!(command, VoiceCommand::Limit(_) | VoiceCommand::Unlimit) {
+            let text = denial.data.as_ref().and_then(|data| data.content.clone());
+            if let Some(text) = text {
+                let kind = if text
+                    == "Voice-room settings are unavailable right now. Try again shortly."
+                {
+                    two_bot_discord::brand::EmbedKind::Warn
+                } else {
+                    two_bot_discord::brand::EmbedKind::Danger
+                };
+                reply(limit::limit_response(text, kind)).await;
+                return true;
+            }
+        }
         reply(denial).await;
         return true;
     }
@@ -15522,6 +15544,35 @@ pub trait InteractionReplies: Send + Sync {
     }
 }
 
+fn limit_completion_embed<'a>(
+    interaction: &Interaction,
+    response: &'a InteractionResponse,
+) -> Option<&'a twilight_model::channel::message::Embed> {
+    if !matches!(
+        parse_voice_command(interaction),
+        Some(VoiceCommand::Limit(_) | VoiceCommand::Unlimit)
+    ) {
+        return None;
+    }
+    let data = response.data.as_ref()?;
+    if data.content.is_some()
+        || data
+            .attachments
+            .as_ref()
+            .is_some_and(|items| !items.is_empty())
+        || data
+            .components
+            .as_ref()
+            .is_some_and(|items| !items.is_empty())
+    {
+        return None;
+    }
+    match data.embeds.as_deref()? {
+        [embed] => Some(embed),
+        _ => None,
+    }
+}
+
 impl InteractionReplies for RoomHttp {
     async fn original_message(
         &self,
@@ -15554,6 +15605,15 @@ impl InteractionReplies for RoomHttp {
         interaction: &Interaction,
         response: InteractionResponse,
     ) -> Result<(), RoomHttpError> {
+        if let Some(embed) = limit_completion_embed(interaction, &response) {
+            return self
+                .complete_prebuilt_voice_embed(
+                    interaction.application_id,
+                    &interaction.token,
+                    embed,
+                )
+                .await;
+        }
         let data = response.data.as_ref();
         let content = data
             .and_then(|data| data.content.as_deref())
