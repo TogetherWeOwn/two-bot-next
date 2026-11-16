@@ -1300,15 +1300,29 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             .ok_or_else(|| refuse(format!("manifest table {name} has an invalid row count")))?;
         let _ = count;
     }
-    // Historical inventories are pinned by fixtures. Each old version waives
-    // only tables first covered by a later version. New v16 archives require
-    // the full inventory, including both guild counters (0441/0442/0446/0447),
-    // the epoch-claim guard (0450/0451), the delete tombstones (0452/0453),
-    // the token registry (0456/0457), the event voice pair (0455) and
-    // the starboard tables (0458/0459) and giveaways (0460/0461),
-    // and the event instance windows (0472).
     let version = obj.get("version").and_then(Value::as_u64);
-    let missing: Vec<&str> = DUMP_TABLES
+    let missing: Vec<&str> = required_manifest_tables(version)
+        .into_iter()
+        .filter(|name| !names.contains(*name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(refuse(format!(
+            "manifest is missing tables: {}",
+            missing.join(", ")
+        )));
+    }
+    serde_json::from_value(obj.clone()).map_err(|e| refuse(format!("manifest is malformed: {e}")))
+}
+
+// Historical inventories are pinned by fixtures. Each old version waives
+// only tables first covered by a later version. New v16 archives require
+// the full inventory, including both guild counters (0441/0442/0446/0447),
+// the epoch-claim guard (0450/0451), the delete tombstones (0452/0453),
+// the token registry (0456/0457), the event voice pair (0455) and
+// the starboard tables (0458/0459) and giveaways (0460/0461),
+// and the event instance windows (0472).
+fn required_manifest_tables(version: Option<u64>) -> Vec<&'static str> {
+    DUMP_TABLES
         .iter()
         .copied()
         .enumerate()
@@ -1390,15 +1404,7 @@ fn validate_manifest(obj: &Value) -> Result<DumpManifest, DumpError> {
             _ => !OPTIONAL_LEGACY_TABLES.contains(name),
         })
         .map(|(_, name)| name)
-        .filter(|name| !names.contains(*name))
-        .collect();
-    if !missing.is_empty() {
-        return Err(refuse(format!(
-            "manifest is missing tables: {}",
-            missing.join(", ")
-        )));
-    }
-    serde_json::from_value(obj.clone()).map_err(|e| refuse(format!("manifest is malformed: {e}")))
+        .collect()
 }
 
 /// Restore raises allocators to these marks, so a malformed one must refuse
@@ -2325,6 +2331,44 @@ mod tests {
             err.to_string().contains("manifest declares 2 rows"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn manifest_inventory_requires_each_addition_at_its_version_boundary() {
+        for (introduced, tables) in [
+            (5, V5_ADDED_TABLES),
+            (6, V6_ADDED_TABLES),
+            (7, V7_ADDED_TABLES),
+            (8, V8_ADDED_TABLES),
+            (9, V9_ADDED_TABLES),
+            (10, V10_ADDED_TABLES),
+            (11, V11_ADDED_TABLES),
+            (12, V12_ADDED_TABLES),
+            (13, V13_ADDED_TABLES),
+            (14, V14_ADDED_TABLES),
+            (15, V15_ADDED_TABLES),
+            (16, V16_ADDED_TABLES),
+        ] {
+            for table in tables {
+                let mut objs = empty_dump();
+                objs[0]["tables"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|entry| entry["name"] != *table);
+                objs[0]["version"] = serde_json::json!(introduced - 1);
+                inspect_bytes(&gzip_lines(&objs)).expect("older version may omit the table");
+                objs[0]["version"] = serde_json::json!(introduced);
+                let err =
+                    inspect_bytes(&gzip_lines(&objs)).expect_err("new version requires table");
+                assert!(err.to_string().contains(table), "{introduced}: {err}");
+            }
+        }
+        for (index, required) in [(21, true), (22, false)] {
+            let mut objs = empty_dump();
+            objs[0]["version"] = serde_json::json!(3);
+            objs[0]["tables"].as_array_mut().unwrap().remove(index);
+            assert_eq!(inspect_bytes(&gzip_lines(&objs)).is_err(), required);
+        }
     }
 
     #[test]
