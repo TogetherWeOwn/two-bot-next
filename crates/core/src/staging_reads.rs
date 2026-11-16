@@ -1,5 +1,7 @@
 //! Inert staging-read lifecycle vocabulary; this does not admit or perform reads.
 
+pub mod canonical_tail;
+
 /// The lifecycle phase of a counted staging-read measurement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MeasurementState {
