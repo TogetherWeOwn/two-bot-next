@@ -146,7 +146,18 @@ the bound and leaves any unconfirmed durable outcome occupied; process loss
 still uses the lease below. Mutations, generic permit Drop, shutdown publication
 rules and the lease duration are unchanged.
 
-A held lane carries a 60 s self-heal lease (`in_flight_since_ms`, migration
+Strict admission is an opt-in pre-wire capability. Migration 0473 adds a
+pending-settlement generation constrained to match an occupied lane. An
+acknowledged strict claim remains blocked across lease expiry and restart until
+its exact generation settles atomically with any cooldown. Missing schema or
+unsupported implementations refuse strict admission; neither falls back to an
+ordinary claim. Old reclaim and completion statements cannot bypass the database
+constraint. Uncertain strict attempts, including a crash before sending, need
+explicitly authorized, all-consumer-fenced reconciliation with effect and
+cooldown evidence; neither startup nor time alone clears the marker. This core
+capability does not enable or wire a new sender.
+
+An ordinary held lane carries a 60 s self-heal lease (`in_flight_since_ms`, migration
 0419, constant `IN_FLIGHT_LEASE_MS`). The next `admit` past the lease reclaims
 the lane with a fresh generation, so the dead holder's late completion lands
 as `StaleClaim` instead of releasing the new holder; fresh holders still
