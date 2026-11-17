@@ -1,6 +1,10 @@
 {
   "version": 1,
   "migrations": {
+    "crates/cutover/migrations/0473_send_admission_strict_settlement.sql": {
+      "sha256": "b5f23c7ebcf989a4fecdedff110bf025aab117d0a8a546425ec6a6b95c23bf98",
+      "justification": "Fence strict admission until exact-generation settlement while retaining the existing public admission row."
+    },
     "crates/store/migrations/0458_starboard.sql": {
       "sha256": "ef1013d4b13d1fbdcbfbfc5eeee9dda23bde54e58d6f0472c2d8f32272e0f7fc",
       "justification": "Add inert starboard configuration, distinct starrers and unique post records to the store chain."

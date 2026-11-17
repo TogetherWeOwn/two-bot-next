@@ -7,6 +7,7 @@ use two_bot_core::send_admission::{
 };
 use two_bot_testsupport::TestDatabase;
 
+#[path = "send_admission/strict.rs"]
 mod strict;
 
 async fn database() -> TestDatabase {
