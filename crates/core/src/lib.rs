@@ -181,6 +181,7 @@ pub mod voice_heat;
 pub mod voice_logging;
 pub mod voice_move_decision;
 pub mod voice_move_facts;
+pub mod voice_move_holds;
 pub mod voice_name_filter;
 pub mod voice_naming;
 pub mod voice_ownership;
