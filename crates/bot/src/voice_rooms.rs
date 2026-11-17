@@ -7957,7 +7957,7 @@ enum ActorCommand {
         is_admin: bool,
         actor_display: String,
         command: PrivacyCommand,
-        reply: oneshot::Sender<String>,
+        reply: oneshot::Sender<(String, EmbedKind)>,
     },
     /// `/room-access-inspect`: read the caller's room privacy lists. Pure
     /// read; the reply is the ephemeral text.
@@ -7965,7 +7965,7 @@ enum ActorCommand {
         actor_id: Snowflake,
         is_admin: bool,
         page: PageArg,
-        reply: oneshot::Sender<String>,
+        reply: oneshot::Sender<(String, EmbedKind)>,
     },
     /// V4: start a vote-kick; the reply carries the vote state or the refusal.
     KickStart {
@@ -9040,6 +9040,19 @@ where
         actor_display: String,
         command: PrivacyCommand,
     ) -> Option<String> {
+        self.run_privacy_classified(guild, actor_id, is_admin, actor_display, command)
+            .await
+            .map(|(text, _)| text)
+    }
+
+    async fn run_privacy_classified(
+        &self,
+        guild: Snowflake,
+        actor_id: Snowflake,
+        is_admin: bool,
+        actor_display: String,
+        command: PrivacyCommand,
+    ) -> Option<(String, EmbedKind)> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor
@@ -9069,6 +9082,18 @@ where
         is_admin: bool,
         page: PageArg,
     ) -> Option<String> {
+        self.run_room_access_classified(guild, actor_id, is_admin, page)
+            .await
+            .map(|(text, _)| text)
+    }
+
+    async fn run_room_access_classified(
+        &self,
+        guild: Snowflake,
+        actor_id: Snowflake,
+        is_admin: bool,
+        page: PageArg,
+    ) -> Option<(String, EmbedKind)> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor
@@ -10710,7 +10735,12 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             command,
             reply,
         } => {
-            let _ = reply.send(worker.apply_privacy(actor_id, is_admin, &actor_display, command));
+            let _ = reply.send(worker.apply_privacy_classified(
+                actor_id,
+                is_admin,
+                &actor_display,
+                command,
+            ));
         }
         ActorCommand::RoomAccess {
             actor_id,
@@ -10718,7 +10748,7 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             page,
             reply,
         } => {
-            let _ = reply.send(worker.apply_room_access(actor_id, is_admin, page));
+            let _ = reply.send(worker.apply_room_access_classified(actor_id, is_admin, page));
         }
         ActorCommand::KickStart {
             vote_id,

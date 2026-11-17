@@ -338,6 +338,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// the ephemeral reply, which says what was queued, not that it landed:
     /// a Discord failure is recorded like any other room write and surfaces in
     /// `/setup`.
+    #[cfg(test)]
     pub(super) fn apply_privacy(
         &mut self,
         actor_id: Snowflake,
