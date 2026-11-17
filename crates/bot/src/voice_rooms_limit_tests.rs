@@ -123,6 +123,42 @@ async fn ownership_replies_use_explicit_outcome_embeds() {
 }
 
 #[tokio::test]
+async fn ownership_missing_invoker_returns_danger_embed() {
+    for (name, options, text) in [
+        (
+            "reclaim",
+            vec![],
+            "I couldn't tell who invoked /reclaim — try again.",
+        ),
+        (
+            "transfer",
+            vec![user_option("member", 301)],
+            "I couldn't tell who invoked /transfer — try again.",
+        ),
+    ] {
+        let runtime = test_runtime(Trace::default());
+        let mut interaction = voice_interaction(
+            Some(command_data(name, options)),
+            Some(Permissions::empty()),
+            true,
+        );
+        interaction.member.as_mut().unwrap().user = None;
+        let seen = Arc::new(Mutex::new(None));
+        let capture = seen.clone();
+        assert!(
+            handle_voice_interaction(&runtime, &interaction, move |response| {
+                *capture.lock().unwrap() = Some(response);
+                async {}
+            })
+            .await
+        );
+        let response = seen.lock().unwrap().clone().expect("reply");
+        assert_limit_embed(&response, EmbedKind::Danger, text);
+        assert!(limit_completion_embed(&interaction, &response).is_some());
+    }
+}
+
+#[tokio::test]
 async fn ownership_gate_refusals_use_classified_embeds() {
     use two_bot_discord::brand::EmbedKind;
 
