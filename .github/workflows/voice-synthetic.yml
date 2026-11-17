@@ -59,13 +59,13 @@ permissions: {}
 # Standalone owns the global window; a called run must never wait on its
 # parent's lock. Inputs are workflow_call-only and come from deploy outputs.
 concurrency:
-  group: ${{ inputs.staging_use_expires_at != '' && format('staging-voice-consumer-{0}', github.run_id) || 'staging-lifecycle' }}
+  group: ${{ (inputs.deploy_staging_call || inputs.staging_use_expires_at != '') && format('staging-voice-consumer-{0}', github.run_id) || 'staging-lifecycle' }}
   cancel-in-progress: false
 
 jobs:
   rerun-refusal:
     needs: [staging-window, synthetic, staging-use-release]
-    if: always() && inputs.deploy_staging_call && github.run_attempt > 1
+    if: always() && inputs.deploy_staging_call && (github.run_attempt > 1 || inputs.staging_use_expires_at == '' || inputs.staging_use_sha == '' || inputs.staging_use_deployment == '')
     permissions: {}
     runs-on: ubuntu-latest
     timeout-minutes: 1
@@ -74,7 +74,7 @@ jobs:
 
   staging-window:
     name: authorize staging use before the consumer
-    if: github.ref == 'refs/heads/main' && (!inputs.deploy_staging_call || github.run_attempt == 1)
+    if: github.ref == 'refs/heads/main' && (!inputs.deploy_staging_call || (github.run_attempt == 1 && inputs.staging_use_expires_at != '' && inputs.staging_use_sha != '' && inputs.staging_use_deployment != ''))
     permissions:
       contents: read
     environment: staging
@@ -93,7 +93,7 @@ jobs:
           package-manager-cache: false
       - name: Acquire a finite standalone window and prove readiness
         id: begin
-        if: inputs.staging_use_expires_at == ''
+        if: inputs.staging_use_expires_at == '' && !inputs.deploy_staging_call
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
@@ -101,7 +101,7 @@ jobs:
           STAGING_USE_RECEIPT: ${{ runner.temp }}/staging-use.jsonl
         run: node wrangler/scripts/staging-use-pipeline.mjs begin
       - name: Assert the caller's exact window and readiness
-        if: inputs.staging_use_expires_at != ''
+        if: (inputs.deploy_staging_call || inputs.staging_use_expires_at != '')
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
@@ -123,7 +123,7 @@ jobs:
   # standalone begin, consumer and cleanup; native expiry covers runner loss.
   staging-use-release:
     needs: [staging-window, synthetic]
-    if: inputs.staging_use_expires_at == '' && always() && github.ref == 'refs/heads/main' && needs.staging-window.outputs.expires_at != ''
+    if: inputs.staging_use_expires_at == '' && !inputs.deploy_staging_call && always() && github.ref == 'refs/heads/main' && needs.staging-window.outputs.expires_at != ''
     permissions:
       contents: read
     environment: staging
@@ -139,7 +139,7 @@ jobs:
           node-version: 22
           package-manager-cache: false
       - name: Release only this standalone run's window
-        if: inputs.staging_use_expires_at == ''
+        if: inputs.staging_use_expires_at == '' && !inputs.deploy_staging_call
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
           OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}

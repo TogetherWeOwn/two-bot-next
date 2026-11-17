@@ -99,6 +99,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// no state is created, refreshed or persisted, and no Discord write is
     /// queued. A room with no privacy record has three empty lists and reads
     /// as public unless Discord already denies @everyone Connect.
+    #[cfg(test)]
     pub(super) fn apply_room_access(
         &self,
         actor_id: Snowflake,

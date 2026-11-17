@@ -14,9 +14,8 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
         canonical = workflows[lifecycle.DEPLOY]["concurrency"]["group"].casefold()
         self.assertEqual(policy.workflow_policy_errors(workflows), [])
         self.assertEqual(lifecycle.repository_errors(workflows, canonical), [])
-        scaffold = workflows[WORKFLOW]
-        expected = policy.reusable_call_expected(WORKFLOW, "voice-first", scaffold)
-        self.assertEqual(scaffold["jobs"]["voice-first"]["uses"], expected)
+        self.assertEqual(workflows[WORKFLOW]["jobs"]["voice-first"]["uses"],
+                         "./.github/workflows/voice-synthetic.yml")
         for name in GUARDS:
             with self.subTest(job=name):
                 changed = deepcopy(workflows)
@@ -24,20 +23,16 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
                 job["if"] = job["if"].replace("false && ", "", 1)
                 self.assertTrue(policy.workflow_policy_errors(changed))
                 self.assertTrue(lifecycle.repository_errors(changed, canonical))
-                with self.assertRaises(KeyError):
-                    policy.reusable_call_expected(WORKFLOW, "voice-first", changed[WORKFLOW])
         for field in ("on", "permissions", "concurrency"):
             with self.subTest(field=field):
                 changed = deepcopy(workflows)
                 changed[WORKFLOW][field] = {"contents": "read"}
                 self.assertTrue(policy.workflow_policy_errors(changed))
                 self.assertTrue(lifecycle.repository_errors(changed, canonical))
-                with self.assertRaises(KeyError):
-                    policy.reusable_call_expected(WORKFLOW, "voice-first", changed[WORKFLOW])
-        changed = deepcopy(scaffold)
-        changed["jobs"]["voice-first"]["uses"] = "./.github/workflows/other.yml"
-        self.assertNotEqual(changed["jobs"]["voice-first"]["uses"],
-                            policy.reusable_call_expected(WORKFLOW, "voice-first", changed))
+        changed = deepcopy(workflows)
+        changed[WORKFLOW]["jobs"]["voice-first"]["uses"] = "./.github/workflows/other.yml"
+        self.assertTrue(policy.workflow_policy_errors(changed))
+        self.assertTrue(lifecycle.repository_errors(changed, canonical))
 
     def test_every_job_is_hard_disabled_and_the_graph_keeps_ownership(self):
         workflow = policy.load_workflows()["voice-rest-measurement.yml"]
