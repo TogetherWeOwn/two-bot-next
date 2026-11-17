@@ -413,7 +413,7 @@ fn resumed(seq: u64) -> Value {
 
 fn component(seq: u64, id: &str, token: &str) -> Value {
     json!({"op":0,"s":seq,"t":"INTERACTION_CREATE","d":{
-        "application_id":"1111","authorizing_integration_owners":{"0":GUILD},
+        "application_id":"1111","attachment_size_limit":10485760,"authorizing_integration_owners":{"0":GUILD},
         "id":id,"token":token,"type":3,"version":1,"guild_id":GUILD,
         "member":{"user":{"id":"77","username":"mock-member","discriminator":"0"},
             "roles":[],"deaf":false,"mute":false,"flags":0},
