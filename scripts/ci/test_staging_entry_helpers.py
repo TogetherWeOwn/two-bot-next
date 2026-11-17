@@ -197,6 +197,27 @@ class VoiceArtifactNamingTests(unittest.TestCase):
 
 
 class StandaloneRoutingTests(unittest.TestCase):
+    def test_deploy_callers_route_real_grants_and_refuse_empty_grants(self):
+        from test_workflows import load_workflows
+
+        workflows = load_workflows()
+        jobs = workflows["deploy-staging.yml"]["jobs"]
+        fields = ("staging_use_expires_at", "staging_use_sha", "staging_use_deployment")
+        for job, filename in (("voice-synthetic", "voice-synthetic.yml"),
+                              ("help-embed-synthetic", "help-embed-synthetic.yml")):
+            with self.subTest(caller=job):
+                caller = jobs[job]
+                self.assertEqual(caller["uses"], f"./.github/workflows/{filename}")
+                self.assertEqual(caller["with"]["deploy_staging_call"], "true")
+                for field in fields:
+                    self.assertEqual(caller["with"][field], f"${{{{ needs.deploy.outputs.{field} }}}}")
+                    self.assertIn(field, jobs["deploy"]["outputs"])
+                callee = workflows[filename]
+                assert_standalone_routing(self, callee, "inputs.staging_use_expires_at")
+                for value, expected in (("valid", (True, False, True, False, False)),
+                                        ("", (False, False, False, False, True))):
+                    assert_routing_behavior(self, callee, True, dict.fromkeys(fields, value), 1, expected)
+
     def test_actual_callee_routing_and_refusal(self):
         from test_workflows import load_workflows
 

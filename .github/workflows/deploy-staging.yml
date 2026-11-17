@@ -659,6 +659,7 @@ jobs:
       contents: read
     uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     with:
+      deploy_staging_call: true
       staging_use_expires_at: ${{ needs.deploy.outputs.staging_use_expires_at }}
       staging_use_sha: ${{ needs.deploy.outputs.staging_use_sha }}
       staging_use_deployment: ${{ needs.deploy.outputs.staging_use_deployment }}
@@ -679,6 +680,7 @@ jobs:
       contents: read
     uses: ./.github/workflows/help-embed-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     with:
+      deploy_staging_call: true
       staging_use_expires_at: ${{ needs.deploy.outputs.staging_use_expires_at }}
       staging_use_sha: ${{ needs.deploy.outputs.staging_use_sha }}
       staging_use_deployment: ${{ needs.deploy.outputs.staging_use_deployment }}
