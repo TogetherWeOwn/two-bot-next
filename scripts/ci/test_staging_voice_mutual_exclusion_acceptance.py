@@ -59,6 +59,8 @@ from unittest import mock
 
 import yaml
 
+from disabled_voice_measurement import WORKFLOW as DISABLED_MEASUREMENT, is_disabled_scaffold
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github/workflows"
 DEPLOY = "deploy-staging.yml"
@@ -581,6 +583,11 @@ def repository_errors(wfs, canonical):
     callers = {f"./.github/workflows/{name}" for name in CHILDREN.values()}
     holders = set(STANDALONE_HOLDERS) | set(OBSERVERS)
     for file, workflow in wfs.items():
+        if file == DISABLED_MEASUREMENT and is_disabled_scaffold(workflow):
+            target = workflow["jobs"]["voice-first"].get("uses")
+            if target != f"./.github/workflows/{VOICE}":
+                errors.append("caller closure: disabled measurement target changed")
+            continue
         triggers = tuple(t for t in events(workflow) if t != "workflow_call")
         nodes = [("workflow", workflow)] + list((workflow.get("jobs") or {}).items())
         for name, node in nodes:

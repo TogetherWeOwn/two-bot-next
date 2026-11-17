@@ -17,6 +17,8 @@ from unittest.mock import patch
 
 import yaml
 
+from disabled_voice_measurement import WORKFLOW as DISABLED_MEASUREMENT, is_disabled_scaffold
+
 ROOT = Path(__file__).resolve().parents[2]
 _HISTORY_SPEC = importlib.util.spec_from_file_location(
     "synthetic_alert_history", ROOT / "scripts/synthetic_alert_history.py")
@@ -4587,7 +4589,9 @@ def workflow_policy_errors(workflows):
     errors.extend(scheduled_binding_audit_errors(workflows))
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
     # An intentional addition needs an explicit policy change and independent review.
-    if set(workflows) != set(JOB_INVENTORY):
+    disabled = is_disabled_scaffold(workflows.get(DISABLED_MEASUREMENT))
+    inventory = set(JOB_INVENTORY) | ({DISABLED_MEASUREMENT} if disabled else set())
+    if set(workflows) != inventory:
         errors.append("workflow inventory changed")
     # Every allowed reusable call must still exist with its pinned ref:
     # converting a caller to an ordinary job keeps the inventory intact
@@ -4607,6 +4611,10 @@ def workflow_policy_errors(workflows):
             errors.append(f"{name}:{job_id}: PR-size activation condition changed")
     for name, workflow in workflows.items():
         jobs = workflow.get("jobs", {})
+        if name == DISABLED_MEASUREMENT and disabled:
+            if jobs["voice-first"].get("uses") != "./.github/workflows/voice-synthetic.yml":
+                errors.append(f"{name}:voice-first: reusable call missing or retargeted")
+            continue
         if set(jobs) != JOB_INVENTORY.get(name, set()):
             errors.append(f"{name}: job inventory changed")
         if name == "deploy-production.yml":
