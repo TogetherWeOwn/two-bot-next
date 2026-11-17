@@ -369,11 +369,13 @@ merge or an unverified deployment is not `t0`.
    rollback step itself fails or its stable gate never verifies, treat staging as
    unverified — it may still serve the failed build or sit fenced. A red downstream
    `voice-synthetic` job is separate: it runs after the deploy job and never triggers
-   a rollback. Before re-running the deploy (or dispatching it), inspect the
+   a rollback. Before any fresh deploy dispatch, inspect the
    `auto-rollback-evidence.json` in the `staging-rollout-evidence` artifact plus the
    current Worker identity (`/health` version header), `/readyz` readiness and
-   ownership status, then fix the cause; production deploys are separate,
-   manual and cutover-owned.
+   ownership status, then fix the cause. For qualification, follow the fresh
+   exact-SHA dispatch recovery above, subject to existing holds and authorization;
+   do not rerun the failed workflow. Production deploys are separate, manual and
+   cutover-owned.
 
 ## Provenance chain
 
