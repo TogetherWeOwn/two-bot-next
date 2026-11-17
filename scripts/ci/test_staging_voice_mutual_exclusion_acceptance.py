@@ -59,6 +59,8 @@ from unittest import mock
 
 import yaml
 
+from disabled_voice_measurement import WORKFLOW as DISABLED_MEASUREMENT, is_disabled_scaffold
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github/workflows"
 DEPLOY = "deploy-staging.yml"
@@ -93,6 +95,8 @@ INHERITED = {"staging_use_expires_at": "STAGING_USE_EXPIRES_AT",
 OWNERSHIP_TOKEN = "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"
 STANDALONE_GUARD = "inputs.staging_use_expires_at == ''"
 INHERITED_GUARD = "inputs.staging_use_expires_at != ''"
+EXPLICIT_STANDALONE_GUARD = STANDALONE_GUARD + " && !inputs.deploy_staging_call"
+EXPLICIT_INHERITED_GUARD = "(inputs.deploy_staging_call || " + INHERITED_GUARD + ")"
 MAIN_ONLY = "github.ref == 'refs/heads/main'"
 # (workflow, job) that must hold the canonical group when run standalone,
 # and whether the hold must be job-level (to keep sibling prod probes free).
@@ -140,7 +144,8 @@ STAGING_TOUCH = re.compile(r"STAGING_WORKER_URL|STAGING_OWNERSHIP_CONTROL_TOKEN|
 # The only accepted expression group forms. Anything else is unprovable and is
 # rejected on a holder and treated as holding the lock on an ancestor.
 CALLED_FORM = re.compile(
-    r"\$\{\{\s*inputs\.staging_use_expires_at\s*!=\s*''\s*&&\s*"
+    r"\$\{\{\s*(?:\(inputs\.deploy_staging_call\s*\|\|\s*inputs\.staging_use_expires_at\s*!=\s*''\)"
+    r"|inputs\.staging_use_expires_at\s*!=\s*'')\s*&&\s*"
     r"format\('([a-z0-9][a-z0-9-]*)\{0\}',\s*github\.run_id\)\s*\|\|\s*"
     r"'([A-Za-z0-9_.-]+)'\s*\}\}")
 EVENT_FORM = re.compile(r"([A-Za-z0-9_.-]*)\$\{\{\s*github\.event_name\s*\}\}")
@@ -373,7 +378,9 @@ def consumer_errors(callee_name, callee):
         for action in ("acquire", "release"):
             for step in staging_use_steps(job, action):
                 guard = bare(step.get("if"))
-                if guard != STANDALONE_GUARD and not guard.startswith(STANDALONE_GUARD + " && "):
+                explicit = "inputs.deploy_staging_call" in str(callee.get("concurrency", ""))
+                required = EXPLICIT_STANDALONE_GUARD if explicit else STANDALONE_GUARD
+                if guard != required:
                     errors.append(f"{callee_name} {job_name}: {action} can touch the caller's grant")
     consumer_name, entry = CONSUMERS[callee_name]
     consumer = jobs.get(consumer_name, {})
@@ -387,9 +394,11 @@ def consumer_errors(callee_name, callee):
     text = str(consumer).lower()
     if "ownership_control" in text or "staging-use.mjs" in text:
         errors.append(f"{callee_name}: live consumer job holds the staging control credential")
-    permitted_gates = ("", MAIN_ONLY)
-    if callee_name == HELP:
-        permitted_gates += (MAIN_ONLY + " && (!inputs.deploy_staging_call || github.run_attempt == 1)",)
+    attempt_gate = MAIN_ONLY + " && (!inputs.deploy_staging_call || github.run_attempt == 1)"
+    permitted_gates = ("", MAIN_ONLY, attempt_gate)
+    window_gate = (MAIN_ONLY + " && (!inputs.deploy_staging_call || (github.run_attempt == 1 && "
+                   "inputs.staging_use_expires_at != '' && inputs.staging_use_sha != '' && "
+                   "inputs.staging_use_deployment != ''))")
     if bare(consumer.get("if")) not in permitted_gates or "continue-on-error" in consumer:
         errors.append(f"{callee_name}: live consumer must keep the main-only, "
                       "success-gated, failure-propagating gate")
@@ -405,10 +414,11 @@ def consumer_errors(callee_name, callee):
             env = step.get("env") or {}
             bound = all(str(env.get(var, "")).replace(" ", "") ==
                         f"${{{{inputs.{name}}}}}" for name, var in INHERITED.items())
-            # Only the inherited-path guard may skip the assert; its job keeps
-            # the plain main-only gate so a skip cannot silently skip consumers.
-            gated_off = (bare(step.get("if")) not in ("", INHERITED_GUARD)
-                         or bare(owner.get("if")) not in permitted_gates)
+            # The attempt guard also skips the consumer on a refused deploy rerun.
+            gated_off = (bare(step.get("if")) not in ("", INHERITED_GUARD, EXPLICIT_INHERITED_GUARD)
+                         or bare(owner.get("if")) not in (*permitted_gates, window_gate)
+                         or (bare(owner.get("if")) in (attempt_gate, window_gate)
+                             and bare(consumer.get("if")) != attempt_gate))
             if (before and bound
                     and str(env.get("OWNERSHIP_CONTROL_TOKEN", "")) == OWNERSHIP_TOKEN
                     and "continue-on-error" not in step and "continue-on-error" not in owner
@@ -581,6 +591,11 @@ def repository_errors(wfs, canonical):
     callers = {f"./.github/workflows/{name}" for name in CHILDREN.values()}
     holders = set(STANDALONE_HOLDERS) | set(OBSERVERS)
     for file, workflow in wfs.items():
+        if file == DISABLED_MEASUREMENT and is_disabled_scaffold(workflow):
+            target = workflow["jobs"]["voice-first"].get("uses")
+            if target != f"./.github/workflows/{VOICE}":
+                errors.append("caller closure: disabled measurement target changed")
+            continue
         triggers = tuple(t for t in events(workflow) if t != "workflow_call")
         nodes = [("workflow", workflow)] + list((workflow.get("jobs") or {}).items())
         for name, node in nodes:
@@ -943,6 +958,14 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_checked_in_workflows_meet_the_full_window_contract(self):
         self.assertEqual(lifecycle_errors(load_all()), [])
+
+    def test_prepared_window_cannot_skip_an_unguarded_consumer(self):
+        for callee, (job, _) in CONSUMERS.items():
+            workflows = load_all()
+            workflows[callee]["jobs"][job]["if"] = MAIN_ONLY
+            with self.subTest(callee=callee):
+                self.assertTrue(any(f"{callee}: no authenticated window/readiness assert" in error
+                                    for error in lifecycle_errors(workflows)))
 
 
 class LockOracleControls(unittest.TestCase):
@@ -1745,7 +1768,8 @@ class ExistingSafetyControls(unittest.TestCase):
         self.assertEqual(voice["on"]["schedule"], [{"cron": "41 */6 * * *"}])
         self.assertEqual(deploy["on"]["push"]["branches"], ["main"])
         job = voice["jobs"]["synthetic"]
-        self.assertEqual(job["if"], "github.ref == 'refs/heads/main'")
+        self.assertEqual(job["if"], "github.ref == 'refs/heads/main' && "
+                         "(!inputs.deploy_staging_call || github.run_attempt == 1)")
         self.assertEqual(job["environment"], "voice-synthetic")
         self.assertEqual(job["timeout-minutes"], "10")
         self.assertEqual(job["permissions"], {"contents": "read"})

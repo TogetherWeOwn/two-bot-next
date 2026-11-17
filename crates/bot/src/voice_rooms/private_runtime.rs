@@ -287,21 +287,27 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         actor_id: Snowflake,
         is_admin: bool,
         name: &str,
-    ) -> Result<(Snowflake, VoiceRoom, Option<Permissions>), String> {
+    ) -> Result<(Snowflake, VoiceRoom, Option<Permissions>), (String, EmbedKind)> {
         let (channel, room, members, bot_permissions) = {
             let live = self.live.read_state();
             if !live.ready {
-                return Err(WARMING.to_owned());
+                return Err((WARMING.to_owned(), EmbedKind::Warn));
             }
             let Some(channel) = live
                 .members
                 .get(&actor_id)
                 .and_then(|member| member.channel_id)
             else {
-                return Err(format!("You need to be in a voice room to use /{name}."));
+                return Err((
+                    format!("You need to be in a voice room to use /{name}."),
+                    EmbedKind::Danger,
+                ));
             };
             let Some(room) = self.rooms.get(&channel).cloned() else {
-                return Err("That voice channel isn't a temporary room I manage.".to_owned());
+                return Err((
+                    "That voice channel isn't a temporary room I manage.".to_owned(),
+                    EmbedKind::Danger,
+                ));
             };
             (
                 channel,
@@ -322,7 +328,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 is_admin,
             },
         )
-        .map_err(|error| owner_gate_refusal(error, name))?;
+        .map_err(|error| (owner_gate_refusal(error, name), EmbedKind::Danger))?;
         Ok((channel, room, bot_permissions))
     }
 
@@ -332,6 +338,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// the ephemeral reply, which says what was queued, not that it landed:
     /// a Discord failure is recorded like any other room write and surfaces in
     /// `/setup`.
+    #[cfg(test)]
     pub(super) fn apply_privacy(
         &mut self,
         actor_id: Snowflake,
@@ -339,8 +346,19 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         actor_display: &str,
         command: PrivacyCommand,
     ) -> String {
+        self.apply_privacy_classified(actor_id, is_admin, actor_display, command)
+            .0
+    }
+
+    pub(super) fn apply_privacy_classified(
+        &mut self,
+        actor_id: Snowflake,
+        is_admin: bool,
+        actor_display: &str,
+        command: PrivacyCommand,
+    ) -> (String, EmbedKind) {
         if self.halted {
-            return PAUSED.to_owned();
+            return (PAUSED.to_owned(), EmbedKind::Danger);
         }
         let (channel, room, bot_permissions) =
             match self.owned_room(actor_id, is_admin, command.name()) {
@@ -348,8 +366,11 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 Err(refusal) => return refusal,
             };
         let Ok(state) = self.privacy_state(&room, actor_id, actor_display) else {
-            return "This room's privacy settings look corrupt. Ask an admin to check /setup."
-                .to_owned();
+            return (
+                "This room's privacy settings look corrupt. Ask an admin to check /setup."
+                    .to_owned(),
+                EmbedKind::Danger,
+            );
         };
         match command {
             PrivacyCommand::Private => self.apply_private(channel, state, bot_permissions),
@@ -362,30 +383,36 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         channel: Snowflake,
         state: PrivateRoom,
         bot_permissions: Option<Permissions>,
-    ) -> String {
+    ) -> (String, EmbedKind) {
         let Ok(plan) = state.make_private() else {
-            return "This room's privacy settings look corrupt. Ask an admin to check /setup."
-                .to_owned();
+            return (
+                "This room's privacy settings look corrupt. Ask an admin to check /setup."
+                    .to_owned(),
+                EmbedKind::Danger,
+            );
         };
         // A private room whose Discord overwrite no longer denies Connect
         // (edited by hand, or a crash between the write and its record) is
         // re-asserted; otherwise a repeat changes nothing.
         let drifted = state.private && !self.live_everyone_denies_connect(channel);
         if (!state.private || drifted) && !can_edit_overwrites(bot_permissions) {
-            return NEEDS_MANAGE_ROLES.to_owned();
+            return (NEEDS_MANAGE_ROLES.to_owned(), EmbedKind::Danger);
         }
         if plan.is_noop(&state) && !drifted {
             self.privacy.insert(channel, state);
-            return "This room is already private.".to_owned();
+            return ("This room is already private.".to_owned(), EmbedKind::Ok);
         }
         if !state.private {
             // The flag and the Join channel follow the Connect write; keep the
             // owner's name for the channel meanwhile.
             self.privacy.insert(channel, state);
             self.enqueue_everyone_connect(channel, true);
-            return "Making this room private: new members can't join it directly, and a \
+            return (
+                "Making this room private: new members can't join it directly, and a \
                     ⇩ Join channel will appear next to it."
-                .to_owned();
+                    .to_owned(),
+                EmbedKind::Warn,
+            );
         }
         let join_missing = state.join_channel.is_none();
         self.privacy.insert(channel, plan.room.clone());
@@ -394,9 +421,15 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         }
         if join_missing {
             self.enqueue_join_creates(channel, &plan.effects);
-            return "This room is already private. Recreating its ⇩ Join channel.".to_owned();
+            return (
+                "This room is already private. Recreating its ⇩ Join channel.".to_owned(),
+                EmbedKind::Warn,
+            );
         }
-        "This room is private, but its Connect deny was missing. Restoring it.".to_owned()
+        (
+            "This room is private, but its Connect deny was missing. Restoring it.".to_owned(),
+            EmbedKind::Warn,
+        )
     }
 
     fn apply_public(
@@ -404,31 +437,37 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         channel: Snowflake,
         state: PrivateRoom,
         bot_permissions: Option<Permissions>,
-    ) -> String {
+    ) -> (String, EmbedKind) {
         if !state.private {
             // A room an `/alwaysprivate` creator made already denies Connect to
             // @everyone while its stored flag still reads public, so the flag
             // alone cannot say the room is open: check what Discord holds.
             if !self.live_everyone_denies_connect(channel) {
                 self.privacy.insert(channel, state);
-                return "This room is already public.".to_owned();
+                return ("This room is already public.".to_owned(), EmbedKind::Ok);
             }
             if !can_edit_overwrites(bot_permissions) {
-                return NEEDS_MANAGE_ROLES.to_owned();
+                return (NEEDS_MANAGE_ROLES.to_owned(), EmbedKind::Danger);
             }
             self.privacy.insert(channel, state);
             self.enqueue_everyone_connect(channel, false);
-            return "This room wasn't marked private, but it was closed to new members. \
+            return (
+                "This room wasn't marked private, but it was closed to new members. \
                     Opening it to everyone."
-                .to_owned();
+                    .to_owned(),
+                EmbedKind::Warn,
+            );
         }
         if !can_edit_overwrites(bot_permissions) {
-            return NEEDS_MANAGE_ROLES.to_owned();
+            return (NEEDS_MANAGE_ROLES.to_owned(), EmbedKind::Danger);
         }
         self.privacy.insert(channel, state);
         self.enqueue_everyone_connect(channel, false);
-        "Making this room public again: anyone can join, and its ⇩ Join channel is going away."
-            .to_owned()
+        (
+            "Making this room public again: anyone can join, and its ⇩ Join channel is going away."
+                .to_owned(),
+            EmbedKind::Warn,
+        )
     }
 
     fn enqueue_everyone_connect(&mut self, channel: Snowflake, deny: bool) {

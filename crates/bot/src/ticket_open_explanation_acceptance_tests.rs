@@ -69,7 +69,7 @@ fn button(action: TicketAction, guild: &str, actor: &str, username: &str, id: &s
         TicketAction::Close => TICKET_CLOSE_ID,
     };
     serde_json::from_value(json!({
-        "application_id":"400", "authorizing_integration_owners":{"0":guild},
+        "application_id":"400", "attachment_size_limit":10485760, "authorizing_integration_owners":{"0":guild},
         "id":id, "token":format!("ticket-test-{id}"), "type":3, "version":1,
         "guild_id":guild, "channel":{"id":"600","type":0,"name":"ticket-member","permissions":"0"},
         "data":{"custom_id":custom_id,"component_type":2},

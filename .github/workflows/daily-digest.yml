@@ -91,7 +91,7 @@ jobs:
         run: node .github/scripts/daily-digest.cjs request
       - name: Plan the CalVer digest (read-only)
         id: plan
-        uses: TogetherWeOwn/.github/actions/calver@2f0f9667c091e5d877b343d4f722a30b96124561 # v0.3.1
+        uses: TogetherWeOwn/.github/actions/calver@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
         with:
           runs-on-json: '"ubuntu-latest"'
           request: ${{ steps.request.outputs.request }}
@@ -110,7 +110,7 @@ jobs:
       - name: Publish the CalVer tag and Release
         id: publish
         if: steps.digest.outputs.publish == 'true'
-        uses: TogetherWeOwn/.github/actions/calver@2f0f9667c091e5d877b343d4f722a30b96124561 # v0.3.1
+        uses: TogetherWeOwn/.github/actions/calver@2ef8ad6447e11d019ac3098bcfd011193b75266a # v0.10.0
         with:
           runs-on-json: '"ubuntu-latest"'
           request: ${{ steps.digest.outputs.publish_request }}
