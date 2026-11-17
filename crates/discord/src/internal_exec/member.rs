@@ -483,7 +483,7 @@ mod tests {
         }
 
         fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
-            Box::pin(async { panic!("voice must use strict admission") })
+            Box::pin(async { Err(AdmissionError::Storage) })
         }
 
         fn admit_strict(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
