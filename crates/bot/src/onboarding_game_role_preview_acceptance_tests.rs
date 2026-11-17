@@ -98,7 +98,7 @@ async fn preview_discord(state: Arc<Mutex<PreviewState>>) -> MockRest {
 
 fn invocation(data: Value, kind: u8, serial: u64) -> Interaction {
     serde_json::from_value(json!({
-        "application_id":"111","authorizing_integration_owners":{"0":"22"},
+        "application_id":"111","attachment_size_limit":10485760,"authorizing_integration_owners":{"0":"22"},
         "id":serial.to_string(),"token":format!("preview-fixture-{serial}"),
         "type":kind,"version":1,"guild_id":"22",
         // Deliberately stale: the fresh REST response, not this payload, wins.

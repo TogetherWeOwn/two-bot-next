@@ -150,7 +150,7 @@ fn preview() -> Interaction {
 
 fn preview_with_member(member: Value) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "111", "authorizing_integration_owners": {"0": "22"},
+        "attachment_size_limit": 10485760, "application_id": "111", "authorizing_integration_owners": {"0": "22"},
         "id": "333", "token": "mock-callback", "type": 2, "version": 1, "guild_id": "22",
         "member": member,
         "data": {"id": "444", "name": "welcome-preview", "type": 1, "options": []},
@@ -160,7 +160,7 @@ fn preview_with_member(member: Value) -> Interaction {
 
 fn preview_in_guild(guild_id: &str) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "111", "authorizing_integration_owners": {"0": guild_id},
+        "attachment_size_limit": 10485760, "application_id": "111", "authorizing_integration_owners": {"0": guild_id},
         "id": "333", "token": "mock-callback", "type": 2, "version": 1, "guild_id": guild_id,
         "member": admin_member("44", Some("32")),
         "data": {"id": "444", "name": "welcome-preview", "type": 1, "options": []},
@@ -170,7 +170,7 @@ fn preview_in_guild(guild_id: &str) -> Interaction {
 
 fn preview_by_bot() -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "111", "authorizing_integration_owners": {"0": "22"},
+        "attachment_size_limit": 10485760, "application_id": "111", "authorizing_integration_owners": {"0": "22"},
         "id": "333", "token": "mock-callback", "type": 2, "version": 1, "guild_id": "22",
         "member": bot_member(),
         "data": {"id": "444", "name": "welcome-preview", "type": 1, "options": []},
@@ -180,7 +180,7 @@ fn preview_by_bot() -> Interaction {
 
 fn preview_without_member() -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "111", "authorizing_integration_owners": {"0": "22"},
+        "attachment_size_limit": 10485760, "application_id": "111", "authorizing_integration_owners": {"0": "22"},
         "id": "333", "token": "mock-callback", "type": 2, "version": 1, "guild_id": "22",
         "member": Value::Null,
         "data": {"id": "444", "name": "welcome-preview", "type": 1, "options": []},
@@ -207,7 +207,7 @@ fn click_rendered_picker(body: &Value, mode: &str) -> Interaction {
         "the click selects a valid, mutating live option"
     );
     serde_json::from_value(json!({
-        "application_id": "111", "authorizing_integration_owners": {"0": "22"},
+        "attachment_size_limit": 10485760, "application_id": "111", "authorizing_integration_owners": {"0": "22"},
         "id": "334", "token": "mock-picker-callback", "type": 3, "version": 1,
         "guild_id": "22", "channel_id": "12",
         "member": admin_member("44", Some("32")),

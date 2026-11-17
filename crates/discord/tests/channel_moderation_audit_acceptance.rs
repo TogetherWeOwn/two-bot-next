@@ -669,7 +669,7 @@ fn interaction_shaped(
         "guild_id": GUILD, "channel": channel,
         "data": {"id": "555555555555555555", "type": 1, "name": action, "options": options},
         "member": member,
-        "token": "synthetic-interaction-token", "version": 1, "locale": "en-US", "guild_locale": "en-US",
+        "token": "synthetic-interaction-token", "version": 1, "attachment_size_limit": 10485760, "locale": "en-US", "guild_locale": "en-US",
         "authorizing_integration_owners": {"0": GUILD}, "entitlements": []
     }))
     .expect("synthetic Twilight interaction")

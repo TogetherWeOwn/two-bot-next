@@ -120,6 +120,7 @@ fn button(
     };
     serde_json::from_value(json!({
         "application_id": "400",
+        "attachment_size_limit": 10485760,
         "authorizing_integration_owners": {"0": "100"},
         "id": interaction_id.to_string(),
         "token": token,
