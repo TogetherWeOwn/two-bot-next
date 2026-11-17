@@ -14,7 +14,6 @@ async fn database() -> TestDatabase {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated agent-testdb or CI service"]
 async fn strict_fence_survives_restarts_and_old_dml() {
     let db = database().await;
     let gate = PgSendAdmission::new(db.pool().clone(), "strict-fixture").unwrap();
@@ -59,7 +58,6 @@ async fn strict_fence_survives_restarts_and_old_dml() {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated agent-testdb or CI service"]
 async fn exact_settlement_preserves_holds_and_rejects_stale() {
     let db = database().await;
     let gate = PgSendAdmission::new(db.pool().clone(), "finite-fixture").unwrap();
@@ -117,7 +115,6 @@ async fn exact_settlement_preserves_holds_and_rejects_stale() {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated agent-testdb or CI service"]
 async fn strict_missing_schema_never_downgrades() {
     let db = database().await;
     sqlx::query(
