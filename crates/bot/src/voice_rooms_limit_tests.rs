@@ -72,6 +72,46 @@ fn completion_routes_only_single_embed_limit_replies() {
 }
 
 #[tokio::test]
+async fn ownership_gate_refusals_use_classified_embeds() {
+    use two_bot_discord::brand::EmbedKind;
+
+    for (controls, error, kind, text) in [
+        (
+            AccessControls {
+                required_role: Some(9),
+                ..AccessControls::default()
+            },
+            None,
+            EmbedKind::Danger,
+            "You need the server's required role to use voice-room commands.",
+        ),
+        (
+            AccessControls::default(),
+            Some(StoreError::Unavailable),
+            EmbedKind::Warn,
+            "Voice-room settings are unavailable right now. Try again shortly.",
+        ),
+    ] {
+        for (name, options) in [
+            ("reclaim", vec![]),
+            ("transfer", vec![user_option("member", 301)]),
+        ] {
+            let trace = Trace::default();
+            let runtime = gated_runtime(trace.clone(), controls.clone(), error);
+            let mut interaction =
+                voice_interaction_as(Some(command_data(name, options)), None, MEMBER);
+            interaction.member.as_mut().unwrap().roles.clear();
+            let (handled, response) = handle_capture(&runtime, &interaction).await;
+            assert!(handled);
+            let response = response.expect("gate reply");
+            assert_limit_embed(&response, kind, text);
+            assert!(limit_completion_embed(&interaction, &response).is_some());
+            assert!(limit_writes(&trace).is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn myroom_cold_worker_returns_warning_embed() {
     let runtime = test_runtime(Trace::default());
     let interaction = voice_interaction_as(

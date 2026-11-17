@@ -14457,6 +14457,8 @@ where
                 | VoiceCommand::Unlimit
                 | VoiceCommand::Ping
                 | VoiceCommand::Invite
+                | VoiceCommand::Reclaim
+                | VoiceCommand::Transfer { .. }
         ) {
             if let Some(text) = denial.data.as_ref().and_then(|data| data.content.clone()) {
                 reply(limit::limit_response(text, kind)).await;
@@ -15575,6 +15577,8 @@ fn limit_completion_embed<'a>(
                 | VoiceCommand::Ping
                 | VoiceCommand::Invite
                 | VoiceCommand::MyRoom
+                | VoiceCommand::Reclaim
+                | VoiceCommand::Transfer { .. }
         )
     ) {
         return None;
