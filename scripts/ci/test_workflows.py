@@ -1045,9 +1045,11 @@ def staging_full_window_errors(workflow, name="deploy-staging.yml"):
                 "STAGING_OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"}:
             errors.append(f"{name}:{job_id}: must forward exactly the test and control tokens by name")
         grant = job.get("with") or {}
-        if set(grant) != set(STAGING_USE_INPUTS):
-            errors.append(f"{name}:{job_id}: must pass exactly the three staging_use inputs")
+        if set(grant) != set(STAGING_USE_INPUTS) | {"deploy_staging_call"}:
+            errors.append(f"{name}:{job_id}: must pass the deploy marker and exactly the three staging_use inputs")
             continue
+        if grant["deploy_staging_call"] != "true":
+            errors.append(f"{name}:{job_id}: deploy marker must be true")
         for key in STAGING_USE_INPUTS:
             if grant[key] != f"${{{{ needs.deploy.outputs.{key} }}}}":
                 errors.append(f"{name}:{job_id}: {key} must come from the matching deploy output")
@@ -7298,6 +7300,9 @@ class WorkflowTests(unittest.TestCase):
             "declared output detached from window": lambda w: job(w, "deploy")["outputs"].update(
                 {"staging_use_sha": "${{ github.sha }}"}),
             "voice grant dropped": lambda w: job(w, "voice-synthetic")["with"].pop("staging_use_deployment"),
+            "voice marker missing": lambda w: job(w, "voice-synthetic")["with"].pop("deploy_staging_call"),
+            "help marker false": lambda w: job(w, "help-embed-synthetic")["with"].update(
+                {"deploy_staging_call": "false"}),
             "release dropped": lambda w: w["jobs"].pop("staging-use-release"),
             "release not always": lambda w: job(w, "staging-use-release").update({"if": "success()"}),
             "release or-always": lambda w: job(w, "staging-use-release").update({"if": "always() || true"}),
