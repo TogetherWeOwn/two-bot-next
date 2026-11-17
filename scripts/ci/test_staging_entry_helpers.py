@@ -55,7 +55,8 @@ def assert_standalone_routing(test, workflow, selector):
     test.assertEqual(ready["if"], f"{selector} != ''", "inherited ready guard")
     test.assertEqual(ready["run"], "node wrangler/scripts/staging-use.mjs ready")
     test.assertIn(f"{selector} == ''", release["if"])
-    finish = next(step for step in release["steps"] if step.get("run"))
+    finish = next(step for step in release["steps"]
+                  if step.get("name") == "Release only this standalone run's window")
     test.assertEqual(finish["if"], f"{selector} == ''", "standalone finish guard")
     test.assertEqual(finish["run"], "node wrangler/scripts/staging-use-pipeline.mjs finish")
 
@@ -129,10 +130,23 @@ class StandaloneRoutingTests(unittest.TestCase):
         for name in ("voice-synthetic.yml", "help-embed-synthetic.yml"):
             workflow = load_workflows()[name]
             assert_standalone_routing(self, workflow, selector)
-            for job, index, diagnostic in (("staging-window", 2, "standalone begin guard"),
-                                           ("staging-window", 3, "inherited ready guard"),
-                                           ("staging-use-release", 2, "standalone finish guard")):
+            for job, command, diagnostic in (
+                    ("staging-window", "node wrangler/scripts/staging-use-pipeline.mjs begin", "standalone begin guard"),
+                    ("staging-window", "node wrangler/scripts/staging-use.mjs ready", "inherited ready guard"),
+                    ("staging-use-release", "node wrangler/scripts/staging-use-pipeline.mjs finish", "standalone finish guard")):
                 changed = deepcopy(workflow)
-                changed["jobs"][job]["steps"][index]["if"] = "true"
-                with self.subTest(workflow=name, job=job, index=index), self.assertRaisesRegex(AssertionError, diagnostic):
+                step = next(step for step in changed["jobs"][job]["steps"] if step.get("run") == command)
+                step["if"] = "true"
+                with self.subTest(workflow=name, command=command), self.assertRaisesRegex(AssertionError, diagnostic):
                     assert_standalone_routing(self, changed, selector)
+
+            changed = deepcopy(workflow)
+            changed["jobs"]["staging-use-release"]["steps"].insert(0, {"run": "echo setup"})
+            with self.subTest(workflow=name, mutation="extra setup"):
+                assert_standalone_routing(self, changed, selector)
+
+            release = next(step for step in changed["jobs"]["staging-use-release"]["steps"]
+                           if step.get("name") == "Release only this standalone run's window")
+            release["run"] = "echo wrong release"
+            with self.subTest(workflow=name, mutation="wrong release"), self.assertRaises(AssertionError):
+                assert_standalone_routing(self, changed, selector)
