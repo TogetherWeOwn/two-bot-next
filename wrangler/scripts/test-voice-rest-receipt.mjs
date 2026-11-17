@@ -1,7 +1,7 @@
 // Offline construction tests for sanitized voice REST receipts.
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildReceipt, resultCountsFrom, validateMetadata } from './voice-rest-receipt.mjs';
+import { buildReceipt, compareReceipts, resultCountsFrom, validateMetadata } from './voice-rest-receipt.mjs';
 
 const META = {
   runId: '123456', runAttempt: '1', sha: 'a'.repeat(40), deploymentId: 'dep-1',
@@ -52,4 +52,54 @@ test('capture refusals: samples, identity, labels, metadata, expiry', () => {
   assert.equal(validateMetadata({ ...META, expiresAt: '2032-02-29T01:00:00.1Z' }).expiresAt, '2032-02-29T01:00:00.1Z');
   assert.equal(code(() => receipt({}, META, at('2030-01-01T01:00:00Z'))), 'grant_expired');
   assert.equal(code(() => validateMetadata(null)), 'metadata_invalid');
+});
+
+test('compare reports per-result, total and 5xx deltas', () => {
+  const later = at('2030-01-01T00:10:00Z');
+  const after = receipt({ counts: { '2xx': 15, '4xx': 2, '5xx': 4, transport: 3, '429': 2 } }, META, later);
+  const out = compareReceipts(receipt(), after, { now: later });
+  assert.deepEqual(out.resultDeltas, { '2xx': 5, '429': 2, '4xx': 0, '5xx': 3, transport: 0 });
+  assert.equal(out.restTotalDelta, 10);
+  assert.equal(out.rest5xxDelta, 3);
+});
+
+test('compare refuses changed identity, grant, counters and time', () => {
+  const later = at('2030-01-01T00:10:00Z');
+  const before = receipt();
+  const after = (over = {}, meta = META) => receipt(over, meta, later);
+  for (const change of [
+    { runId: '123457' }, { runAttempt: '2' }, { sha: 'b'.repeat(40) },
+    { deploymentId: 'dep-2' }, { expiresAt: '2030-01-01T02:00:00Z' },
+  ]) assert.equal(code(() => compareReceipts(before, after({}, { ...META, ...change }), { now: later })), 'metadata_changed');
+  assert.equal(code(() => compareReceipts(before, after({ inc: [9, 2, 3, 4] }), { now: later })), 'incarnation_changed');
+  assert.equal(code(() => compareReceipts(before, after(), { now: at('2030-01-01T01:00:00Z') })), 'grant_expired');
+  assert.equal(code(() => compareReceipts(before, after({ counts: { '2xx': 9, '4xx': 2, '5xx': 1, transport: 3 } }), { now: later })), 'counter_decreased');
+  assert.equal(code(() => compareReceipts(before, after({ counts: { '2xx': 20, '4xx': 2, '5xx': 1 } }), { now: later })), 'counter_decreased');
+  assert.equal(code(() => compareReceipts(after(), before, { now: later })), 'time_regressed');
+  assert.equal(code(() => compareReceipts(before, after(), { now: T0 })), 'time_regressed');
+});
+
+test('compare treats prototype-named results as own counters', () => {
+  const later = at('2030-01-01T00:10:00Z');
+  for (const label of ['constructor', '__proto__']) {
+    const counts = JSON.parse(`{"2xx":10,"${label}":2}`);
+    const before = JSON.parse(JSON.stringify(receipt({ counts })));
+    const after = JSON.parse(JSON.stringify(receipt({ counts: { '2xx': 15 } }, META, later)));
+    assert.equal(code(() => compareReceipts(before, after, { now: later })), 'counter_decreased');
+    const added = compareReceipts(receipt({ counts: { '2xx': 10 } }),
+      receipt({ counts }, META, later), { now: later });
+    assert.equal(added.resultDeltas[label], 2);
+  }
+});
+
+test('compare refuses malformed or unavailable persisted receipts', () => {
+  const before = receipt();
+  const compare = (value) => code(() => compareReceipts(value, before, { now: T0 }));
+  assert.equal(compare({ ...before, available: false }), 'receipt_unavailable');
+  assert.equal(compare({ ...before, extra: 1 }), 'receipt_invalid');
+  assert.equal(compare({ ...before, restTotal: 99 }), 'counter_sum_mismatch');
+  assert.equal(compare({ ...before, incarnation: '0'.repeat(32) }), 'identity_missing');
+  assert.equal(compare({ ...before, capturedAt: '2030-02-30T00:00:00Z' }), 'receipt_invalid');
+  assert.equal(compare({ ...before, results: { '2xx': Number.MAX_SAFE_INTEGER, '5xx': 1 } }), 'receipt_invalid');
+  assert.equal(compare({ ...before, capturedAt: META.expiresAt }), 'grant_expired');
 });
