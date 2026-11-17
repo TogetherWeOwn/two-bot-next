@@ -1,8 +1,8 @@
 use super::*;
 use twilight_http::request::Method;
 
-#[test]
-fn prepares_only_the_selected_channel_patch() {
+#[tokio::test]
+async fn prepares_only_the_selected_channel_patch() {
     let factory = Client::new("synthetic-token".to_owned());
     let request = prepare_voice_move(&factory, "123", "456", "789").expect("valid IDs");
     assert_eq!(request.method(), Method::Patch);
@@ -13,10 +13,11 @@ fn prepares_only_the_selected_channel_patch() {
     assert_eq!(body, serde_json::json!({"channel_id": "789"}));
 }
 
-#[test]
-fn invalid_ids_are_redacted_in_every_position() {
+#[tokio::test]
+async fn invalid_ids_are_redacted_in_every_position() {
     let factory = Client::new("synthetic-token".to_owned());
-    for invalid in ["0", "18446744073709551616", "invalid-sentinel", ""] {
+    let overflow = (u128::from(u64::MAX) + 1).to_string();
+    for invalid in ["0", overflow.as_str(), "invalid-sentinel", ""] {
         for position in 0..3 {
             let mut ids = ["1", "2", "3"];
             ids[position] = invalid;
@@ -32,9 +33,10 @@ fn invalid_ids_are_redacted_in_every_position() {
             }
         }
     }
+    let max_id = u64::MAX.to_string();
     for position in 0..3 {
         let mut ids = ["1", "2", "3"];
-        ids[position] = "18446744073709551615";
+        ids[position] = &max_id;
         assert!(prepare_voice_move(&factory, ids[0], ids[1], ids[2]).is_ok());
     }
 }
