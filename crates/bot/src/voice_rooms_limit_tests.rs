@@ -36,7 +36,7 @@ fn assert_limit_embed(
 fn completion_routes_only_single_embed_limit_replies() {
     let limit = limit_interaction(MEMBER, Vec::new());
     let unlimit = voice_interaction_as(Some(command_data("unlimit", Vec::new())), None, MEMBER);
-    let other = voice_interaction_as(Some(command_data("lock", Vec::new())), None, MEMBER);
+    let other = voice_interaction_as(Some(command_data("name", Vec::new())), None, MEMBER);
     let myroom = voice_interaction_as(Some(command_data("myroom", Vec::new())), None, MEMBER);
     let response = super::super::limit::limit_response(
         "A reply".to_owned(),
@@ -46,6 +46,8 @@ fn completion_routes_only_single_embed_limit_replies() {
     assert!(limit_completion_embed(&unlimit, &response).is_some());
     assert!(limit_completion_embed(&myroom, &response).is_some());
     assert!(limit_completion_embed(&other, &response).is_none());
+    let component = component_interaction("votekick:7000:yes", None, MEMBER);
+    assert!(limit_completion_embed(&component, &response).is_none());
 
     let mut mixed = response.clone();
     mixed.data.as_mut().unwrap().content = Some("text".to_owned());
@@ -197,6 +199,7 @@ async fn ownership_gate_refusals_use_classified_embeds() {
         for (name, options) in [
             ("reclaim", vec![]),
             ("transfer", vec![user_option("member", 301)]),
+            ("myroom", vec![]),
         ] {
             let trace = Trace::default();
             let runtime = gated_runtime(trace.clone(), controls.clone(), error);
@@ -210,6 +213,21 @@ async fn ownership_gate_refusals_use_classified_embeds() {
             assert!(limit_completion_embed(&interaction, &response).is_some());
             assert!(limit_writes(&trace).is_empty());
         }
+
+        let trace = Trace::default();
+        let runtime = gated_runtime(trace.clone(), controls, error);
+        let mut interaction =
+            voice_interaction_as(Some(command_data("name", vec![])), None, MEMBER);
+        interaction.member.as_mut().unwrap().roles.clear();
+        let (handled, response) = handle_capture(&runtime, &interaction).await;
+        assert!(handled);
+        let response = response.expect("gate reply");
+        let data = response.data.as_ref().expect("response data");
+        assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+        assert_eq!(data.content.as_deref(), Some(text));
+        assert!(data.embeds.is_none());
+        assert!(limit_completion_embed(&interaction, &response).is_none());
+        assert!(limit_writes(&trace).is_empty());
     }
 }
 
