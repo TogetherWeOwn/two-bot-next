@@ -42,6 +42,18 @@ async fn invalid_ids_are_redacted_in_every_position() {
 }
 
 #[test]
+fn request_build_errors_are_constant_and_redacted() {
+    let error = match finish_request(Err("request-error-sentinel")) {
+        Ok(_) => panic!("invalid request accepted"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::Malformed);
+    assert_eq!(error.message, "Invalid Discord request");
+    assert_eq!(error.log_reason, "discord_request_invalid");
+    assert!(!format!("{error:?}").contains("request-error-sentinel"));
+}
+
+#[test]
 fn headers_only_classify_definitive_refusals() {
     for (status, expected) in [
         (400, Some(VoiceMovePatch::Stale)),

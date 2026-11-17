@@ -39,17 +39,22 @@ pub fn prepare_voice_move(
     member_id: &str,
     channel_id: &str,
 ) -> Result<Request, ActionError> {
-    factory
-        .update_guild_member(numeric_id(guild_id)?.cast(), numeric_id(member_id)?.cast())
-        .channel_id(Some(numeric_id(channel_id)?.cast()))
-        .try_into_request()
-        .map_err(|_| {
-            ActionError::new(
-                ErrorCode::Malformed,
-                "Invalid Discord request",
-                "discord_request_invalid",
-            )
-        })
+    finish_request(
+        factory
+            .update_guild_member(numeric_id(guild_id)?.cast(), numeric_id(member_id)?.cast())
+            .channel_id(Some(numeric_id(channel_id)?.cast()))
+            .try_into_request(),
+    )
+}
+
+fn finish_request<E>(request: Result<Request, E>) -> Result<Request, ActionError> {
+    request.map_err(|_| {
+        ActionError::new(
+            ErrorCode::Malformed,
+            "Invalid Discord request",
+            "discord_request_invalid",
+        )
+    })
 }
 
 /// Headers alone can prove these refusals, but never success or no-send.
