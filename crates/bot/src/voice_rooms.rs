@@ -7957,7 +7957,7 @@ enum ActorCommand {
         is_admin: bool,
         actor_display: String,
         command: PrivacyCommand,
-        reply: oneshot::Sender<String>,
+        reply: oneshot::Sender<(String, EmbedKind)>,
     },
     /// `/room-access-inspect`: read the caller's room privacy lists. Pure
     /// read; the reply is the ephemeral text.
@@ -7965,7 +7965,7 @@ enum ActorCommand {
         actor_id: Snowflake,
         is_admin: bool,
         page: PageArg,
-        reply: oneshot::Sender<String>,
+        reply: oneshot::Sender<(String, EmbedKind)>,
     },
     /// V4: start a vote-kick; the reply carries the vote state or the refusal.
     KickStart {
@@ -9040,6 +9040,19 @@ where
         actor_display: String,
         command: PrivacyCommand,
     ) -> Option<String> {
+        self.run_privacy_classified(guild, actor_id, is_admin, actor_display, command)
+            .await
+            .map(|(text, _)| text)
+    }
+
+    async fn run_privacy_classified(
+        &self,
+        guild: Snowflake,
+        actor_id: Snowflake,
+        is_admin: bool,
+        actor_display: String,
+        command: PrivacyCommand,
+    ) -> Option<(String, EmbedKind)> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor
@@ -9069,6 +9082,18 @@ where
         is_admin: bool,
         page: PageArg,
     ) -> Option<String> {
+        self.run_room_access_classified(guild, actor_id, is_admin, page)
+            .await
+            .map(|(text, _)| text)
+    }
+
+    async fn run_room_access_classified(
+        &self,
+        guild: Snowflake,
+        actor_id: Snowflake,
+        is_admin: bool,
+        page: PageArg,
+    ) -> Option<(String, EmbedKind)> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         actor
@@ -10710,7 +10735,12 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             command,
             reply,
         } => {
-            let _ = reply.send(worker.apply_privacy(actor_id, is_admin, &actor_display, command));
+            let _ = reply.send(worker.apply_privacy_classified(
+                actor_id,
+                is_admin,
+                &actor_display,
+                command,
+            ));
         }
         ActorCommand::RoomAccess {
             actor_id,
@@ -10718,7 +10748,7 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             page,
             reply,
         } => {
-            let _ = reply.send(worker.apply_room_access(actor_id, is_admin, page));
+            let _ = reply.send(worker.apply_room_access_classified(actor_id, is_admin, page));
         }
         ActorCommand::KickStart {
             vote_id,
@@ -14587,6 +14617,9 @@ where
                 | VoiceCommand::Invite
                 | VoiceCommand::Reclaim
                 | VoiceCommand::Transfer { .. }
+                | VoiceCommand::Private
+                | VoiceCommand::Public
+                | VoiceCommand::RoomAccessInspect(_)
         ) {
             if let Some(text) = denial.data.as_ref().and_then(|data| data.content.clone()) {
                 reply(limit::limit_response(text, kind)).await;
@@ -15231,14 +15264,15 @@ where
                 (PrivacyCommand::Public, "public")
             };
             let Some(actor_id) = invoker_member_id(interaction) else {
-                reply(ephemeral_response(&format!(
-                    "I couldn't tell who invoked /{name} — try again."
-                )))
+                reply(limit::limit_response(
+                    format!("I couldn't tell who invoked /{name} — try again."),
+                    EmbedKind::Danger,
+                ))
                 .await;
                 return true;
             };
-            let text = runtime
-                .run_privacy(
+            let (text, kind) = runtime
+                .run_privacy_classified(
                     guild_id,
                     actor_id,
                     member.is_admin,
@@ -15249,34 +15283,37 @@ where
                 .unwrap_or_else(|| {
                     // A known worker that never answered is a transient
                     // failure, not a cold cache.
-                    if runtime.has_actor(guild_id) {
+                    let text = if runtime.has_actor(guild_id) {
                         WORKER_LOST_REPLY.to_owned()
                     } else {
                         "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
-                    }
+                    };
+                    (text, EmbedKind::Warn)
                 });
-            reply(ephemeral_response(&text)).await;
+            reply(limit::limit_response(text, kind)).await;
             true
         }
         VoiceCommand::RoomAccessInspect(page) => {
             let Some(actor_id) = invoker_member_id(interaction) else {
-                reply(ephemeral_response(
-                    "I couldn't tell who invoked /room-access-inspect — try again.",
+                reply(limit::limit_response(
+                    "I couldn't tell who invoked /room-access-inspect — try again.".to_owned(),
+                    EmbedKind::Danger,
                 ))
                 .await;
                 return true;
             };
-            let text = runtime
-                .run_room_access(guild_id, actor_id, member.is_admin, page)
+            let (text, kind) = runtime
+                .run_room_access_classified(guild_id, actor_id, member.is_admin, page)
                 .await
                 .unwrap_or_else(|| {
-                    if runtime.has_actor(guild_id) {
+                    let text = if runtime.has_actor(guild_id) {
                         WORKER_LOST_REPLY.to_owned()
                     } else {
                         "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
-                    }
+                    };
+                    (text, EmbedKind::Warn)
                 });
-            reply(ephemeral_response(&text)).await;
+            reply(limit::limit_response(text, kind)).await;
             true
         }
         VoiceCommand::Export => {
@@ -15727,6 +15764,9 @@ fn limit_completion_embed<'a>(
                 | VoiceCommand::MyRoom
                 | VoiceCommand::Reclaim
                 | VoiceCommand::Transfer { .. }
+                | VoiceCommand::Private
+                | VoiceCommand::Public
+                | VoiceCommand::RoomAccessInspect(_)
         )
     ) {
         return None;

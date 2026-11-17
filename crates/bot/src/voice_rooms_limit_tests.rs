@@ -213,6 +213,95 @@ async fn ownership_gate_refusals_use_classified_embeds() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn privacy_and_inspect_worker_fallbacks_use_warning_embeds() {
+    for name in ["private", "public", "room-access-inspect"] {
+        let interaction = voice_interaction_as(Some(command_data(name, vec![])), None, MEMBER);
+        let cold = test_runtime(Trace::default());
+        let seen = Arc::new(Mutex::new(None));
+        let capture = seen.clone();
+        assert!(
+            handle_voice_interaction(&cold, &interaction, move |response| {
+                *capture.lock().unwrap() = Some(response);
+                async {}
+            })
+            .await
+        );
+        let response = seen.lock().unwrap().clone().expect("cold reply");
+        assert_limit_embed(
+            &response,
+            EmbedKind::Warn,
+            "The voice worker isn't warmed up yet — try again in a moment.",
+        );
+        assert!(limit_completion_embed(&interaction, &response).is_some());
+
+        let (runtime, _rx) = stalled_worker_runtime();
+        let (_, response) = handle_capture(&runtime, &interaction).await;
+        let response = response.expect("lost worker reply");
+        assert_limit_embed(&response, EmbedKind::Warn, WORKER_LOST_REPLY);
+        assert!(limit_completion_embed(&interaction, &response).is_some());
+    }
+}
+
+#[tokio::test]
+async fn privacy_and_inspect_missing_invoker_and_gates_are_classified() {
+    for name in ["private", "public", "room-access-inspect"] {
+        let runtime = test_runtime(Trace::default());
+        let mut anonymous = voice_interaction(
+            Some(command_data(name, vec![])),
+            Some(Permissions::empty()),
+            true,
+        );
+        anonymous.member.as_mut().unwrap().user = None;
+        let seen = Arc::new(Mutex::new(None));
+        let capture = seen.clone();
+        assert!(
+            handle_voice_interaction(&runtime, &anonymous, move |response| {
+                *capture.lock().unwrap() = Some(response);
+                async {}
+            })
+            .await
+        );
+        let response = seen.lock().unwrap().clone().expect("missing invoker reply");
+        assert_limit_embed(
+            &response,
+            EmbedKind::Danger,
+            &format!("I couldn't tell who invoked /{name} — try again."),
+        );
+        assert!(limit_completion_embed(&anonymous, &response).is_some());
+
+        for (controls, error, kind, text) in [
+            (
+                AccessControls {
+                    required_role: Some(9),
+                    ..AccessControls::default()
+                },
+                None,
+                EmbedKind::Danger,
+                "You need the server's required role to use voice-room commands.",
+            ),
+            (
+                AccessControls::default(),
+                Some(StoreError::Unavailable),
+                EmbedKind::Warn,
+                "Voice-room settings are unavailable right now. Try again shortly.",
+            ),
+        ] {
+            let trace = Trace::default();
+            let runtime = gated_runtime(trace.clone(), controls, error);
+            let mut interaction =
+                voice_interaction_as(Some(command_data(name, vec![])), None, MEMBER);
+            interaction.member.as_mut().unwrap().roles.clear();
+            let (handled, response) = handle_capture(&runtime, &interaction).await;
+            assert!(handled);
+            let response = response.expect("gate reply");
+            assert_limit_embed(&response, kind, text);
+            assert!(limit_completion_embed(&interaction, &response).is_some());
+            assert!(limit_writes(&trace).is_empty());
+        }
+    }
+}
+
 #[tokio::test]
 async fn myroom_cold_worker_returns_warning_embed() {
     let runtime = test_runtime(Trace::default());
