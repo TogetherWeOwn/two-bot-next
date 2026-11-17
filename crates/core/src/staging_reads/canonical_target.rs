@@ -3,6 +3,8 @@
 //! This fragment does not establish trusted identity or authorize a request.
 //! Complete request encoding, decoding, digest and integration remain separate.
 
+use crate::backup::guild_config::{STAGING_BOT_APPLICATION_ID, TWO_STAGING_GUILD_ID};
+
 /// Untrusted target identifiers in canonical request order.
 pub struct RequestTarget<'a> {
     pub staging_application_id: &'a str,
@@ -10,15 +12,15 @@ pub struct RequestTarget<'a> {
 }
 
 /// Encodes the comma-prefixed fields after expires_at_ms when both match v1.
-pub fn encode_target(input: &RequestTarget<'_>) -> Option<&'static str> {
-    if input.staging_application_id != "1469137636663758888"
-        || input.staging_guild_id != "1545644954272137297"
+pub fn encode_target(input: &RequestTarget<'_>) -> Option<String> {
+    if input.staging_application_id != STAGING_BOT_APPLICATION_ID
+        || input.staging_guild_id != TWO_STAGING_GUILD_ID
     {
         return None;
     }
-    Some(
-        ",\"staging_application_id\":\"1469137636663758888\",\"staging_guild_id\":\"1545644954272137297\"",
-    )
+    Some(format!(
+        ",\"staging_application_id\":\"{STAGING_BOT_APPLICATION_ID}\",\"staging_guild_id\":\"{TWO_STAGING_GUILD_ID}\""
+    ))
 }
 
 #[cfg(test)]
@@ -34,7 +36,8 @@ mod tests {
             encode_target(&RequestTarget {
                 staging_application_id: APPLICATION,
                 staging_guild_id: GUILD,
-            }),
+            })
+            .as_deref(),
             Some(
                 ",\"staging_application_id\":\"1469137636663758888\",\"staging_guild_id\":\"1545644954272137297\""
             )
