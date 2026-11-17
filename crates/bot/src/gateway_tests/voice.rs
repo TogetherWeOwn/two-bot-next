@@ -315,7 +315,7 @@ async fn registered_voice_id_with_rsvp_payload_has_one_voice_callback() {
     wait_sequence(&db.store, 1).await;
     ws.send(Message::text(
         json!({"op":0,"s":2,"t":"INTERACTION_CREATE","d":{
-            "application_id":"1111", "authorizing_integration_owners":{"0":GUILD},
+            "application_id":"1111", "attachment_size_limit":10485760, "authorizing_integration_owners":{"0":GUILD},
             "id":"7000", "token":"voice-identity-fixture", "type":2, "version":1,
             "guild_id":GUILD, "entitlements":[],
             "member":{"permissions":"0","roles":[],"deaf":false,"mute":false,"flags":0,

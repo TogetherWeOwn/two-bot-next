@@ -336,7 +336,7 @@ fn welcome(member_id: u64) -> OnboardingJob {
 fn component(custom_id: &str, values: &[&str]) -> OnboardingJob {
     let interaction: Interaction = serde_json::from_value(json!({
         "application_id":"111", "authorizing_integration_owners":{"0":"22"},
-        "id":"333", "token":"mock-callback", "type":3,"version":1,"guild_id":"22",
+        "id":"333", "token":"mock-callback", "type":3,"version":1,"guild_id":"22", "attachment_size_limit":10485760,
         "member":{"user":{"id":"44","username":"member","discriminator":"0"},"roles":[],"deaf":false,"mute":false,"flags":0},
         "data":{"custom_id":custom_id,"component_type":3,"values":values}
     })).unwrap();
