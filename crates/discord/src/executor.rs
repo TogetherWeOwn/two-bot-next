@@ -4750,26 +4750,19 @@ mod tests {
 
     #[tokio::test]
     async fn strict_transport_preserves_pre_wire_refusals() {
-        #[derive(Debug)]
-        struct DistinctAdmission(TokenKey);
-        impl SendAdmission for DistinctAdmission {
-            fn token_key(&self) -> &TokenKey {
-                &self.0
-            }
-            fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
-                Box::pin(async { Err(AdmissionError::Blocked) })
-            }
-            fn admit_strict(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
-                Box::pin(async { Err(AdmissionError::Storage) })
-            }
-        }
+        use crate::strict_transport_fixture::{loopback, Admission};
 
         let _ = rustls::crypto::ring::default_provider().install_default();
         let token = "fixture-strict-refusal";
+        let (listener, origin) = loopback().await;
         let transport = HyperTransport::with_admission(
             token.to_owned(),
-            Some("http://127.0.0.1:1".to_owned()),
-            Arc::new(DistinctAdmission(TokenKey::for_bot_token(token).unwrap())),
+            Some(origin),
+            Arc::new(Admission::new(
+                token,
+                Some(AdmissionError::Blocked),
+                Some(AdmissionError::Storage),
+            )),
         )
         .unwrap();
         let request = Request::from_route(&Route::GetCurrentUser);
@@ -4819,6 +4812,51 @@ mod tests {
             transport.send_strict_request_headers(&unauthorized, None).await,
             Err(StrictTransportError::Transport(message)) if message == "caller-supplied authorization is forbidden"
         ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_transport_fixture_reads_and_completes() {
+        use crate::strict_transport_fixture::{loopback, read_request, Admission};
+        use tokio::io::AsyncWriteExt;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = "fixture-strict-success";
+        let (listener, origin) = loopback().await;
+        let gate = Arc::new(Admission::new(token, None, None));
+        let completed = gate.completed.clone();
+        let transport =
+            HyperTransport::with_admission(token.to_owned(), Some(origin), gate).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let request = read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+            request
+        });
+        let request = Request::from_route(&Route::GetCurrentUser);
+        let pending = transport
+            .send_strict_request_headers(
+                &request,
+                Some(tokio::time::Instant::now() + Duration::from_secs(2)),
+            )
+            .await
+            .unwrap();
+        let (response, _) = pending.collect().await.unwrap();
+        assert_eq!(response.status, 200);
+        assert!(String::from_utf8(server.await.unwrap())
+            .unwrap()
+            .starts_with("GET /api/v10/users/@me "));
+        assert_eq!(*completed.lock().unwrap(), vec![None]);
     }
 
     #[test]

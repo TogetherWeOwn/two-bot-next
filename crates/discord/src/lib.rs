@@ -62,6 +62,8 @@ pub mod rsvp;
 #[cfg(any(test, feature = "test-support"))]
 pub mod staging_slash_smoke;
 #[cfg(test)]
+mod strict_transport_fixture;
+#[cfg(test)]
 mod test_clock;
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
