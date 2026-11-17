@@ -861,11 +861,11 @@ impl HyperTransport {
 /// Headers-received half of one governed wire attempt. The status is known;
 /// the body is not yet collected. The caller either collects the bounded body
 /// ([`PendingHeaders::collect`]) or settles a status-only verdict
-/// ([`PendingHeaders::settle_status`]) and drops the rest unread. Dropping
+/// (`PendingHeaders::settle_status`) and drops the rest unread. Dropping
 /// without settling commits only the header-anchored global timing, never
 /// body timing.
 ///
-/// [`crate::ratelimit_guard::ResponseAccounting`] settles exactly once:
+/// `ResponseAccounting` settles exactly once:
 /// either in `collect`/`settle_status` (with whatever evidence is available)
 /// or in `Drop` (header-anchored fallback). Either way a pending header
 /// restriction resolves to its header timing without opening admission early.
