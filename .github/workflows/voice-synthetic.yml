@@ -30,6 +30,10 @@ on:
         type: string
         required: false
         default: ''
+      deploy_staging_call:
+        type: boolean
+        required: false
+        default: false
       staging_use_expires_at:
         type: string
         required: true
@@ -59,9 +63,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  rerun-refusal:
+    needs: [staging-window, synthetic, staging-use-release]
+    if: always() && inputs.deploy_staging_call && github.run_attempt > 1
+    permissions: {}
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - run: exit 1
+
   staging-window:
     name: authorize staging use before the consumer
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (!inputs.deploy_staging_call || github.run_attempt == 1)
     permissions:
       contents: read
     environment: staging
@@ -147,7 +160,7 @@ jobs:
     needs: staging-window
     permissions:
       contents: read
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (!inputs.deploy_staging_call || github.run_attempt == 1)
     environment: voice-synthetic
     # Runner routing: see the note on `check` in check.yml.
     runs-on: ubuntu-latest
