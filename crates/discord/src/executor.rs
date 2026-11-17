@@ -473,6 +473,15 @@ impl std::fmt::Debug for HyperTransport {
     }
 }
 
+/// Failure before headers, retaining typed durable-admission provenance.
+#[derive(Debug, thiserror::Error)]
+pub enum StrictTransportError {
+    #[error(transparent)]
+    Admission(#[from] two_bot_core::send_admission::AdmissionError),
+    #[error("{0}")]
+    Transport(#[from] String),
+}
+
 impl HyperTransport {
     /// Build against real Discord (`https://discord.com`).
     pub fn new(token: String) -> Result<Self, String> {
@@ -594,11 +603,35 @@ impl HyperTransport {
         request: &Request,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<PendingHeaders<'_>, String> {
+        self.send_request_headers_with_admission(request, deadline, false)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// One strict governed attempt through headers, preserving admission failures.
+    /// This seam does not retry or enable any caller.
+    pub async fn send_strict_request_headers(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<PendingHeaders<'_>, StrictTransportError> {
+        self.send_request_headers_with_admission(request, deadline, true)
+            .await
+    }
+
+    async fn send_request_headers_with_admission(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+        strict: bool,
+    ) -> Result<PendingHeaders<'_>, StrictTransportError> {
         if request
             .headers()
             .is_some_and(|headers| headers.contains_key(hyper::header::AUTHORIZATION))
         {
-            return Err("caller-supplied authorization is forbidden".to_owned());
+            return Err("caller-supplied authorization is forbidden"
+                .to_owned()
+                .into());
         }
         let method: http::Method = request
             .method()
@@ -653,16 +686,24 @@ impl HyperTransport {
         // A timed-out admit never resolved, so no permit exists to release;
         // it reports as a header stall so the caller spends one attempt.
         let permit = match &self.admission {
+            None if strict => {
+                return Err(two_bot_core::send_admission::AdmissionError::Configuration.into())
+            }
             // Constructor restricts ungoverned transport to loopback fixtures.
             None => None,
-            Some(admission) => match deadline {
-                None => Some(admission.admit().await.map_err(|e| e.to_string())?),
-                Some(at) => match tokio::time::timeout_at(at, admission.admit()).await {
-                    Ok(Ok(permit)) => Some(permit),
-                    Ok(Err(error)) => return Err(error.to_string()),
-                    Err(_) => return Err(HEADER_TIMEOUT_MESSAGE.to_owned()),
-                },
-            },
+            Some(admission) => {
+                let take = if strict {
+                    admission.admit_strict()
+                } else {
+                    admission.admit()
+                };
+                Some(match deadline {
+                    None => take.await?,
+                    Some(at) => tokio::time::timeout_at(at, take)
+                        .await
+                        .map_err(|_| HEADER_TIMEOUT_MESSAGE.to_owned())??,
+                })
+            }
         };
         let mut attempt = crate::executor_metrics::Attempt::new(request);
         // Bound the header wait inside the permit scope so a stalled read
@@ -680,14 +721,14 @@ impl HyperTransport {
                 .map_err(|error| format!("transport: {error}"))?,
             Some(at) => match tokio::time::timeout_at(at, request_fut).await {
                 Ok(Ok(response)) => response,
-                Ok(Err(error)) => return Err(format!("transport: {error}")),
+                Ok(Err(error)) => return Err(format!("transport: {error}").into()),
                 Err(_) => {
                     if request.method() == Method::Get {
                         if let Some(permit) = permit {
                             complete_early_release(permit, "header_timeout").await;
                         }
                     }
-                    return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
+                    return Err(HEADER_TIMEOUT_MESSAGE.to_owned().into());
                 }
             },
         };
@@ -822,7 +863,7 @@ impl HyperTransport {
 /// either in `collect`/`settle_status` (with whatever evidence is available)
 /// or in `Drop` (header-anchored fallback). Either way a pending header
 /// restriction resolves to its header timing without opening admission early.
-struct PendingHeaders<'a> {
+pub struct PendingHeaders<'a> {
     response: Option<hyper::Response<hyper::body::Incoming>>,
     accounting: Option<crate::ratelimit_guard::ResponseAccounting<'a>>,
     complete_on_receipt: bool,
@@ -834,7 +875,7 @@ struct PendingHeaders<'a> {
 impl PendingHeaders<'_> {
     /// Collect the bounded body and settle guard/admission accounting exactly
     /// as the pre-split `send_request` always has.
-    async fn collect(self) -> Result<(RawResponse, bool), String> {
+    pub async fn collect(self) -> Result<(RawResponse, bool), String> {
         self.collect_with(Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS))
             .await
     }
@@ -907,7 +948,7 @@ impl PendingHeaders<'_> {
     /// 204 is the singular role-mutation success: it releases admission here
     /// because `complete_on_receipt` (GET + rejection/rate-limit statuses)
     /// never fires for a PUT/DELETE success, and no caller completes it later.
-    async fn settle_status(mut self) -> u16 {
+    pub(crate) async fn settle_status(mut self) -> u16 {
         let status = self.status;
         let mut res = RawResponse {
             status,
