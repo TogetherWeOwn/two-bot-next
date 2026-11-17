@@ -85,7 +85,7 @@ fn payload(sub: &str, children: Vec<Value>) -> Value {
 fn slash(id: u64, permissions: u64, options: Value) -> Interaction {
     serde_json::from_value(json!({
         "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
-        "id": id.to_string(), "token": "mock-options-token", "type": 2, "version": 1,
+        "id": id.to_string(), "token": "mock-options-token", "type": 2, "version": 1, "attachment_size_limit": 10485760,
         "guild_id": GUILD, "channel": {"id": CHANNEL, "type": 0},
         "member": {"permissions": permissions.to_string(), "roles": [],
             "deaf": false, "mute": false, "flags": 0,
