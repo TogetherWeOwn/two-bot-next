@@ -200,9 +200,9 @@ STAGING_CONTROL_ENV = {
     "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
 }
 STAGING_CALLEE_GROUPS = {
-    "voice-synthetic.yml": "${{ inputs.staging_use_expires_at != '' && "
+    "voice-synthetic.yml": "${{ (inputs.deploy_staging_call || inputs.staging_use_expires_at != '') && "
                            "format('staging-voice-consumer-{0}', github.run_id) || 'staging-lifecycle' }}",
-    "help-embed-synthetic.yml": "${{ inputs.staging_use_expires_at != '' && "
+    "help-embed-synthetic.yml": "${{ (inputs.deploy_staging_call || inputs.staging_use_expires_at != '') && "
                                 "format('staging-help-consumer-{0}', github.run_id) || 'staging-lifecycle' }}",
 }
 DEPLOY_MARKERS = (
@@ -3698,7 +3698,9 @@ def staging_callee_window_errors(name, workflow, consumer):
         errors.append(f"{name}: jobs must be exactly {sorted(expected_jobs)}")
     if prepared:
         refusal = {"needs": ["staging-window", consumer, "staging-use-release"],
-                   "if": "always() && inputs.deploy_staging_call && github.run_attempt > 1",
+                   "if": "always() && inputs.deploy_staging_call && (github.run_attempt > 1 || "
+                         "inputs.staging_use_expires_at == '' || inputs.staging_use_sha == '' || "
+                         "inputs.staging_use_deployment == '')",
                    "permissions": {}, "runs-on": "ubuntu-latest",
                    "timeout-minutes": "5" if name == "help-embed-synthetic.yml" else "1",
                    "steps": [{"run": "exit 1"}]}
@@ -3716,7 +3718,9 @@ def staging_callee_window_errors(name, workflow, consumer):
         errors.append(f"{name}:staging-window: unexpected job keys")
     window_if = "github.ref == 'refs/heads/main'"
     if prepared:
-        window_if += " && (!inputs.deploy_staging_call || github.run_attempt == 1)"
+        window_if += (" && (!inputs.deploy_staging_call || (github.run_attempt == 1 && "
+                      "inputs.staging_use_expires_at != '' && inputs.staging_use_sha != '' && "
+                      "inputs.staging_use_deployment != ''))")
     if window.get("if") != window_if:
         errors.append(f"{name}:staging-window: must run only from main with the required attempt guard")
     if window.get("environment") != "staging":
@@ -3747,7 +3751,7 @@ def staging_callee_window_errors(name, workflow, consumer):
         if node != {"uses": STAGING_SETUP_NODE_USES,
                     "with": {"node-version": "22", "package-manager-cache": "false"}}:
             errors.append(f"{name}:staging-window: second step must be the pinned setup-node on Node 22")
-        if set(ready) - {"name"} != {"if", "env", "run"} or ready.get("if") != "inputs.staging_use_expires_at != ''" \
+        if set(ready) - {"name"} != {"if", "env", "run"} or ready.get("if") != "(inputs.deploy_staging_call || inputs.staging_use_expires_at != '')" \
                 or ready.get("run") != "node wrangler/scripts/staging-use.mjs ready" or ready.get("env") != {
                     **STAGING_CONTROL_ENV,
                     "STAGING_USE_SHA": "${{ inputs.staging_use_sha }}",
@@ -3758,7 +3762,7 @@ def staging_callee_window_errors(name, workflow, consumer):
                           "input with the exact input bindings")
         step_id = begin.get("id")
         if set(begin) - {"name"} != {"id", "if", "env", "run"} or not step_id \
-                or begin.get("if") != "inputs.staging_use_expires_at == ''" \
+                or begin.get("if") != "inputs.staging_use_expires_at == '' && !inputs.deploy_staging_call" \
                 or begin.get("run") != "node wrangler/scripts/staging-use-pipeline.mjs begin" or begin.get("env") != {
                     **STAGING_CONTROL_ENV, "STAGING_USE_MINUTES": "45",
                     "STAGING_USE_RECEIPT": STAGING_USE_RECEIPT}:
@@ -3781,9 +3785,9 @@ def staging_callee_window_errors(name, workflow, consumer):
     if not isinstance(needs, list) or set(needs) != {"staging-window", consumer} or len(needs) != 2:
         errors.append(f"{name}:staging-use-release: must need exactly staging-window and {consumer}")
     conjuncts = str(release.get("if") or "").split(" && ")
-    expected = {"always()", "github.ref == 'refs/heads/main'", "inputs.staging_use_expires_at == ''",
-                f"needs.staging-window.outputs.{output_name} != ''"}
-    if output_name is None or len(conjuncts) != 4 or set(conjuncts) != expected:
+    expected = {"always()", "github.ref == 'refs/heads/main'", "!inputs.deploy_staging_call",
+                "inputs.staging_use_expires_at == ''", f"needs.staging-window.outputs.{output_name} != ''"}
+    if output_name is None or len(conjuncts) != 5 or set(conjuncts) != expected:
         errors.append(f"{name}:staging-use-release: must be always(), main-only, standalone-only and "
                       "gated on the begin output")
     if release.get("environment") != "staging":
@@ -3812,7 +3816,7 @@ def staging_callee_window_errors(name, workflow, consumer):
                     "with": {"node-version": "22", "package-manager-cache": "false"}}:
             errors.append(f"{name}:staging-use-release: second step must be the pinned setup-node on Node 22")
         if set(finish) - {"name"} != {"if", "env", "run"} \
-                or finish.get("if") != "inputs.staging_use_expires_at == ''" \
+                or finish.get("if") != "inputs.staging_use_expires_at == '' && !inputs.deploy_staging_call" \
                 or finish.get("run") != "node wrangler/scripts/staging-use-pipeline.mjs finish" or finish.get("env") != {
                     **STAGING_CONTROL_ENV,
                     "STAGING_USE_EXPIRES_AT": f"${{{{ needs.staging-window.outputs.{output_name} }}}}",
