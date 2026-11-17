@@ -14615,6 +14615,7 @@ where
                 | VoiceCommand::Unlimit
                 | VoiceCommand::Ping
                 | VoiceCommand::Invite
+                | VoiceCommand::MyRoom
                 | VoiceCommand::Reclaim
                 | VoiceCommand::Transfer { .. }
                 | VoiceCommand::Private
