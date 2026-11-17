@@ -1,6 +1,8 @@
 //! Inert canonical request assembly. This does not authenticate or admit a request.
 //!
-//! Digest computation, trusted provenance and transport remain separate.
+//! Trusted provenance, authentication and transport remain separate.
+
+use sha2::{Digest, Sha256};
 
 use super::{
     canonical_candidate::{encode_candidate, RequestCandidate},
@@ -129,6 +131,17 @@ pub fn decode_request(bytes: &[u8]) -> Option<CanonicalRequest<'_>> {
     (encode_request(&request)?.as_bytes() == bytes).then_some(request)
 }
 
+/// Hash strictly canonical Q bytes with the request domain, without authorization.
+/// Manifest validation, interoperability, authentication, accounting and runtime
+/// integration remain separate obligations; this function does not admit a request.
+pub fn request_digest(bytes: &[u8]) -> Option<String> {
+    decode_request(bytes)?;
+    let mut hash = Sha256::new();
+    hash.update(b"two.bot.staging-reads.request.v1\n");
+    hash.update(bytes);
+    Some(hex::encode(hash.finalize()))
+}
+
 struct Cursor<'a>(&'a str);
 
 impl<'a> Cursor<'a> {
@@ -249,6 +262,81 @@ mod tests {
             let decoded = decode_request(expected.as_bytes()).expect("canonical vector");
             assert_eq!(encode_request(&decoded).as_deref(), Some(expected.as_str()));
         }
+    }
+
+    #[test]
+    fn request_domain_digest_vectors_and_wrong_domains() {
+        for (verb, expected) in [
+            (
+                Verb::Challenge,
+                "ebb43f5d18e6bdc4dbe2ba88f7718e91f9a3511744ef783e362acf21c1c4204d",
+            ),
+            (
+                Verb::Begin,
+                "7382de091efcf9cadbc53e0a5a579ef7a203a3d31424ef8bb79bb1444a86cbf9",
+            ),
+            (
+                Verb::Read,
+                "26eb806bdc541bdb431e37bdf373a7c56fb5cb1ab62d004674094ab413aa429f",
+            ),
+            (
+                Verb::Status,
+                "cd08bf49580dd2f80df6b53c28e517abf5073ab654cf001e517677c9c3d0ae1e",
+            ),
+            (
+                Verb::Close,
+                "35f99ad1084416feb0a915d20ee1675cdb88acfa2bbf26bd132daaa8f91936b3",
+            ),
+        ] {
+            let bytes = encode_request(&request(verb)).unwrap();
+            let digest = request_digest(bytes.as_bytes()).unwrap();
+            assert_eq!(digest, expected);
+            assert_ne!(digest, hex::encode(Sha256::digest(bytes.as_bytes())));
+            let mut manifest_domain = Sha256::new();
+            manifest_domain.update(b"two.bot.staging-reads.manifest.v1\n");
+            manifest_domain.update(bytes.as_bytes());
+            assert_ne!(digest, hex::encode(manifest_domain.finalize()));
+        }
+        let begin = encode_request(&request(Verb::Begin)).unwrap();
+        assert_eq!(
+            hex::encode(Sha256::digest(begin.as_bytes())),
+            "ca42a52aa0bce2edd1750b03192ebf73008ed7b101eb75db9adfe9e06a847975"
+        );
+    }
+
+    #[test]
+    fn request_digest_refuses_noncanonical_exact_vectors() {
+        let begin = encode_request(&request(Verb::Begin)).unwrap();
+        for (invalid, expected_hash) in [
+            (
+                format!("{begin}\n"),
+                "f6d9714b2b91ddcffb6cb78da4b56fae860ca57791450667a6eb9ab82044d478",
+            ),
+            (
+                begin.replacen("\"v\":\"1\"", "\"v\":\"\\u0031\"", 1),
+                "58cfe5a37b206022e1b61b5cf943e7c05e81b4009ecb74a21eb38c0aa1cad4e0",
+            ),
+            (
+                begin.replacen("\"owner_epoch\":\"1\"", "\"owner_epoch\":1", 1),
+                "680f1dceb6686cd1d2e52bb18f72b4debd43e5214e5b3a80f65ee686038fc623",
+            ),
+            (
+                begin.replacen('{', "{\"v\":\"1\",", 1),
+                "0722d1252ae714fa811e50781597338430c27c26fcd79e8d009e3aca3644440f",
+            ),
+            (
+                begin.replacen('{', "{ ", 1),
+                "3b9bb442eebf088e5884d52d90125ea71c71756669cfcb313ed389ef52ef5d62",
+            ),
+        ] {
+            let mut hash = Sha256::new();
+            hash.update(b"two.bot.staging-reads.request.v1\n");
+            hash.update(invalid.as_bytes());
+            assert_eq!(hex::encode(hash.finalize()), expected_hash);
+            assert!(request_digest(invalid.as_bytes()).is_none());
+        }
+        assert!(request_digest(&vec![b' '; 16_385]).is_none());
+        assert!(request_digest(&[0xff]).is_none());
     }
 
     #[test]
