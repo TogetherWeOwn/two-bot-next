@@ -7,6 +7,8 @@ use two_bot_core::send_admission::{
 };
 use two_bot_testsupport::TestDatabase;
 
+mod strict;
+
 async fn database() -> TestDatabase {
     let url = std::env::var("TWO_TEST_DATABASE_URL").expect("explicit test database URL required");
     TestDatabase::create(&url, &sqlx::migrate!("../cutover/migrations"))

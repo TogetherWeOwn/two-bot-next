@@ -78,6 +78,11 @@ pub fn cooldown_from_delays(header: Option<f64>, body: Option<f64>) -> SendCoold
 pub trait SendAdmission: Send + Sync + fmt::Debug {
     fn token_key(&self) -> &TokenKey;
     fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>>;
+
+    /// Strict admission must never fall back to an ordinary, lease-reclaimable claim.
+    fn admit_strict(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        Box::pin(async { Err(AdmissionError::Configuration) })
+    }
 }
 
 pub trait SendCompletion: Send {
@@ -129,6 +134,28 @@ pub use postgres::{PgSendAdmission, IN_FLIGHT_LEASE_MS};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct OrdinaryOnly(TokenKey);
+
+    impl SendAdmission for OrdinaryOnly {
+        fn token_key(&self) -> &TokenKey {
+            &self.0
+        }
+
+        fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+            Box::pin(async { Err(AdmissionError::Blocked) })
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_strict_admission_fails_closed() {
+        let gate = OrdinaryOnly(TokenKey::for_bot_token("fixture").unwrap());
+        assert!(matches!(
+            gate.admit_strict().await,
+            Err(AdmissionError::Configuration)
+        ));
+    }
 
     #[test]
     fn canonical_namespace_and_closed_delay_rules() {
