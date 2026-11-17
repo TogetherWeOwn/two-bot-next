@@ -832,6 +832,7 @@ mod tests {
         let interaction: Interaction = serde_json::from_value(serde_json::json!({
             "id": "1",
             "application_id": "2",
+            "attachment_size_limit": 10485760,
             "authorizing_integration_owners": {"0": STAGING.to_string()},
             "entitlements": [],
             "type": 2,
@@ -844,6 +845,7 @@ mod tests {
         let interaction: Interaction = serde_json::from_value(serde_json::json!({
             "id": "1",
             "application_id": "2",
+            "attachment_size_limit": 10485760,
             "authorizing_integration_owners": {"0": STAGING.to_string()},
             "entitlements": [],
             "type": 2,

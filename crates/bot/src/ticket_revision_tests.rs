@@ -29,7 +29,7 @@ fn runtime(mock: &MockRest) -> Arc<TicketRuntime> {
 fn open_button() -> Interaction {
     serde_json::from_value(json!({
         "application_id":"400", "authorizing_integration_owners":{"0":"100"},
-        "id":"800", "token":"ticket-test-token", "type":3, "version":1,
+        "id":"800", "token":"ticket-test-token", "type":3, "version":1, "attachment_size_limit":10485760,
         "guild_id":"100", "data":{"custom_id":TICKET_OPEN_ID,"component_type":2},
         "member":{"roles":[],"permissions":"0","deaf":false,"mute":false,"flags":0,
             "user":{"id":"500","username":"member","discriminator":"0","avatar":null}}

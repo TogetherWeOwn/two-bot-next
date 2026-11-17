@@ -402,7 +402,10 @@ fn message_json(id: &str, content: &str) -> serde_json::Value {
 
 fn create_event(id: &str, content: &str) -> Event {
     let message: Message = serde_json::from_value(message_json(id, content)).unwrap();
-    Event::MessageCreate(Box::new(MessageCreate(message)))
+    Event::MessageCreate(Box::new(MessageCreate {
+        message,
+        channel_type: None,
+    }))
 }
 
 fn create(id: &str, content: &str) -> MessageDelivery {

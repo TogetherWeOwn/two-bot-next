@@ -2022,7 +2022,10 @@ mod tests {
         }))
         .expect("fixture message deserializes");
         let event = Event::MessageCreate(Box::new(
-            twilight_model::gateway::payload::incoming::MessageCreate(message),
+            twilight_model::gateway::payload::incoming::MessageCreate {
+                message,
+                channel_type: None,
+            },
         ));
 
         for (delivered, expected) in [(true, Some(11)), (false, None)] {

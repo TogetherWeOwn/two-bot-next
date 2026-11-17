@@ -607,6 +607,7 @@ fn saturation_open(member: u64, interaction_id: u64) -> Interaction {
     let roles: Vec<&str> = vec![];
     serde_json::from_value(json!({
         "application_id": "400",
+        "attachment_size_limit": 10485760,
         "authorizing_integration_owners": {"0": "100"},
         "id": interaction_id.to_string(),
         "token": format!("ticket-saturation-{member}-{interaction_id}"),

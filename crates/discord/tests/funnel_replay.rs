@@ -517,45 +517,48 @@ fn invite_snapshot(uses: u64) -> Vec<InviteState> {
 }
 
 fn message_event(member_id: u64, seq: u64, at: &str) -> Event {
-    Event::MessageCreate(Box::new(MessageCreate(Message {
-        activity: None,
-        application: None,
-        application_id: None,
-        attachments: vec![],
-        author: user(member_id, false),
-        call: None,
-        channel_id: Id::new(CH_TEXT),
-        components: vec![],
-        content: "hello".to_owned(),
-        edited_timestamp: None,
-        embeds: vec![],
-        flags: Some(MessageFlags::empty()),
-        guild_id: Some(Id::new(GUILD)),
-        id: Id::new(4_000_000_000_000_000_000 + seq),
-        // `interaction` is deprecated in favour of `interaction_metadata`
-        // but still a required literal field on 0.17.1.
-        #[allow(deprecated)]
-        interaction: None,
-        interaction_metadata: None,
-        kind: MessageType::Regular,
-        member: None,
-        mention_channels: vec![],
-        mention_everyone: false,
-        mention_roles: vec![],
-        mentions: vec![],
-        message_snapshots: vec![],
-        pinned: false,
-        poll: None,
-        reactions: vec![],
-        reference: None,
-        referenced_message: None,
-        role_subscription_data: None,
-        sticker_items: vec![],
-        timestamp: ts(at),
-        thread: None,
-        tts: false,
-        webhook_id: None,
-    })))
+    Event::MessageCreate(Box::new(MessageCreate {
+        channel_type: None,
+        message: Message {
+            activity: None,
+            application: None,
+            application_id: None,
+            attachments: vec![],
+            author: user(member_id, false),
+            call: None,
+            channel_id: Id::new(CH_TEXT),
+            components: vec![],
+            content: "hello".to_owned(),
+            edited_timestamp: None,
+            embeds: vec![],
+            flags: Some(MessageFlags::empty()),
+            guild_id: Some(Id::new(GUILD)),
+            id: Id::new(4_000_000_000_000_000_000 + seq),
+            // `interaction` is deprecated in favour of `interaction_metadata`
+            // but still a required literal field on 0.17.1.
+            #[allow(deprecated)]
+            interaction: None,
+            interaction_metadata: None,
+            kind: MessageType::Regular,
+            member: None,
+            mention_channels: vec![],
+            mention_everyone: false,
+            mention_roles: vec![],
+            mentions: vec![],
+            message_snapshots: vec![],
+            pinned: false,
+            poll: None,
+            reactions: vec![],
+            reference: None,
+            referenced_message: None,
+            role_subscription_data: None,
+            sticker_items: vec![],
+            timestamp: ts(at),
+            thread: None,
+            tts: false,
+            webhook_id: None,
+        },
+    }))
 }
 
 fn voice_event(member_id: u64, channel: Option<u64>) -> Event {

@@ -158,7 +158,10 @@ fn message_event(message_id: u64, at: &str, content: &str) -> Event {
         "attachments": [], "embeds": [], "pinned": false
     }))
     .expect("fixture message deserializes");
-    Event::MessageCreate(Box::new(MessageCreate(message)))
+    Event::MessageCreate(Box::new(MessageCreate {
+        message,
+        channel_type: None,
+    }))
 }
 
 #[tokio::test]

@@ -9,6 +9,7 @@ use two_bot_core::{ChannelModerationStore, RouterGates};
 fn interaction(channel: Option<&str>, channel_id: Option<&str>) -> Interaction {
     serde_json::from_value(json!({
         "id": "7", "application_id": "1111", "type": 2,
+        "attachment_size_limit": 10_485_760,
         "guild_id": "2222",
         "channel": channel.map(|id| json!({"id": id, "type": 0})),
         "channel_id": channel_id,

@@ -186,7 +186,7 @@ fn select(id: u64, actor: u64, post: &str, role: &str) -> Interaction {
         "guild_id": "2222", "channel": {"id": "4444", "type": 0},
         "member": {"user": {"id": actor.to_string(), "username": "member", "discriminator": "0", "avatar": null},
             "roles": [], "joined_at": null, "deaf": false, "mute": false, "flags": 0, "permissions": "0"},
-        "token": "automation-fixture", "version": 1, "entitlements": [], "authorizing_integration_owners": {},
+        "token": "automation-fixture", "version": 1, "attachment_size_limit": 10485760, "entitlements": [], "authorizing_integration_owners": {},
         "data": {"custom_id": lfg::lfg_custom_id(post), "component_type": 3, "values": [role]}
     })).unwrap()
 }
@@ -337,7 +337,7 @@ async fn signup_burst_has_no_audit_or_refresh_and_leave_close_and_retry_remain_u
         "member": {"user": {"id": "3333", "username": "member", "discriminator": "0", "avatar": null},
             "roles": [], "joined_at": null, "deaf": false, "mute": false, "flags": 0,
             "permissions": two_bot_core::commands::PERM_MANAGE_EVENTS.to_string()},
-        "token": "automation-fixture", "version": 1, "entitlements": [], "authorizing_integration_owners": {},
+        "token": "automation-fixture", "version": 1, "attachment_size_limit": 10485760, "entitlements": [], "authorizing_integration_owners": {},
         "data": {"id": "1", "name": "lfg-close", "type": 1, "options": [{"type": 3, "name": "id", "value": post.id}]}
     })).unwrap();
     rt.handle(&close).await.unwrap();

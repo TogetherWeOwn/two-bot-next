@@ -22,10 +22,28 @@ fn interaction(id: u64, name: &str, registration_guild: Option<u64>) -> Interact
     serde_json::from_value(json!({
         "id": "7000", "application_id": "1111", "type": 2, "token": "identity-fixture",
         "authorizing_integration_owners": {}, "entitlements": [], "guild_id": "2222",
+        "attachment_size_limit": 10485760,
         "data": {"id": id.to_string(), "name": name, "type": 1,
             "guild_id": registration_guild.map(|guild| guild.to_string())}
     }))
     .unwrap()
+}
+
+#[test]
+fn interaction_requires_attachment_size_limit() {
+    let mut payload = json!({
+        "id": "7000", "application_id": "1111", "type": 2, "token": "identity-fixture",
+        "authorizing_integration_owners": {}, "entitlements": [], "guild_id": "2222",
+        "attachment_size_limit": 10485760,
+        "data": {"id": "9001", "name": "ping", "type": 1, "guild_id": "2222"}
+    });
+    assert!(serde_json::from_value::<Interaction>(payload.clone()).is_ok());
+    payload
+        .as_object_mut()
+        .unwrap()
+        .remove("attachment_size_limit");
+    let error = serde_json::from_value::<Interaction>(payload).unwrap_err();
+    assert!(error.to_string().contains("attachment_size_limit"));
 }
 
 #[test]

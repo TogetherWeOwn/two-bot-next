@@ -540,7 +540,10 @@ mod tests {
         }
 
         fn event(message: twilight_model::channel::Message) -> Event {
-            Event::MessageCreate(Box::new(MessageCreate(message)))
+            Event::MessageCreate(Box::new(MessageCreate {
+                message,
+                channel_type: None,
+            }))
         }
 
         // Automod enabled (not the `TWO_AUTOMOD=0` fast path): bootstrap

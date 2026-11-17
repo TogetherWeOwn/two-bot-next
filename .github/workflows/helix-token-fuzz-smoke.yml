@@ -6,6 +6,11 @@ name: helix_token fuzz smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      resolve_locks:
+        description: Resolve and export root and fuzz lockfiles
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -16,6 +21,58 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  resolve-locks:
+    name: Resolve root and fuzz locks
+    if: ${{ inputs.resolve_locks && github.ref != 'refs/heads/main' }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Install pinned root toolchain
+        env:
+          RUST_TOOLCHAIN: "1.100.0"
+        run: bash .github/scripts/install-rust-toolchain.sh
+      - name: Install pinned fuzz toolchain
+        env:
+          RUST_TOOLCHAIN: "nightly-2026-10-01"
+        run: bash .github/scripts/install-rust-toolchain.sh
+      - name: Record inputs and resolve locks
+        env:
+          LOCK_OUTPUT_DIR: ${{ runner.temp }}/twilight-locks
+        run: |
+          set -euo pipefail
+          mkdir -p "$LOCK_OUTPUT_DIR/root" "$LOCK_OUTPUT_DIR/fuzz"
+          git rev-parse HEAD > "$LOCK_OUTPUT_DIR/source-sha.txt"
+          printf 'run_id=%s\nrun_attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > "$LOCK_OUTPUT_DIR/run.txt"
+          {
+            rustc +1.100.0 -Vv
+            cargo +1.100.0 -V
+            rustc +nightly-2026-10-01 -Vv
+            cargo +nightly-2026-10-01 -V
+          } > "$LOCK_OUTPUT_DIR/versions.txt"
+          git ls-files -z -- 'Cargo.toml' 'Cargo.lock' '*/Cargo.toml' 'fuzz/Cargo.lock' 'rust-toolchain*' '*/rust-toolchain*' '.cargo/config' '.cargo/config.toml' '*/.cargo/config' '*/.cargo/config.toml' |
+            xargs -0 sha256sum > "$LOCK_OUTPUT_DIR/inputs.sha256"
+          cargo +1.100.0 fetch --manifest-path Cargo.toml
+          cargo +nightly-2026-10-01 fetch --manifest-path fuzz/Cargo.toml
+          cargo +1.100.0 fetch --locked --manifest-path Cargo.toml
+          cargo +nightly-2026-10-01 fetch --locked --manifest-path fuzz/Cargo.toml
+          cp Cargo.lock "$LOCK_OUTPUT_DIR/root/Cargo.lock"
+          cp fuzz/Cargo.lock "$LOCK_OUTPUT_DIR/fuzz/Cargo.lock"
+          (cd "$LOCK_OUTPUT_DIR" && sha256sum root/Cargo.lock fuzz/Cargo.lock > locks.sha256)
+      - name: Upload resolved lockfiles
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: twilight-locks-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/twilight-locks
+          if-no-files-found: error
+          retention-days: 14
+
   helix-token-smoke:
     name: helix_token 60 s smoke
     permissions:
