@@ -157,6 +157,21 @@ fn decode_keeps_huge_page_as_past_end_candidate() {
 }
 
 #[tokio::test]
+async fn inspect_classifies_reads_and_invalid_pages_at_origin() {
+    let worker = owned_worker().await;
+    let (text, kind) = worker.apply_room_access_classified(MEMBER, false, PageArg::Page(1));
+    assert!(text.contains("**Room access**"));
+    assert_eq!(kind, EmbedKind::Ok);
+    for page in [PageArg::Invalid, PageArg::Page(2)] {
+        let (text, kind) = worker.apply_room_access_classified(MEMBER, false, page);
+        assert!(text.starts_with("Unknown page."));
+        assert_eq!(kind, EmbedKind::Danger);
+    }
+    let (_, kind) = worker.apply_room_access_classified(301, false, PageArg::Page(1));
+    assert_eq!(kind, EmbedKind::Danger);
+}
+
+#[tokio::test]
 async fn invalid_page_refuses_without_listing() {
     let worker = owned_worker().await;
     assert_eq!(
@@ -301,7 +316,12 @@ async fn non_owner_page_errors_stay_behind_the_owner_gate() {
     let mut worker = owned_worker().await;
     let blocked: Vec<u64> = (0..300).map(|n| 81_000_000_000_000_000 + n).collect();
     seed_access(&mut worker, &blocked, &[], &[]);
+    let (gate_text, gate_kind) = worker
+        .owned_room(301, false, "room-access-inspect")
+        .expect_err("non-owner is refused");
+    assert_eq!(gate_kind, EmbedKind::Danger);
     let refusal = worker.apply_room_access(301, false, PageArg::Missing);
+    assert_eq!(gate_text, refusal);
     assert_eq!(
         refusal,
         "Only the room owner or an admin can use /room-access-inspect."

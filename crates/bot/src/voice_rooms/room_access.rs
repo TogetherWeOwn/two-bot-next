@@ -105,12 +105,25 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         is_admin: bool,
         page: PageArg,
     ) -> String {
+        self.apply_room_access_classified(actor_id, is_admin, page)
+            .0
+    }
+
+    pub(super) fn apply_room_access_classified(
+        &self,
+        actor_id: Snowflake,
+        is_admin: bool,
+        page: PageArg,
+    ) -> (String, EmbedKind) {
         let (channel, _, _) = match self.owned_room(actor_id, is_admin, COMMAND) {
             Ok(found) => found,
             Err(refusal) => return refusal,
         };
         let Some(page) = page.number() else {
-            return format!("Unknown page. Use /{COMMAND} page:1 to see the first page.");
+            return (
+                format!("Unknown page. Use /{COMMAND} page:1 to see the first page."),
+                EmbedKind::Danger,
+            );
         };
         let state = self.privacy.get(&channel);
         let blocked: Vec<u64> =
@@ -129,12 +142,18 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         // room is open: an observed deny also reads as private (as `/public`).
         let private =
             state.is_some_and(|s| s.private) || self.live_everyone_denies_connect(channel);
-        render_room_access(private, &lists, page).unwrap_or_else(|pages| {
-            let noun = if pages == 1 { "page" } else { "pages" };
-            format!(
-                "Unknown page. /{COMMAND} has {pages} {noun}; use /{COMMAND} page:1 to start over."
-            )
-        })
+        match render_room_access(private, &lists, page) {
+            Ok(text) => (text, EmbedKind::Ok),
+            Err(pages) => {
+                let noun = if pages == 1 { "page" } else { "pages" };
+                (
+                    format!(
+                        "Unknown page. /{COMMAND} has {pages} {noun}; use /{COMMAND} page:1 to start over."
+                    ),
+                    EmbedKind::Danger,
+                )
+            }
+        }
     }
 }
 
