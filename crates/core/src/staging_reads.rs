@@ -1,6 +1,7 @@
 //! Inert staging-read lifecycle vocabulary; this does not admit or perform reads.
 
 pub mod canonical_candidate;
+pub mod canonical_journeys;
 pub mod canonical_lifecycle;
 pub mod canonical_owner;
 pub mod canonical_prefix;
