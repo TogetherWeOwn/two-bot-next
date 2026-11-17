@@ -728,21 +728,24 @@ impl HyperTransport {
         // held by dropping it uncompleted (uncertain).
         let request_fut = self.inner.request(hyper_req);
         let response = match deadline {
-            None => request_fut
-                .await
-                .map_err(|error| format!("transport: {error}"))?,
-            Some(at) => match tokio::time::timeout_at(at, request_fut).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => return Err(format!("transport: {error}").into()),
-                Err(_) => {
-                    if request.method() == Method::Get {
-                        if let Some(permit) = permit {
-                            complete_early_release(permit, "header_timeout").await;
-                        }
+            None => Ok(request_fut.await),
+            Some(at) => tokio::time::timeout_at(at, request_fut).await,
+        };
+        let response = match response {
+            Ok(Ok(response)) => response,
+            failure => {
+                let (message, reason) = match failure {
+                    Ok(Err(error)) => (format!("transport: {error}"), "transport_error"),
+                    Err(_) => (HEADER_TIMEOUT_MESSAGE.to_owned(), "header_timeout"),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                if request.method() == Method::Get {
+                    if let Some(permit) = permit {
+                        complete_early_release(permit, reason).await;
                     }
-                    return Err(HEADER_TIMEOUT_MESSAGE.to_owned().into());
                 }
-            },
+                return Err(message.into());
+            }
         };
         let status = response.status().as_u16();
         let mut accounting = crate::ratelimit_guard::ResponseAccounting::new(

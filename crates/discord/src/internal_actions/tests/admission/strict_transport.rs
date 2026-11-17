@@ -57,6 +57,56 @@ async fn assert_fenced(gate: &PgSendAdmission, strict: &PgSendAdmission) {
 
 #[tokio::test]
 #[ignore = "requires isolated agent-testdb or CI service"]
+async fn admission_strict_transport_connection_error_settles_only_reads() {
+    for bounded in [false, true] {
+        let db = database().await;
+        let second = db.independent_pool().await.unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let gate = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
+        let other = PgSendAdmission::new(second.clone(), &token()).unwrap();
+        let transport = HyperTransport::with_admission(token(), Some(origin), gate).unwrap();
+        let read = twilight_http::request::Request::builder(
+            &twilight_http::routing::Route::GetCurrentUser,
+        )
+        .build()
+        .unwrap();
+        let until = || if bounded { deadline() } else { None };
+        assert!(matches!(
+            transport.send_strict_request_headers(&read, until()).await,
+            Err(StrictTransportError::Transport(_))
+        ));
+        let settled = lane(&db).await;
+        assert!(!settled.in_flight && settled.pending.is_none());
+        other.admit().await.unwrap().complete(None).await.unwrap();
+        other
+            .admit_strict()
+            .await
+            .unwrap()
+            .complete(None)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            transport
+                .send_strict_request_headers(&strict_request(), until())
+                .await,
+            Err(StrictTransportError::Transport(_))
+        ));
+        let armed = lane(&db).await;
+        assert!(armed.in_flight);
+        assert_eq!(armed.pending, Some(armed.generation));
+        age_past_lease(&db).await;
+        assert_fenced(&other, &other).await;
+        assert_eq!(lane(&db).await, armed);
+        second.close().await;
+        db.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
 async fn admission_strict_transport_blocked_lane_sends_zero_requests() {
     let db = database().await;
     let mock = MockDiscord::start(Reply::success()).await;
