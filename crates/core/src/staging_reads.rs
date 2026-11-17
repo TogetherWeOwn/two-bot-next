@@ -11,6 +11,7 @@ pub mod canonical_slots;
 pub mod canonical_tail;
 pub mod canonical_target;
 pub mod canonical_time;
+pub mod manifest_references;
 
 /// The lifecycle phase of a counted staging-read measurement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
