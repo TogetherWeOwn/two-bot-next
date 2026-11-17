@@ -123,6 +123,7 @@ use two_bot_core::{
     PermissionOverwrite as HealthOverwrite, Snowflake, VoicePermission, VoicePermissionScope,
 };
 use two_bot_cutover::voice_rooms::{CreateClaim, JoinGrantIntent, OwnerGrantIntent, PgRoomStore};
+use two_bot_discord::brand::EmbedKind;
 use two_bot_discord::voice_rooms::{
     can_enforce_kick, can_manage_room, effective_permissions, MessageRef, RoomChannelAttributes,
     RoomHttp, RoomHttpError,
@@ -4365,8 +4366,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         actor_id: Snowflake,
         is_admin: bool,
         command: OwnershipCommand,
-    ) -> (String, two_bot_discord::brand::EmbedKind) {
-        use two_bot_discord::brand::EmbedKind;
+    ) -> (String, EmbedKind) {
         if self.halted {
             return (
                 "Voice rooms are paused: Discord refused the bot credential. \
@@ -7938,7 +7938,7 @@ enum ActorCommand {
         is_admin: bool,
         command: OwnershipCommand,
         reply: oneshot::Sender<String>,
-        kind: Option<oneshot::Sender<two_bot_discord::brand::EmbedKind>>,
+        kind: Option<oneshot::Sender<EmbedKind>>,
     },
     /// V3 `/limit` and `/unlimit`: the worker resolves the caller's room,
     /// decides, queues the Discord write and replies with the text (or a
@@ -9006,7 +9006,7 @@ where
         actor_id: Snowflake,
         is_admin: bool,
         command: OwnershipCommand,
-    ) -> Option<(String, two_bot_discord::brand::EmbedKind)> {
+    ) -> Option<(String, EmbedKind)> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
         let (kind, kind_inbox) = oneshot::channel();
@@ -15064,13 +15064,14 @@ where
         }
         VoiceCommand::Reclaim => {
             let Some(actor_id) = invoker_member_id(interaction) else {
-                reply(ephemeral_response(
-                    "I couldn't tell who invoked /reclaim — try again.",
+                reply(limit::limit_response(
+                    "I couldn't tell who invoked /reclaim — try again.".to_owned(),
+                    EmbedKind::Danger,
                 ))
                 .await;
                 return true;
             };
-            let (text, _kind) = runtime
+            let (text, kind) = runtime
                 .run_ownership_classified(
                     guild_id,
                     actor_id,
@@ -15084,7 +15085,7 @@ where
                     if runtime.has_actor(guild_id) {
                         (
                             WORKER_LOST_REPLY.to_owned(),
-                            two_bot_discord::brand::EmbedKind::Danger,
+                            two_bot_discord::brand::EmbedKind::Warn,
                         )
                     } else {
                         (
@@ -15094,13 +15095,14 @@ where
                         )
                     }
                 });
-            reply(ephemeral_response(&text)).await;
+            reply(limit::limit_response(text, kind)).await;
             true
         }
         VoiceCommand::Transfer { target_id } => {
             let Some(actor_id) = invoker_member_id(interaction) else {
-                reply(ephemeral_response(
-                    "I couldn't tell who invoked /transfer — try again.",
+                reply(limit::limit_response(
+                    "I couldn't tell who invoked /transfer — try again.".to_owned(),
+                    EmbedKind::Danger,
                 ))
                 .await;
                 return true;
@@ -15108,13 +15110,14 @@ where
             // Zero is a malformed payload, not a member (parse default): fail
             // closed before touching the worker.
             if target_id == 0 {
-                reply(ephemeral_response(
-                    "Choose a member in the room to transfer to.",
+                reply(limit::limit_response(
+                    "Choose a member in the room to transfer to.".to_owned(),
+                    EmbedKind::Danger,
                 ))
                 .await;
                 return true;
             }
-            let (text, _kind) = runtime
+            let (text, kind) = runtime
                 .run_ownership_classified(
                     guild_id,
                     actor_id,
@@ -15128,7 +15131,7 @@ where
                     if runtime.has_actor(guild_id) {
                         (
                             WORKER_LOST_REPLY.to_owned(),
-                            two_bot_discord::brand::EmbedKind::Danger,
+                            two_bot_discord::brand::EmbedKind::Warn,
                         )
                     } else {
                         (
@@ -15138,7 +15141,7 @@ where
                         )
                     }
                 });
-            reply(ephemeral_response(&text)).await;
+            reply(limit::limit_response(text, kind)).await;
             true
         }
         VoiceCommand::Name => {

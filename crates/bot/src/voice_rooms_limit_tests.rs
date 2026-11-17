@@ -72,6 +72,108 @@ fn completion_routes_only_single_embed_limit_replies() {
 }
 
 #[tokio::test]
+async fn ownership_replies_use_explicit_outcome_embeds() {
+    use two_bot_discord::brand::EmbedKind;
+
+    for (name, options, expected) in [
+        ("reclaim", vec![], "You're already the owner of this room."),
+        (
+            "transfer",
+            vec![user_option("member", 301)],
+            "Transferred ownership of this room to <@301>.",
+        ),
+    ] {
+        let interaction = voice_interaction_as(Some(command_data(name, options)), None, MEMBER);
+        let cold = test_runtime(Trace::default());
+        let seen = Arc::new(Mutex::new(None));
+        let capture = seen.clone();
+        assert!(
+            handle_voice_interaction(&cold, &interaction, move |response| {
+                *capture.lock().unwrap() = Some(response);
+                async {}
+            })
+            .await
+        );
+        let response = seen.lock().unwrap().clone().expect("cold reply");
+        assert_limit_embed(
+            &response,
+            EmbedKind::Warn,
+            "The voice worker isn't warmed up yet — try again in a moment.",
+        );
+        assert!(limit_completion_embed(&interaction, &response).is_some());
+
+        let runtime = ownership_room_runtime(Trace::default()).await;
+        let (_, response) = handle_capture(&runtime, &interaction).await;
+        let response = response.expect("success reply");
+        assert_limit_embed(&response, EmbedKind::Ok, expected);
+        assert!(limit_completion_embed(&interaction, &response).is_some());
+    }
+
+    let runtime = ownership_room_runtime(Trace::default()).await;
+    let interaction = voice_interaction_as(
+        Some(command_data("transfer", vec![user_option("member", 301)])),
+        None,
+        302,
+    );
+    let (_, response) = handle_capture(&runtime, &interaction).await;
+    let response = response.expect("refusal reply");
+    let text = response_text(&response);
+    assert_limit_embed(&response, EmbedKind::Danger, &text);
+    assert!(limit_completion_embed(&interaction, &response).is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn ownership_lost_worker_reply_uses_warning_embed() {
+    for (name, options) in [
+        ("reclaim", vec![]),
+        ("transfer", vec![user_option("member", 301)]),
+    ] {
+        let (runtime, _rx) = stalled_worker_runtime();
+        let interaction = voice_interaction_as(Some(command_data(name, options)), None, MEMBER);
+        let (_, response) = handle_capture(&runtime, &interaction).await;
+        let response = response.expect("lost worker reply");
+        assert_limit_embed(&response, EmbedKind::Warn, WORKER_LOST_REPLY);
+        assert!(limit_completion_embed(&interaction, &response).is_some());
+    }
+}
+
+#[tokio::test]
+async fn ownership_missing_invoker_returns_danger_embed() {
+    for (name, options, text) in [
+        (
+            "reclaim",
+            vec![],
+            "I couldn't tell who invoked /reclaim — try again.",
+        ),
+        (
+            "transfer",
+            vec![user_option("member", 301)],
+            "I couldn't tell who invoked /transfer — try again.",
+        ),
+    ] {
+        let runtime = test_runtime(Trace::default());
+        let mut interaction = voice_interaction(
+            Some(command_data(name, options)),
+            Some(Permissions::empty()),
+            true,
+        );
+        interaction.member.as_mut().unwrap().user = None;
+        let seen = Arc::new(Mutex::new(None));
+        let capture = seen.clone();
+        assert!(
+            handle_voice_interaction(&runtime, &interaction, move |response| {
+                *capture.lock().unwrap() = Some(response);
+                async {}
+            })
+            .await
+        );
+        let response = seen.lock().unwrap().clone().expect("reply");
+        assert_limit_embed(&response, EmbedKind::Danger, text);
+        assert!(limit_completion_embed(&interaction, &response).is_some());
+    }
+}
+
+#[tokio::test]
 async fn ownership_gate_refusals_use_classified_embeds() {
     use two_bot_discord::brand::EmbedKind;
 

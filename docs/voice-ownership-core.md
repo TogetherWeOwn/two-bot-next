@@ -41,6 +41,20 @@ Bots cannot own, reclaim, or receive transfers. Duplicate members, zero IDs, or 
 snapshot identifying the owner/creator as a bot are invalid and never silently
 repaired. Commands cannot revive an empty room.
 
+## Member reply surfaces
+
+| Surface | Outcome | Deferred ephemeral reply |
+| --- | --- | --- |
+| `/reclaim` (including a claim by an eligible occupant) | committed or already owner | Voice embed, ok |
+| `/transfer` | committed or already assigned | Voice embed, ok |
+| Both | worker not warmed up, lost worker reply, or handoff still finalizing | Voice embed, warn |
+| Both | refused, invalid, or halted | Voice embed, danger |
+
+The existing text remains the description, with a text-only Voice footer. The
+2000-character bound, empty allowed mentions, defer/edit flow and ownership
+commit receipt remain unchanged. Replies carrying attachments or components
+are not converted. There is no separate `/claim` command in this runtime.
+
 ## Replay and concurrency contract
 
 The same inputs always produce the same decision. Reconciliation after applying
