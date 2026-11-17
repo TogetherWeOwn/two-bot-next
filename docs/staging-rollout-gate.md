@@ -404,7 +404,7 @@ merge or an unverified deployment is not `t0`.
    from the deployed checkout's lockfile after `npm ci`, so an older pinned drill
    uses that commit's CLI and receipt guard, not the workflow head's newer pin.
    Require at least one session, all pinned to that checkout's version (currently
-   4.156.0) with record version 1, exactly one `deploy` invocation and every other
+   4.161.0) with record version 1, exactly one `deploy` invocation and every other
    session exactly `--version` or `-v`, and exactly one staging deploy record
    with the expected Worker name, fresh timestamp and concrete Worker version.
    The `receipt` step runs this check **before** `deployment-takeover`, so
