@@ -13789,6 +13789,35 @@ fn kick_refusal_text(refusal: &KickRefusal) -> &'static str {
     }
 }
 
+fn kick_refusal_response(refusal: KickRefusal) -> InteractionResponse {
+    use two_bot_discord::brand::EmbedKind;
+    let kind = match refusal {
+        KickRefusal::Unavailable
+        | KickRefusal::Vote(
+            VoteKickError::AuthorityUnavailable
+            | VoteKickError::Cooldown
+            | VoteKickError::InitiatorLimited
+            | VoteKickError::ReusedVoteId
+            | VoteKickError::InvalidTime,
+        ) => EmbedKind::Warn,
+        _ => EmbedKind::Danger,
+    };
+    kick_text_response(kick_refusal_text(&refusal), kind)
+}
+
+fn kick_text_response(text: &str, kind: two_bot_discord::brand::EmbedKind) -> InteractionResponse {
+    let mut response = limit::limit_response(text.chars().take(2000).collect(), kind);
+    if let Some(data) = response.data.as_mut() {
+        data.allowed_mentions = Some(AllowedMentions {
+            parse: Vec::new(),
+            users: Vec::new(),
+            roles: Vec::new(),
+            replied_user: false,
+        });
+    }
+    response
+}
+
 /// Ephemeral `ChannelMessageWithSource` reply shell.
 #[must_use]
 pub fn ephemeral_response(content: &str) -> InteractionResponse {
@@ -14517,7 +14546,11 @@ where
         return true;
     }
     if matches!(command, VoiceCommand::KickReasonInvalid { .. }) {
-        reply(ephemeral_response(&kick_reason_correction())).await;
+        reply(kick_text_response(
+            &kick_reason_correction(),
+            two_bot_discord::brand::EmbedKind::Danger,
+        ))
+        .await;
         return true;
     }
     // Cold guild-role facts are not a permanent denial: a command that
@@ -14526,7 +14559,15 @@ where
     // interactions keep their existing handling.
     let authority = runtime.guild_authority(interaction);
     if matches!(authority, GuildAuthority::WarmingUp) && requires_guild_authority(&command) {
-        reply(ephemeral_response(WARMING_UP_REPLY)).await;
+        if matches!(command, VoiceCommand::Kick { .. }) {
+            reply(kick_text_response(
+                WARMING_UP_REPLY,
+                two_bot_discord::brand::EmbedKind::Warn,
+            ))
+            .await;
+        } else {
+            reply(ephemeral_response(WARMING_UP_REPLY)).await;
+        }
         return true;
     }
     // Guild-level role gate first. Settings that cannot be read fail closed for
@@ -14536,6 +14577,16 @@ where
     if let Some((denial, kind)) =
         command_gate_classified(&gate_store, guild_id, &member, command.name()).await
     {
+        if matches!(command, VoiceCommand::Kick { .. }) {
+            if let Some(text) = denial
+                .data
+                .as_ref()
+                .and_then(|data| data.content.as_deref())
+            {
+                reply(kick_text_response(text, kind)).await;
+                return true;
+            }
+        }
         if matches!(
             command,
             VoiceCommand::Limit(_)
@@ -14648,8 +14699,9 @@ where
         }
         VoiceCommand::Kick { target, reason } => {
             let Some(initiator) = interaction.author_id().map(|id| id.get()) else {
-                reply(ephemeral_response(
+                reply(kick_text_response(
                     "Could not tell who started the vote. Try again.",
+                    two_bot_discord::brand::EmbedKind::Danger,
                 ))
                 .await;
                 return true;
@@ -14663,14 +14715,15 @@ where
             // A known worker that never answered is a transient failure; a
             // failed lookup must not claim the target has no tracked room.
             if lookup.is_none() && runtime.has_actor(guild_id) {
-                reply(ephemeral_response(WORKER_LOST_REPLY)).await;
+                reply(kick_text_response(
+                    WORKER_LOST_REPLY,
+                    two_bot_discord::brand::EmbedKind::Warn,
+                ))
+                .await;
                 return true;
             }
             let Some(Some(room_id)) = lookup else {
-                reply(ephemeral_response(kick_refusal_text(
-                    &KickRefusal::NotARoom,
-                )))
-                .await;
+                reply(kick_refusal_response(KickRefusal::NotARoom)).await;
                 return true;
             };
             match runtime
@@ -14678,19 +14731,20 @@ where
                 .await
             {
                 None if runtime.has_actor(guild_id) => {
-                    reply(ephemeral_response(WORKER_LOST_REPLY)).await;
-                }
-                None => {
-                    reply(ephemeral_response(
-                        "Voice state is syncing right now. Try again shortly.",
+                    reply(kick_text_response(
+                        WORKER_LOST_REPLY,
+                        two_bot_discord::brand::EmbedKind::Warn,
                     ))
                     .await;
+                }
+                None => {
+                    reply(kick_refusal_response(KickRefusal::Unavailable)).await;
                 }
                 Some(Ok(update)) => {
                     reply(vote_message(&update, initiator, target, reason.as_deref())).await;
                 }
                 Some(Err(refusal)) => {
-                    reply(ephemeral_response(kick_refusal_text(&refusal))).await;
+                    reply(kick_refusal_response(refusal)).await;
                 }
             }
             true
