@@ -1,6 +1,6 @@
 //! Inert canonical request assembly. This does not authenticate or admit a request.
 //!
-//! Decoding, digest computation, trusted provenance and transport remain separate.
+//! Digest computation, trusted provenance and transport remain separate.
 
 use super::{
     canonical_candidate::{encode_candidate, RequestCandidate},
@@ -40,6 +40,134 @@ pub fn encode_request(input: &CanonicalRequest<'_>) -> Option<String> {
     result.push_str(&encode_target(&input.target)?);
     result.push_str(&encode_tail(&input.tail)?);
     Some(result)
+}
+
+/// Decode only canonical Q bytes. This does not authenticate or admit a request.
+/// Challenge envelopes, HTTP framing, status query decoding and provenance are separate.
+pub fn decode_request(bytes: &[u8]) -> Option<CanonicalRequest<'_>> {
+    use super::canonical_tail::Verb;
+
+    if bytes.len() > 16_384 || !bytes.is_ascii() {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut cursor = Cursor(text);
+    cursor.literal("{\"v\":\"1\",\"verb\":")?;
+    let verb = match cursor.string()? {
+        "challenge" => Verb::Challenge,
+        "begin" => Verb::Begin,
+        "read" => Verb::Read,
+        "status" => Verb::Status,
+        "close" => Verb::Close,
+        _ => return None,
+    };
+    cursor.literal(concat!(
+        ",\"environment\":\"staging\",\"repository_id\":\"1396224242\",",
+        "\"repository_owner_id\":\"319943574\",\"workflow_ref\":",
+        "\"TogetherWeOwn/two-bot-next/.github/workflows/deploy-production.yml@refs/heads/main\""
+    ))?;
+    let prefix = RequestPrefix {
+        verb,
+        tooling_sha: cursor.field("tooling_sha")?,
+        event_name: cursor.field("event_name")?,
+        caller_run_id: cursor.field("caller_run_id")?,
+        caller_run_attempt: cursor.field("caller_run_attempt")?,
+    };
+    let candidate = RequestCandidate {
+        candidate_run_id: cursor.field("candidate_run_id")?,
+        candidate_run_attempt: cursor.field("candidate_run_attempt")?,
+        candidate_sha: cursor.field("candidate_sha")?,
+        build_id: cursor.field("build_id")?,
+        worker_version_id: cursor.field("worker_version_id")?,
+        image_digest: cursor.field("image_digest")?,
+    };
+    let owner = RequestOwner {
+        owner_deployment_id: cursor.field("owner_deployment_id")?,
+        owner_epoch: cursor.field("owner_epoch")?,
+    };
+    let lifecycle = RequestLifecycle {
+        lifecycle_run_id: cursor.field("lifecycle_run_id")?,
+        lifecycle_run_attempt: cursor.field("lifecycle_run_attempt")?,
+    };
+    let time = RequestTime {
+        acquired_at_ms: cursor.field("acquired_at_ms")?,
+        expires_at_ms: cursor.field("expires_at_ms")?,
+    };
+    let target = RequestTarget {
+        staging_application_id: cursor.field("staging_application_id")?,
+        staging_guild_id: cursor.field("staging_guild_id")?,
+    };
+    let challenge = cursor.nullable_field("challenge")?;
+    let incarnation = cursor.nullable_field("incarnation")?;
+    let manifest_sha256 = cursor.field("manifest_sha256")?;
+    let index = cursor
+        .nullable_field("index")?
+        .map(str::parse)
+        .transpose()
+        .ok()?;
+    let query = cursor.nullable_field("query")?;
+    cursor.literal("}")?;
+    if !cursor.0.is_empty() {
+        return None;
+    }
+    let request = CanonicalRequest {
+        prefix,
+        candidate,
+        owner,
+        lifecycle,
+        time,
+        target,
+        tail: RequestTail {
+            verb,
+            challenge,
+            incarnation,
+            manifest_sha256,
+            index,
+            query,
+        },
+    };
+    (encode_request(&request)?.as_bytes() == bytes).then_some(request)
+}
+
+struct Cursor<'a>(&'a str);
+
+impl<'a> Cursor<'a> {
+    fn literal(&mut self, expected: &str) -> Option<()> {
+        self.0 = self.0.strip_prefix(expected)?;
+        Some(())
+    }
+
+    fn string(&mut self) -> Option<&'a str> {
+        self.literal("\"")?;
+        let end = self.0.find('"')?;
+        let value = &self.0[..end];
+        if value.bytes().any(|b| b <= b' ' || b == b'\\' || b == 0x7f) {
+            return None;
+        }
+        self.0 = &self.0[end + 1..];
+        Some(value)
+    }
+
+    fn key(&mut self, name: &str) -> Option<()> {
+        self.literal(",\"")?;
+        self.literal(name)?;
+        self.literal("\":")
+    }
+
+    fn field(&mut self, name: &str) -> Option<&'a str> {
+        self.key(name)?;
+        self.string()
+    }
+
+    fn nullable_field(&mut self, name: &str) -> Option<Option<&'a str>> {
+        self.key(name)?;
+        if let Some(rest) = self.0.strip_prefix("null") {
+            self.0 = rest;
+            Some(None)
+        } else {
+            Some(Some(self.string()?))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -118,6 +246,58 @@ mod tests {
             ), name, identity, index, query);
             assert_eq!(expected.len(), length);
             assert_eq!(encode_request(&request(verb)).as_deref(), Some(expected.as_str()));
+            let decoded = decode_request(expected.as_bytes()).expect("canonical vector");
+            assert_eq!(encode_request(&decoded).as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_noncanonical_and_invalid_inputs_for_every_verb() {
+        for verb in [
+            Verb::Challenge,
+            Verb::Begin,
+            Verb::Read,
+            Verb::Status,
+            Verb::Close,
+        ] {
+            let valid = encode_request(&request(verb)).unwrap();
+            let mutations = [
+                valid.replacen("\"v\":\"1\",", "", 1),
+                valid.replacen("\"v\":\"1\",", "\"v\":\"1\",\"v\":\"1\",", 1),
+                valid.replacen("\"v\":\"1\",", "\"extra\":\"x\",\"v\":\"1\",", 1),
+                valid.replacen("\"v\":\"1\",\"verb\":", "\"verb\":\"begin\",\"v\":", 1),
+                valid.replacen(":", ": ", 1),
+                format!("{valid}\n"),
+                format!("\u{feff}{valid}"),
+                valid.replacen("\"v\":\"1\"", "\"v\":\"\\u0031\"", 1),
+                valid.replacen("\"v\":\"1\"", "\"v\":1", 1),
+                valid.replacen("\"caller_run_id\":\"100\"", "\"caller_run_id\":\"0100\"", 1),
+                valid.replacen(
+                    "\"owner_epoch\":\"1\"",
+                    "\"owner_epoch\":\"9007199254740992\"",
+                    1,
+                ),
+                valid.replacen(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    1,
+                ),
+                valid.replacen(
+                    "fixture_deployment\",\"owner_epoch",
+                    "other\",\"owner_epoch",
+                    1,
+                ),
+            ];
+            for invalid in mutations {
+                assert!(decode_request(invalid.as_bytes()).is_none(), "{invalid}");
+            }
+            assert!(decode_request(&[0xff]).is_none());
+            assert!(decode_request(&vec![b' '; 16_385]).is_none());
+        }
+        let read = encode_request(&request(Verb::Read)).unwrap();
+        for index in ["00", "+0", "40", "256"] {
+            let invalid = read.replace("\"index\":\"0\"", &format!("\"index\":\"{index}\""));
+            assert!(decode_request(invalid.as_bytes()).is_none());
         }
     }
 
