@@ -48,7 +48,9 @@ def assert_admission(test, script):
     for source, admitted, attempt, accepted in (
         (sha, sha, "1", True), (sha, sha, "2", True),
         (sha, "b" * 40, "1", False), ("", "", "1", False),
+        (sha, "", "1", False), ("", sha, "1", False),
         ("A" * 40, "A" * 40, "1", False), ("a" * 39, "a" * 39, "1", False),
+        ("a" * 41, "a" * 41, "1", False), ("g" * 40, "g" * 40, "1", False),
     ):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "output"
@@ -63,6 +65,69 @@ def assert_admission(test, script):
                              if accepted else "")
 
 
+def assert_policy_mutations(test, workflow, checker, diagnostic, mutations):
+    """Require a clean fixture and a matching diagnostic per independent mutation."""
+    test.assertEqual(checker(workflow), [])
+    for label, mutate in mutations.items():
+        changed = deepcopy(workflow)
+        mutate(changed)
+        errors = checker(changed)
+        test.assertTrue(any(diagnostic(label, error) for error in errors), (label, errors))
+
+
+def admission_step_mutations():
+    """Mutate the uniquely named admission step, not a positional neighbor."""
+    def mutate(workflow, field, value):
+        steps = workflow["jobs"]["soak-hold"]["steps"]
+        matches = [step for step in steps if step.get("id") == "admit"]
+        if len(matches) != 1:
+            raise ValueError("expected one admit step")
+        if field == "remove":
+            steps.remove(matches[0])
+        else:
+            matches[0][field] = value
+
+    return {label: lambda workflow, field=field, value=value: mutate(workflow, field, value)
+            for label, field, value in (("missing", "remove", None), ("run", "run", "true"),
+                                        ("environment", "env", {}))}
+
+
+def masked_refusal_mutations():
+    """Replace the failing script or mask its job result."""
+    return {"success": lambda w: w["jobs"]["rerun-refusal"]["steps"][0].update(run="exit 0"),
+            "echo": lambda w: w["jobs"]["rerun-refusal"]["steps"][0].update(run="echo exit 1"),
+            "comment": lambda w: w["jobs"]["rerun-refusal"]["steps"][0].update(run="# exit 1"),
+            "continue": lambda w: w["jobs"]["rerun-refusal"].update({"continue-on-error": True})}
+
+
+class PolicyMutationHelperTests(unittest.TestCase):
+    def test_mutations_require_the_expected_diagnostic(self):
+        admit = {"id": "admit", "run": "guard", "env": {"SOURCE": "sha"}}
+        refusal = {"steps": [{"run": "exit 1"}]}
+        workflow = {"jobs": {"soak-hold": {"steps": [{"run": "setup"}, deepcopy(admit)]},
+                             "rerun-refusal": deepcopy(refusal)}}
+
+        def checker(value):
+            jobs = value["jobs"]
+            errors = []
+            if jobs["soak-hold"]["steps"] != [{"run": "setup"}, admit]:
+                errors.append("admission")
+            if jobs["rerun-refusal"] != refusal:
+                errors.append("refusal")
+            return errors
+
+        for mutations, expected in ((admission_step_mutations(), "admission"),
+                                    (masked_refusal_mutations(), "refusal")):
+            def diagnostic(_label, error, expected=expected):
+                return error == expected
+
+            assert_policy_mutations(self, workflow, checker, diagnostic, mutations)
+            with self.assertRaises(AssertionError):
+                assert_policy_mutations(self, workflow, lambda _: [], diagnostic, mutations)
+            with self.assertRaises(AssertionError):
+                assert_policy_mutations(self, workflow, checker, lambda *_: False, mutations)
+
+
 class AdmissionHelperTests(unittest.TestCase):
     def test_admission_fixture_and_corruption(self):
         script = '''
@@ -71,8 +136,9 @@ class AdmissionHelperTests(unittest.TestCase):
 printf 'run_id=%s\\nattempt=%s\\nsha=%s\\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 '''
         assert_admission(self, script)
-        with self.assertRaises(AssertionError):
-            assert_admission(self, script.replace('[[ "$SOURCE_SHA" == "$ADMITTED_SHA" ]]', 'true'))
+        for guard in ('[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]', '[[ "$SOURCE_SHA" == "$ADMITTED_SHA" ]]'):
+            with self.subTest(guard=guard), self.assertRaises(AssertionError):
+                assert_admission(self, script.replace(guard, 'true'))
 
 
 class RefusalHelperTests(unittest.TestCase):
