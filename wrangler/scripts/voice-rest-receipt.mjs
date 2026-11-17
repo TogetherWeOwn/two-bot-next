@@ -25,7 +25,9 @@ function fail(code) {
 function utcMs(value) {
   if (typeof value !== "string" || !UTC_RE.test(value)) return null;
   const ms = Date.parse(value);
-  return Number.isFinite(ms) ? ms : null;
+  if (!Number.isFinite(ms)) return null;
+  const normalized = value.replace(/(?:\.(\d{1,3}))?Z$/, (_, fraction = "") => `.${fraction.padEnd(3, "0")}Z`);
+  return new Date(ms).toISOString() === normalized ? ms : null;
 }
 
 const isCount = (n) => Number.isSafeInteger(n) && n >= 0;

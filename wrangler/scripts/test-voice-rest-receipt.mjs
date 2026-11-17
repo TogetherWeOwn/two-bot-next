@@ -47,6 +47,9 @@ test('capture refusals: samples, identity, labels, metadata, expiry', () => {
   assert.equal(code(() => receipt({ counts: { '2xx': -1 } })), 'invalid_rest_counters');
   assert.equal(code(() => receipt({}, { ...META, sha: 'zz' })), 'sha_invalid');
   assert.equal(code(() => receipt({}, { ...META, expiresAt: 'tomorrow' })), 'expiry_invalid');
+  assert.equal(code(() => receipt({}, { ...META, expiresAt: '2030-02-30T01:00:00Z' })), 'expiry_invalid');
+  assert.equal(code(() => receipt({}, { ...META, expiresAt: '2030-02-29T01:00:00Z' })), 'expiry_invalid');
+  assert.equal(validateMetadata({ ...META, expiresAt: '2032-02-29T01:00:00.1Z' }).expiresAt, '2032-02-29T01:00:00.1Z');
   assert.equal(code(() => receipt({}, META, at('2030-01-01T01:00:00Z'))), 'grant_expired');
   assert.equal(code(() => validateMetadata(null)), 'metadata_invalid');
 });
