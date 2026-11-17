@@ -366,6 +366,7 @@ mod tests {
                     "\"caller_run_attempt\":\"1.0\"",
                 ),
                 ("\"owner_epoch\":\"1\"", "\"owner_epoch\":\"0\""),
+                ("\"owner_epoch\":\"1\"", "\"owner_epoch\":\"01\""),
                 (
                     "\"expires_at_ms\":\"1794858000000\"",
                     "\"expires_at_ms\":\"9007199254740992\"",
