@@ -18,31 +18,12 @@ use two_bot_core::internal_actions::{
 #[path = "member_store.rs"]
 pub mod store;
 
+#[path = "voice_move.rs"]
+pub mod voice_move;
+pub use voice_move::{VoiceMoveNotSent, VoiceMovePatch, VOICE_MOVE_TIMEOUT_MS};
+
 pub const ADD_MEMBER_TIMEOUT_MS: u64 = 1500;
 pub const ROLE_TIMEOUT_MS: u64 = 2000;
-pub const VOICE_MOVE_TIMEOUT_MS: u64 = 2000;
-
-/// A single voice move attempt; no outcome authorizes retrying the same intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VoiceMovePatch {
-    Moved,
-    Denied,
-    Stale,
-    Limited {
-        retry_after_secs: u64,
-    },
-    /// Local admission refused before dispatch, with its provenance retained.
-    NotSent(VoiceMoveNotSent),
-    /// The effect cannot be established from the exchange.
-    Unavailable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VoiceMoveNotSent {
-    Blocked,
-    Storage,
-    Guard,
-}
 
 /// Keep proof of an unsent mutation until the durable caller disposes its claim.
 /// Public callers still receive the legacy scalar-only `ActionError` envelope.
@@ -247,21 +228,10 @@ impl ActionExecutor {
         member_id: &str,
         channel_id: &str,
     ) -> Result<VoiceMovePatch, ActionError> {
-        let request = self
-            .inner
-            .factory
-            .update_guild_member(numeric_id(guild_id)?.cast(), numeric_id(member_id)?.cast())
-            .channel_id(Some(numeric_id(channel_id)?.cast()))
-            .try_into_request()
-            .map_err(|_| {
-                ActionError::new(
-                    ErrorCode::Malformed,
-                    "Invalid Discord request",
-                    "discord_request_invalid",
-                )
-            })?;
+        let request =
+            voice_move::prepare_voice_move(&self.inner.factory, guild_id, member_id, channel_id)?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(VOICE_MOVE_TIMEOUT_MS);
-        match tokio::time::timeout_at(deadline, self.admit(&request, None)).await {
+        match tokio::time::timeout_at(deadline, self.admit(&request, Some(false))).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) | Err(_) => return Ok(VoiceMovePatch::NotSent(VoiceMoveNotSent::Guard)),
         }
@@ -269,55 +239,58 @@ impl ActionExecutor {
         let pending = match self
             .inner
             .transport
-            .send_request_headers(&request, Some(deadline))
+            .send_strict_request_headers(&request, Some(deadline))
             .await
         {
             Ok(pending) => pending,
-            Err(detail) => {
-                let error = super::DiscordError::Unavailable(detail);
-                return Ok(if error.is_admission_blocked() {
-                    VoiceMovePatch::NotSent(VoiceMoveNotSent::Blocked)
-                } else if error.is_admission_storage() {
-                    VoiceMovePatch::NotSent(VoiceMoveNotSent::Storage)
-                } else {
-                    VoiceMovePatch::Unavailable
-                });
-            }
+            Err(super::StrictTransportError::Admission(
+                two_bot_core::send_admission::AdmissionError::Blocked,
+            )) => return Ok(VoiceMovePatch::NotSent(VoiceMoveNotSent::Blocked)),
+            Err(super::StrictTransportError::Admission(
+                two_bot_core::send_admission::AdmissionError::Storage,
+            )) => return Ok(VoiceMovePatch::NotSent(VoiceMoveNotSent::Storage)),
+            Err(_) => return Ok(VoiceMovePatch::Unavailable),
         };
+        if let Some(refusal) = voice_move::header_refusal(pending.status) {
+            let _ = tokio::time::timeout_at(deadline, pending.settle_status()).await;
+            return Ok(refusal);
+        }
         match pending.status {
-            403 => {
-                pending.settle_status().await;
-                Ok(VoiceMovePatch::Denied)
-            }
-            400 | 404 => {
-                pending.settle_status().await;
-                Ok(VoiceMovePatch::Stale)
-            }
             429 | 200..=299 => {
+                let status = pending.status;
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                let (mut response, _) = match pending.collect_with(remaining).await {
-                    Ok(response) => response,
-                    Err(_) => return Ok(VoiceMovePatch::Unavailable),
+                let (mut response, _) = match tokio::time::timeout_at(
+                    deadline,
+                    pending.collect_with(remaining),
+                )
+                .await
+                {
+                    Ok(Ok(response)) => response,
+                    _ if status == 429 => {
+                        return Ok(VoiceMovePatch::Limited {
+                            retry_after_ms: None,
+                        })
+                    }
+                    _ => return Ok(VoiceMovePatch::Unavailable),
                 };
                 if response.status == 429 {
-                    let retry = response
-                        .retry_after_header
-                        .as_deref()
-                        .and_then(|s| s.trim().parse::<f64>().ok())
-                        .filter(|s| s.is_finite() && *s >= 0.0)
-                        .unwrap_or(1.0)
-                        .ceil()
-                        .max(1.0) as u64;
-                    Ok(VoiceMovePatch::Limited {
-                        retry_after_secs: retry,
-                    })
+                    let retry_after_ms = voice_move::retry_delay_ms(
+                        response
+                            .retry_after_header
+                            .as_deref()
+                            .and_then(|s| s.parse().ok()),
+                        response.body_retry_after_secs(),
+                    );
+                    Ok(VoiceMovePatch::Limited { retry_after_ms })
                 } else {
-                    response.complete().await;
-                    Ok(VoiceMovePatch::Moved)
+                    match tokio::time::timeout_at(deadline, response.complete_confirmed()).await {
+                        Ok(Ok(())) => Ok(VoiceMovePatch::Moved),
+                        _ => Ok(VoiceMovePatch::Unavailable),
+                    }
                 }
             }
             _ => {
-                pending.settle_status().await;
+                let _ = tokio::time::timeout_at(deadline, pending.settle_status()).await;
                 Ok(VoiceMovePatch::Unavailable)
             }
         }
@@ -476,32 +449,105 @@ impl ActionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use two_bot_core::send_admission::{
+        AdmissionError, AdmissionFuture, AdmissionPermit, SendAdmission, SendCompletion,
+        SendCooldown, TokenKey,
+    };
+
+    use crate::strict_transport_fixture::{read_request as read_move_request, Admission};
+
+    // This deliberately stalled fake does not model durable fencing.
+    #[derive(Debug)]
+    struct FixtureAdmission {
+        key: TokenKey,
+        held: AtomicBool,
+    }
+    struct FixtureCompletion;
+
+    impl SendCompletion for FixtureCompletion {
+        fn complete(
+            self: Box<Self>,
+            _: Option<SendCooldown>,
+        ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    impl SendAdmission for FixtureAdmission {
+        fn token_key(&self) -> &TokenKey {
+            &self.key
+        }
+
+        fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+            Box::pin(async { panic!("voice must use strict admission") })
+        }
+
+        fn admit_strict(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+            Box::pin(async move {
+                if self.held.swap(true, Ordering::SeqCst) {
+                    return Err(AdmissionError::Blocked);
+                }
+                Ok(AdmissionPermit::new(Box::new(FixtureCompletion)))
+            })
+        }
+    }
+
+    fn fixture_executor_with_refusal(
+        address: std::net::SocketAddr,
+        refusal: Option<AdmissionError>,
+        stall: bool,
+    ) -> ActionExecutor {
+        let token = "fixture-bot-token";
+        let admission: Arc<dyn SendAdmission> = if stall {
+            Arc::new(FixtureAdmission {
+                key: TokenKey::for_bot_token(token).unwrap(),
+                held: AtomicBool::new(false),
+            })
+        } else {
+            Arc::new(Admission::new(
+                token,
+                Some(AdmissionError::Blocked),
+                refusal,
+            ))
+        };
+        ActionExecutor::with_admission(token.into(), Some(format!("http://{address}")), admission)
+            .unwrap()
+    }
+
+    fn fixture_executor(address: std::net::SocketAddr) -> ActionExecutor {
+        fixture_executor_with_refusal(address, None, false)
+    }
 
     async fn move_response(response: &'static [u8]) -> VoiceMovePatch {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        move_response_with_stall(response, false).await
+    }
+
+    async fn move_response_with_stall(response: &'static [u8], stall: bool) -> VoiceMovePatch {
+        use tokio::io::AsyncWriteExt;
         let _ = rustls::crypto::ring::default_provider().install_default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0; 1];
-            while !request.ends_with(b"}") {
-                stream.read_exact(&mut byte).await.unwrap();
-                request.push(byte[0]);
-                assert!(request.len() < 4096);
-            }
+            let request = read_move_request(&mut stream).await;
             let request = String::from_utf8_lossy(&request);
             assert!(request.starts_with("PATCH /api/v10/guilds/1/members/2 "));
             assert!(request.contains("\"channel_id\":\"3\""));
             stream.write_all(response).await.unwrap();
+            if stall {
+                let _ = wait.await;
+            }
         });
-        let executor = ActionExecutor::with_proxy(
-            "fixture-bot-token".into(),
-            Some(format!("http://{address}")),
-        )
-        .unwrap();
+        let executor = fixture_executor(address);
+        let started = tokio::time::Instant::now();
         let result = executor.move_voice_member("1", "2", "3").await.unwrap();
+        assert!(started.elapsed() < Duration::from_millis(VOICE_MOVE_TIMEOUT_MS + 1000));
+        let _ = release.send(());
         server.await.unwrap();
         result
     }
@@ -518,10 +564,142 @@ mod tests {
             (&b"HTTP/1.1 404 Not Found\r\nContent-Length: 10\r\n\r\n"[..], VoiceMovePatch::Stale),
             (&b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n"[..], VoiceMovePatch::Unavailable),
             (&b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n"[..], VoiceMovePatch::Unavailable),
-            (&b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1.2\r\nContent-Length: 10\r\n\r\n"[..], VoiceMovePatch::Limited { retry_after_secs: 2 }),
+            (&b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1.2\r\nContent-Length: 10\r\n\r\n"[..], VoiceMovePatch::Limited { retry_after_ms: Some(1200) }),
         ] {
             assert_eq!(move_response(response).await, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn move_rate_limit_uses_longest_timing_or_indefinite() {
+        assert_eq!(
+            move_response(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 17\r\n\r\n{\"retry_after\":3}").await,
+            VoiceMovePatch::Limited { retry_after_ms: Some(3000) }
+        );
+        assert_eq!(
+            move_response(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n").await,
+            VoiceMovePatch::Limited {
+                retry_after_ms: None
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn move_requests_share_the_paced_lane() {
+        use tokio::io::AsyncWriteExt;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_move_request(&mut stream).await;
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut executor = fixture_executor(address);
+        let (probe, mut admissions) = tokio::sync::mpsc::unbounded_channel();
+        Arc::get_mut(&mut executor.inner).unwrap().pacing_probe = Some(probe);
+        assert_eq!(
+            executor.move_voice_member("1", "2", "3").await.unwrap(),
+            VoiceMovePatch::Moved
+        );
+        assert_eq!(
+            executor.move_voice_member("1", "2", "3").await.unwrap(),
+            VoiceMovePatch::Moved
+        );
+        let first = admissions.recv().await.unwrap();
+        let second = admissions.recv().await.unwrap();
+        assert!(matches!(first.lane, super::super::PacingLane::Shared));
+        assert!(matches!(second.lane, super::super::PacingLane::Shared));
+        assert!(
+            second.at.duration_since(first.at)
+                >= Duration::from_millis(super::super::PACE_INTERVAL_MS)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_bodies_respect_deadline_and_header_verdicts() {
+        for (wire, expected) in [
+            (
+                &b"HTTP/1.1 400 Bad Request\r\nContent-Length: 10\r\n\r\n"[..],
+                VoiceMovePatch::Stale,
+            ),
+            (
+                &b"HTTP/1.1 403 Forbidden\r\nContent-Length: 10\r\n\r\n"[..],
+                VoiceMovePatch::Denied,
+            ),
+            (
+                &b"HTTP/1.1 404 Not Found\r\nContent-Length: 10\r\n\r\n"[..],
+                VoiceMovePatch::Stale,
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n"[..],
+                VoiceMovePatch::Unavailable,
+            ),
+            (
+                &b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 10\r\n\r\n"[..],
+                VoiceMovePatch::Limited {
+                    retry_after_ms: None,
+                },
+            ),
+        ] {
+            assert_eq!(move_response_with_stall(wire, true).await, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_admission_failures_are_typed_and_never_send() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for (refusal, expected) in [
+            (AdmissionError::Blocked, VoiceMoveNotSent::Blocked),
+            (AdmissionError::Storage, VoiceMoveNotSent::Storage),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let executor =
+                fixture_executor_with_refusal(listener.local_addr().unwrap(), Some(refusal), false);
+            assert_eq!(
+                executor.move_voice_member("1", "2", "3").await.unwrap(),
+                VoiceMovePatch::NotSent(expected)
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_settlement_preserves_definite_refusal_and_holds_admission() {
+        use tokio::io::AsyncWriteExt;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_move_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 10\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let executor = fixture_executor_with_refusal(address, None, true);
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            executor.move_voice_member("1", "2", "3").await.unwrap(),
+            VoiceMovePatch::Denied
+        );
+        assert!(started.elapsed() < Duration::from_millis(VOICE_MOVE_TIMEOUT_MS + 1000));
+        assert_eq!(
+            executor.move_voice_member("1", "2", "3").await.unwrap(),
+            VoiceMovePatch::NotSent(VoiceMoveNotSent::Blocked)
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

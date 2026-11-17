@@ -5,6 +5,7 @@ use crate::{ActionExecutor, DiscordError};
 use two_bot_core::send_admission::PgSendAdmission;
 use two_bot_testsupport::TestDatabase;
 
+mod strict_transport;
 mod uncertainty;
 
 async fn database() -> TestDatabase {
@@ -48,6 +49,73 @@ async fn reached_wire(mock: &MockDiscord) {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated agent-testdb or CI service"]
+async fn admission_voice_stalled_429_keeps_durable_fence_after_lease_expiry() {
+    use crate::executor::member::{VoiceMoveNotSent, VoiceMovePatch};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let db = database().await;
+    let second = db.independent_pool().await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0; 1];
+        while !request.ends_with(b"}") {
+            stream.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+            assert!(request.len() < 4096);
+        }
+        assert!(request.starts_with(b"PATCH /api/v10/guilds/1/members/2 "));
+        stream
+            .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 10\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = wait.await;
+        listener
+    });
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let gate = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
+    let action = ActionExecutor::with_admission(token(), Some(origin.clone()), gate).unwrap();
+    assert_eq!(
+        action.move_voice_member("1", "2", "3").await.unwrap(),
+        VoiceMovePatch::Limited {
+            retry_after_ms: None
+        }
+    );
+    let held: bool = sqlx::query_scalar(
+        "SELECT indefinite OR pending_settlement_generation IS NOT NULL FROM public.discord_send_admission",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(held);
+    sqlx::query("UPDATE public.discord_send_admission SET in_flight_since_ms = 0")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let restarted_gate = Arc::new(PgSendAdmission::new(second.clone(), &token()).unwrap());
+    let restarted = ActionExecutor::with_admission(token(), Some(origin), restarted_gate).unwrap();
+    assert_eq!(
+        restarted.move_voice_member("1", "2", "3").await.unwrap(),
+        VoiceMovePatch::NotSent(VoiceMoveNotSent::Blocked)
+    );
+    let _ = release.send(());
+    let listener = server.await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err()
+    );
+    drop(action);
+    drop(restarted);
+    second.close().await;
+    db.close().await.unwrap();
 }
 
 #[tokio::test]

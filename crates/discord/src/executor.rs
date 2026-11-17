@@ -473,6 +473,21 @@ impl std::fmt::Debug for HyperTransport {
     }
 }
 
+/// Failure before headers, retaining typed durable-admission provenance.
+#[derive(Debug, thiserror::Error)]
+pub enum StrictTransportError {
+    #[error(transparent)]
+    Admission(#[from] two_bot_core::send_admission::AdmissionError),
+    #[error("{0}")]
+    Transport(String),
+}
+
+impl From<String> for StrictTransportError {
+    fn from(error: String) -> Self {
+        Self::Transport(error)
+    }
+}
+
 impl HyperTransport {
     /// Build against real Discord (`https://discord.com`).
     pub fn new(token: String) -> Result<Self, String> {
@@ -568,6 +583,12 @@ impl HyperTransport {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_guard(mut self) -> Self {
+        self.guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+        self
+    }
+
     fn url(&self, path: &str) -> String {
         let scheme = if self.scheme_http { "http" } else { "https" };
         format!(
@@ -594,11 +615,35 @@ impl HyperTransport {
         request: &Request,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<PendingHeaders<'_>, String> {
+        self.send_request_headers_with_admission(request, deadline, false)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// One strict governed attempt through headers, preserving admission failures.
+    /// This seam does not retry or enable any caller.
+    pub async fn send_strict_request_headers(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<PendingHeaders<'_>, StrictTransportError> {
+        self.send_request_headers_with_admission(request, deadline, true)
+            .await
+    }
+
+    async fn send_request_headers_with_admission(
+        &self,
+        request: &Request,
+        deadline: Option<tokio::time::Instant>,
+        strict: bool,
+    ) -> Result<PendingHeaders<'_>, StrictTransportError> {
         if request
             .headers()
             .is_some_and(|headers| headers.contains_key(hyper::header::AUTHORIZATION))
         {
-            return Err("caller-supplied authorization is forbidden".to_owned());
+            return Err("caller-supplied authorization is forbidden"
+                .to_owned()
+                .into());
         }
         let method: http::Method = request
             .method()
@@ -653,16 +698,24 @@ impl HyperTransport {
         // A timed-out admit never resolved, so no permit exists to release;
         // it reports as a header stall so the caller spends one attempt.
         let permit = match &self.admission {
+            None if strict => {
+                return Err(two_bot_core::send_admission::AdmissionError::Configuration.into())
+            }
             // Constructor restricts ungoverned transport to loopback fixtures.
             None => None,
-            Some(admission) => match deadline {
-                None => Some(admission.admit().await.map_err(|e| e.to_string())?),
-                Some(at) => match tokio::time::timeout_at(at, admission.admit()).await {
-                    Ok(Ok(permit)) => Some(permit),
-                    Ok(Err(error)) => return Err(error.to_string()),
-                    Err(_) => return Err(HEADER_TIMEOUT_MESSAGE.to_owned()),
-                },
-            },
+            Some(admission) => {
+                let take = if strict {
+                    admission.admit_strict()
+                } else {
+                    admission.admit()
+                };
+                Some(match deadline {
+                    None => take.await?,
+                    Some(at) => tokio::time::timeout_at(at, take)
+                        .await
+                        .map_err(|_| HEADER_TIMEOUT_MESSAGE.to_owned())??,
+                })
+            }
         };
         let mut attempt = crate::executor_metrics::Attempt::new(request);
         // Bound the header wait inside the permit scope so a stalled read
@@ -675,21 +728,24 @@ impl HyperTransport {
         // held by dropping it uncompleted (uncertain).
         let request_fut = self.inner.request(hyper_req);
         let response = match deadline {
-            None => request_fut
-                .await
-                .map_err(|error| format!("transport: {error}"))?,
-            Some(at) => match tokio::time::timeout_at(at, request_fut).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => return Err(format!("transport: {error}")),
-                Err(_) => {
-                    if request.method() == Method::Get {
-                        if let Some(permit) = permit {
-                            complete_early_release(permit, "header_timeout").await;
-                        }
+            None => Ok(request_fut.await),
+            Some(at) => tokio::time::timeout_at(at, request_fut).await,
+        };
+        let response = match response {
+            Ok(Ok(response)) => response,
+            failure => {
+                let (message, reason) = match failure {
+                    Ok(Err(error)) => (format!("transport: {error}"), "transport_error"),
+                    Err(_) => (HEADER_TIMEOUT_MESSAGE.to_owned(), "header_timeout"),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                if request.method() == Method::Get {
+                    if let Some(permit) = permit {
+                        complete_early_release(permit, reason).await;
                     }
-                    return Err(HEADER_TIMEOUT_MESSAGE.to_owned());
                 }
-            },
+                return Err(message.into());
+            }
         };
         let status = response.status().as_u16();
         let mut accounting = crate::ratelimit_guard::ResponseAccounting::new(
@@ -814,15 +870,15 @@ impl HyperTransport {
 /// Headers-received half of one governed wire attempt. The status is known;
 /// the body is not yet collected. The caller either collects the bounded body
 /// ([`PendingHeaders::collect`]) or settles a status-only verdict
-/// ([`PendingHeaders::settle_status`]) and drops the rest unread. Dropping
+/// (`PendingHeaders::settle_status`) and drops the rest unread. Dropping
 /// without settling commits only the header-anchored global timing, never
 /// body timing.
 ///
-/// [`crate::ratelimit_guard::ResponseAccounting`] settles exactly once:
+/// `ResponseAccounting` settles exactly once:
 /// either in `collect`/`settle_status` (with whatever evidence is available)
 /// or in `Drop` (header-anchored fallback). Either way a pending header
 /// restriction resolves to its header timing without opening admission early.
-struct PendingHeaders<'a> {
+pub struct PendingHeaders<'a> {
     response: Option<hyper::Response<hyper::body::Incoming>>,
     accounting: Option<crate::ratelimit_guard::ResponseAccounting<'a>>,
     complete_on_receipt: bool,
@@ -834,7 +890,7 @@ struct PendingHeaders<'a> {
 impl PendingHeaders<'_> {
     /// Collect the bounded body and settle guard/admission accounting exactly
     /// as the pre-split `send_request` always has.
-    async fn collect(self) -> Result<(RawResponse, bool), String> {
+    pub async fn collect(self) -> Result<(RawResponse, bool), String> {
         self.collect_with(Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS))
             .await
     }
@@ -907,7 +963,7 @@ impl PendingHeaders<'_> {
     /// 204 is the singular role-mutation success: it releases admission here
     /// because `complete_on_receipt` (GET + rejection/rate-limit statuses)
     /// never fires for a PUT/DELETE success, and no caller completes it later.
-    async fn settle_status(mut self) -> u16 {
+    pub(crate) async fn settle_status(mut self) -> u16 {
         let status = self.status;
         let mut res = RawResponse {
             status,
@@ -4690,6 +4746,117 @@ mod tests {
 
     fn never_send_admission(token: &str) -> Arc<dyn SendAdmission> {
         Arc::new(NeverSendAdmission(TokenKey::for_bot_token(token).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn strict_transport_preserves_pre_wire_refusals() {
+        use crate::strict_transport_fixture::{loopback, Admission};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = "fixture-strict-refusal";
+        let (listener, origin) = loopback().await;
+        let transport = HyperTransport::with_admission(
+            token.to_owned(),
+            Some(origin),
+            Arc::new(Admission::new(
+                token,
+                Some(AdmissionError::Blocked),
+                Some(AdmissionError::Storage),
+            )),
+        )
+        .unwrap();
+        let request = Request::from_route(&Route::GetCurrentUser);
+        for deadline in [
+            None,
+            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+        ] {
+            assert!(matches!(
+                transport
+                    .send_strict_request_headers(&request, deadline)
+                    .await,
+                Err(StrictTransportError::Admission(AdmissionError::Storage))
+            ));
+            assert_eq!(
+                transport
+                    .send_request_headers(&request, deadline)
+                    .await
+                    .err()
+                    .unwrap(),
+                AdmissionError::Blocked.to_string()
+            );
+        }
+
+        let ungoverned = HyperTransport::build(
+            token.to_owned(),
+            Some("http://127.0.0.1:1".to_owned()),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            ungoverned.send_strict_request_headers(&request, None).await,
+            Err(StrictTransportError::Admission(
+                AdmissionError::Configuration
+            ))
+        ));
+        let unauthorized = twilight_http::request::RequestBuilder::raw(
+            request.method(),
+            request.path().to_owned(),
+        )
+        .headers(std::iter::once((
+            hyper::header::AUTHORIZATION,
+            hyper::header::HeaderValue::from_static("fixture"),
+        )))
+        .build()
+        .unwrap();
+        assert!(matches!(
+            transport.send_strict_request_headers(&unauthorized, None).await,
+            Err(StrictTransportError::Transport(message)) if message == "caller-supplied authorization is forbidden"
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_transport_fixture_reads_and_completes() {
+        use crate::strict_transport_fixture::{loopback, read_request, Admission};
+        use tokio::io::AsyncWriteExt;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = "fixture-strict-success";
+        let (listener, origin) = loopback().await;
+        let gate = Arc::new(Admission::new(token, None, None));
+        let completed = gate.completed.clone();
+        let transport =
+            HyperTransport::with_admission(token.to_owned(), Some(origin), gate).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let request = read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+            request
+        });
+        let request = Request::from_route(&Route::GetCurrentUser);
+        let pending = transport
+            .send_strict_request_headers(
+                &request,
+                Some(tokio::time::Instant::now() + Duration::from_secs(2)),
+            )
+            .await
+            .unwrap();
+        let (response, _) = pending.collect().await.unwrap();
+        assert_eq!(response.status, 200);
+        assert!(String::from_utf8(server.await.unwrap())
+            .unwrap()
+            .starts_with("GET /api/v10/users/@me "));
+        assert_eq!(*completed.lock().unwrap(), vec![None]);
     }
 
     #[test]
