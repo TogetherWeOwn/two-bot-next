@@ -55,7 +55,7 @@ jobs:
     if: ${{ false && github.ref == 'refs/heads/main' && needs.staging-window.result == 'success' }}
     permissions:
       contents: read
-    uses: ./.github/workflows/voice-synthetic.yml
+    uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
     with:
       artifact_invocation: first
       staging_use_expires_at: ${{ needs.staging-window.outputs.expires_at }}
