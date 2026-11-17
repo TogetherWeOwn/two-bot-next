@@ -92,7 +92,6 @@ async fn admission_strict_transport_429_stalled_settlement_fences_past_lease() {
     let pending = transport
         .send_strict_request_headers(&strict_request(), deadline())
         .await
-        .ok()
         .expect("strict claim must be armed and headers received");
     assert_eq!(mock.count(), 1);
     // Headers are in but settlement has not run: the exact claim is pending.
@@ -132,7 +131,6 @@ async fn admission_strict_transport_429_stalled_body_stays_fenced_until_collect(
     let pending = transport
         .send_strict_request_headers(&strict_request(), deadline())
         .await
-        .ok()
         .expect("strict claim must be armed and headers received");
     let armed = lane(&db).await;
     assert_eq!(armed.pending, Some(armed.generation));

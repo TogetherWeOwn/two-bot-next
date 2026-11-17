@@ -4739,6 +4739,79 @@ mod tests {
         Arc::new(NeverSendAdmission(TokenKey::for_bot_token(token).unwrap()))
     }
 
+    #[tokio::test]
+    async fn strict_transport_preserves_pre_wire_refusals() {
+        #[derive(Debug)]
+        struct DistinctAdmission(TokenKey);
+        impl SendAdmission for DistinctAdmission {
+            fn token_key(&self) -> &TokenKey {
+                &self.0
+            }
+            fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+                Box::pin(async { Err(AdmissionError::Blocked) })
+            }
+            fn admit_strict(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+                Box::pin(async { Err(AdmissionError::Storage) })
+            }
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = "fixture-strict-refusal";
+        let transport = HyperTransport::with_admission(
+            token.to_owned(),
+            Some("http://127.0.0.1:1".to_owned()),
+            Arc::new(DistinctAdmission(TokenKey::for_bot_token(token).unwrap())),
+        )
+        .unwrap();
+        let request = Request::from_route(&Route::GetCurrentUser);
+        for deadline in [
+            None,
+            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
+        ] {
+            assert!(matches!(
+                transport
+                    .send_strict_request_headers(&request, deadline)
+                    .await,
+                Err(StrictTransportError::Admission(AdmissionError::Storage))
+            ));
+            assert_eq!(
+                transport
+                    .send_request_headers(&request, deadline)
+                    .await
+                    .err()
+                    .unwrap(),
+                AdmissionError::Blocked.to_string()
+            );
+        }
+
+        let ungoverned = HyperTransport::build(
+            token.to_owned(),
+            Some("http://127.0.0.1:1".to_owned()),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            ungoverned.send_strict_request_headers(&request, None).await,
+            Err(StrictTransportError::Admission(
+                AdmissionError::Configuration
+            ))
+        ));
+        let unauthorized = twilight_http::request::RequestBuilder::raw(
+            request.method(),
+            request.path().to_owned(),
+        )
+        .headers([(
+            hyper::header::AUTHORIZATION,
+            hyper::header::HeaderValue::from_static("fixture"),
+        )])
+        .build()
+        .unwrap();
+        assert!(matches!(
+            transport.send_strict_request_headers(&unauthorized, None).await,
+            Err(StrictTransportError::Transport(message)) if message == "caller-supplied authorization is forbidden"
+        ));
+    }
+
     #[test]
     fn only_the_canonical_blocked_detail_is_retryable() {
         assert!(
