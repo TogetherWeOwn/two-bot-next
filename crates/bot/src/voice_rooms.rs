@@ -14617,6 +14617,9 @@ where
                 | VoiceCommand::Invite
                 | VoiceCommand::Reclaim
                 | VoiceCommand::Transfer { .. }
+                | VoiceCommand::Private
+                | VoiceCommand::Public
+                | VoiceCommand::RoomAccessInspect(_)
         ) {
             if let Some(text) = denial.data.as_ref().and_then(|data| data.content.clone()) {
                 reply(limit::limit_response(text, kind)).await;
@@ -15261,14 +15264,15 @@ where
                 (PrivacyCommand::Public, "public")
             };
             let Some(actor_id) = invoker_member_id(interaction) else {
-                reply(ephemeral_response(&format!(
-                    "I couldn't tell who invoked /{name} — try again."
-                )))
+                reply(limit::limit_response(
+                    format!("I couldn't tell who invoked /{name} — try again."),
+                    EmbedKind::Danger,
+                ))
                 .await;
                 return true;
             };
-            let text = runtime
-                .run_privacy(
+            let (text, kind) = runtime
+                .run_privacy_classified(
                     guild_id,
                     actor_id,
                     member.is_admin,
@@ -15279,34 +15283,37 @@ where
                 .unwrap_or_else(|| {
                     // A known worker that never answered is a transient
                     // failure, not a cold cache.
-                    if runtime.has_actor(guild_id) {
+                    let text = if runtime.has_actor(guild_id) {
                         WORKER_LOST_REPLY.to_owned()
                     } else {
                         "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
-                    }
+                    };
+                    (text, EmbedKind::Warn)
                 });
-            reply(ephemeral_response(&text)).await;
+            reply(limit::limit_response(text, kind)).await;
             true
         }
         VoiceCommand::RoomAccessInspect(page) => {
             let Some(actor_id) = invoker_member_id(interaction) else {
-                reply(ephemeral_response(
-                    "I couldn't tell who invoked /room-access-inspect — try again.",
+                reply(limit::limit_response(
+                    "I couldn't tell who invoked /room-access-inspect — try again.".to_owned(),
+                    EmbedKind::Danger,
                 ))
                 .await;
                 return true;
             };
-            let text = runtime
-                .run_room_access(guild_id, actor_id, member.is_admin, page)
+            let (text, kind) = runtime
+                .run_room_access_classified(guild_id, actor_id, member.is_admin, page)
                 .await
                 .unwrap_or_else(|| {
-                    if runtime.has_actor(guild_id) {
+                    let text = if runtime.has_actor(guild_id) {
                         WORKER_LOST_REPLY.to_owned()
                     } else {
                         "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
-                    }
+                    };
+                    (text, EmbedKind::Warn)
                 });
-            reply(ephemeral_response(&text)).await;
+            reply(limit::limit_response(text, kind)).await;
             true
         }
         VoiceCommand::Export => {
@@ -15757,6 +15764,9 @@ fn limit_completion_embed<'a>(
                 | VoiceCommand::MyRoom
                 | VoiceCommand::Reclaim
                 | VoiceCommand::Transfer { .. }
+                | VoiceCommand::Private
+                | VoiceCommand::Public
+                | VoiceCommand::RoomAccessInspect(_)
         )
     ) {
         return None;
