@@ -1,14 +1,16 @@
-//! Fail-closed reconstruction of rate-limited automod preview replies.
+//! Fail-closed replay of automod preview rows with no filter or exemption.
 //!
-//! Other persisted outcomes remain unavailable until their replay support and
-//! safety tests are restored. This helper must not be wired to a handler yet.
+//! Only rate-limited, no-match, and partial outcomes are supported.
+//! This helper must not be wired to a handler yet.
 
-use crate::automod_preview_report::PREVIEW_RATE_LIMITED_REPLY;
+use crate::automod_preview::{PreviewResult, PreviewVerdict};
+use crate::automod_preview_report::{render_preview_reply, PREVIEW_RATE_LIMITED_REPLY};
 
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedPreviewReason<'a> {
     filter: &'a str,
     exemption: &'a str,
+    dry_run: bool,
 }
 
 fn parse_preview_reason(reason: &str) -> Option<ParsedPreviewReason<'_>> {
@@ -17,36 +19,56 @@ fn parse_preview_reason(reason: &str) -> Option<ParsedPreviewReason<'_>> {
     let exemption = parts.next()?.strip_prefix("exemption=")?;
     let mode = parts.next()?.strip_prefix("mode=")?;
     let len = parts.next()?.strip_prefix("len=")?;
-    if parts.next().is_some()
-        || !matches!(mode, "dry_run" | "enforce")
-        || !matches!(len, "0_50" | "51_500" | "501_2000")
-    {
+    if parts.next().is_some() || !matches!(len, "0_50" | "51_500" | "501_2000") {
         return None;
     }
-    Some(ParsedPreviewReason { filter, exemption })
+    let dry_run = match mode {
+        "dry_run" => true,
+        "enforce" => false,
+        _ => return None,
+    };
+    Some(ParsedPreviewReason {
+        filter,
+        exemption,
+        dry_run,
+    })
 }
 
-/// Reconstruct a rate-limited reply from a committed row without evaluation.
-/// All other outcomes and invalid fields fail closed as unavailable.
+/// Reconstruct a supported reply from a committed row without evaluation.
+/// `created_at` is the pre-rendered stored currency timestamp, not a new clock
+/// reading. Unsupported outcomes, invalid reasons, and empty timestamps fail closed.
 #[must_use]
 pub fn replay_preview_reply(
     outcome: &str,
     reason: Option<&str>,
     created_at: &str,
 ) -> Option<String> {
-    if created_at.is_empty() || outcome != "rate_limited" {
+    if created_at.is_empty() {
         return None;
     }
     let parsed = parse_preview_reason(reason?)?;
     if parsed.filter != "none" || parsed.exemption != "none" {
         return None;
     }
-    Some(PREVIEW_RATE_LIMITED_REPLY.to_owned())
+    let verdict = match outcome {
+        "rate_limited" => return Some(PREVIEW_RATE_LIMITED_REPLY.to_owned()),
+        "no_match" => PreviewVerdict {
+            result: PreviewResult::NoMatch,
+            filter: None,
+            knobs: &[],
+            exemption: None,
+            dry_run: parsed.dry_run,
+        },
+        "partial" => PreviewVerdict::partial(parsed.dry_run),
+        _ => return None,
+    };
+    Some(render_preview_reply(&verdict, created_at))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::automod_preview_report::{audit_reason_for_verdict, preview_audit_outcome};
 
     #[test]
     fn rate_limit_replays_each_emitted_mode_and_bucket() {
@@ -93,10 +115,65 @@ mod tests {
     }
 
     #[test]
+    fn no_match_and_partial_replay_the_original_reply() {
+        let created_at = "2026-11-02T08:00:00.123Z";
+        for dry_run in [true, false] {
+            let no_match = PreviewVerdict {
+                result: PreviewResult::NoMatch,
+                filter: None,
+                knobs: &[],
+                exemption: None,
+                dry_run,
+            };
+            for verdict in [no_match, PreviewVerdict::partial(dry_run)] {
+                let outcome = preview_audit_outcome(&verdict);
+                for len in [50, 51, 501] {
+                    let reason = audit_reason_for_verdict(&verdict, len);
+                    assert_eq!(
+                        replay_preview_reply(outcome, Some(&reason), created_at),
+                        Some(render_preview_reply(&verdict, created_at)),
+                        "{outcome}: {reason}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_contradictory_verdict_rows_fail_closed() {
+        let valid = Some("filter=none;exemption=none;mode=dry_run;len=0_50");
+        for outcome in ["no_match", "partial"] {
+            for reason in [
+                None,
+                Some("filter=none;exemption=none;mode=dry_run"),
+                Some("filter=none;exemption=none;mode=live;len=0_50"),
+                Some("filter=none;exemption=none;mode=dry_run;len=unexpected"),
+                Some("filter=bad_words;exemption=none;mode=dry_run;len=0_50"),
+                Some("filter=none;exemption=bypass_role;mode=dry_run;len=0_50"),
+            ] {
+                assert_eq!(replay_preview_reply(outcome, reason, "t"), None);
+            }
+            assert_eq!(replay_preview_reply(outcome, valid, ""), None);
+        }
+    }
+
+    #[test]
     fn unsupported_outcomes_fail_closed() {
         let reason = Some("filter=none;exemption=none;mode=dry_run;len=0_50");
-        for outcome in ["matched", "no_match", "exempt", "partial", "bogus", ""] {
+        for outcome in ["matched", "exempt", "bogus", ""] {
             assert_eq!(replay_preview_reply(outcome, reason, "t"), None);
+        }
+        for (outcome, reason) in [
+            (
+                "matched",
+                "filter=bad_words;exemption=none;mode=dry_run;len=0_50",
+            ),
+            (
+                "exempt",
+                "filter=none;exemption=bypass_role;mode=dry_run;len=0_50",
+            ),
+        ] {
+            assert_eq!(replay_preview_reply(outcome, Some(reason), "t"), None);
         }
     }
 }
