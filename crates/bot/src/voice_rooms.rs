@@ -4349,6 +4349,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
     /// `reconcile` succession pass; a retried interaction replays safely
     /// (reclaim is idempotent, a former owner's transfer replay fails
     /// authorization), so no interaction-ID dedupe is needed here.
+    #[cfg(test)]
     fn apply_ownership(
         &mut self,
         actor_id: Snowflake,
@@ -4553,16 +4554,16 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         loop {
             if let Ok(outcome) = staged.waiter.try_recv() {
                 let StagedOwnershipReply { reply, success, .. } = staged;
-                let _ = reply.send(match outcome {
+                reply.send(match outcome {
                     OwnershipCommit::Committed => success,
-                    OwnershipCommit::Pending => OWNERSHIP_FINALIZING.to_owned(),
+                    OwnershipCommit::Pending => ownership_finalizing_reply(),
                 });
                 self.ownership_commit_deadline = None;
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
                 let StagedOwnershipReply { reply, .. } = staged;
-                let _ = reply.send(OWNERSHIP_FINALIZING.to_owned());
+                reply.send(ownership_finalizing_reply());
                 // Dropping the waiter keeps the attempt's late commit
                 // silent; the handoff itself stays queued for retry.
                 self.ownership_commit_deadline = None;
@@ -4587,7 +4588,7 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 // held write finishes unbounded instead of timing out
                 // against a budget nobody is waiting on.
                 drop(waiter);
-                let _ = reply.send(OWNERSHIP_FINALIZING.to_owned());
+                reply.send(ownership_finalizing_reply());
                 // The reply is out; the attempt still owns its queued
                 // action, so run it to completion instead of cancelling.
                 // Awaiting consumes the heap-pinned pump, ending its
@@ -7937,6 +7938,7 @@ enum ActorCommand {
         is_admin: bool,
         command: OwnershipCommand,
         reply: oneshot::Sender<String>,
+        kind: Option<oneshot::Sender<two_bot_discord::brand::EmbedKind>>,
     },
     /// V3 `/limit` and `/unlimit`: the worker resolves the caller's room,
     /// decides, queues the Discord write and replies with the text (or a
@@ -8376,14 +8378,35 @@ enum OwnershipCommit {
     Pending,
 }
 
+fn ownership_finalizing_reply() -> (String, two_bot_discord::brand::EmbedKind) {
+    (
+        OWNERSHIP_FINALIZING.to_owned(),
+        two_bot_discord::brand::EmbedKind::Warn,
+    )
+}
+
+struct OwnershipReply {
+    text: oneshot::Sender<String>,
+    kind: Option<oneshot::Sender<two_bot_discord::brand::EmbedKind>>,
+}
+
+impl OwnershipReply {
+    fn send(self, (text, kind): (String, two_bot_discord::brand::EmbedKind)) {
+        if let Some(reply) = self.kind {
+            let _ = reply.send(kind);
+        }
+        let _ = self.text.send(text);
+    }
+}
+
 /// An `Ownership` command parked while its commit attempt runs.
 struct StagedOwnershipReply {
-    /// Where the final text goes, exactly once.
-    reply: oneshot::Sender<String>,
+    /// Where the final reply goes, exactly once.
+    reply: OwnershipReply,
     /// Fires on the first commit attempt for the handoff's room.
     waiter: oneshot::Receiver<OwnershipCommit>,
-    /// Success text, sent only when the commit confirms.
-    success: String,
+    /// Success response, sent only when the commit confirms.
+    success: (String, two_bot_discord::brand::EmbedKind),
 }
 
 pub type KickReply = Result<VoteKickUpdate, KickRefusal>;
@@ -8968,12 +8991,40 @@ where
                 is_admin,
                 command,
                 reply,
+                kind: None,
             })
             .ok()?;
         tokio::time::timeout(WORKER_ACK_WAIT, inbox)
             .await
             .ok()?
             .ok()
+    }
+
+    async fn run_ownership_classified(
+        &self,
+        guild: Snowflake,
+        actor_id: Snowflake,
+        is_admin: bool,
+        command: OwnershipCommand,
+    ) -> Option<(String, two_bot_discord::brand::EmbedKind)> {
+        let actor = self.live_actor(guild)?;
+        let (reply, inbox) = oneshot::channel();
+        let (kind, kind_inbox) = oneshot::channel();
+        actor
+            .tx
+            .send(ActorCommand::Ownership {
+                actor_id,
+                is_admin,
+                command,
+                reply,
+                kind: Some(kind),
+            })
+            .ok()?;
+        tokio::time::timeout(WORKER_ACK_WAIT, async {
+            Some((inbox.await.ok()?, kind_inbox.await.ok()?))
+        })
+        .await
+        .ok()?
     }
 
     /// Run one V3 owner command (`/private`, `/public`) on the live worker
@@ -10626,8 +10677,10 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             is_admin,
             command,
             reply,
+            kind,
         } => {
-            let text = worker.apply_ownership(actor_id, is_admin, command);
+            let result = worker.apply_ownership_classified(actor_id, is_admin, command);
+            let reply = OwnershipReply { text: reply, kind };
             // An accepted handoff stages its reply on the commit: the actor
             // loop drives it right after this dispatch. Anything else
             // (refusal, halt, cold worker) answers immediately.
@@ -10636,12 +10689,10 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
                     worker.staged_ownership_reply = Some(StagedOwnershipReply {
                         reply,
                         waiter,
-                        success: text,
+                        success: result,
                     });
                 }
-                None => {
-                    let _ = reply.send(text);
-                }
+                None => reply.send(result),
             }
         }
         ActorCommand::Limit {
@@ -15019,8 +15070,8 @@ where
                 .await;
                 return true;
             };
-            let text = runtime
-                .run_ownership(
+            let (text, _kind) = runtime
+                .run_ownership_classified(
                     guild_id,
                     actor_id,
                     member.is_admin,
@@ -15031,9 +15082,16 @@ where
                     // A known worker that never answered is a transient
                     // failure, not a cold cache.
                     if runtime.has_actor(guild_id) {
-                        WORKER_LOST_REPLY.to_owned()
+                        (
+                            WORKER_LOST_REPLY.to_owned(),
+                            two_bot_discord::brand::EmbedKind::Danger,
+                        )
                     } else {
-                        "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                        (
+                            "The voice worker isn't warmed up yet — try again in a moment."
+                                .to_owned(),
+                            two_bot_discord::brand::EmbedKind::Warn,
+                        )
                     }
                 });
             reply(ephemeral_response(&text)).await;
@@ -15056,8 +15114,8 @@ where
                 .await;
                 return true;
             }
-            let text = runtime
-                .run_ownership(
+            let (text, _kind) = runtime
+                .run_ownership_classified(
                     guild_id,
                     actor_id,
                     member.is_admin,
@@ -15068,9 +15126,16 @@ where
                     // A known worker that never answered is a transient
                     // failure, not a cold cache.
                     if runtime.has_actor(guild_id) {
-                        WORKER_LOST_REPLY.to_owned()
+                        (
+                            WORKER_LOST_REPLY.to_owned(),
+                            two_bot_discord::brand::EmbedKind::Danger,
+                        )
                     } else {
-                        "The voice worker isn't warmed up yet — try again in a moment.".to_owned()
+                        (
+                            "The voice worker isn't warmed up yet — try again in a moment."
+                                .to_owned(),
+                            two_bot_discord::brand::EmbedKind::Warn,
+                        )
                     }
                 });
             reply(ephemeral_response(&text)).await;
