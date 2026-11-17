@@ -10,6 +10,10 @@ const RUN_RE = /^[1-9][0-9]{0,18}$/;
 const ATTEMPT_RE = /^[1-9][0-9]{0,5}$/;
 const INCARNATION_RE = /^[0-9a-f]{32}$/;
 const UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+const RECEIPT_KEYS = [
+  "schema", "available", "code", "runId", "runAttempt", "capturedAt", "sha",
+  "deploymentId", "expiresAt", "restTotal", "rest5xx", "incarnation", "results",
+];
 export class MeasurementError extends Error {
   constructor(code) {
     super(code);
@@ -97,5 +101,67 @@ export function buildReceipt({ samples, metadata, now = () => new Date() }) {
     rest5xx: counters.rest5xx,
     incarnation: counters.incarnation,
     results,
+  };
+}
+
+/** Re-validate a persisted receipt, refusing unexpected or inconsistent data. */
+export function validateReceipt(receipt) {
+  if (receipt === null || typeof receipt !== "object" || Array.isArray(receipt)) fail("receipt_invalid");
+  const keys = Object.keys(receipt);
+  if (keys.length !== RECEIPT_KEYS.length || !RECEIPT_KEYS.every((k) => keys.includes(k))) fail("receipt_invalid");
+  if (receipt.schema !== SCHEMA) fail("receipt_invalid");
+  if (receipt.available !== true || receipt.code !== "captured") fail("receipt_unavailable");
+  validateMetadata(receipt);
+  if (utcMs(receipt.capturedAt) === null) fail("receipt_invalid");
+  if (!isCount(receipt.restTotal) || !isCount(receipt.rest5xx)) fail("receipt_invalid");
+  if (typeof receipt.incarnation !== "string" || !INCARNATION_RE.test(receipt.incarnation)
+    || receipt.incarnation === "0".repeat(32)) fail("identity_missing");
+  const r = receipt.results;
+  if (r === null || typeof r !== "object" || Array.isArray(r)) fail("receipt_invalid");
+  const labels = Object.keys(r);
+  if (labels.length === 0 || labels.length > MAX_LABELS) fail("receipt_invalid");
+  let sum = 0;
+  for (const label of labels) {
+    if (!LABEL_RE.test(label) || !isCount(r[label])) fail("receipt_invalid");
+    sum += r[label];
+    if (!isCount(sum)) fail("receipt_invalid");
+  }
+  if (sum !== receipt.restTotal || (r["5xx"] ?? 0) !== receipt.rest5xx) fail("counter_sum_mismatch");
+  return receipt;
+}
+
+/** Compare same-grant, same-process receipts without accepting resets or expiry. */
+export function compareReceipts(beforeRaw, afterRaw, { now = () => new Date() } = {}) {
+  const before = validateReceipt(beforeRaw);
+  const after = validateReceipt(afterRaw);
+  if (before.runId !== after.runId || before.runAttempt !== after.runAttempt
+    || before.sha !== after.sha || before.deploymentId !== after.deploymentId || before.expiresAt !== after.expiresAt) {
+    fail("metadata_changed");
+  }
+  if (before.incarnation !== after.incarnation) fail("incarnation_changed");
+  const expiryMs = utcMs(after.expiresAt);
+  if (utcMs(before.capturedAt) >= expiryMs || utcMs(after.capturedAt) >= expiryMs) fail("grant_expired");
+  const nowMs = now().getTime();
+  if (!Number.isFinite(nowMs)) fail("clock_invalid");
+  if (nowMs >= expiryMs) fail("grant_expired");
+  if (utcMs(after.capturedAt) < utcMs(before.capturedAt) || utcMs(after.capturedAt) > nowMs) fail("time_regressed");
+  if (after.restTotal < before.restTotal || after.rest5xx < before.rest5xx) fail("counter_decreased");
+  const labels = [...new Set([...Object.keys(before.results), ...Object.keys(after.results)])].sort();
+  const deltas = Object.create(null);
+  for (const label of labels) {
+    const was = Object.hasOwn(before.results, label) ? before.results[label] : 0;
+    const is = Object.hasOwn(after.results, label) ? after.results[label] : 0;
+    if (is < was) fail("counter_decreased");
+    deltas[label] = is - was;
+  }
+  return {
+    schema: SCHEMA, available: true, code: "compared",
+    sha: after.sha, deploymentId: after.deploymentId, expiresAt: after.expiresAt,
+    incarnation: after.incarnation,
+    before: { runId: before.runId, runAttempt: before.runAttempt, capturedAt: before.capturedAt },
+    after: { runId: after.runId, runAttempt: after.runAttempt, capturedAt: after.capturedAt },
+    restTotalDelta: after.restTotal - before.restTotal,
+    rest5xxDelta: after.rest5xx - before.rest5xx,
+    resultDeltas: Object.fromEntries(Object.entries(deltas)),
   };
 }
