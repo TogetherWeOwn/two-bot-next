@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -37,8 +37,13 @@ test('refuses invalid input, production, missing token, auth and malformed metri
     let calls = 0;
     const attempt = (url, environment, response) => runCli(['capture', '--metadata', meta, '--metrics-url', url, '--out', out], environment, { fetchImpl: async () => { calls++; return response; }, retrySleepSeconds: 0 });
     assert.equal(await attempt(env.PRODUCTION_URL, env, new Response(body)), 1);
+    for (const production of ['', 'not-a-url', 'http://production.example', 'https://production.example/path', env.STAGING_URL]) {
+      assert.equal(await attempt(env.STAGING_URL, { ...env, PRODUCTION_URL: production }, new Response(body)), 1);
+    }
+    assert.equal(await attempt(env.STAGING_URL, { ...env, PRODUCTION_WORKER_URL: 'invalid' }, new Response(body)), 1);
     assert.equal(await attempt(env.STAGING_URL, { ...env, METRICS_SCRAPE_TOKEN: '' }, new Response(body)), 1);
     assert.equal(calls, 0);
+    assert.equal(existsSync(out), false);
     assert.equal(await attempt(env.STAGING_URL, env, new Response('secret response', { status: 401 })), 1);
     assert.equal(await attempt(env.STAGING_URL, env, new Response('not metrics')), 1);
     writeFileSync(meta, JSON.stringify({ ...metadata, expiresAt: '2000-01-01T00:00:00Z' }));
