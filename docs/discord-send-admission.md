@@ -157,6 +157,13 @@ explicitly authorized, all-consumer-fenced reconciliation with effect and
 cooldown evidence; neither startup nor time alone clears the marker. This core
 capability does not enable or wire a new sender.
 
+If a strict claim is acknowledged after the attempt deadline, the transport
+refuses before starting the request and leaves the claim armed. The opt-in
+response observer sees status, retry timing from headers and any collected body
+before durable completion. Observed evidence does not confirm settlement: the
+same absolute deadline bounds completion and unconfirmed attempts are not
+retried. Ordinary collection and automatic settlement remain unchanged.
+
 An ordinary held lane carries a 60 s self-heal lease (`in_flight_since_ms`, migration
 0419, constant `IN_FLIGHT_LEASE_MS`). The next `admit` past the lease reclaims
 the lane with a fresh generation, so the dead holder's late completion lands
