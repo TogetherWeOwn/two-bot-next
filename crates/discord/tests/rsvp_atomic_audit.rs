@@ -43,7 +43,7 @@ fn router() -> InteractionRouter {
 
 fn rsvp(id: u64, status: &str) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
+        "application_id": "1111", "attachment_size_limit": 10485760, "authorizing_integration_owners": {"0": GUILD},
         "id": id.to_string(), "token": "mock-rsvp-token", "type": 2,
         "version": 1, "guild_id": GUILD,
         "member": {"permissions": "0", "roles": [],
