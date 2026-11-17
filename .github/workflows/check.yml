@@ -3521,6 +3521,17 @@ jobs:
         run: npm audit --audit-level=high --include=dev --json
       - run: npm ci
         if: needs.job-inputs.outputs.worker != 'false'
+      - name: Install Cosign for Wrangler provenance
+        if: needs.job-inputs.outputs.worker != 'false'
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.1
+      - name: Qualify nested Wrangler runtime and provenance
+        if: needs.job-inputs.outputs.worker != 'false'
+        run: |
+          node --test scripts/qualification-baseline.test.mjs
+          node scripts/qualify-provenance.mjs
+          node scripts/qualify-nested-runtime.mjs
       - run: npm run typecheck
         if: needs.job-inputs.outputs.worker != 'false'
       - run: npm test
