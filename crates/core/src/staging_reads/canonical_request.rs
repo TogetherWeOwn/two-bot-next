@@ -367,8 +367,8 @@ mod tests {
                 ),
                 ("\"owner_epoch\":\"1\"", "\"owner_epoch\":\"0\""),
                 (
-                    "\"acquired_at_ms\":\"1794855600000\"",
-                    "\"acquired_at_ms\":\"9007199254740992\"",
+                    "\"expires_at_ms\":\"1794858000000\"",
+                    "\"expires_at_ms\":\"9007199254740992\"",
                 ),
                 ("\"build_id\":\"99-2\"", "\"build_id\":\"unknown\""),
                 (
@@ -379,6 +379,40 @@ mod tests {
             for (from, to) in common {
                 let invalid = valid.replacen(from, to, 1);
                 assert_ne!(invalid, valid, "missing mutation target: {from}");
+                assert!(decode_request(invalid.as_bytes()).is_none(), "{invalid}");
+            }
+            for (first, second, old, new) in [
+                (
+                    "caller_run_id",
+                    "lifecycle_run_id",
+                    "100",
+                    "123456789012345678901",
+                ),
+                ("caller_run_attempt", "lifecycle_run_attempt", "1", "0"),
+                (
+                    "caller_run_attempt",
+                    "lifecycle_run_attempt",
+                    "1",
+                    "9007199254740992",
+                ),
+                ("caller_run_attempt", "lifecycle_run_attempt", "1", "1e0"),
+                ("caller_run_attempt", "lifecycle_run_attempt", "1", "+1"),
+                ("caller_run_attempt", "lifecycle_run_attempt", "1", "1.0"),
+                (
+                    "worker_version_id",
+                    "owner_deployment_id",
+                    "fixture_deployment",
+                    "bad/version",
+                ),
+            ] {
+                let mut invalid = valid.clone();
+                for field in [first, second] {
+                    let from = format!("\"{field}\":\"{old}\"");
+                    let to = format!("\"{field}\":\"{new}\"");
+                    let changed = invalid.replacen(&from, &to, 1);
+                    assert_ne!(changed, invalid, "missing mutation target: {from}");
+                    invalid = changed;
+                }
                 assert!(decode_request(invalid.as_bytes()).is_none(), "{invalid}");
             }
             let verb_name = match verb {
