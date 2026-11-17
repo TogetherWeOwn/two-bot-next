@@ -8,6 +8,23 @@ use super::canonical_routes::{encode_routes, ManifestRoute};
 use super::canonical_slots::encode_slots;
 use super::manifest_references::manifest_references_are_valid;
 use super::ReadSlot;
+use sha2::{Digest, Sha256};
+
+/// Hashes an assembled, structurally validated manifest with the v1 domain.
+/// This does not establish provenance, expected-set completeness, envelope size,
+/// request binding, authentication, authorization, or a watch PASS.
+pub fn manifest_digest(
+    candidate_sha: &str,
+    slots: &[ReadSlot],
+    routes: &[ManifestRoute<'_>],
+    journeys: &[ManifestJourney<'_>],
+) -> Option<String> {
+    let manifest = encode_manifest(candidate_sha, slots, routes, journeys)?;
+    let mut hash = Sha256::new();
+    hash.update(b"two.bot.staging-reads.manifest.v1\n");
+    hash.update(manifest.as_bytes());
+    Some(hex::encode(hash.finalize()))
+}
 
 /// Encodes the fixed-version manifest after representation and structural checks.
 /// Callers must independently enforce every trust and admission requirement.
@@ -90,6 +107,46 @@ mod tests {
             .as_deref(),
             Some(expected.as_str())
         );
+    }
+
+    #[test]
+    fn hashes_independent_manifest_vectors() {
+        let slots = plan();
+        let routes = [route("fixture_route")];
+        let journeys = [journey("fixture_journey", &["fixture_route"])];
+        // The first digest is the protocol fixture; the second was calculated
+        // independently using Python's json and hashlib implementations.
+        for (sha, expected) in [
+            (
+                SHA,
+                "0f1f9821354531dc6aedd4ee10c3ddc365e0032ac557aace69a1a76d7fbd6e1c",
+            ),
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "84840bab05516edce8722bc89234a8f0bef198e6dd7d96071652eda2e5824bd9",
+            ),
+        ] {
+            assert_eq!(
+                manifest_digest(sha, &slots, &routes, &journeys).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn digest_rejects_invalid_manifest_inputs() {
+        let slots = plan();
+        let routes = [route("a"), route("b")];
+        let journeys = [journey("a", &["a", "b"])];
+        assert!(manifest_digest("BAD", &slots, &routes, &journeys).is_none());
+        assert!(manifest_digest(SHA, &slots[..39], &routes, &journeys).is_none());
+        let mut changed = slots.clone();
+        changed.swap(0, 1);
+        assert!(manifest_digest(SHA, &changed, &routes, &journeys).is_none());
+        assert!(manifest_digest(SHA, &slots, &routes, &[journey("a", &["a"])]).is_none());
+        assert!(manifest_digest(SHA, &slots, &routes, &[journey("a", &["a", "c"])]).is_none());
+        assert!(manifest_digest(SHA, &slots, &[route("b"), route("a")], &journeys).is_none());
+        assert!(manifest_digest(SHA, &slots, &[], &journeys).is_none());
     }
 
     #[test]
