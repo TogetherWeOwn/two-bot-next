@@ -3685,6 +3685,8 @@ def staging_callee_window_errors(name, workflow, consumer):
     expected_inputs = {key: {"type": "string", "required": "true"} for key in STAGING_USE_INPUTS}
     if prepared:
         expected_inputs["deploy_staging_call"] = {"type": "boolean", "required": "false", "default": "false"}
+    if name == "voice-synthetic.yml":
+        expected_inputs["artifact_invocation"] = {"type": "string", "required": "false", "default": ""}
     if inputs != expected_inputs:
         errors.append(f"{name}: workflow_call inputs must match the exact grant and call-mode profile")
     if workflow.get("concurrency") != {"group": STAGING_CALLEE_GROUPS[name], "cancel-in-progress": "false"}:
@@ -3741,8 +3743,10 @@ def staging_callee_window_errors(name, workflow, consumer):
         checkout, node, first, second, upload = steps
         # The begin/ready guards are disjoint, so either order is equivalent.
         ready, begin = (first, second) if str(first.get("run", "")).endswith(" ready") else (second, first)
-        if {key: value for key, value in upload.items() if key != "name"} != staging_receipt_upload(
-                kind, "start", STAGING_USE_RECEIPT):
+        expected_upload = staging_receipt_upload(kind, "start", STAGING_USE_RECEIPT)
+        if name == "voice-synthetic.yml":
+            expected_upload["with"]["name"] += "${{ inputs.artifact_invocation != '' && format('-{0}', inputs.artifact_invocation) || '' }}"
+        if {key: value for key, value in upload.items() if key != "name"} != expected_upload:
             errors.append(f"{name}:staging-window: must always upload the start receipt for 14 days, "
                           "failing on a missing file")
         if checkout != {"uses": STAGING_CHECKOUT_USES,
@@ -3880,6 +3884,10 @@ def voice_synthetic_errors(workflow):
     runs = [step for step in steps if "run" in step]
     if len(steps) != 3 or len(runs) != 1 or "scripts/staging_voice_synthetic.py" not in runs[0]["run"]:
         errors.append(f"{name}:synthetic: must be checkout, one Run step of the reviewed script, evidence upload")
+    if len(steps) == 3 and steps[2].get("with", {}).get("name") != (
+            "voice-synthetic-${{ github.run_id }}"
+            "${{ inputs.artifact_invocation != '' && format('-{0}', inputs.artifact_invocation) || '' }}"):
+        errors.append(f"{name}:synthetic: evidence artifact must include the optional invocation suffix")
     for step in steps:
         if "secrets." in str(step) and step is not (runs[0] if runs else None):
             errors.append(f"{name}:synthetic: only the Run step may hold a secret")
@@ -7113,6 +7121,10 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["on"].__setitem__("push", None),
             lambda w: w["jobs"]["synthetic"]["steps"][1].__setitem__("run", "wrangler deploy"),
             lambda w: w["jobs"]["synthetic"]["steps"][0].__setitem__("env", {"T": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}),
+            lambda w: w["on"]["workflow_call"]["inputs"].pop("artifact_invocation"),
+            lambda w: w["on"]["workflow_call"]["inputs"]["artifact_invocation"].update({"required": "true"}),
+            lambda w: w["jobs"]["staging-window"]["steps"][4]["with"].update({"name": "collision"}),
+            lambda w: w["jobs"]["synthetic"]["steps"][2]["with"].update({"name": "collision"}),
         ):
             changed = copy.deepcopy(synthetic)
             mutate(changed)

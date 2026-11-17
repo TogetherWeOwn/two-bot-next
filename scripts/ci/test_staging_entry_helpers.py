@@ -165,6 +165,37 @@ def assert_routing_behavior(test, workflow, called, grant, attempt, expected):
     test.assertEqual(refusal["steps"], [{"run": "exit 1"}])
 
 
+class VoiceArtifactNamingTests(unittest.TestCase):
+    def test_invocations_are_distinct_and_confined_to_upload_names(self):
+        from test_workflows import load_workflows
+
+        workflow = load_workflows()["voice-synthetic.yml"]
+        self.assertEqual(workflow["on"]["workflow_call"]["inputs"]["artifact_invocation"],
+                         {"type": "string", "required": "false", "default": ""})
+        jobs = workflow["jobs"]
+        start = jobs["staging-window"]["steps"][-1]["with"]
+        voice = jobs["synthetic"]["steps"][-1]["with"]
+        suffix = "${{ inputs.artifact_invocation != '' && format('-{0}', inputs.artifact_invocation) || '' }}"
+        bases = ("staging-use-voice-start-${{ github.run_id }}-${{ github.run_attempt }}",
+                 "voice-synthetic-${{ github.run_id }}")
+        self.assertEqual((start["name"], voice["name"]), tuple(base + suffix for base in bases))
+        self.assertEqual(start["path"], "${{ runner.temp }}/staging-use.jsonl")
+        self.assertEqual(voice["path"], "voice-synthetic-${{ github.run_id }}-*.json")
+        self.assertEqual(str(jobs).count("inputs.artifact_invocation"), 4)
+        self.assertNotIn("artifact_invocation", str(jobs["staging-use-release"]))
+
+        # Model the pinned expression for one run/attempt; this is not an Actions upload.
+        def names(label):
+            endings = f"-{label}" if label else ""
+            return (f"staging-use-voice-start-42-1{endings}", f"voice-synthetic-42{endings}")
+
+        self.assertEqual(names(None), names(""))
+        self.assertEqual(names(""), ("staging-use-voice-start-42-1", "voice-synthetic-42"))
+        first, second = names("voice-1"), names("voice-2")
+        self.assertEqual(len(set(first + second)), 4)
+        self.assertEqual(len(set(names("") + names(""))), 2)  # immutable-name collision
+
+
 class StandaloneRoutingTests(unittest.TestCase):
     def test_actual_callee_routing_and_refusal(self):
         from test_workflows import load_workflows
