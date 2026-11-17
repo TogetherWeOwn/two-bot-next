@@ -265,7 +265,29 @@ mod tests {
                 valid.replacen("\"v\":\"1\",", "", 1),
                 valid.replacen("\"v\":\"1\",", "\"v\":\"1\",\"v\":\"1\",", 1),
                 valid.replacen("\"v\":\"1\",", "\"extra\":\"x\",\"v\":\"1\",", 1),
-                valid.replacen("\"v\":\"1\",\"verb\":", "\"verb\":\"begin\",\"v\":", 1),
+                valid.replacen(
+                    &format!(
+                        "\"v\":\"1\",\"verb\":\"{}\"",
+                        match verb {
+                            Verb::Challenge => "challenge",
+                            Verb::Begin => "begin",
+                            Verb::Read => "read",
+                            Verb::Status => "status",
+                            Verb::Close => "close",
+                        }
+                    ),
+                    &format!(
+                        "\"verb\":\"{}\",\"v\":\"1\"",
+                        match verb {
+                            Verb::Challenge => "challenge",
+                            Verb::Begin => "begin",
+                            Verb::Read => "read",
+                            Verb::Status => "status",
+                            Verb::Close => "close",
+                        }
+                    ),
+                    1,
+                ),
                 valid.replacen(":", ": ", 1),
                 format!("{valid}\n"),
                 format!("\u{feff}{valid}"),
@@ -289,6 +311,125 @@ mod tests {
                 ),
             ];
             for invalid in mutations {
+                assert_ne!(invalid, valid);
+                assert!(decode_request(invalid.as_bytes()).is_none(), "{invalid}");
+            }
+            let common = [
+                ("\"v\":\"1\"", "\"v\":\"2\""),
+                ("\"build_id\":\"99-2\"", "\"build_id\":\"\\u00399-2\""),
+                (
+                    "\"environment\":\"staging\"",
+                    "\"environment\":\"production\"",
+                ),
+                (
+                    "\"repository_id\":\"1396224242\"",
+                    "\"repository_id\":\"1396224243\"",
+                ),
+                (
+                    "\"repository_owner_id\":\"319943574\"",
+                    "\"repository_owner_id\":\"319943575\"",
+                ),
+                (
+                    "deploy-production.yml@refs/heads/main",
+                    "deploy-production.yml@refs/heads/other",
+                ),
+                (
+                    "\"staging_application_id\":\"1469137636663758888\"",
+                    "\"staging_application_id\":\"1\"",
+                ),
+                (
+                    "\"staging_guild_id\":\"1545644954272137297\"",
+                    "\"staging_guild_id\":\"1\"",
+                ),
+                (
+                    "\"caller_run_id\":\"100\"",
+                    "\"caller_run_id\":\"123456789012345678901\"",
+                ),
+                (
+                    "\"caller_run_attempt\":\"1\"",
+                    "\"caller_run_attempt\":\"0\"",
+                ),
+                (
+                    "\"caller_run_attempt\":\"1\"",
+                    "\"caller_run_attempt\":\"9007199254740992\"",
+                ),
+                (
+                    "\"caller_run_attempt\":\"1\"",
+                    "\"caller_run_attempt\":\"1e0\"",
+                ),
+                (
+                    "\"caller_run_attempt\":\"1\"",
+                    "\"caller_run_attempt\":\"+1\"",
+                ),
+                (
+                    "\"caller_run_attempt\":\"1\"",
+                    "\"caller_run_attempt\":\"1.0\"",
+                ),
+                ("\"owner_epoch\":\"1\"", "\"owner_epoch\":\"0\""),
+                (
+                    "\"acquired_at_ms\":\"1794855600000\"",
+                    "\"acquired_at_ms\":\"9007199254740992\"",
+                ),
+                ("\"build_id\":\"99-2\"", "\"build_id\":\"unknown\""),
+                (
+                    "\"worker_version_id\":\"fixture_deployment\"",
+                    "\"worker_version_id\":\"bad/version\"",
+                ),
+            ];
+            for (from, to) in common {
+                let invalid = valid.replacen(from, to, 1);
+                assert_ne!(invalid, valid, "missing mutation target: {from}");
+                assert!(decode_request(invalid.as_bytes()).is_none(), "{invalid}");
+            }
+            let verb_name = match verb {
+                Verb::Challenge => "challenge",
+                Verb::Begin => "begin",
+                Verb::Read => "read",
+                Verb::Status => "status",
+                Verb::Close => "close",
+            };
+            let mut cases = vec![(
+                format!("\"verb\":\"{verb_name}\""),
+                "\"verb\":\"unknown\"".to_owned(),
+            )];
+            for field in ["challenge", "incarnation", "index", "query"] {
+                let value = match field {
+                    "challenge" if verb != Verb::Challenge => format!("\"{CHALLENGE}\""),
+                    "incarnation" if verb != Verb::Challenge => format!("\"{INCARNATION}\""),
+                    "index" if verb == Verb::Read => "\"0\"".to_owned(),
+                    "query" if verb == Verb::Status => "\"measurement\"".to_owned(),
+                    _ => "null".to_owned(),
+                };
+                let from = format!(",\"{field}\":{value}");
+                cases.push((from.clone(), String::new()));
+                let wrong = if value == "null" {
+                    match field {
+                        "challenge" => format!("\"{CHALLENGE}\""),
+                        "incarnation" => format!("\"{INCARNATION}\""),
+                        "index" => "\"0\"".to_owned(),
+                        _ => "\"measurement\"".to_owned(),
+                    }
+                } else {
+                    "null".to_owned()
+                };
+                cases.push((from, format!(",\"{field}\":{wrong}")));
+            }
+            if verb != Verb::Challenge {
+                cases.push((CHALLENGE.to_owned(), "0".repeat(64)));
+                cases.push((INCARNATION.to_owned(), "0".repeat(32)));
+            }
+            if verb == Verb::Read {
+                cases.push(("\"index\":\"0\"".to_owned(), "\"index\":\"-1\"".to_owned()));
+            }
+            if verb == Verb::Status {
+                cases.push((
+                    "\"query\":\"measurement\"".to_owned(),
+                    "\"query\":\"other\"".to_owned(),
+                ));
+            }
+            for (from, to) in cases {
+                let invalid = valid.replacen(&from, &to, 1);
+                assert_ne!(invalid, valid, "missing mutation target: {from}");
                 assert!(decode_request(invalid.as_bytes()).is_none(), "{invalid}");
             }
             assert!(decode_request(&[0xff]).is_none());
