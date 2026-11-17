@@ -1,17 +1,50 @@
 """Offline contract for the disabled staging measurement wrapper."""
 
+from copy import deepcopy
 import unittest
 
+from disabled_voice_measurement import GUARDS, WORKFLOW
+import test_staging_voice_mutual_exclusion_acceptance as lifecycle
 import test_workflows as policy
 
 
 class VoiceMeasurementSkeletonTests(unittest.TestCase):
+    def test_both_policy_consumers_fail_closed_on_activation(self):
+        workflows = lifecycle.load_all()
+        canonical = workflows[lifecycle.DEPLOY]["concurrency"]["group"].casefold()
+        self.assertEqual(policy.workflow_policy_errors(workflows), [])
+        self.assertEqual(lifecycle.repository_errors(workflows, canonical), [])
+        scaffold = workflows[WORKFLOW]
+        expected = policy.reusable_call_expected(WORKFLOW, "voice-first", scaffold)
+        self.assertEqual(scaffold["jobs"]["voice-first"]["uses"], expected)
+        for name in GUARDS:
+            with self.subTest(job=name):
+                changed = deepcopy(workflows)
+                job = changed[WORKFLOW]["jobs"][name]
+                job["if"] = job["if"].replace("false && ", "", 1)
+                self.assertTrue(policy.workflow_policy_errors(changed))
+                self.assertTrue(lifecycle.repository_errors(changed, canonical))
+                with self.assertRaises(KeyError):
+                    policy.reusable_call_expected(WORKFLOW, "voice-first", changed[WORKFLOW])
+        for field in ("on", "permissions", "concurrency"):
+            with self.subTest(field=field):
+                changed = deepcopy(workflows)
+                changed[WORKFLOW][field] = {"contents": "read"}
+                self.assertTrue(policy.workflow_policy_errors(changed))
+                self.assertTrue(lifecycle.repository_errors(changed, canonical))
+                with self.assertRaises(KeyError):
+                    policy.reusable_call_expected(WORKFLOW, "voice-first", changed[WORKFLOW])
+        changed = deepcopy(scaffold)
+        changed["jobs"]["voice-first"]["uses"] = "./.github/workflows/other.yml"
+        self.assertNotEqual(changed["jobs"]["voice-first"]["uses"],
+                            policy.reusable_call_expected(WORKFLOW, "voice-first", changed))
+
     def test_every_job_is_hard_disabled_and_the_graph_keeps_ownership(self):
         workflow = policy.load_workflows()["voice-rest-measurement.yml"]
         self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
         self.assertEqual(workflow["permissions"], {})
         self.assertEqual(workflow["concurrency"], {
-            "group": "staging-lifecycle", "cancel-in-progress": "false"})
+            "group": "voice-rest-measurement-disabled", "cancel-in-progress": "false"})
         jobs = workflow["jobs"]
         self.assertEqual(set(jobs), {"staging-window", "voice-first", "staging-use-release"})
         guards = {
@@ -23,6 +56,10 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
             self.assertEqual(jobs[name]["if"], guard, name)
         begin = jobs["staging-window"]
         self.assertEqual(begin["environment"], "staging")
+        self.assertEqual(begin["outputs"], {
+            name: "${{ steps.begin.outputs." + name + " }}"
+            for name in ("expires_at", "sha", "deployment_id")
+        })
         step = next(s for s in begin["steps"] if s.get("id") == "begin")
         self.assertEqual(step["run"], "node wrangler/scripts/staging-use-pipeline.mjs begin")
         self.assertEqual(step["env"]["STAGING_USE_EXPECTED_SHA"], "${{ github.sha }}")
@@ -41,6 +78,16 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
         self.assertEqual(finish["run"], "node wrangler/scripts/staging-use-pipeline.mjs finish")
         self.assertEqual(finish["env"]["STAGING_USE_EXPIRES_AT"],
                          "${{ needs.staging-window.outputs.expires_at }}")
+        for job, step, phase in ((begin, step, "start"), (release, finish, "stop")):
+            receipt = "${{ runner.temp }}/staging-use-measurement-" + phase + ".jsonl"
+            self.assertEqual(step["env"]["STAGING_USE_RECEIPT"], receipt)
+            upload = next(s for s in job["steps"] if s.get("with", {}).get("path") == receipt)
+            self.assertEqual(upload["if"], "always()")
+            self.assertEqual(upload["uses"], "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9")
+            self.assertEqual(upload["with"]["name"],
+                             "staging-use-measurement-" + phase + "-${{ github.run_id }}-${{ github.run_attempt }}")
+            self.assertEqual(upload["with"]["if-no-files-found"], "error")
+            self.assertEqual(upload["with"]["retention-days"], "14")
 
 
 if __name__ == "__main__":

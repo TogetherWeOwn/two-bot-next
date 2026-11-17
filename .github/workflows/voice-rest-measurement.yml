@@ -8,7 +8,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: staging-lifecycle
+  group: voice-rest-measurement-disabled
   cancel-in-progress: false
 
 jobs:

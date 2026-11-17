@@ -59,6 +59,8 @@ from unittest import mock
 
 import yaml
 
+from disabled_voice_measurement import WORKFLOW as DISABLED_MEASUREMENT, is_disabled_scaffold
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github/workflows"
 DEPLOY = "deploy-staging.yml"
@@ -581,6 +583,7 @@ def repository_errors(wfs, canonical):
     callers = {f"./.github/workflows/{name}" for name in CHILDREN.values()}
     holders = set(STANDALONE_HOLDERS) | set(OBSERVERS)
     for file, workflow in wfs.items():
+        disabled = file == DISABLED_MEASUREMENT and is_disabled_scaffold(workflow)
         triggers = tuple(t for t in events(workflow) if t != "workflow_call")
         nodes = [("workflow", workflow)] + list((workflow.get("jobs") or {}).items())
         for name, node in nodes:
@@ -589,11 +592,11 @@ def repository_errors(wfs, canonical):
                     errors.append(f"split lifecycle lock: {file} {name} holds {text}")
             if name == "workflow":
                 continue
-            if node.get("uses") in callers and (file != DEPLOY or name not in CHILDREN):
+            if node.get("uses") in callers and (file != DEPLOY or name not in CHILDREN) and not disabled:
                 errors.append(f"caller closure: {file} {name} calls a window consumer")
             env = str(node.get("environment") or "")
             touches = STAGING_TOUCH.search(str(node)) or "staging" in env
-            classified = (file in (DEPLOY, *CONSUMERS) or (file, name) in holders
+            classified = (disabled or file in (DEPLOY, *CONSUMERS) or (file, name) in holders
                           or (file, name) in EXEMPT)
             if touches and not classified:
                 errors.append(f"inventory: unclassified staging consumer {file} {name}")

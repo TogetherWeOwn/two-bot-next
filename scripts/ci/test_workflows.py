@@ -17,6 +17,8 @@ from unittest.mock import patch
 
 import yaml
 
+from disabled_voice_measurement import WORKFLOW as DISABLED_MEASUREMENT, is_disabled_scaffold
+
 ROOT = Path(__file__).resolve().parents[2]
 _HISTORY_SPEC = importlib.util.spec_from_file_location(
     "synthetic_alert_history", ROOT / "scripts/synthetic_alert_history.py")
@@ -230,6 +232,12 @@ def load_workflows():
 def runner_allowed(job_id, runs_on):
     # Job ids remain at call sites for per-job diagnostics; no indirect selector is allowed.
     return runs_on == PUBLIC_RUNNER
+
+
+def reusable_call_expected(name, job_id, workflow):
+    if (name, job_id) == (DISABLED_MEASUREMENT, "voice-first") and is_disabled_scaffold(workflow):
+        return "./.github/workflows/voice-synthetic.yml"
+    return REUSABLE_CALLS[(name, job_id)]
 
 
 def shell_logical_lines(script):
@@ -4587,7 +4595,8 @@ def workflow_policy_errors(workflows):
     errors.extend(scheduled_binding_audit_errors(workflows))
     # Fail closed on new workflows/jobs, including reusable-workflow alternatives.
     # An intentional addition needs an explicit policy change and independent review.
-    if set(workflows) != set(JOB_INVENTORY):
+    disabled = is_disabled_scaffold(workflows.get(DISABLED_MEASUREMENT))
+    if set(workflows) != set(JOB_INVENTORY) | ({DISABLED_MEASUREMENT} if disabled else set()):
         errors.append("workflow inventory changed")
     # Every allowed reusable call must still exist with its pinned ref:
     # converting a caller to an ordinary job keeps the inventory intact
@@ -4606,6 +4615,8 @@ def workflow_policy_errors(workflows):
         elif job.get("if") != expected_if:
             errors.append(f"{name}:{job_id}: PR-size activation condition changed")
     for name, workflow in workflows.items():
+        if name == DISABLED_MEASUREMENT and disabled:
+            continue  # Literal false guards and the isolated queue are pinned above.
         jobs = workflow.get("jobs", {})
         if set(jobs) != JOB_INVENTORY.get(name, set()):
             errors.append(f"{name}: job inventory changed")
@@ -10239,7 +10250,7 @@ class WorkflowTests(unittest.TestCase):
                     if "uses" in job:
                         # The called workflow's own jobs are checked here too.
                         self.assertNotIn("runs-on", job)
-                        self.assertEqual(job["uses"], REUSABLE_CALLS[(name, job_id)])
+                        self.assertEqual(job["uses"], reusable_call_expected(name, job_id, workflow))
                         continue
                     if (name, job_id) == ("deploy-staging.yml", "certify-promotion"):
                         # Artifact-only certification still uses the direct
