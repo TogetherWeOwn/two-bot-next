@@ -240,42 +240,27 @@ mod tests {
     // These files are the exact synthetic packet bytes, with no final LF.
     const BEGIN: &str = include_str!("../../tests/fixtures/counted_read_begin.json");
     const READ: &str = include_str!("../../tests/fixtures/counted_read_read.json");
-    const REQUEST_VECTORS: [(Verb, &str, usize, &str); 5] = [
-        (
-            Verb::Challenge,
-            include_str!("../../tests/fixtures/counted_read_challenge.json"),
-            1025,
-            "ebb43f5d18e6bdc4dbe2ba88f7718e91f9a3511744ef783e362acf21c1c4204d",
-        ),
-        (
-            Verb::Begin,
-            BEGIN,
-            1113,
-            "7382de091efcf9cadbc53e0a5a579ef7a203a3d31424ef8bb79bb1444a86cbf9",
-        ),
-        (
-            Verb::Read,
-            READ,
-            1111,
-            "26eb806bdc541bdb431e37bdf373a7c56fb5cb1ab62d004674094ab413aa429f",
-        ),
-        (
-            Verb::Status,
-            include_str!("../../tests/fixtures/counted_read_status.json"),
-            1123,
-            "cd08bf49580dd2f80df6b53c28e517abf5073ab654cf001e517677c9c3d0ae1e",
-        ),
-        (
-            Verb::Close,
-            include_str!("../../tests/fixtures/counted_read_close.json"),
-            1113,
-            "35f99ad1084416feb0a915d20ee1675cdb88acfa2bbf26bd132daaa8f91936b3",
-        ),
-    ];
+
+    fn request_fixture(verb: Verb) -> &'static str {
+        match verb {
+            Verb::Challenge => include_str!("../../tests/fixtures/counted_read_challenge.json"),
+            Verb::Begin => BEGIN,
+            Verb::Read => READ,
+            Verb::Status => include_str!("../../tests/fixtures/counted_read_status.json"),
+            Verb::Close => include_str!("../../tests/fixtures/counted_read_close.json"),
+        }
+    }
 
     #[test]
     fn contract_request_vectors() {
-        for (verb, expected, length, _) in REQUEST_VECTORS {
+        for (verb, length) in [
+            (Verb::Challenge, 1025),
+            (Verb::Begin, 1113),
+            (Verb::Read, 1111),
+            (Verb::Status, 1123),
+            (Verb::Close, 1113),
+        ] {
+            let expected = request_fixture(verb);
             assert_eq!(expected.len(), length, "{verb:?}");
             assert_eq!(
                 encode_request(&request(verb)).as_deref(),
@@ -301,8 +286,29 @@ mod tests {
 
     #[test]
     fn request_domain_digest_vectors_and_wrong_domains() {
-        for (verb, fixture, _, expected) in REQUEST_VECTORS {
-            let bytes = fixture.as_bytes();
+        for (verb, expected) in [
+            (
+                Verb::Challenge,
+                "ebb43f5d18e6bdc4dbe2ba88f7718e91f9a3511744ef783e362acf21c1c4204d",
+            ),
+            (
+                Verb::Begin,
+                "7382de091efcf9cadbc53e0a5a579ef7a203a3d31424ef8bb79bb1444a86cbf9",
+            ),
+            (
+                Verb::Read,
+                "26eb806bdc541bdb431e37bdf373a7c56fb5cb1ab62d004674094ab413aa429f",
+            ),
+            (
+                Verb::Status,
+                "cd08bf49580dd2f80df6b53c28e517abf5073ab654cf001e517677c9c3d0ae1e",
+            ),
+            (
+                Verb::Close,
+                "35f99ad1084416feb0a915d20ee1675cdb88acfa2bbf26bd132daaa8f91936b3",
+            ),
+        ] {
+            let bytes = request_fixture(verb).as_bytes();
             let digest = request_digest(bytes).expect("canonical vector digest");
             assert_eq!(digest, expected, "{verb:?}");
             assert_ne!(digest, hex::encode(Sha256::digest(bytes)));
@@ -367,7 +373,14 @@ mod tests {
 
     #[test]
     fn decoder_rejects_noncanonical_and_invalid_inputs_for_every_verb() {
-        for (verb, valid, _, _) in REQUEST_VECTORS {
+        for verb in [
+            Verb::Challenge,
+            Verb::Begin,
+            Verb::Read,
+            Verb::Status,
+            Verb::Close,
+        ] {
+            let valid = request_fixture(verb);
             let mutations = [
                 valid.replacen("\"v\":\"1\",", "", 1),
                 valid.replacen("\"v\":\"1\",", "\"v\":\"1\",\"v\":\"1\",", 1),
