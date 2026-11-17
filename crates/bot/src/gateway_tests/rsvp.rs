@@ -69,7 +69,7 @@ fn saved_reply_accepts_only_the_expected_safe_shape() {
 
 pub(super) fn interaction(sequence: u64, status: &str) -> Value {
     json!({"op":0,"s":sequence,"t":"INTERACTION_CREATE","d":{
-        "application_id":"1111", "authorizing_integration_owners":{"0":GUILD},
+        "application_id":"1111", "attachment_size_limit":10485760, "authorizing_integration_owners":{"0":GUILD},
         "id":sequence.to_string(), "token":format!("mock-rsvp-{sequence}"),
         "type":2, "version":1, "guild_id":GUILD,
         "member":{"permissions":"0", "roles":[], "deaf":false, "mute":false,
