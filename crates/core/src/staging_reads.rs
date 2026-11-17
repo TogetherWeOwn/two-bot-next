@@ -3,6 +3,7 @@
 pub mod canonical_candidate;
 pub mod canonical_journeys;
 pub mod canonical_lifecycle;
+pub mod canonical_manifest;
 pub mod canonical_owner;
 pub mod canonical_prefix;
 pub mod canonical_request;
