@@ -36,7 +36,7 @@ fn assert_limit_embed(
 fn completion_routes_only_single_embed_limit_replies() {
     let limit = limit_interaction(MEMBER, Vec::new());
     let unlimit = voice_interaction_as(Some(command_data("unlimit", Vec::new())), None, MEMBER);
-    let other = voice_interaction_as(Some(command_data("lock", Vec::new())), None, MEMBER);
+    let other = voice_interaction_as(Some(command_data("name", Vec::new())), None, MEMBER);
     let myroom = voice_interaction_as(Some(command_data("myroom", Vec::new())), None, MEMBER);
     let response = super::super::limit::limit_response(
         "A reply".to_owned(),
@@ -217,7 +217,7 @@ async fn ownership_gate_refusals_use_classified_embeds() {
         let trace = Trace::default();
         let runtime = gated_runtime(trace.clone(), controls, error);
         let mut interaction =
-            voice_interaction_as(Some(command_data("lock", vec![])), None, MEMBER);
+            voice_interaction_as(Some(command_data("name", vec![])), None, MEMBER);
         interaction.member.as_mut().unwrap().roles.clear();
         let (handled, response) = handle_capture(&runtime, &interaction).await;
         assert!(handled);
