@@ -3620,6 +3620,8 @@ jobs:
         run: node --test scripts/test-staging-ownership-status.mjs
       - name: Verify voice REST receipt construction (offline fixtures)
         run: node --test scripts/test-voice-rest-receipt.mjs
+      - name: Verify voice REST measurement adapter (offline fixtures)
+        run: node --test scripts/test-voice-rest-measurement.mjs
       - name: Verify promotion-gate intake cap (offline fixtures)
         run: node --test scripts/test-promotion-gate-intake-cap.mjs
       - name: Verify slow-burn decide intake cap (offline fixtures)
