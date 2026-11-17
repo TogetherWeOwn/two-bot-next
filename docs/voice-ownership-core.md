@@ -47,8 +47,8 @@ repaired. Commands cannot revive an empty room.
 | --- | --- | --- |
 | `/reclaim` (including a claim by an eligible occupant) | committed or already owner | Voice embed, ok |
 | `/transfer` | committed or already assigned | Voice embed, ok |
-| Both | worker not warmed up or handoff still finalizing | Voice embed, warn |
-| Both | lost worker reply, refused, invalid, or halted | Voice embed, danger |
+| Both | worker not warmed up, lost worker reply, or handoff still finalizing | Voice embed, warn |
+| Both | refused, invalid, or halted | Voice embed, danger |
 
 The existing text remains the description, with a text-only Voice footer. The
 2000-character bound, empty allowed mentions, defer/edit flow and ownership

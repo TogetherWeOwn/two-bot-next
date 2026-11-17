@@ -15085,7 +15085,7 @@ where
                     if runtime.has_actor(guild_id) {
                         (
                             WORKER_LOST_REPLY.to_owned(),
-                            two_bot_discord::brand::EmbedKind::Danger,
+                            two_bot_discord::brand::EmbedKind::Warn,
                         )
                     } else {
                         (
@@ -15131,7 +15131,7 @@ where
                     if runtime.has_actor(guild_id) {
                         (
                             WORKER_LOST_REPLY.to_owned(),
-                            two_bot_discord::brand::EmbedKind::Danger,
+                            two_bot_discord::brand::EmbedKind::Warn,
                         )
                     } else {
                         (

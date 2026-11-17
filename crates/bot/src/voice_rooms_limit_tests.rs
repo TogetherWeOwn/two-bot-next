@@ -122,6 +122,21 @@ async fn ownership_replies_use_explicit_outcome_embeds() {
     assert!(limit_completion_embed(&interaction, &response).is_some());
 }
 
+#[tokio::test(start_paused = true)]
+async fn ownership_lost_worker_reply_uses_warning_embed() {
+    for (name, options) in [
+        ("reclaim", vec![]),
+        ("transfer", vec![user_option("member", 301)]),
+    ] {
+        let (runtime, _rx) = stalled_worker_runtime();
+        let interaction = voice_interaction_as(Some(command_data(name, options)), None, MEMBER);
+        let (_, response) = handle_capture(&runtime, &interaction).await;
+        let response = response.expect("lost worker reply");
+        assert_limit_embed(&response, EmbedKind::Warn, WORKER_LOST_REPLY);
+        assert!(limit_completion_embed(&interaction, &response).is_some());
+    }
+}
+
 #[tokio::test]
 async fn ownership_missing_invoker_returns_danger_embed() {
     for (name, options, text) in [
