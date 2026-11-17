@@ -14559,15 +14559,7 @@ where
     // interactions keep their existing handling.
     let authority = runtime.guild_authority(interaction);
     if matches!(authority, GuildAuthority::WarmingUp) && requires_guild_authority(&command) {
-        if matches!(command, VoiceCommand::Kick { .. }) {
-            reply(kick_text_response(
-                WARMING_UP_REPLY,
-                two_bot_discord::brand::EmbedKind::Warn,
-            ))
-            .await;
-        } else {
-            reply(ephemeral_response(WARMING_UP_REPLY)).await;
-        }
+        reply(ephemeral_response(WARMING_UP_REPLY)).await;
         return true;
     }
     // Guild-level role gate first. Settings that cannot be read fail closed for
