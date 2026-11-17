@@ -479,7 +479,13 @@ pub enum StrictTransportError {
     #[error(transparent)]
     Admission(#[from] two_bot_core::send_admission::AdmissionError),
     #[error("{0}")]
-    Transport(#[from] String),
+    Transport(String),
+}
+
+impl From<String> for StrictTransportError {
+    fn from(error: String) -> Self {
+        Self::Transport(error)
+    }
 }
 
 impl HyperTransport {
