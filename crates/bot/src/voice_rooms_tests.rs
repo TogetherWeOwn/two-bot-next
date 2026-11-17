@@ -13231,6 +13231,7 @@ async fn kick_vote_in_a_shared_room_answers_the_public_ballot_without_defer() {
     );
     let data = completed[0].data.as_ref().expect("ballot body");
     assert_ne!(data.flags, Some(MessageFlags::EPHEMERAL));
+    assert!(data.embeds.is_none());
     let content = data.content.as_deref().unwrap_or_default();
     assert!(content.contains("<@303>"), "{content}");
     assert!(content.contains("too loud"), "{content}");
@@ -13281,9 +13282,130 @@ async fn kick_vote_sink_answers_a_malformed_reason_with_one_private_correction()
         let data = completed[0].data.as_ref().expect("correction body");
         assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL), "{case}");
         assert!(data.components.is_none(), "{case}: no public ballot");
-        let content = data.content.as_deref().unwrap_or_default();
+        assert!(data.content.is_none(), "{case}");
+        let embed = &data.embeds.as_ref().expect("correction embed")[0];
+        let content = embed.description.as_deref().unwrap_or_default();
         assert!(content.contains("reason:"), "{case}: {content}");
+        assert_eq!(
+            embed.color,
+            Some(two_bot_discord::brand::EmbedKind::Danger.color())
+        );
+        let calls = trace.lock().unwrap().clone();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "respond")
+                .count(),
+            1
+        );
+        assert!(!calls
+            .iter()
+            .any(|call| call == "defer" || call == "complete"));
     }
+}
+
+#[tokio::test]
+async fn kick_gate_styles_refusals_without_changing_ballot_buttons() {
+    use two_bot_discord::brand::EmbedKind;
+    for (controls, error, kind, expected) in [
+        (
+            AccessControls {
+                command_roles: [("kick".to_owned(), vec![7])].into(),
+                ..AccessControls::default()
+            },
+            None,
+            EmbedKind::Danger,
+            access_denied_text(AccessDenyReason::CommandRestricted),
+        ),
+        (
+            AccessControls::default(),
+            Some(StoreError::Unavailable),
+            EmbedKind::Warn,
+            "Voice-room settings are unavailable right now. Try again shortly.",
+        ),
+    ] {
+        let runtime = gated_runtime(Trace::default(), controls, error);
+        let kick = kick_sink_interaction(KICK_TARGET, KICK_VOTER);
+        let (owned, response) = handle_capture(&runtime, &kick).await;
+        assert!(owned);
+        let response = response.expect("kick denial");
+        assert_eq!(
+            response.kind,
+            InteractionResponseType::ChannelMessageWithSource
+        );
+        assert_utility_embed(&response, kind);
+        assert_eq!(response_text(&response), expected);
+
+        let ballot = component_interaction("votekick:7000:yes", None, KICK_VOTER);
+        let (owned, response) = handle_capture(&runtime, &ballot).await;
+        assert!(owned);
+        let response = response.expect("ballot denial");
+        assert_eq!(
+            response.kind,
+            InteractionResponseType::ChannelMessageWithSource
+        );
+        let data = response.data.expect("ballot denial data");
+        assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+        assert_eq!(data.content.as_deref(), Some(expected));
+        assert!(data.embeds.is_none());
+    }
+}
+
+#[test]
+fn kick_refusal_embeds_preserve_outcome_and_reply_safety() {
+    use two_bot_discord::brand::EmbedKind;
+    for (refusal, kind) in [
+        (KickRefusal::NotARoom, EmbedKind::Danger),
+        (
+            KickRefusal::Vote(VoteKickError::SelfTarget),
+            EmbedKind::Danger,
+        ),
+        (KickRefusal::Unavailable, EmbedKind::Warn),
+        (KickRefusal::Vote(VoteKickError::Cooldown), EmbedKind::Warn),
+        (
+            KickRefusal::Vote(VoteKickError::AuthorityUnavailable),
+            EmbedKind::Warn,
+        ),
+    ] {
+        let response = kick_refusal_response(refusal);
+        assert_eq!(
+            response.kind,
+            InteractionResponseType::ChannelMessageWithSource
+        );
+        let data = response.data.expect("reply data");
+        assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+        assert!(data.content.is_none());
+        assert!(data.components.is_none());
+        let mentions = data.allowed_mentions.expect("mention safety");
+        assert!(
+            mentions.parse.is_empty() && mentions.users.is_empty() && mentions.roles.is_empty()
+        );
+        assert!(!mentions.replied_user);
+        let embeds = data.embeds.expect("embed");
+        assert_eq!(embeds.len(), 1);
+        let embed = &embeds[0];
+        assert_eq!(
+            embed.description.as_deref(),
+            Some(kick_refusal_text(&refusal))
+        );
+        assert_eq!(embed.color, Some(kind.color()));
+        let footer = embed.footer.as_ref().expect("footer");
+        assert_eq!(footer.text, "Together We Own · Voice");
+        assert!(footer.icon_url.is_none());
+        assert!(embed.title.is_none() && embed.fields.is_empty());
+    }
+    let response = kick_text_response(&"é".repeat(2100), EmbedKind::Warn);
+    let data = response.data.expect("reply data");
+    let embeds = data.embeds.expect("embed");
+    assert_eq!(
+        embeds[0]
+            .description
+            .as_ref()
+            .expect("description")
+            .chars()
+            .count(),
+        2000
+    );
 }
 
 // Every decline sends no callback at all: the router answers instead, so a
