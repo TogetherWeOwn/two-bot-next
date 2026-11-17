@@ -85,8 +85,16 @@ async fn ownership_replies_use_explicit_outcome_embeds() {
     ] {
         let interaction = voice_interaction_as(Some(command_data(name, options)), None, MEMBER);
         let cold = test_runtime(Trace::default());
-        let (_, response) = handle_capture(&cold, &interaction).await;
-        let response = response.expect("cold reply");
+        let seen = Arc::new(Mutex::new(None));
+        let capture = seen.clone();
+        assert!(
+            handle_voice_interaction(&cold, &interaction, move |response| {
+                *capture.lock().unwrap() = Some(response);
+                async {}
+            })
+            .await
+        );
+        let response = seen.lock().unwrap().clone().expect("cold reply");
         assert_limit_embed(
             &response,
             EmbedKind::Warn,

@@ -7938,12 +7938,7 @@ enum ActorCommand {
         is_admin: bool,
         command: OwnershipCommand,
         reply: oneshot::Sender<String>,
-    },
-    OwnershipClassified {
-        actor_id: Snowflake,
-        is_admin: bool,
-        command: OwnershipCommand,
-        reply: oneshot::Sender<(String, EmbedKind)>,
+        kind: Option<oneshot::Sender<EmbedKind>>,
     },
     /// V3 `/limit` and `/unlimit`: the worker resolves the caller's room,
     /// decides, queues the Discord write and replies with the text (or a
@@ -8383,21 +8378,17 @@ enum OwnershipCommit {
     Pending,
 }
 
-enum OwnershipReply {
-    Text(oneshot::Sender<String>),
-    Classified(oneshot::Sender<(String, EmbedKind)>),
+struct OwnershipReply {
+    text: oneshot::Sender<String>,
+    kind: Option<oneshot::Sender<EmbedKind>>,
 }
 
 impl OwnershipReply {
-    fn send(self, outcome: (String, EmbedKind)) {
-        match self {
-            Self::Text(reply) => {
-                let _ = reply.send(outcome.0);
-            }
-            Self::Classified(reply) => {
-                let _ = reply.send(outcome);
-            }
+    fn send(self, (text, kind): (String, EmbedKind)) {
+        if let Some(reply) = self.kind {
+            let _ = reply.send(kind);
         }
+        let _ = self.text.send(text);
     }
 }
 
@@ -8993,6 +8984,7 @@ where
                 is_admin,
                 command,
                 reply,
+                kind: None,
             })
             .ok()?;
         tokio::time::timeout(WORKER_ACK_WAIT, inbox)
@@ -9010,19 +9002,22 @@ where
     ) -> Option<(String, EmbedKind)> {
         let actor = self.live_actor(guild)?;
         let (reply, inbox) = oneshot::channel();
+        let (kind, kind_inbox) = oneshot::channel();
         actor
             .tx
-            .send(ActorCommand::OwnershipClassified {
+            .send(ActorCommand::Ownership {
                 actor_id,
                 is_admin,
                 command,
                 reply,
+                kind: Some(kind),
             })
             .ok()?;
-        tokio::time::timeout(WORKER_ACK_WAIT, inbox)
-            .await
-            .ok()?
-            .ok()
+        tokio::time::timeout(WORKER_ACK_WAIT, async {
+            Some((inbox.await.ok()?, kind_inbox.await.ok()?))
+        })
+        .await
+        .ok()?
     }
 
     /// Run one V3 owner command (`/private`, `/public`) on the live worker
@@ -10695,24 +10690,13 @@ fn apply_command<S: RoomPersistence, H: RoomWrites>(
             is_admin,
             command,
             reply,
+            kind,
         } => dispatch_ownership(
             worker,
             actor_id,
             is_admin,
             command,
-            OwnershipReply::Text(reply),
-        ),
-        ActorCommand::OwnershipClassified {
-            actor_id,
-            is_admin,
-            command,
-            reply,
-        } => dispatch_ownership(
-            worker,
-            actor_id,
-            is_admin,
-            command,
-            OwnershipReply::Classified(reply),
+            OwnershipReply { text: reply, kind },
         ),
         ActorCommand::Limit {
             actor_id,
