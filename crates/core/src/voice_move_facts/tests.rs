@@ -35,7 +35,7 @@ fn override_parsing_rejects_shapes_it_cannot_prove() {
         serde_json::json!({"id": "20", "type": 0, "allow": 0, "deny": "0"}),
         serde_json::json!({"id": "20", "type": 0, "allow": "", "deny": "0"}),
         serde_json::json!({"id": "+20", "type": 0, "allow": "0", "deny": "0"}),
-        serde_json::json!({"id": "20", "type": 0, "allow": "18446744073709551616", "deny": "0"}),
+        serde_json::json!({"id": "20", "type": 0, "allow": (u128::from(u64::MAX) + 1).to_string(), "deny": "0"}),
         serde_json::json!({"id": "20", "type": 0, "allow": "0", "deny": "-1"}),
     ] {
         assert_eq!(parse_override(&bad), None, "{bad}");
