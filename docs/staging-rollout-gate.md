@@ -248,11 +248,14 @@ workflow head. No scheduler or automatic redispatch is added. The five-minute
 observer never grants a window; its cadence is not permission for
 near-continuous staging use.
 
-**Reruns:** use **Re-run all jobs**, never only failed jobs. A partial rerun has a
-new `run_attempt` but old grant outputs, so the inherited assert refuses with
-`staging_window_mismatch`. Do not copy another attempt's expiry, reset the grant
-or renew it to make the rerun pass. Missing inherited expiry fails closed via
-the nested-lock refusal/cancellation, not by bypassing the consumer.
+**Reruns:** do not use **Re-run all jobs** or **Re-run failed jobs** for
+qualification. Both create a new `run_attempt`; the deploy-called voice and help
+synthetics intentionally refuse every rerun, even with fresh grants. A partial
+rerun can also carry stale grant outputs. Do not copy another attempt's expiry,
+reset the grant or renew it to bypass refusal. Subject to existing holds and
+authorization, recover with a fresh `deploy-staging` dispatch from `main` for
+the exact merged 40-hex SHA, as in pending-slot recovery above. Wait for all five
+qualifying jobs and release, and retain the fresh run's receipts.
 
 Before activation, retain authorized live inventory for the staging and
 production Worker versions, namespaces, Container applications/instances,
