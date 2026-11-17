@@ -4,6 +4,7 @@ pub mod canonical_candidate;
 pub mod canonical_lifecycle;
 pub mod canonical_owner;
 pub mod canonical_prefix;
+pub mod canonical_request;
 pub mod canonical_tail;
 pub mod canonical_target;
 pub mod canonical_time;
