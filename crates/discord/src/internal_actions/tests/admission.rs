@@ -5,6 +5,7 @@ use crate::{ActionExecutor, DiscordError};
 use two_bot_core::send_admission::PgSendAdmission;
 use two_bot_testsupport::TestDatabase;
 
+mod strict_transport;
 mod uncertainty;
 
 async fn database() -> TestDatabase {

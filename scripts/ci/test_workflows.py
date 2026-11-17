@@ -145,9 +145,9 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    # After every staging deploy; its failure fails deploy-staging (promotion gate).
                    ("deploy-staging.yml", "help-embed-synthetic"): "./.github/workflows/help-embed-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
-                   ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
+                   ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
                    # Read-only shadow engine, pinned to the published central merge commit.
-                   ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@63699075b492914c137281acffd4c89e51cc1c4c",
+                   ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
                    # SDLC 2.3 CI speed pilot, promoted: required check.yml
                    # caller to the shared nextest lane (local path until
                    # the central move).
@@ -200,9 +200,9 @@ STAGING_CONTROL_ENV = {
     "OWNERSHIP_CONTROL_TOKEN": "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}",
 }
 STAGING_CALLEE_GROUPS = {
-    "voice-synthetic.yml": "${{ inputs.staging_use_expires_at != '' && "
+    "voice-synthetic.yml": "${{ (inputs.deploy_staging_call || inputs.staging_use_expires_at != '') && "
                            "format('staging-voice-consumer-{0}', github.run_id) || 'staging-lifecycle' }}",
-    "help-embed-synthetic.yml": "${{ inputs.staging_use_expires_at != '' && "
+    "help-embed-synthetic.yml": "${{ (inputs.deploy_staging_call || inputs.staging_use_expires_at != '') && "
                                 "format('staging-help-consumer-{0}', github.run_id) || 'staging-lifecycle' }}",
 }
 DEPLOY_MARKERS = (
@@ -2587,7 +2587,7 @@ def staging_ownership_status_errors(workflow):
 # before repinning). Every error-rate input stays explicit so a central
 # default change cannot silently widen the gate.
 GRADUAL_PROOF_ACTION = ("TogetherWeOwn/.github/actions/gradual-promote"
-                        "@89c290be20c0044efaf6916f28341c76e75fff06")
+                        "@2ef8ad6447e11d019ac3098bcfd011193b75266a")
 GRADUAL_PROOF_WORKER = "two-bot-next-gradual-proof"
 GRADUAL_PROOF_WITH = {
     "worker-name": GRADUAL_PROOF_WORKER,
@@ -3685,6 +3685,8 @@ def staging_callee_window_errors(name, workflow, consumer):
     expected_inputs = {key: {"type": "string", "required": "true"} for key in STAGING_USE_INPUTS}
     if prepared:
         expected_inputs["deploy_staging_call"] = {"type": "boolean", "required": "false", "default": "false"}
+    if name == "voice-synthetic.yml":
+        expected_inputs["artifact_invocation"] = {"type": "string", "required": "false", "default": ""}
     if inputs != expected_inputs:
         errors.append(f"{name}: workflow_call inputs must match the exact grant and call-mode profile")
     if workflow.get("concurrency") != {"group": STAGING_CALLEE_GROUPS[name], "cancel-in-progress": "false"}:
@@ -3698,7 +3700,9 @@ def staging_callee_window_errors(name, workflow, consumer):
         errors.append(f"{name}: jobs must be exactly {sorted(expected_jobs)}")
     if prepared:
         refusal = {"needs": ["staging-window", consumer, "staging-use-release"],
-                   "if": "always() && inputs.deploy_staging_call && github.run_attempt > 1",
+                   "if": "always() && inputs.deploy_staging_call && (github.run_attempt > 1 || "
+                         "inputs.staging_use_expires_at == '' || inputs.staging_use_sha == '' || "
+                         "inputs.staging_use_deployment == '')",
                    "permissions": {}, "runs-on": "ubuntu-latest",
                    "timeout-minutes": "5" if name == "help-embed-synthetic.yml" else "1",
                    "steps": [{"run": "exit 1"}]}
@@ -3716,7 +3720,9 @@ def staging_callee_window_errors(name, workflow, consumer):
         errors.append(f"{name}:staging-window: unexpected job keys")
     window_if = "github.ref == 'refs/heads/main'"
     if prepared:
-        window_if += " && (!inputs.deploy_staging_call || github.run_attempt == 1)"
+        window_if += (" && (!inputs.deploy_staging_call || (github.run_attempt == 1 && "
+                      "inputs.staging_use_expires_at != '' && inputs.staging_use_sha != '' && "
+                      "inputs.staging_use_deployment != ''))")
     if window.get("if") != window_if:
         errors.append(f"{name}:staging-window: must run only from main with the required attempt guard")
     if window.get("environment") != "staging":
@@ -3737,8 +3743,10 @@ def staging_callee_window_errors(name, workflow, consumer):
         checkout, node, first, second, upload = steps
         # The begin/ready guards are disjoint, so either order is equivalent.
         ready, begin = (first, second) if str(first.get("run", "")).endswith(" ready") else (second, first)
-        if {key: value for key, value in upload.items() if key != "name"} != staging_receipt_upload(
-                kind, "start", STAGING_USE_RECEIPT):
+        expected_upload = staging_receipt_upload(kind, "start", STAGING_USE_RECEIPT)
+        if name == "voice-synthetic.yml":
+            expected_upload["with"]["name"] += "${{ inputs.artifact_invocation != '' && format('-{0}', inputs.artifact_invocation) || '' }}"
+        if {key: value for key, value in upload.items() if key != "name"} != expected_upload:
             errors.append(f"{name}:staging-window: must always upload the start receipt for 14 days, "
                           "failing on a missing file")
         if checkout != {"uses": STAGING_CHECKOUT_USES,
@@ -3747,7 +3755,7 @@ def staging_callee_window_errors(name, workflow, consumer):
         if node != {"uses": STAGING_SETUP_NODE_USES,
                     "with": {"node-version": "22", "package-manager-cache": "false"}}:
             errors.append(f"{name}:staging-window: second step must be the pinned setup-node on Node 22")
-        if set(ready) - {"name"} != {"if", "env", "run"} or ready.get("if") != "inputs.staging_use_expires_at != ''" \
+        if set(ready) - {"name"} != {"if", "env", "run"} or ready.get("if") != "(inputs.deploy_staging_call || inputs.staging_use_expires_at != '')" \
                 or ready.get("run") != "node wrangler/scripts/staging-use.mjs ready" or ready.get("env") != {
                     **STAGING_CONTROL_ENV,
                     "STAGING_USE_SHA": "${{ inputs.staging_use_sha }}",
@@ -3758,7 +3766,7 @@ def staging_callee_window_errors(name, workflow, consumer):
                           "input with the exact input bindings")
         step_id = begin.get("id")
         if set(begin) - {"name"} != {"id", "if", "env", "run"} or not step_id \
-                or begin.get("if") != "inputs.staging_use_expires_at == ''" \
+                or begin.get("if") != "inputs.staging_use_expires_at == '' && !inputs.deploy_staging_call" \
                 or begin.get("run") != "node wrangler/scripts/staging-use-pipeline.mjs begin" or begin.get("env") != {
                     **STAGING_CONTROL_ENV, "STAGING_USE_MINUTES": "45",
                     "STAGING_USE_RECEIPT": STAGING_USE_RECEIPT}:
@@ -3781,9 +3789,9 @@ def staging_callee_window_errors(name, workflow, consumer):
     if not isinstance(needs, list) or set(needs) != {"staging-window", consumer} or len(needs) != 2:
         errors.append(f"{name}:staging-use-release: must need exactly staging-window and {consumer}")
     conjuncts = str(release.get("if") or "").split(" && ")
-    expected = {"always()", "github.ref == 'refs/heads/main'", "inputs.staging_use_expires_at == ''",
-                f"needs.staging-window.outputs.{output_name} != ''"}
-    if output_name is None or len(conjuncts) != 4 or set(conjuncts) != expected:
+    expected = {"always()", "github.ref == 'refs/heads/main'", "!inputs.deploy_staging_call",
+                "inputs.staging_use_expires_at == ''", f"needs.staging-window.outputs.{output_name} != ''"}
+    if output_name is None or len(conjuncts) != 5 or set(conjuncts) != expected:
         errors.append(f"{name}:staging-use-release: must be always(), main-only, standalone-only and "
                       "gated on the begin output")
     if release.get("environment") != "staging":
@@ -3812,7 +3820,7 @@ def staging_callee_window_errors(name, workflow, consumer):
                     "with": {"node-version": "22", "package-manager-cache": "false"}}:
             errors.append(f"{name}:staging-use-release: second step must be the pinned setup-node on Node 22")
         if set(finish) - {"name"} != {"if", "env", "run"} \
-                or finish.get("if") != "inputs.staging_use_expires_at == ''" \
+                or finish.get("if") != "inputs.staging_use_expires_at == '' && !inputs.deploy_staging_call" \
                 or finish.get("run") != "node wrangler/scripts/staging-use-pipeline.mjs finish" or finish.get("env") != {
                     **STAGING_CONTROL_ENV,
                     "STAGING_USE_EXPIRES_AT": f"${{{{ needs.staging-window.outputs.{output_name} }}}}",
@@ -3876,6 +3884,10 @@ def voice_synthetic_errors(workflow):
     runs = [step for step in steps if "run" in step]
     if len(steps) != 3 or len(runs) != 1 or "scripts/staging_voice_synthetic.py" not in runs[0]["run"]:
         errors.append(f"{name}:synthetic: must be checkout, one Run step of the reviewed script, evidence upload")
+    if len(steps) == 3 and steps[2].get("with", {}).get("name") != (
+            "voice-synthetic-${{ github.run_id }}"
+            "${{ inputs.artifact_invocation != '' && format('-{0}', inputs.artifact_invocation) || '' }}"):
+        errors.append(f"{name}:synthetic: evidence artifact must include the optional invocation suffix")
     for step in steps:
         if "secrets." in str(step) and step is not (runs[0] if runs else None):
             errors.append(f"{name}:synthetic: only the Run step may hold a secret")
@@ -7109,6 +7121,10 @@ class WorkflowTests(unittest.TestCase):
             lambda w: w["on"].__setitem__("push", None),
             lambda w: w["jobs"]["synthetic"]["steps"][1].__setitem__("run", "wrangler deploy"),
             lambda w: w["jobs"]["synthetic"]["steps"][0].__setitem__("env", {"T": "${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}"}),
+            lambda w: w["on"]["workflow_call"]["inputs"].pop("artifact_invocation"),
+            lambda w: w["on"]["workflow_call"]["inputs"]["artifact_invocation"].update({"required": "true"}),
+            lambda w: w["jobs"]["staging-window"]["steps"][4]["with"].update({"name": "collision"}),
+            lambda w: w["jobs"]["synthetic"]["steps"][2]["with"].update({"name": "collision"}),
         ):
             changed = copy.deepcopy(synthetic)
             mutate(changed)
@@ -8373,6 +8389,18 @@ class WorkflowTests(unittest.TestCase):
                 workflows["nightly.yml"]["jobs"]["pipeline-benchmark"]["uses"] = target
                 self.assertTrue(workflow_policy_errors(workflows))
 
+    def test_shared_reusable_call_cannot_revert_to_previous_pin(self):
+        previous = {
+            ("test-guard.yml", "test-guard"): "3fffeb9f9465f371763fcc3c789ed4baefe38f95",
+            ("review-rules.yml", "review-rules"): "63699075b492914c137281acffd4c89e51cc1c4c",
+        }
+        for (name, job_id), sha in previous.items():
+            with self.subTest(workflow=name):
+                workflows = deepcopy(self.workflows)
+                job = workflows[name]["jobs"][job_id]
+                job["uses"] = job["uses"].rsplit("@", 1)[0] + "@" + sha
+                self.assertTrue(workflow_policy_errors(workflows))
+
     def test_reusable_calls_inventory_is_complete(self):
         # Deliberately independent of REUSABLE_CALLS: deleting an entry
         # must not delete its oracle.
@@ -8381,8 +8409,8 @@ class WorkflowTests(unittest.TestCase):
                                           ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                                           ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                                           ("deploy-staging.yml", "help-embed-synthetic"): "./.github/workflows/help-embed-synthetic.yml",
-                                          ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
-                                          ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@63699075b492914c137281acffd4c89e51cc1c4c",
+                                          ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
+                                          ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
                                           ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
                                           ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
                                           ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",

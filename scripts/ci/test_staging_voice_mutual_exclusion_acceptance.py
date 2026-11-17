@@ -93,6 +93,8 @@ INHERITED = {"staging_use_expires_at": "STAGING_USE_EXPIRES_AT",
 OWNERSHIP_TOKEN = "${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}"
 STANDALONE_GUARD = "inputs.staging_use_expires_at == ''"
 INHERITED_GUARD = "inputs.staging_use_expires_at != ''"
+EXPLICIT_STANDALONE_GUARD = STANDALONE_GUARD + " && !inputs.deploy_staging_call"
+EXPLICIT_INHERITED_GUARD = "(inputs.deploy_staging_call || " + INHERITED_GUARD + ")"
 MAIN_ONLY = "github.ref == 'refs/heads/main'"
 # (workflow, job) that must hold the canonical group when run standalone,
 # and whether the hold must be job-level (to keep sibling prod probes free).
@@ -140,7 +142,8 @@ STAGING_TOUCH = re.compile(r"STAGING_WORKER_URL|STAGING_OWNERSHIP_CONTROL_TOKEN|
 # The only accepted expression group forms. Anything else is unprovable and is
 # rejected on a holder and treated as holding the lock on an ancestor.
 CALLED_FORM = re.compile(
-    r"\$\{\{\s*inputs\.staging_use_expires_at\s*!=\s*''\s*&&\s*"
+    r"\$\{\{\s*(?:\(inputs\.deploy_staging_call\s*\|\|\s*inputs\.staging_use_expires_at\s*!=\s*''\)"
+    r"|inputs\.staging_use_expires_at\s*!=\s*'')\s*&&\s*"
     r"format\('([a-z0-9][a-z0-9-]*)\{0\}',\s*github\.run_id\)\s*\|\|\s*"
     r"'([A-Za-z0-9_.-]+)'\s*\}\}")
 EVENT_FORM = re.compile(r"([A-Za-z0-9_.-]*)\$\{\{\s*github\.event_name\s*\}\}")
@@ -373,7 +376,9 @@ def consumer_errors(callee_name, callee):
         for action in ("acquire", "release"):
             for step in staging_use_steps(job, action):
                 guard = bare(step.get("if"))
-                if guard != STANDALONE_GUARD and not guard.startswith(STANDALONE_GUARD + " && "):
+                explicit = "inputs.deploy_staging_call" in str(callee.get("concurrency", ""))
+                required = EXPLICIT_STANDALONE_GUARD if explicit else STANDALONE_GUARD
+                if guard != required:
                     errors.append(f"{callee_name} {job_name}: {action} can touch the caller's grant")
     consumer_name, entry = CONSUMERS[callee_name]
     consumer = jobs.get(consumer_name, {})
@@ -389,6 +394,9 @@ def consumer_errors(callee_name, callee):
         errors.append(f"{callee_name}: live consumer job holds the staging control credential")
     attempt_gate = MAIN_ONLY + " && (!inputs.deploy_staging_call || github.run_attempt == 1)"
     permitted_gates = ("", MAIN_ONLY, attempt_gate)
+    window_gate = (MAIN_ONLY + " && (!inputs.deploy_staging_call || (github.run_attempt == 1 && "
+                   "inputs.staging_use_expires_at != '' && inputs.staging_use_sha != '' && "
+                   "inputs.staging_use_deployment != ''))")
     if bare(consumer.get("if")) not in permitted_gates or "continue-on-error" in consumer:
         errors.append(f"{callee_name}: live consumer must keep the main-only, "
                       "success-gated, failure-propagating gate")
@@ -405,9 +413,9 @@ def consumer_errors(callee_name, callee):
             bound = all(str(env.get(var, "")).replace(" ", "") ==
                         f"${{{{inputs.{name}}}}}" for name, var in INHERITED.items())
             # The attempt guard also skips the consumer on a refused deploy rerun.
-            gated_off = (bare(step.get("if")) not in ("", INHERITED_GUARD)
-                         or bare(owner.get("if")) not in permitted_gates
-                         or (bare(owner.get("if")) == attempt_gate
+            gated_off = (bare(step.get("if")) not in ("", INHERITED_GUARD, EXPLICIT_INHERITED_GUARD)
+                         or bare(owner.get("if")) not in (*permitted_gates, window_gate)
+                         or (bare(owner.get("if")) in (attempt_gate, window_gate)
                              and bare(consumer.get("if")) != attempt_gate))
             if (before and bound
                     and str(env.get("OWNERSHIP_CONTROL_TOKEN", "")) == OWNERSHIP_TOKEN

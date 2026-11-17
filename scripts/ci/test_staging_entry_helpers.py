@@ -1,5 +1,7 @@
 """Offline entry, routing and cleanup checks; not Actions scheduler evidence."""
 
+import ast
+import re
 import unittest
 from copy import deepcopy
 
@@ -35,9 +37,12 @@ def assert_parent_entries(test, jobs, entries, checker, workflow, diagnostic):
 
 def assert_callee_entries(test, workflow, consumer):
     jobs = workflow["jobs"]
-    for entry in ("staging-window", consumer):
-        test.assertEqual(jobs[entry]["if"], "github.ref == 'refs/heads/main' && "
-                         "((!inputs.deploy_staging_call) || github.run_attempt == 1)", f"{entry} guard")
+    prefix = "github.ref == 'refs/heads/main' && (!inputs.deploy_staging_call || "
+    grant = " && ".join(f"inputs.{name} != ''" for name in
+                        ("staging_use_expires_at", "staging_use_sha", "staging_use_deployment"))
+    test.assertEqual(jobs["staging-window"]["if"], prefix + f"(github.run_attempt == 1 && {grant}))",
+                     "staging-window guard")
+    test.assertEqual(jobs[consumer]["if"], prefix + "github.run_attempt == 1)", f"{consumer} guard")
     test.assertEqual(workflow["on"]["workflow_call"]["inputs"]
                      ["deploy_staging_call"]["default"], "false", "callee default")
 
@@ -49,14 +54,15 @@ def assert_standalone_routing(test, workflow, selector):
     begin = next(step for step in steps if step.get("id") == "begin")
     ready = next(step for step in steps if step.get("name") == "Assert the caller's exact window and readiness")
     release = workflow["jobs"]["staging-use-release"]
-    test.assertIn(selector, workflow["concurrency"]["group"], "concurrency selector")
-    test.assertEqual(begin["if"], f"{selector} == ''", "standalone begin guard")
+    test.assertIn(f"(inputs.deploy_staging_call || {selector} != '')", workflow["concurrency"]["group"], "concurrency selector")
+    test.assertEqual(begin["if"], f"{selector} == '' && !inputs.deploy_staging_call", "standalone begin guard")
     test.assertEqual(begin["run"], "node wrangler/scripts/staging-use-pipeline.mjs begin")
-    test.assertEqual(ready["if"], f"{selector} != ''", "inherited ready guard")
+    test.assertEqual(ready["if"], f"(inputs.deploy_staging_call || {selector} != '')", "inherited ready guard")
     test.assertEqual(ready["run"], "node wrangler/scripts/staging-use.mjs ready")
     test.assertIn(f"{selector} == ''", release["if"])
-    finish = next(step for step in release["steps"] if step.get("run"))
-    test.assertEqual(finish["if"], f"{selector} == ''", "standalone finish guard")
+    finish = next(step for step in release["steps"]
+                  if step.get("name") == "Release only this standalone run's window")
+    test.assertEqual(finish["if"], f"{selector} == '' && !inputs.deploy_staging_call", "standalone finish guard")
     test.assertEqual(finish["run"], "node wrangler/scripts/staging-use-pipeline.mjs finish")
 
 
@@ -93,9 +99,12 @@ class EntryAndCleanupHelperTests(unittest.TestCase):
                                   lambda _: ["unrelated diagnostic"], workflow, diagnostic)
 
     def test_callee_and_cleanup_fixtures_reject_corruption(self):
-        guard = "github.ref == 'refs/heads/main' && ((!inputs.deploy_staging_call) || github.run_attempt == 1)"
+        guard = "github.ref == 'refs/heads/main' && (!inputs.deploy_staging_call || github.run_attempt == 1)"
+        grant = " && ".join(f"inputs.{name} != ''" for name in
+                            ("staging_use_expires_at", "staging_use_sha", "staging_use_deployment"))
+        window_guard = "github.ref == 'refs/heads/main' && (!inputs.deploy_staging_call || " + f"(github.run_attempt == 1 && {grant}))"
         workflow = {"on": {"workflow_call": {"inputs": {"deploy_staging_call": {"default": "false"}}}},
-                    "jobs": {"staging-window": {"if": guard}, "synthetic": {"if": guard},
+                    "jobs": {"staging-window": {"if": window_guard}, "synthetic": {"if": guard},
                              "staging-use-release": {"if": "always() && !inputs.deploy_staging_call",
                                                      "steps": [{"run": "node wrangler/scripts/staging-use-pipeline.mjs finish"}]},
                              "rerun-refusal": {"needs": "staging-use-release"}}}
@@ -121,7 +130,118 @@ class EntryAndCleanupHelperTests(unittest.TestCase):
             assert_callee_entries(self, changed, "synthetic")
 
 
+def condition(test, expression, context):
+    """Evaluate the limited guards used here, not the Actions scheduler."""
+    expression = re.sub(r"\b(?:inputs|github|needs)\.[\w.-]+",
+                        lambda match: repr(context.get(match[0], "")), expression)
+    expression = expression.replace("always()", "True").replace("&&", " and ").replace("||", " or ")
+    expression = re.sub(r"!(?!=)", " not ", expression).strip()
+    tree = ast.parse(expression, mode="eval")
+    allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.UnaryOp, ast.Not,
+               ast.Compare, ast.Eq, ast.NotEq, ast.Gt, ast.Constant)
+    test.assertTrue(all(isinstance(node, allowed) for node in ast.walk(tree)), expression)
+    return bool(eval(compile(tree, "<workflow guard>", "eval"), {"__builtins__": {}}))
+
+
+def assert_routing_behavior(test, workflow, called, grant, attempt, expected):
+    jobs = workflow["jobs"]
+    context = {"inputs.deploy_staging_call": called, "github.run_attempt": attempt,
+               "github.ref": "refs/heads/main", "needs.staging-window.outputs.expires_at": "owned"}
+    context.update({f"inputs.{name}": value for name, value in grant.items()})
+    window = jobs["staging-window"]
+    begin = next(step for step in window["steps"] if step.get("id") == "begin")
+    ready = next(step for step in window["steps"] if step.get("name") == "Assert the caller's exact window and readiness")
+    release = jobs["staging-use-release"]
+    finish = next(step for step in release["steps"] if step.get("name") == "Release only this standalone run's window")
+    admitted = condition(test, window["if"], context)
+    actual = (admitted, admitted and condition(test, begin["if"], context),
+              admitted and condition(test, ready["if"], context),
+              condition(test, release["if"], context) and condition(test, finish["if"], context),
+              condition(test, jobs["rerun-refusal"]["if"], context))
+    test.assertEqual(actual, expected)
+    refusal = jobs["rerun-refusal"]
+    test.assertNotIn("environment", refusal)
+    test.assertEqual(refusal.get("permissions"), {})
+    test.assertEqual(refusal["steps"], [{"run": "exit 1"}])
+
+
+class VoiceArtifactNamingTests(unittest.TestCase):
+    def test_invocations_are_distinct_and_confined_to_upload_names(self):
+        from test_workflows import load_workflows
+
+        workflow = load_workflows()["voice-synthetic.yml"]
+        self.assertEqual(workflow["on"]["workflow_call"]["inputs"]["artifact_invocation"],
+                         {"type": "string", "required": "false", "default": ""})
+        jobs = workflow["jobs"]
+        start = jobs["staging-window"]["steps"][-1]["with"]
+        voice = jobs["synthetic"]["steps"][-1]["with"]
+        suffix = "${{ inputs.artifact_invocation != '' && format('-{0}', inputs.artifact_invocation) || '' }}"
+        bases = ("staging-use-voice-start-${{ github.run_id }}-${{ github.run_attempt }}",
+                 "voice-synthetic-${{ github.run_id }}")
+        self.assertEqual((start["name"], voice["name"]), tuple(base + suffix for base in bases))
+        self.assertEqual(start["path"], "${{ runner.temp }}/staging-use.jsonl")
+        self.assertEqual(voice["path"], "voice-synthetic-${{ github.run_id }}-*.json")
+        self.assertEqual(str(jobs).count("inputs.artifact_invocation"), 4)
+        self.assertNotIn("artifact_invocation", str(jobs["staging-use-release"]))
+
+        # Model the pinned expression for one run/attempt; this is not an Actions upload.
+        def names(label):
+            endings = f"-{label}" if label else ""
+            return (f"staging-use-voice-start-42-1{endings}", f"voice-synthetic-42{endings}")
+
+        self.assertEqual(names(None), names(""))
+        self.assertEqual(names(""), ("staging-use-voice-start-42-1", "voice-synthetic-42"))
+        first, second = names("voice-1"), names("voice-2")
+        self.assertEqual(len(set(first + second)), 4)
+        self.assertEqual(len(set(names("") + names(""))), 2)  # immutable-name collision
+
+
 class StandaloneRoutingTests(unittest.TestCase):
+    def test_actual_callee_routing_and_refusal(self):
+        from test_workflows import load_workflows
+
+        fields = ("staging_use_expires_at", "staging_use_sha", "staging_use_deployment")
+        valid = dict.fromkeys(fields, "valid")
+        empty = dict.fromkeys(fields, "")
+        cases = [(False, empty, 1, (True, True, False, True, False)),
+                 (False, valid, 1, (True, False, True, False, False)),
+                 (True, valid, 1, (True, False, True, False, False)),
+                 (True, valid, 2, (False, False, False, False, True))]
+        cases += [(True, {**valid, field: ""}, 1, (False, False, False, False, True))
+                  for field in fields]
+        for name in ("voice-synthetic.yml", "help-embed-synthetic.yml"):
+            workflow = load_workflows()[name]
+            for called, grant, attempt, expected in cases:
+                with self.subTest(workflow=name, called=called, grant=grant, attempt=attempt):
+                    assert_routing_behavior(self, workflow, called, grant, attempt, expected)
+            assert_cleanup(self, workflow["jobs"], True)
+            for mutation in ("environment", "permissions", "steps"):
+                changed = deepcopy(workflow)
+                refusal = changed["jobs"]["rerun-refusal"]
+                refusal[mutation] = {"environment": "staging", "permissions": {"contents": "read"},
+                                     "steps": [{"run": "exit 0"}]}[mutation]
+                with self.subTest(workflow=name, refusal_mutation=mutation), self.assertRaises(AssertionError):
+                    assert_routing_behavior(self, changed, True, empty, 1,
+                                            (False, False, False, False, True))
+            changed = deepcopy(workflow)
+            release = changed["jobs"]["staging-use-release"]
+            release["if"] = release["if"].replace(" && !inputs.deploy_staging_call", "")
+            with self.subTest(workflow=name, cleanup="job ownership"), self.assertRaisesRegex(AssertionError, "cleanup ownership"):
+                assert_cleanup(self, changed["jobs"], True)
+            for field in fields:
+                changed = deepcopy(workflow)
+                guard = changed["jobs"]["staging-window"]["if"]
+                changed["jobs"]["staging-window"]["if"] = guard.replace(f"inputs.{field} != ''", "1 == 1")
+                with self.subTest(workflow=name, removed=field), self.assertRaises(AssertionError):
+                    assert_routing_behavior(self, changed, True, {**valid, field: ""}, 1,
+                                            (False, False, False, False, True))
+                changed = deepcopy(workflow)
+                guard = changed["jobs"]["rerun-refusal"]["if"]
+                changed["jobs"]["rerun-refusal"]["if"] = guard.replace(f"inputs.{field} == ''", "1 == 0")
+                with self.subTest(workflow=name, refusal_removed=field), self.assertRaises(AssertionError):
+                    assert_routing_behavior(self, changed, True, {**valid, field: ""}, 1,
+                                            (False, False, False, False, True))
+
     def test_real_legacy_routing_and_mutations(self):
         from test_workflows import load_workflows
 
@@ -129,10 +249,23 @@ class StandaloneRoutingTests(unittest.TestCase):
         for name in ("voice-synthetic.yml", "help-embed-synthetic.yml"):
             workflow = load_workflows()[name]
             assert_standalone_routing(self, workflow, selector)
-            for job, index, diagnostic in (("staging-window", 2, "standalone begin guard"),
-                                           ("staging-window", 3, "inherited ready guard"),
-                                           ("staging-use-release", 2, "standalone finish guard")):
+            for job, command, diagnostic in (
+                    ("staging-window", "node wrangler/scripts/staging-use-pipeline.mjs begin", "standalone begin guard"),
+                    ("staging-window", "node wrangler/scripts/staging-use.mjs ready", "inherited ready guard"),
+                    ("staging-use-release", "node wrangler/scripts/staging-use-pipeline.mjs finish", "standalone finish guard")):
                 changed = deepcopy(workflow)
-                changed["jobs"][job]["steps"][index]["if"] = "true"
-                with self.subTest(workflow=name, job=job, index=index), self.assertRaisesRegex(AssertionError, diagnostic):
+                step = next(step for step in changed["jobs"][job]["steps"] if step.get("run") == command)
+                step["if"] = "true"
+                with self.subTest(workflow=name, command=command), self.assertRaisesRegex(AssertionError, diagnostic):
                     assert_standalone_routing(self, changed, selector)
+
+            changed = deepcopy(workflow)
+            changed["jobs"]["staging-use-release"]["steps"].insert(0, {"run": "echo setup"})
+            with self.subTest(workflow=name, mutation="extra setup"):
+                assert_standalone_routing(self, changed, selector)
+
+            release = next(step for step in changed["jobs"]["staging-use-release"]["steps"]
+                           if step.get("name") == "Release only this standalone run's window")
+            release["run"] = "echo wrong release"
+            with self.subTest(workflow=name, mutation="wrong release"), self.assertRaises(AssertionError):
+                assert_standalone_routing(self, changed, selector)

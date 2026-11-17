@@ -42,7 +42,7 @@ fn invocation(id: u64, user: u64, permissions: u64, data: Value, kind: u8) -> In
         "guild_id": GUILD, "channel": {"id": CHANNEL, "type": 0},
         "member": {"user": {"id": user.to_string(), "username": "member", "discriminator": "0", "avatar": null},
             "roles": [], "joined_at": null, "deaf": false, "mute": false, "flags": 0, "permissions": permissions.to_string()},
-        "token": "lfg-mock-token", "version": 1, "entitlements": [],
+        "token": "lfg-mock-token", "version": 1, "entitlements": [], "attachment_size_limit": 10485760,
         "authorizing_integration_owners": {}, "data": data
     })).expect("wire interaction")
 }
