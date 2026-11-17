@@ -583,6 +583,12 @@ impl HyperTransport {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_guard(mut self) -> Self {
+        self.guard = Arc::new(RateLimitGuard::new(Default::default()).unwrap());
+        self
+    }
+
     fn url(&self, path: &str) -> String {
         let scheme = if self.scheme_http { "http" } else { "https" };
         format!(

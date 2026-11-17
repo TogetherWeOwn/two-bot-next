@@ -87,8 +87,9 @@ async fn admission_strict_transport_429_stalled_settlement_fences_past_lease() {
     let mock = MockDiscord::start(Reply::new(429, r#"{"retry_after":120,"global":false}"#)).await;
     let gate = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
     let other = PgSendAdmission::new(second.clone(), &token()).unwrap();
-    let transport =
-        HyperTransport::with_admission(token(), Some(mock.origin.clone()), gate).unwrap();
+    let transport = HyperTransport::with_admission(token(), Some(mock.origin.clone()), gate)
+        .unwrap()
+        .with_test_guard();
     let pending = transport
         .send_strict_request_headers(&strict_request(), deadline())
         .await
@@ -126,8 +127,9 @@ async fn admission_strict_transport_429_stalled_body_stays_fenced_until_collect(
     let mock = MockDiscord::start(reply).await;
     let gate = Arc::new(PgSendAdmission::new(db.pool().clone(), &token()).unwrap());
     let other = PgSendAdmission::new(second.clone(), &token()).unwrap();
-    let transport =
-        HyperTransport::with_admission(token(), Some(mock.origin.clone()), gate).unwrap();
+    let transport = HyperTransport::with_admission(token(), Some(mock.origin.clone()), gate)
+        .unwrap()
+        .with_test_guard();
     let pending = transport
         .send_strict_request_headers(&strict_request(), deadline())
         .await
