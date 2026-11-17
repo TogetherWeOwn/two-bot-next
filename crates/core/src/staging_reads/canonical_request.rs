@@ -139,7 +139,7 @@ pub fn request_digest(bytes: &[u8]) -> Option<String> {
     let mut hash = Sha256::new();
     hash.update(b"two.bot.staging-reads.request.v1\n");
     hash.update(bytes);
-    Some(format!("{:x}", hash.finalize()))
+    Some(hex::encode(hash.finalize()))
 }
 
 struct Cursor<'a>(&'a str);
@@ -291,15 +291,15 @@ mod tests {
             let bytes = encode_request(&request(verb)).unwrap();
             let digest = request_digest(bytes.as_bytes()).unwrap();
             assert_eq!(digest, expected);
-            assert_ne!(digest, format!("{:x}", Sha256::digest(bytes.as_bytes())));
+            assert_ne!(digest, hex::encode(Sha256::digest(bytes.as_bytes())));
             let mut manifest_domain = Sha256::new();
             manifest_domain.update(b"two.bot.staging-reads.manifest.v1\n");
             manifest_domain.update(bytes.as_bytes());
-            assert_ne!(digest, format!("{:x}", manifest_domain.finalize()));
+            assert_ne!(digest, hex::encode(manifest_domain.finalize()));
         }
         let begin = encode_request(&request(Verb::Begin)).unwrap();
         assert_eq!(
-            format!("{:x}", Sha256::digest(begin.as_bytes())),
+            hex::encode(Sha256::digest(begin.as_bytes())),
             "ca42a52aa0bce2edd1750b03192ebf73008ed7b101eb75db9adfe9e06a847975"
         );
     }
@@ -332,7 +332,7 @@ mod tests {
             let mut hash = Sha256::new();
             hash.update(b"two.bot.staging-reads.request.v1\n");
             hash.update(invalid.as_bytes());
-            assert_eq!(format!("{:x}", hash.finalize()), expected_hash);
+            assert_eq!(hex::encode(hash.finalize()), expected_hash);
             assert!(request_digest(invalid.as_bytes()).is_none());
         }
         assert!(request_digest(&vec![b' '; 16_385]).is_none());
