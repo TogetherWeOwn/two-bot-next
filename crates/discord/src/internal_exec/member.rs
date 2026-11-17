@@ -20,6 +20,29 @@ pub mod store;
 
 pub const ADD_MEMBER_TIMEOUT_MS: u64 = 1500;
 pub const ROLE_TIMEOUT_MS: u64 = 2000;
+pub const VOICE_MOVE_TIMEOUT_MS: u64 = 2000;
+
+/// A single voice move attempt; no outcome authorizes retrying the same intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceMovePatch {
+    Moved,
+    Denied,
+    Stale,
+    Limited {
+        retry_after_secs: u64,
+    },
+    /// Local admission refused before dispatch, with its provenance retained.
+    NotSent(VoiceMoveNotSent),
+    /// The effect cannot be established from the exchange.
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceMoveNotSent {
+    Blocked,
+    Storage,
+    Guard,
+}
 
 /// Keep proof of an unsent mutation until the durable caller disposes its claim.
 /// Public callers still receive the legacy scalar-only `ActionError` envelope.
@@ -217,6 +240,89 @@ impl ActionExecutor {
             .map(|m| m.roles))
     }
 
+    /// Send one bounded voice move. The receiver owns authorization and fencing.
+    pub async fn move_voice_member(
+        &self,
+        guild_id: &str,
+        member_id: &str,
+        channel_id: &str,
+    ) -> Result<VoiceMovePatch, ActionError> {
+        let request = self
+            .inner
+            .factory
+            .update_guild_member(numeric_id(guild_id)?.cast(), numeric_id(member_id)?.cast())
+            .channel_id(Some(numeric_id(channel_id)?.cast()))
+            .try_into_request()
+            .map_err(|_| {
+                ActionError::new(
+                    ErrorCode::Malformed,
+                    "Invalid Discord request",
+                    "discord_request_invalid",
+                )
+            })?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(VOICE_MOVE_TIMEOUT_MS);
+        match tokio::time::timeout_at(deadline, self.admit(&request, None)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => return Ok(VoiceMovePatch::NotSent(VoiceMoveNotSent::Guard)),
+        }
+        self.count();
+        let pending = match self
+            .inner
+            .transport
+            .send_request_headers(&request, Some(deadline))
+            .await
+        {
+            Ok(pending) => pending,
+            Err(detail) => {
+                let error = super::DiscordError::Unavailable(detail);
+                return Ok(if error.is_admission_blocked() {
+                    VoiceMovePatch::NotSent(VoiceMoveNotSent::Blocked)
+                } else if error.is_admission_storage() {
+                    VoiceMovePatch::NotSent(VoiceMoveNotSent::Storage)
+                } else {
+                    VoiceMovePatch::Unavailable
+                });
+            }
+        };
+        match pending.status {
+            403 => {
+                pending.settle_status().await;
+                Ok(VoiceMovePatch::Denied)
+            }
+            400 | 404 => {
+                pending.settle_status().await;
+                Ok(VoiceMovePatch::Stale)
+            }
+            429 | 200..=299 => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let (mut response, _) = match pending.collect_with(remaining).await {
+                    Ok(response) => response,
+                    Err(_) => return Ok(VoiceMovePatch::Unavailable),
+                };
+                if response.status == 429 {
+                    let retry = response
+                        .retry_after_header
+                        .as_deref()
+                        .and_then(|s| s.trim().parse::<f64>().ok())
+                        .filter(|s| s.is_finite() && *s >= 0.0)
+                        .unwrap_or(1.0)
+                        .ceil()
+                        .max(1.0) as u64;
+                    Ok(VoiceMovePatch::Limited {
+                        retry_after_secs: retry,
+                    })
+                } else {
+                    response.complete().await;
+                    Ok(VoiceMovePatch::Moved)
+                }
+            }
+            _ => {
+                pending.settle_status().await;
+                Ok(VoiceMovePatch::Unavailable)
+            }
+        }
+    }
+
     /// PUT /guilds/{g}/members/{u}. The token is a function argument and wire
     /// body only. Source: <https://docs.discord.com/developers/resources/guild#add-guild-member>
     pub async fn add_internal_member(
@@ -370,6 +476,53 @@ impl ActionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn move_response(response: &'static [u8]) -> VoiceMovePatch {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"}") {
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 4096);
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("PATCH /api/v10/guilds/1/members/2 "));
+            assert!(request.contains("\"channel_id\":\"3\""));
+            stream.write_all(response).await.unwrap();
+        });
+        let executor = ActionExecutor::with_proxy(
+            "fixture-bot-token".into(),
+            Some(format!("http://{address}")),
+        )
+        .unwrap();
+        let result = executor.move_voice_member("1", "2", "3").await.unwrap();
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn move_executor_classifies_receipts_and_broken_bodies() {
+        assert_eq!(
+            move_response(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").await,
+            VoiceMovePatch::Moved
+        );
+        for (response, expected) in [
+            (&b"HTTP/1.1 400 Bad Request\r\nContent-Length: 10\r\n\r\n"[..], VoiceMovePatch::Stale),
+            (&b"HTTP/1.1 403 Forbidden\r\nContent-Length: 10\r\n\r\n"[..], VoiceMovePatch::Denied),
+            (&b"HTTP/1.1 404 Not Found\r\nContent-Length: 10\r\n\r\n"[..], VoiceMovePatch::Stale),
+            (&b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n"[..], VoiceMovePatch::Unavailable),
+            (&b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n"[..], VoiceMovePatch::Unavailable),
+            (&b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1.2\r\nContent-Length: 10\r\n\r\n"[..], VoiceMovePatch::Limited { retry_after_secs: 2 }),
+        ] {
+            assert_eq!(move_response(response).await, expected);
+        }
+    }
 
     #[tokio::test]
     async fn invalid_member_request_keeps_its_redacted_error() {
