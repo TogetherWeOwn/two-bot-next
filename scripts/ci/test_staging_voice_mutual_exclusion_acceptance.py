@@ -387,9 +387,8 @@ def consumer_errors(callee_name, callee):
     text = str(consumer).lower()
     if "ownership_control" in text or "staging-use.mjs" in text:
         errors.append(f"{callee_name}: live consumer job holds the staging control credential")
-    permitted_gates = ("", MAIN_ONLY)
-    if callee_name == HELP:
-        permitted_gates += (MAIN_ONLY + " && (!inputs.deploy_staging_call || github.run_attempt == 1)",)
+    attempt_gate = MAIN_ONLY + " && (!inputs.deploy_staging_call || github.run_attempt == 1)"
+    permitted_gates = ("", MAIN_ONLY, attempt_gate)
     if bare(consumer.get("if")) not in permitted_gates or "continue-on-error" in consumer:
         errors.append(f"{callee_name}: live consumer must keep the main-only, "
                       "success-gated, failure-propagating gate")
@@ -405,10 +404,11 @@ def consumer_errors(callee_name, callee):
             env = step.get("env") or {}
             bound = all(str(env.get(var, "")).replace(" ", "") ==
                         f"${{{{inputs.{name}}}}}" for name, var in INHERITED.items())
-            # Only the inherited-path guard may skip the assert; its job keeps
-            # the plain main-only gate so a skip cannot silently skip consumers.
+            # The attempt guard also skips the consumer on a refused deploy rerun.
             gated_off = (bare(step.get("if")) not in ("", INHERITED_GUARD)
-                         or bare(owner.get("if")) not in permitted_gates)
+                         or bare(owner.get("if")) not in permitted_gates
+                         or (bare(owner.get("if")) == attempt_gate
+                             and bare(consumer.get("if")) != attempt_gate))
             if (before and bound
                     and str(env.get("OWNERSHIP_CONTROL_TOKEN", "")) == OWNERSHIP_TOKEN
                     and "continue-on-error" not in step and "continue-on-error" not in owner
@@ -943,6 +943,14 @@ class RepositoryContractTests(unittest.TestCase):
 
     def test_checked_in_workflows_meet_the_full_window_contract(self):
         self.assertEqual(lifecycle_errors(load_all()), [])
+
+    def test_prepared_window_cannot_skip_an_unguarded_consumer(self):
+        for callee, (job, _) in CONSUMERS.items():
+            workflows = load_all()
+            workflows[callee]["jobs"][job]["if"] = MAIN_ONLY
+            with self.subTest(callee=callee):
+                self.assertTrue(any(f"{callee}: no authenticated window/readiness assert" in error
+                                    for error in lifecycle_errors(workflows)))
 
 
 class LockOracleControls(unittest.TestCase):
@@ -1745,7 +1753,8 @@ class ExistingSafetyControls(unittest.TestCase):
         self.assertEqual(voice["on"]["schedule"], [{"cron": "41 */6 * * *"}])
         self.assertEqual(deploy["on"]["push"]["branches"], ["main"])
         job = voice["jobs"]["synthetic"]
-        self.assertEqual(job["if"], "github.ref == 'refs/heads/main'")
+        self.assertEqual(job["if"], "github.ref == 'refs/heads/main' && "
+                         "(!inputs.deploy_staging_call || github.run_attempt == 1)")
         self.assertEqual(job["environment"], "voice-synthetic")
         self.assertEqual(job["timeout-minutes"], "10")
         self.assertEqual(job["permissions"], {"contents": "read"})
