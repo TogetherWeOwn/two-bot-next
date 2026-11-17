@@ -134,6 +134,74 @@ mod tests {
     use crate::automod_preview_report::{audit_reason_for_verdict, preview_audit_outcome};
 
     #[test]
+    fn rate_limit_replays_each_emitted_mode_and_bucket() {
+        for mode in ["dry_run", "enforce"] {
+            for len in ["0_50", "51_500", "501_2000"] {
+                let reason = format!("filter=none;exemption=none;mode={mode};len={len}");
+                assert_eq!(
+                    replay_preview_reply("rate_limited", Some(&reason), "stored timestamp"),
+                    Some(PREVIEW_RATE_LIMITED_REPLY.to_owned())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_contradictory_rate_limit_rows_fail_closed() {
+        for reason in [
+            "",
+            "filter=none",
+            "filter=none;exemption=none;mode=dry_run",
+            "filter=none;exemption=none;mode=dry_run;len=0_50;extra=x",
+            "filter=none;exemption=none;mode=live;len=0_50",
+            "filter=none;exemption=none;mode=dry_run;len=",
+            "filter=none;exemption=none;mode=dry_run;len=unexpected",
+            "exemption=none;filter=none;mode=dry_run;len=0_50",
+            "filter:none;exemption=none;mode=dry_run;len=0_50",
+            "filter=bad_words;exemption=none;mode=dry_run;len=0_50",
+            "filter=none;exemption=bypass_role;mode=dry_run;len=0_50",
+        ] {
+            assert_eq!(
+                replay_preview_reply("rate_limited", Some(reason), "t"),
+                None
+            );
+        }
+        assert_eq!(replay_preview_reply("rate_limited", None, "t"), None);
+        assert_eq!(
+            replay_preview_reply(
+                "rate_limited",
+                Some("filter=none;exemption=none;mode=dry_run;len=0_50"),
+                ""
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn replay_outcome_support_requires_consistent_fields() {
+        let reason = Some("filter=none;exemption=none;mode=dry_run;len=0_50");
+        // Matched and exempt require a filter and exemption class respectively.
+        for outcome in ["matched", "exempt", "bogus", ""] {
+            assert_eq!(replay_preview_reply(outcome, reason, "t"), None);
+        }
+        let no_match = PreviewVerdict {
+            result: PreviewResult::NoMatch,
+            filter: None,
+            knobs: &[],
+            exemption: None,
+            dry_run: true,
+        };
+        assert_eq!(
+            replay_preview_reply("no_match", reason, "t"),
+            Some(render_preview_reply(&no_match, "t"))
+        );
+        assert_eq!(
+            replay_preview_reply("partial", reason, "t"),
+            Some(render_preview_reply(&PreviewVerdict::partial(true), "t"))
+        );
+    }
+
+    #[test]
     fn reason_parse_accepts_only_the_emitted_shape() {
         let parsed = parse_preview_reason("filter=bad_words;exemption=none;mode=dry_run;len=0_50")
             .expect("emitted shape parses");
