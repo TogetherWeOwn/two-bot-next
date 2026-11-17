@@ -588,7 +588,7 @@ async fn creation_and_close_still_require_manage_events_at_the_router() {
             "id": id.to_string(), "application_id":"1111", "type":2, "guild_id":GUILD,
             "channel":{"id":CHANNEL,"type":0}, "member":{"user":{"id":OWNER,"username":"member","discriminator":"0","avatar":null},
                 "roles":[],"joined_at":null,"deaf":false,"mute":false,"flags":0,"permissions":"0"},
-            "token":"offline-interaction-token", "version":1, "entitlements":[],
+            "token":"offline-interaction-token", "version":1, "entitlements":[], "attachment_size_limit":10485760,
             "authorizing_integration_owners":{}, "data":{"id":"1","name":name,"type":1,"options":options}
         })).expect("wire interaction");
         results.push(rt.handle(&interaction).await);

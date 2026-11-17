@@ -24,7 +24,7 @@ fn invocation(id: u64, name: &str, options: Vec<Value>, permissions: u64) -> Int
         "member": {"user": {"id": "3333", "username": "editor", "discriminator": "0", "avatar": null},
             "roles": [], "joined_at": null, "deaf": false, "mute": false, "flags": 0,
             "permissions": permissions.to_string()},
-        "token": format!("seat-fixture-{id}"), "version": 1, "entitlements": [],
+        "token": format!("seat-fixture-{id}"), "version": 1, "entitlements": [], "attachment_size_limit": 10485760,
         "authorizing_integration_owners": {},
         "data": {"id": "1", "name": name, "type": 1, "options": options}
     }))
