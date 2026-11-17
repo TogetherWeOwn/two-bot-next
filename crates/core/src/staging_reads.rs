@@ -1,7 +1,11 @@
 //! Inert staging-read lifecycle vocabulary; this does not admit or perform reads.
 
+pub mod canonical_candidate;
+pub mod canonical_lifecycle;
+pub mod canonical_owner;
 pub mod canonical_prefix;
 pub mod canonical_tail;
+pub mod canonical_time;
 
 /// The lifecycle phase of a counted staging-read measurement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

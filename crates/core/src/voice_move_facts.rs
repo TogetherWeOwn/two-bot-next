@@ -11,6 +11,33 @@ pub struct GuildRoleFact {
     pub permissions: u64,
 }
 
+/// Parse one Discord overwrite. An unreadable entry must not become an absent overwrite.
+pub fn parse_override(value: &serde_json::Value) -> Option<ChannelOverride> {
+    fn decimal(value: &serde_json::Value) -> Option<u64> {
+        let text = value.as_str()?;
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        text.parse().ok()
+    }
+
+    let id = decimal(value.get("id")?)?;
+    if id == 0 {
+        return None;
+    }
+    let kind = match value.get("type")?.as_u64()? {
+        0 => OverrideKind::Role,
+        1 => OverrideKind::Member,
+        _ => return None,
+    };
+    Some(ChannelOverride {
+        id,
+        kind,
+        allow: decimal(value.get("allow")?)?,
+        deny: decimal(value.get("deny")?)?,
+    })
+}
+
 /// Effective channel permission for one user: guild base (@everyone plus held
 /// roles), then the @everyone overwrite, the combined role overwrites, then
 /// the member overwrite. The owner and `ADMINISTRATOR` holders get everything.

@@ -1,5 +1,46 @@
 use super::*;
-use crate::voice_permissions::PERM_CONNECT;
+use crate::voice_permissions::{PERM_CONNECT, PERM_VIEW_CHANNEL};
+
+#[test]
+fn override_parsing_rejects_shapes_it_cannot_prove() {
+    let role = serde_json::json!({"id": "20", "type": 0, "allow": "1048576", "deny": "0"});
+    assert_eq!(
+        parse_override(&role),
+        Some(ChannelOverride {
+            id: 20,
+            kind: OverrideKind::Role,
+            allow: PERM_CONNECT,
+            deny: 0,
+        })
+    );
+    let member = serde_json::json!({"id": "7", "type": 1, "allow": "0", "deny": "1024"});
+    assert_eq!(
+        parse_override(&member),
+        Some(ChannelOverride {
+            id: 7,
+            kind: OverrideKind::Member,
+            allow: 0,
+            deny: PERM_VIEW_CHANNEL,
+        })
+    );
+    for bad in [
+        serde_json::json!(null),
+        serde_json::json!({"id": "0", "type": 0, "allow": "0", "deny": "0"}),
+        serde_json::json!({"id": "20", "type": 7, "allow": "0", "deny": "0"}),
+        serde_json::json!({"id": "nope", "type": 0, "allow": "0", "deny": "0"}),
+        serde_json::json!({"id": "20", "type": 1, "allow": "1048576"}),
+        serde_json::json!({"id": "20", "type": 0, "allow": "0x10", "deny": "0"}),
+        serde_json::json!({"id": 20, "type": 0, "allow": "0", "deny": "0"}),
+        serde_json::json!({"id": "20", "type": "0", "allow": "0", "deny": "0"}),
+        serde_json::json!({"id": "20", "type": 0, "allow": 0, "deny": "0"}),
+        serde_json::json!({"id": "20", "type": 0, "allow": "", "deny": "0"}),
+        serde_json::json!({"id": "+20", "type": 0, "allow": "0", "deny": "0"}),
+        serde_json::json!({"id": "20", "type": 0, "allow": (u128::from(u64::MAX) + 1).to_string(), "deny": "0"}),
+        serde_json::json!({"id": "20", "type": 0, "allow": "0", "deny": "-1"}),
+    ] {
+        assert_eq!(parse_override(&bad), None, "{bad}");
+    }
+}
 
 #[test]
 fn permission_order_follows_discord_not_array_order() {

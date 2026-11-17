@@ -147,14 +147,17 @@ async fn ownership_gate_refusals_use_classified_embeds() {
             ("reclaim", vec![]),
             ("transfer", vec![user_option("member", 301)]),
         ] {
-            let runtime = gated_runtime(Trace::default(), controls.clone(), error);
+            let trace = Trace::default();
+            let runtime = gated_runtime(trace.clone(), controls.clone(), error);
             let mut interaction =
                 voice_interaction_as(Some(command_data(name, options)), None, MEMBER);
             interaction.member.as_mut().unwrap().roles.clear();
-            let (_, response) = handle_capture(&runtime, &interaction).await;
+            let (handled, response) = handle_capture(&runtime, &interaction).await;
+            assert!(handled);
             let response = response.expect("gate reply");
             assert_limit_embed(&response, kind, text);
             assert!(limit_completion_embed(&interaction, &response).is_some());
+            assert!(limit_writes(&trace).is_empty());
         }
     }
 }
