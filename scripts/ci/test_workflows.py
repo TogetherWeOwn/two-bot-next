@@ -10247,7 +10247,11 @@ class WorkflowTests(unittest.TestCase):
                     if "uses" in job:
                         # The called workflow's own jobs are checked here too.
                         self.assertNotIn("runs-on", job)
-                        self.assertEqual(job["uses"], REUSABLE_CALLS[(name, job_id)])
+                        if (name, job_id) == (DISABLED_MEASUREMENT, "voice-first"):
+                            self.assertTrue(is_disabled_scaffold(workflow))
+                            self.assertEqual(job["uses"], "./.github/workflows/voice-synthetic.yml")
+                        else:
+                            self.assertEqual(job["uses"], REUSABLE_CALLS[(name, job_id)])
                         continue
                     if (name, job_id) == ("deploy-staging.yml", "certify-promotion"):
                         # Artifact-only certification still uses the direct

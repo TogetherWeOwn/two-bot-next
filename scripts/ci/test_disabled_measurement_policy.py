@@ -18,9 +18,9 @@ TARGET = "./.github/workflows/voice-synthetic.yml"
 
 def scaffold():
     jobs = {name: {"if": guard} for name, guard in GUARDS.items()}
-    jobs["staging-window"]["environment"] = "staging"
+    jobs["staging-window"].update({"environment": "staging", "runs-on": "ubuntu-latest"})
     jobs["voice-first"]["uses"] = TARGET
-    jobs["staging-use-release"]["environment"] = "staging"
+    jobs["staging-use-release"].update({"environment": "staging", "runs-on": "ubuntu-latest"})
     return {"on": {"workflow_dispatch": ""}, "permissions": {},
             "concurrency": {"group": "voice-rest-measurement-disabled",
                             "cancel-in-progress": "false"}, "jobs": jobs}
@@ -68,6 +68,23 @@ class DisabledMeasurementPolicyTests(unittest.TestCase):
         wfs["check.yml"]["jobs"]["unexpected-caller"] = {"uses": TARGET}
         self.assertTrue(policy.workflow_policy_errors(wfs))
         self.assertTrue(lifecycle.lifecycle_errors(wfs))
+
+    def test_repository_runner_policy_accepts_only_the_disabled_pinned_call(self):
+        check = policy.WorkflowTests("test_public_hosted_runner_and_service_isolation")
+        check.workflows = {WORKFLOW: scaffold()}
+        check.test_public_hosted_runner_and_service_isolation()
+        for mutation in ("activation", "target", "runner"):
+            with self.subTest(mutation=mutation):
+                candidate = scaffold()
+                if mutation == "activation":
+                    candidate["jobs"]["staging-window"]["if"] = "${{ true }}"
+                elif mutation == "target":
+                    candidate["jobs"]["voice-first"]["uses"] = "./.github/workflows/other.yml"
+                else:
+                    candidate["jobs"]["voice-first"]["runs-on"] = "ubuntu-latest"
+                check.workflows = {WORKFLOW: candidate}
+                with self.assertRaises(AssertionError):
+                    check.test_public_hosted_runner_and_service_isolation()
 
     def test_runner_pin_rejects_changed_target_and_runner(self):
         text = ("jobs:\n  voice-first:\n"
