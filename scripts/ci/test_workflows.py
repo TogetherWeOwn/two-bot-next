@@ -145,9 +145,9 @@ REUSABLE_CALLS = {("nightly.yml", "pipeline-benchmark"): "./.github/workflows/pi
                    # After every staging deploy; its failure fails deploy-staging (promotion gate).
                    ("deploy-staging.yml", "help-embed-synthetic"): "./.github/workflows/help-embed-synthetic.yml",
                    # SDLC separation gate: org reusable, warn mode, pinned SHA.
-                   ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
+                   ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
                    # Read-only shadow engine, pinned to the published central merge commit.
-                   ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@63699075b492914c137281acffd4c89e51cc1c4c",
+                   ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
                    # SDLC 2.3 CI speed pilot, promoted: required check.yml
                    # caller to the shared nextest lane (local path until
                    # the central move).
@@ -2587,7 +2587,7 @@ def staging_ownership_status_errors(workflow):
 # before repinning). Every error-rate input stays explicit so a central
 # default change cannot silently widen the gate.
 GRADUAL_PROOF_ACTION = ("TogetherWeOwn/.github/actions/gradual-promote"
-                        "@89c290be20c0044efaf6916f28341c76e75fff06")
+                        "@2ef8ad6447e11d019ac3098bcfd011193b75266a")
 GRADUAL_PROOF_WORKER = "two-bot-next-gradual-proof"
 GRADUAL_PROOF_WITH = {
     "worker-name": GRADUAL_PROOF_WORKER,
@@ -8389,6 +8389,18 @@ class WorkflowTests(unittest.TestCase):
                 workflows["nightly.yml"]["jobs"]["pipeline-benchmark"]["uses"] = target
                 self.assertTrue(workflow_policy_errors(workflows))
 
+    def test_shared_reusable_call_cannot_revert_to_previous_pin(self):
+        previous = {
+            ("test-guard.yml", "test-guard"): "3fffeb9f9465f371763fcc3c789ed4baefe38f95",
+            ("review-rules.yml", "review-rules"): "63699075b492914c137281acffd4c89e51cc1c4c",
+        }
+        for (name, job_id), sha in previous.items():
+            with self.subTest(workflow=name):
+                workflows = deepcopy(self.workflows)
+                job = workflows[name]["jobs"][job_id]
+                job["uses"] = job["uses"].rsplit("@", 1)[0] + "@" + sha
+                self.assertTrue(workflow_policy_errors(workflows))
+
     def test_reusable_calls_inventory_is_complete(self):
         # Deliberately independent of REUSABLE_CALLS: deleting an entry
         # must not delete its oracle.
@@ -8397,8 +8409,8 @@ class WorkflowTests(unittest.TestCase):
                                           ("release.yml", "release-sbom"): "./.github/workflows/sbom.yml",
                                           ("deploy-staging.yml", "voice-synthetic"): "./.github/workflows/voice-synthetic.yml",
                                           ("deploy-staging.yml", "help-embed-synthetic"): "./.github/workflows/help-embed-synthetic.yml",
-                                          ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@3fffeb9f9465f371763fcc3c789ed4baefe38f95",
-                                          ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@63699075b492914c137281acffd4c89e51cc1c4c",
+                                          ("test-guard.yml", "test-guard"): "TogetherWeOwn/.github/.github/workflows/test-guard.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
+                                          ("review-rules.yml", "review-rules"): "TogetherWeOwn/.github/.github/workflows/review-rules.yml@2ef8ad6447e11d019ac3098bcfd011193b75266a",
                                           ("check.yml", "nextest"): "./.github/workflows/reusable-rust-nextest.yml",
                                           ("pr-size.yml", "pr-size"): "TogetherWeOwn/.github/.github/workflows/pr-size.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
                                           ("pr-size.yml", "pr-size-gate"): "TogetherWeOwn/.github/.github/workflows/pr-size-gate.yml@ac9ce8d63e0cebd19ede904ac79137190c329964",
