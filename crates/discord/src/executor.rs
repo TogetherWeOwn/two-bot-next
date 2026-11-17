@@ -4800,10 +4800,10 @@ mod tests {
             request.method(),
             request.path().to_owned(),
         )
-        .headers([(
+        .headers(std::iter::once((
             hyper::header::AUTHORIZATION,
             hyper::header::HeaderValue::from_static("fixture"),
-        )])
+        )))
         .build()
         .unwrap();
         assert!(matches!(
