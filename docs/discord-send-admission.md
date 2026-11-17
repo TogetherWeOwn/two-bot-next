@@ -159,10 +159,10 @@ capability does not enable or wire a new sender.
 
 If a strict claim is acknowledged after the attempt deadline, the transport
 refuses before starting the request and leaves the claim armed. The opt-in
-response observer sees status, retry timing from headers and any collected body
-before durable completion. Observed evidence does not confirm settlement: the
-same absolute deadline bounds completion and unconfirmed attempts are not
-retried. Ordinary collection and automatic settlement remain unchanged.
+strict response observer sees status, header retry timing and any collected
+body. Only crate-internal receipt code can confirm a successful mutation.
+Storage is not polled or confirmed at or after the same absolute cutoff;
+observed evidence does not authorize retry. Default settlement is unchanged.
 
 An ordinary held lane carries a 60 s self-heal lease (`in_flight_since_ms`, migration
 0419, constant `IN_FLIGHT_LEASE_MS`). The next `admit` past the lease reclaims
