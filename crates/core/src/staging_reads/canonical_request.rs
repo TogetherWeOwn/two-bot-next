@@ -237,103 +237,129 @@ mod tests {
         }
     }
 
+    // These files are the exact synthetic packet bytes, with no final LF.
+    const BEGIN: &str = include_str!("../../tests/fixtures/counted_read_begin.json");
+    const READ: &str = include_str!("../../tests/fixtures/counted_read_read.json");
+    const REQUEST_VECTORS: [(Verb, &str, usize, &str); 5] = [
+        (
+            Verb::Challenge,
+            include_str!("../../tests/fixtures/counted_read_challenge.json"),
+            1025,
+            "ebb43f5d18e6bdc4dbe2ba88f7718e91f9a3511744ef783e362acf21c1c4204d",
+        ),
+        (
+            Verb::Begin,
+            BEGIN,
+            1113,
+            "7382de091efcf9cadbc53e0a5a579ef7a203a3d31424ef8bb79bb1444a86cbf9",
+        ),
+        (
+            Verb::Read,
+            READ,
+            1111,
+            "26eb806bdc541bdb431e37bdf373a7c56fb5cb1ab62d004674094ab413aa429f",
+        ),
+        (
+            Verb::Status,
+            include_str!("../../tests/fixtures/counted_read_status.json"),
+            1123,
+            "cd08bf49580dd2f80df6b53c28e517abf5073ab654cf001e517677c9c3d0ae1e",
+        ),
+        (
+            Verb::Close,
+            include_str!("../../tests/fixtures/counted_read_close.json"),
+            1113,
+            "35f99ad1084416feb0a915d20ee1675cdb88acfa2bbf26bd132daaa8f91936b3",
+        ),
+    ];
+
     #[test]
     fn contract_request_vectors() {
-        for (verb, name, identity, index, query, length) in [
-            (Verb::Challenge, "challenge", "null,\"incarnation\":null", "null", "null", 1025),
-            (Verb::Begin, "begin", "\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"incarnation\":\"000000010000000200000003ffffffff\"", "null", "null", 1113),
-            (Verb::Read, "read", "\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"incarnation\":\"000000010000000200000003ffffffff\"", "\"0\"", "null", 1111),
-            (Verb::Status, "status", "\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"incarnation\":\"000000010000000200000003ffffffff\"", "null", "\"measurement\"", 1123),
-            (Verb::Close, "close", "\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"incarnation\":\"000000010000000200000003ffffffff\"", "null", "null", 1113),
-        ] {
-            let expected = format!(concat!(
-                "{{\"v\":\"1\",\"verb\":\"{}\",\"environment\":\"staging\",\"repository_id\":\"1396224242\",",
-                "\"repository_owner_id\":\"319943574\",\"workflow_ref\":\"TogetherWeOwn/two-bot-next/.github/workflows/deploy-production.yml@refs/heads/main\",",
-                "\"tooling_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"event_name\":\"workflow_dispatch\",",
-                "\"caller_run_id\":\"100\",\"caller_run_attempt\":\"1\",\"candidate_run_id\":\"99\",\"candidate_run_attempt\":\"2\",",
-                "\"candidate_sha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"build_id\":\"99-2\",\"worker_version_id\":\"fixture_deployment\",",
-                "\"image_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",",
-                "\"owner_deployment_id\":\"fixture_deployment\",\"owner_epoch\":\"1\",\"lifecycle_run_id\":\"100\",\"lifecycle_run_attempt\":\"1\",",
-                "\"acquired_at_ms\":\"1794855600000\",\"expires_at_ms\":\"1794858000000\",\"staging_application_id\":\"1469137636663758888\",",
-                "\"staging_guild_id\":\"1545644954272137297\",\"challenge\":{},\"manifest_sha256\":\"0f1f9821354531dc6aedd4ee10c3ddc365e0032ac557aace69a1a76d7fbd6e1c\",\"index\":{},\"query\":{}}}"
-            ), name, identity, index, query);
-            assert_eq!(expected.len(), length);
-            assert_eq!(encode_request(&request(verb)).as_deref(), Some(expected.as_str()));
+        for (verb, expected, length, _) in REQUEST_VECTORS {
+            assert_eq!(expected.len(), length, "{verb:?}");
+            assert_eq!(
+                encode_request(&request(verb)).as_deref(),
+                Some(expected),
+                "{verb:?}"
+            );
             let decoded = decode_request(expected.as_bytes()).expect("canonical vector");
-            assert_eq!(encode_request(&decoded).as_deref(), Some(expected.as_str()));
+            let input = request(verb);
+            assert_eq!(decoded.prefix.verb, verb);
+            assert_eq!(decoded.tail.verb, verb);
+            assert_eq!(decoded.tail.challenge, input.tail.challenge);
+            assert_eq!(decoded.tail.incarnation, input.tail.incarnation);
+            assert_eq!(decoded.tail.manifest_sha256, MANIFEST);
+            assert_eq!(decoded.tail.index, input.tail.index);
+            assert_eq!(decoded.tail.query, input.tail.query);
+            assert_eq!(
+                encode_request(&decoded).as_deref(),
+                Some(expected),
+                "{verb:?}"
+            );
         }
     }
 
     #[test]
     fn request_domain_digest_vectors_and_wrong_domains() {
-        for (verb, expected) in [
-            (
-                Verb::Challenge,
-                "ebb43f5d18e6bdc4dbe2ba88f7718e91f9a3511744ef783e362acf21c1c4204d",
-            ),
-            (
-                Verb::Begin,
-                "7382de091efcf9cadbc53e0a5a579ef7a203a3d31424ef8bb79bb1444a86cbf9",
-            ),
-            (
-                Verb::Read,
-                "26eb806bdc541bdb431e37bdf373a7c56fb5cb1ab62d004674094ab413aa429f",
-            ),
-            (
-                Verb::Status,
-                "cd08bf49580dd2f80df6b53c28e517abf5073ab654cf001e517677c9c3d0ae1e",
-            ),
-            (
-                Verb::Close,
-                "35f99ad1084416feb0a915d20ee1675cdb88acfa2bbf26bd132daaa8f91936b3",
-            ),
-        ] {
-            let bytes = encode_request(&request(verb)).unwrap();
-            let digest = request_digest(bytes.as_bytes()).unwrap();
-            assert_eq!(digest, expected);
-            assert_ne!(digest, hex::encode(Sha256::digest(bytes.as_bytes())));
+        for (verb, fixture, _, expected) in REQUEST_VECTORS {
+            let bytes = fixture.as_bytes();
+            let digest = request_digest(bytes).expect("canonical vector digest");
+            assert_eq!(digest, expected, "{verb:?}");
+            assert_ne!(digest, hex::encode(Sha256::digest(bytes)));
             let mut manifest_domain = Sha256::new();
             manifest_domain.update(b"two.bot.staging-reads.manifest.v1\n");
-            manifest_domain.update(bytes.as_bytes());
+            manifest_domain.update(bytes);
             assert_ne!(digest, hex::encode(manifest_domain.finalize()));
         }
-        let begin = encode_request(&request(Verb::Begin)).unwrap();
         assert_eq!(
-            hex::encode(Sha256::digest(begin.as_bytes())),
+            hex::encode(Sha256::digest(BEGIN.as_bytes())),
             "ca42a52aa0bce2edd1750b03192ebf73008ed7b101eb75db9adfe9e06a847975"
         );
     }
 
     #[test]
     fn request_digest_refuses_noncanonical_exact_vectors() {
-        let begin = encode_request(&request(Verb::Begin)).unwrap();
-        for (invalid, expected_hash) in [
+        for (label, invalid, length, expected_hash) in [
             (
-                format!("{begin}\n"),
+                "N1-final-LF",
+                format!("{BEGIN}\n"),
+                1114,
                 "f6d9714b2b91ddcffb6cb78da4b56fae860ca57791450667a6eb9ab82044d478",
             ),
             (
-                begin.replacen("\"v\":\"1\"", "\"v\":\"\\u0031\"", 1),
+                "N2-escaped-v",
+                BEGIN.replacen(r#""v":"1""#, r#""v":"\u0031""#, 1),
+                1118,
                 "58cfe5a37b206022e1b61b5cf943e7c05e81b4009ecb74a21eb38c0aa1cad4e0",
             ),
             (
-                begin.replacen("\"owner_epoch\":\"1\"", "\"owner_epoch\":1", 1),
+                "N3-numeric-epoch",
+                BEGIN.replacen(r#""owner_epoch":"1""#, r#""owner_epoch":1"#, 1),
+                1111,
                 "680f1dceb6686cd1d2e52bb18f72b4debd43e5214e5b3a80f65ee686038fc623",
             ),
             (
-                begin.replacen('{', "{\"v\":\"1\",", 1),
+                "N4-duplicate-v",
+                BEGIN.replacen('{', r#"{"v":"1","#, 1),
+                1121,
                 "0722d1252ae714fa811e50781597338430c27c26fcd79e8d009e3aca3644440f",
             ),
             (
-                begin.replacen('{', "{ ", 1),
+                "N5-space",
+                BEGIN.replacen('{', "{ ", 1),
+                1114,
                 "3b9bb442eebf088e5884d52d90125ea71c71756669cfcb313ed389ef52ef5d62",
             ),
         ] {
+            let bytes = invalid.as_bytes();
+            assert_eq!(bytes.len(), length, "{label}");
+            // A raw domain hash exists even for malformed bytes; the protocol API must refuse.
             let mut hash = Sha256::new();
             hash.update(b"two.bot.staging-reads.request.v1\n");
-            hash.update(invalid.as_bytes());
-            assert_eq!(hex::encode(hash.finalize()), expected_hash);
-            assert!(request_digest(invalid.as_bytes()).is_none());
+            hash.update(bytes);
+            assert_eq!(hex::encode(hash.finalize()), expected_hash, "{label}");
+            assert!(decode_request(bytes).is_none(), "{label}");
+            assert!(request_digest(bytes).is_none(), "{label}");
         }
         assert!(request_digest(&vec![b' '; 16_385]).is_none());
         assert!(request_digest(&[0xff]).is_none());
@@ -341,14 +367,7 @@ mod tests {
 
     #[test]
     fn decoder_rejects_noncanonical_and_invalid_inputs_for_every_verb() {
-        for verb in [
-            Verb::Challenge,
-            Verb::Begin,
-            Verb::Read,
-            Verb::Status,
-            Verb::Close,
-        ] {
-            let valid = encode_request(&request(verb)).unwrap();
+        for (verb, valid, _, _) in REQUEST_VECTORS {
             let mutations = [
                 valid.replacen("\"v\":\"1\",", "", 1),
                 valid.replacen("\"v\":\"1\",", "\"v\":\"1\",\"v\":\"1\",", 1),
@@ -494,7 +513,7 @@ mod tests {
                     "bad/version",
                 ),
             ] {
-                let mut invalid = valid.clone();
+                let mut invalid = valid.to_owned();
                 for field in [first, second] {
                     let from = format!("\"{field}\":\"{old}\"");
                     let to = format!("\"{field}\":\"{new}\"");
@@ -558,9 +577,8 @@ mod tests {
             assert!(decode_request(&[0xff]).is_none());
             assert!(decode_request(&vec![b' '; 16_385]).is_none());
         }
-        let read = encode_request(&request(Verb::Read)).unwrap();
         for index in ["00", "+0", "40", "256"] {
-            let invalid = read.replace("\"index\":\"0\"", &format!("\"index\":\"{index}\""));
+            let invalid = READ.replace("\"index\":\"0\"", &format!("\"index\":\"{index}\""));
             assert!(decode_request(invalid.as_bytes()).is_none());
         }
     }
