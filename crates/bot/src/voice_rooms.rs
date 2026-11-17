@@ -4355,10 +4355,24 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         is_admin: bool,
         command: OwnershipCommand,
     ) -> String {
+        self.apply_ownership_classified(actor_id, is_admin, command)
+            .0
+    }
+
+    fn apply_ownership_classified(
+        &mut self,
+        actor_id: Snowflake,
+        is_admin: bool,
+        command: OwnershipCommand,
+    ) -> (String, two_bot_discord::brand::EmbedKind) {
+        use two_bot_discord::brand::EmbedKind;
         if self.halted {
-            return "Voice rooms are paused: Discord refused the bot credential. \
+            return (
+                "Voice rooms are paused: Discord refused the bot credential. \
                     Fix the token, then restart the bot."
-                .to_owned();
+                    .to_owned(),
+                EmbedKind::Danger,
+            );
         }
         let request = match command {
             OwnershipCommand::Reclaim => OwnershipRequest::Reclaim {
@@ -4375,7 +4389,10 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let (channel, room, occupants, actor_in_room) = {
             let live = self.live.read_state();
             if !live.ready {
-                return "The voice worker isn't warmed up yet — try again in a moment.".to_owned();
+                return (
+                    "The voice worker isn't warmed up yet — try again in a moment.".to_owned(),
+                    EmbedKind::Warn,
+                );
             }
             // Admins may use owner commands in any room: an admin invoking
             // `/transfer` with no tracked room of their own falls back to the
@@ -4397,17 +4414,23 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
                 (None, _, _) => None,
             };
             let Some(channel) = channel else {
-                return match command {
-                    OwnershipCommand::Reclaim => {
-                        "You need to be in a voice room to use /reclaim.".to_owned()
-                    }
-                    OwnershipCommand::Transfer { .. } => {
-                        "You need to be in a voice room to use /transfer.".to_owned()
-                    }
-                };
+                return (
+                    match command {
+                        OwnershipCommand::Reclaim => {
+                            "You need to be in a voice room to use /reclaim.".to_owned()
+                        }
+                        OwnershipCommand::Transfer { .. } => {
+                            "You need to be in a voice room to use /transfer.".to_owned()
+                        }
+                    },
+                    EmbedKind::Danger,
+                );
             };
             let Some(room) = self.rooms.get(&channel).cloned() else {
-                return "That voice channel isn't a temporary room I manage.".to_owned();
+                return (
+                    "That voice channel isn't a temporary room I manage.".to_owned(),
+                    EmbedKind::Danger,
+                );
             };
             let actor_in_room = own == Some(channel);
             (
@@ -4424,20 +4447,26 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
         let was_creator = room.original_creator_id == actor_id;
         let next = match decide_ownership(ownership, &occupants, request) {
             Ok(OwnershipDecision::Unchanged(_)) => {
-                return match command {
-                    OwnershipCommand::Reclaim => {
-                        "You're already the owner of this room.".to_owned()
-                    }
-                    OwnershipCommand::Transfer { target_id } => {
-                        format!("Ownership is already with <@{target_id}>.")
-                    }
-                };
+                return (
+                    match command {
+                        OwnershipCommand::Reclaim => {
+                            "You're already the owner of this room.".to_owned()
+                        }
+                        OwnershipCommand::Transfer { target_id } => {
+                            format!("Ownership is already with <@{target_id}>.")
+                        }
+                    },
+                    EmbedKind::Ok,
+                );
             }
             Ok(OwnershipDecision::Changed { next, .. }) => next,
             Ok(OwnershipDecision::EmptyRoom) | Err(OwnershipError::EmptyRoom) => {
-                return "There's nobody in this room right now.".to_owned();
+                return (
+                    "There's nobody in this room right now.".to_owned(),
+                    EmbedKind::Danger,
+                );
             }
-            Err(error) => return ownership_refusal(error),
+            Err(error) => return (ownership_refusal(error), EmbedKind::Danger),
         };
         let previous_owner_id = room.owner_id;
         let mut updated = room;
@@ -4457,19 +4486,24 @@ impl<S: RoomPersistence, H: RoomWrites> GuildRoomWorker<S, H> {
             .or_default()
             .push(commit_tx);
         self.pending_commit_wait = Some(commit_rx);
-        match command {
-            OwnershipCommand::Reclaim if was_creator => {
-                "You're the owner of this room again.".to_owned()
-            }
-            OwnershipCommand::Reclaim => "The room's owner is gone, so it's yours now.".to_owned(),
-            OwnershipCommand::Transfer { target_id } => {
-                if actor_in_room {
-                    format!("Transferred ownership of this room to <@{target_id}>.")
-                } else {
-                    format!("Transferred ownership of <#{channel}> to <@{target_id}>.")
+        (
+            match command {
+                OwnershipCommand::Reclaim if was_creator => {
+                    "You're the owner of this room again.".to_owned()
                 }
-            }
-        }
+                OwnershipCommand::Reclaim => {
+                    "The room's owner is gone, so it's yours now.".to_owned()
+                }
+                OwnershipCommand::Transfer { target_id } => {
+                    if actor_in_room {
+                        format!("Transferred ownership of this room to <@{target_id}>.")
+                    } else {
+                        format!("Transferred ownership of <#{channel}> to <@{target_id}>.")
+                    }
+                }
+            },
+            EmbedKind::Ok,
+        )
     }
 
     fn queue_owner_handoff(&mut self, channel_id: Snowflake, previous_owner_id: Snowflake) {
