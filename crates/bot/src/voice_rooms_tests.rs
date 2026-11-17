@@ -2654,6 +2654,128 @@ fn owned_room_for_guild(guild: u64) -> (LiveGuild, Store, Http, Trace) {
 }
 
 #[tokio::test]
+async fn ownership_classifies_outcomes_at_decision() {
+    use two_bot_discord::brand::EmbedKind;
+
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.live.write_state().ready = false;
+    let (text, kind) = worker.apply_ownership_classified(MEMBER, false, OwnershipCommand::Reclaim);
+    assert_eq!(
+        text,
+        "The voice worker isn't warmed up yet — try again in a moment."
+    );
+    assert_eq!(kind, EmbedKind::Warn);
+    worker.live.write_state().ready = true;
+    let (text, kind) = worker.apply_ownership_classified(302, false, OwnershipCommand::Reclaim);
+    assert_eq!(text, "You need to be in a voice room to use /reclaim.");
+    assert_eq!(kind, EmbedKind::Danger);
+    let (text, kind) = worker.apply_ownership_classified(301, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("original creator"));
+    assert_eq!(kind, EmbedKind::Danger);
+    let (text, kind) = worker.apply_ownership_classified(MEMBER, false, OwnershipCommand::Reclaim);
+    assert_eq!(text, "You're already the owner of this room.");
+    assert_eq!(kind, EmbedKind::Ok);
+    let (text, kind) = worker.apply_ownership_classified(
+        MEMBER,
+        false,
+        OwnershipCommand::Transfer { target_id: 301 },
+    );
+    assert_eq!(text, "Transferred ownership of this room to <@301>.");
+    assert_eq!(kind, EmbedKind::Ok);
+    worker.halted = true;
+    let (text, kind) = worker.apply_ownership_classified(MEMBER, false, OwnershipCommand::Reclaim);
+    assert!(text.starts_with("Voice rooms are paused"));
+    assert_eq!(kind, EmbedKind::Danger);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ownership_worker_routes_classification_through_commit_and_timeout() {
+    use two_bot_discord::brand::EmbedKind;
+
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    for (actor_id, command, expected) in [
+        (302, OwnershipCommand::Reclaim, EmbedKind::Danger),
+        (MEMBER, OwnershipCommand::Reclaim, EmbedKind::Ok),
+        (
+            MEMBER,
+            OwnershipCommand::Transfer { target_id: 301 },
+            EmbedKind::Ok,
+        ),
+    ] {
+        let (reply, text) = oneshot::channel();
+        let (kind, result_kind) = oneshot::channel();
+        apply_command(
+            &mut worker,
+            ActorCommand::Ownership {
+                actor_id,
+                is_admin: false,
+                command,
+                reply,
+                kind: Some(kind),
+            },
+            0,
+            &ActorInboxBackpressure::default(),
+        );
+        worker.drive_staged_ownership(0).await;
+        assert!(!text.await.unwrap().is_empty());
+        assert_eq!(result_kind.await.unwrap(), expected);
+    }
+    assert!(worker.queue.suspend(GUILD, 500));
+    let (reply, text) = oneshot::channel();
+    let (kind, result_kind) = oneshot::channel();
+    apply_command(
+        &mut worker,
+        ActorCommand::Ownership {
+            actor_id: 301,
+            is_admin: false,
+            command: OwnershipCommand::Transfer { target_id: MEMBER },
+            reply,
+            kind: Some(kind),
+        },
+        0,
+        &ActorInboxBackpressure::default(),
+    );
+    worker.drive_staged_ownership(0).await;
+    assert_eq!(text.await.unwrap(), OWNERSHIP_FINALIZING);
+    assert_eq!(result_kind.await.unwrap(), EmbedKind::Warn);
+}
+
+#[tokio::test]
+async fn classified_ownership_reaches_deferred_caller() {
+    use two_bot_discord::brand::EmbedKind;
+
+    let runtime = test_runtime(Trace::default());
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    runtime.actors.lock().unwrap().insert(
+        GUILD,
+        GuildActor {
+            live,
+            tx,
+            backpressure: ActorInboxBackpressure::default(),
+        },
+    );
+    let call = runtime.run_ownership_classified(GUILD, 302, false, OwnershipCommand::Reclaim);
+    let dispatch = async {
+        let command = rx.recv().await.unwrap();
+        apply_command(&mut worker, command, 0, &ActorInboxBackpressure::default());
+    };
+    let (result, ()) = tokio::join!(call, dispatch);
+    assert_eq!(
+        result,
+        Some((
+            "You need to be in a voice room to use /reclaim.".to_owned(),
+            EmbedKind::Danger
+        ))
+    );
+}
+
+#[tokio::test]
 async fn reclaim_hands_room_back_to_returned_creator_and_persists() {
     let (live, store, http, trace) = owned_room();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
@@ -2774,6 +2896,7 @@ async fn suspended_room_transfer_reports_finalizing_and_keeps_the_handoff_queued
             is_admin: false,
             command: OwnershipCommand::Transfer { target_id: 301 },
             reply,
+            kind: None,
         },
         0,
         &ActorInboxBackpressure::default(),
@@ -2800,6 +2923,7 @@ async fn held_owner_grant_reports_finalizing_before_the_write_finishes() {
             is_admin: false,
             command: OwnershipCommand::Transfer { target_id: 301 },
             reply,
+            kind: None,
         },
         0,
         &ActorInboxBackpressure::default(),
@@ -2854,6 +2978,7 @@ async fn held_owner_grant_with_slow_store_still_commits_after_finalizing() {
             is_admin: false,
             command: OwnershipCommand::Transfer { target_id: 301 },
             reply,
+            kind: None,
         },
         0,
         &ActorInboxBackpressure::default(),
