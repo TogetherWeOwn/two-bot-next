@@ -1032,7 +1032,11 @@ def staging_full_window_errors(workflow, name="deploy-staging.yml"):
             str(rollback[0].get("run") or "")):
         errors.append(f"{name}: rollback must use the workflow-head tooling checkout")
     declared = deploy.get("outputs") or {}
-    bound = {}
+    expected_outputs = {"staging_use_expires_at": "expires_at", "staging_use_sha": "sha",
+                        "staging_use_deployment": "deployment_id"}
+    for key, output in expected_outputs.items():
+        if declared.get(key) != f"${{{{ steps.use.outputs.{output} }}}}":
+            errors.append(f"{name}:deploy: {key} must come from the acquired window")
     for job_id, workflow_file in (("voice-synthetic", "voice-synthetic.yml"),
                                   ("help-embed-synthetic", "help-embed-synthetic.yml")):
         job = jobs.get(job_id) or {}
@@ -1044,16 +1048,11 @@ def staging_full_window_errors(workflow, name="deploy-staging.yml"):
         if set(grant) != set(STAGING_USE_INPUTS):
             errors.append(f"{name}:{job_id}: must pass exactly the three staging_use inputs")
             continue
-        for key, value in grant.items():
-            match = re.fullmatch(r"\$\{\{ needs\.deploy\.outputs\.([A-Za-z0-9_]+) \}\}", str(value))
-            if not match or match.group(1) not in declared:
-                errors.append(f"{name}:{job_id}: {key} must come only from a declared needs.deploy.outputs value")
-            else:
-                bound.setdefault(key, set()).add(match.group(1))
+        for key in STAGING_USE_INPUTS:
+            if grant[key] != f"${{{{ needs.deploy.outputs.{key} }}}}":
+                errors.append(f"{name}:{job_id}: {key} must come from the matching deploy output")
         if "concurrency" in job or job.get("uses") != f"./.github/workflows/{workflow_file}":
             errors.append(f"{name}:{job_id}: must call its reusable workflow without its own lock")
-    if any(len(names) != 1 for names in bound.values()):
-        errors.append(f"{name}: both reusable callers must pass the same deploy outputs")
     release = jobs.get("staging-use-release") or {}
     wanted = {"deploy", "voice-synthetic", "help-embed-synthetic", "user-flow-synthetic",
               "pinned-history-guard", "certify-promotion"}
@@ -7277,6 +7276,11 @@ class WorkflowTests(unittest.TestCase):
                 {"staging_use_sha": "${{ github.sha }}"}),
             "help grant undeclared output": lambda w: job(w, "help-embed-synthetic")["with"].update(
                 {"staging_use_deployment": "${{ needs.deploy.outputs.undeclared }}"}),
+            "both callers use wrong output": lambda w: [job(w, name)["with"].update(
+                {"staging_use_sha": "${{ needs.deploy.outputs.staging_use_deployment }}"})
+                for name in ("voice-synthetic", "help-embed-synthetic")],
+            "declared output detached from window": lambda w: job(w, "deploy")["outputs"].update(
+                {"staging_use_sha": "${{ github.sha }}"}),
             "voice grant dropped": lambda w: job(w, "voice-synthetic")["with"].pop("staging_use_deployment"),
             "release dropped": lambda w: w["jobs"].pop("staging-use-release"),
             "release not always": lambda w: job(w, "staging-use-release").update({"if": "success()"}),
