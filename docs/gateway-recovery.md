@@ -19,6 +19,8 @@ A crash before commit rolls the batch and checkpoint back together; a crash afte
 
 Open voice sessions are **never** restored. The existing pipeline drops them on READY and RESUMED (legacy `ShardReady`/`ShardResume`). This intentionally avoids outage-inflated durations. Twilight's channel/member cache is also cold after a process restart; this slice does not claim a fully restored cache or invite baseline. Facts, real leveling, REST side effects and invite fetching remain the existing S4/S6 seams; this transaction currently covers the S3 funnel, not arbitrary external side effects. Maintain one running shard owner per guild; overlapping independent deployments are not a supported recovery mechanism.
 
+Fresh READY revokes `voice.snapshot` eligibility for every guild, including any READY omits. A full available GuildCreate restores eligibility; partial updates do not. An unavailable GuildCreate or a GuildDelete revokes it again. RESUMED preserves existing eligibility but does not make a cold guild eligible by itself. Ineligible guilds return retryable `discord_unavailable`, not a zero count.
+
 ### Voice accounting across lifecycle gaps
 
 A guild-unavailable frame (including an unavailable `GuildCreate`) or permanent

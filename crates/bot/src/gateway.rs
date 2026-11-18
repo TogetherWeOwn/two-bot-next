@@ -2419,7 +2419,7 @@ pub async fn build_persistent_pipeline(
     guild_id: Snowflake,
     token: String,
     leveling: Option<LevelingRuntime>,
-    cache: Arc<twilight_cache_inmemory::DefaultInMemoryCache>,
+    cache: Arc<two_bot_discord::SharedCache>,
 ) -> Result<GatewayPipeline<HttpInvites>, sqlx::Error> {
     tokio::time::timeout(CHECKPOINT_IO_MAX, async {
         let buffer = GatewayFunnelBuffer::from_milestones(store.milestones().await?);

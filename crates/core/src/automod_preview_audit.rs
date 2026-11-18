@@ -8,6 +8,38 @@ use crate::automod_preview::{
 };
 use crate::automod_preview_report::{render_preview_reply, PREVIEW_RATE_LIMITED_REPLY};
 
+/// `action` column value for every preview audit row.
+pub const PREVIEW_AUDIT_ACTION: &str = "automod.preview";
+
+/// Audit-row (and advisory-lock) id for one preview attempt:
+/// `automod-preview:<interaction_id>`. The lock key and the row id are the
+/// same string, so one interaction serializes on exactly the row it claims.
+/// Callers must supply a non-empty interaction id for the id to be parseable.
+#[must_use]
+pub fn preview_audit_id(interaction_id: &str) -> String {
+    format!("automod-preview:{interaction_id}")
+}
+
+/// Inverse of [`preview_audit_id`] for non-empty interaction ids: the
+/// interaction id, or `None` when the id is not a preview claim. An empty
+/// remainder refuses; interaction ids containing colons are preserved.
+#[must_use]
+pub fn parse_preview_audit_id(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix("automod-preview:")?;
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// One visible preview audit row: outcome, reason, and the stored
+/// `created_at` text. The timestamp text is used verbatim as the reply's
+/// `current at` currency, so the first reply and every replay render the
+/// same string at database precision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewAuditRow {
+    pub outcome: String,
+    pub reason: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedPreviewReason<'a> {
     filter: &'a str,
@@ -86,6 +118,103 @@ pub fn replay_preview_reply(
         _ => return None,
     };
     Some(render_preview_reply(&verdict, created_at))
+}
+
+/// Build the [`crate::custom_commands::AuditRecord`] for one evaluated
+/// preview or in-scope rate refusal. `outcome`/`reason` come from the
+/// `preview_audit_outcome` / `audit_reason_for_verdict` builders (or the
+/// rate-limited builders). This function does not validate those strings;
+/// callers must not pass preview content. The caller supplies the winning
+/// attempt's captured UTC receipt time separately to `insert_preview_audit` (§3.1).
+#[must_use]
+pub fn preview_audit_record(
+    guild_id: &str,
+    actor_id: &str,
+    channel_id: &str,
+    outcome: &str,
+    reason: String,
+) -> crate::custom_commands::AuditRecord {
+    crate::custom_commands::AuditRecord {
+        guild_id: guild_id.to_owned(),
+        actor_id: Some(actor_id.to_owned()),
+        action: PREVIEW_AUDIT_ACTION.to_owned(),
+        target_key: Some(channel_id.to_owned()),
+        outcome: outcome.to_owned(),
+        reason: Some(reason),
+    }
+}
+
+/// Serialize one attempt by interaction id inside the caller's transaction
+/// (spec §6). Commit or rollback releases the claim. Acquisition waits for a
+/// competing transaction: the caller must set a database timeout before calling.
+#[cfg(feature = "db")]
+pub async fn lock_preview_attempt(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    interaction_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(preview_audit_id(interaction_id))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Transaction-capable replay read: `(outcome, reason, created_at)` for one
+/// audit id, on any executor — the winner's transaction connection or the
+/// pool. `Ok(None)` means no row is visible to that executor; a transaction
+/// can also see its own uncommitted insert. The existing `load_audit` takes
+/// the pool only and drops the timestamp.
+#[cfg(feature = "db")]
+pub async fn load_preview_audit<'c>(
+    executor: impl sqlx::Executor<'c, Database = sqlx::Postgres>,
+    id: &str,
+) -> Result<Option<PreviewAuditRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT outcome, reason,
+                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS created_at_text
+         FROM automation_audit_log WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(executor)
+    .await?;
+    use sqlx::Row;
+    row.map(|row| {
+        Ok(PreviewAuditRow {
+            outcome: row.try_get("outcome")?,
+            reason: row.try_get("reason")?,
+            created_at: row.try_get("created_at_text")?,
+        })
+    })
+    .transpose()
+}
+
+/// Insert one preview audit row and read back the stored timestamp
+/// (`INSERT ... RETURNING` in UTC). The caller renders both the first reply
+/// and every replay from that returned text, independent of session timezone
+/// and at database precision.
+#[cfg(feature = "db")]
+pub async fn insert_preview_audit<'c>(
+    executor: impl sqlx::Executor<'c, Database = sqlx::Postgres>,
+    record: &crate::custom_commands::AuditRecord,
+    id: &str,
+    at_iso: &str,
+) -> Result<String, sqlx::Error> {
+    let stored: String = sqlx::query_scalar(
+        "INSERT INTO automation_audit_log (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::timestamptz)
+         RETURNING to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'",
+    )
+    .bind(id)
+    .bind(&record.guild_id)
+    .bind(&record.actor_id)
+    .bind(&record.action)
+    .bind(&record.target_key)
+    .bind(&record.outcome)
+    .bind(&record.reason)
+    .bind(at_iso)
+    .fetch_one(executor)
+    .await?;
+    Ok(stored)
 }
 
 #[cfg(test)]
@@ -300,6 +429,27 @@ mod tests {
         assert_eq!(replay_preview_reply("exempt", valid, ""), None);
     }
     #[test]
+    fn audit_id_round_trip_is_strict() {
+        assert_eq!(preview_audit_id("123"), "automod-preview:123");
+        assert_eq!(parse_preview_audit_id("automod-preview:123"), Some("123"));
+        for bad in [
+            "",
+            "automod-preview:",
+            "automod-preview",
+            "custom:text:attempt:123",
+            "AUTOMOD-PREVIEW:123",
+            "automod-preview:123:extra",
+        ] {
+            if bad == "automod-preview:123:extra" {
+                // Remainder may itself contain ':'; it still parses.
+                assert_eq!(parse_preview_audit_id(bad), Some("123:extra"));
+            } else {
+                assert_eq!(parse_preview_audit_id(bad), None, "id {bad:?}");
+            }
+        }
+    }
+
+    #[test]
     fn reason_parse_accepts_only_the_emitted_shape() {
         let parsed = parse_preview_reason("filter=bad_words;exemption=none;mode=dry_run;len=0_50")
             .expect("emitted shape parses");
@@ -411,6 +561,26 @@ mod tests {
         assert_eq!(
             replay_preview_reply(preview_audit_outcome(&verdict), Some(&reason), created_at),
             Some(first)
+        );
+    }
+
+    #[test]
+    fn audit_record_carries_claim_fields() {
+        let record = preview_audit_record(
+            "guild-1",
+            "actor-1",
+            "channel-1",
+            "matched",
+            "filter=bad_words;exemption=none;mode=dry_run;len=0_50".to_owned(),
+        );
+        assert_eq!(record.action, "automod.preview");
+        assert_eq!(record.guild_id, "guild-1");
+        assert_eq!(record.actor_id.as_deref(), Some("actor-1"));
+        assert_eq!(record.target_key.as_deref(), Some("channel-1"));
+        assert_eq!(record.outcome, "matched");
+        assert_eq!(
+            record.reason.as_deref(),
+            Some("filter=bad_words;exemption=none;mode=dry_run;len=0_50")
         );
     }
 

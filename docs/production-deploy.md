@@ -541,11 +541,12 @@ Packaging unsets `WRANGLER_OUTPUT_FILE_PATH`: Wrangler's dry run writes session
 and deploy records too, and must not contaminate the real deploy's single receipt.
 Neither **Re-run all jobs** nor **Re-run failed jobs** can certify: the
 deploy-called voice and help synthetics refuse every rerun, and a partial rerun
-can also reuse earlier deploy evidence. Subject to existing holds and authorization,
-use a fresh `deploy-staging` dispatch from `main` for the exact merged 40-hex SHA,
-then wait for all qualifying jobs and release and retain the fresh receipts. The
-[staging recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics) retains
-the historical-pin limits; an older pin cannot certify a different workflow head.
+can also reuse earlier deploy evidence. Subject to existing holds and
+authorization, follow the
+[staging qualification and recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
+for the intended exact `main` SHA. An older pin cannot certify a different
+workflow head. Wait for all qualifying jobs and release, and retain the fresh
+receipts.
 
 The certificate contains only a closed version-1 receipt and `modules/`: source
 repository/SHA/run/attempt, original compiled stamps, verified staging Worker and
