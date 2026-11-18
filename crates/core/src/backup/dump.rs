@@ -431,7 +431,7 @@ pub struct RestoreReport {
     pub manifest: DumpManifest,
     pub restored: BTreeMap<String, u64>,
     pub dropped_columns: BTreeMap<String, Vec<String>>,
-    /// Schema-required baseline rows initialized when absent from an old dump.
+    /// Baseline rows initialized when the archive does not supply them.
     pub initialized_tables: BTreeMap<String, u64>,
     /// Old v3 has no acceptance/generation evidence. Never infer acceptance.
     pub missing_member_ban_ownership: bool,
@@ -467,17 +467,14 @@ impl RestoreReport {
             .tables
             .iter()
             .find(|t| t.name == table)
-            .map_or_else(
-                || self.initialized_tables.get(table).copied().unwrap_or(0),
-                |t| t.count,
-            );
+            .map_or(0, |t| t.count);
         match table {
             "voice_command_roles" => archived.saturating_sub(self.translated_voice_command_roles),
             "voice_command_role_members" => {
                 archived.saturating_sub(self.translated_voice_command_role_members)
             }
             "voice_access_controls" => archived + self.voice_access_controls_added,
-            _ => archived,
+            _ => archived + self.initialized_tables.get(table).copied().unwrap_or(0),
         }
     }
 }
@@ -486,9 +483,10 @@ impl RestoreReport {
 ///
 /// Requires a target without moderation history: overwriting destination
 /// evidence could forget a post-backup PUT/DELETE or newer permanent ban.
-/// Other bot-owned tables are replaced, not merged. One transaction protects
-/// refusal/rollback, and every imported executable expiry is quarantined:
-/// snapshot acceptance is historical evidence, not current Discord ownership.
+/// Other bot-owned rows are replaced, not merged; the installed web contract
+/// version is preserved. One transaction protects refusal/rollback, and every
+/// imported executable expiry is quarantined: snapshot acceptance is historical
+/// evidence, not current Discord ownership.
 pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbDumpError> {
     let contents: DumpContents = inspect(in_path)?;
     let manifest = contents.manifest;
@@ -547,6 +545,33 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             "destination moderation history exists; restore into a fresh migrated target, preserve the destination and reconcile both histories before enabling moderation".into(),
         ));
     }
+    // Check publication separately: unpublished targets can lack the metadata
+    // columns, which PostgreSQL would resolve before evaluating a WHERE clause.
+    let has_contract_view: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = 'contract_meta' AND c.relkind = 'v'
+              AND n.nspname::text = CASE WHEN current_schema() = 'public' THEN 'web_v1'
+                                        ELSE current_schema() || '_web_v1' END
+        )",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let installed_contract: Option<String> = if has_contract_view {
+        let version =
+            sqlx::query_scalar("SELECT contract_version FROM web_contract_meta WHERE singleton")
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    DbDumpError::Refused(
+                        "destination web contract metadata is missing; restore into a fresh migrated target with intact contract metadata".into(),
+                    )
+                })?;
+        Some(version)
+    } else {
+        None
+    };
     let mut suspended = Vec::new();
     for (table, trigger) in [
         ("guild_settings", "trg_guild_settings_revision"),
@@ -929,10 +954,29 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
         .await?;
     }
 
+    let mut initialized_tables = BTreeMap::new();
+    if let Some(version) = installed_contract {
+        // Let replay validate the whole archived row first. Restore only the
+        // destination's version, leaving guild_id from replay (or NULL).
+        if !manifest
+            .tables
+            .iter()
+            .any(|t| t.name == "web_contract_meta" && t.count > 0)
+        {
+            initialized_tables.insert("web_contract_meta".to_owned(), 1);
+        }
+        sqlx::query(
+            "INSERT INTO web_contract_meta (singleton, contract_version) VALUES (TRUE, $1)
+             ON CONFLICT (singleton) DO UPDATE SET contract_version = EXCLUDED.contract_version",
+        )
+        .bind(version)
+        .execute(&mut *tx)
+        .await?;
+    }
+
     // v3 predates the required singleton. Clearing stale target data is not
     // enough: settings writes would subsequently fail without this baseline.
     // Never synthesize application settings/history or replace an archived row.
-    let mut initialized_tables = BTreeMap::new();
     if missing.contains(&"guild_settings_revision") {
         let columns = columns_of(&mut tx, "guild_settings_revision").await?;
         if columns.iter().any(|(name, _)| name == "singleton")

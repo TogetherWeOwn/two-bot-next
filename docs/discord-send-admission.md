@@ -157,6 +157,13 @@ explicitly authorized, all-consumer-fenced reconciliation with effect and
 cooldown evidence; neither startup nor time alone clears the marker. This core
 capability does not enable or wire a new sender.
 
+If a strict claim is acknowledged after the attempt deadline, the transport
+refuses before starting the request and leaves the claim armed. The opt-in
+collector retains status and retry headers but omits the body when the body cap
+or attempt deadline expires before collection finishes. Only crate-internal
+code can validate a mutation. Storage shares the attempt cutoff; evidence does
+not authorize retry. Default settlement is unchanged.
+
 An ordinary held lane carries a 60 s self-heal lease (`in_flight_since_ms`, migration
 0419, constant `IN_FLIGHT_LEASE_MS`). The next `admit` past the lease reclaims
 the lane with a fresh generation, so the dead holder's late completion lands
