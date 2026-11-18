@@ -230,30 +230,35 @@ Retain start/assert and stop/refusal artifacts for the run and attempt. Verify
 on exact-head Actions that the existing staging control secret resolves in each
 called staging job; a missing token fails closed, never warrants a new credential.
 
+**Before any qualification dispatch:** subject to existing holds and
+authorization, check that `main` resolves to the intended merged 40-hex SHA
+immediately before dispatch. Use `main` as the workflow ref and that exact SHA
+as `sha` only if they match. If `main` has moved or the match cannot be verified,
+stop; do not dispatch the older SHA as a recovery pin. A drill pin can redeploy
+staging before the history guard fails it, and cannot produce B1 or a promotion
+certificate. Verify the run's recorded `headSha` against the target too: the
+pre-dispatch check does not lock `main`. A mismatch is not qualification.
+
 **Pending-slot replacement (residual recovery, 2026-11-07):** GitHub preserves a
 running holder with `cancel-in-progress: false`, but keeps only one pending item
 per group. The five-minute user-flow observer is outside that group and cannot
 replace a pending deploy or promotion soak. Actual holders (another deploy,
 drill or soak) can still replace one pending holder; there is no FIFO/fairness
-guarantee. A cancelled run is not qualification or staging history. Re-dispatch
-`deploy-staging` from `main` with `sha` set to that exact merged 40-hex SHA, wait
-for all five qualifying jobs plus release, and retain the new attempt's receipts
-before considering promotion. A cancelled production soak needs a new promotion
-run through its unchanged guard and fresh full-window measurement, never
-historical soak credit. The pin/history guard stays unchanged; an older pin
-still makes that deploy run intentionally red and cannot certify a different
-workflow head. No scheduler or automatic redispatch is added. The five-minute
-observer never grants a window; its cadence is not permission for
-near-continuous staging use.
+guarantee. A cancelled run is not qualification or staging history. Start a
+fresh `deploy-staging` dispatch only if the match above still holds. Wait for
+all five qualifying jobs plus release and retain the new attempt's receipts.
+A cancelled production soak needs a new promotion run through its unchanged
+guard and fresh full-window measurement, never historical soak credit. No
+scheduler or automatic redispatch is added. The five-minute observer never
+grants a window; its cadence is not permission for near-continuous staging use.
 
 **Reruns:** do not use **Re-run all jobs** or **Re-run failed jobs** for
 qualification. Both create a new `run_attempt`; the deploy-called voice and help
 synthetics intentionally refuse every rerun, even with fresh grants. A partial
 rerun can also carry stale grant outputs. Do not copy another attempt's expiry,
-reset the grant or renew it to bypass refusal. Subject to existing holds and
-authorization, recover with a fresh `deploy-staging` dispatch from `main` for
-the exact merged 40-hex SHA, as in pending-slot recovery above. Wait for all five
-qualifying jobs and release, and retain the fresh run's receipts.
+reset the grant or renew it to bypass refusal. For recovery, follow the same
+matching-head check above before a fresh dispatch. Wait for all five qualifying
+jobs and release, and retain the fresh run's receipts.
 
 Before activation, retain authorized live inventory for the staging and
 production Worker versions, namespaces, Container applications/instances,
@@ -277,9 +282,10 @@ compatibility is resolved by the roll-forward rule below, before the merge.
 
 ### First activation roll-forward bootstrap
 
-Activation requires an authorized `deploy-staging` dispatch of a merged SHA
-with `STAGING_RUNTIME_POLICY=bounded` in the staging vars. A merge alone does
-not activate it or establish a baseline.
+Activation requires an authorized `deploy-staging` dispatch with
+`STAGING_RUNTIME_POLICY=bounded` in the staging vars. Apply the matching-head
+check above before dispatch; stop if the intended merged SHA no longer matches
+`main`. A merge alone does not activate the policy or establish a baseline.
 
 - **Predecessors are not restore targets.** The currently deployed staging
   versions (v875, v876 and v877) predate the policy and are unbounded. They are
