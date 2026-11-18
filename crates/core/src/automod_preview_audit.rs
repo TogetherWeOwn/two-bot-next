@@ -299,4 +299,144 @@ mod tests {
         }
         assert_eq!(replay_preview_reply("exempt", valid, ""), None);
     }
+    #[test]
+    fn reason_parse_accepts_only_the_emitted_shape() {
+        let parsed = parse_preview_reason("filter=bad_words;exemption=none;mode=dry_run;len=0_50")
+            .expect("emitted shape parses");
+        assert_eq!(parsed.filter, "bad_words");
+        assert_eq!(parsed.exemption, "none");
+        assert!(parsed.dry_run);
+        let enforced =
+            parse_preview_reason("filter=none;exemption=bypass_role;mode=enforce;len=51_500")
+                .expect("enforce parses");
+        assert!(!enforced.dry_run);
+        for bad in [
+            "",
+            "filter=bad_words",
+            "filter=bad_words;exemption=none;mode=dry_run",
+            "filter=bad_words;exemption=none;mode=dry_run;len=0_50;extra=x",
+            "filter=bad_words;exemption=none;mode=live;len=0_50",
+            "filter=bad_words;exemption=none;mode=dry_run;len=",
+            "filter=bad_words;exemption=none;mode=dry_run;len=unexpected",
+            "exemption=none;filter=bad_words;mode=dry_run;len=0_50",
+            "filter:bad_words;exemption=none;mode=dry_run;len=0_50",
+        ] {
+            assert_eq!(parse_preview_reason(bad), None, "reason {bad:?}");
+        }
+    }
+
+    fn matched_bad_words_verdict(dry_run: bool) -> PreviewVerdict {
+        PreviewVerdict {
+            result: PreviewResult::Matched,
+            filter: Some(AutomodFilter::BadWords),
+            knobs: crate::automod_preview::deciding_knobs(AutomodFilter::BadWords),
+            exemption: None,
+            dry_run,
+        }
+    }
+
+    #[test]
+    fn replay_preserves_opaque_stored_timestamp() {
+        let verdict = matched_bad_words_verdict(true);
+        let reason = audit_reason_for_verdict(&verdict, 12);
+        let timestamp = "stored timestamp with microseconds 123456";
+        assert_eq!(
+            replay_preview_reply("matched", Some(&reason), timestamp),
+            Some(render_preview_reply(&verdict, timestamp))
+        );
+        for dry_run in [true, false] {
+            let verdicts = [
+                PreviewVerdict {
+                    result: PreviewResult::NoMatch,
+                    filter: None,
+                    knobs: &[],
+                    exemption: None,
+                    dry_run,
+                },
+                PreviewVerdict::partial(dry_run),
+                PreviewVerdict {
+                    result: PreviewResult::Exempt,
+                    filter: None,
+                    knobs: crate::automod_preview::exemption_knobs(PreviewExemption::BypassRole),
+                    exemption: Some(PreviewExemption::BypassRole),
+                    dry_run,
+                },
+            ];
+            for verdict in verdicts {
+                let reason = audit_reason_for_verdict(&verdict, 12);
+                let replayed =
+                    replay_preview_reply(preview_audit_outcome(&verdict), Some(&reason), timestamp)
+                        .expect("stored verdict replays");
+                assert_eq!(replayed, render_preview_reply(&verdict, timestamp));
+                if verdict.exemption == Some(PreviewExemption::BypassRole) {
+                    assert!(replayed.contains("TWO_AUTOMOD_BYPASS_ROLE_IDS"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replay_matches_a_live_evaluation_for_the_same_verdict() {
+        use crate::automod::{AutomodConfig, AutomodMessage, AutomodPolicy, RepeatTracker};
+        use crate::automod_preview::preview_automod;
+
+        // Core-half of T17: the row written for a real evaluation replays the
+        // same reply the evaluation rendered.
+        let policy = AutomodPolicy {
+            bad_words: vec!["bannedword".to_owned()],
+            ..AutomodPolicy::default()
+        };
+        let config = AutomodConfig {
+            enabled: true,
+            dry_run: true,
+            policy,
+        };
+        let message = AutomodMessage {
+            guild_id: "g".to_owned(),
+            channel_id: "c".to_owned(),
+            message_id: "preview:live".to_owned(),
+            author_id: "a".to_owned(),
+            author_is_bot: false,
+            role_ids: vec![],
+            content: "has bannedword here".to_owned(),
+            mentioned_user_ids: vec![],
+            attachment_names: vec![],
+            observed_timestamp_ms: 1,
+        };
+        let verdict = preview_automod(&message, 0, &config, &RepeatTracker::default());
+        assert_eq!(verdict.result, PreviewResult::Matched);
+        let created_at = "2026-11-02 08:00:00+00";
+        let first = render_preview_reply(&verdict, created_at);
+        let reason = audit_reason_for_verdict(&verdict, 17);
+        assert_eq!(
+            replay_preview_reply(preview_audit_outcome(&verdict), Some(&reason), created_at),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn replay_never_consults_live_config_or_roles() {
+        use crate::automod::{AutomodConfig, AutomodPolicy};
+
+        // The stored row was written under a config that has since changed:
+        // replay still renders the stored filter and knob, byte-identical.
+        let created_at = "2026-11-02 08:00:00+00";
+        let verdict = matched_bad_words_verdict(true);
+        let reason = audit_reason_for_verdict(&verdict, 12);
+        let before = replay_preview_reply("matched", Some(&reason), created_at).expect("replays");
+        // A "changed world": different policy, different roles — replay takes
+        // neither as a parameter, so the stored row renders the same reply.
+        let policy = AutomodPolicy {
+            bad_words: vec!["different".to_owned()],
+            ..AutomodPolicy::default()
+        };
+        let _config = AutomodConfig {
+            enabled: true,
+            dry_run: false,
+            policy,
+        };
+        let after = replay_preview_reply("matched", Some(&reason), created_at).expect("replays");
+        assert_eq!(before, after);
+        assert!(after.contains("TWO_AUTOMOD_BAD_WORDS"));
+    }
 }

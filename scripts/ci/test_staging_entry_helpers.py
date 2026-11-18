@@ -2,8 +2,14 @@
 
 import ast
 import re
+import subprocess
 import unittest
 from copy import deepcopy
+
+from test_staging_admission_helpers import (
+    assert_policy_mutations,
+    masked_refusal_mutations,
+)
 
 
 def needs(job):
@@ -143,10 +149,10 @@ def condition(test, expression, context):
     return bool(eval(compile(tree, "<workflow guard>", "eval"), {"__builtins__": {}}))
 
 
-def assert_routing_behavior(test, workflow, called, grant, attempt, expected):
+def assert_routing_behavior(test, workflow, called, grant, attempt, expected, *, begin_output="owned"):
     jobs = workflow["jobs"]
     context = {"inputs.deploy_staging_call": called, "github.run_attempt": attempt,
-               "github.ref": "refs/heads/main", "needs.staging-window.outputs.expires_at": "owned"}
+               "github.ref": "refs/heads/main", "needs.staging-window.outputs.expires_at": begin_output}
     context.update({f"inputs.{name}": value for name, value in grant.items()})
     window = jobs["staging-window"]
     begin = next(step for step in window["steps"] if step.get("id") == "begin")
@@ -163,6 +169,55 @@ def assert_routing_behavior(test, workflow, called, grant, attempt, expected):
     test.assertNotIn("environment", refusal)
     test.assertEqual(refusal.get("permissions"), {})
     test.assertEqual(refusal["steps"], [{"run": "exit 1"}])
+
+
+class CalleePolicyRegressionTests(unittest.TestCase):
+    def test_actual_entries_and_terminal_refusal(self):
+        from test_workflows import (
+            help_embed_synthetic_errors,
+            load_workflows,
+            voice_synthetic_errors,
+        )
+
+        workflows = load_workflows()
+        for name, consumer, checker in (
+            ("voice-synthetic.yml", "synthetic", voice_synthetic_errors),
+            ("help-embed-synthetic.yml", "help-embed-smoke", help_embed_synthetic_errors),
+        ):
+            workflow = workflows[name]
+            with self.subTest(workflow=name):
+                self.assertEqual(checker(workflow), [])
+                assert_callee_entries(self, workflow, consumer)
+                steps = workflow["jobs"]["rerun-refusal"]["steps"]
+                self.assertEqual(steps, [{"run": "exit 1"}])
+                result = subprocess.run(["bash", "-e", "-c", steps[0]["run"]], env={},
+                                        capture_output=True, timeout=10, check=False)
+                self.assertEqual(result.returncode, 1)
+
+                mutations = masked_refusal_mutations()
+                mutations["reordered needs"] = lambda w: w["jobs"]["rerun-refusal"]["needs"].reverse()
+                assert_policy_mutations(self, workflow, checker,
+                                        lambda _, error: "rerun-refusal: must be the secret-free" in error,
+                                        mutations)
+
+            for inventory in ("missing refusal", "missing window", "extra job"):
+                changed = deepcopy(workflow)
+                jobs = changed["jobs"]
+                if inventory == "missing refusal":
+                    del jobs["rerun-refusal"]
+                elif inventory == "missing window":
+                    del jobs["staging-window"]
+                else:
+                    jobs["unexpected"] = {}
+                jobs[consumer]["environment"] = "wrong"
+                if "staging-window" in jobs:
+                    jobs["staging-window"]["environment"] = "wrong"
+                with self.subTest(workflow=name, inventory=inventory):
+                    errors = checker(changed)
+                    self.assertTrue(any("jobs must be exactly" in error for error in errors), errors)
+                    self.assertIn(f"{name}:{consumer}: must read only the voice-synthetic Environment", errors)
+                    if "staging-window" in jobs:
+                        self.assertIn(f"{name}:staging-window: must read the staging Environment", errors)
 
 
 class VoiceArtifactNamingTests(unittest.TestCase):
@@ -230,11 +285,16 @@ class StandaloneRoutingTests(unittest.TestCase):
                  (True, valid, 2, (False, False, False, False, True))]
         cases += [(True, {**valid, field: ""}, 1, (False, False, False, False, True))
                   for field in fields]
+        workflows = load_workflows()
         for name in ("voice-synthetic.yml", "help-embed-synthetic.yml"):
-            workflow = load_workflows()[name]
+            workflow = workflows[name]
             for called, grant, attempt, expected in cases:
                 with self.subTest(workflow=name, called=called, grant=grant, attempt=attempt):
                     assert_routing_behavior(self, workflow, called, grant, attempt, expected)
+            for attempt in (1, 2):
+                with self.subTest(workflow=name, attempt=attempt, begin_output=""):
+                    assert_routing_behavior(self, workflow, False, empty, attempt,
+                                            (True, True, False, False, False), begin_output="")
             assert_cleanup(self, workflow["jobs"], True)
             for mutation in ("environment", "permissions", "steps"):
                 changed = deepcopy(workflow)
@@ -249,6 +309,11 @@ class StandaloneRoutingTests(unittest.TestCase):
             release["if"] = release["if"].replace(" && !inputs.deploy_staging_call", "")
             with self.subTest(workflow=name, cleanup="job ownership"), self.assertRaisesRegex(AssertionError, "cleanup ownership"):
                 assert_cleanup(self, changed["jobs"], True)
+            release["if"] = workflow["jobs"]["staging-use-release"]["if"].replace(
+                " && needs.staging-window.outputs.expires_at != ''", "")
+            with self.subTest(workflow=name, cleanup="begin output"), self.assertRaises(AssertionError):
+                assert_routing_behavior(self, changed, False, empty, 2,
+                                        (True, True, False, False, False), begin_output="")
             for field in fields:
                 changed = deepcopy(workflow)
                 guard = changed["jobs"]["staging-window"]["if"]
@@ -267,9 +332,15 @@ class StandaloneRoutingTests(unittest.TestCase):
         from test_workflows import load_workflows
 
         selector = "inputs.staging_use_expires_at"
+        workflows = load_workflows()
         for name in ("voice-synthetic.yml", "help-embed-synthetic.yml"):
-            workflow = load_workflows()[name]
+            workflow = workflows[name]
             assert_standalone_routing(self, workflow, selector)
+            changed = deepcopy(workflow)
+            changed["concurrency"]["group"] = changed["concurrency"]["group"].replace(
+                "inputs.deploy_staging_call || ", "")
+            with self.subTest(workflow=name, mutation="concurrency caller"), self.assertRaisesRegex(AssertionError, "concurrency selector"):
+                assert_standalone_routing(self, changed, selector)
             for job, command, diagnostic in (
                     ("staging-window", "node wrangler/scripts/staging-use-pipeline.mjs begin", "standalone begin guard"),
                     ("staging-window", "node wrangler/scripts/staging-use.mjs ready", "inherited ready guard"),
