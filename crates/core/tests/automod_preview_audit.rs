@@ -222,10 +222,13 @@ async fn verify_same_transaction_row(pool: PgPool) -> Result<(), sqlx::Error> {
     // result descriptor can fail before SQLx tries to decode the column.
     retry.clear_cached_statements().await?;
     let error = preview_audit::load_preview_audit(&mut *retry, &id).await;
-    assert!(matches!(
-        error,
-        Err(sqlx::Error::ColumnDecode { ref index, .. }) if index == "outcome"
-    ));
+    assert!(
+        matches!(
+            error,
+            Err(sqlx::Error::ColumnDecode { ref index, .. }) if index == "\"outcome\""
+        ),
+        "expected outcome column decode error, got {error:?}"
+    );
     retry.rollback().await?;
     Ok(())
 }
