@@ -525,19 +525,6 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     )))
     .execute(&mut *tx)
     .await?;
-    // The installed version describes the destination's views, not archived
-    // guild data. A migration-only target has no publication to preserve.
-    let installed_contract: Option<String> = sqlx::query_scalar(
-        "SELECT contract_version FROM web_contract_meta WHERE singleton AND EXISTS (
-            SELECT 1 FROM pg_catalog.pg_class c
-            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relname = 'contract_meta' AND c.relkind = 'v'
-              AND n.nspname::text = CASE WHEN current_schema() = 'public' THEN 'web_v1'
-                                        ELSE current_schema() || '_web_v1' END
-        )",
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
     // Moderation history fence: overwriting destination evidence could forget
     // a post-backup PUT/DELETE or a newer permanent ban. Refuse while the
     // lock is held so no concurrent writer slips evidence in after the check.
@@ -558,6 +545,26 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             "destination moderation history exists; restore into a fresh migrated target, preserve the destination and reconcile both histories before enabling moderation".into(),
         ));
     }
+    // Check publication separately: unpublished targets can lack the metadata
+    // columns, which PostgreSQL would resolve before evaluating a WHERE clause.
+    let has_contract_view: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = 'contract_meta' AND c.relkind = 'v'
+              AND n.nspname::text = CASE WHEN current_schema() = 'public' THEN 'web_v1'
+                                        ELSE current_schema() || '_web_v1' END
+        )",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let installed_contract: Option<String> = if has_contract_view {
+        sqlx::query_scalar("SELECT contract_version FROM web_contract_meta WHERE singleton")
+            .fetch_optional(&mut *tx)
+            .await?
+    } else {
+        None
+    };
     let mut suspended = Vec::new();
     for (table, trigger) in [
         ("guild_settings", "trg_guild_settings_revision"),
