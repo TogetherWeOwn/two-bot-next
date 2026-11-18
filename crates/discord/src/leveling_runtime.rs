@@ -1061,7 +1061,6 @@ pub struct OrderedLevelingPipeline<S, I = NoInvites, P = PipelineSnapshots> {
     facts: DeferredCommunityFacts,
     dispatch: tokio::sync::Mutex<()>,
     runtime: Option<LevelingRuntime>,
-    snapshot_cache: Option<Arc<crate::pipeline::SharedCache>>,
 }
 
 impl<S: FunnelStore> OrderedLevelingPipeline<S> {
@@ -1086,7 +1085,6 @@ impl<S: FunnelStore> OrderedLevelingPipeline<S> {
             facts,
             dispatch: tokio::sync::Mutex::new(()),
             runtime,
-            snapshot_cache: None,
         }
     }
 }
@@ -1119,7 +1117,6 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
             facts,
             dispatch: tokio::sync::Mutex::new(()),
             runtime,
-            snapshot_cache: None,
         }
     }
 
@@ -1148,7 +1145,7 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
             invite_source,
             classifier.clone(),
             snapshots,
-            Arc::clone(&cache),
+            cache,
         );
         // Fail closed like `new`: the gateway runtime declares the real
         // `MESSAGE_CONTENT` subscription before its shard runs.
@@ -1160,7 +1157,6 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
             facts,
             dispatch: tokio::sync::Mutex::new(()),
             runtime,
-            snapshot_cache: Some(cache),
         }
     }
 
@@ -1205,15 +1201,6 @@ impl<S: FunnelStore, I: InviteSource, P: InviteSnapshotStore> OrderedLevelingPip
     /// move's end+start pair buffers two rows for one frame.
     pub async fn drain_facts(&self) -> Result<usize, CommunityFactsError> {
         self.facts.drain().await
-    }
-
-    /// A cold caller-owned cache needs a fresh READY after RESUME. Private
-    /// replay and funnel caches have no external snapshot readers.
-    #[must_use]
-    pub fn needs_cache_bootstrap(&self) -> bool {
-        self.snapshot_cache
-            .as_ref()
-            .is_some_and(|cache| cache.needs_bootstrap())
     }
 
     /// Access individual cached objects; coherent guild reads use SharedCache.

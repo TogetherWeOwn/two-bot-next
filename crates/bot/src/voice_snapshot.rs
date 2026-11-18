@@ -427,7 +427,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unavailable_and_ready_pending_guilds_refuse_until_full_snapshot() {
+    fn guild_snapshot_eligibility_tracks_gateway_lifecycle() {
         use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
         let cache = new_shared_cache();
         let clock = VoiceOccupancyClock::default();
@@ -440,8 +440,15 @@ mod tests {
             assert_eq!(scalar(), Err(SnapshotRefusal::CacheIncomplete));
         };
         assert_incomplete();
+        cache.update(&Event::Resumed);
+        assert_eq!(admitted(), None);
+        assert_incomplete();
         cache.update(&pipeline_guild(&[42]));
         assert_eq!(admitted(), Some(()));
+        assert_eq!(scalar(), Ok(1));
+        cache.update(&Event::Resumed);
+        assert_eq!(admitted(), Some(()));
+        assert_eq!(listing().expect("warm snapshot")["total_in_voice"], 1);
         assert_eq!(scalar(), Ok(1));
         cache.update(&Event::Ready(
             serde_json::from_value(json!({
@@ -468,6 +475,17 @@ mod tests {
         assert_eq!(admitted(), Some(()));
         assert_eq!(listing().expect("empty snapshot")["total_in_voice"], 0);
         assert_eq!(scalar(), Ok(0));
+        for unavailable in [true, false] {
+            cache.update(&Event::GuildDelete(
+                serde_json::from_value(json!({"id": "100", "unavailable": unavailable}))
+                    .expect("deleted guild fixture"),
+            ));
+            cache.update(&Event::Resumed);
+            assert_eq!(admitted(), None);
+            assert_incomplete();
+            cache.update(&pipeline_guild(&[]));
+            assert_eq!(admitted(), Some(()));
+        }
     }
 
     #[test]

@@ -477,7 +477,6 @@ pub struct SharedCache {
     /// Twilight can retain guild data across READY. Only a full GuildCreate
     /// makes that guild eligible for a projection in the new session.
     complete_guilds: RwLock<HashSet<Snowflake>>,
-    ready_seen: AtomicBool,
     #[cfg(test)]
     before_twilight_update: Option<tests::CacheWriteProbe>,
 }
@@ -487,7 +486,6 @@ impl Default for SharedCache {
         Self {
             inner: build_cache(),
             complete_guilds: RwLock::new(HashSet::new()),
-            ready_seen: AtomicBool::new(false),
             #[cfg(test)]
             before_twilight_update: None,
         }
@@ -500,10 +498,7 @@ impl SharedCache {
         let mut complete = self.complete_guilds.write().expect("cache snapshot fence");
         self.apply_twilight_event(event);
         match event {
-            Event::Ready(_) => {
-                complete.clear();
-                self.ready_seen.store(true, Ordering::Release);
-            }
+            Event::Ready(_) => complete.clear(),
             Event::GuildCreate(create) => match create.as_ref() {
                 twilight_model::gateway::payload::incoming::GuildCreate::Available(guild) => {
                     complete.insert(guild.id.get());
@@ -519,11 +514,6 @@ impl SharedCache {
         }
     }
 
-    /// Only READY proves bootstrap; replayed UserUpdate can also set the user.
-    pub(crate) fn needs_bootstrap(&self) -> bool {
-        !self.ready_seen.load(Ordering::Acquire)
-    }
-
     fn apply_twilight_event(&self, event: &Event) {
         #[cfg(test)]
         if let Some(probe) = &self.before_twilight_update {
@@ -532,7 +522,7 @@ impl SharedCache {
         self.inner.update(event);
     }
 
-    /// Fence every lookup in a guild projection. A rebuild, pending guild or
+    /// Fence every lookup in a guild projection. A rebuild, ineligible guild or
     /// poisoned cache refuses immediately; the reader checks for missing data.
     pub fn with_guild_snapshot<T>(
         &self,
