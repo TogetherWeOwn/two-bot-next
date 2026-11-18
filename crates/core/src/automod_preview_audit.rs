@@ -14,13 +14,15 @@ pub const PREVIEW_AUDIT_ACTION: &str = "automod.preview";
 /// Audit-row (and advisory-lock) id for one preview attempt:
 /// `automod-preview:<interaction_id>`. The lock key and the row id are the
 /// same string, so one interaction serializes on exactly the row it claims.
+/// Callers must supply a non-empty interaction id for the id to be parseable.
 #[must_use]
 pub fn preview_audit_id(interaction_id: &str) -> String {
     format!("automod-preview:{interaction_id}")
 }
 
-/// Strict inverse of [`preview_audit_id`]: the interaction id, or `None`
-/// when the id is not a preview claim. An empty remainder refuses.
+/// Inverse of [`preview_audit_id`] for non-empty interaction ids: the
+/// interaction id, or `None` when the id is not a preview claim. An empty
+/// remainder refuses; interaction ids containing colons are preserved.
 #[must_use]
 pub fn parse_preview_audit_id(id: &str) -> Option<&str> {
     let rest = id.strip_prefix("automod-preview:")?;
@@ -487,16 +489,15 @@ mod tests {
             "matched",
             "filter=bad_words;exemption=none;mode=dry_run;len=0_50".to_owned(),
         );
-        assert_eq!(record.action, PREVIEW_AUDIT_ACTION);
+        assert_eq!(record.action, "automod.preview");
         assert_eq!(record.guild_id, "guild-1");
         assert_eq!(record.actor_id.as_deref(), Some("actor-1"));
         assert_eq!(record.target_key.as_deref(), Some("channel-1"));
         assert_eq!(record.outcome, "matched");
-        assert!(record
-            .reason
-            .as_deref()
-            .unwrap()
-            .starts_with("filter=bad_words;"));
+        assert_eq!(
+            record.reason.as_deref(),
+            Some("filter=bad_words;exemption=none;mode=dry_run;len=0_50")
+        );
     }
 
     #[test]
