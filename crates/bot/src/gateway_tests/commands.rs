@@ -650,6 +650,7 @@ async fn unavailable_automod_or_disabled_command_gates_capture_without_prefix_po
         assert_eq!(gateway.authentication().await["op"], 2);
         gateway.send(ready(&gateway.url, "gated-session")).await;
         wait_sequence(&db.store, 1).await;
+        wait_requests(&rest, 3).await;
         gateway.send(prefix(2, 54)).await;
         wait_sequence(&db.store, 2).await;
         wait_connected(&state).await;
