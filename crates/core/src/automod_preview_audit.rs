@@ -133,6 +133,21 @@ pub fn preview_audit_record(
     }
 }
 
+/// Serialize one attempt by interaction id inside the caller's transaction
+/// (spec §6). Commit or rollback releases the claim. Acquisition waits for a
+/// competing transaction: the caller must set a database timeout before calling.
+#[cfg(feature = "db")]
+pub async fn lock_preview_attempt(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    interaction_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(preview_audit_id(interaction_id))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
