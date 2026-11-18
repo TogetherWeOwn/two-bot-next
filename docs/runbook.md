@@ -2298,11 +2298,11 @@ nothing executes from this path.
 Drill procedure (Operator). The soak needs the armed build undisturbed for
 at least 90 minutes (R1, R2 30+ minutes later, STOP 30+ minutes after R2,
 disarm, then a 30-minute clear) while merges keep landing. Arm the hold
-first: it still blocks error-rate rollback rehearsals, including the daily
-proof. On workflow revisions with a staging push trigger, it also makes
-push-triggered runs fail fast. Non-rehearsal manual dispatches, including the
-explicit arm and disarm below, bypass this hold; do not dispatch an unrelated
-deployment during the drill.
+first: it still blocks staging deploy dispatches that request an error-rate
+rollback rehearsal. On workflow revisions with a staging push trigger, it
+also makes push-triggered runs fail fast. Non-rehearsal manual dispatches,
+including the explicit arm and disarm below, bypass this hold; do not dispatch
+an unrelated deployment during the drill.
 Consult `deploy-staging.yml` at the relevant ref for its triggers. A merge does
 not prove deployment or qualification. Keep promotion held without completed
 qualifying evidence for the intended exact `main` SHA, and follow the separately
@@ -2322,9 +2322,11 @@ authorized [qualification/recovery procedure](staging-rollout-gate.md#full-windo
 3. Arm the fault at the pinned SHA: `gh workflow run deploy-staging.yml
    --ref main -f "sha=$DRILL_SHA" -f inject_voice_stall=true` (add
    `-f inject_unpaired_disconnect=true` for the crash-loop scope).
-   Explicit arm/disarm dispatches bypass the hold. Error-rate rollback proofs,
-   including the daily automated dispatch, honor it and fail without deploying
-   while it is armed; do not clear the hold for a proof.
+   Explicit arm/disarm dispatches bypass the hold. A dispatched error-rate
+   rehearsal fails without deploying while the hold is armed; do not clear the
+   hold for a proof. The scheduled rollback proof currently refuses before
+   dispatch because enforced exact-SHA admission is unavailable, independent
+   of this hold.
    The arm run stays red by design: the history guard fails it after a green
    deploy and synthetic so the pin never reads as staging history for the
    head. Read the deploy and synthetic steps, not the run color.
