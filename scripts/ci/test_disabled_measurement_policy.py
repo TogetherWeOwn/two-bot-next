@@ -18,9 +18,9 @@ TARGET = "./.github/workflows/voice-synthetic.yml"
 
 def scaffold():
     jobs = {name: {"if": guard} for name, guard in GUARDS.items()}
-    jobs["staging-window"].update({"environment": "staging", "runs-on": "ubuntu-latest"})
+    for name in ("staging-window", "measurement-before", "measurement-after", "staging-use-release"):
+        jobs[name].update({"environment": "staging", "runs-on": "ubuntu-latest"})
     jobs["voice-first"]["uses"] = TARGET
-    jobs["staging-use-release"].update({"environment": "staging", "runs-on": "ubuntu-latest"})
     return {"on": {"workflow_dispatch": ""}, "permissions": {},
             "concurrency": {"group": "voice-rest-measurement-disabled",
                             "cancel-in-progress": "false"}, "jobs": jobs}
