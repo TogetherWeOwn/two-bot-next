@@ -236,6 +236,14 @@ fn total_in_voice(rooms: &[RoomDraft]) -> usize {
         .sum()
 }
 
+#[cfg(test)]
+pub(crate) fn read_voice_total(
+    cache: &two_bot_discord::SharedCache,
+    guild_id: Snowflake,
+) -> Result<usize, SnapshotRefusal> {
+    observe_rooms(cache, guild_id).map(|rooms| total_in_voice(&rooms))
+}
+
 /// Whole-second Zulu timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for `observed_at`.
 fn observed_at_now() -> String {
     let now = time::OffsetDateTime::now_utc();
@@ -424,7 +432,7 @@ mod tests {
         let cache = new_shared_cache();
         let clock = VoiceOccupancyClock::default();
         let listing = || read_voice_snapshot(&cache, &clock, 100, &HashMap::new());
-        let scalar = || observe_rooms(&cache, 100).map(|rooms| total_in_voice(&rooms));
+        let scalar = || read_voice_total(&cache, 100);
         // Ignore Twilight's contents so these assertions isolate admission.
         let admitted = || cache.with_guild_snapshot(100, |_| ());
         let assert_incomplete = || {

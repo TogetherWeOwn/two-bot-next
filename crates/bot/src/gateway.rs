@@ -1873,11 +1873,15 @@ pub async fn run_shard<I: InviteSource + 'static>(
                             }
                             _ => None,
                         };
-                        // Only READY sets the current user, so a RESUMED without
-                        // one is a cold resume across a process restart.
+                        // A cold shared cache needs a full snapshot even with
+                        // room management disabled. Optional voice consumers
+                        // may also request bootstrap.
                         let mut committed = None;
-                        if let (Some(voice), Some(dispatch)) = (voice.as_ref(), dispatch.as_ref()) {
-                            if matches!(dispatch.event, Event::Resumed) && voice.needs_bootstrap(pipeline.cache()) {
+                        if let Some(dispatch) = dispatch.as_ref() {
+                            if matches!(dispatch.event, Event::Resumed)
+                                && (pipeline.needs_cache_bootstrap()
+                                    || voice.as_ref().is_some_and(|voice| voice.needs_bootstrap(pipeline.cache())))
+                            {
                                 let (sender, receiver) = tokio::sync::oneshot::channel();
                                 committed = Some(sender);
                                 bootstrap = Some(receiver);

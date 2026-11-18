@@ -374,7 +374,7 @@ async fn registered_voice_id_with_rsvp_payload_has_one_voice_callback() {
     db.close().await;
 }
 
-async fn cold_voice_gateway(release_ready: Arc<Notify>) -> MockGateway {
+async fn cold_voice_gateway(release_ready: Arc<Notify>, replay_user: bool) -> MockGateway {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let gateway_url = url.clone();
@@ -403,11 +403,16 @@ async fn cold_voice_gateway(release_ready: Arc<Notify>) -> MockGateway {
                         if connection == 0 {
                             // Replay the saved dispatch plus one missed dispatch before
                             // RESUMED. Fresh IDENTIFY is allowed only after these commit.
-                            for packet in [
-                                leave(2),
-                                leave(3),
-                                json!({"op":0,"s":4,"t":"RESUMED","d":{}}),
-                            ] {
+                            let missed = if replay_user {
+                                let user =
+                                    ready(&gateway_url, "saved-session")["d"]["user"].clone();
+                                json!({"op":0,"s":3,"t":"USER_UPDATE","d":user})
+                            } else {
+                                leave(3)
+                            };
+                            for packet in
+                                [leave(2), missed, json!({"op":0,"s":4,"t":"RESUMED","d":{}})]
+                            {
                                 ws.send(Message::text(packet.to_string())).await.unwrap();
                             }
                         } else {
@@ -449,7 +454,7 @@ async fn cold_voice_gateway(release_ready: Arc<Notify>) -> MockGateway {
 async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_rooms() {
     let db = TestDb::new().await;
     let release = Arc::new(Notify::new());
-    let mut mock = cold_voice_gateway(release.clone()).await;
+    let mut mock = cold_voice_gateway(release.clone(), false).await;
     db.store
         .commit_dispatch(
             &checkpoint("saved-session", 2, &mock.url),
@@ -566,6 +571,131 @@ async fn cold_voice_resume_commits_replay_before_identify_and_reconciles_stored_
     assert!(voice.disconnects.load(Ordering::Relaxed) > disconnects);
     mock.task.abort();
     drop(voice);
+    db.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn cold_resume_without_voice_rooms_bootstraps_the_shared_cache() {
+    resume_without_voice_rooms(true).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the explicit agent-testdb/CI test URL"]
+async fn warm_resume_without_voice_rooms_preserves_the_shared_cache() {
+    resume_without_voice_rooms(false).await;
+}
+
+async fn resume_without_voice_rooms(cold: bool) {
+    let db = TestDb::new().await;
+    let release = Arc::new(Notify::new());
+    let mut mock = cold_voice_gateway(release.clone(), true).await;
+    db.store
+        .commit_dispatch(
+            &checkpoint("saved-session", 2, &mock.url),
+            FunnelBatch::default(),
+        )
+        .await
+        .unwrap();
+    let buffer = GatewayFunnelBuffer::from_milestones(db.store.milestones().await.unwrap());
+    let cache = crate::voice_snapshot::new_shared_cache();
+    let pipeline = Arc::new(two_bot_discord::OrderedLevelingPipeline::with_shared_cache(
+        buffer.clone(),
+        None,
+        two_bot_discord::NoInvites,
+        buffer,
+        cache.clone(),
+    ));
+    if !cold {
+        let ready = serde_json::from_value(ready(&mock.url, "saved-session")["d"].clone()).unwrap();
+        cache.update(&twilight_gateway::Event::Ready(ready));
+        let fixture = include_str!("../../tests/fixtures/voice_guild.json")
+            .replace("\"100\"", &format!("\"{VOICE_GUILD}\""));
+        let mut guild: Value = serde_json::from_str(&fixture).unwrap();
+        guild["voice_states"] = json!([{
+            "guild_id": VOICE_GUILD, "channel_id": "200", "user_id": "42",
+            "session_id": "fixture", "deaf": false, "mute": false,
+            "self_deaf": false, "self_mute": false, "self_video": false, "suppress": false
+        }]);
+        cache.update(&twilight_gateway::Event::GuildCreate(Box::new(
+            twilight_model::gateway::payload::incoming::GuildCreate::Available(
+                serde_json::from_value(guild).unwrap(),
+            ),
+        )));
+    }
+    ensure_crypto_provider();
+    let saved = load_boot_session(&db.store).await.unwrap();
+    let shard = crate::gateway::build_shard(
+        TOKEN.into(),
+        two_bot_discord::gateway_intents(false),
+        saved.as_ref(),
+        Some(&mock.url),
+    );
+    let state = Arc::new(RwLock::new(GatewayState::Armed));
+    // No room-management sink: the signed receiver still needs the cache.
+    let runner = tokio::spawn(run_shard(
+        shard,
+        Arc::clone(&pipeline),
+        state.clone(),
+        db.store.clone(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        std::future::pending(),
+    ));
+    assert_eq!(mock.authentication().await["op"], 6);
+    if cold {
+        assert_eq!(mock.authentication().await["op"], 2);
+        assert_eq!(db.store.load().await.unwrap().unwrap().sequence, 4);
+        assert_eq!(*state.read().await, GatewayState::Armed);
+        assert_eq!(pipeline.cache().current_user().unwrap().id.get(), 999);
+        assert_eq!(
+            crate::voice_snapshot::read_voice_total(&cache, VOICE_GUILD_ID),
+            Err(crate::voice_snapshot::SnapshotRefusal::CacheIncomplete)
+        );
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if db
+                    .store
+                    .load()
+                    .await
+                    .unwrap()
+                    .is_some_and(|saved| saved.session_id == "voice-session" && saved.sequence == 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("READY and full guild snapshot commit without a voice sink");
+        assert_eq!(
+            crate::voice_snapshot::read_voice_total(&cache, VOICE_GUILD_ID),
+            Ok(0)
+        );
+    } else {
+        wait_sequence(&db.store, 4).await;
+        assert_eq!(
+            db.store.load().await.unwrap().unwrap().session_id,
+            "saved-session"
+        );
+        assert_eq!(
+            crate::voice_snapshot::read_voice_total(&cache, VOICE_GUILD_ID),
+            Ok(1)
+        );
+        assert!(
+            mock.auth.try_recv().is_err(),
+            "warm RESUME does not IDENTIFY"
+        );
+    }
+    wait_connected(&state).await;
+    assert_eq!(*state.read().await, GatewayState::Connected);
+    runner.abort();
+    let _ = runner.await;
+    mock.task.abort();
     db.close().await;
 }
 

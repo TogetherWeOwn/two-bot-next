@@ -41,6 +41,7 @@ const STEP: Duration = Duration::from_secs(5);
 const TOTAL: Duration = Duration::from_secs(45);
 const GUILD: &str = "2222";
 const SESSION: &str = "alive-mock-session";
+const BOOTSTRAP_SESSION: &str = "alive-mock-bootstrap-session";
 type Logs = Arc<Mutex<String>>;
 
 struct TestDb {
@@ -340,6 +341,10 @@ struct MockDiscord {
 
 impl MockDiscord {
     async fn new() -> Self {
+        Self::with_bootstrap(None).await
+    }
+
+    async fn with_bootstrap(resume_url: Option<String>) -> Self {
         let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ws_addr = ws_listener.local_addr().unwrap();
         let url = format!("ws://{ws_addr}");
@@ -352,13 +357,14 @@ impl MockDiscord {
         let rest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", rest_listener.local_addr().unwrap());
         let (auth_tx, auth) = mpsc::channel(2);
-        let (handshake_tx, handshakes) = mpsc::channel(2);
+        let (handshake_tx, handshakes) = mpsc::channel(3);
         let (release, mut gates) = mpsc::channel(4);
-        let resume_url = url.clone();
+        let first_connection = if resume_url.is_some() { 2 } else { 0 };
+        let resume_url = resume_url.unwrap_or_else(|| url.clone());
         let connections = Arc::new(AtomicUsize::new(0));
         let accepted = connections.clone();
         let task = tokio::spawn(async move {
-            for boot in 0..2 {
+            for connection in first_connection..3 {
                 let (stream, _) = ws_listener.accept().await.unwrap();
                 accepted.fetch_add(1, SeqCst);
                 let (_, mut ws) = ServerBuilder::new()
@@ -391,17 +397,24 @@ impl MockDiscord {
                         Some(2 | 6) => {
                             auth_tx.send(packet).await.unwrap();
                             gates.recv().await.expect("release READY/RESUMED");
-                            if boot == 0 {
+                            if connection != 1 {
+                                let session = if connection == 0 {
+                                    SESSION
+                                } else {
+                                    BOOTSTRAP_SESSION
+                                };
                                 ws.send(Message::text(json!({"op":0,"s":1,"t":"READY","d":{
                                     "v":10,"user":{"id":"999","username":"mock-bot","discriminator":"0","mfa_enabled":false},
-                                    "session_id":SESSION,"resume_gateway_url":resume_url,"guilds":[],"application":{"id":"1111","flags":0}
+                                    "session_id":session,"resume_gateway_url":resume_url,"guilds":[],"application":{"id":"1111","flags":0}
                                 }}).to_string())).await.unwrap();
                             }
-                            // On restart this is the exact already-committed dispatch replay.
-                            ws.send(Message::text(json!({"op":0,"s":2,"t":"GUILD_MEMBER_REMOVE","d":{
-                                "guild_id":GUILD,"user":{"id":"77","username":"mock-member","discriminator":"0"}
-                            }}).to_string())).await.unwrap();
-                            if boot == 1 {
+                            if connection != 2 {
+                                // On restart this replays the exact already-committed dispatch.
+                                ws.send(Message::text(json!({"op":0,"s":2,"t":"GUILD_MEMBER_REMOVE","d":{
+                                    "guild_id":GUILD,"user":{"id":"77","username":"mock-member","discriminator":"0"}
+                                }}).to_string())).await.unwrap();
+                            }
+                            if connection == 1 {
                                 ws.send(Message::text(
                                     json!({"op":0,"s":3,"t":"RESUMED","d":{}}).to_string(),
                                 ))
@@ -630,8 +643,8 @@ async fn checkpoint(db: &TestDb, seq: u64) {
 /// Count lines carrying a stable `msg` catalog name (`docs/logging.md`). The
 /// readiness line keeps its human "gateway ready; checkpoint committed"
 /// message for the dashboards that match it, but tests key on `msg`. Each boot
-/// emits exactly one durable READY/RESUMED commit (`ready` on fresh IDENTIFY,
-/// `gateway_resumed` on RESUME replay) and one `shutdown_started` on SIGTERM.
+/// emits one durable readiness commit (`ready` after IDENTIFY, including
+/// cold-resume bootstrap) and one `shutdown_started` on SIGTERM.
 fn msg_count(logs: &str, names: &[&str]) -> usize {
     logs.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -730,7 +743,7 @@ async fn lifecycle(
     discord: &mut MockDiscord,
     bots: &mut Vec<Bot>,
     logs: &Logs,
-    decoy: Option<&str>,
+    mut bootstrap: Option<&mut MockDiscord>,
 ) {
     let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = reserved.local_addr().unwrap();
@@ -738,12 +751,12 @@ async fn lifecycle(
     // Registry-sync requests consumed by the per-boot assertion below.
     let mut consumed = 0usize;
     for boot in 0..2 {
-        // Restart with an unreachable bootstrap URL: RESUME must select the
-        // unchanged persisted endpoint rather than quietly IDENTIFY again.
+        // On restart RESUME must select the persisted endpoint, even with a
+        // distinct bootstrap listener accepting connections.
         let gateway = if boot == 0 {
             &discord.url
         } else {
-            decoy.unwrap_or("ws://127.0.0.1:1")
+            bootstrap.as_deref().map_or(&discord.url, |mock| &mock.url)
         };
         bots.push(Bot::spawn(db, addr, Some(gateway), &discord.api, logs));
         let bot = bots.last_mut().unwrap();
@@ -846,6 +859,9 @@ async fn lifecycle(
         if boot == 1 {
             assert_eq!(auth["d"]["session_id"], SESSION);
             assert_eq!(auth["d"]["seq"], 2);
+            if let Some(mock) = bootstrap.as_deref() {
+                assert_eq!(mock.connections.load(SeqCst), 0, "no dial before replay");
+            }
         }
         wait_http(bot, addr, "/readyz", 503).await; // Authentication alone isn't ready.
         assert_eq!(
@@ -860,6 +876,21 @@ async fn lifecycle(
             Some(&*discord.url),
             "persist the actual admitted wire URL"
         );
+        if boot == 1 {
+            let mock = bootstrap.as_deref_mut().unwrap_or(&mut *discord);
+            mock.release.send(()).await.unwrap(); // Bootstrap HELLO.
+            assert_eq!(mock.authentication().await["op"], 2);
+            let saved = db.store().load().await.unwrap().unwrap();
+            assert_eq!((saved.session_id.as_str(), saved.sequence), (SESSION, 3));
+            wait_http(bot, addr, "/readyz", 503).await;
+            assert_eq!(ready_commits(&logs.lock().await), 1);
+            mock.release.send(()).await.unwrap(); // Bootstrap READY.
+            checkpoint(db, 1).await;
+            assert_eq!(
+                db.store().load().await.unwrap().unwrap().session_id,
+                BOOTSTRAP_SESSION
+            );
+        }
         let ready = wait_http(bot, addr, "/readyz", 200).await;
         assert!(ready.contains("\"gateway\",\"ready\""));
         if boot == 0 {
@@ -890,7 +921,7 @@ async fn lifecycle(
             );
         }
         // Post-ready settle window: poll liveness for 200 ms so a crash
-        // just after RESUMED fails as "bot exited early" instead of being
+        // after reconnect fails as "bot exited early" instead of being
         // masked by an immediate SIGTERM. Bounded 10 ms backoff keeps the
         // window cheap under load.
         let settle_until = tokio::time::Instant::now() + Duration::from_millis(200);
@@ -940,7 +971,7 @@ async fn real_binary_is_alive_and_resumes_after_sigterm() {
 
 #[tokio::test]
 #[ignore = "requires the explicit agent-testdb/CI test URL; CI runs this under 60 seconds"]
-async fn real_binary_resumes_without_contacting_accepting_bootstrap_decoy() {
+async fn real_binary_resumes_before_contacting_distinct_bootstrap() {
     binary_lifecycle(true).await;
 }
 
@@ -950,7 +981,7 @@ async fn binary_lifecycle(accepting_decoy: bool) {
     let mut discord = MockDiscord::new().await;
     let logs = Logs::default();
     let mut bots = Vec::new();
-    let decoy = MockDiscord::new().await; // Accepting listener: any dial is counted.
+    let mut decoy = MockDiscord::with_bootstrap(Some(discord.url.clone())).await;
     let exercise = async {
         strict_boot_probes(&db, &discord.api, &mut bots, &logs, &decoy.url).await;
         let owned = discord.connections.load(SeqCst) + decoy.connections.load(SeqCst);
@@ -959,12 +990,12 @@ async fn binary_lifecycle(accepting_decoy: bool) {
         discord.rest_requests.lock().await.clear();
         // Inadmissible checkpoint under a checked local bootstrap must IDENTIFY.
         seed_raw(&db, &format!("{}/invalid", decoy.url)).await;
-        let bootstrap = accepting_decoy.then_some(decoy.url.as_str());
+        let bootstrap = accepting_decoy.then_some(&mut decoy);
         lifecycle(&db, &mut discord, &mut bots, &logs, bootstrap).await;
         assert_eq!(
             decoy.connections.load(SeqCst),
-            0,
-            "no probe/decoy connections"
+            usize::from(accepting_decoy),
+            "only the post-replay bootstrap may reach the distinct listener"
         );
     };
     let result = AssertUnwindSafe(timeout(TOTAL, exercise))

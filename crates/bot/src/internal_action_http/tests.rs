@@ -2222,6 +2222,68 @@ async fn voice_snapshot_serves_pipeline_fed_shared_cache() {
 }
 
 #[tokio::test]
+async fn voice_snapshot_refuses_guild_omitted_by_ready_until_full_reseed() {
+    use two_bot_discord::{NoInvites, OrderedLevelingPipeline, PipelineSnapshots};
+
+    let Some(db) = database().await else { return };
+    let _flag = INTERNAL_FLAG_LOCK.lock().await;
+    set_voice_snapshot_flag(true);
+    let cache = seeded_voice_cache();
+    let pipeline = OrderedLevelingPipeline::with_shared_cache(
+        two_bot_core::MemStore::new(),
+        None,
+        NoInvites,
+        PipelineSnapshots::new(),
+        Arc::clone(&cache),
+    );
+    let app = voice_app(db.pool().clone(), Arc::clone(&cache));
+    let read = || answer(app.clone(), signed_read(&voice_snapshot_payload(), "old"));
+    let guild_id = staging_guild().parse().unwrap();
+    let scalar = || voice_snapshot::read_voice_total(&cache, guild_id);
+    let (status, _, body) = read().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["total_in_voice"], 2);
+    assert_eq!(scalar(), Ok(2));
+
+    let ready = Event::Ready(serde_json::from_value(serde_json::json!({
+        "v": 10, "session_id": "new-session", "resume_gateway_url": "ws://fixture.invalid",
+        "application": {"id": "999", "flags": 0},
+        "user": {"id": "999", "username": "fixture", "discriminator": "0", "mfa_enabled": false},
+        "guilds": []
+    })).unwrap());
+    for event in [
+        ready,
+        Event::VoiceStateUpdate(Box::new(voice_state("41", Some("33")))),
+    ] {
+        pipeline.handle(&event).await.unwrap();
+        let (status, _, body) = read().await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "discord_unavailable");
+        assert_eq!(body["error"]["retryable"], true);
+        assert_eq!(scalar(), Err(SnapshotRefusal::CacheIncomplete));
+    }
+
+    let Event::GuildCreate(mut create) = seeded_guild_event() else {
+        unreachable!()
+    };
+    let GuildCreate::Available(guild) = create.as_mut() else {
+        unreachable!()
+    };
+    // Keep a text channel so this is a complete guild with no voice rooms.
+    guild.channels.retain(|channel| channel.id.get() == 37);
+    guild.afk_channel_id = None;
+    guild.voice_states.clear();
+    pipeline.handle(&Event::GuildCreate(create)).await.unwrap();
+    let (status, _, body) = read().await;
+    set_voice_snapshot_flag(false);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["total_in_voice"], 0);
+    assert_eq!(body["result"]["rooms"], serde_json::json!([]));
+    assert_eq!(scalar(), Ok(0));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn voice_snapshot_projects_the_live_cache_shape() {
     let Some(db) = database().await else { return };
     let _flag = INTERNAL_FLAG_LOCK.lock().await;
