@@ -1,27 +1,21 @@
-//! Content-free redelivery replay for `/automod-preview` (spec §6).
+//! Fail-closed replay of supported automod preview rows.
 //!
-//! Rebuild replies only from the committed outcome, reason, and timestamp.
-//! Malformed stored data fails closed instead of triggering re-evaluation.
+//! This helper is not wired to the preview handler.
 
 use crate::automod::AutomodFilter;
-use crate::automod_preview::{PreviewExemption, PreviewResult, PreviewVerdict};
-use crate::automod_preview_report::{
-    render_preview_reply, replay_exemption_knob, PREVIEW_RATE_LIMITED_REPLY,
+use crate::automod_preview::{
+    deciding_knobs, exemption_knobs, PreviewExemption, PreviewResult, PreviewVerdict,
 };
+use crate::automod_preview_report::{render_preview_reply, PREVIEW_RATE_LIMITED_REPLY};
 
-/// Parsed `reason` field (`filter=..;exemption=..;mode=..;len=..`). Only the
-/// filter, exemption, and mode drive a replayed reply; the length bucket is
-/// validated present but never rendered.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedPreviewReason {
-    filter: String,
-    exemption: String,
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedPreviewReason<'a> {
+    filter: &'a str,
+    exemption: &'a str,
     dry_run: bool,
 }
 
-/// Strict parse of a stored preview reason. `None` fails closed as
-/// unavailable: never a guessed class or a fresh evaluation.
-fn parse_preview_reason(reason: &str) -> Option<ParsedPreviewReason> {
+fn parse_preview_reason(reason: &str) -> Option<ParsedPreviewReason<'_>> {
     let mut parts = reason.split(';');
     let filter = parts.next()?.strip_prefix("filter=")?;
     let exemption = parts.next()?.strip_prefix("exemption=")?;
@@ -36,23 +30,15 @@ fn parse_preview_reason(reason: &str) -> Option<ParsedPreviewReason> {
         _ => return None,
     };
     Some(ParsedPreviewReason {
-        filter: filter.to_owned(),
-        exemption: exemption.to_owned(),
+        filter,
+        exemption,
         dry_run,
     })
 }
 
-/// Rebuild the ephemeral reply from one committed audit row, without
-/// evaluating anything. Returns `None` for any missing, unknown, or
-/// malformed field: the handler answers the generic unavailable line and
-/// never guesses a verdict.
-///
-/// The exemption knob comes from the persisted class via
-/// [`replay_exemption_knob`], never from current config or member roles; a
-/// `matched` filter name parses via [`AutomodFilter::from_persisted_name`].
-/// `rate_limited` replays the generic rate line (the mode still parses, so a
-/// corrupt reason fails closed). `created_at` is the stored timestamp text,
-/// used verbatim so replays match the first reply exactly.
+/// Reconstruct a supported reply from a committed row without evaluation.
+/// `created_at` is the pre-rendered stored currency timestamp, not a new clock
+/// reading. Unsupported outcomes, invalid reasons, and empty timestamps fail closed.
 #[must_use]
 pub fn replay_preview_reply(
     outcome: &str,
@@ -62,64 +48,40 @@ pub fn replay_preview_reply(
     if created_at.is_empty() {
         return None;
     }
-    if outcome == "rate_limited" {
-        let parsed = parse_preview_reason(reason?)?;
-        if parsed.filter != "none" || parsed.exemption != "none" {
-            return None;
-        }
-        return Some(PREVIEW_RATE_LIMITED_REPLY.to_owned());
-    }
     let parsed = parse_preview_reason(reason?)?;
-    let verdict = match outcome {
-        "matched" => {
-            if parsed.exemption != "none" {
-                return None;
-            }
-            let filter = AutomodFilter::from_persisted_name(&parsed.filter)?;
+    let verdict = match (outcome, parsed.filter, parsed.exemption) {
+        ("matched", name, "none") => {
+            let filter = AutomodFilter::from_persisted_name(name)?;
             PreviewVerdict {
                 result: PreviewResult::Matched,
                 filter: Some(filter),
-                knobs: crate::automod_preview::deciding_knobs(filter),
+                knobs: deciding_knobs(filter),
                 exemption: None,
                 dry_run: parsed.dry_run,
             }
         }
-        "no_match" => {
-            if parsed.filter != "none" || parsed.exemption != "none" {
-                return None;
-            }
-            PreviewVerdict {
-                result: PreviewResult::NoMatch,
-                filter: None,
-                knobs: &[],
-                exemption: None,
-                dry_run: parsed.dry_run,
-            }
-        }
-        "exempt" => {
-            if parsed.filter != "none" {
-                return None;
-            }
-            let class = match parsed.exemption.as_str() {
+        ("rate_limited", "none", "none") => return Some(PREVIEW_RATE_LIMITED_REPLY.to_owned()),
+        ("no_match", "none", "none") => PreviewVerdict {
+            result: PreviewResult::NoMatch,
+            filter: None,
+            knobs: &[],
+            exemption: None,
+            dry_run: parsed.dry_run,
+        },
+        ("partial", "none", "none") => PreviewVerdict::partial(parsed.dry_run),
+        ("exempt", "none", class) => {
+            let exemption = match class {
                 "exempt_channel" => PreviewExemption::ExemptChannel,
                 "bypass_role" => PreviewExemption::BypassRole,
                 _ => return None,
             };
-            // The knob comes from the stored class, never current config.
-            replay_exemption_knob(parsed.exemption.as_str())?;
             PreviewVerdict {
                 result: PreviewResult::Exempt,
                 filter: None,
-                knobs: crate::automod_preview::exemption_knobs(class),
-                exemption: Some(class),
+                knobs: exemption_knobs(exemption),
+                exemption: Some(exemption),
                 dry_run: parsed.dry_run,
             }
-        }
-        "partial" => {
-            if parsed.filter != "none" || parsed.exemption != "none" {
-                return None;
-            }
-            PreviewVerdict::partial(parsed.dry_run)
         }
         _ => return None,
     };
@@ -129,8 +91,6 @@ pub fn replay_preview_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::automod::{AutomodConfig, AutomodMessage, AutomodPolicy, RepeatTracker};
-    use crate::automod_preview::preview_automod;
     use crate::automod_preview_report::{audit_reason_for_verdict, preview_audit_outcome};
 
     #[test]
@@ -178,29 +138,167 @@ mod tests {
     }
 
     #[test]
-    fn replay_outcome_support_requires_consistent_fields() {
+    fn no_match_and_partial_replay_the_original_reply() {
+        let created_at = "2026-11-02T08:00:00.123Z";
+        for dry_run in [true, false] {
+            let no_match = PreviewVerdict {
+                result: PreviewResult::NoMatch,
+                filter: None,
+                knobs: &[],
+                exemption: None,
+                dry_run,
+            };
+            for verdict in [no_match, PreviewVerdict::partial(dry_run)] {
+                let outcome = preview_audit_outcome(&verdict);
+                for len in [50, 51, 501] {
+                    let reason = audit_reason_for_verdict(&verdict, len);
+                    assert_eq!(
+                        replay_preview_reply(outcome, Some(&reason), created_at),
+                        Some(render_preview_reply(&verdict, created_at)),
+                        "{outcome}: {reason}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_contradictory_verdict_rows_fail_closed() {
+        let valid = Some("filter=none;exemption=none;mode=dry_run;len=0_50");
+        for outcome in ["no_match", "partial"] {
+            for reason in [
+                None,
+                Some("filter=none;exemption=none;mode=dry_run"),
+                Some("filter=none;exemption=none;mode=live;len=0_50"),
+                Some("filter=none;exemption=none;mode=dry_run;len=unexpected"),
+                Some("filter=bad_words;exemption=none;mode=dry_run;len=0_50"),
+                Some("filter=none;exemption=bypass_role;mode=dry_run;len=0_50"),
+            ] {
+                assert_eq!(replay_preview_reply(outcome, reason, "t"), None);
+            }
+            assert_eq!(replay_preview_reply(outcome, valid, ""), None);
+        }
+    }
+
+    #[test]
+    fn unknown_outcomes_and_missing_exemption_fail_closed() {
         let reason = Some("filter=none;exemption=none;mode=dry_run;len=0_50");
-        // Matched and exempt require a filter and exemption class respectively.
-        for outcome in ["matched", "exempt", "bogus", ""] {
+        for outcome in ["exempt", "bogus", ""] {
             assert_eq!(replay_preview_reply(outcome, reason, "t"), None);
         }
-        let no_match = PreviewVerdict {
-            result: PreviewResult::NoMatch,
-            filter: None,
-            knobs: &[],
-            exemption: None,
-            dry_run: true,
-        };
         assert_eq!(
-            replay_preview_reply("no_match", reason, "t"),
-            Some(render_preview_reply(&no_match, "t"))
-        );
-        assert_eq!(
-            replay_preview_reply("partial", reason, "t"),
-            Some(render_preview_reply(&PreviewVerdict::partial(true), "t"))
+            replay_preview_reply(
+                "bogus",
+                Some("filter=none;exemption=bypass_role;mode=dry_run;len=0_50"),
+                "t",
+            ),
+            None
         );
     }
 
+    #[test]
+    fn matched_replays_the_original_reply_for_each_filter_and_mode() {
+        let created_at = "2026-11-02T08:00:00.123Z";
+        for filter in [
+            AutomodFilter::BadWords,
+            AutomodFilter::RepeatedMessage,
+            AutomodFilter::MentionSpam,
+            AutomodFilter::InviteLink,
+            AutomodFilter::ExternalLink,
+            AutomodFilter::AttachmentType,
+        ] {
+            for dry_run in [true, false] {
+                let verdict = PreviewVerdict {
+                    result: PreviewResult::Matched,
+                    filter: Some(filter),
+                    knobs: deciding_knobs(filter),
+                    exemption: None,
+                    dry_run,
+                };
+                let outcome = preview_audit_outcome(&verdict);
+                for len in [50, 51, 501] {
+                    let reason = audit_reason_for_verdict(&verdict, len);
+                    assert_eq!(
+                        replay_preview_reply(outcome, Some(&reason), created_at),
+                        Some(render_preview_reply(&verdict, created_at)),
+                        "{outcome}: {reason}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_contradictory_matched_rows_fail_closed() {
+        let valid = Some("filter=bad_words;exemption=none;mode=dry_run;len=0_50");
+        for reason in [
+            None,
+            Some("filter=none;exemption=none;mode=dry_run;len=0_50"),
+            Some("filter=unknown;exemption=none;mode=dry_run;len=0_50"),
+            Some("filter=bad_words;exemption=bypass_role;mode=dry_run;len=0_50"),
+            Some("filter=bad_words;exemption=exempt_channel;mode=enforce;len=0_50"),
+            Some("filter=bad_words;exemption=none;mode=live;len=0_50"),
+            Some("filter=bad_words;exemption=none;mode=dry_run;len=unexpected"),
+            Some("filter=bad_words;exemption=none;mode=dry_run"),
+            Some("filter=bad_words;exemption=none;mode=dry_run;len=0_50;filter=invite_link"),
+        ] {
+            assert_eq!(
+                replay_preview_reply("matched", reason, "t"),
+                None,
+                "{reason:?}"
+            );
+        }
+        assert_eq!(replay_preview_reply("matched", valid, ""), None);
+    }
+
+    #[test]
+    fn exempt_replays_the_original_reply_for_each_class_and_mode() {
+        let created_at = "2026-11-02T08:00:00.123Z";
+        for exemption in [
+            PreviewExemption::ExemptChannel,
+            PreviewExemption::BypassRole,
+        ] {
+            for dry_run in [true, false] {
+                let verdict = PreviewVerdict {
+                    result: PreviewResult::Exempt,
+                    filter: None,
+                    knobs: exemption_knobs(exemption),
+                    exemption: Some(exemption),
+                    dry_run,
+                };
+                let outcome = preview_audit_outcome(&verdict);
+                for len in [50, 51, 501] {
+                    let reason = audit_reason_for_verdict(&verdict, len);
+                    assert_eq!(
+                        replay_preview_reply(outcome, Some(&reason), created_at),
+                        Some(render_preview_reply(&verdict, created_at)),
+                        "{outcome}: {reason}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_contradictory_exempt_rows_fail_closed() {
+        let valid = Some("filter=none;exemption=bypass_role;mode=dry_run;len=0_50");
+        for reason in [
+            None,
+            Some("filter=none;exemption=none;mode=dry_run;len=0_50"),
+            Some("filter=none;exemption=admin;mode=dry_run;len=0_50"),
+            Some("filter=bad_words;exemption=bypass_role;mode=dry_run;len=0_50"),
+            Some("filter=none;exemption=exempt_channel;mode=live;len=0_50"),
+            Some("filter=none;exemption=bypass_role;mode=dry_run;len=unexpected"),
+            Some("filter=none;exemption=exempt_channel;mode=enforce"),
+        ] {
+            assert_eq!(
+                replay_preview_reply("exempt", reason, "t"),
+                None,
+                "{reason:?}"
+            );
+        }
+        assert_eq!(replay_preview_reply("exempt", valid, ""), None);
+    }
     #[test]
     fn reason_parse_accepts_only_the_emitted_shape() {
         let parsed = parse_preview_reason("filter=bad_words;exemption=none;mode=dry_run;len=0_50")
@@ -238,184 +336,50 @@ mod tests {
     }
 
     #[test]
-    fn replay_rebuilds_every_outcome_without_evaluating() {
-        let created_at = "2026-11-02 08:00:00+00";
-        // Matched: first reply and replayed reply are byte-identical.
+    fn replay_preserves_opaque_stored_timestamp() {
         let verdict = matched_bad_words_verdict(true);
-        let first = render_preview_reply(&verdict, created_at);
         let reason = audit_reason_for_verdict(&verdict, 12);
+        let timestamp = "stored timestamp with microseconds 123456";
         assert_eq!(
-            replay_preview_reply(preview_audit_outcome(&verdict), Some(&reason), created_at),
-            Some(first)
+            replay_preview_reply("matched", Some(&reason), timestamp),
+            Some(render_preview_reply(&verdict, timestamp))
         );
-        // No-match, exempt (knob from the stored class), partial, rate-limited.
-        let no_match = PreviewVerdict {
-            result: PreviewResult::NoMatch,
-            filter: None,
-            knobs: &[],
-            exemption: None,
-            dry_run: false,
-        };
-        let reason = audit_reason_for_verdict(&no_match, 9);
-        assert_eq!(
-            replay_preview_reply("no_match", Some(&reason), created_at),
-            Some(render_preview_reply(&no_match, created_at))
-        );
-        let exempt = PreviewVerdict {
-            result: PreviewResult::Exempt,
-            filter: None,
-            knobs: crate::automod_preview::exemption_knobs(PreviewExemption::BypassRole),
-            exemption: Some(PreviewExemption::BypassRole),
-            dry_run: true,
-        };
-        let reason = audit_reason_for_verdict(&exempt, 7);
-        let replayed =
-            replay_preview_reply("exempt", Some(&reason), created_at).expect("exempt replays");
-        assert_eq!(replayed, render_preview_reply(&exempt, created_at));
-        assert!(replayed.contains("TWO_AUTOMOD_BYPASS_ROLE_IDS"));
-        let partial = PreviewVerdict::partial(true);
-        let reason = audit_reason_for_verdict(&partial, 9);
-        assert_eq!(
-            replay_preview_reply("partial", Some(&reason), created_at),
-            Some(render_preview_reply(&partial, created_at))
-        );
-        assert_eq!(
-            replay_preview_reply(
-                "rate_limited",
-                Some("filter=none;exemption=none;mode=enforce;len=51_500"),
-                created_at
-            ),
-            Some(PREVIEW_RATE_LIMITED_REPLY.to_owned())
-        );
-    }
-
-    #[test]
-    fn replay_fails_closed_on_any_malformed_field() {
-        let created_at = "2026-11-02 08:00:00+00";
-        // Unknown outcome, missing/invalid reason, unknown filter, guessed class.
-        assert_eq!(
-            replay_preview_reply(
-                "bogus",
-                Some("filter=none;exemption=none;mode=dry_run;len=0_50"),
-                created_at
-            ),
-            None
-        );
-        assert_eq!(replay_preview_reply("matched", None, created_at), None);
-        assert_eq!(
-            replay_preview_reply(
-                "matched",
-                Some("filter=nonsense;exemption=none;mode=dry_run;len=0_50"),
-                created_at
-            ),
-            None
-        );
-        // Matched row claiming an exemption, exempt row with a filter, and an
-        // invalid stored exemption class all refuse instead of guessing.
-        assert_eq!(
-            replay_preview_reply(
-                "matched",
-                Some("filter=bad_words;exemption=bypass_role;mode=dry_run;len=0_50"),
-                created_at
-            ),
-            None
-        );
-        assert_eq!(
-            replay_preview_reply(
-                "no_match",
-                Some("filter=bad_words;exemption=none;mode=dry_run;len=0_50"),
-                created_at
-            ),
-            None
-        );
-        assert_eq!(
-            replay_preview_reply(
-                "exempt",
-                Some("filter=none;exemption=admin;mode=dry_run;len=0_50"),
-                created_at
-            ),
-            None
-        );
-        assert_eq!(
-            replay_preview_reply(
-                "exempt",
-                Some("filter=none;exemption=none;mode=dry_run;len=0_50"),
-                created_at
-            ),
-            None
-        );
-        for (outcome, reason) in [
-            (
-                "exempt",
-                "filter=bad_words;exemption=bypass_role;mode=dry_run;len=0_50",
-            ),
-            (
-                "partial",
-                "filter=bad_words;exemption=none;mode=dry_run;len=0_50",
-            ),
-            (
-                "partial",
-                "filter=none;exemption=bypass_role;mode=dry_run;len=0_50",
-            ),
-            (
-                "rate_limited",
-                "filter=bad_words;exemption=none;mode=dry_run;len=0_50",
-            ),
-            (
-                "rate_limited",
-                "filter=none;exemption=bypass_role;mode=dry_run;len=0_50",
-            ),
-        ] {
-            assert_eq!(
-                replay_preview_reply(outcome, Some(reason), created_at),
-                None
-            );
+        for dry_run in [true, false] {
+            let verdicts = [
+                PreviewVerdict {
+                    result: PreviewResult::NoMatch,
+                    filter: None,
+                    knobs: &[],
+                    exemption: None,
+                    dry_run,
+                },
+                PreviewVerdict::partial(dry_run),
+                PreviewVerdict {
+                    result: PreviewResult::Exempt,
+                    filter: None,
+                    knobs: crate::automod_preview::exemption_knobs(PreviewExemption::BypassRole),
+                    exemption: Some(PreviewExemption::BypassRole),
+                    dry_run,
+                },
+            ];
+            for verdict in verdicts {
+                let reason = audit_reason_for_verdict(&verdict, 12);
+                let replayed =
+                    replay_preview_reply(preview_audit_outcome(&verdict), Some(&reason), timestamp)
+                        .expect("stored verdict replays");
+                assert_eq!(replayed, render_preview_reply(&verdict, timestamp));
+                if verdict.exemption == Some(PreviewExemption::BypassRole) {
+                    assert!(replayed.contains("TWO_AUTOMOD_BYPASS_ROLE_IDS"));
+                }
+            }
         }
-        // Corrupt rate-limited reason and empty timestamp refuse too.
-        assert_eq!(
-            replay_preview_reply(
-                "rate_limited",
-                Some("filter=none;exemption=none;mode=live;len=0_50"),
-                created_at
-            ),
-            None
-        );
-        assert_eq!(
-            replay_preview_reply(
-                "no_match",
-                Some("filter=none;exemption=none;mode=dry_run;len=0_50"),
-                ""
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn replay_never_consults_live_config_or_roles() {
-        // The stored row was written under a config that has since changed:
-        // replay still renders the stored filter and knob, byte-identical.
-        let created_at = "2026-11-02 08:00:00+00";
-        let verdict = matched_bad_words_verdict(true);
-        let reason = audit_reason_for_verdict(&verdict, 12);
-        let before = replay_preview_reply("matched", Some(&reason), created_at).expect("replays");
-        // A "changed world": different policy, different roles — replay takes
-        // neither as a parameter, so the stored row renders the same reply.
-        let policy = AutomodPolicy {
-            bad_words: vec!["different".to_owned()],
-            ..AutomodPolicy::default()
-        };
-        let _config = AutomodConfig {
-            enabled: true,
-            dry_run: false,
-            policy,
-        };
-        let after = replay_preview_reply("matched", Some(&reason), created_at).expect("replays");
-        assert_eq!(before, after);
-        assert!(after.contains("TWO_AUTOMOD_BAD_WORDS"));
     }
 
     #[test]
     fn replay_matches_a_live_evaluation_for_the_same_verdict() {
+        use crate::automod::{AutomodConfig, AutomodMessage, AutomodPolicy, RepeatTracker};
+        use crate::automod_preview::preview_automod;
+
         // Core-half of T17: the row written for a real evaluation replays the
         // same reply the evaluation rendered.
         let policy = AutomodPolicy {
@@ -448,5 +412,31 @@ mod tests {
             replay_preview_reply(preview_audit_outcome(&verdict), Some(&reason), created_at),
             Some(first)
         );
+    }
+
+    #[test]
+    fn replay_never_consults_live_config_or_roles() {
+        use crate::automod::{AutomodConfig, AutomodPolicy};
+
+        // The stored row was written under a config that has since changed:
+        // replay still renders the stored filter and knob, byte-identical.
+        let created_at = "2026-11-02 08:00:00+00";
+        let verdict = matched_bad_words_verdict(true);
+        let reason = audit_reason_for_verdict(&verdict, 12);
+        let before = replay_preview_reply("matched", Some(&reason), created_at).expect("replays");
+        // A "changed world": different policy, different roles — replay takes
+        // neither as a parameter, so the stored row renders the same reply.
+        let policy = AutomodPolicy {
+            bad_words: vec!["different".to_owned()],
+            ..AutomodPolicy::default()
+        };
+        let _config = AutomodConfig {
+            enabled: true,
+            dry_run: false,
+            policy,
+        };
+        let after = replay_preview_reply("matched", Some(&reason), created_at).expect("replays");
+        assert_eq!(before, after);
+        assert!(after.contains("TWO_AUTOMOD_BAD_WORDS"));
     }
 }

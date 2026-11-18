@@ -61,7 +61,7 @@ fn router() -> InteractionRouter {
 
 fn slash(id: u64, name: &str, permissions: u64, options: Value) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
+        "application_id": "1111", "attachment_size_limit": 10485760, "authorizing_integration_owners": {"0": GUILD},
         "id": id.to_string(), "token": "mock-rsvp-token", "type": 2,
         "version": 1, "guild_id": GUILD,
         "member": {"permissions": permissions.to_string(), "roles": [],
@@ -2084,7 +2084,7 @@ fn candidate_runtime_with_router(router: InteractionRouter, mock: &MockRest) -> 
 /// returns `None` even though the wire name reads `rsvp`.
 fn identity_mismatched_rsvp(id: u64) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
+        "application_id": "1111", "attachment_size_limit": 10485760, "authorizing_integration_owners": {"0": GUILD},
         "id": id.to_string(), "token": "mock-rsvp-token", "type": 2,
         "version": 1, "guild_id": GUILD,
         "member": {"permissions": "0", "roles": [],
@@ -2103,7 +2103,7 @@ fn identity_mismatched_rsvp(id: u64) -> Interaction {
 /// never owns: `resolve_interaction` passes it through, but it is not slash.
 fn component_interaction(id: u64) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
+        "application_id": "1111", "attachment_size_limit": 10485760, "authorizing_integration_owners": {"0": GUILD},
         "id": id.to_string(), "token": "mock-rsvp-token", "type": 3,
         "version": 1, "guild_id": GUILD,
         "member": {"permissions": "0", "roles": [],

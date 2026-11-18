@@ -81,21 +81,8 @@ mod tests {
 
     #[test]
     fn encodes_synthetic_manifest_bytes() {
-        let slots = (0..40)
-            .map(|i| {
-                let op = ["identity", "guild_context", "bot_membership", "event_list"][i % 4];
-                format!(
-                    "{{\"index\":\"{i}\",\"operation\":\"{op}\",\"offset_ms\":\"{}\"}}",
-                    15000 + 10000 * i
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let expected = format!(concat!(
-            "{{\"v\":\"1\",\"candidate_sha\":\"{SHA}\",\"slots\":[{slots}],",
-            "\"routes\":[{{\"id\":\"fixture_route\",\"evidence_contract_sha256\":\"{ROUTE_HASH}\",\"read_operation\":\"identity\"}}],",
-            "\"journeys\":[{{\"id\":\"fixture_journey\",\"evidence_contract_sha256\":\"{JOURNEY_HASH}\",\"route_ids\":[\"fixture_route\"]}}]}}"
-        ), SHA = SHA, slots = slots, ROUTE_HASH = ROUTE_HASH, JOURNEY_HASH = JOURNEY_HASH);
+        // Exact synthetic packet bytes, with no final LF.
+        let expected = include_str!("../../tests/fixtures/counted_read_manifest.json");
         assert_eq!(expected.len(), 2867);
         assert_eq!(
             encode_manifest(
@@ -105,7 +92,7 @@ mod tests {
                 &[journey("fixture_journey", &["fixture_route"])]
             )
             .as_deref(),
-            Some(expected.as_str())
+            Some(expected)
         );
     }
 
@@ -141,8 +128,42 @@ mod tests {
         assert!(manifest_digest("BAD", &slots, &routes, &journeys).is_none());
         assert!(manifest_digest(SHA, &slots[..39], &routes, &journeys).is_none());
         let mut changed = slots.clone();
+        changed.push(slots[39]);
+        assert!(manifest_digest(SHA, &changed, &routes, &journeys).is_none());
+        changed.truncate(slots.len());
         changed.swap(0, 1);
         assert!(manifest_digest(SHA, &changed, &routes, &journeys).is_none());
+        changed.swap(0, 1);
+        for invalid in [
+            ReadSlot {
+                index: 1,
+                ..slots[0]
+            },
+            ReadSlot {
+                operation: ReadOperation::EventList,
+                ..slots[0]
+            },
+            ReadSlot {
+                due_after_seconds: 16,
+                ..slots[0]
+            },
+        ] {
+            changed[0] = invalid;
+            assert!(
+                manifest_digest(SHA, &changed, &routes, &journeys).is_none(),
+                "{invalid:?}"
+            );
+        }
+        let bad_route = ManifestRoute {
+            evidence_contract_sha256: "",
+            ..route("a")
+        };
+        let bad_journey = ManifestJourney {
+            evidence_contract_sha256: "not-a-sha256",
+            ..journey("a", &["a", "b"])
+        };
+        assert!(manifest_digest(SHA, &slots, &[bad_route, route("b")], &journeys).is_none());
+        assert!(manifest_digest(SHA, &slots, &routes, &[bad_journey]).is_none());
         assert!(manifest_digest(SHA, &slots, &routes, &[journey("a", &["a"])]).is_none());
         assert!(manifest_digest(SHA, &slots, &routes, &[journey("a", &["a", "c"])]).is_none());
         assert!(manifest_digest(SHA, &slots, &[route("b"), route("a")], &journeys).is_none());

@@ -3349,7 +3349,7 @@ mod tests {
     fn live_entry() -> (LiveInteraction, tokio::sync::oneshot::Sender<bool>) {
         let interaction: twilight_model::application::interaction::Interaction =
             serde_json::from_value(serde_json::json!({
-                "id": "9", "application_id": "1111", "type": 2,
+                "id": "9", "application_id": "1111", "attachment_size_limit": 10485760, "type": 2,
                 "token": "synthetic-interaction-token", "version": 1,
                 "guild_id": "22",
                 "channel": {"id": "4444", "type": 0, "name": "commands"},
@@ -4723,6 +4723,7 @@ mod tests {
         let interaction: twilight_model::application::interaction::Interaction =
             serde_json::from_value(serde_json::json!({
                 "application_id": "111",
+                "attachment_size_limit": 10485760,
                 "authorizing_integration_owners": {"0": "22"},
                 "id": "333",
                 "token": "mock-callback",
