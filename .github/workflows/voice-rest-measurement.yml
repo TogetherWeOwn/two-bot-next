@@ -50,9 +50,44 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  voice-first:
+  measurement-before:
     needs: staging-window
     if: ${{ false && github.ref == 'refs/heads/main' && needs.staging-window.result == 'success' }}
+    permissions:
+      contents: read
+    environment: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Capture the initial sanitized receipt
+        env:
+          STAGING_USE_SHA: ${{ needs.staging-window.outputs.sha }}
+          STAGING_USE_DEPLOYMENT: ${{ needs.staging-window.outputs.deployment_id }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.staging-window.outputs.expires_at }}
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
+        run: |
+          node wrangler/scripts/voice-measurement-metadata.mjs "$RUNNER_TEMP/voice-metadata.json"
+          node wrangler/scripts/voice-rest-measurement.mjs capture --metadata "$RUNNER_TEMP/voice-metadata.json" --metrics-url "$STAGING_WORKER_URL" --out "$RUNNER_TEMP/voice-before.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: voice-measurement-before-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/voice-before.json
+          if-no-files-found: error
+          retention-days: 14
+
+  voice-first:
+    needs: [staging-window, measurement-before]
+    if: ${{ false && github.ref == 'refs/heads/main' && needs.staging-window.result == 'success' && needs.measurement-before.result == 'success' }}
     permissions:
       contents: read
     uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
@@ -65,8 +100,48 @@ jobs:
       TWO_VOICE_SYNTHETIC_BOT_TOKEN: ${{ secrets.TWO_VOICE_SYNTHETIC_BOT_TOKEN }}
       STAGING_OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
 
+  measurement-after:
+    needs: [staging-window, measurement-before, voice-first]
+    if: ${{ false && github.ref == 'refs/heads/main' && needs.voice-first.result == 'success' }}
+    permissions:
+      contents: read
+    environment: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: voice-measurement-before-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/voice-before
+      - name: Capture and compare sanitized receipts
+        env:
+          STAGING_USE_SHA: ${{ needs.staging-window.outputs.sha }}
+          STAGING_USE_DEPLOYMENT: ${{ needs.staging-window.outputs.deployment_id }}
+          STAGING_USE_EXPIRES_AT: ${{ needs.staging-window.outputs.expires_at }}
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          PRODUCTION_WORKER_URL: ${{ vars.PRODUCTION_WORKER_URL }}
+          METRICS_SCRAPE_TOKEN: ${{ secrets.STAGING_METRICS_SCRAPE_TOKEN }}
+        run: |
+          node wrangler/scripts/voice-measurement-metadata.mjs "$RUNNER_TEMP/voice-metadata.json"
+          node wrangler/scripts/voice-rest-measurement.mjs capture --metadata "$RUNNER_TEMP/voice-metadata.json" --metrics-url "$STAGING_WORKER_URL" --out "$RUNNER_TEMP/voice-after.json"
+          node wrangler/scripts/voice-rest-measurement.mjs compare --before "$RUNNER_TEMP/voice-before/voice-before.json" --after "$RUNNER_TEMP/voice-after.json" --out "$RUNNER_TEMP/voice-comparison.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: voice-measurement-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/voice-comparison.json
+          if-no-files-found: error
+          retention-days: 14
+
   staging-use-release:
-    needs: [staging-window, voice-first]
+    needs: [staging-window, measurement-before, voice-first, measurement-after]
     if: ${{ false && always() && github.ref == 'refs/heads/main' && needs.staging-window.outputs.expires_at != '' }}
     permissions:
       contents: read

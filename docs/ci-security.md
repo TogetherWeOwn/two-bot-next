@@ -21,28 +21,15 @@ base-branch gate provenance without importing modules from the PR checkout.
 Explicit job names match their previous jobs-API identities; permission comments
 explain the existing grants without changing their values.
 
-## Staging deployment (active)
+## Staging deployment
 
-AUTOMATED staging deployment is ACTIVE (TOG-12856, unblocking the TOG-12852
-rehearsal): the `deploy` job in `deploy-staging.yml` runs unconditionally on
-every push to `main` that changes a runtime input, and on manual
-`workflow_dispatch`, in the GitHub `staging` environment, with the single
-fenced `release_fence` dispatch input (opt-in boolean, defaults to false). The
-push trigger carries a workflow-level `paths-ignore` deny-list of non-runtime
-paths (`docs/**`, root `*.md`, license, editor/ignore/gitleaks config, issue and
-PR templates, CODEOWNERS, dependabot config). GitHub skips the run only when
-every changed path matches, so a mixed push, an unclassified path or any
-workflow, Cargo, `crates/**` or `wrangler/**` change still deploys, and a
-skipped push creates **no run at all** (not a skipped job). There is no
-job-level `if:` — a condition there (including the old `if: ${{ false }}`
-suspension, removed here) would silently skip deploys on some SHAs and leave
-the production guard refusing those SHAs with no deploy ever running. The
-deny-list is the one reviewed exception: it skips only SHAs whose diff cannot
-change the Worker or container, and `scripts/ci/test_workflows.py` pins it
-against sample runtime paths. A skipped job is **not** deployment, readiness,
-protected-environment or E2E success; only a `success` conclusion with the
-intended-rollout evidence counts. Existing running staging resources are
-unchanged; no alternate manual deploy route is authorized.
+Staging deployment is governed by `deploy-staging.yml`. Consult the workflow
+at the relevant ref for its triggers; a merge is not evidence of deployment,
+readiness, activation or qualification. Verify completed qualifying evidence
+for the intended exact `main` SHA. If it is absent, keep promotion held and
+follow the separately authorized [qualification/recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
+A skipped job is not deployment, protected-environment or E2E success; no
+alternate manual deploy route is authorized.
 
 CISO accepted the prior disabled CI-only scope in TOG-10958 and TOG-11179 plan
 revision 2. This re-activation ships as a reviewed workflow PR with exact-head
@@ -89,10 +76,10 @@ Every `deploy-staging` run starts with the `soak-hold` job and then the
 `schema-gate` job, and `deploy` needs the gates, so a staging database behind
 the source fails the run before any deploy step instead of staying red
 silently. The hold reads only the Operator-owned `STAGING_SOAK_HOLD_UNTIL`
-repo variable and fails the run while a drill hold is armed, so a deferred
-push never reports a success the production guard could mistake for staging
-history. The gate job runs only in the
-`staging-migrate-plan` environment with `contents: read`, builds the reviewed
+repo variable. While armed, a run subject to the hold fails fast rather than
+reporting success without deploying. Ordinary manual dispatches bypass this
+hold; error-rate rollback rehearsal dispatches honor it. The schema gate job
+runs only in the `staging-migrate-plan` environment with `contents: read`, builds the reviewed
 `staging-migrate` binary at the exact deploy SHA, and runs
 `scripts/ci/staging_schema_gate.py`, which invokes the binary's read-only
 `--plan` through the plan environment's existing
@@ -342,15 +329,13 @@ Environment. Negative fixtures cover extra triggers, removed `needs` or
 environment, a bypass condition, deploy steps in the guard, and dropping those
 checks.
 
-With staging active (TOG-12856), every `main` push that changes a runtime input
-runs deploy-staging on its SHA; the guard accepts only a run that concluded
-`success` on that SHA, so a `skipped` or failed run still refuses production
-for that SHA. A docs-only push (the `paths-ignore` list above) starts no run, so
-the guard also refuses a docs-only head with `deploy-staging has no successful
-run`. This fails closed and is the intended trade: pin the latest
-runtime-affecting commit, or dispatch `deploy-staging` for the head you need
-([production-deploy.md](production-deploy.md)). This change does not authorize
-a production bypass. A pinned drill dispatch (a `sha` below the workflow head)
+A merge is not evidence of staging deployment or qualification. Consult
+`deploy-staging.yml` at the relevant ref for its triggers and verify completed
+qualifying evidence for the intended exact `main` SHA. A skipped, failed or
+missing run does not qualify that SHA. If evidence is absent, keep promotion
+held and follow the separately authorized [qualification/recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
+This does not authorize a production bypass. A pinned drill dispatch (a `sha`
+below the workflow head)
 deploys the pin but fails its run red in the `pinned-history-guard` job after
 the synthetic, so it never mints a successful run the guard could mistake for
 staging history of the head.

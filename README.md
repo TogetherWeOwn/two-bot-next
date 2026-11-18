@@ -206,14 +206,14 @@ The final-stage reviewer squash-merges the pinned settled head before final
 approval; the author merges only without a review stage. Every `main` merge,
 including docs-only, needs the Release Manager's exact-head authorization because
 it can reach production through the promotion path. For web/bot, staging
-qualification is the automatic **post-merge, pre-production exact-main
-staging/e2e/soak gate**, enforced by the promotion guard. Staging accepts only
-main-ancestor SHAs; unmerged-head staging and artifact-equality proofs are not
-substitute merge prerequisites. Runtime-input pushes to `main` start automatic
-qualification; docs-only merges do not trigger `deploy-staging`. Promoting an
-otherwise unqualified exact main SHA (including a docs-only squash SHA) requires
-authorized staging dispatch/qualification first; follow the existing
-[dispatch/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
+qualification is the **post-merge, pre-production exact-main staging/e2e/soak
+gate**, enforced by the promotion guard. Staging accepts only main-ancestor
+SHAs; unmerged-head staging and artifact-equality proofs are not substitute
+merge prerequisites. A merge is not evidence of staging deployment or
+qualification. Consult `deploy-staging.yml` at the relevant ref for its triggers
+and verify completed qualifying evidence for the intended exact `main` SHA.
+If evidence is absent, keep promotion held and follow the separately authorized
+[qualification/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
 without bypassing holds. See
 [Production merge evidence](CONTRIBUTING.md#production-merge-evidence) for the
 superseding contract. Exact-PR-head Actions/Devin, specialist/native review,

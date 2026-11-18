@@ -7,7 +7,9 @@ its own lifecycle-lock and consumer-policy review.
 WORKFLOW = "voice-rest-measurement.yml"
 GUARDS = {
     "staging-window": "${{ false && github.ref == 'refs/heads/main' }}",
-    "voice-first": "${{ false && github.ref == 'refs/heads/main' && needs.staging-window.result == 'success' }}",
+    "measurement-before": "${{ false && github.ref == 'refs/heads/main' && needs.staging-window.result == 'success' }}",
+    "voice-first": "${{ false && github.ref == 'refs/heads/main' && needs.staging-window.result == 'success' && needs.measurement-before.result == 'success' }}",
+    "measurement-after": "${{ false && github.ref == 'refs/heads/main' && needs.voice-first.result == 'success' }}",
     "staging-use-release": "${{ false && always() && github.ref == 'refs/heads/main' && needs.staging-window.outputs.expires_at != '' }}",
 }
 
