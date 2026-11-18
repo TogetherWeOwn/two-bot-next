@@ -1115,6 +1115,7 @@ mod tests {
                 locked: false,
             }),
             topic: None,
+            total_message_sent: None,
             user_limit: None,
             video_quality_mode: None,
         }

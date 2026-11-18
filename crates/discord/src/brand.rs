@@ -154,6 +154,7 @@ pub fn ephemeral_reply_embed(kind: EmbedKind, surface: &str, text: String) -> Em
             color: None,
             description: Some(text),
             fields: Vec::new(),
+            flags: None,
             footer: None,
             image: None,
             kind: "rich".to_owned(),
@@ -180,6 +181,8 @@ mod brand_tests {
                 let embed = ephemeral_reply_embed(kind, surface, "Reply".to_owned());
                 assert_eq!(embed.color, Some(kind.color()));
                 assert_eq!(embed.description.as_deref(), Some("Reply"));
+                let wire = serde_json::to_value(&embed).expect("serialize embed");
+                assert!(wire.get("flags").is_none());
                 assert!(embed.title.is_none());
                 let footer = embed.footer.as_ref().expect("footer");
                 assert_eq!(footer.text, format!("Together We Own · {surface}"));
@@ -294,6 +297,7 @@ mod brand_tests {
             color: None,
             description: Some("help".to_owned()),
             fields: Vec::new(),
+            flags: None,
             footer: None,
             image: None,
             kind: "rich".to_owned(),

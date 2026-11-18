@@ -76,7 +76,10 @@ fn shared_pipeline_captures_rejection_without_awards_and_skips_replay_and_edit()
     let mut runtime = runtime();
     let mut msg = message();
     msg.content = "blocked".into();
-    let event = Event::MessageCreate(Box::new(MessageCreate(msg.clone())));
+    let event = Event::MessageCreate(Box::new(MessageCreate {
+        channel_type: None,
+        message: msg.clone(),
+    }));
     let delivery = event_to_automod(&event, 1_790_726_400_000).unwrap();
     let Inspection::Matched(matched) = runtime.inspect(&delivery) else {
         panic!("expected match")
@@ -95,7 +98,10 @@ fn shared_pipeline_captures_rejection_without_awards_and_skips_replay_and_edit()
     // A different, clean create follows the ordinary funnel exactly once.
     msg.id = Id::new(msg.id.get() + 1);
     msg.content = "clean".into();
-    let event = Event::MessageCreate(Box::new(MessageCreate(msg.clone())));
+    let event = Event::MessageCreate(Box::new(MessageCreate {
+        channel_type: None,
+        message: msg.clone(),
+    }));
     let delivery = event_to_automod(&event, 1_790_726_401_000).unwrap();
     let Inspection::Accepted(disposition) = runtime.inspect(&delivery) else {
         panic!("expected accept")
@@ -146,7 +152,10 @@ fn runtime() -> AutomodRuntime {
 fn create_keeps_content_role_mention_attachment_and_message_time_facts() {
     let mut msg = message();
     msg.content = "blocked".into();
-    let event = Event::MessageCreate(Box::new(MessageCreate(msg)));
+    let event = Event::MessageCreate(Box::new(MessageCreate {
+        channel_type: None,
+        message: msg,
+    }));
     let delivery = event_to_automod(&event, 9_000_000).unwrap();
     assert_eq!(delivery.kind, MessageDeliveryKind::Create);
     let snapshot = delivery.snapshot.as_ref().unwrap();
@@ -190,7 +199,10 @@ fn update_requests_fetch_then_reinspects_at_receipt_time_without_funnel() {
 fn missing_member_roles_requests_fetch_instead_of_bypassing_protection() {
     let mut msg = message();
     msg.member = None;
-    let event = Event::MessageCreate(Box::new(MessageCreate(msg)));
+    let event = Event::MessageCreate(Box::new(MessageCreate {
+        channel_type: None,
+        message: msg,
+    }));
     let delivery = event_to_automod(&event, 1_790_726_401_000).unwrap();
     assert!(delivery.snapshot.is_none());
     assert!(matches!(
@@ -209,7 +221,10 @@ fn mock_attachment_is_blocked_and_reply_without_ping_is_not_mention_spam() {
     value["message_reference"] = serde_json::json!({"message_id": "777777777777777777"});
     let msg: Message = serde_json::from_value(value).unwrap();
     let delivery = event_to_automod(
-        &Event::MessageCreate(Box::new(MessageCreate(msg))),
+        &Event::MessageCreate(Box::new(MessageCreate {
+            channel_type: None,
+            message: msg,
+        })),
         1_790_726_401_000,
     )
     .unwrap();
@@ -237,7 +252,10 @@ fn role_enrichment_must_not_replace_blocked_create_with_edited_content() {
         "url": "http://mock.invalid/file", "proxy_url": "http://mock.invalid/file"
     }]))
     .unwrap();
-    let event = Event::MessageCreate(Box::new(MessageCreate(original.clone())));
+    let event = Event::MessageCreate(Box::new(MessageCreate {
+        channel_type: None,
+        message: original.clone(),
+    }));
     let delivery = event_to_automod(&event, 1_790_726_401_000).unwrap();
     assert!(matches!(
         runtime().inspect(&delivery),
@@ -277,7 +295,10 @@ fn original_create_with_roles_is_capture_only_control() {
     let mut original = message();
     original.content = "blocked".into();
     let delivery = event_to_automod(
-        &Event::MessageCreate(Box::new(MessageCreate(original))),
+        &Event::MessageCreate(Box::new(MessageCreate {
+            channel_type: None,
+            message: original,
+        })),
         1_790_726_401_000,
     )
     .unwrap();
