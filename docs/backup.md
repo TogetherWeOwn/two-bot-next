@@ -282,9 +282,11 @@ For an installed `web_v1.contract_meta` view (or its schema-qualified
 counterpart), restore keeps the destination's recorded `contract_version`,
 even if the archive contains an older version or no metadata row. Restore
 still validates and replays the archive's `guild_id`; it never keeps the old
-destination guild ID. A migrated target without the view uses the archived
-metadata. Replay and version preservation commit together, so invalid metadata
-rolls back the restore.
+destination guild ID. If the view exists but its metadata row is missing,
+restore refuses before writing instead of guessing the installed version. Use
+a fresh migrated target with intact contract metadata. A migrated target without
+the view uses the archived metadata. Replay and version preservation commit
+together, so invalid metadata rolls back the restore.
 
 v3 must contain its original 22 table entries. It can lack later tables, but
 restore clears their old target rows and emits a warning in both dry-run and

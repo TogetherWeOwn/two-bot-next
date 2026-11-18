@@ -1609,6 +1609,30 @@ async fn historical_contract_archive_preserves_installed_capability_and_restores
         assert_eq!(meta, ("2.0".to_owned(), inferred_guild));
         assert_eq!(snapshot(pool, &ledgers).await, ledger_before);
     }
+
+    // An older v3 restore could leave the view installed with no backing row.
+    sqlx::raw_sql(
+        "DELETE FROM web_contract_meta WHERE singleton;
+         INSERT INTO guild_counters (guild_id, human_member_count, human_member_count_at)
+         VALUES ('100000000000000001', 99, '2025-01-01T00:00:00Z');",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let meta: Option<(String, Option<String>)> = sqlx::query_as(meta_view)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+    assert_eq!(meta, None, "the installed view has no metadata row");
+    let before = snapshot(pool, &data).await;
+    let error = restore(pool, &current).await.unwrap_err();
+    assert!(
+        matches!(&error, DbDumpError::Refused(reason) if reason.contains("destination web contract metadata is missing")),
+        "{error}"
+    );
+    assert_eq!(snapshot(pool, &data).await, before);
+    assert_eq!(snapshot(pool, &ledgers).await, ledger_before);
+
     source.close().await.unwrap();
     target.close().await.unwrap();
 }

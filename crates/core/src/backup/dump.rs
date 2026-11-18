@@ -559,9 +559,16 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     .fetch_one(&mut *tx)
     .await?;
     let installed_contract: Option<String> = if has_contract_view {
-        sqlx::query_scalar("SELECT contract_version FROM web_contract_meta WHERE singleton")
-            .fetch_optional(&mut *tx)
-            .await?
+        let version =
+            sqlx::query_scalar("SELECT contract_version FROM web_contract_meta WHERE singleton")
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    DbDumpError::Refused(
+                        "destination web contract metadata is missing; restore into a fresh migrated target with intact contract metadata".into(),
+                    )
+                })?;
+        Some(version)
     } else {
         None
     };
