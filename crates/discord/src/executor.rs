@@ -367,10 +367,9 @@ async fn complete_early_release(
     }
 }
 
-// Tokio's timeout polls the work before its timer. Check around each poll so
-// storage neither advances nor confirms at the cutoff. Dropping an in-flight
-// completion cannot undo a database commit.
-async fn settle_before<F: Future>(at: Instant, work: F) -> Option<F::Output> {
+// Tokio's timeout polls work before its timer. Check before every poll and
+// reject ready results at or after the cutoff. Dropping work is not rollback.
+async fn poll_before<F: Future>(at: Instant, work: F) -> Option<F::Output> {
     let mut work = std::pin::pin!(work);
     let guarded = std::future::poll_fn(|cx| {
         if Instant::now() >= at {
@@ -411,16 +410,14 @@ impl RawResponse {
                     self.body_retry_after_secs(),
                 )
             });
-            let unconfirmed =
-                || DiscordError::Unavailable("send admission completion unconfirmed".into());
             let completion = permit.complete(cooldown);
             let result = match deadline {
-                Some(at) => settle_before(at, completion)
-                    .await
-                    .ok_or_else(unconfirmed)?,
-                None => completion.await,
+                Some(at) => poll_before(at, completion).await,
+                None => Some(completion.await),
             };
-            result.map_err(|_| unconfirmed())?;
+            result.and_then(Result::ok).ok_or_else(|| {
+                DiscordError::Unavailable("send admission completion unconfirmed".into())
+            })?;
         }
         Ok(())
     }
@@ -818,7 +815,7 @@ impl HyperTransport {
                     if let Some(permit) = permit {
                         let release = complete_early_release(permit, reason);
                         if let Some(at) = evidence_deadline {
-                            let _ = settle_before(at, release).await;
+                            let _ = poll_before(at, release).await;
                         } else {
                             release.await;
                         }
@@ -1096,13 +1093,14 @@ impl StrictEvidenceHeaders<'_> {
         let mut pending = self.pending;
         let body_cap = Instant::now() + Duration::from_millis(RESPONSE_BODY_TIMEOUT_MS);
         let response = pending.response.take().expect("pending headers");
-        let body =
-            http_body_util::Limited::new(response.into_body(), RESPONSE_BODY_LIMIT).collect();
-        let body = tokio::time::timeout_at(deadline.min(body_cap), body)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .map(|body| body.to_bytes().to_vec());
+        let body = poll_before(deadline.min(body_cap), async {
+            http_body_util::Limited::new(response.into_body(), RESPONSE_BODY_LIMIT)
+                .collect()
+                .await
+                .map(|body| body.to_bytes().to_vec())
+        })
+        .await
+        .and_then(Result::ok);
         let body_available = body.is_some();
         let mut response = RawResponse {
             status: pending.status,
@@ -4960,41 +4958,36 @@ mod tests {
 
     #[tokio::test]
     async fn strict_transport_fixture_reads_and_completes() {
-        fixture_reads_and_completes(false).await;
-        fixture_reads_and_completes(true).await;
-    }
-
-    async fn fixture_reads_and_completes(strict: bool) {
         use crate::strict_transport_fixture::Admission;
         use std::sync::atomic::Ordering;
 
         let token = "fixture-strict-success";
-        let gate = Arc::new(Admission::new(token, None, None));
-        let (transport, server) = strict_fixture_exchange(
-            token,
-            gate.clone(),
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-        )
-        .await;
         let request = Request::from_route(&Route::GetCurrentUser);
-        let at = Some(tokio::time::Instant::now() + Duration::from_secs(2));
-        let pending = if strict {
-            let send = transport.send_strict_request_headers(&request, at);
-            send.await.unwrap()
-        } else {
-            transport.send_request_headers(&request, at).await.unwrap()
-        };
-        let (response, _) = pending.collect().await.unwrap();
-        assert_eq!(response.status, 200);
-        assert!(server
-            .await
-            .unwrap()
-            .starts_with(b"GET /api/v10/users/@me "));
-        assert_eq!(
-            gate.strict_admitted.load(Ordering::Relaxed),
-            usize::from(strict)
-        );
-        assert_eq!(*gate.completed.lock().unwrap(), vec![None]);
+        for strict in [false, true] {
+            let gate = Arc::new(Admission::new(token, None, None));
+            let (transport, server) = strict_fixture_exchange(
+                token,
+                gate.clone(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .await;
+            let at = Some(Instant::now() + Duration::from_secs(2));
+            let pending = if strict {
+                transport
+                    .send_strict_request_headers(&request, at)
+                    .await
+                    .unwrap()
+            } else {
+                transport.send_request_headers(&request, at).await.unwrap()
+            };
+            let (response, _) = pending.collect().await.unwrap();
+            let wire = server.await.unwrap();
+            assert_eq!(response.status, 200);
+            assert!(wire.starts_with(b"GET /api/v10/users/@me "));
+            let admitted = gate.strict_admitted.load(Ordering::Relaxed);
+            assert_eq!(admitted, usize::from(strict));
+            assert_eq!(*gate.completed.lock().unwrap(), vec![None]);
+        }
     }
 
     #[tokio::test]
@@ -5056,22 +5049,24 @@ mod tests {
     async fn strict_transport_observes_evidence_before_bounded_completion() {
         use crate::strict_transport_fixture::Admission;
         use two_bot_core::send_admission::cooldown_from_delays;
-        for (completion, stalled, expected) in [
-            (Ok(()), false, StrictSettlement::Confirmed),
-            (
-                Err(AdmissionError::Storage),
-                false,
-                StrictSettlement::Unconfirmed,
-            ),
-            (Ok(()), true, StrictSettlement::Unconfirmed),
+        for (completion, stalled, expired) in [
+            (Ok(()), false, false),
+            (Err(AdmissionError::Storage), false, false),
+            (Ok(()), true, false),
+            (Ok(()), false, true),
         ] {
             let token = "fixture-strict-evidence";
             let mut gate = Admission::new(token, None, None);
             gate.completion = completion;
             gate.stall_completion = stalled;
             let gate = Arc::new(gate);
-            let (transport, server) = strict_fixture_exchange(token, gate.clone(),
-                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"retry_after\":2}").await;
+            // A zero-length response has EOF ready without another socket poll.
+            let reply: &[u8] = if expired {
+                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n"
+            } else {
+                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 17\r\n\r\n{\"retry_after\":2}"
+            };
+            let (transport, server) = strict_fixture_exchange(token, gate.clone(), reply).await;
             let request =
                 twilight_http::request::RequestBuilder::raw(Method::Post, "fixture".to_owned())
                     .build()
@@ -5082,23 +5077,33 @@ mod tests {
                 .send_strict_evidence_headers(&request, at)
                 .await
                 .unwrap();
+            if expired {
+                tokio::time::pause();
+                tokio::time::advance(at.saturating_duration_since(Instant::now())).await;
+            }
             let settled = tokio::time::timeout_at(
                 at + Duration::from_secs(1),
                 pending.collect_evidence(|evidence| {
                     assert!(gate.completed.lock().unwrap().is_empty());
                     assert_eq!(evidence.status, 429);
                     assert_eq!(evidence.retry_after_header, Some("1"));
-                    assert_eq!(evidence.body, Some(br#"{"retry_after":2}"#.as_slice()));
+                    let body = br#"{"retry_after":2}"#.as_slice();
+                    assert_eq!(evidence.body, (!expired).then_some(body));
                     observed = true;
                 }),
             )
             .await
             .expect("settlement must be bounded");
+            if expired {
+                tokio::time::resume();
+            }
             assert!(observed);
-            assert_eq!(settled, expected);
+            let confirmed = completion.is_ok() && !stalled && !expired;
+            assert_eq!(settled == StrictSettlement::Confirmed, confirmed);
+            let attempt = (!expired).then(|| Some(cooldown_from_delays(Some(1.0), Some(2.0))));
             assert_eq!(
-                *gate.completed.lock().unwrap(),
-                vec![Some(cooldown_from_delays(Some(1.0), Some(2.0)))]
+                gate.completed.lock().unwrap().as_slice(),
+                attempt.as_slice()
             );
             assert!(server.await.unwrap().starts_with(b"POST /api/v10/fixture "));
         }
@@ -5118,7 +5123,7 @@ mod tests {
                 }
                 Poll::Ready(())
             });
-            let mut settled = std::pin::pin!(settle_before(at, work));
+            let mut settled = std::pin::pin!(poll_before(at, work));
             assert!(futures_util::poll!(&mut settled).is_pending());
             tokio::time::advance(budget + late).await;
             assert_eq!(tokio::time::Instant::now(), at + late);
@@ -5132,7 +5137,7 @@ mod tests {
                 assert_eq!(Instant::now(), at + late);
                 Poll::Ready(())
             });
-            assert_eq!(settle_before(at, work).await, None, "late acknowledgement");
+            assert_eq!(poll_before(at, work).await, None, "late acknowledgement");
         }
     }
 
