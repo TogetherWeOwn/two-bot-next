@@ -713,7 +713,7 @@ mod tests {
         let interaction: Interaction = serde_json::from_value(serde_json::json!({
             "application_id": "1111", "authorizing_integration_owners": {"0": "2222"},
             "id": "100", "token": "synthetic-secret-token", "type": 2,
-            "version": 1, "guild_id": "2222",
+            "version": 1, "attachment_size_limit": 10485760, "guild_id": "2222",
             "member": {"permissions": "0", "roles": [], "deaf": false, "mute": false,
                 "flags": 0, "user": {"id": "77", "username": "human", "discriminator": "0"}},
             "data": {"id": "4444", "name": "rsvp", "type": 1, "options": []}
@@ -735,7 +735,7 @@ mod tests {
         let interaction: Interaction = serde_json::from_value(serde_json::json!({
             "application_id": "1111", "authorizing_integration_owners": {"0": "2222"},
             "id": "100", "token": "synthetic-secret-token", "type": 2,
-            "version": 1, "guild_id": "2222",
+            "version": 1, "attachment_size_limit": 10485760, "guild_id": "2222",
             "member": {"permissions": "0", "roles": [], "deaf": false, "mute": false,
                 "flags": 0, "user": {"id": "77", "username": "human", "discriminator": "0"}},
             "data": {"id": "4444", "name": "rsvp", "type": 1, "options": []}
