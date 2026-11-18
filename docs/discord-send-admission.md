@@ -159,8 +159,8 @@ capability does not enable or wire a new sender.
 
 If a strict claim is acknowledged after the attempt deadline, the transport
 refuses before starting the request and leaves the claim armed. The opt-in
-strict response observer sees status, header retry timing and any collected
-body. Only crate-internal receipt code can confirm a successful mutation.
+strict evidence headers expose only the bounded collector for status, retry
+header and collected body. Only crate-internal code can validate a mutation.
 Storage is not polled or confirmed at or after the same absolute cutoff;
 observed evidence does not authorize retry. Default settlement is unchanged.
 
