@@ -524,34 +524,6 @@ def backfill_quarantine_errors(pinned, current):
     return errors
 
 
-# Staging deploy push filter. Each deploy restarts the bot container and drops the
-# gateway for ~2 minutes, so a push that touches only non-runtime paths must not
-# start one (the B2 soak needs a stable staging). The filter is a deny-list so an
-# unclassified path still deploys; these samples pin both sides of it.
-RUNTIME_PATHS = (
-    "crates/bot/src/main.rs", "crates/core/Cargo.toml", "crates/core/README.md",
-    "crates/core/tests/fixtures/reference_settings.json", "src/main.rs",
-    "sql/web_v1.sql", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml",
-    "migrations.lock", "Dockerfile", ".dockerignore",
-    "wrangler/wrangler.toml", "wrangler/src/index.ts", "wrangler/package.json",
-    "wrangler/package-lock.json", "wrangler/scripts/ownership-control.mjs",
-    "wrangler/README.md", "scripts/staging_rollout.py", "scripts/container-smoke.py",
-    ".github/workflows/deploy-staging.yml", ".github/workflows/check.yml",
-    ".github/scripts/anything.py", "deploy/two-bot.service", "tests/voice_templates/corpus.json",
-    "release-please-config.json", ".release-please-manifest.json", "fuzz/Cargo.toml",
-    "fuzz/Cargo.lock",
-    "a-new-top-level-dir/file.txt", ".cargo/config.toml",
-)
-NON_RUNTIME_PATHS = (
-    "docs/runbook.md", "docs/parity-baseline.json", "docs/adr/0001-example.md",
-    "docs/soak-checklist.json", "README.md", "CHANGELOG.md", "AGENTS.md",
-    "CONTRIBUTING.md", "LICENSE", ".editorconfig", ".gitignore", ".gitleaks.toml",
-    ".gitleaksignore", ".github/ISSUE_TEMPLATE/bug_report.yml",
-    ".github/pull_request_template.md", ".github/CODEOWNERS", ".github/dependabot.yml",
-    "ops/metrics/dora-2026-W43.json", "ops/metrics/dora-2026-W43.md",
-)
-
-
 def filter_pattern_matches(pattern, path):
     """GitHub path-filter semantics: anchored at the root, `*` stops at `/`, `**` does not."""
     regex, i = "", 0
@@ -567,35 +539,8 @@ def filter_pattern_matches(pattern, path):
     return re.fullmatch(regex, path) is not None
 
 
-def staging_push_filter_errors(name, push):
-    """The push trigger is main-only with a deny-list of non-runtime paths.
-
-    GitHub skips a push run only when every changed path matches `paths-ignore`,
-    so a runtime path matching ANY pattern would be skipped only when it ships
-    alone. Pin that no pattern matches a runtime path, that the known non-runtime
-    set stays skipped, and that an allow-list (`paths`) never replaces the
-    deny-list (an unclassified path must still deploy).
-    """
-    if not isinstance(push, dict) or push.get("branches") != ["main"]:
-        return [f"{name}: push trigger must be branches [main]"]
-    errors = []
-    if set(push) - {"branches", "paths-ignore"}:
-        errors.append(f"{name}: push trigger may only carry branches and paths-ignore")
-    patterns = push.get("paths-ignore") or []
-    if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
-        return errors + [f"{name}: paths-ignore must be a list of patterns"]
-    for path in RUNTIME_PATHS:
-        hits = [p for p in patterns if filter_pattern_matches(p, path)]
-        if hits:
-            errors.append(f"{name}: paths-ignore {hits} would skip a runtime path {path}")
-    for path in NON_RUNTIME_PATHS:
-        if not any(filter_pattern_matches(p, path) for p in patterns):
-            errors.append(f"{name}: paths-ignore no longer skips non-runtime path {path}")
-    return errors
-
-
 def staging_dispatch_errors(workflow):
-    """The active staging workflow keeps exactly six fenced dispatch inputs.
+    """Only workflow_dispatch can start staging, with six fenced inputs.
 
     `release_fence` exists on main (TOG-11143) so post-handoff release of an
     uninitialized/parked singleton is explicit and auditable; it defaults to
@@ -617,26 +562,27 @@ def staging_dispatch_errors(workflow):
     """
     name = "deploy-staging.yml"
     errors = []
-    on = workflow.get("on") or {}
-    if set(on) != {"push", "workflow_dispatch"}:
-        errors.append(f"{name}: triggers changed")
-    errors.extend(staging_push_filter_errors(name, on.get("push")))
-    dispatch = on.get("workflow_dispatch") or {}
+    on = workflow.get("on")
+    if not isinstance(on, dict) or set(on) != {"workflow_dispatch"}:
+        return [f"{name}: workflow_dispatch must be the only trigger"]
+    dispatch = on["workflow_dispatch"]
+    inputs = dispatch.get("inputs") if isinstance(dispatch, dict) and set(dispatch) == {"inputs"} else None
     expected_booleans = {"release_fence", "inject_gateway_failure", "inject_error_rate_spike",
                          "inject_voice_stall", "inject_unpaired_disconnect"}
     expected = expected_booleans | {"sha"}
-    if set(dispatch) != {"inputs"} or set(dispatch.get("inputs") or {}) != expected:
-        errors.append(f"{name}: workflow_dispatch must carry only the release_fence, drill and sha inputs")
-    else:
-        for input_name in expected_booleans:
-            spec = dispatch["inputs"][input_name] or {}
-            if spec.get("type") != "boolean" or spec.get("default") not in (False, "false"):
-                errors.append(f"{name}: {input_name} must be an opt-in boolean defaulting to false")
-        sha = dispatch["inputs"]["sha"] or {}
-        if (sha.get("type") != "string" or str(sha.get("required")).lower() != "false"
-                or sha.get("default") != ""):
-            errors.append(f"{name}: sha must be an optional string defaulting to empty "
-                          "(empty deploys the workflow head)")
+    if not isinstance(inputs, dict) or set(inputs) != expected:
+        return [f"{name}: workflow_dispatch must carry only the release_fence, drill and sha inputs"]
+    for input_name in expected_booleans:
+        spec = inputs[input_name]
+        if (not isinstance(spec, dict) or set(spec) != {"description", "type", "default"}
+                or spec.get("type") != "boolean" or spec.get("default") not in (False, "false")):
+            errors.append(f"{name}: {input_name} must be an opt-in boolean defaulting to false")
+    sha = inputs["sha"]
+    if (not isinstance(sha, dict) or set(sha) != {"description", "required", "type", "default"}
+            or sha.get("type") != "string" or str(sha.get("required")).lower() != "false"
+            or sha.get("default") != ""):
+        errors.append(f"{name}: sha must be an optional string defaulting to empty "
+                      "(empty deploys the workflow head)")
     return errors
 
 
@@ -894,7 +840,7 @@ def staging_fault_injection_errors(workflows):
 def staging_pinned_sha_errors(workflows):
     """The pinned-SHA arm/disarm is dispatch-only, exact and ancestor-checked.
 
-    A dispatch may name its exact commit; a push (or an empty dispatch) always
+    A dispatch may name its exact commit; an empty dispatch always
     deploys the workflow head. All three jobs check out the pinned
     dispatch-or-head ref at full depth, and each carries one SHA step that
     resolves the same expression through the environment, proves HEAD equals
@@ -1080,15 +1026,12 @@ def staging_full_window_errors(workflow, name="deploy-staging.yml"):
 
 
 def soak_hold_errors(workflow, name="deploy-staging.yml"):
-    """The soak hold defers push deploys loudly, never as a quiet green.
+    """The hold defers error-rate rehearsal dispatches, never as a quiet green.
 
-    While the Operator holds staging armed for a remediation-drill soak,
-    push deploys must not redeploy it — and the run must fail fast here with
-    a deferral message instead of reporting success without deploying (the
-    production guard accepts a successful staging run as staging history, so
-    a quiet skip would void that leg). Explicit arm/disarm dispatches
-    proceed, but error-rate proofs honor the hold. One job runs first on every
-    trigger (no `if:`, no `needs:`, no environment, no checkout): a single step
+    While staging is held armed for a remediation-drill soak, a rehearsal
+    must fail fast instead of reporting success without deploying. Other
+    dispatches bypass the hold. One job runs first on every dispatch
+    (no `if:`, no `needs:`, no environment, no checkout): a single step
     binds the hold deadline, event and pinned dispatch-only proof flag. It
     exits 0 for a non-proof dispatch, empty var or expired deadline (fail open),
     and exits 1 for an unparsable or over-long value
@@ -1100,7 +1043,7 @@ def soak_hold_errors(workflow, name="deploy-staging.yml"):
     errors = []
     jobs = workflow.get("jobs") or {}
     job = jobs.get("soak-hold") or {}
-    if job.get("name") != "soak hold (defer push deploys while armed)":
+    if job.get("name") != "soak hold (defer error-rate rehearsals while armed)":
         errors.append(f"{name}:soak-hold: consumer job identity changed")
     if job.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:soak-hold: must keep contents:read only")
@@ -4743,7 +4686,7 @@ def workflow_policy_errors(workflows):
             if name == "deploy-staging.yml" and job_id == "deploy":
                 continue  # the live deploy route: pinned by the staging checks above
             if name == "deploy-staging.yml" and job_id == "soak-hold":
-                continue  # push-deferral gate: pinned by soak_hold_errors above
+                continue  # rehearsal-deferral gate: pinned by soak_hold_errors above
             if name == "deploy-staging.yml" and job_id == "pinned-history-guard":
                 continue  # pinned-drill verdict: pinned by pinned_history_guard_errors above
             if name == "deploy-staging.yml" and job_id == "user-flow-synthetic":
@@ -7556,7 +7499,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(outer_ms, minimum_ms + 120_000)
         self.assertIn(f"timed out after {outer.group(1)} seconds", run)
 
-    def test_staging_runs_unconditionally_for_push_and_dispatch(self):
+    def test_staging_deploy_has_no_job_condition(self):
         staging = self.workflows["deploy-staging.yml"]
         self.assertEqual(staging_dispatch_errors(staging), [])
         self.assertEqual(staging_active_errors(staging), [])
@@ -7604,7 +7547,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(armed), 1)
         index = steps.index(armed[0])
         mutations = {
-            # Push could read it / default armed.
+            # Keep the explicit event guard and the opt-in default.
             "expression without dispatch guard": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
                 .__setitem__("INJECT_GATEWAY_FAILURE", "${{ inputs.inject_gateway_failure }}"),
             "expression constant true": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
@@ -7647,7 +7590,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(armed[0].get("id"), "error_rate_gate")
         index = steps.index(armed[0])
         mutations = {
-            # Push could read it / default armed.
+            # Keep the explicit event guard and the opt-in default.
             "expression without dispatch guard": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
                 .__setitem__("INJECT_ERROR_RATE_SPIKE", "${{ inputs.inject_error_rate_spike }}"),
             "expression constant true": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
@@ -7759,7 +7702,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(armed), 1)
         index = steps.index(armed[0])
         mutations = {
-            # Push could read it / default armed.
+            # Keep the explicit event guard and the opt-in default.
             "expression without dispatch guard": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
                 .__setitem__("INJECT_VOICE_STALL", "${{ inputs.inject_voice_stall }}"),
             "expression constant true": lambda w: w["jobs"]["deploy"]["steps"][index]["env"]
@@ -7842,7 +7785,7 @@ class WorkflowTests(unittest.TestCase):
             workflow["jobs"]["deploy"]["steps"][2]["run"] = "\n".join(lines)
 
         mutations = {
-            # A push (or an empty dispatch) must deploy the workflow head, never a constant.
+            # An empty dispatch must deploy the workflow head, never a constant.
             "checkout ref constant": lambda w: w["jobs"]["deploy"]["steps"][0]["with"]
                 .__setitem__("ref", "main"),
             "checkout ref without dispatch guard": lambda w: w["jobs"]["deploy"]["steps"][0]["with"]
@@ -7907,7 +7850,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertTrue(staging_pinned_sha_errors(changed))
                 self.assertTrue(workflow_policy_errors(changed))
 
-    def test_soak_hold_defers_push_and_never_skips_silently(self):
+    def test_soak_hold_defers_rehearsals_and_never_skips_silently(self):
         staging = self.workflows["deploy-staging.yml"]
         self.assertEqual(soak_hold_errors(staging), [])
         self.assertEqual(schema_gate_errors(staging), [])
@@ -8066,10 +8009,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(synthetic_user_flow_errors(changed))
 
     def test_soak_hold_shell_behaves(self):
-        # Execute the actual hold-check shell across its six cases: dispatch
-        # and empty bypass, expiry fails open, armed defers, unparsable and
-        # over-long fail closed. Deadlines sit minutes away from the real
-        # clock, far from any comparison boundary.
+        # Execute the actual hold-check shell: ordinary dispatch bypasses the
+        # hold, and rehearsals check empty, expired, armed and invalid deadlines.
+        # Deadlines sit minutes away from the real clock.
         import datetime
         import os
         import subprocess
@@ -8079,20 +8021,20 @@ class WorkflowTests(unittest.TestCase):
         now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
         stamp = lambda moment: moment.strftime("%Y-%m-%dT%H:%M:%SZ")
         cases = (
-            ("dispatch bypasses the hold", "workflow_dispatch", stamp(now + datetime.timedelta(hours=1)), 0, ""),
-            ("empty var means no hold", "push", "", 0, ""),
-            ("expired hold fails open", "push", stamp(now - datetime.timedelta(minutes=1)), 0, "expired"),
-            ("armed hold defers", "push", stamp(now + datetime.timedelta(hours=1)), 1, "deferred"),
-            ("unparsable hold fails closed", "push", "not-a-timestamp", 1, ""),
-            ("over-long hold fails closed", "push", stamp(now + datetime.timedelta(hours=5)), 1, ""),
+            ("ordinary dispatch bypasses the hold", "false", stamp(now + datetime.timedelta(hours=1)), 0, ""),
+            ("empty var means no hold", "true", "", 0, ""),
+            ("expired hold fails open", "true", stamp(now - datetime.timedelta(minutes=1)), 0, "expired"),
+            ("armed hold defers", "true", stamp(now + datetime.timedelta(hours=1)), 1, "fresh authorized dispatch"),
+            ("unparsable hold fails closed", "true", "not-a-timestamp", 1, ""),
+            ("over-long hold fails closed", "true", stamp(now + datetime.timedelta(hours=5)), 1, ""),
         )
-        for label, event, hold_until, expected_code, summary_needle in cases:
+        for label, rehearsal, hold_until, expected_code, summary_needle in cases:
             with self.subTest(label):
                 with tempfile.TemporaryDirectory() as temp_dir:
                     summary = Path(temp_dir) / "summary.md"
                     summary.write_text("", encoding="utf-8")
-                    env = dict(os.environ, EVENT=event, HOLD_UNTIL=hold_until,
-                               GITHUB_STEP_SUMMARY=str(summary))
+                    env = dict(os.environ, EVENT="workflow_dispatch", REHEARSAL=rehearsal,
+                               HOLD_UNTIL=hold_until, GITHUB_STEP_SUMMARY=str(summary))
                     proc = subprocess.run(
                         ["bash", "-c", shell], cwd=str(ROOT), env=env,
                         capture_output=True, text=True, timeout=10,
@@ -8330,39 +8272,30 @@ class WorkflowTests(unittest.TestCase):
                 )
                 self.assertTrue(workflow_policy_errors(changed), label)
 
-    def test_docs_only_push_skips_staging_but_runtime_paths_deploy(self):
-        # A docs-only merge to main must start no run (the soak needs a stable
-        # gateway), while every runtime path still deploys. Pinned against
-        # sample paths with GitHub's filter semantics, not just the pattern text.
-        push = self.workflows["deploy-staging.yml"]["on"]["push"]
-        self.assertEqual(push["branches"], ["main"])
-        self.assertNotIn("paths", push)
-        for path in NON_RUNTIME_PATHS:
-            with self.subTest(skipped=path):
-                self.assertTrue(any(filter_pattern_matches(p, path) for p in push["paths-ignore"]))
-        for path in RUNTIME_PATHS:
-            with self.subTest(deploys=path):
-                self.assertFalse(any(filter_pattern_matches(p, path) for p in push["paths-ignore"]))
-        # Manual dispatch is unfiltered.
-        self.assertEqual(set(self.workflows["deploy-staging.yml"]["on"]["workflow_dispatch"]), {"inputs"})
-
-    def test_push_filter_cannot_widen_into_runtime_or_become_an_allow_list(self):
-        ignore = self.workflows["deploy-staging.yml"]["on"]["push"]["paths-ignore"]
+    def test_staging_trigger_is_dispatch_only(self):
+        staging = self.workflows["deploy-staging.yml"]
+        self.assertEqual(set(staging["on"]), {"workflow_dispatch"})
+        dispatch = staging["on"]["workflow_dispatch"]
+        self.assertEqual(set(dispatch), {"inputs"})
+        self.assertEqual(len(dispatch["inputs"]), 6)
+        self.assertEqual(dispatch["inputs"]["sha"]["default"], "")
+        self.assertEqual(staging_dispatch_errors(staging), [])
         mutations = {
-            "allow-list": {"branches": ["main"], "paths": ["docs/**"]},
-            "no filter list": {"branches": ["main"], "paths-ignore": []},
-            "other branches": {"branches": ["main", "release/**"], "paths-ignore": ignore},
-            "tags": {"branches": ["main"], "tags": ["v*"], "paths-ignore": ignore},
+            "push": lambda on: on.update({"push": {"branches": ["main"]}}),
+            "schedule": lambda on: on.update({"schedule": [{"cron": "0 0 * * *"}]}),
+            "reusable": lambda on: on.update({"workflow_call": {}}),
+            "alternate trigger": lambda on: on.update({"workflow_run": {"workflows": ["check"]}}),
+            "missing input": lambda on: on["workflow_dispatch"]["inputs"].pop("sha"),
+            "extra dispatch field": lambda on: on["workflow_dispatch"].update({"other": True}),
+            "required boolean": lambda on: on["workflow_dispatch"]["inputs"]["release_fence"].update({"required": True}),
+            "extra sha field": lambda on: on["workflow_dispatch"]["inputs"]["sha"].update({"options": ["main"]}),
+            "nonempty sha default": lambda on: on["workflow_dispatch"]["inputs"]["sha"].update({"default": "main"}),
         }
-        for widened in ("**", "*", "*.json", "**/*.md", "crates/**", "wrangler/**", "scripts/**",
-                        ".github/**", ".github/workflows/**", "sql/**", "Cargo.*", "Dockerfile*",
-                        "src/**", "deploy/**", "tests/**"):
-            mutations[f"ignore {widened}"] = {"branches": ["main"], "paths-ignore": ignore + [widened]}
-        for label, push in mutations.items():
-            with self.subTest(label):
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
                 workflows = deepcopy(self.workflows)
-                workflows["deploy-staging.yml"]["on"]["push"] = push
-                self.assertTrue(staging_dispatch_errors(workflows["deploy-staging.yml"]))
+                mutate(workflows["deploy-staging.yml"]["on"])
+                self.assertTrue(staging_dispatch_errors(workflows["deploy-staging.yml"]), label)
                 self.assertTrue(workflow_policy_errors(workflows))
 
     def test_step_level_skip_is_not_a_deploy(self):
