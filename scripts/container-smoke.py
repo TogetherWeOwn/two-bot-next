@@ -87,12 +87,18 @@ IMAGE_MAX_BYTES = 112 * MIB
 # lto, strip). The binary ceiling moves to 18 MiB, leaving about 1 MiB of
 # headroom above the measured heads; revisit if the binary approaches it.
 # The 112 MiB image ceiling is unchanged (43.46 MiB measured on this head).
-BINARY_MAX_BYTES = 18 * MIB
+# 2026-11-18 recalibration: main measured 18,806,512 bytes (17.94 MiB),
+# leaving 67,856 bytes under 18 MiB. The Twilight head measured 19,199,352
+# bytes (18.31 MiB), 324,984 bytes over. 20 MiB leaves 1,772,168 bytes
+# (about 1.7 MiB) above the Twilight measurement; revisit if the binary
+# approaches it. The release profile (opt-level=z, LTO, strip, panic=unwind)
+# and the 112 MiB image ceiling are unchanged.
+BINARY_MAX_BYTES = 20 * MIB
 # CLI refusal bounds (not budget policy): --image-max-bytes/--binary-max-bytes
 # outside 1..cap are unusable — a non-positive budget can never pass and a
 # gigantic one silently disables the budget — so main() refuses them with a
 # fixed message before any Docker call. The caps sit far above any sane
-# override (defaults are 112 MiB/18 MiB) and far below budget-disabling
+# override (defaults are 112 MiB/20 MiB) and far below budget-disabling
 # magnitudes; sane values pass through byte-identically.
 IMAGE_BUDGET_CAP_BYTES = 1024 * MIB
 BINARY_BUDGET_CAP_BYTES = 256 * MIB

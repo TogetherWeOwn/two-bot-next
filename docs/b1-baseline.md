@@ -132,7 +132,7 @@ unpacked snapshots and is logged separately, not compared to that ceiling.
 See [Docker's store documentation](https://docs.docker.com/engine/storage/containerd/)
 and [Moby's layer-history implementation](https://github.com/moby/moby/blob/master/daemon/containerd/image_history.go).
 The 112 MiB image ceiling is unchanged. The binary budget was 15 MiB at the
-2026-10-01 calibration and is now 18 MiB (2026-10-24 recalibration below);
+2026-10-01 calibration and is now 20 MiB (2026-11-18 recalibration below);
 the 2026-10-10 measurements record the tighter tripwire it replaced.
 
 Measured on 2026-09-30 in [PR #78's hosted container job](https://github.com/TogetherWeOwn/two-bot-next/actions/runs/36770739970/job/110076173793)
@@ -204,10 +204,18 @@ lto, strip). The budget is therefore rebumped to 18 MiB, leaving about 1 MiB
 of headroom above the measured heads; revisit if the binary approaches it.
 The 112 MiB image ceiling is unchanged (43.46 MiB measured on this head).
 
-This branch's automation-only head separately measured 15,769,872 bytes
-(15.04 MiB) before the event-executor merge. The current binary ceiling is
-18 MiB following the 2026-10-24 calibration above; each combined exact-head
-CI measurement is still required.
+The automation-only head separately measured 15,769,872 bytes (15.04 MiB)
+before the event-executor merge.
+
+On 2026-11-18 the 18 MiB ceiling was nearly spent: main measured
+18,806,512 bytes (17.94 MiB), leaving 67,856 bytes of headroom. The Twilight
+migration head (PR #2018) measured 19,199,352 bytes (18.31 MiB), 324,984 bytes
+over the old ceiling. The new 20 MiB tripwire (20,971,520 bytes) leaves
+1,772,168 bytes (about 1.7 MiB) above the Twilight measurement. Revisit it if
+the binary approaches the ceiling. The release profile (`opt-level=z`, LTO,
+strip, `panic=unwind`) and the 112 MiB image ceiling are unchanged. These
+measurements justify the calibration, not compliance on a new head; each
+combined exact-head CI measurement is still required.
 
 ### Docker history image measurement and immutable-ID pinning
 
@@ -245,7 +253,7 @@ The unused streamed-archive helper and its archive-specific builders/tests
 have been removed in favor of main's history metric; the smoke/runtime
 contract fixtures remain.
 
-The 112 MiB image ceiling is unchanged; the release-binary ceiling is 18 MiB
+The 112 MiB image ceiling is unchanged; the release-binary ceiling is 20 MiB
 (see the current calibration above). CI on this PR's exact head must still
 record the corrected image size and pass the runtime contract and both
 one-byte-budget negative checks; fixture success alone cannot establish
