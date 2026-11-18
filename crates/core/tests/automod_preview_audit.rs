@@ -10,7 +10,7 @@
 //! same-transaction reload. Neither proves cross-connection committed replay or
 //! that a real handler commits before replying.
 
-use sqlx::{migrate::Migrator, PgPool, Postgres, Transaction};
+use sqlx::{migrate::Migrator, Connection, PgPool, Postgres, Transaction};
 use two_bot_core::automod_preview_audit as preview_audit;
 use two_bot_testsupport::TestDatabase;
 
@@ -218,9 +218,14 @@ async fn verify_same_transaction_row(pool: PgPool) -> Result<(), sqlx::Error> {
         .bind(&id)
         .execute(&mut *retry)
         .await?;
-    assert!(preview_audit::load_preview_audit(&mut *retry, &id)
-        .await
-        .is_err());
+    // Reprepare the query against the replacement schema; otherwise a cached
+    // result descriptor can fail before SQLx tries to decode the column.
+    retry.clear_cached_statements().await?;
+    let error = preview_audit::load_preview_audit(&mut *retry, &id).await;
+    assert!(matches!(
+        error,
+        Err(sqlx::Error::ColumnDecode { ref index, .. }) if index == "outcome"
+    ));
     retry.rollback().await?;
     Ok(())
 }
