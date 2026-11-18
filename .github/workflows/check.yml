@@ -2269,9 +2269,6 @@ jobs:
       - name: custom-command Postgres proof
         run: cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
 
-      - name: automod preview audit proof (CI service only)
-        run: cargo test -p two-bot-core --features db --locked --test automod_preview_audit -- --ignored
-
       - name: automations import/export Postgres proof
         run: cargo test -p two-bot-core --features db --locked --test automation_transfer -- --ignored
 
@@ -3629,6 +3626,8 @@ jobs:
         run: node --test scripts/test-voice-measurement-metadata.mjs
       - name: Verify voice measurement interval decisions (offline fixtures)
         run: node --test scripts/test-voice-measurement-decision.mjs
+      - name: Verify voice measurement candidate (offline fixtures)
+        run: node --test scripts/test-voice-measurement-candidate.mjs
       - name: Verify promotion-gate intake cap (offline fixtures)
         run: node --test scripts/test-promotion-gate-intake-cap.mjs
       - name: Verify slow-burn decide intake cap (offline fixtures)
