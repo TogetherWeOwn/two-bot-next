@@ -2270,6 +2270,8 @@ jobs:
         run: cargo test -p two-bot-core --features db --locked --test custom_command_store -- --ignored
 
       - name: automod preview audit proof (CI service only)
+        env:
+          TWO_TEST_DATABASE_URL: postgres://agent_test:@agent-testdb:5432/two_bot_test_ci
         run: cargo test -p two-bot-core --features db --locked --test automod_preview_audit -- --ignored
 
       - name: automations import/export Postgres proof
