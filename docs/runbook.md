@@ -2310,9 +2310,12 @@ authorized [qualification/recovery procedure](staging-rollout-gate.md#full-windo
    an ancestor of `origin/main`. Save it once: `DRILL_SHA=<paste the 40-hex
    SHA>` (replace the placeholder before running; the shell would read the
    angle brackets as a redirection).
-2. Arm the hold: `gh variable set STAGING_SOAK_HOLD_UNTIL --body
-   "2026-10-19T20:00:00Z"` with an ISO-8601 UTC deadline at most 4h out
-   (past the planned disarm plus the 30-minute clear).
+2. Choose a fresh ISO-8601 UTC deadline for this drill. It must cover the
+   observation, planned disarm, and 30-minute clear without exceeding 4h from
+   now. Set `HOLD_UNTIL` to that deadline, then run `gh variable set
+   STAGING_SOAK_HOLD_UNTIL --body "$HOLD_UNTIL"`. Before arming the fault,
+   read it back with `gh variable get STAGING_SOAK_HOLD_UNTIL` and confirm the
+   stored deadline still covers the planned window. A past deadline fails open.
 3. Arm the fault at the pinned SHA: `gh workflow run deploy-staging.yml
    --ref main -f "sha=$DRILL_SHA" -f inject_voice_stall=true` (add
    `-f inject_unpaired_disconnect=true` for the crash-loop scope).
