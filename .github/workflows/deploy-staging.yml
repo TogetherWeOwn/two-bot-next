@@ -103,7 +103,7 @@ jobs:
             echo "::error::Soak hold exceeds the 4h maximum: $HOLD_UNTIL. Shorten it or clear it."
             exit 1
           fi
-          echo "Staging deploy deferred by the soak hold until $HOLD_UNTIL. A merge will not retry this run; use a fresh authorized dispatch after expiry." >> "$GITHUB_STEP_SUMMARY"
+          echo "Staging deploy deferred by the soak hold until $HOLD_UNTIL. A merge will not retry this run; dispatch a fresh authorized rehearsal with inject_error_rate_spike=true after expiry." >> "$GITHUB_STEP_SUMMARY"
           echo "::error::Staging deploy deferred by the soak hold until $HOLD_UNTIL"
           exit 1
   # Pre-deploy schema-drift gate: a drifted staging database fails this job

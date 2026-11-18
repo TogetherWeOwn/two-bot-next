@@ -8024,7 +8024,8 @@ class WorkflowTests(unittest.TestCase):
             ("ordinary dispatch bypasses the hold", "false", stamp(now + datetime.timedelta(hours=1)), 0, ""),
             ("empty var means no hold", "true", "", 0, ""),
             ("expired hold fails open", "true", stamp(now - datetime.timedelta(minutes=1)), 0, "expired"),
-            ("armed hold defers", "true", stamp(now + datetime.timedelta(hours=1)), 1, "fresh authorized dispatch"),
+            ("armed hold defers", "true", stamp(now + datetime.timedelta(hours=1)), 1,
+             "dispatch a fresh authorized rehearsal with inject_error_rate_spike=true after expiry"),
             ("unparsable hold fails closed", "true", "not-a-timestamp", 1, ""),
             ("over-long hold fails closed", "true", stamp(now + datetime.timedelta(hours=5)), 1, ""),
         )
