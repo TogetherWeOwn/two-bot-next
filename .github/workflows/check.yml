@@ -3624,6 +3624,8 @@ jobs:
         run: node --test scripts/test-voice-rest-measurement.mjs
       - name: Verify voice measurement grant metadata (offline fixtures)
         run: node --test scripts/test-voice-measurement-metadata.mjs
+      - name: Verify voice measurement interval decisions (offline fixtures)
+        run: node --test scripts/test-voice-measurement-decision.mjs
       - name: Verify promotion-gate intake cap (offline fixtures)
         run: node --test scripts/test-promotion-gate-intake-cap.mjs
       - name: Verify slow-burn decide intake cap (offline fixtures)
