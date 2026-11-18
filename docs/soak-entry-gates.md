@@ -26,12 +26,16 @@ Companions: [staging-soak.md](staging-soak.md) (lifecycle and acceptance),
 
 ## Gate 1 — container healthy at a pinned SHA
 
-The staging deployment is the `main` head it claims to be, and the process
-answers truthfully.
+The staging deployment serves the pinned `main` SHA, and the process answers
+truthfully. A merge does not prove staging deployment or qualification. Consult
+`deploy-staging.yml` at the relevant ref for its triggers. If qualifying evidence
+for the intended SHA is absent, keep the gate closed and promotion held. Follow
+only the separately authorized
+[qualification/recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
 
 | Check | Verification command | Expected value |
 |---|---|---|
-| Deploy green | `gh run list --workflow deploy-staging.yml --branch main --limit 1` | `conclusion: success`, head SHA recorded as the pinned SHA. Docs-only merges start no run, so `main` may be ahead of the pinned SHA by docs-only commits; confirm with `git diff --stat <pinned>..origin/main` that nothing outside the `deploy-staging.yml` `paths-ignore` list changed |
+| Deploy green | `gh run list --workflow deploy-staging.yml --branch main --commit <pinned> --limit 1 --json headSha,status,conclusion,url` | The latest run completed with `conclusion: success` on the pinned SHA; retain the exact-SHA rollout and qualification evidence. A newer merge or another SHA's run is not a substitute. |
 | Liveness | `curl -s -o /tmp/health.json -w '%{http_code}' "$STAGING_WORKER_URL/health"` | `200`, body `{"status":"ok"}` |
 | Readiness | `curl -s -o /tmp/readyz.json -w '%{http_code}' "$STAGING_WORKER_URL/readyz"` | `200` with `components` `[["process","ready"],["gateway","ready"],["database","ready"]]` (plus informational `jobs`) |
 
