@@ -1,6 +1,9 @@
 //! Test-only transport doubles; these do not model durable admission fencing.
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tokio::{
@@ -19,6 +22,9 @@ pub(crate) struct Admission {
     pub ordinary: Option<AdmissionError>,
     pub strict: Option<AdmissionError>,
     pub completion: Result<(), AdmissionError>,
+    pub stall_completion: bool,
+    pub strict_admitted: AtomicUsize,
+    /// Completion attempts, not durable commits.
     pub completed: Arc<Mutex<Vec<Option<SendCooldown>>>>,
 }
 
@@ -33,6 +39,8 @@ impl Admission {
             ordinary,
             strict,
             completion: Ok(()),
+            stall_completion: false,
+            strict_admitted: AtomicUsize::new(0),
             completed: Arc::default(),
         }
     }
@@ -43,6 +51,7 @@ impl Admission {
         }
         Ok(AdmissionPermit::new(Box::new(Completion {
             result: self.completion,
+            stalled: self.stall_completion,
             completed: self.completed.clone(),
         })))
     }
@@ -56,12 +65,17 @@ impl SendAdmission for Admission {
         Box::pin(async { self.permit(self.ordinary) })
     }
     fn admit_strict(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
-        Box::pin(async { self.permit(self.strict) })
+        Box::pin(async {
+            let permit = self.permit(self.strict)?;
+            self.strict_admitted.fetch_add(1, Ordering::Relaxed);
+            Ok(permit)
+        })
     }
 }
 
 struct Completion {
     result: Result<(), AdmissionError>,
+    stalled: bool,
     completed: Arc<Mutex<Vec<Option<SendCooldown>>>>,
 }
 impl SendCompletion for Completion {
@@ -71,6 +85,9 @@ impl SendCompletion for Completion {
     ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
         Box::pin(async move {
             self.completed.lock().unwrap().push(cooldown);
+            if self.stalled {
+                std::future::pending::<()>().await;
+            }
             self.result
         })
     }

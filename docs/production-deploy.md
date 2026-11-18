@@ -56,12 +56,14 @@ guard checks before the deploy job can run. This repository is public, so
 required reviewers work on every plan; no Enterprise plan is needed.
 
 **Deploy.** Leave `sha` empty to promote the commit of the latest successful
-`deploy-staging` run on `main` (the normal case: merges keep superseding pending
-staging runs, so the newest `main` commit is often not staged). The guard then
-applies every rule below to that commit and refuses it if its `ci-ok` or
-`worker check` has not finished green. To deploy a specific commit, dispatch
-with `sha` set to a full 40-character commit (or an unambiguous 7-40 character hex prefix, which the guard resolves to the full commit via the commits API) that is on `main`. That commit needs successful, completed `ci-ok` and `worker check`
-runs from GitHub Actions and a successful `deploy-staging` run. `ci-ok` is the
+`deploy-staging` run on `main`. The newest `main` commit may not have a
+qualifying staging run. The guard applies every rule below to the selected
+commit and refuses it if its `ci-ok` or `worker check` has not finished green.
+To deploy a specific commit, dispatch with `sha` set to a full 40-character
+commit (or an unambiguous 7-40 character hex prefix, which the guard resolves
+to the full commit via the commits API) that is on `main`. That commit needs
+successful, completed `ci-ok` and `worker check` runs from GitHub Actions and
+a successful `deploy-staging` run. `ci-ok` is the
 full verdict over lint, worker checks and every selected Rust/DB test lane;
 a green lint-only `check` job is not enough. The guard enumerates `check.yml`
 runs for the exact SHA without a success filter, selects the newest run number,
@@ -74,12 +76,11 @@ pagination and a run/attempt change during validation fail closed. If a partial
 rerun omits a required job from the current attempt, rerun **all jobs**; do not
 reuse the earlier attempt's receipt. The summary records the admitted run/attempt.
 Staging runs queue in a single concurrency group, so an intermediate commit may
-never stage; the empty-`sha` promotion picks the latest one that did. A push to `main` that touches only docs, root
-markdown or repository chrome (the `paths-ignore` list in `deploy-staging.yml`)
-starts no staging run either, so the newest `main` commit may have no
-`deploy-staging` run: pin the latest commit that changes runtime inputs, or
-dispatch `deploy-staging` for the head you need. Docs-only commits after a
-staged commit change nothing the Worker or container serves.
+never stage; the empty-`sha` promotion picks the latest one that did. A merge
+does not prove staging deployment or qualification. Consult `deploy-staging.yml`
+at the relevant ref for its triggers, and verify completed qualifying evidence
+for the intended exact `main` SHA. If evidence is absent, keep promotion held
+and follow the separately authorized [qualification/recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
 After the reviewer approves (or the automated approval passes), the job:
 
 1. checks out exactly that commit and re-verifies that it is on `origin/main`;
