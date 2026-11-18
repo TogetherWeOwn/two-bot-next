@@ -8,6 +8,25 @@ use crate::automod_preview::{
 };
 use crate::automod_preview_report::{render_preview_reply, PREVIEW_RATE_LIMITED_REPLY};
 
+/// `action` column value for every preview audit row.
+pub const PREVIEW_AUDIT_ACTION: &str = "automod.preview";
+
+/// Audit-row (and advisory-lock) id for one preview attempt:
+/// `automod-preview:<interaction_id>`. The lock key and the row id are the
+/// same string, so one interaction serializes on exactly the row it claims.
+#[must_use]
+pub fn preview_audit_id(interaction_id: &str) -> String {
+    format!("automod-preview:{interaction_id}")
+}
+
+/// Strict inverse of [`preview_audit_id`]: the interaction id, or `None`
+/// when the id is not a preview claim. An empty remainder refuses.
+#[must_use]
+pub fn parse_preview_audit_id(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix("automod-preview:")?;
+    (!rest.is_empty()).then_some(rest)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedPreviewReason<'a> {
     filter: &'a str,
@@ -86,6 +105,30 @@ pub fn replay_preview_reply(
         _ => return None,
     };
     Some(render_preview_reply(&verdict, created_at))
+}
+
+/// Build the [`crate::custom_commands::AuditRecord`] for one evaluated
+/// preview or in-scope rate refusal. `outcome`/`reason` come from the
+/// `preview_audit_outcome` / `audit_reason_for_verdict` builders (or the
+/// rate-limited builders). This function does not validate those strings;
+/// callers must not pass preview content. The caller supplies the winning
+/// attempt's captured UTC receipt time separately to `insert_preview_audit` (§3.1).
+#[must_use]
+pub fn preview_audit_record(
+    guild_id: &str,
+    actor_id: &str,
+    channel_id: &str,
+    outcome: &str,
+    reason: String,
+) -> crate::custom_commands::AuditRecord {
+    crate::custom_commands::AuditRecord {
+        guild_id: guild_id.to_owned(),
+        actor_id: Some(actor_id.to_owned()),
+        action: PREVIEW_AUDIT_ACTION.to_owned(),
+        target_key: Some(channel_id.to_owned()),
+        outcome: outcome.to_owned(),
+        reason: Some(reason),
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +343,27 @@ mod tests {
         assert_eq!(replay_preview_reply("exempt", valid, ""), None);
     }
     #[test]
+    fn audit_id_round_trip_is_strict() {
+        assert_eq!(preview_audit_id("123"), "automod-preview:123");
+        assert_eq!(parse_preview_audit_id("automod-preview:123"), Some("123"));
+        for bad in [
+            "",
+            "automod-preview:",
+            "automod-preview",
+            "custom:text:attempt:123",
+            "AUTOMOD-PREVIEW:123",
+            "automod-preview:123:extra",
+        ] {
+            if bad == "automod-preview:123:extra" {
+                // Remainder may itself contain ':'; it still parses.
+                assert_eq!(parse_preview_audit_id(bad), Some("123:extra"));
+            } else {
+                assert_eq!(parse_preview_audit_id(bad), None, "id {bad:?}");
+            }
+        }
+    }
+
+    #[test]
     fn reason_parse_accepts_only_the_emitted_shape() {
         let parsed = parse_preview_reason("filter=bad_words;exemption=none;mode=dry_run;len=0_50")
             .expect("emitted shape parses");
@@ -412,6 +476,27 @@ mod tests {
             replay_preview_reply(preview_audit_outcome(&verdict), Some(&reason), created_at),
             Some(first)
         );
+    }
+
+    #[test]
+    fn audit_record_carries_claim_fields() {
+        let record = preview_audit_record(
+            "guild-1",
+            "actor-1",
+            "channel-1",
+            "matched",
+            "filter=bad_words;exemption=none;mode=dry_run;len=0_50".to_owned(),
+        );
+        assert_eq!(record.action, PREVIEW_AUDIT_ACTION);
+        assert_eq!(record.guild_id, "guild-1");
+        assert_eq!(record.actor_id.as_deref(), Some("actor-1"));
+        assert_eq!(record.target_key.as_deref(), Some("channel-1"));
+        assert_eq!(record.outcome, "matched");
+        assert!(record
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("filter=bad_words;"));
     }
 
     #[test]
