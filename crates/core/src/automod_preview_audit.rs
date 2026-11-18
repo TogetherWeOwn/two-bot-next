@@ -29,6 +29,17 @@ pub fn parse_preview_audit_id(id: &str) -> Option<&str> {
     (!rest.is_empty()).then_some(rest)
 }
 
+/// One visible preview audit row: outcome, reason, and the stored
+/// `created_at` text. The timestamp text is used verbatim as the reply's
+/// `current at` currency, so the first reply and every replay render the
+/// same string at database precision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewAuditRow {
+    pub outcome: String,
+    pub reason: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedPreviewReason<'a> {
     filter: &'a str,
@@ -131,6 +142,79 @@ pub fn preview_audit_record(
         outcome: outcome.to_owned(),
         reason: Some(reason),
     }
+}
+
+/// Serialize one attempt by interaction id inside the caller's transaction
+/// (spec §6). Transaction-scoped: commit or rollback releases the claim, so
+/// no permanent claimed-without-result state is possible.
+#[cfg(feature = "db")]
+pub async fn lock_preview_attempt(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    interaction_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(preview_audit_id(interaction_id))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Transaction-capable replay read: `(outcome, reason, created_at)` for one
+/// audit id, on any executor — the winner's transaction connection or the
+/// pool. `Ok(None)` means no row is visible to that executor; a transaction
+/// can also see its own uncommitted insert. The existing `load_audit` takes
+/// the pool only and drops the timestamp.
+#[cfg(feature = "db")]
+pub async fn load_preview_audit<'c>(
+    executor: impl sqlx::Executor<'c, Database = sqlx::Postgres>,
+    id: &str,
+) -> Result<Option<PreviewAuditRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT outcome, reason,
+                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS created_at_text
+         FROM automation_audit_log WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(executor)
+    .await?;
+    use sqlx::Row;
+    row.map(|row| {
+        Ok(PreviewAuditRow {
+            outcome: row.try_get("outcome")?,
+            reason: row.try_get("reason")?,
+            created_at: row.try_get("created_at_text")?,
+        })
+    })
+    .transpose()
+}
+
+/// Insert one preview audit row and read back the stored timestamp
+/// (`INSERT ... RETURNING` in UTC). The caller renders both the first reply
+/// and every replay from that returned text, independent of session timezone
+/// and at database precision.
+#[cfg(feature = "db")]
+pub async fn insert_preview_audit<'c>(
+    executor: impl sqlx::Executor<'c, Database = sqlx::Postgres>,
+    record: &crate::custom_commands::AuditRecord,
+    id: &str,
+    at_iso: &str,
+) -> Result<String, sqlx::Error> {
+    let stored: String = sqlx::query_scalar(
+        "INSERT INTO automation_audit_log (id, guild_id, actor_id, action, target_key, outcome, reason, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::timestamptz)
+         RETURNING to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'",
+    )
+    .bind(id)
+    .bind(&record.guild_id)
+    .bind(&record.actor_id)
+    .bind(&record.action)
+    .bind(&record.target_key)
+    .bind(&record.outcome)
+    .bind(&record.reason)
+    .bind(at_iso)
+    .fetch_one(executor)
+    .await?;
+    Ok(stored)
 }
 
 #[cfg(test)]
