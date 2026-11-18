@@ -425,14 +425,16 @@ mod tests {
         let clock = VoiceOccupancyClock::default();
         let listing = || read_voice_snapshot(&cache, &clock, 100, &HashMap::new());
         let scalar = || observe_rooms(&cache, 100).map(|rooms| total_in_voice(&rooms));
+        // Ignore Twilight's contents so these assertions isolate admission.
+        let admitted = || cache.with_guild_snapshot(100, |_| ());
         let assert_incomplete = || {
             assert_eq!(listing(), Err(SnapshotRefusal::CacheIncomplete));
             assert_eq!(scalar(), Err(SnapshotRefusal::CacheIncomplete));
         };
         assert_incomplete();
         cache.update(&pipeline_guild(&[42]));
+        assert_eq!(admitted(), Some(()));
         assert_eq!(scalar(), Ok(1));
-        // Twilight retains the old guild on READY until the new snapshot.
         cache.update(&Event::Ready(
             serde_json::from_value(json!({
                 "v": 10, "session_id": "fixture", "resume_gateway_url": "ws://fixture.invalid",
@@ -442,16 +444,20 @@ mod tests {
             }))
             .expect("ready fixture"),
         ));
+        assert_eq!(admitted(), None);
         assert_incomplete();
         cache.update(&pipeline_guild(&[42]));
+        assert_eq!(admitted(), Some(()));
         assert_eq!(listing().expect("full snapshot")["total_in_voice"], 1);
         assert_eq!(scalar(), Ok(1));
         cache.update(&Event::GuildCreate(Box::new(GuildCreate::Unavailable(
             serde_json::from_value(json!({"id": "100", "unavailable": true}))
                 .expect("unavailable guild fixture"),
         ))));
+        assert_eq!(admitted(), None);
         assert_incomplete();
         cache.update(&pipeline_guild(&[]));
+        assert_eq!(admitted(), Some(()));
         assert_eq!(listing().expect("empty snapshot")["total_in_voice"], 0);
         assert_eq!(scalar(), Ok(0));
     }

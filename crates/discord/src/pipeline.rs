@@ -477,6 +477,8 @@ pub struct SharedCache {
     /// READY can retain an old guild entry while its new snapshot is pending.
     /// Keep those guilds ineligible until an available GuildCreate completes.
     pending_guilds: RwLock<HashSet<Snowflake>>,
+    #[cfg(test)]
+    before_twilight_update: Option<tests::CacheWriteProbe>,
 }
 
 impl Default for SharedCache {
@@ -484,6 +486,8 @@ impl Default for SharedCache {
         Self {
             inner: build_cache(),
             pending_guilds: RwLock::new(HashSet::new()),
+            #[cfg(test)]
+            before_twilight_update: None,
         }
     }
 }
@@ -512,6 +516,14 @@ impl SharedCache {
                 }
             }
             _ => {}
+        }
+        self.apply_twilight_event(event);
+    }
+
+    fn apply_twilight_event(&self, event: &Event) {
+        #[cfg(test)]
+        if let Some(probe) = &self.before_twilight_update {
+            probe(self);
         }
         self.inner.update(event);
     }
@@ -1298,14 +1310,32 @@ mod tests {
 
     const GUILD: Snowflake = 7;
 
+    pub(super) type CacheWriteProbe = Box<dyn Fn(&SharedCache) + Send + Sync>;
+
     #[test]
     fn guild_snapshot_refuses_during_cache_rebuild_and_fences_the_whole_read() {
-        let cache = SharedCache::default();
-        let rebuild = cache.pending_guilds.write().expect("rebuild fence");
-        assert_eq!(cache.with_guild_snapshot(GUILD, |_| 42), None);
-        drop(rebuild);
+        const OTHER_GUILD: Snowflake = GUILD + 1;
+        let (observed, probe) = std::sync::mpsc::channel();
+        let cache = SharedCache {
+            before_twilight_update: Some(Box::new(move |cache| {
+                // READY only marks GUILD pending. Refusing OTHER_GUILD here
+                // must come from the actual writer holding the fence.
+                assert_eq!(cache.with_guild_snapshot(OTHER_GUILD, |_| 42), None);
+                assert!(cache.inner.current_user().is_none());
+                observed.send(()).expect("record writer probe");
+            })),
+            ..SharedCache::default()
+        };
+        cache.update(&lifecycle_ready());
+        probe
+            .try_recv()
+            .expect("writer reached the Twilight update");
         assert_eq!(
-            cache.with_guild_snapshot(GUILD, |_| {
+            cache.inner.current_user().expect("READY user").id.get(),
+            999
+        );
+        assert_eq!(
+            cache.with_guild_snapshot(OTHER_GUILD, |_| {
                 assert!(cache.pending_guilds.try_write().is_err());
                 42
             }),
