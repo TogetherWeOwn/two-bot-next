@@ -1,12 +1,56 @@
 #![cfg(feature = "db")]
 
-//! Disposable-Postgres proof of preview advisory claim exclusion and rollback.
+//! Database proofs for the preview audit transaction (spec §6, T17 core half).
+//! The lock test uses the shared disposable database fixture. The ignored row
+//! test is restricted to agent-testdb or the CI service container; run it with
+//! `cargo test -p two-bot-core --features db --test automod_preview_audit -- --ignored`.
+//! Neither test consults DATABASE_URL or inherited application credentials.
+//!
+//! The lock test checks exclusion and rollback using two transactions. The row
+//! test uses a rolled-back transaction over `pg_temp` to check insertion and
+//! same-transaction reload. Neither proves cross-connection committed replay or
+//! that a real handler commits before replying.
 
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{migrate::Migrator, PgPool, Postgres, Transaction};
 use two_bot_core::automod_preview_audit as preview_audit;
 use two_bot_testsupport::TestDatabase;
 
-const INTERACTION_ID: &str = "999";
+const MIGRATION: &str = include_str!("../../cutover/migrations/0130_custom_commands.sql");
+const AT: &str = "2026-11-02T08:00:00.123456Z";
+
+async fn test_pool() -> Result<sqlx::PgPool, sqlx::Error> {
+    let ci_service = std::env::var("CI").as_deref() == Ok("true")
+        && std::env::var("TWO_CUSTOM_COMMAND_TEST_CI").as_deref() == Ok("1");
+    let options = PgConnectOptions::new()
+        .host(if ci_service {
+            "127.0.0.1"
+        } else {
+            "agent-testdb"
+        })
+        .port(5432)
+        .username("agent_test")
+        .password("")
+        .database("agent_test")
+        .options([("statement_timeout", "5000ms")]);
+    PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect_with(options)
+        .await
+}
+
+fn matched_record() -> two_bot_core::custom_commands::AuditRecord {
+    preview_audit::preview_audit_record(
+        "test-guild-one",
+        "actor-one",
+        "channel-one",
+        "matched",
+        "filter=bad_words;exemption=none;mode=dry_run;len=0_50".to_owned(),
+    )
+}
+
+const INTERACTION_ID: &str = "lock-test-999";
 const OTHER_INTERACTION_ID: &str = "1000";
 
 async fn try_claim(tx: &mut Transaction<'_, Postgres>, id: &str) -> Result<bool, sqlx::Error> {
@@ -44,5 +88,74 @@ async fn preview_claim_excludes_contender_and_rollback_releases_it(
     assert!(!same, "claim lock excludes the same interaction");
     assert!(other, "unrelated interaction remains independent");
     assert!(released, "rollback releases the claim");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
+async fn preview_claim_insert_replay_and_rollback() -> Result<(), sqlx::Error> {
+    let pool = test_pool().await?;
+
+    // pg_temp shadows all persistent tables. Everything, including DDL, rolls
+    // back, even on an assertion failure when the transaction is dropped.
+    let mut tx = pool.begin().await?;
+    sqlx::query("CREATE TEMP TABLE preview_audit_test_scope (id INTEGER)")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL search_path = pg_temp")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::raw_sql(MIGRATION).execute(&mut *tx).await?;
+    sqlx::raw_sql(MIGRATION).execute(&mut *tx).await?;
+
+    let id = preview_audit::preview_audit_id("999");
+
+    // No committed row: a first delivery may evaluate.
+    preview_audit::lock_preview_attempt(&mut tx, "999").await?;
+    assert_eq!(
+        preview_audit::load_preview_audit(&mut *tx, &id).await?,
+        None
+    );
+
+    // The winner inserts with its receipt time and reads back the stored
+    // timestamp; the first reply and every replay share that text.
+    sqlx::query("SET LOCAL TIME ZONE 'America/New_York'")
+        .execute(&mut *tx)
+        .await?;
+    let record = matched_record();
+    let stored = preview_audit::insert_preview_audit(&mut *tx, &record, &id, AT).await?;
+    assert_eq!(stored, "2026-11-02 08:00:00.123456+00");
+    // Neither insert nor replay may inherit the database session's timezone.
+    sqlx::query("SET LOCAL TIME ZONE 'Asia/Tokyo'")
+        .execute(&mut *tx)
+        .await?;
+    let row = preview_audit::load_preview_audit(&mut *tx, &id)
+        .await?
+        .expect("inserted row reloads on the same connection");
+    assert_eq!(row.outcome, "matched");
+    assert_eq!(
+        row.reason.as_deref(),
+        Some("filter=bad_words;exemption=none;mode=dry_run;len=0_50")
+    );
+    assert_eq!(row.created_at, stored);
+    let first = two_bot_core::automod_preview_report::render_preview_reply(
+        &two_bot_core::automod_preview::PreviewVerdict {
+            result: two_bot_core::automod_preview::PreviewResult::Matched,
+            filter: Some(two_bot_core::automod::AutomodFilter::BadWords),
+            knobs: two_bot_core::automod_preview::deciding_knobs(
+                two_bot_core::automod::AutomodFilter::BadWords,
+            ),
+            exemption: None,
+            dry_run: true,
+        },
+        &stored,
+    );
+    assert_eq!(
+        preview_audit::replay_preview_reply(&row.outcome, row.reason.as_deref(), &row.created_at),
+        Some(first),
+        "same-transaction replay renders byte-identical to the first reply"
+    );
+
+    tx.rollback().await?;
     Ok(())
 }
