@@ -2298,8 +2298,11 @@ nothing executes from this path.
 Drill procedure (Operator). The soak needs the armed build undisturbed for
 at least 90 minutes (R1, R2 30+ minutes later, STOP 30+ minutes after R2,
 disarm, then a 30-minute clear) while merges keep landing. Arm the hold
-first so any push-triggered staging run fails fast. Ordinary manual dispatches
-bypass this hold; do not dispatch an unrelated deployment during the drill.
+first: it still blocks error-rate rollback rehearsals, including the daily
+proof. On workflow revisions with a staging push trigger, it also makes
+push-triggered runs fail fast. Non-rehearsal manual dispatches, including the
+explicit arm and disarm below, bypass this hold; do not dispatch an unrelated
+deployment during the drill.
 Consult `deploy-staging.yml` at the relevant ref for its triggers. A merge does
 not prove deployment or qualification. Keep promotion held without completed
 qualifying evidence for the intended exact `main` SHA, and follow the separately

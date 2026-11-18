@@ -167,7 +167,11 @@ is the serving version (same id as `wrangler deployments status --env staging`),
 and if they differ redeploy the intended SHA through the workflow first (full rule
 in `docs/production-deploy.md`).
 
-1. Merge this change. `deploy-staging` deploys it dark; `/health` and `/readyz` are unchanged.
+1. Before staging any enablement secrets, verify that staging serves the
+   intended build with the receiver still off. Confirm a successful deployment
+   of the intended SHA and a matching `build_revision` in the live `200`
+   `/readyz` response. A merge alone does not prove deployment. `/health`
+   and `/readyz` are unchanged.
 2. Operator stages `TWO_INTERNAL_CALLERS` and `TWO_INTERNAL_CHANNEL_KEYS` (plain values), only under the separately authorized enablement contract; no role keys or optional capability gates travel through this Worker.
 3. Operator generates the key on the Operator host and stages `TWO_INTERNAL_KEYS`, and sets the website's `staging` environment secret `BOT_SHARED_SECRET` to the same value, without printing it.
 4. Operator applies migrations `0423` (settings CAS) and `0424` (event outcome) first (the bot does not apply migrations; an enabled receiver's finish fails without the columns), then stages `TWO_INTERNAL_ACTIONS` as `1` **last**, deploys the version, and transfers ownership. The container restart applies the settings: an invalid combination exits the process (the receiver boots all-or-nothing) and keeps staging red until step 5.
