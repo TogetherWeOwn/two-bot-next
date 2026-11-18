@@ -13,6 +13,9 @@ export function verifyCandidate(receipts, candidate, secondRequired, grant, opti
       ? combinedDecision(...receipts, options)
       : firstIntervalDecision(...receipts, options);
     if (!secondRequired && expected.secondRequired) return false;
+    // The comparisons validate timestamps; each interval still needs a fresh capture.
+    if (receipts.some((receipt, i) => i > 0
+      && Date.parse(receipt.capturedAt) <= Date.parse(receipts[i - 1].capturedAt))) return false;
     const first = receipts[0];
     if (!['runId', 'runAttempt', 'sha', 'deploymentId', 'expiresAt']
       .every((key) => typeof grant[key] === 'string' && first[key] === grant[key])) return false;
