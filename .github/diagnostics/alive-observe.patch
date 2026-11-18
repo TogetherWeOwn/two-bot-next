@@ -1,0 +1,346 @@
+--- a/crates/bot/tests/alive.rs
++++ b/crates/bot/tests/alive.rs
+@@ -42,6 +42,82 @@
+ const GUILD: &str = "2222";
+ const SESSION: &str = "alive-mock-session";
+ type Logs = Arc<Mutex<String>>;
++
++// Only the supplemental job applies this patch, to the pinned baseline checkout.
++static EXPERIMENT_CLOCK: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
++static ACTIVE_TESTS: AtomicUsize = AtomicUsize::new(0);
++
++#[derive(Clone, Copy)]
++struct Trace(&'static str);
++
++struct TestSpan(Trace);
++
++impl Trace {
++    fn start(self) -> TestSpan {
++        self.note(
++            "test_threads",
++            std::thread::available_parallelism().map_or(0, |n| n.get()) as u128,
++        );
++        self.note(
++            "test_enter",
++            (ACTIVE_TESTS.fetch_add(1, SeqCst) + 1) as u128,
++        );
++        TestSpan(self)
++    }
++
++    fn note(self, phase: &'static str, value: u128) {
++        eprintln!(
++            "alive_observe {} {} {} {}",
++            self.0,
++            phase,
++            EXPERIMENT_CLOCK.elapsed().as_micros(),
++            value
++        );
++    }
++
++    fn ready(response: &str) -> u128 {
++        let Some((_, body)) = response.split_once("\r\n\r\n") else {
++            return 0;
++        };
++        let Ok(body) = serde_json::from_str::<Value>(body) else {
++            return 0;
++        };
++        let status = &body["jobs"]["scheduled_events"];
++        if !status.is_object() {
++            return 0;
++        }
++        // Bitset: present, parked, running, start seen, success seen, error seen.
++        1 | (u128::from(status["parked"].as_bool() == Some(true)) << 1)
++            | (u128::from(status["running"].as_bool() == Some(true)) << 2)
++            | (u128::from(status["last_start"].is_u64()) << 3)
++            | (u128::from(status["last_success"].is_u64()) << 4)
++            | (u128::from(status["last_error_class"].is_string()) << 5)
++    }
++
++    async fn watch_ready(self, addr: SocketAddr) {
++        let mut last = None;
++        loop {
++            if let Ok(Ok(response)) = timeout(Duration::from_millis(80), get(addr, "/readyz")).await
++            {
++                let bits = Self::ready(&response);
++                if last != Some(bits) {
++                    self.note("job_state", bits);
++                    last = Some(bits);
++                }
++            }
++            sleep(Duration::from_millis(100)).await;
++        }
++    }
++}
++
++impl Drop for TestSpan {
++    fn drop(&mut self) {
++        self.0.note(
++            "test_leave",
++            (ACTIVE_TESTS.fetch_sub(1, SeqCst) - 1) as u128,
++        );
++    }
++}
+
+ struct TestDb {
+     admin: PgPool,
+@@ -339,7 +415,7 @@
+ }
+
+ impl MockDiscord {
+-    async fn new() -> Self {
++    async fn new(trace: Trace) -> Self {
+         let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let ws_addr = ws_listener.local_addr().unwrap();
+         let url = format!("ws://{ws_addr}");
+@@ -361,10 +437,12 @@
+             for boot in 0..2 {
+                 let (stream, _) = ws_listener.accept().await.unwrap();
+                 accepted.fetch_add(1, SeqCst);
++                trace.note("mock_tcp_accept", boot);
+                 let (_, mut ws) = ServerBuilder::new()
+                     .accept(stream)
+                     .await
+                     .expect("mock websocket");
++                trace.note("mock_upgrade_done", boot);
+                 handshake_tx.send(()).await.expect("handshake receiver");
+                 gates.recv().await.expect("release HELLO");
+                 ws.send(Message::text(
+@@ -422,6 +500,7 @@
+             rest_listener,
+             rest_requests.clone(),
+             rest_handlers.clone(),
++            trace,
+         ));
+         Self {
+             url,
+@@ -474,6 +553,7 @@
+     listener: TcpListener,
+     recorded: Arc<Mutex<Vec<RestRequest>>>,
+     handlers: Arc<Mutex<tokio::task::JoinSet<()>>>,
++    trace: Trace,
+ ) {
+     loop {
+         let Ok((mut stream, _)) = listener.accept().await else {
+@@ -537,6 +617,14 @@
+                 body: request_body,
+                 received_at: tokio::time::Instant::now(),
+             });
++            match (method.as_str(), path.as_str()) {
++                ("GET", "/api/v10/applications/@me") => trace.note("mock_rest_identity", 0),
++                ("GET", "/api/v10/users/@me") => trace.note("mock_rest_user", 0),
++                ("GET", "/api/v10/guilds/2222") => trace.note("mock_rest_guild", 0),
++                ("PUT", "/api/v10/applications/1111/guilds/2222/commands") => trace.note("mock_rest_registry", 0),
++                ("GET", path) if path.contains("scheduled-events") => trace.note("mock_rest_events", 0),
++                _ => {}
++            }
+             // Registry and job requests can interleave, so never script replies
+             // by arrival order. The fixture grounds no raid windows; only the
+             // events mirror reads. Unknown routes fail closed on this socket.
+@@ -731,6 +819,7 @@
+     bots: &mut Vec<Bot>,
+     logs: &Logs,
+     decoy: Option<&str>,
++    trace: Trace,
+ ) {
+     let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+     let addr = reserved.local_addr().unwrap();
+@@ -745,15 +834,22 @@
+         } else {
+             decoy.unwrap_or("ws://127.0.0.1:1")
+         };
++        trace.note("boot_start", boot as u128);
++        let health_started = Instant::now();
+         bots.push(Bot::spawn(db, addr, Some(gateway), &discord.api, logs));
+         let bot = bots.last_mut().unwrap();
+         let health = wait_http(bot, addr, "/healthz", 200).await;
++        trace.note("health_ok", health_started.elapsed().as_micros());
+         assert!(health.contains("\"status\":\"ok\""));
+         wait_http(bot, addr, "/health", 200).await;
+         let before = wait_http(bot, addr, "/readyz", 503).await;
++        trace.note("ready_starting", Trace::ready(&before));
+         assert!(before.contains("\"gateway\",\"starting\""));
+         discord.release.send(()).await.unwrap(); // Health precedes HELLO.
++        let auth_started = Instant::now();
++        trace.note("auth_begin", STEP.as_micros());
+         let auth = discord.authentication().await;
++        trace.note("auth_done", auth_started.elapsed().as_micros());
+         let requests: Vec<_> = discord
+             .rest_requests
+             .lock()
+@@ -860,13 +956,19 @@
+             Some(&*discord.url),
+             "persist the actual admitted wire URL"
+         );
++        let ready_started = Instant::now();
++        trace.note("ready_begin", STEP.as_micros());
+         let ready = wait_http(bot, addr, "/readyz", 200).await;
++        trace.note("ready_ok", ready_started.elapsed().as_micros());
++        trace.note("job_state", Trace::ready(&ready));
+         assert!(ready.contains("\"gateway\",\"ready\""));
+         if boot == 0 {
+             // Deterministic website-job coverage: the events mirror must tick
+             // on its own REST socket during the first boot, never the gateway
+             // listener. Jitter is bounded by min(cadence, 5s); STEP covers it.
+-            let ticked = timeout(STEP, async {
++            let tick_started = Instant::now();
++            trace.note("tick_begin", STEP.as_micros());
++            let tick = timeout(STEP, async {
+                 loop {
+                     if discord
+                         .rest_requests
+@@ -882,8 +984,20 @@
+                     // window instead of spinning on the mutex.
+                     sleep(Duration::from_millis(10)).await;
+                 }
+-            })
+-            .await;
++            });
++            let ticked = tokio::select! {
++                biased;
++                verdict = tick => verdict,
++                () = trace.watch_ready(addr) => unreachable!("observer does not return"),
++            };
++            trace.note(
++                if ticked.is_ok() {
++                    "tick_hit"
++                } else {
++                    "tick_miss"
++                },
++                tick_started.elapsed().as_micros(),
++            );
+             assert!(
+                 ticked.is_ok(),
+                 "events job never hit REST during first boot"
+@@ -894,9 +1008,16 @@
+         // masked by an immediate SIGTERM. Bounded 10 ms backoff keeps the
+         // window cheap under load.
+         let settle_until = tokio::time::Instant::now() + Duration::from_millis(200);
+-        while tokio::time::Instant::now() < settle_until {
+-            bot.assert_alive();
+-            sleep(Duration::from_millis(10)).await;
++        let settle = async {
++            while tokio::time::Instant::now() < settle_until {
++                bot.assert_alive();
++                sleep(Duration::from_millis(10)).await;
++            }
++        };
++        tokio::select! {
++            biased;
++            () = settle => (),
++            () = trace.watch_ready(addr) => unreachable!("observer does not return"),
+         }
+         bot.assert_alive();
+         assert_ready_correlation(&logs.lock().await);
+@@ -945,12 +1066,15 @@
+ }
+
+ async fn binary_lifecycle(accepting_decoy: bool) {
++    let trace = Trace(if accepting_decoy { "decoy" } else { "sigterm" });
++    let _span = trace.start();
+     let started = Instant::now();
+     let db = TestDb::new().await;
+-    let mut discord = MockDiscord::new().await;
++    trace.note("schema_ready", started.elapsed().as_micros());
++    let mut discord = MockDiscord::new(trace).await;
+     let logs = Logs::default();
+     let mut bots = Vec::new();
+-    let decoy = MockDiscord::new().await; // Accepting listener: any dial is counted.
++    let decoy = MockDiscord::new(Trace("bootstrap_decoy")).await; // Accepting listener: any dial is counted.
+     let exercise = async {
+         strict_boot_probes(&db, &discord.api, &mut bots, &logs, &decoy.url).await;
+         let owned = discord.connections.load(SeqCst) + decoy.connections.load(SeqCst);
+@@ -960,16 +1084,26 @@
+         // Inadmissible checkpoint under a checked local bootstrap must IDENTIFY.
+         seed_raw(&db, &format!("{}/invalid", decoy.url)).await;
+         let bootstrap = accepting_decoy.then_some(decoy.url.as_str());
+-        lifecycle(&db, &mut discord, &mut bots, &logs, bootstrap).await;
++        lifecycle(&db, &mut discord, &mut bots, &logs, bootstrap, trace).await;
+         assert_eq!(
+             decoy.connections.load(SeqCst),
+             0,
+             "no probe/decoy connections"
+         );
+     };
++    let lifecycle_started = Instant::now();
++    trace.note("lifecycle_begin", TOTAL.as_micros());
+     let result = AssertUnwindSafe(timeout(TOTAL, exercise))
+         .catch_unwind()
+         .await;
++    trace.note(
++        match &result {
++            Ok(Ok(())) => "lifecycle_pass",
++            Ok(Err(_)) => "lifecycle_timeout",
++            Err(_) => "lifecycle_assertion",
++        },
++        lifecycle_started.elapsed().as_micros(),
++    );
+     // Retain ownership outside catch_unwind: reap BOTH subprocesses and drop
+     // only this schema even when an assertion or the overall deadline fails.
+     let mut cleaned = true;
+@@ -1006,6 +1140,8 @@
+ #[test]
+ #[ignore = "requires the explicit agent-testdb/CI test URL"]
+ fn fixture_schema_collision_preserves_existing_companion() {
++    let trace = Trace("collision");
++    let _span = trace.start();
+     let runtime = tokio::runtime::Builder::new_current_thread()
+         .enable_all()
+         .build()
+@@ -1064,6 +1200,8 @@
+ #[test]
+ #[ignore = "requires the explicit agent-testdb/CI test URL"]
+ fn fixture_lost_commit_ack_retains_both_schemas() {
++    let trace = Trace("lost_ack");
++    let _span = trace.start();
+     let runtime = tokio::runtime::Builder::new_current_thread()
+         .enable_all()
+         .build()
+@@ -1139,10 +1277,13 @@
+ #[tokio::test]
+ #[ignore = "requires the explicit agent-testdb/CI test URL"]
+ async fn fixture_teardown_releases_processes_sockets_and_schemas_after_each_outcome() {
++    let trace = Trace("teardown");
++    let _span = trace.start();
+     assert_injected_assertion_rejects_unrelated_panics();
+     for outcome in 0..6 {
+         let db = TestDb::new().await;
+-        let mut discord = MockDiscord::new().await;
++        trace.note("teardown_case", outcome);
++        let mut discord = MockDiscord::new(trace).await;
+         let addr = TcpListener::bind("127.0.0.1:0")
+             .await
+             .unwrap()
+@@ -1157,6 +1298,8 @@
+         let logs = Logs::default();
+         let mut bot = Bot::spawn(&db, addr, Some(&discord.url), &discord.api, &logs);
+         let phase = Cell::new("health readiness");
++        let elapsed = Instant::now();
++        trace.note("teardown_begin", STEP.as_micros());
+         let exercised = AssertUnwindSafe(timeout(STEP, async {
+             if outcome == 4 {
+                 std::future::pending::<()>().await;
+@@ -1165,6 +1308,7 @@
+             // Health precedes gateway initialization. Finish the upgrade before
+             // intentionally killing the child, but keep HELLO gated.
+             phase.set("gateway upgrade");
++            trace.note("teardown_health_ok", elapsed.elapsed().as_micros());
+             if outcome == 5 {
+                 std::future::pending::<()>().await;
+             }
+@@ -1178,6 +1322,16 @@
+         }))
+         .catch_unwind()
+         .await;
++        trace.note(
++            match (&exercised, phase.get()) {
++                (Ok(Err(_)), "gateway upgrade") => "teardown_upgrade_timeout",
++                (Ok(Err(_)), "health readiness") => "teardown_health_timeout",
++                (Ok(Err(_)), _) => "teardown_injected_timeout",
++                (Err(_), _) => "teardown_assertion",
++                _ => "teardown_pass",
++            },
++            elapsed.elapsed().as_micros(),
++        );
+         if outcome == 3 {
+             // The real capture future panics on invalid UTF-8 before cleanup joins it.
+             bot.readers
