@@ -6,7 +6,7 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_ra
 # Staging only. Accept the intended new rollout + serving image, never an old
 # healthy singleton. Production promotion remains subject to its separate gates.
 # Runs only on workflow_dispatch; merging into main does not start staging.
-# The deploy job has no job-level condition and uses the `staging` environment.
+# The deploy job enters `staging` only after fresh-run admission.
 # `release_fence` only releases an uninitialized/parked singleton after handoff
 # authorization and defaults to false. `inject_gateway_failure` is the opt-in
 # rollback-drill switch (docs/staging-rollout-gate.md). It reaches the deployed build
@@ -17,7 +17,7 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_ra
 # plumbing, arming a stale creator map and/or an unpaired disconnect with
 # guard recommendations for the soak.
 # `sha` pins the deployed commit so arm and disarm run at one exact revision:
-# a dispatch-only string, empty by default (empty deploys the workflow head).
+# a dispatch-only string; an empty dispatch pin is refused by admission.
 # Every job checks out that ref and refuses anything that is not a full
 # 40-hex ancestor of origin/main, so a pin can only name a merged main commit
 # and rollback is a pin, not moving main.
@@ -48,7 +48,7 @@ on:
         type: boolean
         default: false
       sha:
-        description: Deploy exactly this main commit (full 40-hex SHA, must be an ancestor of origin/main); empty deploys the workflow head
+        description: Deploy exactly this admitted main commit (full 40-hex SHA, must be an ancestor of origin/main); empty is refused
         required: false
         type: string
         default: ""
@@ -76,6 +76,10 @@ jobs:
     # note on `check` in check.yml.
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      run_id: ${{ steps.admit.outputs.run_id }}
+      attempt: ${{ steps.admit.outputs.attempt }}
+      sha: ${{ steps.admit.outputs.sha }}
     steps:
       - name: Check the rehearsal against the soak hold
         env:
@@ -106,6 +110,21 @@ jobs:
           echo "Staging deploy deferred by the soak hold until $HOLD_UNTIL. A merge will not retry this run; dispatch a fresh authorized rehearsal with inject_error_rate_spike=true after expiry." >> "$GITHUB_STEP_SUMMARY"
           echo "::error::Staging deploy deferred by the soak hold until $HOLD_UNTIL"
           exit 1
+      - name: Require admitted staging SHA
+        id: admit
+        env:
+          SOURCE_SHA: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.sha }}
+          ADMITTED_SHA: ${{ vars.STAGING_ADMITTED_SHA }}
+        run: |
+          set -euo pipefail
+          case "$SOURCE_SHA" in
+            *[!0-9a-f]*|'') echo "::error::Staging SHA must be a full 40-hex commit SHA."; exit 1 ;;
+          esac
+          if [ "${#SOURCE_SHA}" -ne 40 ] || [ "$SOURCE_SHA" != "$ADMITTED_SHA" ]; then
+            echo "::error::Staging deployment is held: commit is not admitted."
+            exit 1
+          fi
+          printf 'run_id=%s\nattempt=%s\nsha=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
   # Pre-deploy schema-drift gate: a drifted staging database fails this job
   # (and, through `needs`, the deploy below) instead of staying red silently.
   # Read-only `staging-migrate plan` through the no-reviewer
@@ -120,10 +139,8 @@ jobs:
     name: schema drift gate (staging-migrate plan)
     permissions:
       contents: read
-    # No `if:`: every deploy must prove a drift-free staging DB first. A
-    # skipped gate with a green deploy would re-create the silent-red staging.
-    # `needs: soak-hold`: a deferred error-rate rehearsal fails before this gate.
     needs: soak-hold
+    if: github.run_attempt == 1 && needs.soak-hold.outputs.run_id == github.run_id && needs.soak-hold.outputs.attempt == '1' && needs.soak-hold.outputs.sha == (github.event_name != 'workflow_dispatch' && github.sha || inputs.sha)
     environment: staging-migrate-plan
     # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
     # note on `check` in check.yml.
@@ -135,11 +152,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          ref: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.sha }}
           fetch-depth: 0
       - name: Deploy SHA must be exact and reachable from main
         env:
-          SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          SOURCE_SHA: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.sha }}
           WORKFLOW_REF: ${{ github.ref }}
         run: |
           [ "$WORKFLOW_REF" = "refs/heads/main" ] || { echo "::error::This job must run from main (workflow ref: $WORKFLOW_REF)" >&2; exit 1; }
@@ -163,7 +180,7 @@ jobs:
           TWO_BOT_STAGING_HOST: ${{ vars.TWO_BOT_STAGING_HOST }}
           TWO_BOT_STAGING_DATABASE: ${{ vars.TWO_BOT_STAGING_DATABASE }}
           TWO_BOT_STAGING_BRANCH_ID: ${{ vars.TWO_BOT_STAGING_BRANCH_ID }}
-          SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          SOURCE_SHA: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.sha }}
         # `shell: bash` runs with `-eo pipefail`. The container's default `sh`
         # has no pipefail, so a gate refusal piped anywhere would read green.
         # `set -o pipefail` is belt-and-braces for the same guarantee if the
@@ -188,10 +205,8 @@ jobs:
     name: role drift gate (two-bot db roles verify)
     permissions:
       contents: read
-    # No `if:`: every deploy must prove drift-free grants first. A skipped
-    # gate with a green deploy would re-create the 2026-10-16 crash-loop.
-    # `needs: soak-hold`: a deferred error-rate rehearsal fails before this gate.
     needs: soak-hold
+    if: github.run_attempt == 1 && needs.soak-hold.outputs.run_id == github.run_id && needs.soak-hold.outputs.attempt == '1' && needs.soak-hold.outputs.sha == (github.event_name != 'workflow_dispatch' && github.sha || inputs.sha)
     environment: staging-migrate-plan
     # Runner routing: explicit standard GitHub-hosted ubuntu-latest; see the
     # note on `check` in check.yml.
@@ -203,11 +218,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          ref: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.sha }}
           fetch-depth: 0
       - name: Deploy SHA must be exact and reachable from main
         env:
-          SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          SOURCE_SHA: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.sha }}
           WORKFLOW_REF: ${{ github.ref }}
         run: |
           [ "$WORKFLOW_REF" = "refs/heads/main" ] || { echo "::error::This job must run from main (workflow ref: $WORKFLOW_REF)" >&2; exit 1; }
@@ -244,7 +259,8 @@ jobs:
             --expected-branch-id "$TWO_BOT_STAGING_BRANCH_ID"
   deploy:
     name: wrangler deploy + intended rollout gate
-    needs: [schema-gate, roles-gate]
+    needs: [soak-hold, schema-gate, roles-gate]
+    if: github.run_attempt == 1 && needs.soak-hold.outputs.run_id == github.run_id && needs.soak-hold.outputs.attempt == '1' && needs.soak-hold.outputs.sha == (github.event_name != 'workflow_dispatch' && github.sha || inputs.sha)
     outputs:
       promotion_clean: ${{ steps.prepare.outputs.promotion_clean }}
       staging_use_expires_at: ${{ steps.use.outputs.expires_at }}
@@ -269,7 +285,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          ref: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.sha }}
           fetch-depth: 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -284,7 +300,7 @@ jobs:
           fetch-depth: 1
       - name: Deploy SHA must be exact and reachable from main
         env:
-          SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          SOURCE_SHA: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.sha }}
           WORKFLOW_REF: ${{ github.ref }}
         run: |
           [ "$WORKFLOW_REF" = "refs/heads/main" ] || { echo "::error::This job must run from main (workflow ref: $WORKFLOW_REF)" >&2; exit 1; }
@@ -615,7 +631,8 @@ jobs:
   # commit whose latest deploy-staging run succeeded, so a broken temp-voice
   # lifecycle cannot reach production.
   voice-synthetic:
-    needs: deploy
+    needs: [soak-hold, deploy]
+    if: github.run_attempt == 1 && needs.soak-hold.outputs.run_id == github.run_id && needs.soak-hold.outputs.attempt == '1' && needs.soak-hold.outputs.sha == (github.event_name != 'workflow_dispatch' && github.sha || inputs.sha)
     permissions:
       contents: read
     uses: ./.github/workflows/voice-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
@@ -636,7 +653,8 @@ jobs:
   # brand regression cannot reach production. While its bindings are
   # unprovisioned the called workflow notice-passes (see its header).
   help-embed-synthetic:
-    needs: deploy
+    needs: [soak-hold, deploy]
+    if: github.run_attempt == 1 && needs.soak-hold.outputs.run_id == github.run_id && needs.soak-hold.outputs.attempt == '1' && needs.soak-hold.outputs.sha == (github.event_name != 'workflow_dispatch' && github.sha || inputs.sha)
     permissions:
       contents: read
     uses: ./.github/workflows/help-embed-synthetic.yml # zizmor: ignore[self-repository] same-repo reusable call, pinned by test_workflows
@@ -660,7 +678,8 @@ jobs:
   # synthetic keeps the incident-issue path.
   user-flow-synthetic:
     name: staging user-flow synthetic (exact SHA)
-    needs: deploy
+    needs: [soak-hold, deploy]
+    if: github.run_attempt == 1 && needs.soak-hold.outputs.run_id == github.run_id && needs.soak-hold.outputs.attempt == '1' && needs.soak-hold.outputs.sha == (github.event_name != 'workflow_dispatch' && github.sha || inputs.sha)
     environment: staging
     permissions:
       contents: read
@@ -699,7 +718,7 @@ jobs:
       - name: Probe the staging user flow on the exact deployed SHA
         env:
           STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
-          EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+          EXPECTED_SHA: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.sha }}
         run: |
           set -euo pipefail
           if [ -z "$STAGING_WORKER_URL" ]; then
@@ -722,8 +741,8 @@ jobs:
   # not read as staging history for the head. This job runs after the voice
   # synthetic (a deploy-job verdict step cannot judge: its failure would
   # auto-roll back the drill build) and fails the run red with the reason when
-  # the pin differs from the head. An empty pin, or a pin equal to the head,
-  # deploys the head, so the run stays green. The drill still deploys and the
+  # the pin differs from the head. Admission rejects an empty dispatch pin; a
+  # pin equal to the head can stay green. The drill still deploys and the
   # synthetic still runs; only the run verdict is red, exactly like the
   # rollback drill's intentionally-red run.
   pinned-history-guard:
@@ -753,8 +772,8 @@ jobs:
   certify-promotion:
     name: certify immutable staging bytes
     environment: staging
-    needs: [deploy, voice-synthetic, help-embed-synthetic, user-flow-synthetic, pinned-history-guard]
-    if: success() && needs.deploy.outputs.promotion_clean == 'true' && vars.VOICE_SYNTHETIC_REQUIRED != 'false'
+    needs: [soak-hold, deploy, voice-synthetic, help-embed-synthetic, user-flow-synthetic, pinned-history-guard]
+    if: success() && github.run_attempt == 1 && needs.soak-hold.outputs.run_id == github.run_id && needs.soak-hold.outputs.attempt == '1' && needs.soak-hold.outputs.sha == (github.event_name != 'workflow_dispatch' && github.sha || inputs.sha) && needs.deploy.outputs.promotion_clean == 'true' && vars.VOICE_SYNTHETIC_REQUIRED != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -852,3 +871,14 @@ jobs:
           path: ${{ runner.temp }}/staging-use-release.jsonl
           if-no-files-found: error
           retention-days: 14
+
+  rerun-refusal:
+    needs: [soak-hold, schema-gate, roles-gate, deploy, voice-synthetic, help-embed-synthetic, user-flow-synthetic, pinned-history-guard, certify-promotion, staging-use-release]
+    if: always() && github.run_attempt != 1
+    permissions: {}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo '::error::Staging qualification requires a new authorized workflow run, not a rerun.'
+          exit 1

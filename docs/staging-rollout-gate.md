@@ -34,6 +34,13 @@ ordered restore plan for a receipt without any mutation via
 `scripts/worker_container_rollback.py rollback ... --dry-run`, which validates
 the receipt identically to the live path and exits 0.
 
+The deploy workflow first compares its selected full lowercase commit SHA with
+`STAGING_ADMITTED_SHA` before entering either preflight environment. Missing,
+malformed or different values fail the run; an empty dispatch pin is refused.
+This restriction covers deploy-staging only, not migration or other staging
+entrypoints, and does not authorize a dispatch or qualification.
+The owned stop-only release remains available after an acquired window.
+
 ## No-always-on staging rule and activation hold
 
 Idle staging/preview must carry **no recurring always-on runtime cost**. Start

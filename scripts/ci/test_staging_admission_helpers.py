@@ -94,7 +94,9 @@ def admission_step_mutations():
 
 def masked_refusal_mutations():
     """Replace the failing script or mask its job result."""
-    return {"success": lambda w: w["jobs"]["rerun-refusal"]["steps"][0].update(run="exit 0"),
+    return {"duplicate needs": lambda w: w["jobs"]["rerun-refusal"].setdefault("needs", []).append(
+                w["jobs"]["rerun-refusal"].get("needs", ["duplicate"])[0]),
+            "success": lambda w: w["jobs"]["rerun-refusal"]["steps"][0].update(run="exit 0"),
             "echo": lambda w: w["jobs"]["rerun-refusal"]["steps"][0].update(run="echo exit 1"),
             "comment": lambda w: w["jobs"]["rerun-refusal"]["steps"][0].update(run="# exit 1"),
             "continue": lambda w: w["jobs"]["rerun-refusal"].update({"continue-on-error": True})}
@@ -103,7 +105,7 @@ def masked_refusal_mutations():
 class PolicyMutationHelperTests(unittest.TestCase):
     def test_mutations_require_the_expected_diagnostic(self):
         admit = {"id": "admit", "run": "guard", "env": {"SOURCE": "sha"}}
-        refusal = {"steps": [{"run": "exit 1"}]}
+        refusal = {"needs": ["entry"], "steps": [{"run": "exit 1"}]}
         workflow = {"jobs": {"soak-hold": {"steps": [{"run": "setup"}, deepcopy(admit)]},
                              "rerun-refusal": deepcopy(refusal)}}
 
