@@ -37,11 +37,14 @@ only the separately authorized
 |---|---|---|
 | Deploy green | `gh run list --workflow deploy-staging.yml --branch main --commit <pinned> --limit 1 --json headSha,status,conclusion,url` | The latest run completed with `conclusion: success` on the pinned SHA; retain the exact-SHA rollout and qualification evidence. A newer merge or another SHA's run is not a substitute. |
 | Liveness | `curl -s -o /tmp/health.json -w '%{http_code}' "$STAGING_WORKER_URL/health"` | `200`, body `{"status":"ok"}` |
-| Readiness | `curl -s -o /tmp/readyz.json -w '%{http_code}' "$STAGING_WORKER_URL/readyz"` | `200` with `components` `[["process","ready"],["gateway","ready"],["database","ready"]]` (plus informational `jobs`) |
+| Readiness | `curl -s -o /tmp/readyz.json -w '%{http_code}' "$STAGING_WORKER_URL/readyz"` | `200` with `components` `[["process","ready"],["gateway","ready"],["database","ready"]]` (plus informational `jobs`) and `build_revision` exactly equal to the pinned SHA in the same response |
 
+A historical green run for the pin does not prove it is still serving. Use the
+existing reviewed staging readiness read path; a missing or mismatched live
+`build_revision` keeps the gate closed, even when both endpoints return `200`.
 `503` means the gateway is parked or starting — the gate is closed, not broken.
-Any other status (500/1101/…) means the deploy is broken: file a repair card,
-do not start the clock. `/health` 200 alone never passes this gate.
+Any other non-200 status (500/1101/…) means the deploy is broken: file a repair
+card, do not start the clock. `/health` 200 alone never passes this gate.
 
 ## Gate 2 — qualify entry (no passive wait)
 
@@ -77,7 +80,7 @@ checks between the Gate 1 readiness probe and the final pre-`T` probe:
 |---|---|---|
 | No readiness alerts | Worker-log query for `container_unready_alert` between the two probes | `0`; a `container_unready_recovery` without a preceding alert is fine |
 | No deployment | Existing authorized workflow execution-attempt verification for `main` over the recorded probe interval, including reruns and executions spanning either probe | `0` deployment executions; missing or incomplete attempt evidence closes the gate |
-| Final readiness | Same `/readyz` curl as Gate 1, before writing `T` | `200` with all three components `ready` |
+| Final readiness | Same `/readyz` curl as Gate 1, before writing `T` | Meets Gate 1 readiness expectations, including the pinned `build_revision` |
 
 Record the Gate 1 and final readiness probe timestamps as UTC in `GATE1_UTC`
 and `FINAL_UTC`. This paginated, explicitly read-only listing discovers

@@ -2506,9 +2506,11 @@ this client rejects production origins. Never roll back to an unfenced wrapper.
   ref. A merge does not establish a deploy or exact-SHA qualification; keep
   promotion held without qualifying evidence and follow the separately
   authorized [qualification/recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
-  The workflow currently accepts a 503 readiness response as a scaffold-era
-  gate. **Workflow green is not gateway ready**: require your own first
-  `/readyz` 200 observation and feature evidence.
+  Rollout verification requires `/readyz` to return `200` for the exact build.
+  Warming may return `503`, but that response cannot pass verification. A
+  successful rollout verifies readiness at rollout time, not current readiness
+  or feature coverage. Independently verify a current `/readyz` `200` for the
+  intended build and collect feature evidence through the reviewed paths.
 - Gateway startup connects DML-only and does not migrate; lazy jobs also use
   `skip_migrations=true` and install no web-contract DDL. Schema and grants must
   already be provisioned through the reviewed operator path before runtime
