@@ -538,9 +538,13 @@ rollback proofs and an opted-out voice gate never certify. The diagnostic
 `staging-rollout-evidence` upload stays independent and still runs on failure.
 Packaging unsets `WRANGLER_OUTPUT_FILE_PATH`: Wrangler's dry run writes session
 and deploy records too, and must not contaminate the real deploy's single receipt.
-Only **Re-run all jobs** is supported for certification. A partial job rerun can
-reuse an earlier deploy attempt; certification intentionally refuses that old
-build evidence rather than relabeling it as the new current attempt.
+Neither **Re-run all jobs** nor **Re-run failed jobs** can certify: the
+deploy-called voice and help synthetics refuse every rerun, and a partial rerun
+can also reuse earlier deploy evidence. Subject to existing holds and authorization,
+use a fresh `deploy-staging` dispatch from `main` for the exact merged 40-hex SHA,
+then wait for all qualifying jobs and release and retain the fresh receipts. The
+[staging recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics) retains
+the historical-pin limits; an older pin cannot certify a different workflow head.
 
 The certificate contains only a closed version-1 receipt and `modules/`: source
 repository/SHA/run/attempt, original compiled stamps, verified staging Worker and
@@ -606,7 +610,7 @@ verifies the saved module inventory and renders immutable inputs as described
 above. The legacy recovery invocation makes source/build paths absolute and
 sets `image_vars` on the single production container; existing protected tests
 still pin that legacy diff. The lockfile's Wrangler
-(4.156.0) runs the deploy: `wrangler-action` uses the installed version when
+(4.161.0) runs the deploy: `wrangler-action` uses the installed version when
 `wranglerVersion` is omitted, and the job runs `npm ci` first.
 
 The gate polls `/readyz` every 10 seconds for up to 30 attempts. In ordinary

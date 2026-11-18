@@ -23,8 +23,9 @@ export async function runCli(argv, env, deps = {}) {
       if (Date.now() >= Date.parse(metadata.expiresAt)) throw new Error();
       const origin = originOf(options["--metrics-url"]);
       const staging = [env.STAGING_WORKER_URL, env.STAGING_URL].map(originOf).filter(Boolean);
-      const production = [env.PRODUCTION_WORKER_URL, env.PRODUCTION_URL].map(originOf).filter(Boolean);
-      if (!origin || !staging.includes(origin) || production.includes(origin)) throw new Error();
+      const configuredProduction = [env.PRODUCTION_WORKER_URL, env.PRODUCTION_URL].filter(Boolean);
+      const production = configuredProduction.map(originOf);
+      if (!origin || !staging.includes(origin) || !production.length || production.includes(null) || production.includes(origin)) throw new Error();
       const token = env.METRICS_SCRAPE_TOKEN;
       if (typeof token !== "string" || token.length < 32) throw new Error();
       const { samples } = await fetchExposition({

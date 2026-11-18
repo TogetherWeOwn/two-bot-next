@@ -127,7 +127,12 @@ no permanent staging keepalive, host timer or new always-on cost is authorized.
 Each live run retries twice after 60 s; three failures fail it. The longer
 window covers the documented 95-139 s per-deploy gateway drop as well as a
 transient gateway/REST hiccup. Evidence JSON is
-uploaded as the `voice-synthetic-<run id>` artifact for 14 days.
+uploaded as the `voice-synthetic-<run id>` artifact for 14 days. A reusable
+workflow caller can provide the optional `artifact_invocation` label to append
+`-<label>` to that artifact and the `staging-use-voice-start-<run id>-<attempt>`
+receipt. An omitted or empty label preserves the original names. Callers with
+multiple invocations must use distinct fixed labels; the label does not change
+file paths, retries or staging ownership.
 
 ## Identity
 

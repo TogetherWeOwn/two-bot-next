@@ -21,6 +21,7 @@ pub mod automation_quota;
 pub mod automation_transfer;
 pub mod automod;
 pub mod automod_preview;
+pub mod automod_preview_audit;
 pub mod automod_preview_input;
 pub mod automod_preview_limiter;
 pub mod automod_preview_report;

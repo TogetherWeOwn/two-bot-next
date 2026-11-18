@@ -528,7 +528,7 @@ mod tests {
             }
         );
 
-        fn message(id: u64, author: &str, content: &str) -> twilight_model::channel::Message {
+        fn message_create(id: u64, author: &str, content: &str) -> MessageCreate {
             serde_json::from_value(serde_json::json!({
                 "id": id.to_string(), "guild_id": "2222", "channel_id": "4444", "type": 0,
                 "author": {"id": author, "username": "tester", "discriminator": "0000", "avatar": null},
@@ -536,14 +536,7 @@ mod tests {
                 "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
                 "attachments": [], "embeds": [], "pinned": false
             }))
-            .expect("valid Twilight message fixture")
-        }
-
-        fn event(message: twilight_model::channel::Message) -> Event {
-            Event::MessageCreate(Box::new(MessageCreate {
-                message,
-                channel_type: None,
-            }))
+            .expect("fixture MESSAGE_CREATE")
         }
 
         // Automod enabled (not the `TWO_AUTOMOD=0` fast path): bootstrap
@@ -573,8 +566,9 @@ mod tests {
             funnel: FunnelDisposition::CaptureOnly,
             trigger: FunnelDisposition::CaptureOnly,
         });
-        let accept_event = event(message(51, "3333", "!faq please"));
-        let split_event = event(message(52, "3334", "!faq please"));
+        let accept_event =
+            Event::MessageCreate(Box::new(message_create(51, "3333", "!faq please")));
+        let split_event = Event::MessageCreate(Box::new(message_create(52, "3334", "!faq please")));
         assert_eq!(
             worker_prefix_trigger(accept_disposition, &accept_event, true),
             Some(Some(FunnelDisposition::Accept)),
@@ -728,7 +722,7 @@ mod tests {
         );
         let denied_outcome = denied_runtime
             .handle_message(
-                &message(52, "3334", "!faq please"),
+                &message_create(52, "3334", "!faq please"),
                 acceptance_for_verdict(Some(FunnelDisposition::CaptureOnly)),
                 true,
                 Some("Test guild"),
@@ -789,7 +783,7 @@ mod tests {
         );
         let accepted_result = accepted_runtime
             .handle_message(
-                &message(53, "3335", "!faq please"),
+                &message_create(53, "3335", "!faq please"),
                 acceptance_for_verdict(Some(FunnelDisposition::Accept)),
                 true,
                 Some("Test guild"),

@@ -172,6 +172,68 @@ async fn inspect_classifies_reads_and_invalid_pages_at_origin() {
 }
 
 #[tokio::test]
+async fn actor_preserves_privacy_and_inspect_outcome_kinds() {
+    let runtime = live_runtime(owned_worker().await);
+    let (text, kind) = runtime
+        .run_privacy_classified(
+            GUILD,
+            MEMBER,
+            false,
+            "member".to_owned(),
+            PrivacyCommand::Public,
+        )
+        .await
+        .expect("privacy reply");
+    assert_eq!(text, "This room is already public.");
+    assert_eq!(kind, EmbedKind::Ok);
+    let (text, kind) = runtime
+        .run_room_access_classified(GUILD, MEMBER, false, PageArg::Invalid)
+        .await
+        .expect("inspect reply");
+    assert!(text.starts_with("Unknown page."));
+    assert_eq!(kind, EmbedKind::Danger);
+}
+
+#[tokio::test]
+async fn privacy_and_inspect_replies_reach_embed_completion() {
+    let runtime = live_runtime(owned_worker().await);
+    for (name, options, expected, kind) in [
+        (
+            "public",
+            vec![],
+            "This room is already public.",
+            EmbedKind::Ok,
+        ),
+        (
+            "private",
+            vec![],
+            "Making this room private:",
+            EmbedKind::Warn,
+        ),
+        (
+            "room-access-inspect",
+            vec![],
+            "**Room access**",
+            EmbedKind::Ok,
+        ),
+        (
+            "room-access-inspect",
+            vec![page_option(CommandOptionValue::Integer(0))],
+            "Unknown page.",
+            EmbedKind::Danger,
+        ),
+    ] {
+        let interaction = voice_interaction_as(Some(command_data(name, options)), None, MEMBER);
+        let (owned, response) = handle_capture(&runtime, &interaction).await;
+        assert!(owned);
+        let response = response.expect("reply");
+        assert_utility_embed(&response, kind);
+        assert!(response_text(&response).starts_with(expected));
+        assert!(limit_completion_embed(&interaction, &response).is_some());
+    }
+}
+
+#[tokio::test]
 async fn invalid_page_refuses_without_listing() {
     let worker = owned_worker().await;
     assert_eq!(

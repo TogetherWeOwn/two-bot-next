@@ -17,10 +17,7 @@ use std::sync::{
 
 use common::{MockRest, ScriptedResponse};
 use serde_json::json;
-use twilight_model::{
-    channel::Message,
-    gateway::{event::Event, payload::incoming::MessageCreate},
-};
+use twilight_model::gateway::{event::Event, payload::incoming::MessageCreate};
 use two_bot_core::automod_runtime::{
     AutomodClaimLedger, AutomodMatch, AutomodRuntime, AutomodScope, CompletionKind, DeliveryKey,
     FunnelDisposition, LedgerClaim, MessageDelivery, MessageDeliveryKind, MessageSubject,
@@ -401,11 +398,9 @@ fn message_json(id: &str, content: &str) -> serde_json::Value {
 }
 
 fn create_event(id: &str, content: &str) -> Event {
-    let message: Message = serde_json::from_value(message_json(id, content)).unwrap();
-    Event::MessageCreate(Box::new(MessageCreate {
-        message,
-        channel_type: None,
-    }))
+    let create: MessageCreate =
+        serde_json::from_value(message_json(id, content)).expect("fixture MESSAGE_CREATE");
+    Event::MessageCreate(Box::new(create))
 }
 
 fn create(id: &str, content: &str) -> MessageDelivery {

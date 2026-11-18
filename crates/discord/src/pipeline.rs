@@ -2008,7 +2008,9 @@ mod tests {
 
     #[test]
     fn lengths_measured_only_when_content_delivered() {
-        let message: twilight_model::channel::Message = serde_json::from_value(serde_json::json!({
+        use twilight_model::gateway::payload::incoming::MessageCreate;
+
+        let create: MessageCreate = serde_json::from_value(serde_json::json!({
             "id": "10",
             "guild_id": "7",
             "channel_id": "8",
@@ -2020,13 +2022,8 @@ mod tests {
             "tts": false, "mention_everyone": false, "mentions": [], "mention_roles": [],
             "attachments": [], "embeds": [], "pinned": false
         }))
-        .expect("fixture message deserializes");
-        let event = Event::MessageCreate(Box::new(
-            twilight_model::gateway::payload::incoming::MessageCreate {
-                message,
-                channel_type: None,
-            },
-        ));
+        .expect("fixture MESSAGE_CREATE");
+        let event = Event::MessageCreate(Box::new(create));
 
         for (delivered, expected) in [(true, Some(11)), (false, None)] {
             let captured = CapturedLengths::default();
