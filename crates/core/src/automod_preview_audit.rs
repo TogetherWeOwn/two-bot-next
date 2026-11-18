@@ -1,9 +1,11 @@
 //! Fail-closed replay of supported automod preview rows.
 //!
-//! Exempt outcomes are not supported. This helper must not be wired to a handler yet.
+//! This helper is not wired to the preview handler.
 
 use crate::automod::AutomodFilter;
-use crate::automod_preview::{deciding_knobs, PreviewResult, PreviewVerdict};
+use crate::automod_preview::{
+    deciding_knobs, exemption_knobs, PreviewExemption, PreviewResult, PreviewVerdict,
+};
 use crate::automod_preview_report::{render_preview_reply, PREVIEW_RATE_LIMITED_REPLY};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -47,11 +49,8 @@ pub fn replay_preview_reply(
         return None;
     }
     let parsed = parse_preview_reason(reason?)?;
-    if parsed.exemption != "none" {
-        return None;
-    }
-    let verdict = match (outcome, parsed.filter) {
-        ("matched", name) => {
+    let verdict = match (outcome, parsed.filter, parsed.exemption) {
+        ("matched", name, "none") => {
             let filter = AutomodFilter::from_persisted_name(name)?;
             PreviewVerdict {
                 result: PreviewResult::Matched,
@@ -61,15 +60,29 @@ pub fn replay_preview_reply(
                 dry_run: parsed.dry_run,
             }
         }
-        ("rate_limited", "none") => return Some(PREVIEW_RATE_LIMITED_REPLY.to_owned()),
-        ("no_match", "none") => PreviewVerdict {
+        ("rate_limited", "none", "none") => return Some(PREVIEW_RATE_LIMITED_REPLY.to_owned()),
+        ("no_match", "none", "none") => PreviewVerdict {
             result: PreviewResult::NoMatch,
             filter: None,
             knobs: &[],
             exemption: None,
             dry_run: parsed.dry_run,
         },
-        ("partial", "none") => PreviewVerdict::partial(parsed.dry_run),
+        ("partial", "none", "none") => PreviewVerdict::partial(parsed.dry_run),
+        ("exempt", "none", class) => {
+            let exemption = match class {
+                "exempt_channel" => PreviewExemption::ExemptChannel,
+                "bypass_role" => PreviewExemption::BypassRole,
+                _ => return None,
+            };
+            PreviewVerdict {
+                result: PreviewResult::Exempt,
+                filter: None,
+                knobs: exemption_knobs(exemption),
+                exemption: Some(exemption),
+                dry_run: parsed.dry_run,
+            }
+        }
         _ => return None,
     };
     Some(render_preview_reply(&verdict, created_at))
@@ -168,14 +181,14 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_outcomes_fail_closed() {
+    fn unknown_outcomes_and_missing_exemption_fail_closed() {
         let reason = Some("filter=none;exemption=none;mode=dry_run;len=0_50");
         for outcome in ["exempt", "bogus", ""] {
             assert_eq!(replay_preview_reply(outcome, reason, "t"), None);
         }
         assert_eq!(
             replay_preview_reply(
-                "exempt",
+                "bogus",
                 Some("filter=none;exemption=bypass_role;mode=dry_run;len=0_50"),
                 "t",
             ),
@@ -236,5 +249,54 @@ mod tests {
             );
         }
         assert_eq!(replay_preview_reply("matched", valid, ""), None);
+    }
+
+    #[test]
+    fn exempt_replays_the_original_reply_for_each_class_and_mode() {
+        let created_at = "2026-11-02T08:00:00.123Z";
+        for exemption in [
+            PreviewExemption::ExemptChannel,
+            PreviewExemption::BypassRole,
+        ] {
+            for dry_run in [true, false] {
+                let verdict = PreviewVerdict {
+                    result: PreviewResult::Exempt,
+                    filter: None,
+                    knobs: exemption_knobs(exemption),
+                    exemption: Some(exemption),
+                    dry_run,
+                };
+                let outcome = preview_audit_outcome(&verdict);
+                for len in [50, 51, 501] {
+                    let reason = audit_reason_for_verdict(&verdict, len);
+                    assert_eq!(
+                        replay_preview_reply(outcome, Some(&reason), created_at),
+                        Some(render_preview_reply(&verdict, created_at)),
+                        "{outcome}: {reason}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_contradictory_exempt_rows_fail_closed() {
+        let valid = Some("filter=none;exemption=bypass_role;mode=dry_run;len=0_50");
+        for reason in [
+            None,
+            Some("filter=none;exemption=none;mode=dry_run;len=0_50"),
+            Some("filter=none;exemption=admin;mode=dry_run;len=0_50"),
+            Some("filter=bad_words;exemption=bypass_role;mode=dry_run;len=0_50"),
+            Some("filter=none;exemption=exempt_channel;mode=live;len=0_50"),
+            Some("filter=none;exemption=bypass_role;mode=dry_run;len=unexpected"),
+            Some("filter=none;exemption=exempt_channel;mode=enforce"),
+        ] {
+            assert_eq!(
+                replay_preview_reply("exempt", reason, "t"),
+                None,
+                "{reason:?}"
+            );
+        }
+        assert_eq!(replay_preview_reply("exempt", valid, ""), None);
     }
 }
