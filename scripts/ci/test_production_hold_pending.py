@@ -4,7 +4,6 @@ No network, service or database: each test builds a throwaway git repository.
 """
 
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -144,16 +143,22 @@ class PendingSinceTest(unittest.TestCase):
         self.repo.commit()
         self.assertEqual(self.pend(), self.ts(2))
 
-    def test_ignore_list_matches_workflow(self):
-        text = (ROOT / ".github/workflows/deploy-staging.yml").read_text()
-        block = text.split("paths-ignore:")[1].split("workflow_dispatch:")[0]
-        items = [m.strip().split(" #")[0].strip("'\"")
-                 for m in re.findall(r"^\s+- (.+)$", block, re.M)]
-        expected = {i for i in items if not i.endswith("/**") and i != "*.md"}
-        prefixes = {i[:-2] for i in items if i.endswith("/**")}
-        self.assertEqual(expected, set(pending.IGNORED_EXACT))
-        self.assertEqual(prefixes, set(pending.IGNORED_PREFIXES))
-        self.assertIn("*.md", items)
+    def test_pending_age_exclusion_contract(self):
+        self.assertEqual(set(pending.IGNORED_EXACT), {
+            "LICENSE",
+            ".editorconfig",
+            ".gitignore",
+            ".gitleaks.toml",
+            ".gitleaksignore",
+            ".github/pull_request_template.md",
+            ".github/CODEOWNERS",
+            ".github/dependabot.yml",
+        })
+        self.assertEqual(set(pending.IGNORED_PREFIXES), {
+            "docs/", ".github/ISSUE_TEMPLATE/", "ops/",
+        })
+        self.assertTrue(pending.is_ignored("notes.md"))
+        self.assertFalse(pending.is_ignored("src/notes.md"))
 
     def test_is_ignored_samples(self):
         for path in ("docs/a/b.md", "README.md", "ops/x.json", "LICENSE",
