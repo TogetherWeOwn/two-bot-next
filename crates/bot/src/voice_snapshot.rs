@@ -236,6 +236,14 @@ fn total_in_voice(rooms: &[RoomDraft]) -> usize {
         .sum()
 }
 
+#[cfg(test)]
+pub(crate) fn read_voice_total(
+    cache: &two_bot_discord::SharedCache,
+    guild_id: Snowflake,
+) -> Result<usize, SnapshotRefusal> {
+    observe_rooms(cache, guild_id).map(|rooms| total_in_voice(&rooms))
+}
+
 /// Whole-second Zulu timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for `observed_at`.
 fn observed_at_now() -> String {
     let now = time::OffsetDateTime::now_utc();
@@ -419,12 +427,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unavailable_and_ready_pending_guilds_refuse_until_full_snapshot() {
+    fn guild_snapshot_eligibility_tracks_gateway_lifecycle() {
         use twilight_model::gateway::{event::Event, payload::incoming::GuildCreate};
         let cache = new_shared_cache();
         let clock = VoiceOccupancyClock::default();
         let listing = || read_voice_snapshot(&cache, &clock, 100, &HashMap::new());
-        let scalar = || observe_rooms(&cache, 100).map(|rooms| total_in_voice(&rooms));
+        let scalar = || read_voice_total(&cache, 100);
         // Ignore Twilight's contents so these assertions isolate admission.
         let admitted = || cache.with_guild_snapshot(100, |_| ());
         let assert_incomplete = || {
@@ -432,8 +440,15 @@ mod tests {
             assert_eq!(scalar(), Err(SnapshotRefusal::CacheIncomplete));
         };
         assert_incomplete();
+        cache.update(&Event::Resumed);
+        assert_eq!(admitted(), None);
+        assert_incomplete();
         cache.update(&pipeline_guild(&[42]));
         assert_eq!(admitted(), Some(()));
+        assert_eq!(scalar(), Ok(1));
+        cache.update(&Event::Resumed);
+        assert_eq!(admitted(), Some(()));
+        assert_eq!(listing().expect("warm snapshot")["total_in_voice"], 1);
         assert_eq!(scalar(), Ok(1));
         cache.update(&Event::Ready(
             serde_json::from_value(json!({
@@ -460,6 +475,17 @@ mod tests {
         assert_eq!(admitted(), Some(()));
         assert_eq!(listing().expect("empty snapshot")["total_in_voice"], 0);
         assert_eq!(scalar(), Ok(0));
+        for unavailable in [true, false] {
+            cache.update(&Event::GuildDelete(
+                serde_json::from_value(json!({"id": "100", "unavailable": unavailable}))
+                    .expect("deleted guild fixture"),
+            ));
+            cache.update(&Event::Resumed);
+            assert_eq!(admitted(), None);
+            assert_incomplete();
+            cache.update(&pipeline_guild(&[]));
+            assert_eq!(admitted(), Some(()));
+        }
     }
 
     #[test]
