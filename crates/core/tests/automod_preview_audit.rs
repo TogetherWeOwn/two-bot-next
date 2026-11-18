@@ -1,9 +1,8 @@
 #![cfg(feature = "db")]
 
 //! Database proofs for the preview audit transaction (spec §6, T17 core half).
-//! Both tests use the shared disposable database fixture. With a guarded
-//! `TWO_TEST_DATABASE_URL`, Actions runs the ignored row test with
-//! `cargo test -p two-bot-core --features db --test automod_preview_audit -- --ignored`.
+//! Both tests use the shared disposable database fixture and run in the
+//! standard CI integration sweep with its guarded `TWO_TEST_DATABASE_URL`.
 //! Neither test consults DATABASE_URL or inherited application credentials.
 //!
 //! The lock test checks exclusion and rollback using two transactions. The row
@@ -70,7 +69,6 @@ async fn preview_claim_excludes_contender_and_rollback_releases_it(
 }
 
 #[tokio::test]
-#[ignore = "requires agent-testdb or the credential-free CI Postgres service"]
 async fn preview_claim_insert_replay_and_rollback() -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap required");
     let db = TestDatabase::create(&url, &Migrator::DEFAULT).await?;
