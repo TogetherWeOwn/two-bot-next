@@ -189,13 +189,15 @@ and historical records remain intact.
   it does not prove a deployed build, live event coverage or staging
   acceptance, so the Gate 5 recovery measurement stays NOT VERIFIED until a
   reviewed log source exists.
-- The staging deploy workflow documents a **95–139-second gateway drop per
-  deploy**, and a separate historical staging note records a **92–139-second
-  redeploy**. These are documented historical interruption ranges, not a
-  verified outage-start-to-recovery measurement. Interrupting planned redeploys
-  count as actual outages by default; historical warnings are not waivers.
-  These exercises cannot establish PASS without independently measured
-  under-60-second recovery and separately authorized stop/restore and budgets.
+- A [historical staging workflow comment](https://github.com/TogetherWeOwn/two-bot-next/blob/057a4b2cc0d67439c92eded1d25421852d32840f/.github/workflows/deploy-staging.yml#L10-L12)
+  warns of a **95–139-second gateway drop per deploy**. A separate historical
+  staging note records a **92–139-second redeploy**
+  ([boot-window record](discord-send-admission.md#cancellation-crash-unavailable-storage-and-recovery)).
+  These ranges are not verified outage-start-to-recovery measurements.
+  Interrupting planned redeploys count as actual outages by default;
+  historical warnings are not waivers. These exercises cannot establish PASS
+  without independently measured under-60-second recovery and separately
+  authorized stop/restore and budgets.
 - Flat memory and no error spikes remain requirements. Numeric RSS/error
   definitions are unaccepted; the historical B1 RSS receipt is not a new B2
   numeric criterion.

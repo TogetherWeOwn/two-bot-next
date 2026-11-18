@@ -474,9 +474,9 @@ pub struct MessageEligibility {
 /// mistake that intermediate state for a complete empty guild.
 pub struct SharedCache {
     inner: InMemoryCache,
-    /// READY can retain an old guild entry while its new snapshot is pending.
-    /// Keep those guilds ineligible until an available GuildCreate completes.
-    pending_guilds: RwLock<HashSet<Snowflake>>,
+    /// Twilight can retain guild data across READY. Only a full GuildCreate
+    /// makes that guild eligible for a projection in the new session.
+    complete_guilds: RwLock<HashSet<Snowflake>>,
     #[cfg(test)]
     before_twilight_update: Option<tests::CacheWriteProbe>,
 }
@@ -485,7 +485,7 @@ impl Default for SharedCache {
     fn default() -> Self {
         Self {
             inner: build_cache(),
-            pending_guilds: RwLock::new(HashSet::new()),
+            complete_guilds: RwLock::new(HashSet::new()),
             #[cfg(test)]
             before_twilight_update: None,
         }
@@ -495,29 +495,23 @@ impl Default for SharedCache {
 impl SharedCache {
     /// Apply one gateway event atomically with respect to guild projections.
     pub fn update(&self, event: &Event) {
-        let mut pending = self.pending_guilds.write().expect("cache snapshot fence");
+        let mut complete = self.complete_guilds.write().expect("cache snapshot fence");
+        self.apply_twilight_event(event);
         match event {
-            Event::Ready(ready) => {
-                pending.extend(ready.guilds.iter().map(|guild| guild.id.get()));
-            }
+            Event::Ready(_) => complete.clear(),
             Event::GuildCreate(create) => match create.as_ref() {
                 twilight_model::gateway::payload::incoming::GuildCreate::Available(guild) => {
-                    pending.remove(&guild.id.get());
+                    complete.insert(guild.id.get());
                 }
                 twilight_model::gateway::payload::incoming::GuildCreate::Unavailable(guild) => {
-                    pending.insert(guild.id.get());
+                    complete.remove(&guild.id.get());
                 }
             },
             Event::GuildDelete(guild) => {
-                if guild.unavailable == Some(true) {
-                    pending.insert(guild.id.get());
-                } else {
-                    pending.remove(&guild.id.get());
-                }
+                complete.remove(&guild.id.get());
             }
             _ => {}
         }
-        self.apply_twilight_event(event);
     }
 
     fn apply_twilight_event(&self, event: &Event) {
@@ -528,15 +522,15 @@ impl SharedCache {
         self.inner.update(event);
     }
 
-    /// Fence every lookup in a guild projection. A rebuild, pending guild or
+    /// Fence every lookup in a guild projection. A rebuild, ineligible guild or
     /// poisoned cache refuses immediately; the reader checks for missing data.
     pub fn with_guild_snapshot<T>(
         &self,
         guild_id: Snowflake,
         read: impl FnOnce(&InMemoryCache) -> T,
     ) -> Option<T> {
-        let pending = self.pending_guilds.try_read().ok()?;
-        if pending.contains(&guild_id) {
+        let complete = self.complete_guilds.try_read().ok()?;
+        if !complete.contains(&guild_id) {
             return None;
         }
         Some(read(&self.inner))
@@ -1314,34 +1308,27 @@ mod tests {
 
     #[test]
     fn guild_snapshot_refuses_during_cache_rebuild_and_fences_the_whole_read() {
-        const OTHER_GUILD: Snowflake = GUILD + 1;
         let (observed, probe) = std::sync::mpsc::channel();
-        let cache = SharedCache {
-            before_twilight_update: Some(Box::new(move |cache| {
-                // READY only marks GUILD pending. Refusing OTHER_GUILD here
-                // must come from the actual writer holding the fence.
-                assert_eq!(cache.with_guild_snapshot(OTHER_GUILD, |_| 42), None);
-                assert!(cache.inner.current_user().is_none());
-                observed.send(()).expect("record writer probe");
-            })),
-            ..SharedCache::default()
-        };
-        cache.update(&lifecycle_ready());
+        let mut cache = SharedCache::default();
+        cache.update(&lifecycle_available_guild());
+        cache.before_twilight_update = Some(Box::new(move |cache| {
+            // A replacement for an already eligible guild must still refuse
+            // while the actual writer holds the fence.
+            assert_eq!(cache.with_guild_snapshot(GUILD, |_| 42), None);
+            observed.send(()).expect("record writer probe");
+        }));
+        cache.update(&lifecycle_available_guild());
         probe
             .try_recv()
             .expect("writer reached the Twilight update");
         assert_eq!(
-            cache.inner.current_user().expect("READY user").id.get(),
-            999
-        );
-        assert_eq!(
-            cache.with_guild_snapshot(OTHER_GUILD, |_| {
-                assert!(cache.pending_guilds.try_write().is_err());
+            cache.with_guild_snapshot(GUILD, |_| {
+                assert!(cache.complete_guilds.try_write().is_err());
                 42
             }),
             Some(42)
         );
-        assert!(cache.pending_guilds.try_write().is_ok());
+        assert!(cache.complete_guilds.try_write().is_ok());
     }
 
     #[test]
