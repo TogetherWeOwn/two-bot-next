@@ -60,7 +60,7 @@ fn router() -> InteractionRouter {
 
 fn attendance(id: u64, permissions: u64, member: &str, occurrence: &str) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
+        "application_id": "1111", "attachment_size_limit": 10485760, "authorizing_integration_owners": {"0": GUILD},
         "id": id.to_string(), "token": "mock-checkin-token", "type": 2,
         "version": 1, "guild_id": GUILD,
         "member": {"permissions": permissions.to_string(), "roles": [],

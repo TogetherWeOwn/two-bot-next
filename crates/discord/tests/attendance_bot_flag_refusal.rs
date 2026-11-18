@@ -38,7 +38,7 @@ fn invalid_flags() -> Vec<(&'static str, Value)> {
 fn interaction(on_behalf: bool, occurrence: &str) -> Interaction {
     let target = if on_behalf { TARGET } else { HOST };
     serde_json::from_value(json!({
-        "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
+        "application_id": "1111", "attachment_size_limit": 10485760, "authorizing_integration_owners": {"0": GUILD},
         "id": "3333", "token": "attendance-fixture", "type": 2, "version": 1,
         "guild_id": GUILD,
         "member": {"permissions": (1_u64 << 33).to_string(), "roles": [],
