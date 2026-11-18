@@ -1766,7 +1766,8 @@ class ExistingSafetyControls(unittest.TestCase):
         deploy, voice = wfs[DEPLOY], wfs[VOICE]
         self.assertEqual(set(voice["on"]), set(INVOCATIONS))
         self.assertEqual(voice["on"]["schedule"], [{"cron": "41 */6 * * *"}])
-        self.assertEqual(deploy["on"]["push"]["branches"], ["main"])
+        # The staging trigger policy lives in test_workflows.py.
+        self.assertIn("workflow_dispatch", events(deploy))
         job = voice["jobs"]["synthetic"]
         self.assertEqual(job["if"], "github.ref == 'refs/heads/main' && "
                          "(!inputs.deploy_staging_call || github.run_attempt == 1)")

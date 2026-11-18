@@ -1,18 +1,20 @@
 #![cfg(feature = "db")]
 
-//! Opt-in database proof for the preview audit transaction (spec §6, T17
-//! core half). Restricted to agent-testdb or the CI service container.
-//! Run: cargo test -p two-bot-core --features db --test automod_preview_audit -- --ignored
-//! No DATABASE_URL or inherited application credentials are consulted.
+//! Database proofs for the preview audit transaction (spec §6, T17 core half).
+//! The lock test uses the shared disposable database fixture. The ignored row
+//! test is restricted to agent-testdb or the CI service container; run it with
+//! `cargo test -p two-bot-core --features db --test automod_preview_audit -- --ignored`.
+//! Neither test consults DATABASE_URL or inherited application credentials.
 //!
-//! Proves, inside one rolled-back transaction over `pg_temp`: the advisory
-//! lock excludes a second transaction for the same interaction id, insert and
-//! same-transaction reload return the same UTC timestamp, and rollback releases
-//! the claim. This does not prove that another connection can read a committed
-//! row or that a real handler commits before replying.
+//! The lock test checks exclusion and rollback using two transactions. The row
+//! test uses a rolled-back transaction over `pg_temp` to check insertion and
+//! same-transaction reload. Neither proves cross-connection committed replay or
+//! that a real handler commits before replying.
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{migrate::Migrator, PgPool, Postgres, Transaction};
 use two_bot_core::automod_preview_audit as preview_audit;
+use two_bot_testsupport::TestDatabase;
 
 const MIGRATION: &str = include_str!("../../cutover/migrations/0130_custom_commands.sql");
 const AT: &str = "2026-11-02T08:00:00.123456Z";
@@ -46,6 +48,47 @@ fn matched_record() -> two_bot_core::custom_commands::AuditRecord {
         "matched",
         "filter=bad_words;exemption=none;mode=dry_run;len=0_50".to_owned(),
     )
+}
+
+const INTERACTION_ID: &str = "lock-test-999";
+const OTHER_INTERACTION_ID: &str = "1000";
+
+async fn try_claim(tx: &mut Transaction<'_, Postgres>, id: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(preview_audit::preview_audit_id(id))
+        .fetch_one(&mut **tx)
+        .await
+}
+
+async fn observe_claims(pool: &PgPool) -> Result<(bool, bool, bool), sqlx::Error> {
+    let mut holder = pool.begin().await?;
+    preview_audit::lock_preview_attempt(&mut holder, INTERACTION_ID).await?;
+
+    // Both transactions stay open, so the contender uses a separate connection.
+    let mut contender = pool.begin().await?;
+    let same = try_claim(&mut contender, INTERACTION_ID).await?;
+    let other = try_claim(&mut contender, OTHER_INTERACTION_ID).await?;
+
+    holder.rollback().await?;
+    let released = try_claim(&mut contender, INTERACTION_ID).await?;
+    contender.rollback().await?;
+    Ok((same, other, released))
+}
+
+#[tokio::test]
+async fn preview_claim_excludes_contender_and_rollback_releases_it(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap required");
+    let db = TestDatabase::create(&url, &Migrator::DEFAULT).await?;
+    let observations = observe_claims(db.pool()).await;
+    db.close().await?;
+
+    // Assert after teardown so a broken lock cannot strand the fixture.
+    let (same, other, released) = observations?;
+    assert!(!same, "claim lock excludes the same interaction");
+    assert!(other, "unrelated interaction remains independent");
+    assert!(released, "rollback releases the claim");
+    Ok(())
 }
 
 #[tokio::test]
@@ -160,26 +203,8 @@ async fn preview_claim_insert_replay_and_rollback() -> Result<(), sqlx::Error> {
         "rolling back the insert removes the row from the same schema"
     );
 
-    // The same lock key excludes a contender while held; an unrelated
-    // interaction id remains independent.
-    let mut contender = pool.begin().await?;
-    let same: bool =
-        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(preview_audit::preview_audit_id("999"))
-            .fetch_one(&mut *contender)
-            .await?;
-    assert!(!same, "claim lock excludes the same interaction");
-    let other: bool =
-        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(preview_audit::preview_audit_id("1000"))
-            .fetch_one(&mut *contender)
-            .await?;
-    assert!(other, "unrelated interaction remains independent");
-    contender.rollback().await?;
-
-    // Rollback releases the claim. The retry uses a newly created temporary
-    // schema, so its empty read is not proof of persistent-row rollback.
-    // It works whichever pooled session the retry acquires.
+    // The retry uses a newly created temporary schema, so its empty read is
+    // not proof of persistent-row rollback.
     tx.rollback().await?;
     let mut retry = pool.begin().await?;
     sqlx::query("CREATE TEMP TABLE preview_audit_retry_scope (id INTEGER)")

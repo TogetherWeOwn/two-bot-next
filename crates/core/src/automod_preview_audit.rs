@@ -145,8 +145,8 @@ pub fn preview_audit_record(
 }
 
 /// Serialize one attempt by interaction id inside the caller's transaction
-/// (spec §6). Transaction-scoped: commit or rollback releases the claim, so
-/// no permanent claimed-without-result state is possible.
+/// (spec §6). Commit or rollback releases the claim. Acquisition waits for a
+/// competing transaction: the caller must set a database timeout before calling.
 #[cfg(feature = "db")]
 pub async fn lock_preview_attempt(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
