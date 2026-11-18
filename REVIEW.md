@@ -18,20 +18,20 @@ not a cosmetic one.
 Apply [the contribution policy](CONTRIBUTING.md#production-merge-evidence) when
 reviewing production merge readiness; this advisory guide grants no merge or
 deploy permission. For two-web-next and two-bot-next, staging qualification is the
-automatic **post-merge, pre-production exact-main staging/e2e/soak gate** (owner
+**post-merge, pre-production exact-main staging/e2e/soak gate** (owner
 decision 2026-11-06), enforced by the promotion guard. Staging accepts only
 main-ancestor SHAs. Unmerged-head staging and artifact-equality proofs are not
 substitute merge prerequisites; the earlier artifact-identical exception is
 superseded. Neither CI nor artifact equality replaces post-merge qualification
 or the pipeline's exact-SHA artifact and promotion evidence.
 
-Automatic qualification starts on runtime-input pushes to `main`;
-`deploy-staging.yml` ignores docs-only merges. Before promoting an otherwise
-unqualified exact main SHA (including a docs-only squash SHA), an authorized
-staging dispatch must qualify it through the same gate. Use the existing
-[dispatch/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
-and retain its exact-SHA receipts; this is not pre-merge staging or permission
-to dispatch through a hold.
+A merge is not evidence of staging qualification. Consult `deploy-staging.yml`
+at the relevant ref for its triggers and verify completed qualifying evidence
+for the intended exact `main` SHA. If evidence is absent, keep promotion held
+and follow the separately authorized
+[qualification/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
+Retain exact-SHA receipts; this is not pre-merge staging or permission to act
+through a hold.
 
 Before merge, verify required GitHub Actions checks and Devin Review on the
 exact PR head, all applicable specialist and native review, and finding
