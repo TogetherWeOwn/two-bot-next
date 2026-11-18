@@ -278,13 +278,23 @@ chain (`crates/store/migrations`) is text-scanned for `CREATE TABLE`, so a
 new store table without a dump/exclude decision is refused rather than
 silently omitted from the backup.
 
+For an installed `web_v1.contract_meta` view (or its schema-qualified
+counterpart), restore keeps the destination's recorded `contract_version`,
+even if the archive contains an older version or no metadata row. Restore
+still validates and replays the archive's `guild_id`; it never keeps the old
+destination guild ID. A migrated target without the view uses the archived
+metadata. Replay and version preservation commit together, so invalid metadata
+rolls back the restore.
+
 v3 must contain its original 22 table entries. It can lack later tables, but
 restore clears their old target rows and emits a warning in both dry-run and
-real-restore CLI output. One explicit infrastructure exception is the required
-`guild_settings_revision` singleton: an old archive that lacks it initializes
-`(TRUE, 0)` so subsequent settings writes work. `RestoreReport.initialized_tables`
-and CLI warnings identify that baseline as synthesized, **not archived data**.
-No settings values, rank ladder or other application history are synthesized.
+real-restore CLI output. If the archive lacks `guild_settings_revision`,
+restore initializes `(TRUE, 0)` so subsequent settings writes work. If the
+archive has no contract metadata row but the target has a version to preserve,
+restore initializes a singleton with that version and no stored guild ID.
+`RestoreReport.initialized_tables` and the CLI identify these baselines as
+**not archived data**. No settings values, rank ladder or other application
+history are synthesized.
 
 Restore ignores manifest ordering and inserts parents before children using the
 inventory. It acquires explicit `ACCESS EXCLUSIVE` table locks and truncates the
