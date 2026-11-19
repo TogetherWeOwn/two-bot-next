@@ -31,6 +31,7 @@ pub struct AttemptContext<'a> {
     pub actor_id: &'a str,
     pub channel_id: &'a str,
     pub receipt_iso: &'a str,
+    /// Mode for rate refusals; evaluated attempts use the verdict's mode.
     pub dry_run: bool,
 }
 
@@ -82,7 +83,7 @@ pub async fn finish_fresh_attempt(
         .insert_and_commit(commit.record, audit_id, receipt_iso)
         .await
     else {
-        return unavailable(dry_run);
+        return unavailable(verdict.as_ref().map_or(dry_run, |verdict| verdict.dry_run));
     };
     AttemptResult {
         reply: verdict.map_or_else(
@@ -161,9 +162,14 @@ mod tests {
                 assert_eq!(record, expected.record);
                 async { rx.await.map_err(|_| ()) }
             };
+            // An evaluated attempt uses its verdict mode even when the context differs.
+            let context = AttemptContext {
+                dry_run: !evaluated,
+                ..CONTEXT
+            };
             let mut attempt = std::pin::pin!(finish_fresh_attempt(
                 plan,
-                CONTEXT,
+                context,
                 "claim",
                 5,
                 Store { commit },
