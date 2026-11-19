@@ -3,10 +3,9 @@
 
 Decides whether a change can alter the runtime image built from
 ``Dockerfile`` so PRs that touch only docs, worker UI or unrelated CI
-tooling skip the ~15-minute amd64 release build. Fail-closed: any
-undecidable diff, any unrecognized path, and every non-PR event selects a
-full build, so the staging-deploy guardrail (deploy-staging.yml runs on
-push to main) always sees a validated image.
+tooling skip the ~15-minute amd64 release build. CI selects the full build
+for an undecidable diff, an unrecognized path, or a non-PR event. Selection
+neither deploys staging nor proves that an image is eligible for deployment.
 
 The dependency-layer file list is not duplicated here: every Dockerfile
 COPY source parsed by ``dockerfile_dependency_sources`` must satisfy

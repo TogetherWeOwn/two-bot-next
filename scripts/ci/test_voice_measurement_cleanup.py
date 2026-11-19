@@ -15,18 +15,34 @@ class VoiceMeasurementCleanupTests(unittest.TestCase):
         use = dict(correlation, expiresAt=123456, acquiredAt=120000, phase="released", sha="a" * 40,
                    deploymentId="deploy", epoch=1)
         records = [
-            dict(correlation, schema="two-bot-staging-pipeline.v1", action="attempt", operation="finish"),
-            dict(environment="staging", schema="two-bot-staging-use.v1", action="status",
-                 sha="a" * 40, deploymentId="deploy", epoch=1, running=True,
-                 use=dict(use, phase="active")),
-            dict(environment="staging", schema="two-bot-staging-use.v1", action="release", running=False,
-                 sha="a" * 40, deploymentId="deploy", epoch=1, use=use),
+            dict(correlation, schema="two-bot-staging-pipeline.v1", action="attempt", operation="finish",
+                 observedAt="1970-01-01T00:02:01.000Z"),
+            dict(correlation, schema="two-bot-staging-use.v1", action="status",
+                 observedAt="1970-01-01T00:02:02.000Z", sha="a" * 40, deploymentId="deploy",
+                 epoch=1, running=True, use=dict(use, phase="active")),
+            dict(correlation, schema="two-bot-staging-use.v1", action="release",
+                 observedAt="1970-01-01T00:02:03.000Z", sha="a" * 40, deploymentId="deploy",
+                 epoch=1, running=False, use=use),
         ]
         args = ("123", 1, 123456, "a" * 40, "deploy")
-        self.assertTrue(cleanup_verified(records, *args))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.jsonl"
+            path.write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
+            self.assertTrue(cleanup_verified(read_cleanup_receipt(path), *args))
+        for index, record in enumerate(records):
+            for key, mismatches in (("runId", ("124", 123)), ("runAttempt", (2, True, 1.0, "1"))):
+                with self.subTest(row=record["action"], field=key, missing=True):
+                    changed = deepcopy(records)
+                    del changed[index][key]
+                    self.assertFalse(cleanup_verified(changed, *args))
+                for value in mismatches:
+                    with self.subTest(row=record["action"], field=key, value=value):
+                        changed = deepcopy(records)
+                        changed[index][key] = value
+                        self.assertFalse(cleanup_verified(changed, *args))
         for index, key, value in (
             (0, "operation", "begin"), (1, "action", "failed"), (2, "action", "not-owned"),
-            (2, "running", True), (0, "runId", "124"), (0, "runAttempt", True),
+            (2, "running", True),
             (2, "sha", "b" * 40), (2, "deploymentId", "other"),
         ):
             with self.subTest(key=key, value=value):
@@ -47,6 +63,10 @@ class VoiceMeasurementCleanupTests(unittest.TestCase):
             changed = deepcopy(records)
             changed[index]["use"]["acquiredAt"] = -1
             self.assertFalse(cleanup_verified(changed, *args))
+        # Recovery can stop the container without proving continuity of the grant epoch.
+        recovered = deepcopy(records)
+        recovered[1]["epoch"] = recovered[2]["epoch"] = 2
+        self.assertFalse(cleanup_verified(recovered, *args))
         self.assertFalse(cleanup_verified(records[:-1], *args))
         self.assertFalse(cleanup_verified(records + [records[-1]], *args))
         self.assertFalse(cleanup_verified(None, *args))

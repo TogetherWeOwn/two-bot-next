@@ -49,9 +49,9 @@ def cleanup_verified(records, run_id, attempt, expires_at, sha, deployment_id):
             or status.get("schema") != "two-bot-staging-use.v1" or status.get("action") != "status"
             or release.get("schema") != "two-bot-staging-use.v1" or release.get("action") != "release"):
         return False
-    if (any(record.get("environment") != "staging" for record in records)
-            or start.get("runId") != run_id or type(start.get("runAttempt")) is not int
-            or start["runAttempt"] != attempt):
+    if any(record.get("environment") != "staging" or record.get("runId") != run_id
+           or type(record.get("runAttempt")) is not int or record["runAttempt"] != attempt
+           for record in records):
         return False
     use = release.get("use")
     prior = status.get("use")

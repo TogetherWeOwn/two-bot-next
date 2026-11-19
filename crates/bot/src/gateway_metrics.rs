@@ -41,7 +41,7 @@ impl Observer {
                 11 => {
                     metrics.gateway_event("HEARTBEAT_ACK");
                     // Most recent completed heartbeat, not an average or elapsed uptime.
-                    // https://docs.rs/twilight-gateway/0.17.1/twilight_gateway/struct.Latency.html#method.recent
+                    // https://docs.rs/twilight-gateway/0.18.0/twilight_gateway/struct.Latency.html#method.recent
                     if let Some(latency) = latency {
                         metrics.gateway_latency(latency);
                     }
