@@ -106,7 +106,7 @@ console.log(JSON.stringify({ expires, metadata, before, middle, after,
                 if second == "false":
                     env.update(RESULT_VOICE_SECOND="skipped", RESULT_MEASUREMENT_FINAL="skipped")
                 with patch("sys.argv", ["terminal", str(output)]), patch.dict("os.environ", env, clear=True):
-                    for offset, verdict in ((0, "accepted"), (2000, "refused")):
+                    for offset, verdict in ((0, "accepted"), (500, "refused")):
                         with self.subTest(second=second, acquisition_offset=offset):
                             for record in records[1:]:
                                 record["use"]["acquiredAt"] = use_start + offset
