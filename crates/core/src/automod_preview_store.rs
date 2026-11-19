@@ -1,5 +1,7 @@
 //! PostgreSQL adapter for one preview attempt, with no Discord I/O.
 
+use std::time::Duration;
+
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::time::{timeout_at, Instant};
 
@@ -10,7 +12,9 @@ use crate::automod_preview_audit::{
 };
 use crate::custom_commands::AuditRecord;
 
-/// Holds the transaction only on a locked miss, until commit or drop.
+const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Holds the transaction only on a locked miss, bounded by the caller deadline.
 pub struct SqlPreviewStore<'a> {
     pool: &'a PgPool,
     deadline: Instant,
@@ -32,6 +36,22 @@ impl<'a> SqlPreviewStore<'a> {
 
 fn deadline_error() -> sqlx::Error {
     std::io::Error::from(std::io::ErrorKind::TimedOut).into()
+}
+
+async fn set_idle_timeout(
+    tx: &mut Transaction<'_, Postgres>,
+    timeout: Duration,
+) -> Result<(), sqlx::Error> {
+    let millis = timeout.as_millis();
+    // PostgreSQL interprets zero as disabled, not expired.
+    if millis == 0 {
+        return Err(deadline_error());
+    }
+    sqlx::query("SELECT set_config('idle_in_transaction_session_timeout', $1, true)")
+        .bind(format!("{millis}ms"))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 impl PreviewAttemptStore for SqlPreviewStore<'_> {
@@ -57,15 +77,20 @@ impl PreviewAttemptStore for SqlPreviewStore<'_> {
             sqlx::query("SET LOCAL statement_timeout = '1s'")
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("SET LOCAL idle_in_transaction_session_timeout = '2s'")
-                .execute(&mut *tx)
-                .await?;
+            set_idle_timeout(&mut tx, MAX_IDLE_TIMEOUT).await?;
             sqlx::query("SET LOCAL lock_timeout = '750ms'")
                 .execute(&mut *tx)
                 .await?;
             lock_preview_attempt(&mut tx, interaction_id).await?;
             // A separate statement gets a fresh snapshot after any lock wait.
             let row = load_preview_audit(&mut *tx, audit_id).await?;
+            if row.is_none() {
+                let remaining = self.deadline.saturating_duration_since(Instant::now());
+                if remaining < MAX_IDLE_TIMEOUT {
+                    // Expire an idle claim even if the caller never polls insert or drops the store.
+                    set_idle_timeout(&mut tx, remaining).await?;
+                }
+            }
             if Instant::now() >= self.deadline {
                 return Err(deadline_error());
             }

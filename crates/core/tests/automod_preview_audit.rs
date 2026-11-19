@@ -106,6 +106,43 @@ async fn sql_preview_store_times_out_and_replays_after_a_dropped_claim(
     Ok(())
 }
 
+#[tokio::test]
+async fn sql_preview_store_releases_a_live_claim_at_its_deadline(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap required");
+    let db = TestDatabase::create(&url, &Migrator::DEFAULT).await?;
+    let proof = tokio::spawn(verify_live_claim_expiry(db.pool().clone())).await;
+    db.close().await?;
+    proof??;
+    Ok(())
+}
+
+async fn verify_live_claim_expiry(pool: PgPool) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(MIGRATION).execute(&pool).await?;
+    let id = preview_audit::preview_audit_id("live-claim-999");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut holder = SqlPreviewStore::new(&pool, deadline);
+    assert_eq!(holder.claim_and_read(&id).await?, None);
+
+    // Keep the holder alive across the wait. The contender's 750ms lock
+    // timeout fits after the caller deadline but before the 2s idle backstop.
+    let mut contender = SqlPreviewStore::new(&pool, Instant::now() + Duration::from_secs(5));
+    assert_eq!(contender.claim_and_read(&id).await?, None);
+    tokio::time::sleep_until(deadline).await;
+    let error = holder
+        .insert_and_commit(matched_record(), &id, AT)
+        .await
+        .expect_err("the expired holder cannot commit");
+    assert!(matches!(error, sqlx::Error::Io(err) if err.kind() == std::io::ErrorKind::TimedOut));
+    assert_eq!(
+        contender
+            .insert_and_commit(matched_record(), &id, AT)
+            .await?,
+        "2026-11-02 08:00:00.123456+00"
+    );
+    Ok(())
+}
+
 async fn verify_sql_preview_store(pool: PgPool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(MIGRATION).execute(&pool).await?;
     let id = preview_audit::preview_audit_id("adapter-999");
