@@ -55,7 +55,7 @@ JOB_INVENTORY = {
                               "promotion-skipped", "production"},
     "deploy-staging.yml": {"deploy", "schema-gate", "roles-gate", "soak-hold", "voice-synthetic", "help-embed-synthetic",
                            "user-flow-synthetic", "pinned-history-guard", "certify-promotion",
-                           "staging-use-release"},
+                           "staging-use-release", "rerun-refusal"},
     "nightly.yml": {"changes", "pipeline-benchmark", "advisories", "sweep-plan",
                     "sweep-partition", "sweep-guarded", "sweep-docs", "sweep"},
     "pipeline-benchmark.yml": {"benchmark"},
@@ -544,7 +544,7 @@ def staging_dispatch_errors(workflow):
 
     `release_fence` exists on main (TOG-11143) so post-handoff release of an
     uninitialized/parked singleton is explicit and auditable; it defaults to
-    false and the deploy job itself runs unconditionally (TOG-12856).
+    false; the deploy job separately requires fresh-run admission.
     `inject_gateway_failure` is the staging rollback-drill switch: also an
     opt-in boolean defaulting to false, readable only through the pinned
     dispatch-only expression in staging_gateway_injection_errors.
@@ -555,7 +555,7 @@ def staging_dispatch_errors(workflow):
     same shape, readable only through the pinned dispatch-only expressions
     in staging_fault_injection_errors. `sha` pins the deployed commit for
     arm/disarm at one exact revision: an optional string, empty by default
-    (empty deploys the workflow head), readable only through the pinned
+    (empty is refused by admission), readable only through the pinned
     dispatch-or-head expression in staging_pinned_sha_errors. Anything else
     in the dispatch block (an arming switch, a deploy flag, a default of
     true) is an unreviewed deploy route outside the pinned shape.
@@ -582,7 +582,7 @@ def staging_dispatch_errors(workflow):
             or sha.get("type") != "string" or str(sha.get("required")).lower() != "false"
             or sha.get("default") != ""):
         errors.append(f"{name}: sha must be an optional string defaulting to empty "
-                      "(empty deploys the workflow head)")
+                      "(empty is refused by admission)")
     return errors
 
 
@@ -604,7 +604,7 @@ FAULT_MARKERS = (
 # Pinned-SHA arm/disarm: a dispatch names its exact commit, anything else
 # deploys the workflow head. Every checkout ref and every SHA-step env in
 # deploy-staging must use exactly this expression.
-DEPLOY_SHA_EXPRESSION = "${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}"
+DEPLOY_SHA_EXPRESSION = "${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.sha }}"
 # Soak-hold bindings: the Operator-owned repo variable holding the ISO-8601
 # UTC deadline, event name and dispatch-only rehearsal flag. Explicit arm/disarm
 # dispatches bypass the hold; automatic error-gate proofs never do.
@@ -764,7 +764,7 @@ def staging_error_rate_gate_errors(workflows):
     if staging.get("run-name") != REHEARSAL_RUN_NAME:
         errors.append("deploy-staging.yml: rehearsal identity must be pinned to the dispatch-only switch")
     hold = ((staging.get("jobs") or {}).get("soak-hold") or {}).get("steps") or []
-    if len(hold) != 1 or hold[0].get("env") != SOAK_HOLD_ENV:
+    if len(hold) != 2 or hold[0].get("env") != SOAK_HOLD_ENV:
         errors.append("deploy-staging.yml: rehearsal must honor the soak hold")
     steps = ((staging.get("jobs") or {}).get("deploy") or {}).get("steps") or []
     armed = [step for step in steps
@@ -840,9 +840,9 @@ def staging_fault_injection_errors(workflows):
 def staging_pinned_sha_errors(workflows):
     """The pinned-SHA arm/disarm is dispatch-only, exact and ancestor-checked.
 
-    A dispatch may name its exact commit; an empty dispatch always
-    deploys the workflow head. All three jobs check out the pinned
-    dispatch-or-head ref at full depth, and each carries one SHA step that
+    A dispatch must name its exact commit. An empty dispatch stays empty and
+    is refused by admission. All three jobs check out the pinned ref at full
+    depth, and each carries one SHA step that
     resolves the same expression through the environment, proves HEAD equals
     it, enforces a full 40-hex shape and refuses anything that is not an
     ancestor of origin/main. Each SHA step refuses exactly five ways
@@ -850,10 +850,9 @@ def staging_pinned_sha_errors(workflows):
     exit count so no refusal can go green. The workflow-ref refusal comes
     first: the job must itself run from `refs/heads/main`, an in-file
     fail-closed backstop behind the Environment branch policy (a job-level
-    `if:` would skip silently instead, so the job still carries none). Exactly nine reads exist (three checkout refs, three
-    SHA-step envs, the schema gate's --source-sha env, the user-flow
-    synthetic's expected SHA, the history guard's comparison env): eight use
-    the pinned expression and the ninth is the guard's raw pin-vs-head
+    admission guard is pinned separately). Ten reads exist (three checkout refs, three
+    SHA-step envs, schema gate, user-flow, admission and history guard): nine use
+    the pinned expression and the last is the guard's raw pin-vs-head
     comparison, so no other step can resolve or judge a different commit. Build identity and provenance then follow the
     validated SHA through the deploy job's DEPLOY_SHA export, pinned by
     staging_deploy_identity_errors. Every other workflow must not mention the
@@ -868,11 +867,10 @@ def staging_pinned_sha_errors(workflows):
             errors.append(f"{name}: pinned-sha marker inputs.sha outside the deploy workflows")
     staging = workflows.get("deploy-staging.yml") or {}
     text = str(staging)
-    if text.count("inputs.sha") != 9:
-        errors.append("deploy-staging.yml: sha must be read exactly nine times "
-                      "(three checkouts, three SHA steps, the schema gate env, "
-                      "the user-flow synthetic expected SHA, the history guard comparison)")
-    if text.count(DEPLOY_SHA_EXPRESSION) != 8:
+    if text.count("inputs.sha") != 17:
+        errors.append("deploy-staging.yml: sha reads must include the seven admission guards "
+                      "and the ten pinned source and history reads")
+    if text.count(DEPLOY_SHA_EXPRESSION) != 9:
         errors.append("deploy-staging.yml: every sha read but the history guard comparison "
                       "must use the pinned dispatch-or-head expression")
     jobs = staging.get("jobs") or {}
@@ -1031,7 +1029,7 @@ def soak_hold_errors(workflow, name="deploy-staging.yml"):
     While staging is held armed for a remediation-drill soak, a rehearsal
     must fail fast instead of reporting success without deploying. Other
     dispatches bypass the hold. One job runs first on every dispatch
-    (no `if:`, no `needs:`, no environment, no checkout): a single step
+    (no `if:`, no `needs:`, no environment, no checkout): the first step
     binds the hold deadline, event and pinned dispatch-only proof flag. It
     exits 0 for a non-proof dispatch, empty var or expired deadline (fail open),
     and exits 1 for an unparsable or over-long value
@@ -1060,9 +1058,27 @@ def soak_hold_errors(workflow, name="deploy-staging.yml"):
     if "secrets." in text:
         errors.append(f"{name}:soak-hold: must never read secrets")
     steps = job.get("steps", [])
-    if len(steps) != 1 or any("if" in step or "continue-on-error" in step for step in steps):
-        errors.append(f"{name}:soak-hold: must run exactly one unconditional check step")
+    if len(steps) != 2 or any("if" in step or "continue-on-error" in step for step in steps):
+        errors.append(f"{name}:soak-hold: must run both unconditional check steps")
         return errors
+    admission = {
+        "name": "Require admitted staging SHA",
+        "id": "admit",
+        "env": {"SOURCE_SHA": DEPLOY_SHA_EXPRESSION, "ADMITTED_SHA": "${{ vars.STAGING_ADMITTED_SHA }}"},
+        "run": 'set -euo pipefail\n'
+               'case "$SOURCE_SHA" in\n'
+               '  *[!0-9a-f]*|\'\') echo "::error::Staging SHA must be a full 40-hex commit SHA."; exit 1 ;;\n'
+               'esac\n'
+               'if [ "${#SOURCE_SHA}" -ne 40 ] || [ "$SOURCE_SHA" != "$ADMITTED_SHA" ]; then\n'
+               '  echo "::error::Staging deployment is held: commit is not admitted."\n'
+               '  exit 1\n'
+               'fi\n'
+               'printf \'run_id=%s\\nattempt=%s\\nsha=%s\\n\' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_SHA" >> "$GITHUB_OUTPUT"\n',
+    }
+    if job.get("outputs") != {key: f"${{{{ steps.admit.outputs.{key} }}}}" for key in ("run_id", "attempt", "sha")}:
+        errors.append(f"{name}:soak-hold: must bind admission outputs to this run and SHA")
+    if steps[1] != admission:
+        errors.append(f"{name}:soak-hold: must require the exact admitted SHA")
     step = steps[0]
     if step.get("env") != SOAK_HOLD_ENV:
         errors.append(f"{name}:soak-hold: step must bind exactly the hold deadline, event and rehearsal "
@@ -1137,14 +1153,14 @@ def user_flow_synthetic_errors(workflow, name="deploy-staging.yml"):
     job = jobs.get("user-flow-synthetic") or {}
     if job.get("name") != "staging user-flow synthetic (exact SHA)":
         errors.append(f"{name}:user-flow-synthetic: job identity changed (the production guard reads it by name)")
-    if job.get("needs") != "deploy":
-        errors.append(f"{name}:user-flow-synthetic: must run after the deploy")
+    if job.get("needs") != ["soak-hold", "deploy"] or job.get("if") != STAGING_ADMISSION_IF:
+        errors.append(f"{name}:user-flow-synthetic: must run after admitted deploy")
     if job.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:user-flow-synthetic: must keep contents:read only")
     if not runner_allowed("user-flow-synthetic", job.get("runs-on")):
         errors.append(f"{name}:user-flow-synthetic: must use the explicit ubuntu-latest runner "
                       "for job 'user-flow-synthetic'")
-    for key in ("if", "uses", "services", "container",
+    for key in ("uses", "services", "container",
                 "continue-on-error", "strategy", "concurrency"):
         if key in job:
             errors.append(f"{name}:user-flow-synthetic: must not set {key}")
@@ -1250,7 +1266,7 @@ def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
     github.sha may appear in the deploy job outside the two pinned
     dispatch-or-head expressions (checkout ref, SHA-step env) and the
     workflow-head tooling checkout ref (which runs deploy_id.py for pins
-    whose commits predate it).
+    whose commits predate it), or the separately pinned admission guard.
     """
     errors = []
     jobs = workflow.get("jobs") or {}
@@ -1289,9 +1305,9 @@ def staging_deploy_identity_errors(workflow, name="deploy-staging.yml"):
             "github-actions:${{ github.run_id }}:${{ env.DEPLOY_SHA }}":
         errors.append(f"{name}:deploy: rollback actor must name the validated deploy SHA")
     text = str(deploy)
-    if text.count("github.sha") != text.count(DEPLOY_SHA_EXPRESSION) + 1 or text.count("github.sha") != 3:
+    if text.count("github.sha") != text.count(DEPLOY_SHA_EXPRESSION) + 2 or text.count("github.sha") != 4:
         errors.append(f"{name}:deploy: github.sha may only appear in the checkout ref, "
-                      "the SHA-step dispatch-or-head expressions and the tooling checkout ref")
+                      "the SHA-step dispatch-or-head expressions, tooling checkout ref and admission guard")
     return errors
 
 
@@ -3243,22 +3259,45 @@ def production_deploy_id_errors(workflow, name="deploy-production.yml"):
     return errors
 
 
-def staging_active_errors(workflow):
-    """The deploy job is live (TOG-12856): no static suspension guard.
+STAGING_ADMISSION_IF = ("github.run_attempt == 1 && needs.soak-hold.outputs.run_id == github.run_id "
+                        "&& needs.soak-hold.outputs.attempt == '1' && needs.soak-hold.outputs.sha == "
+                        "(github.event_name != 'workflow_dispatch' && github.sha || inputs.sha)")
 
-    The job must carry no `if:` at all — unconditional on both the push/main
-    and workflow_dispatch triggers — while keeping the `staging` environment
-    scope, the public-hosted runner for job 'deploy', the fenced `release_fence`
-    dispatch shape, default-deny top-level permissions and the least-privilege
-    per-job grant. A job-level condition would silently skip deploys on some
-    SHAs and leave the production guard refusing those SHAs; step-level
-    guards are not an equivalent gate, so any job condition fails closed.
-    """
+
+def staging_active_errors(workflow):
+    """Pin each protected entry to the fresh-run admission and refusal path."""
     name = "deploy-staging.yml"
     errors = []
-    job = (workflow.get("jobs") or {}).get("deploy", {})
-    if "if" in job:
-        errors.append(f"{name}:deploy: a job condition would silently skip staging deploys")
+    jobs = workflow.get("jobs") or {}
+    job = jobs.get("deploy", {})
+    entries = {"schema-gate", "roles-gate", "deploy", "voice-synthetic",
+               "help-embed-synthetic", "user-flow-synthetic", "certify-promotion"}
+    for entry in entries:
+        protected = jobs.get(entry) or {}
+        expected = STAGING_ADMISSION_IF
+        if entry == "certify-promotion":
+            expected = ("success() && " + expected + " && needs.deploy.outputs.promotion_clean == 'true' "
+                        "&& vars.VOICE_SYNTHETIC_REQUIRED != 'false'")
+        needs = protected.get("needs") or []
+        needs = [needs] if isinstance(needs, str) else needs
+        if protected.get("if") != expected or "soak-hold" not in needs:
+            errors.append(f"{name}:{entry}: must require the run-bound admission")
+    refusal = jobs.get("rerun-refusal") or {}
+    expected_needs = set(jobs) - {"rerun-refusal"}
+    refusal_script = ("echo '::error::Staging qualification requires a new authorized workflow run, not a rerun.'\n"
+                      "exit 1\n")
+    if (set(refusal) != {"needs", "if", "permissions", "runs-on", "timeout-minutes", "steps"}
+            or set(refusal.get("needs") or []) != expected_needs
+            or len(refusal.get("needs") or []) != len(expected_needs)
+            or refusal.get("if") != "always() && github.run_attempt != 1"
+            or refusal.get("permissions") != {}
+            or refusal.get("runs-on") != "ubuntu-latest"
+            or refusal.get("timeout-minutes") != "5"
+            or refusal.get("steps") != [{"run": refusal_script}]):
+        errors.append(f"{name}:rerun-refusal: must fail without credentials after every entry")
+    for entry in ("voice-synthetic", "help-embed-synthetic"):
+        if (jobs.get(entry, {}).get("with") or {}).get("deploy_staging_call") != "true":
+            errors.append(f"{name}:{entry}: must declare the deploy call")
     if job.get("environment") != "staging":
         errors.append(f"{name}:deploy: must stay scoped to the staging environment")
     if not runner_allowed("deploy", job.get("runs-on")):
@@ -3279,8 +3318,8 @@ SCHEMA_GATE_IMAGE = ("rust:1.100-trixie@sha256:"
 def schema_gate_errors(workflow, name="deploy-staging.yml"):
     """Pre-deploy schema-drift gate: read-only plan, fail closed, no new privilege.
 
-    One job runs on every deploy-staging run (no `if:`, `needs: soak-hold` only)
-    through the no-reviewer `staging-migrate-plan` environment, builds the
+    The admitted first-attempt job needs only `soak-hold` and runs through the
+    no-reviewer `staging-migrate-plan` environment, builds the
     reviewed `staging-migrate` binary and fails the run with a `schema drift`
     error when `pending_before` is non-empty. The deploy job must `needs` the
     gate, so drift can never deploy silently. Plan-only: no migrator binding,
@@ -3293,8 +3332,8 @@ def schema_gate_errors(workflow, name="deploy-staging.yml"):
         errors.append(f"{name}:schema-gate: must read only the staging-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:schema-gate: must keep contents:read only")
-    if "if" in gate:
-        errors.append(f"{name}:schema-gate: a job condition would bypass the stage gate")
+    if gate.get("if") != STAGING_ADMISSION_IF:
+        errors.append(f"{name}:schema-gate: must require the exact admission guard")
     if gate.get("needs") != "soak-hold":
         errors.append(f"{name}:schema-gate: must wait only for the soak hold (it is the wait after the hold)")
     if not runner_allowed("schema-gate", gate.get("runs-on")):
@@ -3440,8 +3479,8 @@ ROLES_GATE_MARKERS = ("wrangler", "--apply", "rolesplan", "migrator_database_url
 def roles_gate_errors(workflow, name="deploy-staging.yml"):
     """Pre-deploy role-drift gate: read-only verify, fail closed, no new privilege.
 
-    One job runs on every deploy-staging run (no `if:`, `needs: soak-hold` only)
-    through the no-reviewer `staging-migrate-plan` environment, builds the
+    The admitted first-attempt job needs only `soak-hold` and runs through the
+    no-reviewer `staging-migrate-plan` environment, builds the
     reviewed `two-bot` binary and fails the run when `db roles verify` reports
     any finding. The deploy job must `needs` the gate, so drift can never
     deploy silently. Verify-only: no migrator write binding, no `--apply`, no
@@ -3454,8 +3493,8 @@ def roles_gate_errors(workflow, name="deploy-staging.yml"):
         errors.append(f"{name}:roles-gate: must read only the staging-migrate-plan Environment binding")
     if gate.get("permissions") != {"contents": "read"}:
         errors.append(f"{name}:roles-gate: must keep contents:read only")
-    if "if" in gate:
-        errors.append(f"{name}:roles-gate: a job condition would let drift deploy silently")
+    if gate.get("if") != STAGING_ADMISSION_IF:
+        errors.append(f"{name}:roles-gate: must require the exact admission guard")
     if gate.get("needs") != "soak-hold":
         errors.append(f"{name}:roles-gate: must wait only for the soak hold (it is the wait after the hold)")
     if not runner_allowed("roles-gate", gate.get("runs-on")):
@@ -4697,9 +4736,10 @@ def workflow_policy_errors(workflows):
                 errors.extend(staging_qualification_assert_errors(job, job_id, "scripts/bot_promotion.py certify",
                               "staging-use-certify.jsonl", "staging-use-certify"))
                 if (job.get("permissions") != {"contents": "read", "actions": "read"}
-                        or set(job.get("needs") or []) != {"deploy", "voice-synthetic", "help-embed-synthetic",
+                        or set(job.get("needs") or []) != {"soak-hold", "deploy", "voice-synthetic", "help-embed-synthetic",
                                                           "user-flow-synthetic", "pinned-history-guard"}
-                        or job.get("if") != "success() && needs.deploy.outputs.promotion_clean == 'true' && vars.VOICE_SYNTHETIC_REQUIRED != 'false'"):
+                        or job.get("if") != ("success() && " + STAGING_ADMISSION_IF
+                                             + " && needs.deploy.outputs.promotion_clean == 'true' && vars.VOICE_SYNTHETIC_REQUIRED != 'false'")):
                     errors.append(f"{name}:{job_id}: must retain the success-only, complete qualification gate")
                 continue  # offline certificate with a narrowly scoped readiness assertion
             else:
@@ -7115,9 +7155,11 @@ class WorkflowTests(unittest.TestCase):
                     changed = copy.deepcopy(self.workflows[filename])
                     changed["jobs"]["unexpected"] = {}
                     changed["jobs"][consumer][field] = value
+                    changed["jobs"]["staging-window"]["environment"] = "wrong"
                     errors = check(changed)
                     self.assertTrue(any("jobs must be exactly" in error for error in errors), errors)
                     self.assertTrue(any(diagnostic in error for error in errors), errors)
+                    self.assertIn(f"{filename}:staging-window: must read the staging Environment", errors)
 
     def test_reusable_staging_consumers_pin_the_independent_full_window(self):
         import copy
@@ -7281,9 +7323,9 @@ class WorkflowTests(unittest.TestCase):
 
     def test_staging_deploy_gates_on_the_voice_synthetic(self):
         job = self.workflows["deploy-staging.yml"]["jobs"]["voice-synthetic"]
-        self.assertEqual(job.get("needs"), "deploy")
+        self.assertEqual(job.get("needs"), ["soak-hold", "deploy"])
         self.assertEqual(job.get("uses"), "./.github/workflows/voice-synthetic.yml")
-        self.assertNotIn("if", job)
+        self.assertEqual(job.get("if"), STAGING_ADMISSION_IF)
         # An environment secret is empty in a called workflow unless the caller
         # passes it; pass exactly the two token names, never `inherit`.
         self.assertEqual(
@@ -7339,9 +7381,9 @@ class WorkflowTests(unittest.TestCase):
     def test_staging_deploy_gates_on_the_help_embed_synthetic(self):
         staging = self.workflows["deploy-staging.yml"]
         job = staging["jobs"]["help-embed-synthetic"]
-        self.assertEqual(job.get("needs"), "deploy")
+        self.assertEqual(job.get("needs"), ["soak-hold", "deploy"])
         self.assertEqual(job.get("uses"), "./.github/workflows/help-embed-synthetic.yml")
-        self.assertNotIn("if", job)
+        self.assertEqual(job.get("if"), STAGING_ADMISSION_IF)
         # An environment secret is empty in a called workflow unless the caller
         # passes it; pass exactly the two token names, never `inherit`.
         self.assertEqual(
@@ -7387,10 +7429,10 @@ class WorkflowTests(unittest.TestCase):
         deploy, gate = staging["jobs"]["deploy"], staging["jobs"]["schema-gate"]
         self.assertIn("schema-gate", [deploy["needs"]] if isinstance(deploy["needs"], str) else deploy["needs"])
         self.assertEqual(gate.get("environment"), "staging-migrate-plan")
-        self.assertNotIn("if", gate)
+        self.assertEqual(gate.get("if"), STAGING_ADMISSION_IF)
         self.assertEqual(gate.get("needs"), "soak-hold")
         # The chain stays ordered: hold first, gates second, deploy third, synthetic last.
-        self.assertEqual(staging["jobs"]["voice-synthetic"].get("needs"), "deploy")
+        self.assertEqual(staging["jobs"]["voice-synthetic"].get("needs"), ["soak-hold", "deploy"])
 
     def test_roles_gate_shape_is_pinned_and_mutations_fail(self):
         import copy
@@ -7424,10 +7466,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("schema-gate", needs)
         self.assertIn("roles-gate", needs)
         self.assertEqual(gate.get("environment"), "staging-migrate-plan")
-        self.assertNotIn("if", gate)
+        self.assertEqual(gate.get("if"), STAGING_ADMISSION_IF)
         self.assertEqual(gate.get("needs"), "soak-hold")
         # The chain stays ordered: hold first, gates second, deploy third, synthetic last.
-        self.assertEqual(staging["jobs"]["voice-synthetic"].get("needs"), "deploy")
+        self.assertEqual(staging["jobs"]["voice-synthetic"].get("needs"), ["soak-hold", "deploy"])
 
     def test_staging_takeover_fence_hint_is_scoped_to_the_fenced_refusal(self):
         # Execute the actual workflow shell with a stub control client. This
@@ -7499,20 +7541,41 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(outer_ms, minimum_ms + 120_000)
         self.assertIn(f"timed out after {outer.group(1)} seconds", run)
 
-    def test_staging_deploy_has_no_job_condition(self):
+    def test_staging_admission_regressions_on_actual_workflow(self):
+        # Source-level closure is not evidence of Actions scheduling.
+        from test_staging_admission_helpers import (assert_admission, assert_refusal,
+            assert_policy_mutations, admission_step_mutations, masked_refusal_mutations)
+        from test_staging_entry_helpers import assert_cleanup, assert_parent_entries
+
+        workflow = self.workflows["deploy-staging.yml"]
+        jobs = workflow["jobs"]
+        admit = [step for step in jobs["soak-hold"]["steps"] if step.get("id") == "admit"]
+        self.assertEqual(len(admit), 1)
+        assert_admission(self, admit[0]["run"])
+        entries = {"schema-gate", "roles-gate", "deploy", "voice-synthetic", "help-embed-synthetic",
+                   "user-flow-synthetic", "certify-promotion"}
+        assert_parent_entries(self, jobs, entries, staging_active_errors, workflow,
+                              lambda entry, part, error: f"deploy-staging.yml:{entry}:" in error)
+        assert_refusal(self, jobs, "always() && github.run_attempt != 1")
+        assert_cleanup(self, jobs, False)
+        for checker, mutations, message in (
+            (soak_hold_errors, admission_step_mutations(), "soak-hold:"),
+            (staging_active_errors, masked_refusal_mutations(), "rerun-refusal:"),
+        ):
+            assert_policy_mutations(self, workflow, checker,
+                                    lambda label, error: message in error, mutations)
+
+    def test_staging_requires_admission_for_dispatch(self):
         staging = self.workflows["deploy-staging.yml"]
         self.assertEqual(staging_dispatch_errors(staging), [])
         self.assertEqual(staging_active_errors(staging), [])
         self.assertEqual(schema_gate_errors(staging), [])
         self.assertEqual(workflow_policy_errors(self.workflows), [])
         self.assertEqual(staging["jobs"]["deploy"]["environment"], "staging")
-        self.assertNotIn("if", staging["jobs"]["deploy"])
+        self.assertEqual(staging["jobs"]["deploy"]["if"], STAGING_ADMISSION_IF)
 
-    def test_any_job_condition_on_staging_deploy_fails(self):
-        # The live deploy job carries no `if` at all: a job-level condition
-        # would silently skip deploys on some SHAs (including the old
-        # `if: ${{ false }}` suspension), leaving the production guard
-        # refusing those SHAs with no deploy ever running.
+    def test_unapproved_staging_deploy_conditions_fail(self):
+        # Only the exact admission guard may control the deploy job.
         for guard in ("${{ false }}", "true", "${{ true }}", "${{ vars.ENABLE_STAGING }}",
                       "${{ github.ref == 'refs/heads/main' }}", "${{ inputs.deploy }}",
                       "${{ always() }}"):
@@ -7785,7 +7848,10 @@ class WorkflowTests(unittest.TestCase):
             workflow["jobs"]["deploy"]["steps"][2]["run"] = "\n".join(lines)
 
         mutations = {
-            # An empty dispatch must deploy the workflow head, never a constant.
+            # An empty dispatch is refused rather than selecting the workflow head.
+            "empty dispatch falls back to head": lambda w: next(
+                step for step in w["jobs"]["soak-hold"]["steps"] if step.get("id") == "admit")
+                ["env"].__setitem__("SOURCE_SHA", "${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}"),
             "checkout ref constant": lambda w: w["jobs"]["deploy"]["steps"][0]["with"]
                 .__setitem__("ref", "main"),
             "checkout ref without dispatch guard": lambda w: w["jobs"]["deploy"]["steps"][0]["with"]
@@ -7857,11 +7923,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(roles_gate_errors(staging), [])
         self.assertEqual(staging["jobs"]["schema-gate"].get("needs"), "soak-hold")
         self.assertEqual(staging["jobs"]["roles-gate"].get("needs"), "soak-hold")
-        # A hold never becomes a quiet green: the gates and the deploy carry
-        # no `if`, so a failed hold skips them and fails the run red, which
-        # the production guard refuses as staging history.
-        for job_id in ("soak-hold", "schema-gate", "roles-gate", "deploy"):
-            self.assertNotIn("if", staging["jobs"][job_id])
+        # A failed hold remains red; protected entries require fresh admission.
+        self.assertNotIn("if", staging["jobs"]["soak-hold"])
+        for job_id in ("schema-gate", "roles-gate", "deploy"):
+            self.assertEqual(staging["jobs"][job_id]["if"], STAGING_ADMISSION_IF)
         mutations = {
             "hold job removed": lambda w: w["jobs"].pop("soak-hold"),
             "hold gains a condition": lambda w: w["jobs"]["soak-hold"].__setitem__("if", "true"),
@@ -10712,8 +10777,10 @@ class WorkflowTests(unittest.TestCase):
                         # No checkout or API access: only report and upload a receipt.
                         expected = {}
                     elif (name, job_id) in (("gradual-promote-proof.yml", "admission-hold"),
+                                            ("deploy-staging.yml", "rerun-refusal"),
+                                            ("help-embed-synthetic.yml", "rerun-refusal"),
                                             ("voice-synthetic.yml", "rerun-refusal")):
-                        # Refuses before checkout or API access.
+                        # Refuses without checkout or API access.
                         expected = {}
                     elif (name, job_id) == ("daily-digest.yml", "digest"):
                         # Cuts the vYYYY.MM.DD tag and its release, reads the
@@ -10765,8 +10832,6 @@ class WorkflowTests(unittest.TestCase):
                         # summary to the automation branch. This main-only
                         # job is the workflow's sole write grant.
                         expected = {"contents": "write"}
-                    if (name, job_id) == ("help-embed-synthetic.yml", "rerun-refusal"):
-                        expected = {}
                     self.assertEqual(job["permissions"], expected)
                     for step in job.get("steps", []):
                         if step.get("uses", "").startswith("actions/checkout@"):

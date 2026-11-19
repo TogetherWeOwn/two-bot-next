@@ -85,6 +85,11 @@ WINDOW_JOBS = ("deploy", "voice-synthetic", "help-embed-synthetic",
                "user-flow-synthetic", "certify-promotion")
 # Reusable caller job in deploy-staging -> called workflow.
 CHILDREN = {"voice-synthetic": VOICE, "help-embed-synthetic": HELP}
+CALLER_ADMISSION = (
+    "github.run_attempt == 1 && needs.soak-hold.outputs.run_id == github.run_id "
+    "&& needs.soak-hold.outputs.attempt == '1' && needs.soak-hold.outputs.sha == "
+    "(github.event_name != 'workflow_dispatch' && github.sha || inputs.sha)"
+)
 # Called workflow -> (live consumer job, live entry point).
 CONSUMERS = {VOICE: ("synthetic", "scripts/staging_voice_synthetic.py"),
              HELP: ("help-embed-smoke", "scripts/staging_help_embed_smoke.py")}
@@ -332,11 +337,12 @@ def child_errors(wfs, canonical):
         label = f"caller {caller_name}"
         if caller.get("uses") != f"./.github/workflows/{callee_name}":
             errors.append(f"{label}: must invoke the local {callee_name}")
-        needs = caller.get("needs")
-        if needs != "deploy" and needs != ["deploy"]:
-            errors.append(f"{label}: must wait for deploy completion")
-        if "if" in caller or "continue-on-error" in caller:
-            errors.append(f"{label}: must retain default success-only, failure-propagating gate")
+        if caller.get("needs") != ["soak-hold", "deploy"]:
+            errors.append(f"{label}: must wait for admission and deploy completion")
+        # The exact admission expression has no status function, so Actions
+        # retains its implicit success() check on both dependencies.
+        if bare(caller.get("if")) != CALLER_ADMISSION or "continue-on-error" in caller:
+            errors.append(f"{label}: must retain the success-only, failure-propagating admission gate")
         if "concurrency" in caller:
             errors.append(f"{label}: waiting reusable caller declares concurrency")
         passed = caller.get("with") or {}
@@ -1102,18 +1108,22 @@ class LockOracleControls(unittest.TestCase):
             with self.subTest(change=change):
                 self.assert_rejected(wfs, claim)
 
-    # Old guarantee: called gate waits for a successful deploy, local call,
-    # failure propagates, waiting caller holds nothing.
     def test_called_consumer_requires_successful_deploy_and_local_call(self):
-        changes = ({"needs": "schema-gate"}, {"uses": "./wrong.yml"},
-                   {"if": "always()"}, {"continue-on-error": "true"},
-                   {"concurrency": "unrelated-caller-group"})
+        wait = "must wait for admission and deploy completion"
+        gate = "must retain the success-only, failure-propagating admission gate"
+        changes = (({"needs": "schema-gate"}, wait), ({"needs": "deploy"}, wait),
+                   ({"needs": "soak-hold"}, wait), ({"uses": "./wrong.yml"}, "must invoke the local"),
+                   ({"if": ""}, gate), ({"if": "always()"}, gate),
+                   ({"if": "always() && " + CALLER_ADMISSION}, gate),
+                   ({"if": CALLER_ADMISSION.replace("github.run_attempt == 1 && ", "")}, gate),
+                   ({"continue-on-error": "true"}, gate),
+                   ({"concurrency": "unrelated-caller-group"}, "waiting reusable caller declares concurrency"))
         for caller in CHILDREN:
-            for change in changes:
+            for change, claim in changes:
                 wfs = target_fixture()
                 wfs[DEPLOY]["jobs"][caller].update(change)
                 with self.subTest(caller=caller, change=change):
-                    self.assert_rejected(wfs, f"caller {caller}:")
+                    self.assert_rejected(wfs, f"caller {caller}: {claim}")
 
     def test_grant_must_come_from_deploy_outputs(self):
         for value in ("", "1767225600000", "${{ inputs.sha }}", "${{ github.sha }}",
@@ -1793,7 +1803,7 @@ class ExistingSafetyControls(unittest.TestCase):
     def test_deploy_lock_scope_contains_takeover_readiness_and_rollback(self):
         job = load_all()[DEPLOY]["jobs"]["deploy"]
         self.assertEqual(job["environment"], "staging")
-        self.assertEqual(job["needs"], ["schema-gate", "roles-gate"])
+        self.assertEqual(job["needs"], ["soak-hold", "schema-gate", "roles-gate"])
         steps = job["steps"]
         by_id = {step["id"]: step for step in steps if "id" in step}
         self.assertIn("cloudflare/wrangler-action@", by_id["deploy"]["uses"])
