@@ -2,10 +2,11 @@
 
 import json
 import os
+import stat
 import subprocess
 from datetime import datetime, timezone
 
-from voice_lifecycle_evidence import validate as validate_lifecycle
+from voice_lifecycle_evidence import unique_object, validate as validate_lifecycle
 from voice_measurement_cleanup import cleanup_verified, read_cleanup_receipt
 
 
@@ -30,34 +31,41 @@ def lifecycles_verified(first, second, run_id, second_required):
     return second is None
 
 
-def candidate_verified(second_required, grant, candidate, receipts):
-    """Recompute a candidate silently; missing or invalid evidence is refusal."""
+def candidate_verified(second_required, grant, acquired_at, candidate, receipts):
+    """Recompute silently using the validated grant, without reopening it."""
     if (second_required not in ("true", "false") or not isinstance(receipts, list)
             or len(receipts) != (3 if second_required == "true" else 2)
-            or any(not isinstance(path, (str, os.PathLike)) for path in [grant, candidate, *receipts])):
+            or any(not isinstance(path, (str, os.PathLike)) for path in [candidate, *receipts])):
         return False
     try:
         result = subprocess.run(
             ["node", "wrangler/scripts/voice-measurement-candidate.mjs",
-             second_required, grant, candidate, *receipts],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=15, check=False,
+             second_required, "-", candidate, *receipts],
+            input=json.dumps(dict(grant, acquiredAt=acquired_at)), text=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=False,
         )
         return result.returncode == 0
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return False
 
 
-def grant_matches(grant, run_id, attempt, expires_at, sha, deployment_id):
-    """Bind candidate metadata to the same grant used to verify cleanup."""
+def read_matching_grant(path, run_id, attempt, expires_at, sha, deployment_id):
+    """Return bounded regular-file metadata only if it agrees with cleanup."""
     try:
-        with open(grant, encoding="utf-8") as source:
-            metadata = json.loads(source.read(4097))
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                return None
+            data = source.read(4097)
+        if len(data) > 4096:
+            return None
+        metadata = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
         expiry = datetime.fromtimestamp(expires_at / 1000, timezone.utc).isoformat(timespec="milliseconds")
-        return metadata == {"runId": run_id, "runAttempt": str(attempt), "sha": sha,
-                            "deploymentId": deployment_id, "expiresAt": expiry.replace("+00:00", "Z")}
+        expected = {"runId": run_id, "runAttempt": str(attempt), "sha": sha,
+                    "deploymentId": deployment_id, "expiresAt": expiry.replace("+00:00", "Z")}
+        return expected if metadata == expected else None
     except (OSError, TypeError, ValueError, OverflowError, RecursionError):
-        return False
+        return None
 
 
 def terminal_verdict(results, second_required, cleanup_verified, candidate_verified):
@@ -80,13 +88,14 @@ def evaluate_terminal(results, second_required, run_id, attempt, expires_at, sha
     """Accept only when the job graph and all original evidence independently agree."""
     if terminal_verdict(results, second_required, True, True) != "accepted":
         return "refused"
-    if not cleanup_verified(read_cleanup_receipt(cleanup_path), run_id, attempt, expires_at, sha, deployment_id):
+    cleanup = read_cleanup_receipt(cleanup_path)
+    if not cleanup_verified(cleanup, run_id, attempt, expires_at, sha, deployment_id):
         return "refused"
     if not lifecycles_verified(first_lifecycle, second_lifecycle, run_id, second_required):
         return "refused"
-    if not grant_matches(grant, run_id, attempt, expires_at, sha, deployment_id):
-        return "refused"
-    if not candidate_verified(second_required, grant, candidate, receipts):
+    metadata = read_matching_grant(grant, run_id, attempt, expires_at, sha, deployment_id)
+    acquired_at = cleanup[2]["use"]["acquiredAt"]
+    if metadata is None or not candidate_verified(second_required, metadata, acquired_at, candidate, receipts):
         return "refused"
     return "accepted"
 

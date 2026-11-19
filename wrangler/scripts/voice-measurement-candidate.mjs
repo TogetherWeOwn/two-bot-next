@@ -32,9 +32,14 @@ export function runCli(args) {
     if (!['true', 'false'].includes(branch)
       || receiptPaths.length !== (branch === 'true' ? 3 : 2)) throw new Error();
     const read = (path) => JSON.parse(readFileSync(path, 'utf8'));
-    if (!verifyCandidate(receiptPaths.map(read), read(candidatePath), branch === 'true', read(grantPath))) {
-      throw new Error();
-    }
+    // The terminal verifier passes its validated grant and acquisition time on stdin.
+    const fromStdin = grantPath === '-';
+    const grant = read(fromStdin ? 0 : grantPath);
+    const receipts = receiptPaths.map(read);
+    if (!verifyCandidate(receipts, read(candidatePath), branch === 'true', grant)) throw new Error();
+    // Candidate verification already ensures strict capture ordering and expiry.
+    if (fromStdin && (!Number.isSafeInteger(grant.acquiredAt) || grant.acquiredAt < 0
+      || Date.parse(receipts[0].capturedAt) < grant.acquiredAt)) throw new Error();
     return 0;
   } catch {
     console.error('voice measurement candidate refused');

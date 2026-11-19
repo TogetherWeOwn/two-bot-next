@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -23,22 +24,11 @@ class VoiceMeasurementTerminalTests(unittest.TestCase):
                    "STAGING_USE_EXPIRES_AT": "123456", "STAGING_USE_SHA": "a" * 40,
                    "STAGING_USE_DEPLOYMENT": "deploy", "SECOND_REQUIRED": "false"}
             with patch("sys.argv", ["terminal", str(out)]), patch.dict("os.environ", env, clear=True), \
-                 patch("voice_measurement_terminal.evaluate_terminal", return_value="accepted") as evaluate:
+                 patch("voice_measurement_terminal.evaluate_terminal", return_value="accepted"):
                 self.assertEqual(main(), 0)
                 self.assertEqual(json.loads(out.read_text()),
                                  {"schema": "voice-measurement-terminal.v1", "verdict": "accepted"})
                 self.assertEqual(main(), 1)
-                self.assertEqual(evaluate.call_args.args[-1],
-                                 [str(Path(directory) / "candidate" / "voice-before" / "voice-before.json"),
-                                  str(Path(directory) / "candidate" / "voice-after.json")])
-                out.unlink()
-                env["SECOND_REQUIRED"] = "true"
-                with patch.dict("os.environ", env, clear=True):
-                    self.assertEqual(main(), 0)
-                self.assertEqual(evaluate.call_args.args[-1],
-                                 [str(Path(directory) / "candidate" / "voice-before" / "voice-before.json"),
-                                  str(Path(directory) / "candidate" / "voice-middle" / "voice-after.json"),
-                                  str(Path(directory) / "candidate" / "voice-final.json")])
             out.unlink()
             with patch("sys.argv", ["terminal", str(out)]), patch.dict("os.environ", {}, clear=True):
                 self.assertEqual(main(), 1)
@@ -85,7 +75,8 @@ console.log(JSON.stringify({ expires, metadata, before, middle, after,
             for name in ("first", "second"):
                 write(f"{name}/voice-synthetic-123-1.json", {"checks": checks})
             correlation = {"environment": "staging", "runId": "123", "runAttempt": 1}
-            use = dict(correlation, expiresAt=fixture["expires"], acquiredAt=fixture["expires"] - 3600000,
+            use_start = fixture["expires"] - 3602000  # Exactly the first capture.
+            use = dict(correlation, expiresAt=fixture["expires"], acquiredAt=use_start,
                        phase="released", sha="a" * 40, deploymentId="deploy", epoch=1)
             records = [dict(correlation, schema="two-bot-staging-pipeline.v1", action="attempt", operation="finish"),
                        dict(correlation, schema="two-bot-staging-use.v1", action="status",
@@ -94,41 +85,51 @@ console.log(JSON.stringify({ expires, metadata, before, middle, after,
                        dict(correlation, schema="two-bot-staging-use.v1", action="release",
                             running=False, sha="a" * 40, deploymentId="deploy", epoch=1, use=use)]
             cleanup = root / "cleanup/staging-use-measurement-stop.jsonl"
-            cleanup.write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
+
+            def write_cleanup(value):
+                cleanup.write_text("\n".join(map(json.dumps, value)) + "\n", encoding="utf-8")
+
             env = {"PATH": os.environ.get("PATH", ""), "EVIDENCE_DIR": directory,
                    "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1",
                    "STAGING_USE_EXPIRES_AT": str(fixture["expires"]), "STAGING_USE_SHA": "a" * 40,
                    "STAGING_USE_DEPLOYMENT": "deploy"}
+            output = root / "terminal.json"
+
+            def assert_verdict(verdict, command=main):
+                self.assertEqual(command(), 0 if verdict == "accepted" else 1)
+                self.assertEqual(json.loads(output.read_text())["verdict"], verdict)
+                output.unlink()
+
             for second in ("false", "true"):
                 env["SECOND_REQUIRED"] = second
                 env.update({"RESULT_" + job.upper().replace("-", "_"): "success" for job in JOBS})
                 if second == "false":
                     env.update(RESULT_VOICE_SECOND="skipped", RESULT_MEASUREMENT_FINAL="skipped")
-                output = root / f"terminal-{second}.json"
                 with patch("sys.argv", ["terminal", str(output)]), patch.dict("os.environ", env, clear=True):
-                    self.assertEqual(main(), 0)
-                    self.assertEqual(json.loads(output.read_text())["verdict"], "accepted")
+                    for offset, verdict in ((0, "accepted"), (2000, "refused")):
+                        with self.subTest(second=second, acquisition_offset=offset):
+                            for record in records[1:]:
+                                record["use"]["acquiredAt"] = use_start + offset
+                            write_cleanup(records)
+                            assert_verdict(verdict)
+                    for record in records[1:]:
+                        record["use"]["acquiredAt"] = use_start
                     altered = json.loads(json.dumps(records))
                     for record in altered[1:]:
-                        record['sha'] = 'b' * 40
-                        record['use']['sha'] = 'b' * 40
-                    cleanup.write_text('\n'.join(map(json.dumps, altered)) + '\n', encoding='utf-8')
-                    output.unlink()
-                    with patch.dict('os.environ', {'STAGING_USE_SHA': 'b' * 40}):
-                        self.assertEqual(main(), 1)
-                        self.assertEqual(json.loads(output.read_text())['verdict'], 'refused')
-                    cleanup.write_text('\n'.join(map(json.dumps, records)) + '\n', encoding='utf-8')
+                        record["sha"] = record["use"]["sha"] = "b" * 40
+                    write_cleanup(altered)
+                    with patch.dict("os.environ", {"STAGING_USE_SHA": "b" * 40}):
+                        assert_verdict("refused")
+                        write("grant.json", dict(fixture["metadata"], sha="b" * 40))
+                        assert_verdict("refused")
+                    write("grant.json", fixture["metadata"])
                     for index in (1, 2):
                         with self.subTest(second=second, missing_correlation=index):
-                            output.unlink()
                             altered = [dict(record) for record in records]
                             del altered[index]["runId"]
-                            cleanup.write_text("\n".join(map(json.dumps, altered)) + "\n", encoding="utf-8")
-                            try:
-                                self.assertEqual(main(), 1)
-                                self.assertEqual(json.loads(output.read_text())["verdict"], "refused")
-                            finally:
-                                cleanup.write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
+                            write_cleanup(altered)
+                            assert_verdict("refused")
+                    write_cleanup(records)
                     paths = ["grant.json", "cleanup/staging-use-measurement-stop.jsonl",
                              "first/voice-synthetic-123-1.json", "candidate/voice-before/voice-before.json"]
                     paths += (["second/voice-synthetic-123-1.json", "candidate/voice-middle/voice-after.json",
@@ -136,15 +137,19 @@ console.log(JSON.stringify({ expires, metadata, before, middle, after,
                               else ["candidate/voice-after.json", "candidate/voice-decision.json"])
                     for path in paths:
                         with self.subTest(second=second, missing=path):
-                            output.unlink()
                             missing = root / path
                             saved = missing.read_bytes()
                             missing.unlink()
-                            try:
-                                self.assertEqual(main(), 1)
-                                self.assertEqual(json.loads(output.read_text())["verdict"], "refused")
-                            finally:
-                                missing.write_bytes(saved)
+                            assert_verdict("refused")
+                            missing.write_bytes(saved)
+                    grant = root / "grant.json"
+                    grant.unlink()
+                    os.mkfifo(grant)
+                    assert_verdict("refused", lambda: subprocess.run(
+                        [sys.executable, "scripts/ci/voice_measurement_terminal.py", output], timeout=5,
+                    ).returncode)
+                    grant.unlink()
+                    write("grant.json", fixture["metadata"])
 
     def test_lifecycles_require_raw_success_for_the_selected_branch(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -166,40 +171,41 @@ console.log(JSON.stringify({ expires, metadata, before, middle, after,
             self.assertFalse(lifecycles_verified(first, second, "123", "true"))
 
     def test_candidate_verifier_refuses_invalid_inputs_and_process_failures(self):
+        args = ({"runId": "123"}, 100, "candidate", ["before", "after"])
         with patch("voice_measurement_terminal.subprocess.run") as run:
             run.return_value.returncode = 0
-            self.assertTrue(candidate_verified("false", "grant", "candidate", ["before", "after"]))
-            self.assertEqual(run.call_args.args[0][-5:], ["false", "grant", "candidate", "before", "after"])
-            self.assertEqual(run.call_args.kwargs["stdout"], subprocess.DEVNULL)
-            self.assertEqual(run.call_args.kwargs["stderr"], subprocess.DEVNULL)
+            self.assertTrue(candidate_verified("false", *args))
+            self.assertEqual(run.call_args.args[0][-5:], ["false", "-", "candidate", "before", "after"])
+            self.assertEqual(json.loads(run.call_args.kwargs["input"]), {"runId": "123", "acquiredAt": 100})
+            for stream in ("stdout", "stderr"):
+                self.assertEqual(run.call_args.kwargs[stream], subprocess.DEVNULL)
             self.assertEqual(run.call_args.kwargs["timeout"], 15)
-            self.assertFalse(candidate_verified("true", "grant", "candidate", ["before", "after"]))
-            self.assertFalse(candidate_verified("unknown", "grant", "candidate", ["before", "after"]))
+            for branch in ("true", "unknown"):
+                self.assertFalse(candidate_verified(branch, *args))
             run.return_value.returncode = 1
-            self.assertFalse(candidate_verified("false", "grant", "candidate", ["before", "after"]))
-            run.side_effect = subprocess.TimeoutExpired("node", 15)
-            self.assertFalse(candidate_verified("false", "grant", "candidate", ["before", "after"]))
-            run.side_effect = FileNotFoundError()
-            self.assertFalse(candidate_verified("false", "grant", "candidate", ["before", "after"]))
+            for error in (None, subprocess.TimeoutExpired("node", 15), FileNotFoundError()):
+                run.side_effect = error
+                self.assertFalse(candidate_verified("false", *args))
 
     def test_terminal_requires_all_independent_evidence(self):
         results = dict.fromkeys(JOBS, "success")
         args = (results, "true", "123", 1, 123456, "a" * 40, "deploy",
                 "cleanup", "first", "second", "grant", "candidate", ["before", "middle", "after"])
-        with patch("voice_measurement_terminal.read_cleanup_receipt", return_value=["records"]) as read, \
+        records = [{}, {}, {"use": {"acquiredAt": 100}}]
+        metadata = {"runId": "123"}
+        with patch("voice_measurement_terminal.read_cleanup_receipt", return_value=records) as read, \
              patch("voice_measurement_terminal.cleanup_verified", return_value=True) as cleanup, \
              patch("voice_measurement_terminal.lifecycles_verified", return_value=True) as lifecycle, \
-             patch("voice_measurement_terminal.grant_matches", return_value=True) as grant, \
+             patch("voice_measurement_terminal.read_matching_grant", return_value=metadata) as grant, \
              patch("voice_measurement_terminal.candidate_verified", return_value=True) as candidate:
             self.assertEqual(evaluate_terminal(*args), "accepted")
             read.assert_called_with("cleanup")
-            cleanup.assert_called_with(["records"], "123", 1, 123456, "a" * 40, "deploy")
+            cleanup.assert_called_with(records, "123", 1, 123456, "a" * 40, "deploy")
             lifecycle.assert_called_with("first", "second", "123", "true")
-            candidate.assert_called_with("true", "grant", "candidate", ["before", "middle", "after"])
+            candidate.assert_called_with("true", metadata, 100, "candidate", ["before", "middle", "after"])
             for check in (cleanup, lifecycle, grant, candidate):
-                check.return_value = False
-                self.assertEqual(evaluate_terminal(*args), "refused")
-                check.return_value = True
+                with patch.object(check, "return_value", None):
+                    self.assertEqual(evaluate_terminal(*args), "refused")
             failed = dict(results, **{"staging-use-release": "failure"})
             read.reset_mock()
             self.assertEqual(evaluate_terminal(failed, *args[1:]), "refused")
