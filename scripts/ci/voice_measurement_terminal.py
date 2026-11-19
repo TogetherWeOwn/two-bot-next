@@ -31,8 +31,24 @@ def lifecycles_verified(first, second, run_id, second_required):
     return second is None
 
 
-def candidate_verified(second_required, grant, acquired_at, candidate, receipts):
-    """Recompute silently using the validated grant, without reopening it."""
+def cleanup_started_at(records, acquired_at):
+    """Validate the observation sequence; finish must start after the last capture."""
+    try:
+        times = []
+        for record in records:
+            stamp = record["observedAt"]
+            parsed = datetime.fromisoformat(stamp)
+            if parsed.tzinfo is not timezone.utc or stamp != parsed.isoformat(timespec="milliseconds")[:-6] + "Z":
+                return None
+            times.append(round(parsed.timestamp() * 1000))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    start, status, release = times
+    return start if acquired_at <= start <= status <= release else None
+
+
+def candidate_verified(second_required, grant, candidate, receipts):
+    """Recompute silently using the validated grant and timing snapshot."""
     if (second_required not in ("true", "false") or not isinstance(receipts, list)
             or len(receipts) != (3 if second_required == "true" else 2)
             or any(not isinstance(path, (str, os.PathLike)) for path in [candidate, *receipts])):
@@ -41,7 +57,7 @@ def candidate_verified(second_required, grant, acquired_at, candidate, receipts)
         result = subprocess.run(
             ["node", "wrangler/scripts/voice-measurement-candidate.mjs",
              second_required, "-", candidate, *receipts],
-            input=json.dumps(dict(grant, acquiredAt=acquired_at)), text=True,
+            input=json.dumps(grant), text=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=False,
         )
         return result.returncode == 0
@@ -91,11 +107,13 @@ def evaluate_terminal(results, second_required, run_id, attempt, expires_at, sha
     cleanup = read_cleanup_receipt(cleanup_path)
     if not cleanup_verified(cleanup, run_id, attempt, expires_at, sha, deployment_id):
         return "refused"
-    if not lifecycles_verified(first_lifecycle, second_lifecycle, run_id, second_required):
+    acquired_at = cleanup[2]["use"]["acquiredAt"]
+    started_at = cleanup_started_at(cleanup, acquired_at)
+    if started_at is None or not lifecycles_verified(first_lifecycle, second_lifecycle, run_id, second_required):
         return "refused"
     metadata = read_matching_grant(grant, run_id, attempt, expires_at, sha, deployment_id)
-    acquired_at = cleanup[2]["use"]["acquiredAt"]
-    if metadata is None or not candidate_verified(second_required, metadata, acquired_at, candidate, receipts):
+    if metadata is None or not candidate_verified(
+            second_required, dict(metadata, acquiredAt=acquired_at, cleanupStartedAt=started_at), candidate, receipts):
         return "refused"
     return "accepted"
 
