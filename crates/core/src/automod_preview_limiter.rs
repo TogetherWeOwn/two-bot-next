@@ -8,8 +8,8 @@
 //!
 //! Time is an explicit `now_ms` (wall-clock millis) so tests pin boundaries
 //! on a paused clock. Charges are idempotent by interaction id for the
-//! limiter's in-memory lifetime: a redelivered interaction replays without
-//! charging again. Refusals never charge.
+//! limiter's in-memory lifetime: a redelivered interaction does not charge
+//! again. Refusals never charge.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -27,8 +27,9 @@ pub const PREVIEW_LIMITER_CAPACITY: usize = 1024;
 const HOUR_MS: u64 = 3_600_000;
 const DAY_MS: u64 = 86_400_000;
 
-/// Outcome of a limiter check. `ReplayDuplicate` is a redelivery of an
-/// already-admitted interaction: replay without charging or evaluating.
+/// Outcome of a limiter check. `ReplayDuplicate` means the interaction was
+/// already charged. The caller replays a committed row without evaluating, or
+/// retries evaluation without another charge if the locked read found no row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewRateDecision {
     Admit,
