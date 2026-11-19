@@ -211,10 +211,13 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
         workflow = workflows[WORKFLOW]
         self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
         self.assertEqual(workflow["permissions"], {})
+        canonical = workflows[lifecycle.DEPLOY]["concurrency"]["group"]
         self.assertEqual(workflow["concurrency"], {
-            "group": "voice-rest-measurement-disabled", "cancel-in-progress": "false"})
-        self.assertNotEqual(workflow["concurrency"]["group"].casefold(),
-                            workflows[lifecycle.DEPLOY]["concurrency"]["group"].casefold())
+            "group": "${{ false && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
+            "&& github.run_attempt == 1 && '" + canonical + "' || "
+            "format('voice-rest-measurement-disabled-{0}-{1}', github.run_id, github.run_attempt) }}",
+            "cancel-in-progress": "false", "queue": "max",
+        })
         jobs = workflow["jobs"]
         self.assertNotIn("defaults", workflow)
         for name, job in jobs.items():

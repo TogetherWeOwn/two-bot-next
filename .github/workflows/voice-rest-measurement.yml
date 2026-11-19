@@ -7,10 +7,11 @@ on:
 
 permissions: {}
 
-# This disabled workflow must not enter the canonical staging lifecycle queue.
+# Keep the canonical group unreachable until scheduling and activation are reviewed.
 concurrency:
-  group: voice-rest-measurement-disabled
+  group: ${{ false && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.run_attempt == 1 && 'staging-lifecycle' || format('voice-rest-measurement-disabled-{0}-{1}', github.run_id, github.run_attempt) }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   staging-window:
