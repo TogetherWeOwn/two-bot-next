@@ -10,8 +10,13 @@
 //! same-transaction reload. The committed-row test checks replay on a separate
 //! connection; it does not prove that a real handler commits before replying.
 
+use std::time::Duration;
+
 use sqlx::{migrate::Migrator, Connection, PgPool, Postgres, Transaction};
+use tokio::time::Instant;
+use two_bot_core::automod_preview_attempt::PreviewAttemptStore;
 use two_bot_core::automod_preview_audit as preview_audit;
+use two_bot_core::automod_preview_store::SqlPreviewStore;
 use two_bot_testsupport::TestDatabase;
 
 const MIGRATION: &str = include_str!("../../cutover/migrations/0130_custom_commands.sql");
@@ -87,6 +92,68 @@ async fn committed_preview_replays_on_another_connection() -> Result<(), Box<dyn
     let proof = tokio::spawn(verify_committed_replay(db.pool().clone())).await;
     db.close().await?;
     proof??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sql_preview_store_times_out_and_replays_after_a_dropped_claim(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap required");
+    let db = TestDatabase::create(&url, &Migrator::DEFAULT).await?;
+    let proof = tokio::spawn(verify_sql_preview_store(db.pool().clone())).await;
+    db.close().await?;
+    proof??;
+    Ok(())
+}
+
+async fn verify_sql_preview_store(pool: PgPool) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(MIGRATION).execute(&pool).await?;
+    let id = preview_audit::preview_audit_id("adapter-999");
+    let store = || SqlPreviewStore::new(&pool, Instant::now() + Duration::from_secs(5));
+
+    let mut holder = store();
+    assert_eq!(holder.claim_and_read(&id).await?, None);
+    assert!(holder.claim_and_read(&id).await.is_err());
+    let err = store()
+        .claim_and_read(&id)
+        .await
+        .expect_err("a second transaction cannot acquire the claim");
+    assert_eq!(
+        err.as_database_error()
+            .and_then(|err| err.code())
+            .as_deref(),
+        Some("55P03"),
+        "the database lock timeout must fire: {err}"
+    );
+    drop(holder);
+
+    let mut expired = SqlPreviewStore::new(&pool, Instant::now());
+    assert!(expired.claim_and_read(&id).await.is_err());
+    assert!(store().claim_and_read("bad-id").await.is_err());
+    assert!(store()
+        .insert_and_commit(matched_record(), &id, AT)
+        .await
+        .is_err());
+    let mut wrong_claim = store();
+    assert_eq!(wrong_claim.claim_and_read(&id).await?, None);
+    assert!(wrong_claim
+        .insert_and_commit(matched_record(), "automod-preview:wrong", AT)
+        .await
+        .is_err());
+
+    let mut retry = store();
+    assert_eq!(retry.claim_and_read(&id).await?, None);
+    let record = matched_record();
+    let stored = retry.insert_and_commit(matched_record(), &id, AT).await?;
+    assert_eq!(stored, "2026-11-02 08:00:00.123456+00");
+    assert_eq!(
+        store().claim_and_read(&id).await?,
+        Some(preview_audit::PreviewAuditRow {
+            outcome: record.outcome,
+            reason: record.reason,
+            created_at: stored,
+        })
+    );
     Ok(())
 }
 
