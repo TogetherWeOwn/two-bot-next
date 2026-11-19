@@ -376,6 +376,9 @@ pub const EXCLUDED_TABLES: &[&str] = &[
     "backfill_history_counts",
     "member_catchup_cursors",
     "member_catchup_members",
+    // Short-lived derived voice calibration, not source data. Restore clears
+    // any target rows rather than mixing them with later observations.
+    "voice_heat_hours",
     // Migration ledgers describe target DDL; replacing them would falsely mark
     // unapplied migrations as applied. Legacy schema_migrations is diagnostic
     // manifest metadata only, never restored application data. The store

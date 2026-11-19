@@ -853,7 +853,25 @@ async fn forget_moderation_history(pool: &PgPool) {
     .unwrap();
 }
 
+async fn seed_voice_heat(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO voice_heat_hours VALUES ('2026-01-01 00:00Z', 3, 6, '2026-01-01 00:10Z')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn assert_voice_heat_cleared(pool: &PgPool) {
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM voice_heat_hours")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0, "restore clears excluded heat rows");
+}
+
 async fn dirty_target(pool: &PgPool) {
+    seed_voice_heat(pool).await;
     sqlx::raw_sql(
         "UPDATE members SET join_source = 'target-only'; \
          INSERT INTO members (guild_id, member_id) VALUES ('100000000000000001', 'target-only-member'); \
@@ -1057,12 +1075,14 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     };
     let pool = db.pool();
     seed(pool).await;
+    seed_voice_heat(pool).await;
     forget_voice_authority_migration(pool).await;
     let control_fields_before = voice_control_fields(pool).await;
     let tables = covered_tables(pool).await;
     let before = snapshot(pool, &tables).await;
-    let ledgers = vec![
+    let ledgers = [
         "_sqlx_migrations".to_owned(),
+        "_two_bot_migrations".to_owned(),
         "schema_migrations".to_owned(),
     ];
     let guard_before = triggers(pool).await;
@@ -1094,6 +1114,8 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     sqlx::raw_sql(
         "CREATE TABLE schema_migrations (id TEXT PRIMARY KEY); \
          INSERT INTO schema_migrations VALUES ('destination-ledger-only'); \
+         CREATE TABLE _two_bot_migrations (version bigint PRIMARY KEY, checksum bytea); \
+         INSERT INTO _two_bot_migrations VALUES (1, decode('ab', 'hex')); \
          ALTER TABLE members ADD COLUMN backup_identity BIGINT GENERATED ALWAYS AS IDENTITY \
              (START WITH 17 INCREMENT BY 3) UNIQUE;",
     )
@@ -1102,6 +1124,25 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
     .unwrap();
     let ledger_before = snapshot(pool, &ledgers).await;
     dirty_target(pool).await;
+    sqlx::raw_sql(
+        "CREATE TABLE heat_dependency (h timestamptz REFERENCES voice_heat_hours);
+         INSERT INTO heat_dependency SELECT hour_start_utc FROM voice_heat_hours;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let heat_tables = ["voice_heat_hours".to_owned(), "heat_dependency".to_owned()];
+    let heat_before = snapshot(pool, &heat_tables).await;
+    match restore(pool, &original).await.unwrap_err() {
+        DbDumpError::Db(error) => assert_sqlstate(&error, "0A000"),
+        other => panic!("restore must not cascade into foreign tables: {other}"),
+    }
+    assert_eq!(snapshot(pool, &heat_tables).await, heat_before);
+    assert_eq!(snapshot(pool, &ledgers).await, ledger_before);
+    sqlx::query("DROP TABLE heat_dependency")
+        .execute(pool)
+        .await
+        .unwrap();
     let cas_before = next_cas_token(pool).await;
     let report = restore(pool, &original).await.unwrap();
     assert!(report.ok);
@@ -1359,6 +1400,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
         .await
         .unwrap();
     assert_eq!(cooldowns, 0, "excluded throttles are not replayed");
+    assert_voice_heat_cleared(pool).await;
     assert_guards_work(pool).await;
 
     let mut reversed = copy_contents(&contents);
@@ -1403,6 +1445,7 @@ async fn every_migrated_row_roundtrips_with_reversed_manifest_and_all_sequence_d
             before,
             "reversed complete rows: {revision_mode}/{audit_mode}"
         );
+        assert_voice_heat_cleared(pool).await;
         assert_fresh_cas_tokens(pool, cas_before).await;
         assert_eq!(
             triggers(pool).await,
@@ -1486,7 +1529,8 @@ async fn historical_contract_archive_preserves_installed_capability_and_restores
     sqlx::raw_sql(
         "CREATE TABLE schema_migrations (id TEXT PRIMARY KEY);
          INSERT INTO schema_migrations VALUES ('destination-ledger-only');
-         UPDATE web_contract_meta SET contract_version = '2.0';",
+         UPDATE web_contract_meta SET contract_version = '2.0';
+         DROP TABLE voice_heat_hours;",
     )
     .execute(pool)
     .await
@@ -2223,6 +2267,7 @@ async fn restore_sql_failures_and_late_sequence_exhaustion_roll_back_data_guards
         set_guard_modes(pool, revision_mode, audit_mode).await;
         for (archive, code) in [(&bad_check_path, "23514"), (&bad_fk_path, "23503")] {
             let before = snapshot(pool, &tables).await;
+            assert_eq!(before["voice_heat_hours"].rows.len(), 1);
             let guards = triggers(pool).await;
             let sequences = sequence_snapshot(pool).await;
             let tokens = cas_tokens(pool).await;
