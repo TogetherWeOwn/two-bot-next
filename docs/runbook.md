@@ -2324,9 +2324,8 @@ authorized [qualification/recovery procedure](staging-rollout-gate.md#full-windo
    `-f inject_unpaired_disconnect=true` for the crash-loop scope).
    Explicit arm/disarm dispatches bypass the hold. A dispatched error-rate
    rehearsal fails without deploying while the hold is armed; do not clear the
-   hold for a proof. The scheduled rollback proof currently refuses before
-   dispatch because enforced exact-SHA admission is unavailable, independent
-   of this hold.
+   hold for a proof. A rollback proof dispatched during the hold
+   fails rather than overriding it.
    The arm run stays red by design: the history guard fails it after a green
    deploy and synthetic so the pin never reads as staging history for the
    head. Read the deploy and synthetic steps, not the run color.
@@ -2914,8 +2913,8 @@ the fence, rollback, takeover and first-ready times, the time-to-ready against
 the workflow's 60 s budget, probe counts, the container image digest and
 instance counts. This workflow interval is not an outage-start recovery
 measurement and cannot prove B2's under-60-second recovery criterion. An empty
-`target_version` instead selects the [daily automatic rollback proof](production-deploy.md#daily-staging-proof),
-which also runs on a daily schedule and verifies both Worker and image restoration.
+`target_version` instead selects the [on-demand automatic rollback proof](production-deploy.md#on-demand-staging-proof),
+which verifies both Worker and image restoration.
 Gateway-session count is not observable from probes; read the Worker logs for it.
 
 The finite-use implementation (see the [first-activation bootstrap](staging-rollout-gate.md#first-activation-roll-forward-bootstrap) and its unmet live gates)

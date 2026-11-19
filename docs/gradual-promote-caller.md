@@ -92,9 +92,8 @@ npm run test:smoke
 
 ## Passive status (read before claiming proof)
 
-- An unconditional admission hold fails before the staging environment is entered.
-  The retained target-lock step also refuses before any Cloudflare call. The
-  pinned caller is a future invocation, not a completed rollout.
+- The target-lock step refuses before any Cloudflare call. The pinned caller
+  is a future invocation, not a completed rollout.
 - What runs today: `bin/smoke.mjs` against staging, plus its contract tests.
 - The pinned action invokes `npx wrangler` from the repository root; this
   repository keeps its locked Wrangler installation under `wrangler/`. The

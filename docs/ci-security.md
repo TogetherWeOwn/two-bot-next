@@ -111,14 +111,9 @@ fall back to raw `max_connections` and label the ceiling as such.
 
 ## Staging rollback drill (manual)
 
-`staging-rollback-drill.yml` has a daily automatic recovery proof and a manual
-[Worker-version rollback](runbook.md#worker-version-rollback) option. The daily
-proof is described in [production-deploy.md](production-deploy.md#daily-staging-proof):
-the proof currently refuses before any dispatch; the retained dispatcher has no
-Cloudflare or ownership credentials. Failed proofs open the `staging-rollback-proof`
-GitHub issue labelled `incident` with the job-scoped `GITHUB_TOKEN`
-(`issues: write`). An independent daily read-only watcher catches
-missing/stale scheduled proof; a healthy check closes any open issue.
+`staging-rollback-drill.yml` offers an [on-demand automatic proof](production-deploy.md#on-demand-staging-proof)
+and a [Worker-version rollback](runbook.md#worker-version-rollback). The proof dispatcher has no Cloudflare
+or ownership credentials. A separate job alerts on failure with `GITHUB_TOKEN` (`issues: write`).
 
 For the manual Worker-only option, pass a named, previously served
 `target_version` (never "latest"). It is an optional string with empty default:
