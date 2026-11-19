@@ -497,7 +497,7 @@ class RollbackRunTests(unittest.TestCase):
             rb.run(GOOD_VERSION, good_image())
         self.assertEqual(gate_started, [900.0])
 
-    def routes(self, serving=BAD_VERSION):
+    def routes(self, serving=BAD_VERSION, *, stale_reads=0):
         prev = rollout_row("r-prev", good_image(), created="2026-10-14T00:00:00Z")
         created = {"n": 0}
 
@@ -516,13 +516,20 @@ class RollbackRunTests(unittest.TestCase):
             routes_state["serving"] = body["versions"][0]["version_id"]
             return {"ok": True}
 
+        def get_deployments():
+            nonlocal stale_reads
+            versions = [routes_state["serving"]]
+            if routes_state["serving"] != serving and stale_reads:
+                stale_reads -= 1
+                versions.insert(0, serving)  # The target in history is not confirmation.
+            rows = [{"versions": [{"version_id": version, "percentage": 100}]}
+                    for version in versions]
+            return {"success": True, "result": {"deployments": rows}}
+
         routes_state = {"serving": serving}
         handler, health = ready_probe(GOOD_VERSION)
         routes = {
-            ("GET", f"/workers/scripts/{WORKER}/deployments"):
-                lambda: {"success": True, "result": {"deployments": [
-                    {"versions": [{"version_id": routes_state["serving"],
-                                   "percentage": 100}]}]}},
+            ("GET", f"/workers/scripts/{WORKER}/deployments"): get_deployments,
             ("POST", f"/workers/scripts/{WORKER}/deployments"): post_deployments,
             ("GET", f"/containers/applications/{APP_ID}/rollouts?limit=100"):
                 lambda: {"success": True, "result": [prev]},
@@ -562,6 +569,61 @@ class RollbackRunTests(unittest.TestCase):
         self.assertEqual(evidence["restored_version"], GOOD_VERSION)
         self.assertEqual(evidence["from_version"], BAD_VERSION)
         self.assertEqual(state["serving"], GOOD_VERSION)
+
+    def test_worker_restore_waits_through_stale_readback_before_image_restore(self):
+        routes, _ = self.routes(stale_reads=2)
+        rb, client, _ = make_rollback(routes)
+        evidence = rb.run(GOOD_VERSION, good_image())
+        path = f"/workers/scripts/{WORKER}/deployments"
+        rollout_path = f"/containers/applications/{APP_ID}/rollouts"
+        calls = [call[:2] for call in client.calls]
+        start = calls.index(("POST", path))
+        end = calls.index(("GET", rollout_path + "?limit=100"))
+        self.assertEqual(calls[start:end], [("POST", path), ("GET", path),
+                                            ("GET", path), ("GET", path)])
+        self.assertEqual(calls.count(("POST", path)), 1)
+        self.assertEqual(evidence["restored_version"], GOOD_VERSION)
+        self.assertEqual(evidence["gate"], "stable-200-gateway-ready")
+
+    def test_worker_restore_exhausts_readback_without_continuing(self):
+        routes, _ = self.routes(stale_reads=100)
+        clock = Clock()
+        control, actions = control_stub()
+        rb, client, log = make_rollback(routes, clock=clock, control=control)
+        with self.assertRaisesRegex(base.GateError, "^rollback_not_active$"):
+            rb.run(GOOD_VERSION, good_image())
+        path = f"/workers/scripts/{WORKER}/deployments"
+        calls = [call[:2] for call in client.calls]
+        start = calls.index(("POST", path))
+        self.assertEqual(calls[start:], [("POST", path)] + [("GET", path)] * 7)
+        self.assertEqual(clock.t, 60)
+        self.assertEqual([action for action, _, _ in actions], ["status", "fence"])
+        self.assertNotIn("worker restored", log.getvalue())
+        self.assertNotIn("restored_version", rb.evidence)
+
+    def test_worker_restore_does_not_retry_readback_errors(self):
+        path = f"/workers/scripts/{WORKER}/deployments"
+        for failure in ("api_http_failure", "split_traffic_deployment", "invalid_version_id"):
+            with self.subTest(failure=failure):
+                routes, _ = self.routes()
+                result = routes[("GET", path)]
+
+                def readback():
+                    if failure == "api_http_failure":
+                        raise base.GateError(failure)
+                    payload = result()
+                    active = payload["result"]["deployments"][0]["versions"][0]
+                    active.update({"percentage": 50} if failure == "split_traffic_deployment"
+                                  else {"version_id": "malformed"})
+                    return payload
+
+                routes[("GET", path)] = readback
+                rb, client, log = make_rollback(routes)
+                with self.assertRaisesRegex(base.GateError, f"^{failure}$"):
+                    rb.restore_worker(GOOD_VERSION)
+                self.assertEqual([call[:2] for call in client.calls],
+                                 [("POST", path), ("GET", path)])
+                self.assertNotIn("worker restored", log.getvalue())
 
     def test_worker_leg_skipped_when_already_restored(self):
         routes, _ = self.routes(serving=GOOD_VERSION)
