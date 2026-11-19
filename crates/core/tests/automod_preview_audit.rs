@@ -120,15 +120,18 @@ async fn sql_preview_store_releases_a_live_claim_at_its_deadline(
 async fn verify_live_claim_expiry(pool: PgPool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(MIGRATION).execute(&pool).await?;
     let id = preview_audit::preview_audit_id("live-claim-999");
-    let deadline = Instant::now() + Duration::from_millis(500);
+    let deadline = Instant::now() + Duration::from_millis(1_500);
     let mut holder = SqlPreviewStore::new(&pool, deadline);
     assert_eq!(holder.claim_and_read(&id).await?, None);
 
-    // Keep the holder alive across the wait. The contender's 750ms lock
-    // timeout fits after the caller deadline but before the 2s idle backstop.
+    // Expire the original client budget with the holder still alive. PostgreSQL
+    // uses real time, so its relative idle timer does not advance with Tokio.
+    // The contender's 750ms lock timeout is shorter than either idle timeout.
+    tokio::time::pause();
+    tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
+    tokio::time::resume();
     let mut contender = SqlPreviewStore::new(&pool, Instant::now() + Duration::from_secs(5));
     assert_eq!(contender.claim_and_read(&id).await?, None);
-    tokio::time::sleep_until(deadline).await;
     let error = holder
         .insert_and_commit(matched_record(), &id, AT)
         .await
@@ -177,6 +180,14 @@ async fn verify_sql_preview_store(pool: PgPool) -> Result<(), sqlx::Error> {
         .insert_and_commit(matched_record(), "automod-preview:wrong", AT)
         .await
         .is_err());
+
+    let mut cancelled = store();
+    assert_eq!(cancelled.claim_and_read(&id).await?, None);
+    let mut commit = Box::pin(cancelled.insert_and_commit(matched_record(), &id, AT));
+    // This test's single-threaded runtime cannot run the claim task before the
+    // commit future is dropped. An already queued insert must not commit.
+    assert!(futures_util::poll!(&mut commit).is_pending());
+    drop(commit);
 
     let mut retry = store();
     assert_eq!(retry.claim_and_read(&id).await?, None);
