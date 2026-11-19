@@ -10,6 +10,39 @@ use super::manifest_references::manifest_references_are_valid;
 use super::ReadSlot;
 use sha2::{Digest, Sha256};
 
+/// Inputs for one manifest; callers must establish the expected inputs independently.
+#[derive(Clone, Copy)]
+pub struct ManifestInputs<'a> {
+    pub candidate_sha: &'a str,
+    pub slots: &'a [ReadSlot],
+    pub routes: &'a [ManifestRoute<'a>],
+    pub journeys: &'a [ManifestJourney<'a>],
+}
+
+/// Compares separately assembled canonical manifests. A match is not evidence of
+/// provenance, completeness, authorization, or a watch PASS. Runtime callers must
+/// independently derive and authenticate the candidate-bound expected inputs.
+pub fn manifest_matches_expected(
+    proposed: &ManifestInputs<'_>,
+    expected: Option<&ManifestInputs<'_>>,
+) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    let encode = |input: &ManifestInputs<'_>| {
+        encode_manifest(
+            input.candidate_sha,
+            input.slots,
+            input.routes,
+            input.journeys,
+        )
+    };
+    match (encode(proposed), encode(expected)) {
+        (Some(proposed), Some(expected)) => proposed == expected,
+        _ => false,
+    }
+}
+
 /// Hashes an assembled, structurally validated manifest with the v1 domain.
 /// This does not establish provenance, expected-set completeness, envelope size,
 /// request binding, authentication, authorization, or a watch PASS.
@@ -77,6 +110,82 @@ mod tests {
             evidence_contract_sha256: JOURNEY_HASH,
             route_ids,
         }
+    }
+
+    #[test]
+    fn compares_only_valid_independent_manifest_inputs() {
+        let slots = plan();
+        let routes = [route("a"), route("b")];
+        let journeys = [journey("a", &["a", "b"])];
+        let expected = ManifestInputs {
+            candidate_sha: SHA,
+            slots: &slots,
+            routes: &routes,
+            journeys: &journeys,
+        };
+        let same_routes = [route("a"), route("b")];
+        let same_journeys = [journey("a", &["a", "b"])];
+        let proposed = ManifestInputs {
+            candidate_sha: SHA,
+            slots: &slots,
+            routes: &same_routes,
+            journeys: &same_journeys,
+        };
+        assert!(manifest_matches_expected(&proposed, Some(&expected)));
+        assert!(!manifest_matches_expected(&proposed, None));
+
+        let reduced_routes = [route("a")];
+        let reduced_journeys = [journey("a", &["a"])];
+        let reduced = ManifestInputs {
+            candidate_sha: SHA,
+            slots: &slots,
+            routes: &reduced_routes,
+            journeys: &reduced_journeys,
+        };
+        assert!(manifest_digest(SHA, &slots, &reduced_routes, &reduced_journeys).is_some());
+        assert!(!manifest_matches_expected(&reduced, Some(&expected)));
+
+        let changed_routes = [
+            route("a"),
+            ManifestRoute {
+                evidence_contract_sha256: JOURNEY_HASH,
+                ..route("b")
+            },
+        ];
+        let changed_journeys = [journey("a", &["a"]), journey("b", &["b"])];
+        let changed_mapping = [journey("a", &["b"]), journey("b", &["a"])];
+        for different in [
+            ManifestInputs {
+                candidate_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ..proposed
+            },
+            ManifestInputs {
+                routes: &changed_routes,
+                ..proposed
+            },
+            ManifestInputs {
+                journeys: &changed_journeys,
+                ..proposed
+            },
+        ] {
+            assert!(!manifest_matches_expected(&different, Some(&expected)));
+        }
+        let mapped = ManifestInputs {
+            journeys: &changed_journeys,
+            ..proposed
+        };
+        let remapped = ManifestInputs {
+            journeys: &changed_mapping,
+            ..proposed
+        };
+        assert!(!manifest_matches_expected(&remapped, Some(&mapped)));
+        let invalid = ManifestInputs {
+            candidate_sha: "BAD",
+            ..proposed
+        };
+        assert!(!manifest_matches_expected(&invalid, Some(&expected)));
+        assert!(!manifest_matches_expected(&proposed, Some(&invalid)));
+        assert!(!manifest_matches_expected(&invalid, Some(&invalid)));
     }
 
     #[test]
