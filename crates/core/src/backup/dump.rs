@@ -46,6 +46,9 @@ pub enum DbDumpError {
     Refused(String),
 }
 
+/// Derived tables omitted from archives but cleared along with restored data.
+const CLEARED_EXCLUDED_TABLES: &[&str] = &["voice_heat_hours"];
+
 /// Total, locale-independent order even for composite keys or tables without
 /// a primary key. Text output is the archive's representation; equal sort keys
 /// therefore mean identical archived rows (including JSON and binary columns).
@@ -72,8 +75,8 @@ fn batch_size_for(column_count: usize) -> usize {
 ///
 /// Audit, in one place so every interpolation site shares it: each
 /// interpolated identifier is either an [`is_dump_table`] allowlist member
-/// (re-checked at every call site, including the restore path that reads
-/// table names out of the file) or came from the target database itself
+/// (re-checked for file-supplied names), a fixed restore-only name from
+/// `CLEARED_EXCLUDED_TABLES`, or came from the target database itself
 /// (`information_schema` / `pg_attribute`) and is double-quote-escaped;
 /// limits/offsets are integers; row values travel only as bound parameters.
 /// File-supplied *values* never reach this function.
@@ -514,6 +517,22 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
             target_tables.push(*name);
         }
     }
+    // Historical targets need not have the excluded tables. When present,
+    // include them in both the lock and truncate sets, not the replay set.
+    let mut cleared_tables = target_tables.clone();
+    for &name in CLEARED_EXCLUDED_TABLES {
+        // Catalog existence is independent of column visibility: a permission
+        // gap must fail on lock/truncate, not silently keep the old rows.
+        let exists: bool = sqlx::query_scalar(
+            "SELECT to_regclass(format('%I.%I', current_schema(), $1::text)) IS NOT NULL",
+        )
+        .bind(name)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists {
+            cleared_tables.push(name);
+        }
+    }
     // Lock before changing guards. Only two named application triggers are
     // suspended, never FK/check constraints or session_replication_role. ALTER
     // TABLE is transactional: error/cancellation rolls back data AND guards.
@@ -521,7 +540,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     // https://www.postgresql.org/docs/16/sql-altertable.html
     sqlx::query(audited(format!(
         "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
-        target_tables.join(", ")
+        cleared_tables.join(", ")
     )))
     .execute(&mut *tx)
     .await?;
@@ -600,7 +619,7 @@ pub async fn restore(pool: &PgPool, in_path: &Path) -> Result<RestoreReport, DbD
     // A single explicit truncate covers all FK dependencies, without CASCADE
     // touching foreign/website tables. No RESTART IDENTITY: that would discard
     // the target's own high-water mark, which the restarts below preserve.
-    sqlx::query(audited(format!("TRUNCATE {}", target_tables.join(", "))))
+    sqlx::query(audited(format!("TRUNCATE {}", cleared_tables.join(", "))))
         .execute(&mut *tx)
         .await?;
     // Cooldowns are intentionally not archived; discard stale target throttles.
