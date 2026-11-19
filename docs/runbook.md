@@ -2913,8 +2913,8 @@ the fence, rollback, takeover and first-ready times, the time-to-ready against
 the workflow's 60 s budget, probe counts, the container image digest and
 instance counts. This workflow interval is not an outage-start recovery
 measurement and cannot prove B2's under-60-second recovery criterion. An empty
-`target_version` instead selects the [daily automatic rollback proof](production-deploy.md#daily-staging-proof),
-which also runs on a daily schedule and verifies both Worker and image restoration.
+`target_version` instead selects the [on-demand automatic rollback proof](production-deploy.md#on-demand-staging-proof),
+which verifies both Worker and image restoration.
 Gateway-session count is not observable from probes; read the Worker logs for it.
 
 The finite-use implementation (see the [first-activation bootstrap](staging-rollout-gate.md#first-activation-roll-forward-bootstrap) and its unmet live gates)
