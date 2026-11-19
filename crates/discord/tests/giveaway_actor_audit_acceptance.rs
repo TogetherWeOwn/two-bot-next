@@ -152,7 +152,7 @@ fn command(
     serde_json::from_value(json!({
         "application_id": "1111", "authorizing_integration_owners": {"0": guild},
         "id": seq.to_string(), "token": "fixture-interaction-token", "type": 2,
-        "version": 1, "guild_id": guild, "channel": {"id": CHANNEL, "type": 0},
+        "version": 1, "attachment_size_limit": 10485760, "guild_id": guild, "channel": {"id": CHANNEL, "type": 0},
         "member": {"permissions": PERM_MANAGE_GUILD.to_string(), "roles": [],
             "deaf": false, "mute": false, "flags": 0,
             "user": {"id": actor, "username": "staff", "discriminator": "0"}},

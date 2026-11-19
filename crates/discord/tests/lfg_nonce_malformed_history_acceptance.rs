@@ -453,7 +453,7 @@ mod routed {
             "member": {"user": {"id": "3333", "username": "member", "discriminator": "0", "avatar": null},
                 "roles": [], "joined_at": null, "deaf": false, "mute": false, "flags": 0,
                 "permissions": PERM_MANAGE_EVENTS.to_string()},
-            "token": "lfg-mock-token", "version": 1, "entitlements": [],
+            "token": "lfg-mock-token", "version": 1, "entitlements": [], "attachment_size_limit": 10485760,
             "authorizing_integration_owners": {},
             "data": {"id": "1", "name": "lfg", "type": 1, "options": [
                 {"type": 3, "name": "title", "value": "Friday raid"},

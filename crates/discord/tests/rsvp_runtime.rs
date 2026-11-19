@@ -1,6 +1,8 @@
 //! Shared route → sqlx store → shared executor acceptance, never live Discord.
 #![cfg(feature = "db")]
 
+#[path = "common/attendance_reply.rs"]
+mod attendance_reply;
 #[allow(dead_code)]
 mod common;
 
@@ -15,7 +17,8 @@ use two_bot_core::{
     ClassifierConfig, InteractionRouter, RouterGates, ANNOUNCEMENTS_DISABLED_REPLY,
 };
 use two_bot_discord::{
-    interactions::InteractionRuntime, rsvp::handle_rsvp_interaction, ActionExecutor,
+    brand::EmbedKind, interactions::InteractionRuntime, rsvp::handle_rsvp_interaction,
+    ActionExecutor,
 };
 use two_bot_testsupport::TestDatabase;
 
@@ -58,7 +61,7 @@ fn router() -> InteractionRouter {
 
 fn slash(id: u64, name: &str, permissions: u64, options: Value) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
+        "application_id": "1111", "attachment_size_limit": 10485760, "authorizing_integration_owners": {"0": GUILD},
         "id": id.to_string(), "token": "mock-rsvp-token", "type": 2,
         "version": 1, "guild_id": GUILD,
         "member": {"permissions": permissions.to_string(), "roles": [],
@@ -291,6 +294,14 @@ fn assert_single_failure(failures: Vec<Value>, write: &str) {
 }
 
 fn assert_reply(mock: &MockRest, content: &str, deferred: bool) {
+    assert_reply_kind(mock, content, deferred, EmbedKind::Danger);
+}
+
+fn assert_success_reply(mock: &MockRest, content: &str) {
+    assert_reply_kind(mock, content, true, EmbedKind::Ok);
+}
+
+fn assert_reply_kind(mock: &MockRest, content: &str, deferred: bool, kind: EmbedKind) {
     let requests = mock.requests();
     let last = requests.last().unwrap();
     let body: Value = serde_json::from_slice(&last.body).unwrap();
@@ -300,18 +311,9 @@ fn assert_reply(mock: &MockRest, content: &str, deferred: bool) {
             last.path,
             "/api/v10/webhooks/1111/mock-rsvp-token/messages/@original"
         );
-        if content.starts_with("RSVP saved:") {
-            // Event-link confirmations may append the stable numeric identity.
-            // Keep the existing status sentence and every refusal oracle intact;
-            // the protected link tests independently require the event identity.
-            let actual = body["content"].as_str().expect("RSVP confirmation");
-            assert!(
-                actual == content || (actual.starts_with(content) && actual.contains(EVENT)),
-                "expected the saved status, optionally followed by event identity: {actual}"
-            );
-        } else {
-            assert_eq!(body["content"], content);
-        }
+        // This fixture supplies a numeric event ID, not a pasted link; the
+        // latter's appended event identity is covered by the link fixtures.
+        assert_eq!(attendance_reply::deferred_text(&body, kind), content);
         // Executor defaults continue to suppress mentions on deferred edits.
         assert_eq!(body["allowed_mentions"]["parse"], json!([]));
     } else {
@@ -392,7 +394,7 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
         .enumerate()
     {
         run(fixture.pool(), &mock, &rsvp(100 + i as u64, status)).await;
-        assert_reply(&mock, want, true);
+        assert_success_reply(&mock, want);
         let stored: String = sqlx::query_scalar(
             "SELECT status FROM event_rsvps WHERE guild_id=$1 AND event_id=$2 AND user_id=$3",
         )
@@ -424,10 +426,9 @@ async fn transitions_totals_and_audits_round_trip_through_router() {
         ),
     )
     .await;
-    assert_reply(
+    assert_success_reply(
         &mock,
         &format!("Stored RSVPs for event `{EVENT}`\nGoing: 0\nInterested: 0\nDeclined: 1\nYour saved response: Declined\nSaved: <t:{saved_epoch}:f>\nHistorical saved responses; live event availability is not checked."),
-        true,
     );
     assert_eq!(counts(fixture.pool()).await, (1, 4, 0));
     let audits: Vec<(String, String, String, String)> = sqlx::query_as(
@@ -652,10 +653,9 @@ async fn totals_remain_readable_without_live_event_access() {
             ),
         )
         .await;
-        assert_reply(
+        assert_success_reply(
             &mock,
             &format!("Stored RSVPs for event `{EVENT}`\nGoing: 1\nInterested: 0\nDeclined: 0\nYour saved response: Going\nSaved: <t:1577934245:f>\nHistorical saved responses; live event availability is not checked."),
-            true,
         );
         assert_eq!(mock.requests().len(), 2);
         assert!(mock.requests().iter().all(|r| r.method != "GET"));
@@ -793,10 +793,9 @@ async fn host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof() 
         &attendance(400, MANAGE_EVENTS, USER, &format!(" {occ} ")),
     )
     .await;
-    assert_reply(
+    assert_success_reply(
         &mock,
         &format!("Recorded <@{USER}> for event occurrence `{occ}`."),
-        true,
     );
     run(
         fixture.pool(),
@@ -804,10 +803,9 @@ async fn host_checkin_authorized_self_and_on_behalf_retain_host_checkin_proof() 
         &attendance(401, MANAGE_EVENTS, USER, &occ),
     )
     .await;
-    assert_reply(
+    assert_success_reply(
         &mock,
         &format!("Attendance for <@{USER}> and event occurrence `{occ}` was already recorded."),
-        true,
     );
     run(
         fixture.pool(),
@@ -1297,11 +1295,7 @@ async fn failed_final_reply_does_not_retry_committed_effects() {
         .handle(&attendance(602, MANAGE_EVENTS, USER, &occ))
         .await
         .unwrap());
-    assert_reply(
-        &mock,
-        &two_bot_core::checkin_duplicate_text(USER, &occ),
-        true,
-    );
+    assert_success_reply(&mock, &two_bot_core::checkin_duplicate_text(USER, &occ));
     // The duplicate adds no fact and no audit row.
     assert_eq!(counts(fixture.pool()).await, (1, 2, 1));
     fixture.close().await;
@@ -1394,7 +1388,7 @@ async fn rsvp_refused_rewrite_restores_previous_response() {
     )
     .await;
     run(fixture.pool(), &saved, &rsvp(810, "going")).await;
-    assert_reply(&saved, "RSVP saved: going.", true);
+    assert_success_reply(&saved, "RSVP saved: going.");
     assert_eq!(saved.requests().len(), 6);
     saved.shutdown().await;
     let before: (String, String) = sqlx::query_as(
@@ -2090,7 +2084,7 @@ fn candidate_runtime_with_router(router: InteractionRouter, mock: &MockRest) -> 
 /// returns `None` even though the wire name reads `rsvp`.
 fn identity_mismatched_rsvp(id: u64) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
+        "application_id": "1111", "attachment_size_limit": 10485760, "authorizing_integration_owners": {"0": GUILD},
         "id": id.to_string(), "token": "mock-rsvp-token", "type": 2,
         "version": 1, "guild_id": GUILD,
         "member": {"permissions": "0", "roles": [],
@@ -2109,7 +2103,7 @@ fn identity_mismatched_rsvp(id: u64) -> Interaction {
 /// never owns: `resolve_interaction` passes it through, but it is not slash.
 fn component_interaction(id: u64) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
+        "application_id": "1111", "attachment_size_limit": 10485760, "authorizing_integration_owners": {"0": GUILD},
         "id": id.to_string(), "token": "mock-rsvp-token", "type": 3,
         "version": 1, "guild_id": GUILD,
         "member": {"permissions": "0", "roles": [],

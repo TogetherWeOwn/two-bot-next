@@ -71,10 +71,11 @@ ACTIVE-hour or one-minute-sample evidence gaps above.
 
 ## Deployment interruption and recovery gap
 
-The current staging deploy workflow documents a **95–139-second gateway drop
-per deploy** ([workflow comment](../.github/workflows/deploy-staging.yml#L10)); a
-separate historical staging note records a **92–139-second redeploy**
-([boot window](discord-send-admission.md#boot-window)). Keep both labelled as
+A [historical staging workflow comment](https://github.com/TogetherWeOwn/two-bot-next/blob/057a4b2cc0d67439c92eded1d25421852d32840f/.github/workflows/deploy-staging.yml#L10-L12)
+warns of a **95–139-second gateway drop per deploy**. A separate historical
+staging note records a **92–139-second redeploy**
+([boot-window record](discord-send-admission.md#cancellation-crash-unavailable-storage-and-recovery)).
+Keep both labelled as
 documented historical interruption ranges, not as a verified
 outage-start-to-recovery measurement. **Interrupting planned redeploys count as
 actual outages by default**. Those historical ranges exceed the under-60-second

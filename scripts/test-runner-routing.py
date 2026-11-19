@@ -40,7 +40,7 @@ def jobs(text):
     return found
 
 
-def violations(text):
+def violations(text, workflow_name=None):
     """Reject indirect or nonstandard runners, including dormant routing."""
     problems = []
     for job, lines in jobs(text).items():
@@ -49,6 +49,9 @@ def violations(text):
             for line in lines
             if re.match(r"^    [A-Za-z0-9_-]+:", line)
         }
+        if workflow_name == "voice-rest-measurement.yml" and job == "voice-first":
+            if keys.get("uses", "").split(" #", 1)[0] != "./.github/workflows/voice-synthetic.yml":
+                problems.append(f"{job}: reusable target changed")
         if "uses" in keys:
             # A reusable-workflow call has no runner; the called file is checked.
             if "runs-on" in keys:
@@ -79,7 +82,7 @@ class RepositoryWorkflowTests(unittest.TestCase):
         hosted_jobs = 0
         for path in files:
             text = path.read_text()
-            self.assertEqual(violations(text), [], path.name)
+            self.assertEqual(violations(text, path.name), [], path.name)
             hosted_jobs += text.count(f"    runs-on: {PUBLIC_RUNNER}")
         self.assertGreaterEqual(hosted_jobs, 88)
 

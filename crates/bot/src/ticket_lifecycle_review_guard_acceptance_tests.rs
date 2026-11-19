@@ -142,7 +142,7 @@ fn button(
         TicketAction::Close => TICKET_CLOSE_ID,
     };
     serde_json::from_value(json!({
-        "application_id":"400", "authorizing_integration_owners":{"0":guild},
+        "application_id":"400", "attachment_size_limit":10485760, "authorizing_integration_owners":{"0":guild},
         "id":"800", "token":"ticket-test-interaction-token", "type":3, "version":1,
         "guild_id":guild, "channel":{"id":"600","type":0,"name":"ticket-member","permissions":"0"},
         "data":{"custom_id":custom_id,"component_type":2},
@@ -165,7 +165,7 @@ fn button_without_user(action: TicketAction, guild: &str, roles: Vec<&str>) -> I
         TicketAction::Close => TICKET_CLOSE_ID,
     };
     serde_json::from_value(json!({
-        "application_id":"400", "authorizing_integration_owners":{"0":guild},
+        "application_id":"400", "attachment_size_limit":10485760, "authorizing_integration_owners":{"0":guild},
         "id":"801", "token":"ticket-test-interaction-token", "type":3, "version":1,
         "guild_id":guild, "channel":{"id":"600","type":0,"name":"ticket-member","permissions":"0"},
         "data":{"custom_id":custom_id,"component_type":2},

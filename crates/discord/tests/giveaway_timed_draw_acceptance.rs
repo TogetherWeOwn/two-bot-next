@@ -148,7 +148,7 @@ fn slash(id: u64, user: &str, name: &str, permissions: u64, options: Value) -> I
     serde_json::from_value(json!({
         "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
         "id": id.to_string(), "token": "mock-giveaway-token", "type": 2,
-        "version": 1, "guild_id": GUILD, "channel": {"id": CHANNEL, "type": 0},
+        "version": 1, "attachment_size_limit": 10485760, "guild_id": GUILD, "channel": {"id": CHANNEL, "type": 0},
         "member": {"permissions": permissions.to_string(), "roles": [],
             "deaf": false, "mute": false, "flags": 0,
             "user": {"id": user, "username": "member", "discriminator": "0"}},
@@ -167,7 +167,7 @@ fn button(id: u64, user: &str, custom_id: &str) -> Interaction {
     serde_json::from_value(json!({
         "application_id": "1111", "authorizing_integration_owners": {"0": GUILD},
         "id": id.to_string(), "token": "mock-giveaway-token", "type": 3,
-        "version": 1, "guild_id": GUILD, "channel": {"id": CHANNEL, "type": 0},
+        "version": 1, "attachment_size_limit": 10485760, "guild_id": GUILD, "channel": {"id": CHANNEL, "type": 0},
         "member": {"permissions": "0", "roles": [],
             "deaf": false, "mute": false, "flags": 0,
             "user": {"id": user, "username": "member", "discriminator": "0"}},

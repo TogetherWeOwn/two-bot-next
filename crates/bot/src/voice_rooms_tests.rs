@@ -2654,6 +2654,128 @@ fn owned_room_for_guild(guild: u64) -> (LiveGuild, Store, Http, Trace) {
 }
 
 #[tokio::test]
+async fn ownership_classifies_outcomes_at_decision() {
+    use two_bot_discord::brand::EmbedKind;
+
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    worker.live.write_state().ready = false;
+    let (text, kind) = worker.apply_ownership_classified(MEMBER, false, OwnershipCommand::Reclaim);
+    assert_eq!(
+        text,
+        "The voice worker isn't warmed up yet — try again in a moment."
+    );
+    assert_eq!(kind, EmbedKind::Warn);
+    worker.live.write_state().ready = true;
+    let (text, kind) = worker.apply_ownership_classified(302, false, OwnershipCommand::Reclaim);
+    assert_eq!(text, "You need to be in a voice room to use /reclaim.");
+    assert_eq!(kind, EmbedKind::Danger);
+    let (text, kind) = worker.apply_ownership_classified(301, false, OwnershipCommand::Reclaim);
+    assert!(text.contains("original creator"));
+    assert_eq!(kind, EmbedKind::Danger);
+    let (text, kind) = worker.apply_ownership_classified(MEMBER, false, OwnershipCommand::Reclaim);
+    assert_eq!(text, "You're already the owner of this room.");
+    assert_eq!(kind, EmbedKind::Ok);
+    let (text, kind) = worker.apply_ownership_classified(
+        MEMBER,
+        false,
+        OwnershipCommand::Transfer { target_id: 301 },
+    );
+    assert_eq!(text, "Transferred ownership of this room to <@301>.");
+    assert_eq!(kind, EmbedKind::Ok);
+    worker.halted = true;
+    let (text, kind) = worker.apply_ownership_classified(MEMBER, false, OwnershipCommand::Reclaim);
+    assert!(text.starts_with("Voice rooms are paused"));
+    assert_eq!(kind, EmbedKind::Danger);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ownership_worker_routes_classification_through_commit_and_timeout() {
+    use two_bot_discord::brand::EmbedKind;
+
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
+    for (actor_id, command, expected) in [
+        (302, OwnershipCommand::Reclaim, EmbedKind::Danger),
+        (MEMBER, OwnershipCommand::Reclaim, EmbedKind::Ok),
+        (
+            MEMBER,
+            OwnershipCommand::Transfer { target_id: 301 },
+            EmbedKind::Ok,
+        ),
+    ] {
+        let (reply, text) = oneshot::channel();
+        let (kind, result_kind) = oneshot::channel();
+        apply_command(
+            &mut worker,
+            ActorCommand::Ownership {
+                actor_id,
+                is_admin: false,
+                command,
+                reply,
+                kind: Some(kind),
+            },
+            0,
+            &ActorInboxBackpressure::default(),
+        );
+        worker.drive_staged_ownership(0).await;
+        assert!(!text.await.unwrap().is_empty());
+        assert_eq!(result_kind.await.unwrap(), expected);
+    }
+    assert!(worker.queue.suspend(GUILD, 500));
+    let (reply, text) = oneshot::channel();
+    let (kind, result_kind) = oneshot::channel();
+    apply_command(
+        &mut worker,
+        ActorCommand::Ownership {
+            actor_id: 301,
+            is_admin: false,
+            command: OwnershipCommand::Transfer { target_id: MEMBER },
+            reply,
+            kind: Some(kind),
+        },
+        0,
+        &ActorInboxBackpressure::default(),
+    );
+    worker.drive_staged_ownership(0).await;
+    assert_eq!(text.await.unwrap(), OWNERSHIP_FINALIZING);
+    assert_eq!(result_kind.await.unwrap(), EmbedKind::Warn);
+}
+
+#[tokio::test]
+async fn classified_ownership_reaches_deferred_caller() {
+    use two_bot_discord::brand::EmbedKind;
+
+    let runtime = test_runtime(Trace::default());
+    let (live, store, http, _) = owned_room();
+    let mut worker = GuildRoomWorker::load(live.clone(), store, http)
+        .await
+        .unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    runtime.actors.lock().unwrap().insert(
+        GUILD,
+        GuildActor {
+            live,
+            tx,
+            backpressure: ActorInboxBackpressure::default(),
+        },
+    );
+    let call = runtime.run_ownership_classified(GUILD, 302, false, OwnershipCommand::Reclaim);
+    let dispatch = async {
+        let command = rx.recv().await.unwrap();
+        apply_command(&mut worker, command, 0, &ActorInboxBackpressure::default());
+    };
+    let (result, ()) = tokio::join!(call, dispatch);
+    assert_eq!(
+        result,
+        Some((
+            "You need to be in a voice room to use /reclaim.".to_owned(),
+            EmbedKind::Danger
+        ))
+    );
+}
+
+#[tokio::test]
 async fn reclaim_hands_room_back_to_returned_creator_and_persists() {
     let (live, store, http, trace) = owned_room();
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
@@ -2767,6 +2889,7 @@ async fn suspended_room_transfer_reports_finalizing_and_keeps_the_handoff_queued
     // must answer from the pump deadline, not hang on the queue.
     assert!(worker.queue.suspend(GUILD, 500));
     let (reply, inbox) = oneshot::channel();
+    let (kind, kind_inbox) = oneshot::channel();
     apply_command(
         &mut worker,
         ActorCommand::Ownership {
@@ -2774,12 +2897,14 @@ async fn suspended_room_transfer_reports_finalizing_and_keeps_the_handoff_queued
             is_admin: false,
             command: OwnershipCommand::Transfer { target_id: 301 },
             reply,
+            kind: Some(kind),
         },
         0,
         &ActorInboxBackpressure::default(),
     );
     worker.drive_staged_ownership(0).await;
     assert_eq!(inbox.await.unwrap(), OWNERSHIP_FINALIZING);
+    assert_eq!(kind_inbox.await.unwrap(), EmbedKind::Warn);
     assert!(
         worker.ownership_queued.contains(&500),
         "an unconfirmed handoff stays queued for retry"
@@ -2793,6 +2918,7 @@ async fn held_owner_grant_reports_finalizing_before_the_write_finishes() {
     http.overwrites_gate = Some(gate.clone());
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     let (reply, inbox) = oneshot::channel();
+    let (kind, kind_inbox) = oneshot::channel();
     apply_command(
         &mut worker,
         ActorCommand::Ownership {
@@ -2800,6 +2926,7 @@ async fn held_owner_grant_reports_finalizing_before_the_write_finishes() {
             is_admin: false,
             command: OwnershipCommand::Transfer { target_id: 301 },
             reply,
+            kind: Some(kind),
         },
         0,
         &ActorInboxBackpressure::default(),
@@ -2813,6 +2940,7 @@ async fn held_owner_grant_reports_finalizing_before_the_write_finishes() {
         let text = response
             .expect("reply before the held grant finishes")
             .unwrap();
+        assert_eq!(kind_inbox.await.unwrap(), EmbedKind::Warn);
         assert!(
             text.contains("Recorded") && text.contains("finalized"),
             "{text}"
@@ -2847,6 +2975,7 @@ async fn held_owner_grant_with_slow_store_still_commits_after_finalizing() {
     store.update_ownership_yields.store(1, Ordering::Relaxed);
     let mut worker = GuildRoomWorker::load(live, store, http).await.unwrap();
     let (reply, inbox) = oneshot::channel();
+    let (kind, kind_inbox) = oneshot::channel();
     apply_command(
         &mut worker,
         ActorCommand::Ownership {
@@ -2854,6 +2983,7 @@ async fn held_owner_grant_with_slow_store_still_commits_after_finalizing() {
             is_admin: false,
             command: OwnershipCommand::Transfer { target_id: 301 },
             reply,
+            kind: Some(kind),
         },
         0,
         &ActorInboxBackpressure::default(),
@@ -2867,6 +2997,7 @@ async fn held_owner_grant_with_slow_store_still_commits_after_finalizing() {
         let text = response
             .expect("reply before the held grant finishes")
             .unwrap();
+        assert_eq!(kind_inbox.await.unwrap(), EmbedKind::Warn);
         assert!(
             text.contains("Recorded") && text.contains("finalized"),
             "{text}"
@@ -5446,6 +5577,7 @@ fn voice_interaction(
     Interaction {
         app_permissions: None,
         application_id: Id::new(1),
+        attachment_size_limit: 10_485_760,
         authorizing_integration_owners: ApplicationIntegrationMap {
             guild: None,
             user: None,
@@ -5480,8 +5612,24 @@ fn response_text(response: &InteractionResponse) -> String {
     response
         .data
         .as_ref()
-        .and_then(|data| data.content.clone())
+        .and_then(|data| {
+            data.content
+                .clone()
+                .or_else(|| data.embeds.as_ref()?.first()?.description.clone())
+        })
         .unwrap_or_default()
+}
+
+fn assert_utility_embed(response: &InteractionResponse, kind: two_bot_discord::brand::EmbedKind) {
+    let data = response.data.as_ref().expect("response data");
+    assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+    assert!(data.content.is_none());
+    let embeds = data.embeds.as_ref().expect("embed");
+    assert_eq!(embeds.len(), 1);
+    assert_eq!(embeds[0].color, Some(kind.color()));
+    let footer = embeds[0].footer.as_ref().expect("footer");
+    assert_eq!(footer.text, "Together We Own · Voice");
+    assert!(footer.icon_url.is_none());
 }
 
 async fn handle_capture<S, H>(
@@ -5695,10 +5843,8 @@ async fn ping_replies_ephemerally_without_touching_store_or_http() {
     assert!(owned);
     let response = response.expect("ping reply");
     assert!(response_text(&response).starts_with("Pong! "));
-    assert_eq!(
-        response.data.as_ref().and_then(|data| data.flags),
-        Some(MessageFlags::EPHEMERAL)
-    );
+    assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Ok);
+    assert!(limit_completion_embed(&interaction, &response).is_some());
     assert!(trace.lock().unwrap().is_empty());
 }
 
@@ -5709,10 +5855,12 @@ async fn invite_renders_the_vanity_code_or_the_fixed_notice() {
     let interaction = voice_interaction(Some(command_data("invite", Vec::new())), None, true);
     let (owned, response) = handle_capture(&runtime, &interaction).await;
     assert!(owned);
+    let response = response.expect("invite reply");
     assert_eq!(
-        response_text(&response.expect("invite reply")),
+        response_text(&response),
         two_bot_core::voice_utilities::NO_INVITE_CONFIGURED
     );
+    assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Warn);
     let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
     let writer = seen.clone();
     handle_voice_interaction_with(&runtime, &interaction, Some("abc-123"), None, |response| {
@@ -5725,6 +5873,28 @@ async fn invite_renders_the_vanity_code_or_the_fixed_notice() {
         response_text(&response),
         "Join the server: https://discord.gg/abc-123"
     );
+    assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Ok);
+    assert!(limit_completion_embed(&interaction, &response).is_some());
+
+    let seen = Arc::new(Mutex::new(None::<InteractionResponse>));
+    let writer = seen.clone();
+    handle_voice_interaction_with(
+        &runtime,
+        &interaction,
+        Some("invalid/code"),
+        None,
+        |response| {
+            *writer.lock().unwrap() = Some(response);
+            async {}
+        },
+    )
+    .await;
+    let response = seen.lock().unwrap().clone().expect("invite reply");
+    assert_eq!(
+        response_text(&response),
+        two_bot_core::voice_utilities::INVALID_INVITE_CODE
+    );
+    assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Danger);
     assert!(trace.lock().unwrap().is_empty());
 }
 
@@ -6547,10 +6717,12 @@ async fn required_role_gates_members_but_never_admins() {
 
     let (owned, response) = handle_capture(&runtime, &ping()).await;
     assert!(owned);
+    let response = response.expect("denial");
     assert_eq!(
-        response_text(&response.expect("denial")),
+        response_text(&response),
         access_denied_text(AccessDenyReason::RequiredRole)
     );
+    assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Danger);
 
     let (_, response) = handle_capture(&runtime, &with_roles(ping(), &[9])).await;
     assert!(response_text(&response.expect("ping")).starts_with("Pong! "));
@@ -6598,7 +6770,9 @@ async fn unreadable_settings_fail_closed_for_members_only() {
     let member = voice_interaction(Some(command_data("ping", Vec::new())), None, true);
     let (owned, response) = handle_capture(&runtime, &member).await;
     assert!(owned);
-    assert!(response_text(&response.expect("notice")).contains("unavailable"));
+    let response = response.expect("notice");
+    assert!(response_text(&response).contains("unavailable"));
+    assert_utility_embed(&response, two_bot_discord::brand::EmbedKind::Warn);
 
     let admin = voice_interaction(
         Some(command_data("ping", Vec::new())),
@@ -13058,6 +13232,7 @@ async fn kick_vote_in_a_shared_room_answers_the_public_ballot_without_defer() {
     );
     let data = completed[0].data.as_ref().expect("ballot body");
     assert_ne!(data.flags, Some(MessageFlags::EPHEMERAL));
+    assert!(data.embeds.is_none());
     let content = data.content.as_deref().unwrap_or_default();
     assert!(content.contains("<@303>"), "{content}");
     assert!(content.contains("too loud"), "{content}");
@@ -13108,9 +13283,130 @@ async fn kick_vote_sink_answers_a_malformed_reason_with_one_private_correction()
         let data = completed[0].data.as_ref().expect("correction body");
         assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL), "{case}");
         assert!(data.components.is_none(), "{case}: no public ballot");
-        let content = data.content.as_deref().unwrap_or_default();
+        assert!(data.content.is_none(), "{case}");
+        let embed = &data.embeds.as_ref().expect("correction embed")[0];
+        let content = embed.description.as_deref().unwrap_or_default();
         assert!(content.contains("reason:"), "{case}: {content}");
+        assert_eq!(
+            embed.color,
+            Some(two_bot_discord::brand::EmbedKind::Danger.color())
+        );
+        let calls = trace.lock().unwrap().clone();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "respond")
+                .count(),
+            1
+        );
+        assert!(!calls
+            .iter()
+            .any(|call| call == "defer" || call == "complete"));
     }
+}
+
+#[tokio::test]
+async fn kick_gate_styles_refusals_without_changing_ballot_buttons() {
+    use two_bot_discord::brand::EmbedKind;
+    for (controls, error, kind, expected) in [
+        (
+            AccessControls {
+                command_roles: [("kick".to_owned(), vec![7])].into(),
+                ..AccessControls::default()
+            },
+            None,
+            EmbedKind::Danger,
+            access_denied_text(AccessDenyReason::CommandRestricted),
+        ),
+        (
+            AccessControls::default(),
+            Some(StoreError::Unavailable),
+            EmbedKind::Warn,
+            "Voice-room settings are unavailable right now. Try again shortly.",
+        ),
+    ] {
+        let runtime = gated_runtime(Trace::default(), controls, error);
+        let kick = kick_sink_interaction(KICK_TARGET, KICK_VOTER);
+        let (owned, response) = handle_capture(&runtime, &kick).await;
+        assert!(owned);
+        let response = response.expect("kick denial");
+        assert_eq!(
+            response.kind,
+            InteractionResponseType::ChannelMessageWithSource
+        );
+        assert_utility_embed(&response, kind);
+        assert_eq!(response_text(&response), expected);
+
+        let ballot = component_interaction("votekick:7000:yes", None, KICK_VOTER);
+        let (owned, response) = handle_capture(&runtime, &ballot).await;
+        assert!(owned);
+        let response = response.expect("ballot denial");
+        assert_eq!(
+            response.kind,
+            InteractionResponseType::ChannelMessageWithSource
+        );
+        let data = response.data.expect("ballot denial data");
+        assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+        assert_eq!(data.content.as_deref(), Some(expected));
+        assert!(data.embeds.is_none());
+    }
+}
+
+#[test]
+fn kick_refusal_embeds_preserve_outcome_and_reply_safety() {
+    use two_bot_discord::brand::EmbedKind;
+    for (refusal, kind) in [
+        (KickRefusal::NotARoom, EmbedKind::Danger),
+        (
+            KickRefusal::Vote(VoteKickError::SelfTarget),
+            EmbedKind::Danger,
+        ),
+        (KickRefusal::Unavailable, EmbedKind::Warn),
+        (KickRefusal::Vote(VoteKickError::Cooldown), EmbedKind::Warn),
+        (
+            KickRefusal::Vote(VoteKickError::AuthorityUnavailable),
+            EmbedKind::Warn,
+        ),
+    ] {
+        let response = kick_refusal_response(refusal);
+        assert_eq!(
+            response.kind,
+            InteractionResponseType::ChannelMessageWithSource
+        );
+        let data = response.data.expect("reply data");
+        assert_eq!(data.flags, Some(MessageFlags::EPHEMERAL));
+        assert!(data.content.is_none());
+        assert!(data.components.is_none());
+        let mentions = data.allowed_mentions.expect("mention safety");
+        assert!(
+            mentions.parse.is_empty() && mentions.users.is_empty() && mentions.roles.is_empty()
+        );
+        assert!(!mentions.replied_user);
+        let embeds = data.embeds.expect("embed");
+        assert_eq!(embeds.len(), 1);
+        let embed = &embeds[0];
+        assert_eq!(
+            embed.description.as_deref(),
+            Some(kick_refusal_text(&refusal))
+        );
+        assert_eq!(embed.color, Some(kind.color()));
+        let footer = embed.footer.as_ref().expect("footer");
+        assert_eq!(footer.text, "Together We Own · Voice");
+        assert!(footer.icon_url.is_none());
+        assert!(embed.title.is_none() && embed.fields.is_empty());
+    }
+    let response = kick_text_response(&"é".repeat(2100), EmbedKind::Warn);
+    let data = response.data.expect("reply data");
+    let embeds = data.embeds.expect("embed");
+    assert_eq!(
+        embeds[0]
+            .description
+            .as_ref()
+            .expect("description")
+            .chars()
+            .count(),
+        2000
+    );
 }
 
 // Every decline sends no callback at all: the router answers instead, so a

@@ -56,7 +56,7 @@ fn slash(id: u64, options: Value) -> Interaction {
         "member": {"user": {"id": "3333", "username": "staff", "discriminator": "0"},
             "roles": [], "deaf": false, "mute": false, "flags": 0,
             "permissions": PERM_MANAGE_GUILD.to_string()},
-        "token": "giveaway-inspect-fixture", "version": 1, "entitlements": [],
+        "token": "giveaway-inspect-fixture", "version": 1, "attachment_size_limit": 10485760, "entitlements": [],
         "authorizing_integration_owners": {},
         "data": {"id": "1", "name": "giveaway", "type": 1, "options": options}
     }))

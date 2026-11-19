@@ -771,6 +771,8 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
     try:
         worker = args.worker or WORKERS[args.variant]
         application = args.application or APPLICATIONS[args.variant]
+        if args.command == "rollback" and args.variant == "staging":
+            require(application == APPLICATIONS["staging"], "staging_application_invalid")
         client = client_factory(env.get("CLOUDFLARE_ACCOUNT_ID"), env.get("CLOUDFLARE_API_TOKEN"))
         if args.command == "snapshot":
             state = build_snapshot(client, worker, application)

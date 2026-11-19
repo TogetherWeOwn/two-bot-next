@@ -56,12 +56,14 @@ guard checks before the deploy job can run. This repository is public, so
 required reviewers work on every plan; no Enterprise plan is needed.
 
 **Deploy.** Leave `sha` empty to promote the commit of the latest successful
-`deploy-staging` run on `main` (the normal case: merges keep superseding pending
-staging runs, so the newest `main` commit is often not staged). The guard then
-applies every rule below to that commit and refuses it if its `ci-ok` or
-`worker check` has not finished green. To deploy a specific commit, dispatch
-with `sha` set to a full 40-character commit (or an unambiguous 7-40 character hex prefix, which the guard resolves to the full commit via the commits API) that is on `main`. That commit needs successful, completed `ci-ok` and `worker check`
-runs from GitHub Actions and a successful `deploy-staging` run. `ci-ok` is the
+`deploy-staging` run on `main`. The newest `main` commit may not have a
+qualifying staging run. The guard applies every rule below to the selected
+commit and refuses it if its `ci-ok` or `worker check` has not finished green.
+To deploy a specific commit, dispatch with `sha` set to a full 40-character
+commit (or an unambiguous 7-40 character hex prefix, which the guard resolves
+to the full commit via the commits API) that is on `main`. That commit needs
+successful, completed `ci-ok` and `worker check` runs from GitHub Actions and
+a successful `deploy-staging` run. `ci-ok` is the
 full verdict over lint, worker checks and every selected Rust/DB test lane;
 a green lint-only `check` job is not enough. The guard enumerates `check.yml`
 runs for the exact SHA without a success filter, selects the newest run number,
@@ -74,12 +76,11 @@ pagination and a run/attempt change during validation fail closed. If a partial
 rerun omits a required job from the current attempt, rerun **all jobs**; do not
 reuse the earlier attempt's receipt. The summary records the admitted run/attempt.
 Staging runs queue in a single concurrency group, so an intermediate commit may
-never stage; the empty-`sha` promotion picks the latest one that did. A push to `main` that touches only docs, root
-markdown or repository chrome (the `paths-ignore` list in `deploy-staging.yml`)
-starts no staging run either, so the newest `main` commit may have no
-`deploy-staging` run: pin the latest commit that changes runtime inputs, or
-dispatch `deploy-staging` for the head you need. Docs-only commits after a
-staged commit change nothing the Worker or container serves.
+never stage; the empty-`sha` promotion picks the latest one that did. A merge
+does not prove staging deployment or qualification. Consult `deploy-staging.yml`
+at the relevant ref for its triggers, and verify completed qualifying evidence
+for the intended exact `main` SHA. If evidence is absent, keep promotion held
+and follow the separately authorized [qualification/recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
 After the reviewer approves (or the automated approval passes), the job:
 
 1. checks out exactly that commit and re-verifies that it is on `origin/main`;
@@ -538,9 +539,14 @@ rollback proofs and an opted-out voice gate never certify. The diagnostic
 `staging-rollout-evidence` upload stays independent and still runs on failure.
 Packaging unsets `WRANGLER_OUTPUT_FILE_PATH`: Wrangler's dry run writes session
 and deploy records too, and must not contaminate the real deploy's single receipt.
-Only **Re-run all jobs** is supported for certification. A partial job rerun can
-reuse an earlier deploy attempt; certification intentionally refuses that old
-build evidence rather than relabeling it as the new current attempt.
+Neither **Re-run all jobs** nor **Re-run failed jobs** can certify: the
+deploy-called voice and help synthetics refuse every rerun, and a partial rerun
+can also reuse earlier deploy evidence. Subject to existing holds and
+authorization, follow the
+[staging qualification and recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
+for the intended exact `main` SHA. An older pin cannot certify a different
+workflow head. Wait for all qualifying jobs and release, and retain the fresh
+receipts.
 
 The certificate contains only a closed version-1 receipt and `modules/`: source
 repository/SHA/run/attempt, original compiled stamps, verified staging Worker and
@@ -606,7 +612,7 @@ verifies the saved module inventory and renders immutable inputs as described
 above. The legacy recovery invocation makes source/build paths absolute and
 sets `image_vars` on the single production container; existing protected tests
 still pin that legacy diff. The lockfile's Wrangler
-(4.156.0) runs the deploy: `wrangler-action` uses the installed version when
+(4.161.0) runs the deploy: `wrangler-action` uses the installed version when
 `wranglerVersion` is omitted, and the job runs `npm ci` first.
 
 The gate polls `/readyz` every 10 seconds for up to 30 attempts. In ordinary
@@ -661,7 +667,11 @@ operator; a failed restore is never a reason to wait for the next deployment.
 ### Daily staging proof
 
 `staging-rollback-drill.yml` runs daily at **03:17 UTC** on `main`. With no manual
-`target_version`, its `proof` job calls `scripts/rollback_proof.py run`, which:
+`target_version`, its `proof` job currently fails before dispatch; its failure
+alert remains active. Retain this refusal until non-mutating Actions evidence and
+independent Security acceptance establish a replacement. No synthetic green is
+qualification. The retained, currently unreachable `scripts/rollback_proof.py run`
+would:
 
 1. Dispatches only `deploy-staging.yml` on `main`, with the existing staging
    error-rate gate rehearsal enabled. No production dispatch or traffic fault
@@ -708,18 +718,10 @@ scheduled proof passes. This independent
 schedule catches a missed drill trigger; an outage of GitHub Actions itself is
 outside these two scheduled checks.
 
-For a reviewed on-demand proof after a repair:
-
-```sh
-# No network, dispatch or mutation:
-python3 scripts/rollback_proof.py run --dry-run
-# Staging only; use the merged main workflow, never a production drill:
-gh workflow run staging-rollback-drill.yml --ref main
-```
-
-Inspect the exact child run and staging state before retrying a failed/timed-out
-proof. The dispatcher never cancels or blindly reruns a mutating child. A manual
-proof is useful evidence, but the freshness watcher requires a scheduled proof.
+Do not dispatch an on-demand proof while this refusal is in place. The local
+`python3 scripts/rollback_proof.py run --dry-run` does not dispatch or qualify a
+proof. Inspect any prior child run and staging state before recovery; the
+freshness watcher requires a scheduled proof, not a manual substitute.
 
 Both gate curls enforce `--max-filesize 65536` (64 KiB). Any transfer
 failure counts as `000`, even if curl reports HTTP 200 and leaves a valid

@@ -130,15 +130,15 @@ tokio-websockets = { version = "0.13", default-features = false, features = [
     "server",
     "sha1_smol",
 ] }
-twilight-cache-inmemory = { version = "0.17", default-features = false }
-twilight-gateway = { version = "0.17", default-features = false, features = [
+twilight-cache-inmemory = { version = "0.18", default-features = false }
+twilight-gateway = { version = "0.18", default-features = false, features = [
     "rustls-platform-verifier",
     "zlib",
 ] }
-twilight-http = { version = "0.17", default-features = false, features = [
+twilight-http = { version = "0.18", default-features = false, features = [
     "rustls-platform-verifier",
 ] }
-twilight-model = "0.17"
+twilight-model = "0.18"
 
 [profile.release]
 # lite Container headroom (256 MiB): favour size over last-percent speed.

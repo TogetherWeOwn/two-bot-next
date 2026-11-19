@@ -92,14 +92,14 @@ finding is fixed or answered with evidence. The author merges only when there is
 no review stage. Pin the merge to that head SHA; record the squash SHA and the
 release decision in the release log.
 
-`main` reaches production through staging and automatic promotion. A path ignored
-by `deploy-staging.yml` does not exempt a merge from production safeguards: even a
-docs-only PR needs a fresh, per-PR Release Manager `request_confirmation` on its
-exact head before merge. Put the confirmation on a child task assigned and
+`main` can reach production through staging and automatic promotion. Staging
+trigger rules do not exempt a merge from production safeguards: even a docs-only
+PR needs a fresh, per-PR Release Manager `request_confirmation` on its exact
+head before merge. Put the confirmation on a child task assigned and
 addressed to the Release Manager (`resolverPolicy: not_creator`). A manual
 production dispatch or rollback needs its own Release Manager confirmation too.
 
-For two-web-next and two-bot-next, staging qualification is the automatic
+For two-web-next and two-bot-next, staging qualification is the
 **post-merge, pre-production exact-main staging/e2e/soak gate** (owner decision
 2026-11-06). Staging accepts only main-ancestor SHAs; an unmerged PR-head staging
 run is not a merge prerequisite. Production promotes only the exact main SHA
@@ -107,13 +107,12 @@ that passes staging deploy, e2e and soak, enforced by the promotion guard. See t
 [production deploy gate](docs/production-deploy.md) and
 [staging rollout gate](docs/staging-rollout-gate.md) for the pipeline evidence.
 This describes the required gate, not a claim that any SHA has qualified.
-Automatic qualification starts on runtime-input pushes to `main`;
-`deploy-staging.yml` ignores docs-only merges. To promote an otherwise unqualified
-exact main SHA, including a docs-only squash SHA, first obtain authorized staging
-dispatch/qualification using the existing
-[dispatch/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
-Do not wait for a docs-only push to trigger it, skip qualification or dispatch
-through an existing hold.
+A merge is not evidence of staging deployment or qualification. Consult
+`deploy-staging.yml` at the relevant ref for its triggers and verify completed
+qualifying evidence for the intended exact `main` SHA. If evidence is absent,
+keep promotion held and follow the separately authorized
+[qualification/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics);
+do not skip qualification or act through an existing hold.
 
 This contract supersedes the earlier artifact-identical staging exception.
 Unmerged-head staging and paired artifact-equality proofs are not substitute
@@ -207,8 +206,9 @@ unchanged, including non-UTF-8 output. Only the closing harness summary supplies
 summary/count evidence; earlier summary-looking child lines are diagnostics.
 The successful closing summary/counts and process exit remain mandatory.
 Missing, empty, duplicate, failed, ignored or unknown result records fail closed.
-The pinned Rust 1.99.1 supports this deprecated flag; recheck its protocol when
-upgrading the toolchain rather than falling back to parsing mixed console output.
+The nightly partition workflow exercises this deprecated flag on the pinned Rust
+toolchain; recheck its protocol when upgrading rather than falling back to parsing
+mixed console output.
 
 Verify a change with an actual executing `pull_request` run on its exact head,
 record each heavy job's time and headroom, and aim for at most 35 minutes per

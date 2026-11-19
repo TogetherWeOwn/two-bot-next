@@ -40,7 +40,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  admission-hold:
+    permissions: {}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Refuse staging use without enforced admission
+        run: |
+          echo "::error::enforced exact-SHA admission is unavailable"
+          exit 1
+
   proof:
+    needs: admission-hold
     name: gradual-promote-proof
     # Only the reviewed harness on main may run; a branch copy can never
     # dispatch against the synthetic target.
@@ -118,7 +129,7 @@ jobs:
       # with the synthetic fixture.
       - name: Gradual promotion via the pinned central action
         id: gradual
-        uses: TogetherWeOwn/.github/actions/gradual-promote@89c290be20c0044efaf6916f28341c76e75fff06
+        uses: TogetherWeOwn/.github/actions/gradual-promote@2ef8ad6447e11d019ac3098bcfd011193b75266a
         with:
           worker-name: two-bot-next-gradual-proof
           version-tag: ${{ inputs.candidate_tag }}

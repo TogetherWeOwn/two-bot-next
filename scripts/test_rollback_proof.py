@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -544,13 +545,18 @@ class PromotionAndHoldTests(unittest.TestCase):
                     self.assertEqual(result[1], {})
 
     def test_daily_rehearsal_honors_the_hold_but_manual_arm_disarm_keeps_exception(self):
-        lines = (Path(__file__).resolve().parents[1] / ".github/workflows/deploy-staging.yml").read_text().splitlines()
-        start = lines.index("      - name: Defer the push while the soak hold is armed")
-        start = lines.index("        run: |", start) + 1
-        end = start
-        while end < len(lines) and (not lines[end].strip() or lines[end].startswith("          ")):
-            end += 1
-        shell = textwrap.dedent("\n".join(lines[start:end]))
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/deploy-staging.yml").read_text()
+        jobs = re.findall(r"^  soak-hold:\n(.*?)(?=^ {0,2}[^ \t\n#]|\Z)", workflow, re.M | re.S)
+        self.assertEqual(len(jobs), 1, "expected exactly one soak-hold job")
+        # Bind to the hold variable within this job, not the step's display name.
+        binding = "          HOLD_UNTIL: ${{ vars.STAGING_SOAK_HOLD_UNTIL }}"
+        steps = re.split(r"^      - ", jobs[0], flags=re.M)[1:]
+        hold_steps = [step for step in steps if binding in step.splitlines()]
+        self.assertEqual(len(hold_steps), 1, "expected exactly one hold step in soak-hold")
+        scripts = re.findall(r"^        run: \|\n((?:^ {10}.*(?:\n|\Z)|^\n)+)", hold_steps[0], re.M)
+        self.assertEqual(len(scripts), 1, "expected exactly one inline script in the soak-hold step")
+        shell = textwrap.dedent(scripts[0])
+        self.assertTrue(shell.strip(), "expected a non-empty soak-hold script")
         now = datetime.now(timezone.utc)
         for rehearsal, hold, expected in (
             ("true", now + timedelta(hours=2), 1), ("false", now + timedelta(hours=2), 0),
