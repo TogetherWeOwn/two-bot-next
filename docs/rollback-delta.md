@@ -93,6 +93,7 @@ from this map, and the acceptance battery pins the JSON encoding):
 | `self_role_exchange_baselines` | `accept-with-reason` | Pinned/retired in place by the legacy-journal path; accepted with a per-event baseline dump comparison (freeze vs rollback) as alternate evidence |
 | `voice_channel_templates`, `voice_game_aliases`, `voice_random_lists`, `voice_random_list_choices`, `voice_logging`, `voice_logging_mention_members`, `voice_logging_mention_roles`, `voice_guild_settings`, `voice_command_roles`, `voice_command_role_members` | `accept-with-reason` | Wholesale-replaced configuration, accepted with the freeze/rollback configuration export pair below as alternate evidence |
 | `voice_creators` | `accept-with-reason` | Accepted with the export pair plus a per-guild full-row dump comparison as alternate evidence (see below) |
+| `voice_heat_hours` | `accept-with-reason` | Timestamps describe observations, not writes; excluded as derived calibration and cleared by restore |
 | `voice_logging_settings`, `voice_access_controls` | `accept-with-reason` | Mutable per-guild settings rows; accepted with the read-back pair below as alternate evidence |
 | `web_contract_meta` | `manual-reconcile-required` | Singleton contract row; a window change is invisible and no alternate measured evidence is named |
 

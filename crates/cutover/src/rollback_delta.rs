@@ -286,6 +286,10 @@ pub const TABLE_SPECS: &[TableSpec] = &[
         table: "voice_creators",
         measure: TableMeasure::Unmeasurable("no timestamp column; creator configuration is upserted in place (see PgRoomStore::add_creator)", DISPOSITION_ACCEPT_WITH_REASON),
     },
+    TableSpec {
+        table: "voice_heat_hours",
+        measure: TableMeasure::Unmeasurable("timestamps record observations, not writes; derived calibration is excluded from backups and discarded on restore", DISPOSITION_ACCEPT_WITH_REASON),
+    },
     // V3 block list (0416): one row per blocked member, stamped on insert; an
     // unblock deletes the row, so only additions are measurable.
     TableSpec { table: "voice_room_blocks", measure: TableMeasure::Columns(&["created_at"]) },
@@ -753,6 +757,9 @@ mod tests {
         // No duplicate specs.
         assert_eq!(specs.len(), TABLE_SPECS.len());
         let mut universe = matrix_tables();
+        // Dormant and migrator-owned, but still needs a recovery disposition.
+        assert!(MATRIX_SQL.contains("('public', 'voice_heat_hours', 'migrator')"));
+        universe.insert("voice_heat_hours".to_owned());
         for table in two_bot_core::backup::DUMP_TABLES {
             universe.insert((*table).to_owned());
         }
