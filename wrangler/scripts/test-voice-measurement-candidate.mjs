@@ -67,7 +67,7 @@ test('candidate CLI is silent on success and refuses missing or mismatched evide
     const paths = ['before', 'middle', 'after', 'candidate', 'grant'].map((name) => join(dir, name));
     const [before, middle, after, candidate, grant] = paths;
     const capturedAt = Date.now();
-    const cliGrant = { ...metadata, expiresAt: new Date(capturedAt + 60 * 60 * 1000).toISOString() };
+    const cliGrant = { ...metadata, note: String.fromCodePoint(0xfffd), expiresAt: new Date(capturedAt + 60 * 60 * 1000).toISOString() };
     const receipts = [5, 9, 16].map((count, i) => receipt(count, capturedAt - (2 - i) * 1000, cliGrant));
     receipts.forEach((value, i) => writeFileSync(paths[i], JSON.stringify(value)));
     writeFileSync(candidate, JSON.stringify(combinedDecision(...receipts)));
@@ -93,6 +93,8 @@ test('candidate CLI is silent on success and refuses missing or mismatched evide
       assert.equal(refused.stderr, 'voice measurement candidate refused\n');
     }
     writeFileSync(grant, JSON.stringify({ ...cliGrant, runId: '7' }));
+    assert.equal(run('true', grant, candidate, before, middle, after).status, 1);
+    writeFileSync(grant, JSON.stringify(cliGrant).replace(cliGrant.note, '\xff'), 'latin1');
     assert.equal(run('true', grant, candidate, before, middle, after).status, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });

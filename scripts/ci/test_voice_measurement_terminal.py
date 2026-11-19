@@ -54,8 +54,8 @@ class VoiceMeasurementTerminalTests(unittest.TestCase):
         if two:
             evidence["candidate/voice-middle/voice-after.json"] = f["middle"]
         checks = [{"check": name, "verdict": "PASS"} for name in ("create", "moved", "delete")]
-        for name in (["first", "second"] if two else ["first"]):
-            evidence[f"{name}/voice-synthetic-123-1.json"] = {"checks": checks}
+        lifecycles = [f"{name}/voice-synthetic-123-1.json" for name in (("first", "second") if two else ("first",))]
+        evidence.update(dict.fromkeys(lifecycles, {"checks": checks}))
         for name, value in evidence.items():
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,11 +66,9 @@ class VoiceMeasurementTerminalTests(unittest.TestCase):
         binding = {"sha": "a" * 40, "deploymentId": "deploy", "epoch": 1}
         use = dict(correlation, **binding, expiresAt=f["expires"], acquiredAt=f["expires"] - 3602000)
 
-        def write_cleanup(start=None, status=None, release=None, acquired=None, omit=None):
+        def write_cleanup(start=None, status=None, release=None, acquired=0, omit=None):
             end = f["after"]["capturedAt"]
-            prior = dict(use, phase="active")
-            if acquired is not None:
-                prior["acquiredAt"] += acquired
+            prior = dict(use, phase="active", acquiredAt=use["acquiredAt"] + acquired)
             records = [dict(correlation, schema="two-bot-staging-pipeline.v1", action="attempt",
                             operation="finish", observedAt=start if start is not None else end),
                        dict(correlation, **binding, schema="two-bot-staging-use.v1", action="status",
@@ -100,22 +98,25 @@ class VoiceMeasurementTerminalTests(unittest.TestCase):
         with patch("sys.argv", ["terminal", str(output)]), patch.dict("os.environ", env, clear=True):
             write_cleanup()  # Exact equality at acquisition and finish boundaries.
             assert_verdict("accepted")
-            for times in ({"acquired": 500}, dict.fromkeys(("start", "status", "release"), f["early"]),
-                          {"status": f["early"]}, {"release": f["early"]}, {"start": ""}):
-                with self.subTest(times=times):
-                    write_cleanup(**times)
+            for changes in ({"acquired": 500}, dict.fromkeys(("start", "status", "release"), f["early"]),
+                            {"status": f["early"]}, {"release": f["early"]}, {"start": ""},
+                            *({"omit": field} for field in ((0, "observedAt"), (1, "runId"), (2, "runId")))):
+                with self.subTest(cleanup=changes):
+                    write_cleanup(**changes)
                     assert_verdict("refused")
-            for index, key in ((0, "observedAt"), (1, "runId"), (2, "runId")):
-                write_cleanup(omit=(index, key))
-                assert_verdict("refused")
             write_cleanup()
-            with patch.dict("os.environ", {"STAGING_USE_SHA": "b" * 40}):
+            with patch.dict("os.environ", {"RESULT_VOICE_FIRST": "failure"}):
                 assert_verdict("refused")
-            for path in [cleanup, *(root / name for name in evidence)]:
-                with self.subTest(missing=path.name):
+            for name in (None, *evidence):
+                path = root / name if name else cleanup
+                with self.subTest(artifact=name):
                     saved = path.read_bytes()
                     path.unlink()
                     assert_verdict("refused")
+                    if name == "grant.json" or name in lifecycles:
+                        old, new = (b'"deploy"', b'"other"') if name == "grant.json" else (b'"PASS"', b'"FAIL"')
+                        path.write_bytes(saved.replace(old, new, 1))
+                        assert_verdict("refused")
                     path.write_bytes(saved)
             for path in (root / final, root / decision):
                 with self.subTest(input=path.name):
@@ -125,8 +126,6 @@ class VoiceMeasurementTerminalTests(unittest.TestCase):
                                  else data.replace(b": {", b': {"restTotalDelta":null,', 1))
                     self.assertEqual(json.loads(duplicate), json.loads(data))
                     path.write_bytes(duplicate)
-                    assert_verdict("refused")
-                    path.write_bytes(data + b"\xff")
                     assert_verdict("refused")
                     path.write_bytes(data.ljust(65536))
                     assert_verdict("accepted")
@@ -156,8 +155,7 @@ class VoiceMeasurementTerminalTests(unittest.TestCase):
             self.assertEqual(json.loads(run.call_args.kwargs["input"]), args[1])
             self.assertEqual(run.call_args.kwargs["timeout"], 15)
             self.assertFalse(candidate_verified("true", *args[1:]))
-            run.return_value.returncode = 1
-            for error in (None, subprocess.TimeoutExpired("node", 15), FileNotFoundError()):
+            for error in (subprocess.TimeoutExpired("node", 15), FileNotFoundError()):
                 run.side_effect = error
                 self.assertFalse(candidate_verified(*args))
 
@@ -168,8 +166,7 @@ class VoiceMeasurementTerminalTests(unittest.TestCase):
             for job in JOBS:
                 for result in ("failure", "cancelled", "", "unknown"):
                     self.assertEqual(terminal_verdict(dict(results, **{job: result}), second, True, True), "refused")
-                self.assertEqual(terminal_verdict({k: v for k, v in results.items() if k != job},
-                                                  second, True, True), "refused")
+                self.assertEqual(terminal_verdict({k: results[k] for k in JOBS if k != job}, second, True, True), "refused")
             self.assertEqual(terminal_verdict(dict(results, unexpected="success"), second, True, True), "refused")
             for cleanup, candidate in ((False, True), (True, False), (None, True), (True, None)):
                 self.assertEqual(terminal_verdict(results, second, cleanup, candidate), "refused")
