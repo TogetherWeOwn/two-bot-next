@@ -84,7 +84,7 @@ mod tests {
             "guild_id": STAGING_GUILD_ID,
             "channel": {"id": "777", "type": 0}, "channel_id": legacy_channel_id,
             "data": {"id": "1", "type": 1, "name": "automod-preview"},
-            "member": {"user": {"id": "4242", "username": "previewer", "discriminator": "0"},
+            "member": {"user": {"id": "2222", "username": "previewer", "discriminator": "0"},
                 "roles": ["9"], "flags": 0, "deaf": false, "mute": false},
             "token": "synthetic-test-token", "version": 1,
             "authorizing_integration_owners": {"0": STAGING_GUILD_ID},
@@ -107,7 +107,7 @@ mod tests {
             .expect("complete invocation forms a request");
         assert_eq!(request.guild_id.as_deref(), Some(STAGING_GUILD_ID));
         assert_eq!(request.channel_id, "777");
-        assert_eq!(request.actor_id, "4242");
+        assert_eq!(request.actor_id, "2222");
         assert_eq!(request.role_ids, vec!["9".to_owned()]);
         assert_eq!(request.interaction_id, 4242);
 
@@ -126,7 +126,7 @@ mod tests {
         dm.user = dm.member.take().and_then(|member| member.user);
         let request = PreviewRequest::from_interaction(&dm).expect("DM still forms a request");
         assert_eq!(request.guild_id, None);
-        assert_eq!(request.actor_id, "4242");
+        assert_eq!(request.actor_id, "2222");
         assert!(request.role_ids.is_empty());
         dm.user = None;
         assert_eq!(PreviewRequest::from_interaction(&dm), None);
@@ -176,6 +176,24 @@ mod tests {
         let decoded = decode_interaction_options(&valid).expect("valid options decode");
         assert_eq!(decoded.text, "hello");
         assert_eq!(decoded.mention_count, 3);
+    }
+
+    #[test]
+    fn decoder_rejects_unknown_and_noncanonical_option_names() {
+        let extra = command_data(json!([
+            {"name": "text", "type": 3, "value": "hello"},
+            {"name": "extra", "type": 3, "value": "unexpected"}
+        ]));
+        assert_eq!(
+            decode_interaction_options(&extra),
+            Err(PreviewInputRefusal::UnknownOption)
+        );
+
+        let uppercase = command_data(json!([{"name": "TEXT", "type": 3, "value": "hello"}]));
+        assert_eq!(
+            decode_interaction_options(&uppercase),
+            Err(PreviewInputRefusal::UnknownOption)
+        );
     }
 
     #[test]
