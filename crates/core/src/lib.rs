@@ -27,6 +27,8 @@ pub mod automod_preview_flow;
 pub mod automod_preview_input;
 pub mod automod_preview_limiter;
 pub mod automod_preview_report;
+#[cfg(feature = "db")]
+pub mod automod_preview_store;
 pub mod automod_runtime;
 #[cfg(feature = "db")]
 pub mod automod_store;
