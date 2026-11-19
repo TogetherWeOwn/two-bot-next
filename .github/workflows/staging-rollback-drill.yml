@@ -20,7 +20,6 @@ on:
 permissions: {}
 
 concurrency:
-  # Keep the wrapper outside the staging lifecycle lane held by its child.
   group: staging-rollback-proof-${{ github.event_name }}
   cancel-in-progress: false
 

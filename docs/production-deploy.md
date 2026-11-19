@@ -401,8 +401,8 @@ runs `scripts/rollback_target_preflight.py`, which refuses the promotion
 Its receipt (version, image, SHA, the migrations it checked, refusal codes)
 goes to the log and the run summary; it never carries SQL text or API
 bodies. A rollback and the live-SHA redeploy skip it: recovery never waits on
-it. The daily `staging-rollback-drill` keeps exercising the restore path
-itself on staging.
+it. The Release Manager exercises the restore path with the [on-demand staging proof](#on-demand-staging-proof)
+once per bot production release, after deploying the candidate to staging.
 
 ## Regression gate against production
 
@@ -667,12 +667,10 @@ operator; a failed restore is never a reason to wait for the next deployment.
 <a id="daily-staging-proof"></a>
 ### On-demand staging proof
 
-The Release Manager dispatches `staging-rollback-drill.yml` on `main` once per
-production release, after the candidate's staging deploy. With no
-`target_version`, `scripts/rollback_proof.py run` performs the automatic proof.
-Pass the full 40-character lowercase candidate commit as `sha`. The proof:
+Dispatch `staging-rollback-drill.yml` on `main` with `target_version` empty
+and `sha` set to the full 40-character lowercase candidate commit.
 
-1. Dispatches only `deploy-staging.yml` on `main`, with that pinned SHA and the existing staging
+1. Dispatches only `deploy-staging.yml` on `main`, with the existing staging
    error-rate gate rehearsal enabled. No production dispatch or traffic fault
    is involved. The GitHub REST `2026-03-10` dispatch response provides the exact
    child run ID; a missing ID refuses without redispatch or guessing "latest".
@@ -683,16 +681,12 @@ Pass the full 40-character lowercase candidate commit as `sha`. The proof:
 3. Checks `staging-rollout-evidence`: the restore must name the exact pre-deploy
    Worker version and image digest, with takeover and the stable 200/gateway-ready
    gate. It uploads a sanitized `staging-rollback-proof` artifact (`proof.json`)
-   containing the child run ID, deployed SHA (`child_sha`), workflow SHA
-   (`workflow_sha`) and restored members, retained for 14 days. The deployed SHA
-   must equal the requested SHA.
-4. Requires a successful `staging-use-release` job and an ordered finish
-   attempt, status and stopped release in `staging-use-deploy-stop-<run>-1`.
-   The records must match the original staging run, first attempt and window
-   expiry; status and release must agree on the build after rollback. Missing,
-   mismatched or `not-owned` evidence does not pass.
-
-   The wrapper is green only after that proof is validated and uploaded.
+   containing the child run ID/SHA and restored members, retained for 14 days.
+   The deployed `child_sha` must equal the requested SHA; `workflow_sha` can differ.
+4. Requires a green `staging-use-release` job and ordered finish, status and stop
+   receipts in `staging-use-deploy-stop-<run>-1` for the same window and attempt.
+   Status and release must agree on the restored build; `not-owned` is not a stop.
+   The wrapper passes only after validation and artifact upload.
 
 The child is named `staging rollback proof`, not a staging certification run.
 Production excludes it from latest-certification history only after re-reading
@@ -706,15 +700,14 @@ build. Inspect the hold and resume the proof after the observation window;
 do not clear a hold to make a proof green. Explicit arm/disarm dispatches without
 the error-rate switch retain their exception.
 
-The wrapper uses `staging-rollback-proof-workflow_dispatch`, **not** the staging
-lifecycle group, so its child can acquire the staging deploy lane. The optional
-Worker-only drill holds the staging lifecycle lane and uploads separate evidence;
-it does not count as the automatic proof.
+The wrapper runs outside `staging-lifecycle` so its child can acquire that lane.
+The Worker-only drill holds the lane and uploads separate evidence; it does not
+count as automatic proof.
 
-A failed wrapper opens or comments on the `staging-rollback-proof` incident issue.
-There is no scheduled freshness watcher. Inspect the exact wrapper, child and
-artifact before closing an incident; a dry run does not dispatch or qualify a proof.
-Inspect the prior child run and staging state before recovery.
+Failures open or update the `staging-rollback-proof` incident; verify the exact
+wrapper, child and artifact before closing it. No scheduled watcher or dry run
+qualifies a proof. Wrapper reruns fail without dispatching: inspect the original
+child run and staging state before recovery.
 
 Both gate curls enforce `--max-filesize 65536` (64 KiB). Any transfer
 failure counts as `000`, even if curl reports HTTP 200 and leaves a valid

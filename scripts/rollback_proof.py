@@ -353,6 +353,7 @@ def main(argv=None):
             return 0
         if args.mode == "run":
             require(args.evidence is not None, "evidence_path_required_before_dispatch")
+            require(os.environ.get("GITHUB_RUN_ATTEMPT") == "1", "wrapper_rerun_refused")
             evidence = prove(requested_sha=args.sha)
             args.evidence.write_text(json.dumps(evidence, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         else:

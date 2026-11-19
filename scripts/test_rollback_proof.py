@@ -52,7 +52,7 @@ def local_gh(script):
 NOW = datetime(2026, 10, 23, 6, 23, tzinfo=timezone.utc)
 VERSION = "11111111-1111-1111-1111-111111111111"
 DIGEST = "sha256:" + "a" * 64
-ENV = {"GITHUB_REPOSITORY": proof.REPO, "GITHUB_REF": "refs/heads/main"}
+ENV = {"GITHUB_REPOSITORY": proof.REPO, "GITHUB_REF": "refs/heads/main", "GITHUB_RUN_ATTEMPT": "1"}
 
 
 PASS = {"verdict": "pass", "proof_completed_at": NOW.isoformat()}
@@ -273,10 +273,17 @@ class RollbackProofTests(unittest.TestCase):
 
     def test_missing_dispatch_id_never_searches_latest_or_redispatches(self):
         for response in ({}, {"workflow_run_id": True}, {"workflow_run_id": "123"}):
-            with self.subTest(response=response), patch.object(proof, "gh", return_value=response) as gh:
-                with self.assertRaisesRegex(proof.ProofError, "dispatch_missing_exact_run_id"):
-                    proof.prove(requested_sha="a" * 40)
-                self.assertEqual(gh.call_count, 1)
+            with self.subTest(response=response), patch.object(proof, "gh", return_value=response) as gh, \
+                    tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, ENV), \
+                    redirect_stderr(io.StringIO()) as errors:
+                path = Path(directory) / "proof.json"
+                args = ["run", "--sha", "a" * 40, "--evidence", str(path)]
+                for attempt, code in (("1", "dispatch_missing_exact_run_id_no_retry"), ("2", "wrapper_rerun_refused")):
+                    with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": attempt}):
+                        self.assertEqual(proof.main(args), 1)
+                    self.assertEqual(gh.call_count, 1)
+                    self.assertEqual(json.loads(errors.getvalue().splitlines()[-1])["code"], code)
+                    self.assertFalse(path.exists())
 
     def test_child_provenance_or_unexpected_outcome_is_not_a_proof(self):
         mutations = [lambda r: r.update(conclusion="success"), lambda r: r.update(conclusion="cancelled"),
