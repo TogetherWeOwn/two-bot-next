@@ -5,6 +5,7 @@ import unittest
 from rest_evidence_continuity import EvidenceError, MAX_COUNTER
 from rest_watch_controls import ControlGuard
 from rest_watch_handoff import claim_handoff, claim_recovery
+from rest_watch_window_policy import EvidenceGate
 
 
 class HandoffTest(unittest.TestCase):
@@ -50,7 +51,8 @@ class HandoffTest(unittest.TestCase):
         _, sequence, schedule = self.start(ledger=lambda *args: transitions.append(args) or True)
         endpoint = copy.deepcopy(self.record["initial"]["samples"][1])
         endpoint.update(start_ms=90000, end_ms=90001, monotonic_ms=90000)
-        sequence.accept(endpoint, "next-proof", now_ms=90001, monotonic_ms=90000)
+        gate = EvidenceGate(sequence, lambda: (90001, 90000, "clock"), "clock", schedule.end)
+        self.assertEqual(gate.observe(endpoint, "next-proof"), endpoint)
         self.assertEqual(transitions[0][0], self.record["initial"]["samples"][1])
         self.assertEqual(transitions[0][1], "initial-end")
         self.assertEqual(schedule.end, 1880000)

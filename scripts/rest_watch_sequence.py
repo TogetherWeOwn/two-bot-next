@@ -9,7 +9,7 @@ sequence must be serialized by its owner, with trusted clocks and binding.
 
 import copy
 
-from rest_evidence_continuity import EvidenceError, validate_continuity
+from rest_evidence_continuity import EvidenceError, MAX_COUNTER, validate_continuity
 
 
 class SampleSequence:
@@ -26,10 +26,14 @@ class SampleSequence:
     def accept(self, sample, proof, *, now_ms, monotonic_ms, before_claim=None):
         """Verify both bookends, then claim the endpoint before returning it.
 
-        The ledger receives previous sample/proof, current sample/proof and
-        expected binding, and must return exactly True only after an atomic
-        durable compare-and-swap. Any error, including an ambiguous ledger
-        outcome, permanently terminates this object; recovery is caller-owned.
+        The required trusted before_claim callback reads the clock after
+        verification and returns limits capped by the active cutoff and sample
+        freshness. The ledger receives both bookends and proofs, the expected
+        binding, and those limits. In the same atomic commit as sequence and
+        replay consumption, it must verify the clock domain and enforce the
+        inclusive wall and tick ranges, returning exactly True only after that
+        commit. Failure is terminal; reconcile a possible commit by its original
+        operation, without retry or ownership restoration.
         """
         if self._failed:
             raise EvidenceError("sample sequence is terminal")
@@ -51,11 +55,22 @@ class SampleSequence:
 
             validate_continuity([previous, current], self._expected, now_ms=now_ms,
                                 monotonic_ms=monotonic_ms, verify_sample=verify)
-            if before_claim is not None:
-                before_claim(copy.deepcopy(current))
-            if self._ledger(copy.deepcopy(previous), copy.deepcopy(old_proof),
-                            copy.deepcopy(current), copy.deepcopy(new_proof),
-                            copy.deepcopy(self._expected)) is not True:
+            if not callable(before_claim):
+                raise EvidenceError("missing claim limits")
+            claim_args = copy.deepcopy((previous, old_proof, current, new_proof, self._expected))
+            limits = before_claim(copy.deepcopy(current))
+            keys = {"clock_domain", "wall_not_before", "tick_not_before",
+                    "wall_deadline", "tick_deadline"}
+            if (type(limits) is not dict or set(limits) != keys
+                    or type(limits["clock_domain"]) is not str or not limits["clock_domain"]
+                    or any(type(limits[k]) is not int or not 0 <= limits[k] <= MAX_COUNTER
+                           for k in keys - {"clock_domain"})
+                    or not now_ms <= limits["wall_not_before"] <= limits["wall_deadline"]
+                    or not monotonic_ms <= limits["tick_not_before"] <= limits["tick_deadline"]
+                    or limits["wall_deadline"] > current["end_ms"] + 30000
+                    or limits["tick_deadline"] > current["monotonic_ms"] + 30000):
+                raise EvidenceError("invalid claim limits")
+            if self._ledger(*claim_args, limits.copy()) is not True:
                 raise EvidenceError("replay ledger rejected endpoint")
             self._previous, self._proof = current, new_proof
             return copy.deepcopy(current)

@@ -47,9 +47,13 @@ class EvidenceGate:
 
     def _fresh(self, sample):
         wall, tick = self._time()
-        if (wall - sample["end_ms"] > 30000
-                or tick - sample["monotonic_ms"] > 30000):
+        wall_deadline = min(sample["end_ms"] + 30000, MAX_COUNTER)
+        tick_deadline = min(sample["monotonic_ms"] + 30000, self._cutoff)
+        if wall > wall_deadline or tick > tick_deadline:
             raise EvidenceError("stale evidence")
+        return {"clock_domain": self._domain, "wall_not_before": wall,
+                "tick_not_before": tick, "wall_deadline": wall_deadline,
+                "tick_deadline": tick_deadline}
 
     def observe(self, sample, proof):
         """Return claimed continuity evidence, never window or watch completion.
