@@ -3,11 +3,17 @@
 //! The caller owns authorization and I/O. Decode and scope refusals stop
 //! before the caller takes a transaction claim or charges the limiter.
 
-use crate::automod_preview_audit::{preview_audit_id, replay_preview_reply, PreviewAuditRow};
-use crate::automod_preview_input::{DecodedPreviewInput, PreviewInputRefusal};
-use crate::automod_preview_report::{
-    metric_not_evaluated, PreviewMetricLabels, PREVIEW_NOT_EVALUATED_REPLY,
+use crate::automod_preview::PreviewVerdict;
+use crate::automod_preview_audit::{
+    preview_audit_id, preview_audit_record, replay_preview_reply, PreviewAuditRow,
 };
+use crate::automod_preview_input::{DecodedPreviewInput, PreviewInputRefusal};
+use crate::automod_preview_limiter::PreviewRateDecision;
+use crate::automod_preview_report::{
+    audit_reason_for_verdict, audit_reason_rate_limited, metric_for_verdict, metric_not_evaluated,
+    metric_rate_limited, preview_audit_outcome, PreviewMetricLabels, PREVIEW_NOT_EVALUATED_REPLY,
+};
+use crate::custom_commands::AuditRecord;
 
 /// Answer a refusal immediately or proceed to claim the interaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,17 +84,130 @@ pub fn plan_post_claim(row: Option<&PreviewAuditRow>) -> PostClaimPlan {
     }
 }
 
+/// Fresh-attempt decision after the locked read finds no row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshPlan {
+    /// Evaluate. A duplicate admission retries without charging again.
+    Evaluate,
+    /// Record the rate refusal without evaluating.
+    RefuseRateLimited,
+}
+
+/// Map the result of the caller's limiter charge to evaluation or refusal.
+#[must_use]
+pub fn plan_fresh(decision: PreviewRateDecision) -> FreshPlan {
+    match decision {
+        PreviewRateDecision::Admit | PreviewRateDecision::ReplayDuplicate => FreshPlan::Evaluate,
+        PreviewRateDecision::RateLimited => FreshPlan::RefuseRateLimited,
+    }
+}
+
+/// Audit record and metric for a fresh attempt. The caller commits the record
+/// before emitting the metric or showing the resulting reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewCommit {
+    pub record: AuditRecord,
+    pub metric: PreviewMetricLabels,
+}
+
+/// Build the record and metric from the verdict enums and bucketed length.
+#[must_use]
+pub fn evaluated_commit(
+    verdict: &PreviewVerdict,
+    text_len_utf16: u32,
+    guild_id: &str,
+    actor_id: &str,
+    channel_id: &str,
+) -> PreviewCommit {
+    PreviewCommit {
+        record: preview_audit_record(
+            guild_id,
+            actor_id,
+            channel_id,
+            preview_audit_outcome(verdict),
+            audit_reason_for_verdict(verdict, text_len_utf16),
+        ),
+        metric: metric_for_verdict(verdict),
+    }
+}
+
+/// Build a rate-refusal record without requiring an evaluated verdict.
+#[must_use]
+pub fn rate_limited_commit(
+    dry_run: bool,
+    text_len_utf16: u32,
+    guild_id: &str,
+    actor_id: &str,
+    channel_id: &str,
+) -> PreviewCommit {
+    PreviewCommit {
+        record: preview_audit_record(
+            guild_id,
+            actor_id,
+            channel_id,
+            "rate_limited",
+            audit_reason_rate_limited(dry_run, text_len_utf16),
+        ),
+        metric: metric_rate_limited(dry_run),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::automod::AutomodFilter;
     use crate::automod_preview::{
-        deciding_knobs, exemption_knobs, PreviewExemption, PreviewResult, PreviewVerdict,
+        deciding_knobs, exemption_knobs, PreviewExemption, PreviewResult,
     };
-    use crate::automod_preview_report::{
-        audit_reason_for_verdict, audit_reason_rate_limited, preview_audit_outcome,
-        render_preview_reply, PREVIEW_RATE_LIMITED_REPLY,
-    };
+    use crate::automod_preview_report::{render_preview_reply, PREVIEW_RATE_LIMITED_REPLY};
+
+    #[test]
+    fn fresh_plan_evaluates_admissions_but_not_rate_refusals() {
+        assert_eq!(plan_fresh(PreviewRateDecision::Admit), FreshPlan::Evaluate);
+        assert_eq!(
+            plan_fresh(PreviewRateDecision::ReplayDuplicate),
+            FreshPlan::Evaluate
+        );
+        assert_eq!(
+            plan_fresh(PreviewRateDecision::RateLimited),
+            FreshPlan::RefuseRateLimited
+        );
+    }
+
+    #[test]
+    fn commit_bundles_record_outcome_reason_and_metric() {
+        let filter = AutomodFilter::BadWords;
+        let verdict = PreviewVerdict {
+            result: PreviewResult::Matched,
+            filter: Some(filter),
+            knobs: deciding_knobs(filter),
+            exemption: None,
+            dry_run: true,
+        };
+        let evaluated = evaluated_commit(&verdict, 12, "guild-1", "actor-1", "channel-1");
+        assert_eq!(evaluated.metric, metric_for_verdict(&verdict));
+        let limited = rate_limited_commit(false, 600, "guild-1", "actor-1", "channel-1");
+        assert_eq!(limited.metric, metric_rate_limited(false));
+        for (record, outcome, reason) in [
+            (
+                evaluated.record,
+                "matched",
+                "filter=bad_words;exemption=none;mode=dry_run;len=0_50",
+            ),
+            (
+                limited.record,
+                "rate_limited",
+                "filter=none;exemption=none;mode=enforce;len=501_2000",
+            ),
+        ] {
+            assert_eq!(record.guild_id, "guild-1");
+            assert_eq!(record.actor_id.as_deref(), Some("actor-1"));
+            assert_eq!(record.action, "automod.preview");
+            assert_eq!(record.target_key.as_deref(), Some("channel-1"));
+            assert_eq!(record.outcome, outcome);
+            assert_eq!(record.reason.as_deref(), Some(reason));
+        }
+    }
 
     #[test]
     fn stored_row_replays_the_original_reply() {
