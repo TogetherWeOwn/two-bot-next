@@ -25,6 +25,9 @@ impl PreviewRequest {
     /// required field. A guild invocation never falls back to a DM user.
     #[must_use]
     pub fn from_interaction(interaction: &Interaction) -> Option<Self> {
+        #[cfg(feature = "db")]
+        let channel_id = crate::channel_moderation::invoking_channel_id(interaction)?;
+        #[cfg(not(feature = "db"))]
         let channel_id = interaction.channel.as_ref()?.id.to_string();
         let (user, role_ids) = if interaction.guild_id.is_some() {
             let member = interaction.member.as_ref()?;
@@ -74,12 +77,12 @@ mod tests {
     use serde_json::json;
     use two_bot_core::automod_runtime::STAGING_GUILD_ID;
 
-    fn preview_interaction() -> Interaction {
+    fn preview_interaction(legacy_channel_id: Option<&str>) -> Interaction {
         serde_json::from_value(json!({
             "id": "4242", "application_id": "1111", "type": 2,
             "attachment_size_limit": 10_485_760,
             "guild_id": STAGING_GUILD_ID,
-            "channel": {"id": "777", "type": 0},
+            "channel": {"id": "777", "type": 0}, "channel_id": legacy_channel_id,
             "data": {"id": "1", "type": 1, "name": "automod-preview"},
             "member": {"user": {"id": "4242", "username": "previewer", "discriminator": "0"},
                 "roles": ["9"], "flags": 0, "deaf": false, "mute": false},
@@ -99,18 +102,26 @@ mod tests {
 
     #[test]
     fn request_takes_invocation_ids_and_member_roles() {
-        let request = PreviewRequest::from_interaction(&preview_interaction())
+        let mut interaction = preview_interaction(Some("888"));
+        let request = PreviewRequest::from_interaction(&interaction)
             .expect("complete invocation forms a request");
         assert_eq!(request.guild_id.as_deref(), Some(STAGING_GUILD_ID));
         assert_eq!(request.channel_id, "777");
         assert_eq!(request.actor_id, "4242");
         assert_eq!(request.role_ids, vec!["9".to_owned()]);
         assert_eq!(request.interaction_id, 4242);
+
+        interaction.channel = None;
+        let legacy = PreviewRequest::from_interaction(&interaction);
+        #[cfg(feature = "db")]
+        assert_eq!(legacy.expect("legacy invocation channel").channel_id, "888");
+        #[cfg(not(feature = "db"))]
+        assert_eq!(legacy, None);
     }
 
     #[test]
     fn request_maps_dm_to_no_guild_and_refuses_contextless_shapes() {
-        let mut dm = preview_interaction();
+        let mut dm = preview_interaction(None);
         dm.guild_id = None;
         dm.user = dm.member.take().and_then(|member| member.user);
         let request = PreviewRequest::from_interaction(&dm).expect("DM still forms a request");
@@ -121,7 +132,7 @@ mod tests {
         assert_eq!(PreviewRequest::from_interaction(&dm), None);
 
         for missing in ["member", "member_user", "channel"] {
-            let mut interaction = preview_interaction();
+            let mut interaction = preview_interaction(None);
             interaction.user = interaction
                 .member
                 .as_ref()
