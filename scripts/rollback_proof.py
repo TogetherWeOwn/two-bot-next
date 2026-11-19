@@ -183,6 +183,57 @@ def validate_evidence(files):
             "gate": restore["gate"], "takeover": True}
 
 
+# Kept separate from prove() until the dispatch and receipt loading are wired.
+def validate_deployed_sha(files, requested_sha):
+    require(isinstance(requested_sha, str) and SHA.fullmatch(requested_sha), "requested_sha_invalid")
+    evidence = files.get("evidence.json") if isinstance(files, dict) else None
+    require(isinstance(evidence, dict) and evidence.get("revision") == requested_sha,
+            "deployed_sha_mismatch")
+
+
+def validate_shutdown(files, stop_files, run_id, requested_sha):
+    require(type(run_id) is int and run_id > 0, "shutdown_run_id_invalid")
+    start = files.get("staging-use.jsonl") if isinstance(files, dict) else None
+    stop = stop_files.get("staging-use-release.jsonl") if isinstance(stop_files, dict) else None
+    require(isinstance(start, list) and isinstance(stop, list)
+            and all(isinstance(row, dict) for rows in (start, stop) for row in rows),
+            "shutdown_receipt_invalid")
+    validate_deployed_sha(files, requested_sha)
+    windows = [row for row in start if row.get("action") == "window"]
+    require(len(windows) == 1 and [row.get("action") for row in stop] == ["attempt", "status", "release"]
+            and stop[0].get("operation") == "finish"
+            and not any(row.get("action") in ("failed", "not-owned") for row in start),
+            "shutdown_not_confirmed")
+    window = windows[0]
+    finish, status, release = stop
+    expiry = window.get("expiresAt")
+    expected_run = str(run_id)
+
+    def same_attempt(row):
+        return (isinstance(row, dict) and row.get("environment") == "staging"
+                and row.get("runId") == expected_run
+                and type(row.get("runAttempt")) is int and row["runAttempt"] == 1)
+
+    def same_window(use):
+        return same_attempt(use) and type(use.get("expiresAt")) is int and use["expiresAt"] == expiry
+
+    # Rollback may rebind the initial window. Finish pins release to the
+    # preceding status's build while preserving the original attempt and expiry.
+    finish_sha, finish_deployment = status.get("sha"), status.get("deploymentId")
+    prior, use = status.get("use"), release.get("use")
+    require(all(same_attempt(row) for row in (window, finish, status, release))
+            and window.get("schema") == finish.get("schema") == "two-bot-staging-pipeline.v1"
+            and status.get("schema") == release.get("schema") == "two-bot-staging-use.v1"
+            and window.get("sha") == requested_sha and type(expiry) is int and 0 < expiry <= 2**53 - 1
+            and isinstance(finish_sha, str) and SHA.fullmatch(finish_sha) and release.get("sha") == finish_sha
+            and isinstance(finish_deployment, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", finish_deployment)
+            and release.get("deploymentId") == finish_deployment
+            and type(status.get("running")) is bool and release.get("running") is False
+            and same_window(prior) and prior.get("phase") in ("preparing", "active", "released")
+            and same_window(use) and use.get("phase") == "released",
+            "shutdown_receipt_mismatch")
+
+
 def prove(*, sleep=time.sleep, clock=time.monotonic):
     response = gh(f"repos/{REPO}/actions/workflows/deploy-staging.yml/dispatches", body=DISPATCH)
     run_id = response.get("workflow_run_id")
