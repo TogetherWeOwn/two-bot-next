@@ -101,6 +101,8 @@ SHA = re.compile(r"[0-9a-f]{40}")
 # >=3 min stability the release gate demands after takeover.
 STABLE_PASSES = 18
 POLL_SECONDS = 10
+WORKER_RESTORE_READS = 7
+WORKER_RESTORE_POLL_SECONDS = 10
 ROLLOUT_TIMEOUT_SECONDS = 600
 GATE_TIMEOUT_SECONDS = 900
 CONTROL_TIMEOUT_SECONDS = 420
@@ -542,8 +544,15 @@ class Rollback:
             "strategy": "percentage", "versions": [{"version_id": version, "percentage": 100}],
             "annotations": {"workers/message": f"rollback to {version} run {self.run_id}"[:120]},
             "code_update_strategy": {"mode": "immediate"}})
-        self.stamp("worker restored")
-        require(serving_version(self.client, self.worker) == version, "rollback_not_active")
+        # Cloudflare can still list the previous deployment right after the POST.
+        # Retry only a valid mismatch; serving_version's refusals still stop the run.
+        for attempt in range(WORKER_RESTORE_READS):
+            if attempt:
+                self.sleep(WORKER_RESTORE_POLL_SECONDS)
+            if serving_version(self.client, self.worker) == version:
+                self.stamp("worker restored")
+                return
+        raise GateError("rollback_not_active")
 
     def restore_image(self, image):
         """Roll the container image back with a single 100% rolling step."""
