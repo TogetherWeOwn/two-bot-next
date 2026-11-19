@@ -4549,8 +4549,9 @@ def workflow_policy_errors(workflows):
     for name, workflow in workflows.items():
         jobs = workflow.get("jobs", {})
         if name == DISABLED_MEASUREMENT and disabled:
-            if jobs["voice-first"].get("uses") != "./.github/workflows/voice-synthetic.yml":
-                errors.append(f"{name}:voice-first: reusable call missing or retargeted")
+            for job_id in ("voice-first", "voice-second"):
+                if jobs[job_id].get("uses") != "./.github/workflows/voice-synthetic.yml":
+                    errors.append(f"{name}:{job_id}: reusable call missing or retargeted")
             continue
         if set(jobs) != JOB_INVENTORY.get(name, set()):
             errors.append(f"{name}: job inventory changed")
@@ -10188,7 +10189,7 @@ class WorkflowTests(unittest.TestCase):
                     if "uses" in job:
                         # The called workflow's own jobs are checked here too.
                         self.assertNotIn("runs-on", job)
-                        if (name, job_id) == (DISABLED_MEASUREMENT, "voice-first"):
+                        if name == DISABLED_MEASUREMENT and job_id in ("voice-first", "voice-second"):
                             self.assertTrue(is_disabled_scaffold(workflow))
                             self.assertEqual(job["uses"], "./.github/workflows/voice-synthetic.yml")
                         else:
@@ -10697,7 +10698,9 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("deploy-production.yml", "promotion-skipped"):
                         # No checkout or API access: only report and upload a receipt.
                         expected = {}
-                    elif (name, job_id) == ("voice-synthetic.yml", "rerun-refusal"):
+                    elif job_id == "rerun-refusal" and name in (
+                        "voice-rest-measurement.yml", "voice-synthetic.yml"
+                    ):
                         # Refuses before checkout or API access.
                         expected = {}
                     elif (name, job_id) == ("daily-digest.yml", "digest"):

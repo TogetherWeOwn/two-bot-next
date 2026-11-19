@@ -592,9 +592,10 @@ def repository_errors(wfs, canonical):
     holders = set(STANDALONE_HOLDERS) | set(OBSERVERS)
     for file, workflow in wfs.items():
         if file == DISABLED_MEASUREMENT and is_disabled_scaffold(workflow):
-            target = workflow["jobs"]["voice-first"].get("uses")
-            if target != f"./.github/workflows/{VOICE}":
-                errors.append("caller closure: disabled measurement target changed")
+            for job_id in ("voice-first", "voice-second"):
+                target = workflow["jobs"][job_id].get("uses")
+                if target != f"./.github/workflows/{VOICE}":
+                    errors.append(f"caller closure: disabled measurement {job_id} target changed")
             continue
         triggers = tuple(t for t in events(workflow) if t != "workflow_call")
         nodes = [("workflow", workflow)] + list((workflow.get("jobs") or {}).items())
