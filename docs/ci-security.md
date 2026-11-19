@@ -117,6 +117,8 @@ fall back to raw `max_connections` and label the ceiling as such.
 staging deployment and recovery rehearsal; its dispatcher has no Cloudflare or
 ownership credentials. Failed proofs open the `staging-rollback-proof` GitHub
 issue labelled `incident` with the job-scoped `GITHUB_TOKEN` (`issues: write`).
+The automatic proof requires the `sha` input (full 40-character commit SHA) and
+passes only with that revision deployed and positive same-run shutdown evidence.
 There is no scheduled freshness watcher: inspect the wrapper, child and artifact
 before manually closing an incident after a successful proof.
 

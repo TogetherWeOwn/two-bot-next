@@ -71,34 +71,106 @@ def files():
             "auto-rollback-evidence.json": {"worker": "two-bot-next-staging", "variant": "staging",
                 "restored_version": VERSION, "restored_image_digest": DIGEST,
                 "gate": "stable-200-gateway-ready", "takeover": True},
-            "error-rate-gate.json": {"mode": "rehearsal", "verdict": "fail", "firing": ["rest_5xx_rate"]}}
+            "error-rate-gate.json": {"mode": "rehearsal", "verdict": "fail", "firing": ["rest_5xx_rate"]},
+            "evidence.json": {"revision": "a" * 40},
+            "staging-use.jsonl": [{"schema": "two-bot-staging-pipeline.v1", "action": "window",
+                "environment": "staging", "runId": "123", "runAttempt": 1, "expiresAt": 1000}]}
+
+
+def stop_files():
+    return {"staging-use-release.jsonl": [{"schema": "two-bot-staging-use.v1", "action": "release",
+        "environment": "staging", "running": False,
+        "use": {"environment": "staging", "runId": "123", "runAttempt": 1,
+                "expiresAt": 1000, "phase": "released"}}]}
 
 
 def jobs():
-    return {"total_count": 1, "jobs": [{"name": "wrangler deploy + intended rollout gate",
-            "steps": [{"name": name, "conclusion": outcome} for name, outcome in EXPECTED_STEPS.items()]}]}
+    return {"total_count": 2, "jobs": [{"name": "wrangler deploy + intended rollout gate",
+            "steps": [{"name": name, "conclusion": outcome} for name, outcome in EXPECTED_STEPS.items()]},
+            {"name": "staging-use-release", "conclusion": "success"}]}
 
 
 class RollbackProofTests(unittest.TestCase):
+    def test_requested_sha_is_bound_before_dispatch_even_when_main_drifts(self):
+        requested = "b" * 40
+        with patch.object(proof, "gh", return_value={}) as gh:
+            with self.assertRaisesRegex(proof.ProofError, "dispatch_missing_exact_run_id"):
+                proof.prove(requested_sha=requested)
+        self.assertEqual(gh.call_args.kwargs["body"], {
+            "ref": "main", "inputs": {"inject_error_rate_spike": True, "sha": requested}})
+
+    def test_invalid_sha_refuses_before_dispatch(self):
+        for requested in (None, "", "a" * 39, "A" * 40, "g" * 40):
+            with self.subTest(requested=requested), patch.object(proof, "gh") as gh:
+                with self.assertRaisesRegex(proof.ProofError, "requested_sha_invalid"):
+                    proof.prove(requested_sha=requested)
+                gh.assert_not_called()
+
+    def test_deployed_sha_evidence_must_match_requested_commit(self):
+        requested = "b" * 40
+        evidence = files()
+        for candidate in (None, "a" * 40):
+            evidence["evidence.json"] = {"revision": candidate}
+            with self.subTest(candidate=candidate), self.assertRaises(proof.ProofError):
+                proof.validate_deployed_sha(evidence, requested)
+        evidence["evidence.json"] = {"revision": requested}
+        proof.validate_deployed_sha(evidence, requested)
+
+    def test_shutdown_receipt_requires_same_attempt_and_window(self):
+        window = {"schema": "two-bot-staging-pipeline.v1", "action": "window",
+                  "environment": "staging", "runId": "123", "runAttempt": 1, "expiresAt": 1000}
+        use = {"environment": "staging", "runId": "123", "runAttempt": 1,
+               "expiresAt": 1000, "phase": "released"}
+        release = {"schema": "two-bot-staging-use.v1", "action": "release", "environment": "staging",
+                   "running": False, "use": use}
+        start = {"staging-use.jsonl": [window]}
+        stop = {"staging-use-release.jsonl": [release]}
+        proof.validate_shutdown(start, stop, 123)
+        for mutate in (lambda r: r.update(action="not-owned"), lambda r: r.update(running=True),
+                       lambda r: r["use"].update(runAttempt=2), lambda r: r["use"].update(expiresAt=1001),
+                       lambda r: r["use"].update(phase="active"), lambda r: r["use"].update(runId="124")):
+            bad = deepcopy(stop)
+            mutate(bad["staging-use-release.jsonl"][0])
+            with self.subTest(bad=bad), self.assertRaises(proof.ProofError):
+                proof.validate_shutdown(start, bad, 123)
+        with self.assertRaises(proof.ProofError):
+            proof.validate_shutdown(start, {}, 123)
+
     def test_dispatch_is_exactly_once_staging_main_and_restores_both_members(self):
         with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, run(), jobs()]) as gh, \
-                patch.object(proof, "artifact_files", return_value=files()) as artifacts, redirect_stdout(io.StringIO()):
-            result = proof.prove()
+                patch.object(proof, "artifact_files", side_effect=[files(), stop_files()]) as artifacts, redirect_stdout(io.StringIO()):
+            result = proof.prove(requested_sha="a" * 40)
         self.assertEqual(gh.call_count, 3)
         self.assertEqual(gh.call_args_list[0].args, (f"repos/{proof.REPO}/actions/workflows/deploy-staging.yml/dispatches",))
         self.assertEqual(gh.call_args_list[0].kwargs["body"],
-                         {"ref": "main", "inputs": {"inject_error_rate_spike": True}})
-        artifacts.assert_called_once_with(123, "staging-rollout-evidence")
+                         {"ref": "main", "inputs": {"inject_error_rate_spike": True, "sha": "a" * 40}})
+        self.assertEqual([call.args for call in artifacts.call_args_list],
+                         [(123, "staging-rollout-evidence"), (123, "staging-use-deploy-stop-123-1")])
         self.assertEqual(result["restored_version"], VERSION)
         self.assertEqual(result["restored_image_digest"], DIGEST)
         self.assertEqual(result["child_conclusion"], "failure")
         self.assertEqual(result["verdict"], "pass")
 
+    def test_successful_rollback_without_confirmed_shutdown_never_passes(self):
+        for outcome in ("failure", "skipped", None):
+            child_jobs = jobs()
+            child_jobs["jobs"][1]["conclusion"] = outcome
+            with self.subTest(outcome=outcome), \
+                    patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, run(), child_jobs]), \
+                    patch.object(proof, "artifact_files") as artifacts, redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(proof.ProofError, "shutdown_job_not_successful"):
+                    proof.prove(requested_sha="a" * 40)
+                artifacts.assert_not_called()
+        with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, run(), jobs()]), \
+                patch.object(proof, "artifact_files", side_effect=[files(), {}]), redirect_stdout(io.StringIO()):
+            with self.assertRaises(proof.ProofError):
+                proof.prove(requested_sha="a" * 40)
+
     def test_missing_dispatch_id_never_searches_latest_or_redispatches(self):
         for response in ({}, {"workflow_run_id": True}, {"workflow_run_id": "123"}):
             with self.subTest(response=response), patch.object(proof, "gh", return_value=response) as gh:
                 with self.assertRaisesRegex(proof.ProofError, "dispatch_missing_exact_run_id"):
-                    proof.prove()
+                    proof.prove(requested_sha="a" * 40)
                 self.assertEqual(gh.call_count, 1)
 
     def test_child_provenance_or_unexpected_outcome_is_not_a_proof(self):
@@ -113,18 +185,18 @@ class RollbackProofTests(unittest.TestCase):
             with self.subTest(child=child), patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, child]), \
                     patch.object(proof, "artifact_files") as artifacts, redirect_stdout(io.StringIO()):
                 with self.assertRaises(proof.ProofError):
-                    proof.prove()
+                    proof.prove(requested_sha="a" * 40)
                 artifacts.assert_not_called()
 
     def test_transient_display_title_before_completion_is_tolerated(self):
         pending = run()
         pending.update(status="in_progress", conclusion=None, display_title="deploy-staging")
         with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, pending, run(), jobs()]) as gh, \
-                patch.object(proof, "artifact_files", return_value=files()) as artifacts, \
+                patch.object(proof, "artifact_files", side_effect=[files(), stop_files()]) as artifacts, \
                 redirect_stdout(io.StringIO()):
-            result = proof.prove(sleep=lambda _: None, clock=lambda: 0)
+            result = proof.prove(requested_sha="a" * 40, sleep=lambda _: None, clock=lambda: 0)
         self.assertEqual(gh.call_count, 4)
-        artifacts.assert_called_once_with(123, "staging-rollout-evidence")
+        self.assertEqual(artifacts.call_count, 2)
         self.assertEqual(result["verdict"], "pass")
         self.assertEqual(result["child_run_id"], 123)
 
@@ -134,7 +206,7 @@ class RollbackProofTests(unittest.TestCase):
         with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, child]), \
                 patch.object(proof, "artifact_files") as artifacts, redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(proof.ProofError, "child_not_rehearsal"):
-                proof.prove()
+                proof.prove(requested_sha="a" * 40)
             artifacts.assert_not_called()
 
     def test_timeout_does_not_cancel_or_redispatch_a_mutating_child(self):
@@ -143,7 +215,7 @@ class RollbackProofTests(unittest.TestCase):
         with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, child]) as gh, \
                 redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(proof.ProofError, "staging_run_timeout"):
-                proof.prove(clock=iter([0, proof.MAX_WAIT + 1]).__next__)
+                proof.prove(requested_sha="a" * 40, clock=iter([0, proof.MAX_WAIT + 1]).__next__)
         self.assertEqual(gh.call_count, 2)
 
     def test_every_expected_step_is_required(self):
@@ -162,7 +234,7 @@ class RollbackProofTests(unittest.TestCase):
                         side_effect=[{"workflow_run_id": 123}, run(), job]), \
                         patch.object(proof, "artifact_files") as artifacts, redirect_stdout(io.StringIO()):
                     with self.assertRaisesRegex(proof.ProofError, "unexpected_staging_step_outcome"):
-                        proof.prove()
+                        proof.prove(requested_sha="a" * 40)
                     artifacts.assert_not_called()
 
     def test_evidence_rejects_wrong_version_image_staging_gate_or_injection(self):
@@ -190,7 +262,8 @@ class RollbackProofTests(unittest.TestCase):
         data = io.BytesIO()
         with zipfile.ZipFile(data, "w") as archive:
             for name, value in files().items():
-                archive.writestr("../" + name, json.dumps(value))
+                content = "\n".join(json.dumps(row) for row in value) if name.endswith(".jsonl") else json.dumps(value)
+                archive.writestr("../" + name, content)
         listing = {"total_count": 1, "artifacts": [{"id": 1, "name": "staging-rollout-evidence",
                     "size_in_bytes": len(data.getvalue()), "expired": False}]}
         with patch.object(proof, "gh", side_effect=[listing, data.getvalue()]):
@@ -356,8 +429,10 @@ class RollbackProofTests(unittest.TestCase):
         self.assertIn('<a id="daily-staging-proof"></a>', runbook.read_text())
 
     def test_dry_run_has_no_effects_and_missing_evidence_refuses_before_dispatch(self):
-        with patch.object(proof, "gh") as gh, patch.object(proof, "alert") as alert, redirect_stdout(io.StringIO()):
-            self.assertEqual(proof.main(["run", "--dry-run"]), 0)
+        with patch.object(proof, "gh") as gh, patch.object(proof, "alert") as alert, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(proof.main(["run", "--dry-run", "--sha", "b" * 40]), 0)
+            self.assertEqual(json.loads(output.getvalue())["dispatch"],
+                             {"ref": "main", "inputs": {"inject_error_rate_spike": True, "sha": "b" * 40}})
             gh.assert_not_called()
             alert.assert_not_called()
         with patch.dict(os.environ, ENV), patch.object(proof, "prove") as prove, redirect_stderr(io.StringIO()):

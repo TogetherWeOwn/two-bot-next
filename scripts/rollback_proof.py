@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run or watch the daily staging-only automatic rollback proof.
+"""Run the on-demand staging-only rollback proof, or use the legacy scheduled watcher.
 
 `run --dry-run` prints the fixed dispatch contract without any network calls.
 `run` dispatches deploy-staging on main exactly once, using GitHub REST
@@ -33,7 +33,6 @@ GH_TIMEOUT = 45
 REHEARSAL_TITLE = "staging rollback proof"
 MAX_WAIT = 70 * 60
 MAX_AGE = timedelta(hours=30)
-DISPATCH = {"ref": "main", "inputs": {"inject_error_rate_spike": True}}
 SHA = re.compile(r"[0-9a-f]{40}")
 VERSION = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -152,9 +151,14 @@ def artifact_files(run_id, name):
             files = {}
             for item in items:
                 name = Path(item.filename).name
-                if name.endswith(".json"):
+                if name.endswith((".json", ".jsonl")):
                     require(name not in files, "artifact_duplicate_filename")
-                    files[name] = json.loads(bundle.read(item), object_pairs_hook=unique_object)
+                    content = bundle.read(item)
+                    if name.endswith(".jsonl"):
+                        files[name] = [json.loads(line, object_pairs_hook=unique_object)
+                                       for line in content.splitlines() if line.strip()]
+                    else:
+                        files[name] = json.loads(content, object_pairs_hook=unique_object)
             return files
     except (ValueError, OSError, zipfile.BadZipFile, RuntimeError, RecursionError):
         raise ProofError("artifact_invalid_archive") from None
@@ -183,8 +187,42 @@ def validate_evidence(files):
             "gate": restore["gate"], "takeover": True}
 
 
-def prove(*, sleep=time.sleep, clock=time.monotonic):
-    response = gh(f"repos/{REPO}/actions/workflows/deploy-staging.yml/dispatches", body=DISPATCH)
+def validate_deployed_sha(files, requested_sha):
+    evidence = files.get("evidence.json") or {}
+    require(isinstance(evidence, dict) and evidence.get("revision") == requested_sha,
+            "deployed_sha_mismatch")
+
+
+def validate_shutdown(files, stop_files, run_id):
+    start = files.get("staging-use.jsonl")
+    stop = stop_files.get("staging-use-release.jsonl")
+    require(isinstance(start, list) and isinstance(stop, list)
+            and all(isinstance(row, dict) for row in start + stop), "shutdown_receipt_invalid")
+    windows = [row for row in start if row.get("action") == "window"]
+    releases = [row for row in stop if row.get("action") == "release"]
+    require(len(windows) == 1 and len(releases) == 1
+            and not any(row.get("action") in ("failed", "not-owned") for row in stop),
+            "shutdown_not_confirmed")
+    window, release = windows[0], releases[0]
+    use = release.get("use")
+    expiry = window.get("expiresAt")
+    require(window.get("schema") == "two-bot-staging-pipeline.v1"
+            and window.get("environment") == "staging" and window.get("runId") == str(run_id)
+            and type(window.get("runAttempt")) is int and window["runAttempt"] == 1
+            and type(expiry) is int and expiry > 0
+            and release.get("schema") == "two-bot-staging-use.v1"
+            and release.get("environment") == "staging" and release.get("running") is False
+            and isinstance(use, dict) and use.get("environment") == "staging"
+            and use.get("runId") == str(run_id) and type(use.get("runAttempt")) is int
+            and use["runAttempt"] == 1 and type(use.get("expiresAt")) is int
+            and use["expiresAt"] == expiry and use.get("phase") == "released",
+            "shutdown_receipt_mismatch")
+
+
+def prove(*, requested_sha, sleep=time.sleep, clock=time.monotonic):
+    require(isinstance(requested_sha, str) and SHA.fullmatch(requested_sha), "requested_sha_invalid")
+    dispatch = {"ref": "main", "inputs": {"inject_error_rate_spike": True, "sha": requested_sha}}
+    response = gh(f"repos/{REPO}/actions/workflows/deploy-staging.yml/dispatches", body=dispatch)
     run_id = response.get("workflow_run_id")
     require(type(run_id) is int and run_id > 0, "dispatch_missing_exact_run_id_no_retry")
     print(json.dumps({"child_run_id": run_id, "next_action": "wait_for_exact_staging_run"}))
@@ -210,9 +248,16 @@ def prove(*, sleep=time.sleep, clock=time.monotonic):
     for name, outcome in REQUIRED_STEPS.items():
         found = [step for step in steps if step.get("name") == name]
         require(len(found) == 1 and found[0].get("conclusion") == outcome, "unexpected_staging_step_outcome")
-    evidence = validate_evidence(artifact_files(run_id, "staging-rollout-evidence"))
+    release_jobs = [job for job in jobs.get("jobs", []) if job.get("name") == "staging-use-release"]
+    require(len(release_jobs) == 1 and release_jobs[0].get("conclusion") == "success",
+            "shutdown_job_not_successful")
+    files = artifact_files(run_id, "staging-rollout-evidence")
+    validate_deployed_sha(files, requested_sha)
+    evidence = validate_evidence(files)
+    stop_files = artifact_files(run_id, f"staging-use-deploy-stop-{run_id}-1")
+    validate_shutdown(files, stop_files, run_id)
     return dict(evidence, schema_version=1, verdict="pass", child_run_id=run_id,
-                child_sha=run["head_sha"], child_run_attempt=1, child_conclusion="failure",
+                child_sha=requested_sha, workflow_sha=run["head_sha"], child_run_attempt=1, child_conclusion="failure",
                 environment="staging", completed_at=run["updated_at"])
 
 
@@ -276,10 +321,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("mode", choices=("run", "watch", "alert"))
     parser.add_argument("--evidence", type=Path)
+    parser.add_argument("--sha", help="full staging deployment commit SHA")
     parser.add_argument("--dry-run", action="store_true", help="print the fixed contract; no network or mutation")
     args = parser.parse_args(argv)
     if args.dry_run:
-        print(json.dumps({"environment": "staging", "dispatch": DISPATCH, "mode": args.mode}))
+        dispatch = {"ref": "main", "inputs": {"inject_error_rate_spike": True, "sha": args.sha or "<full-commit-sha>"}}
+        print(json.dumps({"environment": "staging", "dispatch": dispatch, "mode": args.mode}))
         return 0
     try:
         require(os.environ.get("GITHUB_REPOSITORY") == REPO
@@ -289,7 +336,7 @@ def main(argv=None):
             return 0
         if args.mode == "run":
             require(args.evidence is not None, "evidence_path_required_before_dispatch")
-            evidence = prove()
+            evidence = prove(requested_sha=args.sha)
             args.evidence.write_text(json.dumps(evidence, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         else:
             try:
