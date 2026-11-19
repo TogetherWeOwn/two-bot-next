@@ -1,6 +1,7 @@
 """Contract tests for terminal job-graph classification."""
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -94,7 +95,8 @@ console.log(JSON.stringify({ expires, metadata, before, middle, after,
                             running=False, sha="a" * 40, deploymentId="deploy", epoch=1, use=use)]
             cleanup = root / "cleanup/staging-use-measurement-stop.jsonl"
             cleanup.write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
-            env = {"EVIDENCE_DIR": directory, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1",
+            env = {"PATH": os.environ.get("PATH", ""), "EVIDENCE_DIR": directory,
+                   "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1",
                    "STAGING_USE_EXPIRES_AT": str(fixture["expires"]), "STAGING_USE_SHA": "a" * 40,
                    "STAGING_USE_DEPLOYMENT": "deploy"}
             for second in ("false", "true"):
