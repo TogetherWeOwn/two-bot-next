@@ -38,8 +38,9 @@ set -euo pipefail
 
 : "${GITLEAKS_BIN:?GITLEAKS_BIN must point at the verified gitleaks binary}"
 
-# --log-opts=HEAD: scan only history reachable from HEAD, not every fetched branch.
-args=(git . --redact --verbose --exit-code 1 --log-opts=HEAD --ignore-gitleaks-allow)
+# Scan only history reachable from HEAD. Force text patches even for files Git
+# treats as binary, and include merge diffs to catch changes made in resolutions.
+args=(git . --redact --verbose --exit-code 1 --log-opts="--text --diff-merges=first-parent HEAD" --ignore-gitleaks-allow)
 
 if [[ "${EVENT_NAME:-}" == "pull_request" || "${EVENT_NAME:-}" == "merge_group" || "${EVENT_NAME:-}" == "workflow_dispatch" ]]; then
   : "${BASE_REF:?BASE_REF is required for PR, queue and dispatch runs}"
