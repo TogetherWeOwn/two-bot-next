@@ -1,14 +1,14 @@
 #![cfg(feature = "db")]
 
 //! Database proofs for the preview audit transaction (spec §6, T17 core half).
-//! Both tests use the shared disposable database fixture and run in the
+//! These tests use the shared disposable database fixture and run in the
 //! standard CI integration sweep with its guarded `TWO_TEST_DATABASE_URL`.
-//! Neither test consults DATABASE_URL or inherited application credentials.
+//! None of the tests consults DATABASE_URL or inherited application credentials.
 //!
 //! The lock test checks exclusion and rollback using two transactions. The row
 //! test uses a rolled-back transaction over `pg_temp` to check insertion and
-//! same-transaction reload. Neither proves cross-connection committed replay or
-//! that a real handler commits before replying.
+//! same-transaction reload. The committed-row test checks replay on a separate
+//! connection; it does not prove that a real handler commits before replying.
 
 use sqlx::{migrate::Migrator, Connection, PgPool, Postgres, Transaction};
 use two_bot_core::automod_preview_audit as preview_audit;
@@ -76,6 +76,94 @@ async fn preview_claim_insert_replay_and_rollback() -> Result<(), Box<dyn std::e
     let proof = tokio::spawn(verify_same_transaction_row(db.pool().clone())).await;
     db.close().await?;
     proof??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn committed_preview_replays_on_another_connection() -> Result<(), Box<dyn std::error::Error>>
+{
+    let url = std::env::var("TWO_TEST_DATABASE_URL").expect("disposable test bootstrap required");
+    let db = TestDatabase::create(&url, &Migrator::DEFAULT).await?;
+    let proof = tokio::spawn(verify_committed_replay(db.pool().clone())).await;
+    db.close().await?;
+    proof??;
+    Ok(())
+}
+
+async fn verify_committed_replay(pool: PgPool) -> Result<(), sqlx::Error> {
+    // This persistent table lives only in the guarded disposable database.
+    sqlx::raw_sql(MIGRATION).execute(&pool).await?;
+    let mut writer = pool.acquire().await?;
+    let mut reader = pool.acquire().await?;
+    let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *writer)
+        .await?;
+    let reader_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *reader)
+        .await?;
+    assert_ne!(
+        writer_pid, reader_pid,
+        "proof requires distinct connections"
+    );
+
+    let id = preview_audit::preview_audit_id("committed-replay-999");
+    let mut tx = writer.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '2s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL TIME ZONE 'America/New_York'")
+        .execute(&mut *tx)
+        .await?;
+    preview_audit::lock_preview_attempt(&mut tx, "committed-replay-999").await?;
+    assert_eq!(
+        preview_audit::load_preview_audit(&mut *tx, &id).await?,
+        None
+    );
+    let stored = preview_audit::insert_preview_audit(&mut *tx, &matched_record(), &id, AT).await?;
+    assert_eq!(
+        preview_audit::load_preview_audit(&mut *reader, &id).await?,
+        None,
+        "uncommitted insert is not visible on the other connection"
+    );
+    tx.commit().await?;
+
+    let mut replay = reader.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '2s'")
+        .execute(&mut *replay)
+        .await?;
+    sqlx::query("SET LOCAL TIME ZONE 'Asia/Tokyo'")
+        .execute(&mut *replay)
+        .await?;
+    preview_audit::lock_preview_attempt(&mut replay, "committed-replay-999").await?;
+    let row = preview_audit::load_preview_audit(&mut *replay, &id)
+        .await?
+        .expect("committed row is visible on the other connection");
+    assert_eq!(stored, "2026-11-02 08:00:00.123456+00");
+    assert_eq!(row.created_at, stored);
+    assert_eq!(row.outcome, "matched");
+    assert_eq!(row.reason, matched_record().reason);
+    let expected = two_bot_core::automod_preview_report::render_preview_reply(
+        &two_bot_core::automod_preview::PreviewVerdict {
+            result: two_bot_core::automod_preview::PreviewResult::Matched,
+            filter: Some(two_bot_core::automod::AutomodFilter::BadWords),
+            knobs: two_bot_core::automod_preview::deciding_knobs(
+                two_bot_core::automod::AutomodFilter::BadWords,
+            ),
+            exemption: None,
+            dry_run: true,
+        },
+        &stored,
+    );
+    assert_eq!(
+        preview_audit::replay_preview_reply(&row.outcome, row.reason.as_deref(), &row.created_at),
+        Some(expected)
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM automation_audit_log WHERE id = $1")
+        .bind(&id)
+        .fetch_one(&mut *replay)
+        .await?;
+    assert_eq!(count, 1);
+    replay.rollback().await?;
     Ok(())
 }
 
