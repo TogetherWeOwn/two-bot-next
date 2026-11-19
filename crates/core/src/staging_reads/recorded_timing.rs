@@ -136,7 +136,6 @@ mod tests {
         let v = valid(0, 15_000);
         assert!(recorded_timing_is_consistent(&v));
         assert_timing!(v, true, wire: tick(15_000));
-        assert_timing!(v, false, receipt: tick(14_999), admission: tick(14_999));
         assert_timing!(v, false, wire: tick(16_000));
         assert_timing!(v, false, admission: tick(16_000), wire: tick(16_000));
         let last = valid(39, 405_000);
@@ -147,10 +146,14 @@ mod tests {
         // Early receipt is allowed, but admission does not reset its deadline.
         let early = RecordedReadTiming {
             receipt: tick(14_999),
+            body: tick(19_998),
+            settlement: tick(20_998),
             ..v
         };
-        assert_timing!(early, true, body: tick(19_998), settlement: tick(19_998));
-        assert_timing!(early, false, settlement: tick(19_999));
+        assert!(recorded_timing_is_consistent(&early));
+        assert_timing!(early, false, admission: tick(14_999));
+        assert_timing!(early, false, body: tick(19_999));
+        assert_timing!(early, false, settlement: tick(20_999));
         assert_timing!(v, false, body: tick(20_000), settlement: tick(20_000));
         assert_timing!(v, false, settlement: tick(21_000));
     }
@@ -158,8 +161,14 @@ mod tests {
     #[test]
     fn original_cutoffs_tighten_operation_and_settlement_independently() {
         let v = valid(0, 15_000);
-        assert_timing!(v, false, attempt_cutoff: tick(19_999));
-        assert_timing!(v, false, operation_authority_cutoff: tick(19_999));
+        let before_settlement_deadline = RecordedReadTiming {
+            settlement: tick(20_998),
+            ..v
+        };
+        assert_timing!(before_settlement_deadline, true, attempt_cutoff: tick(19_999), body: tick(19_998));
+        assert_timing!(before_settlement_deadline, false, attempt_cutoff: tick(19_999));
+        assert_timing!(before_settlement_deadline, true, operation_authority_cutoff: tick(19_999), body: tick(19_998));
+        assert_timing!(before_settlement_deadline, false, operation_authority_cutoff: tick(19_999));
         assert_timing!(v, false, settlement_cutoff: tick(20_999));
         assert_timing!(v, false, settlement_authority_cutoff: tick(20_999));
         let bounded = RecordedReadTiming {
