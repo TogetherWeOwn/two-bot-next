@@ -3,10 +3,10 @@
 use std::future::Future;
 
 use crate::automod_preview::PreviewVerdict;
+use crate::automod_preview_audit::replay_preview_reply;
 use crate::automod_preview_flow::{evaluated_commit, rate_limited_commit, FreshPlan};
 use crate::automod_preview_report::{
-    metric_unavailable, render_preview_reply, PreviewMetricLabels, PREVIEW_RATE_LIMITED_REPLY,
-    PREVIEW_UNAVAILABLE_REPLY,
+    metric_unavailable, PreviewMetricLabels, PREVIEW_UNAVAILABLE_REPLY,
 };
 use crate::custom_commands::AuditRecord;
 
@@ -50,7 +50,8 @@ fn unavailable(dry_run: bool) -> AttemptResult {
 
 /// Complete a fresh attempt after the adapter has claimed and read no row.
 /// The caller supplies the admission decision and must release the limiter
-/// guard before calling this function. Returns no verdict on commit error.
+/// guard before calling this function. Renders from the same audit fields as
+/// replay. Returns no verdict if the commit fails or its row cannot be replayed.
 pub async fn finish_fresh_attempt(
     plan: FreshPlan,
     context: AttemptContext<'_>,
@@ -66,30 +67,32 @@ pub async fn finish_fresh_attempt(
         receipt_iso,
         dry_run,
     } = context;
-    let (commit, verdict) = match plan {
+    let (commit, effective_dry_run) = match plan {
         FreshPlan::Evaluate => {
             let verdict = evaluate();
             (
                 evaluated_commit(&verdict, len, guild_id, actor_id, channel_id),
-                Some(verdict),
+                verdict.dry_run,
             )
         }
         FreshPlan::RefuseRateLimited => (
             rate_limited_commit(dry_run, len, guild_id, actor_id, channel_id),
-            None,
+            dry_run,
         ),
     };
+    let outcome = commit.record.outcome.clone();
+    let reason = commit.record.reason.clone();
     let Ok(stored_at) = store
         .insert_and_commit(commit.record, audit_id, receipt_iso)
         .await
     else {
-        return unavailable(verdict.as_ref().map_or(dry_run, |verdict| verdict.dry_run));
+        return unavailable(effective_dry_run);
+    };
+    let Some(reply) = replay_preview_reply(&outcome, reason.as_deref(), &stored_at) else {
+        return unavailable(effective_dry_run);
     };
     AttemptResult {
-        reply: verdict.map_or_else(
-            || PREVIEW_RATE_LIMITED_REPLY.to_owned(),
-            |verdict| render_preview_reply(&verdict, &stored_at),
-        ),
+        reply,
         metric: Some(commit.metric),
     }
 }
@@ -97,8 +100,11 @@ pub async fn finish_fresh_attempt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::automod::AutomodFilter;
     use crate::automod_preview::PreviewResult;
-    use crate::automod_preview_report::{metric_for_verdict, metric_rate_limited};
+    use crate::automod_preview_report::{
+        metric_for_verdict, metric_rate_limited, render_preview_reply, PREVIEW_RATE_LIMITED_REPLY,
+    };
     use std::task::{Context, Poll, Waker};
     use tokio::sync::oneshot;
 
@@ -144,12 +150,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_reply_matches_replay_of_committed_row() {
+        let mut committed = None;
+        let commit = |record: AuditRecord| {
+            committed = Some(record);
+            std::future::ready(Ok(STORED_AT.to_owned()))
+        };
+        let evaluate = || PreviewVerdict {
+            result: PreviewResult::Matched,
+            filter: Some(AutomodFilter::BadWords),
+            knobs: &[],
+            ..verdict()
+        };
+        let result = finish_fresh_attempt(
+            FreshPlan::Evaluate,
+            CONTEXT,
+            "claim",
+            5,
+            Store { commit },
+            evaluate,
+        )
+        .await;
+        let record = committed.expect("audit row committed");
+        let replay = replay_preview_reply(&record.outcome, record.reason.as_deref(), STORED_AT)
+            .expect("committed row can be replayed");
+        assert!(replay.contains("TWO_AUTOMOD_BAD_WORDS"));
+        assert_eq!(result.reply, replay);
+    }
+
+    #[tokio::test]
     async fn fresh_reply_waits_for_commit_and_uses_stored_time() {
-        for (plan, committed) in [
-            (FreshPlan::Evaluate, true),
-            (FreshPlan::Evaluate, false),
-            (FreshPlan::RefuseRateLimited, true),
-            (FreshPlan::RefuseRateLimited, false),
+        for (plan, stored_at) in [
+            (FreshPlan::Evaluate, Some(STORED_AT)),
+            (FreshPlan::Evaluate, None),
+            (FreshPlan::Evaluate, Some("")),
+            (FreshPlan::RefuseRateLimited, Some(STORED_AT)),
+            (FreshPlan::RefuseRateLimited, None),
         ] {
             let evaluated = matches!(plan, FreshPlan::Evaluate);
             let (tx, rx) = oneshot::channel();
@@ -181,17 +217,17 @@ mod tests {
                     .poll(&mut Context::from_waker(Waker::noop())),
                 Poll::Pending
             ));
-            if committed {
-                tx.send(STORED_AT.to_owned())
+            if let Some(stored_at) = stored_at {
+                tx.send(stored_at.to_owned())
                     .expect("commit receiver remains pending");
             } else {
                 drop(tx);
             }
             let result = attempt.await;
-            if committed && evaluated {
+            if stored_at == Some(STORED_AT) && evaluated {
                 assert_eq!(result.reply, render_preview_reply(&verdict(), STORED_AT));
                 assert_eq!(result.metric, Some(metric_for_verdict(&verdict())));
-            } else if committed {
+            } else if stored_at == Some(STORED_AT) {
                 assert_eq!(result.reply, PREVIEW_RATE_LIMITED_REPLY);
                 assert_eq!(result.metric, Some(metric_rate_limited(true)));
             } else {
