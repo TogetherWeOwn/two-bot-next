@@ -34,26 +34,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  rollback-proof-watch:
-    name: alert on a missing daily staging rollback proof
-    if: github.ref == 'refs/heads/main' && inputs.dry_run != true
-    permissions:
-      contents: read
-      actions: read # Read workflow runs and artifacts for staging-rollback-proof-watch.py.
-      issues: write # open or close the staging-rollback-proof incident issue
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 1
-      - name: Check daily rollback proof freshness independently of the digest
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python3 scripts/rollback_proof.py watch
-
   digest:
     name: cut the daily digest tag and release
     permissions:

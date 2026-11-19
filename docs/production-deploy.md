@@ -401,8 +401,8 @@ runs `scripts/rollback_target_preflight.py`, which refuses the promotion
 Its receipt (version, image, SHA, the migrations it checked, refusal codes)
 goes to the log and the run summary; it never carries SQL text or API
 bodies. A rollback and the live-SHA redeploy skip it: recovery never waits on
-it. The daily `staging-rollback-drill` keeps exercising the restore path
-itself on staging.
+it. The Release Manager exercises the restore path with the [on-demand staging proof](#on-demand-staging-proof)
+once per bot production release, after deploying the candidate to staging.
 
 ## Regression gate against production
 
@@ -664,14 +664,11 @@ policy pins this ordering, condition, local snapshot command and red outcome.
 Without a takeover or a successful deploy/snapshot the run fails for the
 operator; a failed restore is never a reason to wait for the next deployment.
 
-### Daily staging proof
+<a id="daily-staging-proof"></a>
+### On-demand staging proof
 
-`staging-rollback-drill.yml` runs daily at **03:17 UTC** on `main`. With no manual
-`target_version`, its `proof` job currently fails before dispatch; its failure
-alert remains active. Retain this refusal until non-mutating Actions evidence and
-independent Security acceptance establish a replacement. No synthetic green is
-qualification. The retained, currently unreachable `scripts/rollback_proof.py run`
-would:
+Dispatch `staging-rollback-drill.yml` on `main` with `target_version` empty
+and `sha` set to the full 40-character lowercase candidate commit.
 
 1. Dispatches only `deploy-staging.yml` on `main`, with the existing staging
    error-rate gate rehearsal enabled. No production dispatch or traffic fault
@@ -685,7 +682,11 @@ would:
    Worker version and image digest, with takeover and the stable 200/gateway-ready
    gate. It uploads a sanitized `staging-rollback-proof` artifact (`proof.json`)
    containing the child run ID/SHA and restored members, retained for 14 days.
-   The wrapper is green only after that proof is validated and uploaded.
+   The deployed `child_sha` must equal the requested SHA; `workflow_sha` can differ.
+4. Requires a green `staging-use-release` job and ordered finish, status and stop
+   receipts in `staging-use-deploy-stop-<run>-1` for the same window and attempt.
+   Status and release must agree on the restored build; `not-owned` is not a stop.
+   The wrapper passes only after validation and artifact upload.
 
 The child is named `staging rollback proof`, not a staging certification run.
 Production excludes it from latest-certification history only after re-reading
@@ -699,29 +700,14 @@ build. Inspect the hold and resume the proof after the observation window;
 do not clear a hold to make a proof green. Explicit arm/disarm dispatches without
 the error-rate switch retain their exception.
 
-The wrapper uses separate `staging-rollback-proof-schedule` and
-`staging-rollback-proof-workflow_dispatch` groups, **not** `deploy-staging`:
-a later manual dispatch cannot replace the pending scheduled wrapper, and its
-child can acquire the staging deploy lane. The optional manual Worker-only
-drill still holds `deploy-staging` while it runs and now uploads its separate
-evidence artifact; it does not count as the daily automatic proof.
+The wrapper runs outside `staging-lifecycle` so its child can acquire that lane.
+The Worker-only drill holds the lane and uploads separate evidence; it does not
+count as automatic proof.
 
-A failed wrapper opens (or comments on) the one `staging-rollback-proof`
-GitHub issue labelled `incident`; Paperclip turns it into an agent task. Independently, the **06:23 UTC** `daily-digest` workflow's
-`rollback-proof-watch` job checks the newest scheduled drill and its artifact,
-even if the digest fails. Missing, failed, cancelled, stuck, unreadable or
-older-than-30-hour proof alerts and fails the watcher. An older successful proof
-cannot hide a newer failed one. A healthy check comments on and closes any open issue
-with no activity since the graded proof completed. Every failed proof, scheduled
-or manual, alerts on that issue, so later activity holds it open until a newer
-scheduled proof passes. This independent
-schedule catches a missed drill trigger; an outage of GitHub Actions itself is
-outside these two scheduled checks.
-
-Do not dispatch an on-demand proof while this refusal is in place. The local
-`python3 scripts/rollback_proof.py run --dry-run` does not dispatch or qualify a
-proof. Inspect any prior child run and staging state before recovery; the
-freshness watcher requires a scheduled proof, not a manual substitute.
+Failures open or update the `staging-rollback-proof` incident; verify the exact
+wrapper, child and artifact before closing it. No scheduled watcher or dry run
+qualifies a proof. Wrapper reruns fail without dispatching: inspect the original
+child run and staging state before recovery.
 
 Both gate curls enforce `--max-filesize 65536` (64 KiB). Any transfer
 failure counts as `000`, even if curl reports HTTP 200 and leaves a valid

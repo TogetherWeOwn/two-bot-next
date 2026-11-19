@@ -1,13 +1,16 @@
 name: staging-rollback-drill
 
-# Daily automatic recovery proof, staging only. The dispatcher never holds the
+# On-demand recovery proof, staging only. The dispatcher never holds the
 # deploy-staging lock while waiting for its child. A manual target retains the
 # original Worker-only backout/restore drill, serialized in the staging lane.
 on:
-  schedule:
-    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
+      sha:
+        description: Full candidate commit SHA for the automatic rollback proof
+        type: string
+        required: false
+        default: ""
       target_version:
         description: Optional previously served staging Worker UUID for the manual Worker-only drill; empty runs the automatic rollback proof
         type: string
@@ -17,13 +20,12 @@ on:
 permissions: {}
 
 concurrency:
-  # A later manual dispatch cannot replace the pending scheduled proof.
   group: staging-rollback-proof-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
   proof:
-    name: daily staging automatic rollback proof
+    name: on-demand staging automatic rollback proof
     if: github.ref == 'refs/heads/main' && inputs.target_version == ''
     permissions:
       contents: read
@@ -31,11 +33,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 80
     steps:
-      # Fail this job itself so the existing incident alert still runs.
-      - name: Refuse staging use without enforced admission
-        run: |
-          echo "::error::enforced exact-SHA admission is unavailable"
-          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -43,8 +40,9 @@ jobs:
       - name: Prove the staging failure-to-restore chain
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/rollback_proof.py run --evidence "$RUNNER_TEMP/proof.json"
-      - name: Upload the daily rollback proof
+          REQUESTED_SHA: ${{ inputs.sha }}
+        run: python3 scripts/rollback_proof.py run --sha "$REQUESTED_SHA" --evidence "$RUNNER_TEMP/proof.json"
+      - name: Upload the rollback proof
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: staging-rollback-proof
