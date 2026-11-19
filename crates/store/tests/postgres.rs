@@ -375,7 +375,14 @@ async fn voice_heat_hours_constraints_bind_observation_to_samples(pool: &Pool<Po
                 let error = result.unwrap_err();
                 let error = error.as_database_error().expect("CHECK violation");
                 assert_eq!(error.code().as_deref(), Some("23514"));
-                assert_eq!(error.constraint(), Some(expected));
+                let actual = error.constraint();
+                // Negative samples violate both checks; do not depend on which
+                // constraint PostgreSQL reports first.
+                assert!(
+                    actual == Some(expected)
+                        || (samples < 0 && actual == Some("voice_heat_observation_valid")),
+                    "expected {expected} for {samples} samples, got {actual:?}"
+                );
             }
             None => assert_eq!(result.unwrap().rows_affected(), 1),
         }
