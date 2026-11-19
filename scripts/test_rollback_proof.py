@@ -341,7 +341,7 @@ class RollbackProofTests(unittest.TestCase):
     @staticmethod
     def alert_text(code):
         return (f"two-bot-next ALERT staging rollback proof: {code}. "
-                "Inspect the daily staging drill and its child run before retrying; never drill production. "
+                "Inspect the on-demand staging drill and its child run before retrying; never drill production. "
                 "Runbook: https://github.com/TogetherWeOwn/two-bot-next/blob/main/docs/production-deploy.md#daily-staging-proof "
                 "| logs https://example.test/run/123")
 
@@ -352,6 +352,8 @@ class RollbackProofTests(unittest.TestCase):
             self.assertEqual(proof.main(["alert"]), 0)
         opened.assert_called_once_with(os.environ, "staging-rollback-proof",
                                        "staging rollback proof failed", self.alert_text("daily_proof_failed"))
+        runbook = Path(__file__).resolve().parent.parent / "docs/production-deploy.md"
+        self.assertIn('<a id="daily-staging-proof"></a>', runbook.read_text())
 
     def test_dry_run_has_no_effects_and_missing_evidence_refuses_before_dispatch(self):
         with patch.object(proof, "gh") as gh, patch.object(proof, "alert") as alert, redirect_stdout(io.StringIO()):

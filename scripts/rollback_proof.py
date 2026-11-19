@@ -249,7 +249,7 @@ def incident_client():
 def alert(code):
     client = incident_client()
     content = (f"two-bot-next ALERT staging rollback proof: {code}. "
-               "Inspect the daily staging drill and its child run before retrying; never drill production. "
+               "Inspect the on-demand staging drill and its child run before retrying; never drill production. "
                f"Runbook: https://github.com/{REPO}/blob/main/docs/production-deploy.md#daily-staging-proof "
                f"| logs {client.run_link()}")
     try:

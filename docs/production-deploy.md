@@ -664,6 +664,7 @@ policy pins this ordering, condition, local snapshot command and red outcome.
 Without a takeover or a successful deploy/snapshot the run fails for the
 operator; a failed restore is never a reason to wait for the next deployment.
 
+<a id="daily-staging-proof"></a>
 ### On-demand staging proof
 
 The Release Manager dispatches `staging-rollback-drill.yml` on `main` once per
