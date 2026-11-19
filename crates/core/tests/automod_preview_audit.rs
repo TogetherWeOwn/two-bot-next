@@ -10,7 +10,7 @@
 //! same-transaction reload. Neither proves cross-connection committed replay or
 //! that a real handler commits before replying.
 
-use sqlx::{migrate::Migrator, PgPool, Postgres, Transaction};
+use sqlx::{migrate::Migrator, Connection, PgPool, Postgres, Transaction};
 use two_bot_core::automod_preview_audit as preview_audit;
 use two_bot_testsupport::TestDatabase;
 
@@ -101,14 +101,55 @@ async fn verify_same_transaction_row(pool: PgPool) -> Result<(), sqlx::Error> {
         None
     );
 
+    // Invalid receipt timestamps fail without leaving an audit row.
+    sqlx::query("SAVEPOINT invalid_timestamp")
+        .execute(&mut *tx)
+        .await?;
+    let record = matched_record();
+    let error = preview_audit::insert_preview_audit(&mut *tx, &record, &id, "not-a-timestamp")
+        .await
+        .expect_err("invalid timestamp must be refused");
+    assert_eq!(
+        error.as_database_error().and_then(|err| err.code()),
+        Some("22007".into()),
+        "expected PostgreSQL invalid_datetime_format, got {error:?}"
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT invalid_timestamp")
+        .execute(&mut *tx)
+        .await?;
+    assert_eq!(
+        preview_audit::load_preview_audit(&mut *tx, &id).await?,
+        None
+    );
+
+    // Preserve the temporary schema while testing that rolling back the insert
+    // removes the row from the same transaction.
+    sqlx::query("SAVEPOINT before_insert")
+        .execute(&mut *tx)
+        .await?;
+
     // The winner inserts with its receipt time and reads back the stored
     // timestamp; the first reply and every replay share that text.
     sqlx::query("SET LOCAL TIME ZONE 'America/New_York'")
         .execute(&mut *tx)
         .await?;
-    let record = matched_record();
     let stored = preview_audit::insert_preview_audit(&mut *tx, &record, &id, AT).await?;
     assert_eq!(stored, "2026-11-02 08:00:00.123456+00");
+    let metadata: (String, Option<String>, String, Option<String>) = sqlx::query_as(
+        "SELECT guild_id, actor_id, action, target_key FROM automation_audit_log WHERE id = $1",
+    )
+    .bind(&id)
+    .fetch_one(&mut *tx)
+    .await?;
+    assert_eq!(
+        metadata,
+        (
+            "test-guild-one".to_owned(),
+            Some("actor-one".to_owned()),
+            "automod.preview".to_owned(),
+            Some("channel-one".to_owned()),
+        )
+    );
     // Neither insert nor replay may inherit the database session's timezone.
     sqlx::query("SET LOCAL TIME ZONE 'Asia/Tokyo'")
         .execute(&mut *tx)
@@ -140,6 +181,57 @@ async fn verify_same_transaction_row(pool: PgPool) -> Result<(), sqlx::Error> {
         "same-transaction replay renders byte-identical to the first reply"
     );
 
+    sqlx::query("ROLLBACK TO SAVEPOINT before_insert")
+        .execute(&mut *tx)
+        .await?;
+    assert_eq!(
+        preview_audit::load_preview_audit(&mut *tx, &id).await?,
+        None,
+        "rolling back the insert removes the row from the same schema"
+    );
+
+    // The retry uses a newly created temporary schema, so its empty read is
+    // not proof of persistent-row rollback.
     tx.rollback().await?;
+    let mut retry = pool.begin().await?;
+    sqlx::query("CREATE TEMP TABLE preview_audit_retry_scope (id INTEGER)")
+        .execute(&mut *retry)
+        .await?;
+    sqlx::query("SET LOCAL search_path = pg_temp")
+        .execute(&mut *retry)
+        .await?;
+    sqlx::raw_sql(MIGRATION).execute(&mut *retry).await?;
+    preview_audit::lock_preview_attempt(&mut retry, "999").await?;
+    assert_eq!(
+        preview_audit::load_preview_audit(&mut *retry, &id).await?,
+        None,
+        "fresh retry schema contains no audit row"
+    );
+    // A mismatched database column must return an error, not panic while
+    // decoding the row. The replacement table is temporary and rolled back.
+    sqlx::query("DROP TABLE automation_audit_log")
+        .execute(&mut *retry)
+        .await?;
+    sqlx::query(
+        "CREATE TEMP TABLE automation_audit_log (id TEXT, outcome INTEGER, reason TEXT, created_at TIMESTAMPTZ)",
+    )
+    .execute(&mut *retry)
+    .await?;
+    sqlx::query("INSERT INTO automation_audit_log VALUES ($1, 1, NULL, now())")
+        .bind(&id)
+        .execute(&mut *retry)
+        .await?;
+    // Reprepare the query against the replacement schema; otherwise a cached
+    // result descriptor can fail before SQLx tries to decode the column.
+    retry.clear_cached_statements().await?;
+    let error = preview_audit::load_preview_audit(&mut *retry, &id).await;
+    assert!(
+        matches!(
+            error,
+            Err(sqlx::Error::ColumnDecode { ref index, .. }) if index == "\"outcome\""
+        ),
+        "expected outcome column decode error, got {error:?}"
+    );
+    retry.rollback().await?;
     Ok(())
 }
