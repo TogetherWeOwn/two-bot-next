@@ -92,48 +92,100 @@ class RollbackProofValidatorTests(unittest.TestCase):
                 proof.validate_deployed_sha({"evidence.json": {"revision": invalid}}, invalid)
 
     def setUp(self):
-        self.window = {"schema": "two-bot-staging-pipeline.v1", "action": "window",
-                       "environment": "staging", "runId": "123", "runAttempt": 1, "expiresAt": 1000,
-                       "sha": "b" * 40}
-        self.use = {"environment": "staging", "runId": "123", "runAttempt": 1, "expiresAt": 1000,
-                    "phase": "released", "sha": "a" * 40}
-        self.release = {"schema": "two-bot-staging-use.v1", "action": "release", "environment": "staging",
-                        "running": False, "use": self.use}
-        self.start = {"staging-use.jsonl": [{"action": "attempt"}, self.window]}
-        self.stop = {"staging-use-release.jsonl": [{"action": "status"}, self.release]}
+        self.sha = "b" * 40
+        correlation = {"environment": "staging", "runId": "123", "runAttempt": 1}
+        pipeline = dict(correlation, schema="two-bot-staging-pipeline.v1", observedAt=NOW.isoformat())
+        client = dict(correlation, schema="two-bot-staging-use.v1", observedAt=NOW.isoformat())
+        original = {"sha": self.sha, "deploymentId": VERSION, "epoch": 1}
+        restored = {"sha": "a" * 40, "deploymentId": "22222222-2222-2222-2222-222222222222", "epoch": 2}
+        acquired_at = int(NOW.timestamp()) * 1000
+        expires_at = acquired_at + 120 * 60 * 1000
+        self.window = dict(pipeline, action="window", expiresAt=expires_at, sha=self.sha, deploymentId=VERSION)
+        self.use = dict(correlation, **restored, acquiredAt=acquired_at, expiresAt=expires_at, phase="released")
+        self.status = dict(client, **restored, action="status", running=True, use=dict(self.use, phase="active"))
+        self.release = dict(client, **restored, action="release", running=False, use=self.use)
+        self.start = {"evidence.json": {"revision": self.sha}, "staging-use.jsonl": [
+            dict(pipeline, action="attempt", operation="begin"),
+            dict(client, **original, action="status", running=False, use=None),
+            self.window,
+            dict(client, **original, action="acquire", running=False,
+                 use=dict(correlation, **original, acquiredAt=acquired_at, expiresAt=expires_at, phase="active")),
+        ]}
+        self.finish = dict(pipeline, action="attempt", operation="finish")
+        self.stop = {"staging-use-release.jsonl": [self.finish, self.status, self.release]}
+
+    def test_shutdown_rejects_wrong_or_missing_outer_release_identity(self):
+        for key, invalid in (("runId", "124"), ("runAttempt", 2), ("runAttempt", True),
+                             ("runId", None), ("runAttempt", None)):
+            with self.subTest(key=key, value=invalid), patch.dict(self.release):
+                if invalid is None:
+                    del self.release[key]
+                else:
+                    self.release[key] = invalid
+                with self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                    proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+    def test_shutdown_requires_ordered_finish_receipt(self):
+        for rows in ([self.release], [self.finish, self.release], [self.status, self.release],
+                     [self.finish, self.release, self.status],
+                     [self.finish, self.status, self.release, self.status],
+                     [dict(self.finish, operation="begin"), self.status, self.release]):
+            with self.subTest(actions=[row["action"] for row in rows]), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_not_confirmed$"):
+                proof.validate_shutdown(self.start, {"staging-use-release.jsonl": rows}, 123, self.sha)
+
+    def test_shutdown_requires_initial_window_on_deployed_sha(self):
+        with patch.dict(self.window, sha="c" * 40), \
+                self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+            proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+        with patch.dict(self.start["evidence.json"], revision="c" * 40), \
+                self.assertRaisesRegex(proof.ProofError, "^deployed_sha_mismatch$"):
+            proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+    def test_shutdown_rejects_matching_expiry_above_safe_integer_limit(self):
+        expiry = {"expiresAt": 9007199254740992}
+        with patch.dict(self.window, expiry), patch.dict(self.use, expiry), \
+                patch.dict(self.status["use"], expiry), \
+                self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+            proof.validate_shutdown(self.start, self.stop, 123, self.sha)
 
     def test_shutdown_confirms_release_of_original_window_after_rebind(self):
-        proof.validate_shutdown(self.start, self.stop, 123)
+        proof.validate_shutdown(self.start, self.stop, 123, self.sha)
 
     def test_shutdown_rejects_malformed_receipts_and_run_id(self):
         for start, stop in ((None, self.stop), (self.start, {}), (self.start, {"staging-use-release.jsonl": [False]}),
                             ({"staging-use.jsonl": self.window}, self.stop)):
             with self.subTest(start=start, stop=stop), self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_invalid$"):
-                proof.validate_shutdown(start, stop, 123)
+                proof.validate_shutdown(start, stop, 123, self.sha)
         for invalid in (True, 0, "123"):
             with self.subTest(run_id=invalid), self.assertRaisesRegex(proof.ProofError, "^shutdown_run_id_invalid$"):
-                proof.validate_shutdown(self.start, self.stop, invalid)
+                proof.validate_shutdown(self.start, self.stop, invalid, self.sha)
 
     def test_shutdown_rejects_missing_duplicate_or_failed_outcomes(self):
-        for windows, releases in (([], [self.release]), ([self.window, self.window], [self.release]),
-                                  ([self.window], []), ([self.window], [self.release, self.release]),
-                                  ([self.window, {"action": "failed"}], [self.release]),
-                                  ([self.window], [self.release, {"action": "not-owned"}]),
-                                  ([self.window], [self.release, {"action": "failed"}])):
-            with self.subTest(windows=windows, releases=releases), \
+        begin = self.start["staging-use.jsonl"]
+        finish = self.stop["staging-use-release.jsonl"]
+        for start, stop in ((begin[:2], finish), (begin + [self.window], finish), (begin, []),
+                            (begin, finish + [self.release]), (begin + [{"action": "failed"}], finish),
+                            (begin, finish[:2] + [{"action": "not-owned"}]),
+                            (begin, finish + [{"action": "failed"}])):
+            with self.subTest(start=[row["action"] for row in start], stop=[row["action"] for row in stop]), \
                     self.assertRaisesRegex(proof.ProofError, "^shutdown_not_confirmed$"):
-                proof.validate_shutdown({"staging-use.jsonl": windows}, {"staging-use-release.jsonl": releases}, 123)
+                proof.validate_shutdown(dict(self.start, **{"staging-use.jsonl": start}),
+                                        {"staging-use-release.jsonl": stop}, 123, self.sha)
 
     def test_shutdown_requires_same_staging_run_attempt_and_expiry_and_stopped_runtime(self):
         for target, changes in (
             (self.window, {"schema": "unknown", "environment": "production", "runId": "124", "runAttempt": True, "expiresAt": 0}),
+            (self.finish, {"schema": "unknown", "runId": "124"}),
+            (self.status, {"schema": "unknown", "runAttempt": 2, "running": 0, "use": None}),
+            (self.status["use"], {"runId": "124", "expiresAt": 1001, "phase": "unknown"}),
             (self.release, {"schema": "unknown", "environment": "production", "running": 0, "use": []}),
             (self.use, {"environment": "production", "runId": "124", "runAttempt": 2, "expiresAt": 1001, "phase": "active"}),
         ):
             for key, invalid in changes.items():
                 with self.subTest(key=key, value=invalid), patch.dict(target, {key: invalid}), \
                         self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
-                    proof.validate_shutdown(self.start, self.stop, 123)
+                    proof.validate_shutdown(self.start, self.stop, 123, self.sha)
 
 
 class RollbackProofTests(unittest.TestCase):

@@ -191,33 +191,42 @@ def validate_deployed_sha(files, requested_sha):
             "deployed_sha_mismatch")
 
 
-def validate_shutdown(files, stop_files, run_id):
+def validate_shutdown(files, stop_files, run_id, requested_sha):
     require(type(run_id) is int and run_id > 0, "shutdown_run_id_invalid")
     start = files.get("staging-use.jsonl") if isinstance(files, dict) else None
     stop = stop_files.get("staging-use-release.jsonl") if isinstance(stop_files, dict) else None
     require(isinstance(start, list) and isinstance(stop, list)
             and all(isinstance(row, dict) for rows in (start, stop) for row in rows),
             "shutdown_receipt_invalid")
+    validate_deployed_sha(files, requested_sha)
     windows = [row for row in start if row.get("action") == "window"]
-    releases = [row for row in stop if row.get("action") == "release"]
-    require(len(windows) == 1 and len(releases) == 1
-            and not any(row.get("action") in ("failed", "not-owned") for rows in (start, stop) for row in rows),
+    require(len(windows) == 1 and [row.get("action") for row in stop] == ["attempt", "status", "release"]
+            and stop[0].get("operation") == "finish"
+            and not any(row.get("action") in ("failed", "not-owned") for row in start),
             "shutdown_not_confirmed")
-    window, release = windows[0], releases[0]
-    use = release.get("use")
+    window = windows[0]
+    finish, status, release = stop
     expiry = window.get("expiresAt")
-    # Rollback can rebind the window to another build, but not to another run,
-    # attempt, or expiry. A release must attest that the runtime is stopped.
-    require(window.get("schema") == "two-bot-staging-pipeline.v1"
-            and window.get("environment") == "staging" and window.get("runId") == str(run_id)
-            and type(window.get("runAttempt")) is int and window["runAttempt"] == 1
-            and type(expiry) is int and expiry > 0
-            and release.get("schema") == "two-bot-staging-use.v1"
-            and release.get("environment") == "staging" and release.get("running") is False
-            and isinstance(use, dict) and use.get("environment") == "staging"
-            and use.get("runId") == str(run_id) and type(use.get("runAttempt")) is int
-            and use["runAttempt"] == 1 and type(use.get("expiresAt")) is int
-            and use["expiresAt"] == expiry and use.get("phase") == "released",
+    expected_run = str(run_id)
+
+    def same_attempt(row):
+        return (isinstance(row, dict) and row.get("environment") == "staging"
+                and row.get("runId") == expected_run
+                and type(row.get("runAttempt")) is int and row["runAttempt"] == 1)
+
+    def same_window(use):
+        return same_attempt(use) and type(use.get("expiresAt")) is int and use["expiresAt"] == expiry
+
+    # Only the initial window is pinned to the deployed build. Rollback may
+    # rebind it, but the finish transaction must preserve the attempt and expiry.
+    prior, use = status.get("use"), release.get("use")
+    require(all(same_attempt(row) for row in (window, finish, status, release))
+            and window.get("schema") == finish.get("schema") == "two-bot-staging-pipeline.v1"
+            and status.get("schema") == release.get("schema") == "two-bot-staging-use.v1"
+            and window.get("sha") == requested_sha and type(expiry) is int and 0 < expiry <= 2**53 - 1
+            and type(status.get("running")) is bool and release.get("running") is False
+            and same_window(prior) and prior.get("phase") in ("preparing", "active", "released")
+            and same_window(use) and use.get("phase") == "released",
             "shutdown_receipt_mismatch")
 
 
