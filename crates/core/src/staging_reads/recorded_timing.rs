@@ -125,6 +125,7 @@ mod tests {
             assert_eq!(
                 recorded_timing_is_consistent(&RecordedReadTiming { $($field: $value,)* ..$base }),
                 $expected,
+                "{}",
                 stringify!($($field: $value),*)
             );
         };
@@ -203,6 +204,7 @@ mod tests {
             settlement_cutoff: tick(open + 5000),
             ..valid(0, open)
         };
+        assert_timing!(v, true, attempt_cutoff: tick(open + 4999), body: tick(open + 4998));
         assert!(!recorded_timing_is_consistent(&v));
         assert_timing!(v, false, anchor: tick(u64::MAX));
         assert_timing!(v, false, receipt: tick(u64::MAX));
