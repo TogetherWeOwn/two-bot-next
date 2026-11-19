@@ -515,6 +515,25 @@ pub struct DeltaReport {
     pub tables: Vec<TableDelta>,
 }
 
+async fn table_exists(tx: &mut Transaction<'_, Postgres>, table: &str) -> Result<bool, DeltaError> {
+    // Resolve through the same search_path as the COUNT, without reading rows.
+    Ok(sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(table)
+        .fetch_one(&mut **tx)
+        .await?)
+}
+
+fn missing_table(table: &str) -> TableDelta {
+    TableDelta {
+        table: table.to_owned(),
+        status: "missing".to_owned(),
+        columns: None,
+        count: None,
+        reason: Some("table not present in this database".to_owned()),
+        disposition: None,
+    }
+}
+
 /// Count one measured table inside the caller's read-only transaction. A
 /// missing table (partially migrated database) is reported, not an error.
 async fn count_table(
@@ -523,21 +542,8 @@ async fn count_table(
     since: &str,
 ) -> Result<TableDelta, DeltaError> {
     let table = quote(spec.table)?;
-    // Unqualified on purpose: it resolves through the same search_path as the
-    // COUNT below, so schema-isolated test databases behave like production.
-    let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-        .bind(spec.table)
-        .fetch_one(&mut **tx)
-        .await?;
-    if !exists {
-        return Ok(TableDelta {
-            table: spec.table.to_owned(),
-            status: "missing".to_owned(),
-            columns: None,
-            count: None,
-            reason: Some("table not present in this database".to_owned()),
-            disposition: None,
-        });
+    if !table_exists(tx, spec.table).await? {
+        return Ok(missing_table(spec.table));
     }
     let predicate = recency_predicate(spec)?;
     // Table and column names are static constants validated by `quote`;
@@ -581,6 +587,11 @@ async fn report_at(
         })?;
     let mut tables = Vec::with_capacity(TABLE_SPECS.len());
     for spec in TABLE_SPECS {
+        // Pre-heat targets lack this migrator-only table; probe only the catalog.
+        if spec.table == "voice_heat_hours" && !table_exists(&mut tx, spec.table).await? {
+            tables.push(missing_table(spec.table));
+            continue;
+        }
         match spec.measure {
             TableMeasure::Unmeasurable(reason, disposition) => tables.push(TableDelta {
                 table: spec.table.to_owned(),

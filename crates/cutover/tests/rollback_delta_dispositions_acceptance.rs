@@ -220,6 +220,7 @@ impl TestDb {
             include_str!("../migrations/0414_voice_rooms_custom_name.sql"),
             include_str!("../migrations/0416_voice_room_privacy.sql"),
             include_str!("../migrations/0422_voice_create_reservations.sql"),
+            include_str!("../migrations/0479_voice_heat_hours.sql"),
         ] {
             sqlx::raw_sql(migration).execute(&pool).await?;
         }
