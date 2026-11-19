@@ -165,7 +165,8 @@ class SecretScanSurfaceTests(unittest.TestCase):
 
     def test_scan_wrapper_keeps_history_scan_and_ignores_pr_policy(self):
         script = SCAN_SCRIPT.read_text()
-        for flag in ("--redact", "--exit-code 1", '--log-opts="--text --diff-merges=first-parent HEAD"',
+        for flag in ("--redact", "--exit-code 1", '--log-opts="--text --diff-merges=remerge HEAD"',
+                     '--log-opts="--text --diff-merges=first-parent --min-parents=3 HEAD"',
                      "--ignore-gitleaks-allow", "--config", "--gitleaks-ignore-path"):
             self.assertIn(flag, script)
         self.assertNotIn("--no-git", script)

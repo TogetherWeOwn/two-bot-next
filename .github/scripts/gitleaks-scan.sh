@@ -38,9 +38,7 @@ set -euo pipefail
 
 : "${GITLEAKS_BIN:?GITLEAKS_BIN must point at the verified gitleaks binary}"
 
-# Scan only history reachable from HEAD. Force text patches even for files Git
-# treats as binary, and include merge diffs to catch changes made in resolutions.
-args=(git . --redact --verbose --exit-code 1 --log-opts="--text --diff-merges=first-parent HEAD" --ignore-gitleaks-allow)
+args=(git . --redact --verbose --exit-code 1 --ignore-gitleaks-allow)
 
 if [[ "${EVENT_NAME:-}" == "pull_request" || "${EVENT_NAME:-}" == "merge_group" || "${EVENT_NAME:-}" == "workflow_dispatch" ]]; then
   : "${BASE_REF:?BASE_REF is required for PR, queue and dispatch runs}"
@@ -84,4 +82,36 @@ if [[ "${EVENT_NAME:-}" == "pull_request" || "${EVENT_NAME:-}" == "merge_group" 
   args+=(--config "${config}" --gitleaks-ignore-path "${ignore}")
 fi
 
-"${GITLEAKS_BIN}" "${args[@]}"
+# Gitleaks 8.30.1 misreads the path when Git inserts `remerge ...` metadata
+# inside a patch header. Strip only those metadata lines (patch text always
+# starts with +, - or a space) so path-based policies still use canonical paths.
+shim="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/gitleaks-remerge.XXXXXX")"
+trap 'rm -rf -- "${shim}"' EXIT
+cat > "${shim}/git" <<'BASH'
+#!/usr/bin/env bash
+set -o pipefail
+if [[ "${3:-}" == log ]]; then
+  if ! "${GITLEAKS_REAL_GIT}" "$@" | sed '/^remerge /d'; then
+    printf '%s\n' 'Failed to read remerge patches.' >&2
+    exit 1
+  fi
+else
+  exec "${GITLEAKS_REAL_GIT}" "$@"
+fi
+BASH
+chmod 0700 "${shim}/git"
+
+# Scan both parents' histories. Compare two-parent merges with Git's automatic
+# remerge, so a cleanly inherited finding keeps its original commit fingerprint
+# and edits introduced by the resolution are scanned at the merge commit.
+GITLEAKS_REAL_GIT="$(type -P git)" PATH="${shim}:${PATH}" \
+  "${GITLEAKS_BIN}" "${args[@]}" --log-opts="--text --diff-merges=remerge HEAD"
+
+# Git cannot remerge three or more parents. Keep first-parent patch coverage
+# for those merges rather than silently skipping their resolution changes.
+if ! octopus="$(git rev-list --min-parents=3 --max-count=1 HEAD)"; then
+  exit 2
+fi
+if [[ -n "${octopus}" ]]; then
+  "${GITLEAKS_BIN}" "${args[@]}" --log-opts="--text --diff-merges=first-parent --min-parents=3 HEAD"
+fi

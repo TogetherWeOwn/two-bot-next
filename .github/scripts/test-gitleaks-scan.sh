@@ -93,6 +93,18 @@ expect() {
   fi
 }
 
+# expect_finding NAME FINGERPRINT GOT_RC: exit 1 alone also matches scan errors.
+expect_finding() {
+  cases=$((cases + 1))
+  if [[ "$3" == 1 ]] && ! grep -Fq "${token}" "${work}/last.log" &&
+      sed -n 's/^Fingerprint:[[:blank:]]*//p' "${work}/last.log" | grep -Fx "$2" >/dev/null; then
+    printf 'ok   %s (redacted finding)\n' "$1"
+  else
+    failures=$((failures + 1))
+    printf 'FAIL %s: expected redacted finding %s and exit 1, got exit %s\n' "$1" "$2" "$3"
+  fi
+}
+
 # fingerprint_of CONFIG: gitleaks fingerprint of the planted finding in ${repo}.
 fingerprint_of() {
   (cd "${repo}" && "${GITLEAKS_BIN}" git . --config "$1" --log-opts=HEAD --no-banner \
@@ -122,7 +134,8 @@ base_commit
 printf 'fixture.txt -diff\n' > "${repo}/.gitattributes"
 plant_token
 pr_commit
-expect "pr: token in a -diff file is detected" 1 "$(scan_rc pull_request)"
+expect_finding "pr: token in a -diff file is detected" \
+  "$(git -C "${repo}" rev-parse HEAD):fixture.txt:github-pat:1" "$(scan_rc pull_request)"
 
 new_repo merge-resolution
 write_stock_config
@@ -143,7 +156,45 @@ if git -C "${repo}" merge --no-edit side || [[ -z "$(git -C "${repo}" ls-files -
 fi
 plant_token
 pr_commit
-expect "pr: token introduced only in a merge resolution is detected" 1 "$(scan_rc pull_request)"
+expect_finding "pr: token introduced only in a merge resolution is detected" \
+  "$(git -C "${repo}" rev-parse HEAD):fixture.txt:github-pat:1" "$(scan_rc pull_request)"
+
+new_repo merge-inherited-ignore
+write_stock_config
+base_commit
+git -C "${repo}" switch -q -c side
+plant_token
+pr_commit
+fp="$(fingerprint_of "${work}/stock.toml")"
+: "${fp:?expected the original fixture fingerprint}"
+git -C "${repo}" switch -q main
+printf '%s\n' "${fp}" > "${repo}/.gitleaksignore"
+base_commit
+git -C "${repo}" merge -q --no-ff --no-edit side
+expect "pr: exact fingerprint is honoured for a finding inherited unchanged" 0 "$(scan_rc pull_request)"
+printf 'other = "%s"\n' "${token}" >> "${repo}/fixture.txt"
+git -C "${repo}" add fixture.txt
+git -C "${repo}" commit -q --amend --no-edit
+expect_finding "pr: exact fingerprint does not cover a new merge finding" \
+  "$(git -C "${repo}" rev-parse HEAD):fixture.txt:github-pat:2" "$(scan_rc pull_request)"
+
+new_repo octopus-merge
+write_stock_config
+base_commit
+for side in first second; do
+  git -C "${repo}" switch -q -c "${side}" main
+  printf 'side\n' > "${repo}/${side}.txt"
+  pr_commit
+done
+git -C "${repo}" switch -q main
+printf 'more docs\n' >> "${repo}/README.md"
+base_commit
+git -C "${repo}" merge -q --no-ff --no-commit first second
+plant_token
+pr_commit
+git -C "${repo}" rev-parse --verify HEAD^3 >/dev/null
+expect_finding "pr: token introduced by a three-parent merge is detected" \
+  "$(git -C "${repo}" rev-parse HEAD):fixture.txt:github-pat:1" "$(scan_rc pull_request)"
 
 # -- the bypasses a PR could add itself ---------------------------------------
 new_repo pr-config
