@@ -188,6 +188,8 @@ mod tests {
     use super::*;
     use crate::staging_reads::canonical_tail::Verb;
 
+    mod mutation_matrix;
+
     const MANIFEST: &str = "0f1f9821354531dc6aedd4ee10c3ddc365e0032ac557aace69a1a76d7fbd6e1c";
     const CHALLENGE: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const INCARNATION: &str = "000000010000000200000003ffffffff";

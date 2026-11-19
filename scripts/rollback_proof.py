@@ -188,34 +188,52 @@ def validate_evidence(files):
 
 
 def validate_deployed_sha(files, requested_sha):
-    evidence = files.get("evidence.json") or {}
+    require(isinstance(requested_sha, str) and SHA.fullmatch(requested_sha), "requested_sha_invalid")
+    evidence = files.get("evidence.json") if isinstance(files, dict) else None
     require(isinstance(evidence, dict) and evidence.get("revision") == requested_sha,
             "deployed_sha_mismatch")
 
 
-def validate_shutdown(files, stop_files, run_id):
-    start = files.get("staging-use.jsonl")
-    stop = stop_files.get("staging-use-release.jsonl")
+def validate_shutdown(files, stop_files, run_id, requested_sha):
+    require(type(run_id) is int and run_id > 0, "shutdown_run_id_invalid")
+    start = files.get("staging-use.jsonl") if isinstance(files, dict) else None
+    stop = stop_files.get("staging-use-release.jsonl") if isinstance(stop_files, dict) else None
     require(isinstance(start, list) and isinstance(stop, list)
-            and all(isinstance(row, dict) for row in start + stop), "shutdown_receipt_invalid")
+            and all(isinstance(row, dict) for rows in (start, stop) for row in rows),
+            "shutdown_receipt_invalid")
+    validate_deployed_sha(files, requested_sha)
     windows = [row for row in start if row.get("action") == "window"]
-    releases = [row for row in stop if row.get("action") == "release"]
-    require(len(windows) == 1 and len(releases) == 1
-            and not any(row.get("action") in ("failed", "not-owned") for row in stop),
+    require(len(windows) == 1 and [row.get("action") for row in stop] == ["attempt", "status", "release"]
+            and stop[0].get("operation") == "finish"
+            and not any(row.get("action") in ("failed", "not-owned") for row in start),
             "shutdown_not_confirmed")
-    window, release = windows[0], releases[0]
-    use = release.get("use")
+    window = windows[0]
+    finish, status, release = stop
     expiry = window.get("expiresAt")
-    require(window.get("schema") == "two-bot-staging-pipeline.v1"
-            and window.get("environment") == "staging" and window.get("runId") == str(run_id)
-            and type(window.get("runAttempt")) is int and window["runAttempt"] == 1
-            and type(expiry) is int and expiry > 0
-            and release.get("schema") == "two-bot-staging-use.v1"
-            and release.get("environment") == "staging" and release.get("running") is False
-            and isinstance(use, dict) and use.get("environment") == "staging"
-            and use.get("runId") == str(run_id) and type(use.get("runAttempt")) is int
-            and use["runAttempt"] == 1 and type(use.get("expiresAt")) is int
-            and use["expiresAt"] == expiry and use.get("phase") == "released",
+    expected_run = str(run_id)
+
+    def same_attempt(row):
+        return (isinstance(row, dict) and row.get("environment") == "staging"
+                and row.get("runId") == expected_run
+                and type(row.get("runAttempt")) is int and row["runAttempt"] == 1)
+
+    def same_window(use):
+        return same_attempt(use) and type(use.get("expiresAt")) is int and use["expiresAt"] == expiry
+
+    # Rollback may rebind the initial window. Finish pins release to the
+    # preceding status's build while preserving the original attempt and expiry.
+    finish_sha, finish_deployment = status.get("sha"), status.get("deploymentId")
+    prior, use = status.get("use"), release.get("use")
+    require(all(same_attempt(row) for row in (window, finish, status, release))
+            and window.get("schema") == finish.get("schema") == "two-bot-staging-pipeline.v1"
+            and status.get("schema") == release.get("schema") == "two-bot-staging-use.v1"
+            and window.get("sha") == requested_sha and type(expiry) is int and 0 < expiry <= 2**53 - 1
+            and isinstance(finish_sha, str) and SHA.fullmatch(finish_sha) and release.get("sha") == finish_sha
+            and isinstance(finish_deployment, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", finish_deployment)
+            and release.get("deploymentId") == finish_deployment
+            and type(status.get("running")) is bool and release.get("running") is False
+            and same_window(prior) and prior.get("phase") in ("preparing", "active", "released")
+            and same_window(use) and use.get("phase") == "released",
             "shutdown_receipt_mismatch")
 
 
@@ -252,10 +270,9 @@ def prove(*, requested_sha, sleep=time.sleep, clock=time.monotonic):
     require(len(release_jobs) == 1 and release_jobs[0].get("conclusion") == "success",
             "shutdown_job_not_successful")
     files = artifact_files(run_id, "staging-rollout-evidence")
-    validate_deployed_sha(files, requested_sha)
     evidence = validate_evidence(files)
     stop_files = artifact_files(run_id, f"staging-use-deploy-stop-{run_id}-1")
-    validate_shutdown(files, stop_files, run_id)
+    validate_shutdown(files, stop_files, run_id, requested_sha)
     return dict(evidence, schema_version=1, verdict="pass", child_run_id=run_id,
                 child_sha=requested_sha, workflow_sha=run["head_sha"], child_run_attempt=1, child_conclusion="failure",
                 environment="staging", completed_at=run["updated_at"])

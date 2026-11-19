@@ -670,14 +670,9 @@ operator; a failed restore is never a reason to wait for the next deployment.
 The Release Manager dispatches `staging-rollback-drill.yml` on `main` once per
 production release, after the candidate's staging deploy. With no
 `target_version`, `scripts/rollback_proof.py run` performs the automatic proof.
-The proof never certifies a build for promotion. The `sha` input is required for
-the automatic proof: pass the full 40-character lowercase candidate commit SHA.
-A short, uppercase or empty value is refused before any dispatch. The wrapper
-forwards it to the child, which deploys that commit rather than whatever `main`
-resolves to at dispatch time. The proof is green only if the child's deployed
-revision equals the requested SHA. It:
+Pass the full 40-character lowercase candidate commit as `sha`. The proof:
 
-1. Dispatches only `deploy-staging.yml` on `main`, with the requested `sha` and the existing staging
+1. Dispatches only `deploy-staging.yml` on `main`, with that pinned SHA and the existing staging
    error-rate gate rehearsal enabled. No production dispatch or traffic fault
    is involved. The GitHub REST `2026-03-10` dispatch response provides the exact
    child run ID; a missing ID refuses without redispatch or guessing "latest".
@@ -688,15 +683,14 @@ revision equals the requested SHA. It:
 3. Checks `staging-rollout-evidence`: the restore must name the exact pre-deploy
    Worker version and image digest, with takeover and the stable 200/gateway-ready
    gate. It uploads a sanitized `staging-rollback-proof` artifact (`proof.json`)
-   containing the child run ID, the requested SHA (`child_sha`), the workflow SHA (`workflow_sha`) and restored members, retained for 14 days.
-   The evidence revision must equal the requested SHA.
-4. Requires positive shutdown evidence from the same run and attempt 1: the
-   `staging-use-release` job must succeed, and the `staging-use-deploy-stop-<run>-1`
-   artifact must hold exactly one `release` receipt (`running` false, phase
-   `released`) with no `failed` or `not-owned` row. Its run ID, attempt and
-   window expiry must match the single `window` row in the child's
-   `staging-use.jsonl`. A missing, mismatched or other-run receipt fails the
-   proof; a skipped stop is not shutdown evidence.
+   containing the child run ID, deployed SHA (`child_sha`), workflow SHA
+   (`workflow_sha`) and restored members, retained for 14 days. The deployed SHA
+   must equal the requested SHA.
+4. Requires a successful `staging-use-release` job and an ordered finish
+   attempt, status and stopped release in `staging-use-deploy-stop-<run>-1`.
+   The records must match the original staging run, first attempt and window
+   expiry; status and release must agree on the build after rollback. Missing,
+   mismatched or `not-owned` evidence does not pass.
 
    The wrapper is green only after that proof is validated and uploaded.
 

@@ -74,14 +74,18 @@ def files():
             "error-rate-gate.json": {"mode": "rehearsal", "verdict": "fail", "firing": ["rest_5xx_rate"]},
             "evidence.json": {"revision": "a" * 40},
             "staging-use.jsonl": [{"schema": "two-bot-staging-pipeline.v1", "action": "window",
-                "environment": "staging", "runId": "123", "runAttempt": 1, "expiresAt": 1000}]}
+                "environment": "staging", "runId": "123", "runAttempt": 1, "expiresAt": 1000, "sha": "a" * 40}]}
 
 
 def stop_files():
-    return {"staging-use-release.jsonl": [{"schema": "two-bot-staging-use.v1", "action": "release",
-        "environment": "staging", "running": False,
-        "use": {"environment": "staging", "runId": "123", "runAttempt": 1,
-                "expiresAt": 1000, "phase": "released"}}]}
+    attempt = {"environment": "staging", "runId": "123", "runAttempt": 1}
+    use = dict(attempt, expiresAt=1000, phase="released")
+    build = dict(attempt, schema="two-bot-staging-use.v1", sha="c" * 40, deploymentId=VERSION)
+    return {"staging-use-release.jsonl": [
+        dict(attempt, schema="two-bot-staging-pipeline.v1", action="attempt", operation="finish"),
+        dict(build, action="status", running=True, use=dict(use, phase="active")),
+        dict(build, action="release", running=False, use=use),
+    ]}
 
 
 def jobs():
@@ -90,15 +94,135 @@ def jobs():
             {"name": "staging-use-release", "conclusion": "success"}]}
 
 
-class RollbackProofTests(unittest.TestCase):
-    def test_requested_sha_is_bound_before_dispatch_even_when_main_drifts(self):
+class RollbackProofValidatorTests(unittest.TestCase):
+    def test_deployed_sha_requires_exact_full_revision(self):
         requested = "b" * 40
-        with patch.object(proof, "gh", return_value={}) as gh:
-            with self.assertRaisesRegex(proof.ProofError, "dispatch_missing_exact_run_id"):
-                proof.prove(requested_sha=requested)
-        self.assertEqual(gh.call_args.kwargs["body"], {
-            "ref": "main", "inputs": {"inject_error_rate_spike": True, "sha": requested}})
+        proof.validate_deployed_sha({"evidence.json": {"revision": requested}}, requested)
+        for artifact in (None, {}, {"evidence.json": [requested]}, {"evidence.json": {}},
+                         {"evidence.json": {"revision": "a" * 40}}):
+            with self.subTest(artifact=artifact), self.assertRaisesRegex(proof.ProofError, "^deployed_sha_mismatch$"):
+                proof.validate_deployed_sha(artifact, requested)
+        for invalid in (None, "", "a" * 39, "B" * 40, "g" * 40):
+            with self.subTest(sha=invalid), self.assertRaisesRegex(proof.ProofError, "^requested_sha_invalid$"):
+                proof.validate_deployed_sha({"evidence.json": {"revision": invalid}}, invalid)
 
+    def setUp(self):
+        self.sha = "b" * 40
+        correlation = {"environment": "staging", "runId": "123", "runAttempt": 1}
+        pipeline = dict(correlation, schema="two-bot-staging-pipeline.v1", observedAt=NOW.isoformat())
+        client = dict(correlation, schema="two-bot-staging-use.v1", observedAt=NOW.isoformat())
+        original = {"sha": self.sha, "deploymentId": VERSION, "epoch": 1}
+        restored = {"sha": "a" * 40, "deploymentId": "22222222-2222-2222-2222-222222222222", "epoch": 2}
+        acquired_at = int(NOW.timestamp()) * 1000
+        expires_at = acquired_at + 120 * 60 * 1000
+        self.window = dict(pipeline, action="window", expiresAt=expires_at, sha=self.sha, deploymentId=VERSION)
+        self.use = dict(correlation, **restored, acquiredAt=acquired_at, expiresAt=expires_at, phase="released")
+        self.status = dict(client, **restored, action="status", running=True, use=dict(self.use, phase="active"))
+        self.release = dict(client, **restored, action="release", running=False, use=self.use)
+        self.start = {"evidence.json": {"revision": self.sha}, "staging-use.jsonl": [
+            dict(pipeline, action="attempt", operation="begin"),
+            dict(client, **original, action="status", running=False, use=None),
+            self.window,
+            dict(client, **original, action="acquire", running=False,
+                 use=dict(correlation, **original, acquiredAt=acquired_at, expiresAt=expires_at, phase="active")),
+        ]}
+        self.finish = dict(pipeline, action="attempt", operation="finish")
+        self.stop = {"staging-use-release.jsonl": [self.finish, self.status, self.release]}
+
+    def test_shutdown_rejects_wrong_or_missing_outer_release_identity(self):
+        for key, invalid in (("runId", "124"), ("runAttempt", 2), ("runAttempt", True),
+                             ("runId", None), ("runAttempt", None)):
+            with self.subTest(key=key, value=invalid), patch.dict(self.release):
+                if invalid is None:
+                    del self.release[key]
+                else:
+                    self.release[key] = invalid
+                with self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                    proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+    def test_shutdown_requires_ordered_finish_receipt(self):
+        for rows in ([self.release], [self.finish, self.release], [self.status, self.release],
+                     [self.finish, self.release, self.status],
+                     [self.finish, self.status, self.release, self.status],
+                     [dict(self.finish, operation="begin"), self.status, self.release]):
+            with self.subTest(actions=[row["action"] for row in rows]), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_not_confirmed$"):
+                proof.validate_shutdown(self.start, {"staging-use-release.jsonl": rows}, 123, self.sha)
+
+    def test_shutdown_requires_initial_window_on_deployed_sha(self):
+        with patch.dict(self.window, sha="c" * 40), \
+                self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+            proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+        with patch.dict(self.start["evidence.json"], revision="c" * 40), \
+                self.assertRaisesRegex(proof.ProofError, "^deployed_sha_mismatch$"):
+            proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+    def test_shutdown_rejects_matching_expiry_above_safe_integer_limit(self):
+        expiry = {"expiresAt": 9007199254740992}
+        with patch.dict(self.window, expiry), patch.dict(self.use, expiry), \
+                patch.dict(self.status["use"], expiry), \
+                self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+            proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+    def test_shutdown_requires_matching_finish_build(self):
+        for key, other in (("sha", self.sha), ("deploymentId", VERSION)):
+            with self.subTest(field=key), patch.dict(self.release, {key: other}), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+        for key, invalid in (("sha", "A" * 40), ("sha", 1), ("deploymentId", "bad/id"),
+                             ("deploymentId", "a" * 129), ("deploymentId", [])):
+            with self.subTest(field=key, value=invalid), patch.dict(self.status, {key: invalid}), \
+                    patch.dict(self.release, {key: invalid}), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+        for key in ("sha", "deploymentId"):
+            with self.subTest(missing=key), patch.dict(self.status), patch.dict(self.release), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                del self.status[key], self.release[key]
+                proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+    def test_shutdown_confirms_release_of_original_window_after_rebind(self):
+        proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+    def test_shutdown_rejects_malformed_receipts_and_run_id(self):
+        for start, stop in ((None, self.stop), (self.start, {}), (self.start, {"staging-use-release.jsonl": [False]}),
+                            ({"staging-use.jsonl": self.window}, self.stop)):
+            with self.subTest(start=start, stop=stop), self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_invalid$"):
+                proof.validate_shutdown(start, stop, 123, self.sha)
+        for invalid in (True, 0, "123"):
+            with self.subTest(run_id=invalid), self.assertRaisesRegex(proof.ProofError, "^shutdown_run_id_invalid$"):
+                proof.validate_shutdown(self.start, self.stop, invalid, self.sha)
+
+    def test_shutdown_rejects_missing_duplicate_or_failed_outcomes(self):
+        begin = self.start["staging-use.jsonl"]
+        finish = self.stop["staging-use-release.jsonl"]
+        for start, stop in ((begin[:2], finish), (begin + [self.window], finish), (begin, []),
+                            (begin, finish + [self.release]), (begin + [{"action": "failed"}], finish),
+                            (begin, finish[:2] + [{"action": "not-owned"}]),
+                            (begin, finish + [{"action": "failed"}])):
+            with self.subTest(start=[row["action"] for row in start], stop=[row["action"] for row in stop]), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_not_confirmed$"):
+                proof.validate_shutdown(dict(self.start, **{"staging-use.jsonl": start}),
+                                        {"staging-use-release.jsonl": stop}, 123, self.sha)
+
+    def test_shutdown_requires_same_staging_run_attempt_and_expiry_and_stopped_runtime(self):
+        for target, changes in (
+            (self.window, {"schema": "unknown", "environment": "production", "runId": "124", "runAttempt": True, "expiresAt": 0}),
+            (self.finish, {"schema": "unknown", "runId": "124"}),
+            (self.status, {"schema": "unknown", "runAttempt": 2, "running": 0, "use": None}),
+            (self.status["use"], {"runId": "124", "expiresAt": 1001, "phase": "unknown"}),
+            (self.release, {"schema": "unknown", "environment": "production", "running": 0, "use": []}),
+            (self.use, {"environment": "production", "runId": "124", "runAttempt": 2, "expiresAt": 1001, "phase": "active"}),
+        ):
+            for key, invalid in changes.items():
+                with self.subTest(key=key, value=invalid), patch.dict(target, {key: invalid}), \
+                        self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                    proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+
+class RollbackProofTests(unittest.TestCase):
     def test_invalid_sha_refuses_before_dispatch(self):
         for requested in (None, "", "a" * 39, "A" * 40, "g" * 40):
             with self.subTest(requested=requested), patch.object(proof, "gh") as gh:
@@ -107,37 +231,17 @@ class RollbackProofTests(unittest.TestCase):
                 gh.assert_not_called()
 
     def test_deployed_sha_evidence_must_match_requested_commit(self):
-        requested = "b" * 40
-        evidence = files()
-        for candidate in (None, "a" * 40):
-            evidence["evidence.json"] = {"revision": candidate}
-            with self.subTest(candidate=candidate), self.assertRaises(proof.ProofError):
-                proof.validate_deployed_sha(evidence, requested)
-        evidence["evidence.json"] = {"revision": requested}
-        proof.validate_deployed_sha(evidence, requested)
-
-    def test_shutdown_receipt_requires_same_attempt_and_window(self):
-        window = {"schema": "two-bot-staging-pipeline.v1", "action": "window",
-                  "environment": "staging", "runId": "123", "runAttempt": 1, "expiresAt": 1000}
-        use = {"environment": "staging", "runId": "123", "runAttempt": 1,
-               "expiresAt": 1000, "phase": "released"}
-        release = {"schema": "two-bot-staging-use.v1", "action": "release", "environment": "staging",
-                   "running": False, "use": use}
-        start = {"staging-use.jsonl": [window]}
-        stop = {"staging-use-release.jsonl": [release]}
-        proof.validate_shutdown(start, stop, 123)
-        for mutate in (lambda r: r.update(action="not-owned"), lambda r: r.update(running=True),
-                       lambda r: r["use"].update(runAttempt=2), lambda r: r["use"].update(expiresAt=1001),
-                       lambda r: r["use"].update(phase="active"), lambda r: r["use"].update(runId="124")):
-            bad = deepcopy(stop)
-            mutate(bad["staging-use-release.jsonl"][0])
-            with self.subTest(bad=bad), self.assertRaises(proof.ProofError):
-                proof.validate_shutdown(start, bad, 123)
-        with self.assertRaises(proof.ProofError):
-            proof.validate_shutdown(start, {}, 123)
+        for candidate in (None, "b" * 40):
+            evidence = dict(files(), **{"evidence.json": {"revision": candidate}})
+            with self.subTest(candidate=candidate), redirect_stdout(io.StringIO()), \
+                    patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, run(), jobs()]), \
+                    patch.object(proof, "artifact_files", side_effect=[evidence, stop_files()]):
+                with self.assertRaisesRegex(proof.ProofError, "^deployed_sha_mismatch$"):
+                    proof.prove(requested_sha="a" * 40)
 
     def test_dispatch_is_exactly_once_staging_main_and_restores_both_members(self):
-        with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, run(), jobs()]) as gh, \
+        child = dict(run(), head_sha="b" * 40)
+        with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, child, jobs()]) as gh, \
                 patch.object(proof, "artifact_files", side_effect=[files(), stop_files()]) as artifacts, redirect_stdout(io.StringIO()):
             result = proof.prove(requested_sha="a" * 40)
         self.assertEqual(gh.call_count, 3)
@@ -149,6 +253,7 @@ class RollbackProofTests(unittest.TestCase):
         self.assertEqual(result["restored_version"], VERSION)
         self.assertEqual(result["restored_image_digest"], DIGEST)
         self.assertEqual(result["child_conclusion"], "failure")
+        self.assertEqual((result["child_sha"], result["workflow_sha"]), ("a" * 40, "b" * 40))
         self.assertEqual(result["verdict"], "pass")
 
     def test_successful_rollback_without_confirmed_shutdown_never_passes(self):

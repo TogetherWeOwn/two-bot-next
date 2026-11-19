@@ -864,6 +864,11 @@ def staging_pinned_sha_errors(workflows):
     for name, workflow in workflows.items():
         if name in ("deploy-staging.yml", "deploy-production.yml"):
             continue
+        if name == "staging-rollback-drill.yml":
+            steps = ((workflow.get("jobs") or {}).get("proof") or {}).get("steps") or []
+            env = (steps[1].get("env") or {}) if len(steps) > 1 else {}
+            if env.get("REQUESTED_SHA") == "${{ inputs.sha }}" and str(workflow).count("inputs.sha") == 1:
+                continue  # Only the reviewed proof binding may read this input.
         if "inputs.sha" in str(workflow):
             errors.append(f"{name}: pinned-sha marker inputs.sha outside the deploy workflows")
     staging = workflows.get("deploy-staging.yml") or {}
@@ -1769,7 +1774,8 @@ def rollback_proof_job_errors(job, mode):
         errors.append(f"rollback proof {mode}: checkout must not persist credentials")
     run = f"python3 scripts/rollback_proof.py {mode}"
     if mode == "run":
-        run += ' --evidence "$RUNNER_TEMP/proof.json"'
+        env["REQUESTED_SHA"] = "${{ inputs.sha }}"
+        run += ' --sha "$REQUESTED_SHA" --evidence "$RUNNER_TEMP/proof.json"'
         upload = steps[2]
         if (not str(upload.get("uses") or "").startswith("actions/upload-artifact@")
                 or (upload.get("with") or {}).get("name") != "staging-rollback-proof"
@@ -1794,13 +1800,14 @@ def staging_rollback_drill_errors(workflow):
         errors.append(f"{name}: must run only on manual dispatch")
     dispatch = on.get("workflow_dispatch") or {}
     inputs = dispatch.get("inputs") or {}
-    if set(dispatch) != {"inputs"} or set(inputs) != {"target_version"}:
-        errors.append(f"{name}: workflow_dispatch must carry exactly the target_version input")
+    if set(dispatch) != {"inputs"} or set(inputs) != {"target_version", "sha"}:
+        errors.append(f"{name}: workflow_dispatch must carry exactly target_version and sha inputs")
     else:
-        field = inputs["target_version"] or {}
-        if (field.get("type") != "string" or str(field.get("required")).lower() != "false"
-                or field.get("default") != ""):
-            errors.append(f"{name}: target_version must be optional/empty for the daily automatic proof")
+        for input_name in ("target_version", "sha"):
+            field = inputs[input_name] or {}
+            if (field.get("type") != "string" or str(field.get("required")).lower() != "false"
+                    or field.get("default") != ""):
+                errors.append(f"{name}: {input_name} must be an optional empty string")
     if workflow.get("concurrency") != {"group": "staging-rollback-proof-${{ github.event_name }}", "cancel-in-progress": "false"}:
         errors.append(f"{name}: scheduled/manual wrappers must have separate groups outside staging-lifecycle")
     jobs = workflow.get("jobs") or {}
@@ -8989,6 +8996,10 @@ class WorkflowTests(unittest.TestCase):
                 {"concurrency": {"group": "staging-lifecycle", "cancel-in-progress": False}}),
             "dispatcher reads production secrets": lambda w: w["jobs"]["proof"].update({"environment": "production"}),
             "dispatcher extra bindings": lambda w: w["jobs"]["proof"]["steps"][1]["env"].update({"URL": "production"}),
+            "missing sha input": lambda w: w["on"]["workflow_dispatch"]["inputs"].pop("sha"),
+            "sha binding changed": lambda w: w["jobs"]["proof"]["steps"][1]["env"].update({"REQUESTED_SHA": "${{ github.sha }}"}),
+            "sha argument omitted": lambda w: w["jobs"]["proof"]["steps"][1].update({"run": 'python3 scripts/rollback_proof.py run --evidence "$RUNNER_TEMP/proof.json"'}),
+            "extra sha reader": lambda w: w["jobs"]["drill"]["steps"][2]["env"].update({"EXTRA": "${{ inputs.sha }}"}),
             "proof command removed": lambda w: w["jobs"]["proof"]["steps"].pop(1),
             "proof command conditional": lambda w: w["jobs"]["proof"]["steps"][1].update({"if": "false"}),
             "proof failure tolerated": lambda w: w["jobs"]["proof"]["steps"][1].update({"continue-on-error": "true"}),
