@@ -5,7 +5,7 @@ import importlib.util
 from pathlib import Path
 import unittest
 
-from disabled_voice_measurement import GUARDS, WORKFLOW
+from disabled_voice_measurement import GUARDS, QUEUE, WORKFLOW
 import test_workflows as policy
 import test_staging_voice_mutual_exclusion_acceptance as lifecycle
 
@@ -18,12 +18,14 @@ TARGET = "./.github/workflows/voice-synthetic.yml"
 
 def scaffold():
     jobs = {name: {"if": guard} for name, guard in GUARDS.items()}
-    for name in ("staging-window", "measurement-before", "measurement-after", "staging-use-release"):
+    for name in ("staging-window", "measurement-before", "measurement-after", "measurement-final", "staging-use-release"):
         jobs[name].update({"environment": "staging", "runs-on": "ubuntu-latest"})
-    jobs["voice-first"]["uses"] = TARGET
+    for name in ("measurement-terminal", "rerun-refusal"):
+        jobs[name]["runs-on"] = "ubuntu-latest"
+    for name in ("voice-first", "voice-second"):
+        jobs[name]["uses"] = TARGET
     return {"on": {"workflow_dispatch": ""}, "permissions": {},
-            "concurrency": {"group": "voice-rest-measurement-disabled",
-                            "cancel-in-progress": "false"}, "jobs": jobs}
+            "concurrency": QUEUE.copy(), "jobs": jobs}
 
 
 class DisabledMeasurementPolicyTests(unittest.TestCase):
@@ -38,7 +40,7 @@ class DisabledMeasurementPolicyTests(unittest.TestCase):
         self.assertEqual(lifecycle.lifecycle_errors(wfs), [])
 
     def test_mutations_do_not_bypass_inventory_or_lifecycle(self):
-        for mutation in ("activation", "queue", "trigger", "permissions", "target"):
+        for mutation in ("activation", "queue", "job-lock", "rerun", "trigger", "permissions", "target"):
             with self.subTest(mutation=mutation):
                 wfs = deepcopy(self.workflows)
                 wfs[WORKFLOW] = candidate = scaffold()
@@ -46,6 +48,10 @@ class DisabledMeasurementPolicyTests(unittest.TestCase):
                     candidate["jobs"]["staging-window"]["if"] = "${{ true }}"
                 elif mutation == "queue":
                     candidate["concurrency"]["group"] = "staging-lifecycle"
+                elif mutation == "job-lock":
+                    candidate["jobs"]["staging-window"]["concurrency"] = "staging-lifecycle"
+                elif mutation == "rerun":
+                    candidate["jobs"]["staging-window"]["if"] = "${{ false && github.ref == 'refs/heads/main' }}"
                 elif mutation == "trigger":
                     candidate["on"]["push"] = ""
                 elif mutation == "permissions":
@@ -85,6 +91,24 @@ class DisabledMeasurementPolicyTests(unittest.TestCase):
                 check.workflows = {WORKFLOW: candidate}
                 with self.assertRaises(AssertionError):
                     check.test_public_hosted_runner_and_service_isolation()
+
+    def test_second_call_mutations_fail_closed(self):
+        other = "./.github/workflows/other.yml"
+        check = policy.WorkflowTests("test_public_hosted_runner_and_service_isolation")
+        for field, value in (("uses", other), ("runs-on", "ubuntu-latest"), ("if", "${{ true }}")):
+            wfs = deepcopy(self.workflows)
+            wfs[WORKFLOW] = candidate = scaffold()
+            candidate["jobs"]["voice-second"][field] = value
+            if field != "runs-on":
+                self.assertTrue(policy.workflow_policy_errors(wfs), field)
+                self.assertTrue(lifecycle.lifecycle_errors(wfs), field)
+            check.workflows = {WORKFLOW: candidate}
+            with self.assertRaises(AssertionError, msg=field):
+                check.test_public_hosted_runner_and_service_isolation()
+        text = f"jobs:\n  voice-second:\n    uses: {TARGET}\n"
+        self.assertEqual(runner.violations(text, WORKFLOW), [])
+        self.assertTrue(runner.violations(text.replace(TARGET, other), WORKFLOW))
+        self.assertTrue(runner.violations(text + "    runs-on: ubuntu-latest\n", WORKFLOW))
 
     def test_runner_pin_rejects_changed_target_and_runner(self):
         text = ("jobs:\n  voice-first:\n"

@@ -5,13 +5,23 @@ its own lifecycle-lock and consumer-policy review.
 """
 
 WORKFLOW = "voice-rest-measurement.yml"
-GUARDS = {
-    "staging-window": "${{ false && github.ref == 'refs/heads/main' }}",
-    "measurement-before": "${{ false && github.ref == 'refs/heads/main' && needs.staging-window.result == 'success' }}",
-    "voice-first": "${{ false && github.ref == 'refs/heads/main' && needs.staging-window.result == 'success' && needs.measurement-before.result == 'success' }}",
-    "measurement-after": "${{ false && github.ref == 'refs/heads/main' && needs.voice-first.result == 'success' }}",
-    "staging-use-release": "${{ false && always() && github.ref == 'refs/heads/main' && needs.staging-window.outputs.expires_at != '' }}",
+FIRST = "github.ref == 'refs/heads/main' && github.run_attempt == 1"
+QUEUE = {
+    "group": "${{ false && github.event_name == 'workflow_dispatch' && " + FIRST
+    + " && 'staging-lifecycle' || format('voice-rest-measurement-disabled-{0}-{1}', github.run_id, github.run_attempt) }}",
+    "cancel-in-progress": "false", "queue": "max",
 }
+GUARDS = {name: "${{ false && " + condition + " }}" for name, condition in {
+    "staging-window": FIRST,
+    "measurement-before": FIRST + " && needs.staging-window.result == 'success'",
+    "voice-first": FIRST + " && needs.staging-window.result == 'success' && needs.measurement-before.result == 'success'",
+    "measurement-after": FIRST + " && needs.voice-first.result == 'success'",
+    "voice-second": FIRST + " && needs.measurement-after.result == 'success' && needs.measurement-after.outputs.second_required == 'true'",
+    "measurement-final": FIRST + " && needs.voice-second.result == 'success'",
+    "staging-use-release": "always() && " + FIRST + " && needs.staging-window.outputs.expires_at != ''",
+    "measurement-terminal": "always() && " + FIRST,
+    "rerun-refusal": "always() && github.run_attempt != 1",
+}.items()}
 
 
 def is_disabled_scaffold(workflow):
@@ -24,9 +34,7 @@ def is_disabled_scaffold(workflow):
     triggers = workflow.get("on")
     if not isinstance(triggers, dict) or set(triggers) != {"workflow_dispatch"}:
         return False
-    if workflow.get("permissions") != {} or workflow.get("concurrency") != {
-        "group": "voice-rest-measurement-disabled", "cancel-in-progress": "false"
-    }:
+    if workflow.get("permissions") != {} or workflow.get("concurrency") != QUEUE:
         return False
     return all(isinstance(jobs[name], dict) and jobs[name].get("if") == guard
-               for name, guard in GUARDS.items())
+               and "concurrency" not in jobs[name] for name, guard in GUARDS.items())

@@ -49,7 +49,7 @@ def violations(text, workflow_name=None):
             for line in lines
             if re.match(r"^    [A-Za-z0-9_-]+:", line)
         }
-        if workflow_name == "voice-rest-measurement.yml" and job == "voice-first":
+        if workflow_name == "voice-rest-measurement.yml" and job in ("voice-first", "voice-second"):
             if keys.get("uses", "").split(" #", 1)[0] != "./.github/workflows/voice-synthetic.yml":
                 problems.append(f"{job}: reusable target changed")
         if "uses" in keys:
