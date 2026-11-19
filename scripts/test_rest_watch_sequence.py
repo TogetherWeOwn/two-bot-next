@@ -28,12 +28,21 @@ class SampleSequenceTest(unittest.TestCase):
         self.verified.append(copy.deepcopy(proof))
         return proof == {"tick": sample["monotonic_ms"]} and expected == self.binding
 
-    def ledger(self, previous, old_proof, sample, proof, expected):
+    def ledger(self, previous, old_proof, sample, proof, expected, limits):
         self.claims += 1
         if (previous, old_proof) != self.state or expected != self.binding:
             return False
         self.state = (copy.deepcopy(sample), copy.deepcopy(proof))
         return True
+
+    def bounded_claim(self, reading, *claim):
+        wall, tick, domain = reading
+        limits = claim[-1]
+        if (domain != limits["clock_domain"]
+                or not limits["wall_not_before"] <= wall <= limits["wall_deadline"]
+                or not limits["tick_not_before"] <= tick <= limits["tick_deadline"]):
+            return False
+        return self.ledger(*claim)
 
     def sequence(self, ledger=None, verifier=None):
         return SampleSequence(self.anchor, {"tick": 10}, self.binding,
@@ -43,7 +52,12 @@ class SampleSequenceTest(unittest.TestCase):
     def accept(self, sequence, sample=None, proof=None, tick=20):
         return sequence.accept(self.current if sample is None else sample,
                                {"tick": 20} if proof is None else proof,
-                               now_ms=4000, monotonic_ms=tick)
+                               now_ms=4000, monotonic_ms=tick,
+                               before_claim=lambda current: {
+                                   "clock_domain": "clock", "wall_not_before": 4000,
+                                   "tick_not_before": tick,
+                                   "wall_deadline": current["end_ms"] + 30000,
+                                   "tick_deadline": current["monotonic_ms"] + 30000})
 
     def test_original_proofs_and_atomic_compare_and_swap(self):
         first, competing = self.sequence(), self.sequence()
@@ -113,6 +127,64 @@ class SampleSequenceTest(unittest.TestCase):
     def gate(self, clock, ledger=None, cutoff=30020):
         return EvidenceGate(self.sequence(ledger=ledger), clock, "clock", cutoff)
 
+    def test_gate_passes_frozen_claim_and_inclusive_limits(self):
+        for cutoff, deadline in ((25000, 25000), (40000, 30020)):
+            with self.subTest(cutoff=cutoff):
+                self.setUp()
+                seen = []
+                reading = [4000, 20, "clock"]
+                def verify(*args):
+                    reading[:] = (4001, 21, "clock")
+                    return self.verify(*args)
+                def ledger(*args):
+                    seen.append(copy.deepcopy(args))
+                    reading[:] = (32010, deadline, "clock")
+                    return self.bounded_claim(reading, *args)
+                sequence = self.sequence(ledger=ledger, verifier=verify)
+                gate = EvidenceGate(sequence, lambda: tuple(reading), "clock", cutoff)
+                self.assertEqual(gate.observe(self.current, {"tick": 20}), self.current)
+                self.assertEqual(seen, [(self.anchor, {"tick": 10}, self.current, {"tick": 20},
+                                         self.binding, {"clock_domain": "clock",
+                                                        "wall_not_before": 4001, "tick_not_before": 21,
+                                                        "wall_deadline": 32010, "tick_deadline": deadline})])
+
+    def test_missing_or_invalid_claim_limits_are_terminal(self):
+        invalid = (None, lambda _: None, lambda _: {"clock_domain": "clock"},
+                   lambda _: {"clock_domain": "clock", "wall_not_before": 4000,
+                              "tick_not_before": 20, "wall_deadline": 32011,
+                              "tick_deadline": 30020})
+        for callback in invalid:
+            with self.subTest(callback=callback):
+                self.setUp()
+                sequence = self.sequence()
+                with self.assertRaises(EvidenceError):
+                    sequence.accept(self.current, {"tick": 20}, now_ms=4000,
+                                    monotonic_ms=20, before_claim=callback)
+                self.assertEqual(self.claims, 0)
+                with self.assertRaisesRegex(EvidenceError, "terminal"):
+                    self.accept(sequence)
+
+    def test_late_ledger_refusal_or_success_is_terminal_without_retry(self):
+        for commit_tick in (100, 101):
+            with self.subTest(commit_tick=commit_tick):
+                self.setUp()
+                reading = [4000, 20, "clock"]
+                attempts = []
+                def ledger(*args):
+                    attempts.append(args)
+                    reading[1] = commit_tick
+                    committed = self.bounded_claim(reading, *args)
+                    reading[1] = 101
+                    return committed
+                gate = self.gate(lambda: tuple(reading), ledger=ledger, cutoff=100)
+                with self.assertRaises(EvidenceError):
+                    gate.observe(self.current, {"tick": 20})
+                with self.assertRaisesRegex(EvidenceError, "terminal"):
+                    gate.observe(self.current, {"tick": 20})
+                self.assertEqual(len(attempts), 1)
+                self.assertEqual(self.state, (self.current, {"tick": 20}) if commit_tick == 100
+                                 else (self.anchor, {"tick": 10}))
+
     def test_gate_refusal_cutoff_boundaries_and_no_completion(self):
         for finish in (30019, 30020, 30021):
             with self.subTest(finish=finish):
@@ -140,11 +212,12 @@ class SampleSequenceTest(unittest.TestCase):
             gate.observe(self.current, {"tick": 20})
 
     def test_gate_refuses_expired_verification_before_claim(self):
-        for final in ((4001, 30021, "clock"), (32011, 21, "clock")):
-            with self.subTest(final=final):
+        for wall, tick, cutoff in ((4001, 101, 100), (4001, 30021, 40000),
+                                   (32011, 21, 40000)):
+            with self.subTest(wall=wall, tick=tick, cutoff=cutoff):
                 self.setUp()
-                readings = iter(((4000, 20, "clock"), final))
-                gate = self.gate(lambda: next(readings), cutoff=40000)
+                readings = iter(((4000, 20, "clock"), (wall, tick, "clock")))
+                gate = self.gate(lambda: next(readings), cutoff=cutoff)
                 with self.assertRaises(EvidenceError):
                     gate.observe(self.current, {"tick": 20})
                 self.assertEqual(self.claims, 0)
