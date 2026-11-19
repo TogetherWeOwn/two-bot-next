@@ -106,10 +106,13 @@ async fn verify_same_transaction_row(pool: PgPool) -> Result<(), sqlx::Error> {
         .execute(&mut *tx)
         .await?;
     let record = matched_record();
-    assert!(
-        preview_audit::insert_preview_audit(&mut *tx, &record, &id, "not-a-timestamp")
-            .await
-            .is_err()
+    let error = preview_audit::insert_preview_audit(&mut *tx, &record, &id, "not-a-timestamp")
+        .await
+        .expect_err("invalid timestamp must be refused");
+    assert_eq!(
+        error.as_database_error().and_then(|err| err.code()),
+        Some("22007".into()),
+        "expected PostgreSQL invalid_datetime_format, got {error:?}"
     );
     sqlx::query("ROLLBACK TO SAVEPOINT invalid_timestamp")
         .execute(&mut *tx)
