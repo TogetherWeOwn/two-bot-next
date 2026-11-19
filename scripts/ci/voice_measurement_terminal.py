@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 
 from voice_lifecycle_evidence import validate as validate_lifecycle
 from voice_measurement_cleanup import cleanup_verified, read_cleanup_receipt
@@ -47,6 +48,18 @@ def candidate_verified(second_required, grant, candidate, receipts):
         return False
 
 
+def grant_matches(grant, run_id, attempt, expires_at, sha, deployment_id):
+    """Bind candidate metadata to the same grant used to verify cleanup."""
+    try:
+        with open(grant, encoding="utf-8") as source:
+            metadata = json.loads(source.read(4097))
+        expiry = datetime.fromtimestamp(expires_at / 1000, timezone.utc).isoformat(timespec="milliseconds")
+        return metadata == {"runId": run_id, "runAttempt": str(attempt), "sha": sha,
+                            "deploymentId": deployment_id, "expiresAt": expiry.replace("+00:00", "Z")}
+    except (OSError, TypeError, ValueError, OverflowError, RecursionError):
+        return False
+
+
 def terminal_verdict(results, second_required, cleanup_verified, candidate_verified):
     """Return a fixed verdict without copying untrusted input into evidence."""
     if not isinstance(results, dict) or set(results) != set(JOBS):
@@ -70,6 +83,8 @@ def evaluate_terminal(results, second_required, run_id, attempt, expires_at, sha
     if not cleanup_verified(read_cleanup_receipt(cleanup_path), run_id, attempt, expires_at, sha, deployment_id):
         return "refused"
     if not lifecycles_verified(first_lifecycle, second_lifecycle, run_id, second_required):
+        return "refused"
+    if not grant_matches(grant, run_id, attempt, expires_at, sha, deployment_id):
         return "refused"
     if not candidate_verified(second_required, grant, candidate, receipts):
         return "refused"

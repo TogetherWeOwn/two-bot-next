@@ -106,6 +106,16 @@ console.log(JSON.stringify({ expires, metadata, before, middle, after,
                 with patch("sys.argv", ["terminal", str(output)]), patch.dict("os.environ", env, clear=True):
                     self.assertEqual(main(), 0)
                     self.assertEqual(json.loads(output.read_text())["verdict"], "accepted")
+                    altered = json.loads(json.dumps(records))
+                    for record in altered[1:]:
+                        record['sha'] = 'b' * 40
+                        record['use']['sha'] = 'b' * 40
+                    cleanup.write_text('\n'.join(map(json.dumps, altered)) + '\n', encoding='utf-8')
+                    output.unlink()
+                    with patch.dict('os.environ', {'STAGING_USE_SHA': 'b' * 40}):
+                        self.assertEqual(main(), 1)
+                        self.assertEqual(json.loads(output.read_text())['verdict'], 'refused')
+                    cleanup.write_text('\n'.join(map(json.dumps, records)) + '\n', encoding='utf-8')
                     for index in (1, 2):
                         with self.subTest(second=second, missing_correlation=index):
                             output.unlink()
@@ -177,13 +187,14 @@ console.log(JSON.stringify({ expires, metadata, before, middle, after,
         with patch("voice_measurement_terminal.read_cleanup_receipt", return_value=["records"]) as read, \
              patch("voice_measurement_terminal.cleanup_verified", return_value=True) as cleanup, \
              patch("voice_measurement_terminal.lifecycles_verified", return_value=True) as lifecycle, \
+             patch("voice_measurement_terminal.grant_matches", return_value=True) as grant, \
              patch("voice_measurement_terminal.candidate_verified", return_value=True) as candidate:
             self.assertEqual(evaluate_terminal(*args), "accepted")
             read.assert_called_with("cleanup")
             cleanup.assert_called_with(["records"], "123", 1, 123456, "a" * 40, "deploy")
             lifecycle.assert_called_with("first", "second", "123", "true")
             candidate.assert_called_with("true", "grant", "candidate", ["before", "middle", "after"])
-            for check in (cleanup, lifecycle, candidate):
+            for check in (cleanup, lifecycle, grant, candidate):
                 check.return_value = False
                 self.assertEqual(evaluate_terminal(*args), "refused")
                 check.return_value = True

@@ -227,6 +227,11 @@ jobs:
         run: |
           python3 -m pip --isolated --disable-pip-version-check --no-cache-dir install --only-binary=:all: --no-deps --target "$RUNNER_TEMP/zizmor" 'zizmor==1.30.1' 'PyYAML==6.0.3'
 
+      - name: Set up Node for source-level CI regressions
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
       - name: Source-level CI gate regressions
         run: PYTHONPATH="$RUNNER_TEMP/zizmor" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
 
