@@ -168,7 +168,7 @@ mod tests {
             receipt: &str,
         ) -> impl Future<Output = Result<String, ()>> + Send {
             assert_eq!((id, receipt), ("claim", "receipt"));
-            self.commit(record)
+            (self.commit)(record)
         }
     }
 
