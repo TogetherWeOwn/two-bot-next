@@ -6,11 +6,7 @@ its own lifecycle-lock and consumer-policy review.
 
 WORKFLOW = "voice-rest-measurement.yml"
 FIRST = "github.ref == 'refs/heads/main' && github.run_attempt == 1"
-QUEUE = {
-    "group": "${{ false && github.event_name == 'workflow_dispatch' && " + FIRST
-    + " && 'staging-lifecycle' || format('voice-rest-measurement-disabled-{0}-{1}', github.run_id, github.run_attempt) }}",
-    "cancel-in-progress": "false", "queue": "max",
-}
+QUEUE = {"group": "voice-rest-measurement-disabled", "cancel-in-progress": "false"}
 GUARDS = {name: "${{ false && " + condition + " }}" for name, condition in {
     "staging-window": FIRST,
     "measurement-before": FIRST + " && needs.staging-window.result == 'success'",
@@ -19,7 +15,6 @@ GUARDS = {name: "${{ false && " + condition + " }}" for name, condition in {
     "voice-second": FIRST + " && needs.measurement-after.result == 'success' && needs.measurement-after.outputs.second_required == 'true'",
     "measurement-final": FIRST + " && needs.voice-second.result == 'success'",
     "staging-use-release": "always() && " + FIRST + " && needs.staging-window.outputs.expires_at != ''",
-    "measurement-terminal": "always() && " + FIRST,
     "rerun-refusal": "always() && github.run_attempt != 1",
 }.items()}
 

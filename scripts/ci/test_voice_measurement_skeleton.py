@@ -9,37 +9,6 @@ import test_workflows as policy
 
 
 class VoiceMeasurementSkeletonTests(unittest.TestCase):
-    def test_terminal_follows_cleanup_and_uploads_refusal(self):
-        job = policy.load_workflows()[WORKFLOW]["jobs"]["measurement-terminal"]
-        self.assertEqual(set(job["needs"]), {
-            "staging-window", "measurement-before", "voice-first", "measurement-after",
-            "voice-second", "measurement-final", "staging-use-release",
-        })
-        steps = job["steps"]
-        self.assertEqual(len(steps), 9)
-        for step, name, path in zip(steps[2:6],
-                ("staging-use-measurement-stop-${{ github.run_id }}-${{ github.run_attempt }}",
-                 "voice-measurement-candidate-${{ github.run_id }}-${{ github.run_attempt }}",
-                 "voice-synthetic-${{ github.run_id }}-first",
-                 "voice-synthetic-${{ github.run_id }}-second"),
-                ("cleanup", "candidate", "first", "second")):
-            expected = {
-                "uses": "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
-                "continue-on-error": "true",
-                "with": {"name": name, "path": "${{ runner.temp }}/voice-evidence/" + path},
-            }
-            if path == "second":
-                expected["if"] = "${{ needs.measurement-after.outputs.second_required == 'true' }}"
-            self.assertEqual(step, expected)
-        metadata = steps[6]
-        self.assertEqual(metadata["name"], "Reconstruct the original grant metadata")
-        self.assertNotIn("if", metadata)
-        evaluate, upload = steps[-2:]
-        self.assertEqual(evaluate["run"], 'python3 scripts/ci/voice_measurement_terminal.py "$RUNNER_TEMP/voice-terminal.json"')
-        self.assertEqual(upload["if"], "always()")
-        self.assertEqual(upload["with"]["if-no-files-found"], "error")
-        self.assertEqual(upload["with"]["name"], "voice-measurement-terminal-${{ github.run_id }}-${{ github.run_attempt }}")
-
     def test_both_policy_consumers_fail_closed_on_activation(self):
         workflows = lifecycle.load_all()
         canonical = workflows[lifecycle.DEPLOY]["concurrency"]["group"].casefold()
@@ -56,9 +25,7 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
                 self.assertTrue(lifecycle.repository_errors(changed, canonical))
         queue = workflows[WORKFLOW]["concurrency"]
         for field, value in (("on", {"push": ""}), ("permissions", {"contents": "write"}),
-                             ("concurrency", dict(queue, queue="single")),
-                             ("concurrency", dict(queue, group=queue["group"].replace("false && ", ""))),
-                             ("concurrency", dict(queue, group=queue["group"].replace(" && github.run_attempt == 1", "")))):
+                             ("concurrency", dict(queue, group=canonical))):
             with self.subTest(field=field, value=value):
                 changed = deepcopy(workflows)
                 changed[WORKFLOW][field] = value
@@ -195,24 +162,18 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
         workflow = workflows[WORKFLOW]
         self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
         self.assertEqual(workflow["permissions"], {})
-        canonical = workflows[lifecycle.DEPLOY]["concurrency"]["group"]
         self.assertEqual(workflow["concurrency"], {
-            "group": "${{ false && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
-                     "&& github.run_attempt == 1 && '" + canonical + "' || "
-                     "format('voice-rest-measurement-disabled-{0}-{1}', github.run_id, github.run_attempt) }}",
-            "cancel-in-progress": "false", "queue": "max",
-        })
+            "group": "voice-rest-measurement-disabled", "cancel-in-progress": "false"})
+        self.assertNotEqual(workflow["concurrency"]["group"].casefold(),
+                            workflows[lifecycle.DEPLOY]["concurrency"]["group"].casefold())
         jobs = workflow["jobs"]
         self.assertNotIn("defaults", workflow)
         for name, job in jobs.items():
             with self.subTest(job=name):
                 self.assertNotIn("continue-on-error", job)
                 self.assertNotIn("defaults", job)
-                for index, step in enumerate(job.get("steps", [])):
-                    if name == "measurement-terminal" and index in range(2, 7):
-                        self.assertEqual(step.get("continue-on-error"), "true")
-                    else:
-                        self.assertNotIn("continue-on-error", step)
+                for step in job.get("steps", []):
+                    self.assertNotIn("continue-on-error", step)
                     self.assertNotIn("shell", step)
         first = "github.ref == 'refs/heads/main' && github.run_attempt == 1"
         guards = {
@@ -223,13 +184,12 @@ class VoiceMeasurementSkeletonTests(unittest.TestCase):
             "voice-second": first + " && needs.measurement-after.result == 'success' && needs.measurement-after.outputs.second_required == 'true'",
             "measurement-final": first + " && needs.voice-second.result == 'success'",
             "staging-use-release": "always() && " + first + " && needs.staging-window.outputs.expires_at != ''",
-            "measurement-terminal": "always() && " + first,
             "rerun-refusal": "always() && github.run_attempt != 1",
         }
         self.assertEqual({name: job["if"] for name, job in jobs.items()},
                          {name: "${{ false && " + guard + " }}" for name, guard in guards.items()})
         refusal = jobs["rerun-refusal"]
-        self.assertEqual(refusal["needs"], "measurement-terminal")
+        self.assertEqual(refusal["needs"], "staging-use-release")
         self.assertEqual(refusal["permissions"], {})
         self.assertEqual(refusal["steps"], [{"run": "exit 1"}])
         begin = jobs["staging-window"]
