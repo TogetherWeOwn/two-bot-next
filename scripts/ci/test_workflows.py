@@ -9002,7 +9002,12 @@ class WorkflowTests(unittest.TestCase):
             change(changed)
             with self.subTest(label=label):
                 self.assertTrue(staging_rollback_drill_errors(changed))
-        self.assertNotIn("rollback-proof-watch", self.workflows["daily-digest.yml"]["jobs"])
+        digest_jobs = self.workflows["daily-digest.yml"]["jobs"]
+        self.assertNotIn("rollback-proof-watch", digest_jobs)
+        self.assertFalse(any(
+            "rollback_proof.py watch" in str(step.get("run") or "")
+            for job in digest_jobs.values() for step in job.get("steps", [])
+        ))
         changed = deepcopy(self.workflows["daily-digest.yml"])
         changed["jobs"]["rollback-proof-watch"] = {"steps": [{"run": "python3 scripts/rollback_proof.py watch"}]}
         self.assertTrue(daily_digest_errors(changed))
