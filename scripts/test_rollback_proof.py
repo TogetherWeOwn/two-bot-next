@@ -149,6 +149,25 @@ class RollbackProofValidatorTests(unittest.TestCase):
                 self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
             proof.validate_shutdown(self.start, self.stop, 123, self.sha)
 
+    def test_shutdown_requires_matching_finish_build(self):
+        for key, other in (("sha", self.sha), ("deploymentId", VERSION)):
+            with self.subTest(field=key), patch.dict(self.release, {key: other}), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+        for key, invalid in (("sha", "A" * 40), ("sha", 1), ("deploymentId", "bad/id"),
+                             ("deploymentId", "a" * 129), ("deploymentId", [])):
+            with self.subTest(field=key, value=invalid), patch.dict(self.status, {key: invalid}), \
+                    patch.dict(self.release, {key: invalid}), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
+        for key in ("sha", "deploymentId"):
+            with self.subTest(missing=key), patch.dict(self.status), patch.dict(self.release), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                del self.status[key], self.release[key]
+                proof.validate_shutdown(self.start, self.stop, 123, self.sha)
+
     def test_shutdown_confirms_release_of_original_window_after_rebind(self):
         proof.validate_shutdown(self.start, self.stop, 123, self.sha)
 

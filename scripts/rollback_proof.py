@@ -217,13 +217,17 @@ def validate_shutdown(files, stop_files, run_id, requested_sha):
     def same_window(use):
         return same_attempt(use) and type(use.get("expiresAt")) is int and use["expiresAt"] == expiry
 
-    # Only the initial window is pinned to the deployed build. Rollback may
-    # rebind it, but the finish transaction must preserve the attempt and expiry.
+    # Rollback may rebind the initial window. Finish pins release to the
+    # preceding status's build while preserving the original attempt and expiry.
+    finish_sha, finish_deployment = status.get("sha"), status.get("deploymentId")
     prior, use = status.get("use"), release.get("use")
     require(all(same_attempt(row) for row in (window, finish, status, release))
             and window.get("schema") == finish.get("schema") == "two-bot-staging-pipeline.v1"
             and status.get("schema") == release.get("schema") == "two-bot-staging-use.v1"
             and window.get("sha") == requested_sha and type(expiry) is int and 0 < expiry <= 2**53 - 1
+            and isinstance(finish_sha, str) and SHA.fullmatch(finish_sha) and release.get("sha") == finish_sha
+            and isinstance(finish_deployment, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", finish_deployment)
+            and release.get("deploymentId") == finish_deployment
             and type(status.get("running")) is bool and release.get("running") is False
             and same_window(prior) and prior.get("phase") in ("preparing", "active", "released")
             and same_window(use) and use.get("phase") == "released",
