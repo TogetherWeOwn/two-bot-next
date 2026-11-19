@@ -64,10 +64,10 @@ JOB_INVENTORY = {
     "release.yml": {"sbom-target", "release-sbom", "verify-sbom", "attach-sbom", "verdict"},
     # Daily digest release (docs/releases.md): at most one vYYYY.MDD.P tag a day,
     # plus the missing-digest alert; pinned shape below.
-    "daily-digest.yml": {"digest", "alert", "rollback-proof-watch"},
+    "daily-digest.yml": {"digest", "alert"},
     "staging-migrate.yml": {"plan", "claim", "apply"},
     "production-migrate.yml": {"plan", "claim", "apply"},
-    # Daily staging automatic recovery proof plus the manual Worker-only drill.
+    # On-demand staging automatic recovery proof plus the manual Worker-only drill.
     "staging-rollback-drill.yml": {"drill", "proof", "alert"},
     # Container-image backout/restore drill: manual, staging-only, pinned shape below.
     "staging-container-drill.yml": {"container-drill"},
@@ -88,7 +88,7 @@ JOB_INVENTORY = {
     "staging-ownership-status.yml": {"status"},
     # Manual gradual-promote proof caller (passive until the synthetic
     # fixture lands); pinned shape below.
-    "gradual-promote-proof.yml": {"admission-hold", "proof"},
+    "gradual-promote-proof.yml": {"proof"},
     "supply-chain.yml": {"pr-lint", "gitleaks"},
     # TOG-10893: read-only SBOM inventory/gates shared by the PR dry-run and releases.
     # `image` builds/scans the untrusted ref with pinned actions only; `verify`
@@ -1736,12 +1736,6 @@ ROLLBACK_DRILL_ENV = {
 }
 
 
-ADMISSION_REFUSAL = {
-    "name": "Refuse staging use without enforced admission",
-    "run": 'echo "::error::enforced exact-SHA admission is unavailable"\nexit 1\n',
-}
-
-
 def rollback_proof_job_errors(job, mode):
     """Pin the dispatcher/observer to reviewed tooling and the smallest token."""
     errors = []
@@ -1765,12 +1759,8 @@ def rollback_proof_job_errors(job, mode):
     if str(job.get("timeout-minutes")) != ("80" if mode == "run" else "5"):
         errors.append(f"rollback proof {mode}: bounded job timeout changed")
     steps = job.get("steps") or []
-    if len(steps) != (4 if mode == "run" else 2):
+    if len(steps) != (3 if mode == "run" else 2):
         return errors + [f"rollback proof {mode}: unexpected steps"]
-    if mode == "run":
-        if steps[0] != ADMISSION_REFUSAL:
-            errors.append("rollback proof run: first step must unconditionally refuse admission")
-        steps = steps[1:]
     if any("if" in step or "continue-on-error" in step for step in steps):
         errors.append(f"rollback proof {mode}: steps must run and fail closed")
     checkout, command = steps[:2]
@@ -1792,7 +1782,7 @@ def rollback_proof_job_errors(job, mode):
 
 
 def staging_rollback_drill_errors(workflow):
-    """Daily staging-only auto-rollback proof and optional manual Worker drill.
+    """On-demand staging-only auto-rollback proof and optional Worker drill.
 
     The orchestrator must not hold staging-lifecycle while waiting for its child;
     only the manual Worker drill shares that lane. No production bindings.
@@ -1800,8 +1790,8 @@ def staging_rollback_drill_errors(workflow):
     name = "staging-rollback-drill.yml"
     errors = []
     on = workflow.get("on") or {}
-    if set(on) != {"workflow_dispatch", "schedule"} or on.get("schedule") != [{"cron": "17 3 * * *"}]:
-        errors.append(f"{name}: must run daily at 03:17 UTC plus manual dispatch only")
+    if set(on) != {"workflow_dispatch"}:
+        errors.append(f"{name}: must run only on manual dispatch")
     dispatch = on.get("workflow_dispatch") or {}
     inputs = dispatch.get("inputs") or {}
     if set(dispatch) != {"inputs"} or set(inputs) != {"target_version"}:
@@ -2593,17 +2583,12 @@ def gradual_promote_proof_errors(workflow):
     if workflow.get("concurrency") != {"group": "gradual-promote-proof", "cancel-in-progress": "false"}:
         errors.append(f"{name}: must use its own gradual-promote-proof group without cancelling")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"admission-hold", "proof"}:
-        errors.append(f"{name}: jobs must be exactly admission-hold and proof")
+    if set(jobs) != {"proof"}:
+        errors.append(f"{name}: jobs must be exactly proof")
         return errors
-    if jobs["admission-hold"] != {
-        "permissions": {}, "runs-on": "ubuntu-latest", "timeout-minutes": "2",
-        "steps": [ADMISSION_REFUSAL],
-    }:
-        errors.append(f"{name}: admission hold must unconditionally fail without credentials")
     job = jobs["proof"]
-    if job.get("needs") != "admission-hold":
-        errors.append(f"{name}: proof must depend on the admission hold")
+    if "needs" in job:
+        errors.append(f"{name}: proof must not depend on another job")
     if job.get("name") != "gradual-promote-proof":
         errors.append(f"{name}:proof: job name must stay gradual-promote-proof")
     if job.get("if") != "github.ref == 'refs/heads/main'":
@@ -2857,13 +2842,9 @@ def daily_digest_errors(workflow):
     if workflow.get("concurrency") != {"group": "daily-digest", "cancel-in-progress": "false"}:
         errors.append(f"{name}: must serialize digests at the top level without cancelling")
     jobs = workflow.get("jobs") or {}
-    if set(jobs) != {"digest", "alert", "rollback-proof-watch"}:
-        errors.append(f"{name}: jobs must be exactly digest, alert and rollback-proof-watch")
+    if set(jobs) != {"digest", "alert"}:
+        errors.append(f"{name}: jobs must be exactly digest and alert")
         return errors
-    watcher = jobs["rollback-proof-watch"]
-    errors.extend(rollback_proof_job_errors(watcher, "watch"))
-    if ("needs" in watcher or watcher.get("if") != "github.ref == 'refs/heads/main' && inputs.dry_run != true"):
-        errors.append(f"{name}: rollback proof watcher must be independent of digest success, never dry-run")
     digest = jobs["digest"]
     if digest.get("if") != "github.ref == 'refs/heads/main'":
         errors.append(f"{name}:digest: must run on main only")
@@ -8998,21 +8979,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(workflow_policy_errors(missing))
         self.assertEqual(workflow_policy_errors(workflows), [])
 
-    def test_daily_rollback_proof_and_independent_finding_only_watch_are_pinned(self):
+    def test_on_demand_rollback_proof_is_pinned(self):
         workflow = self.workflows["staging-rollback-drill.yml"]
         self.assertEqual(staging_rollback_drill_errors(workflow), [])
         for label, change in {
-            "missing daily schedule": lambda w: w["on"].pop("schedule"),
-            "manual replaces pending schedule": lambda w: w["concurrency"].update({"group": "staging-rollback-proof"}),
-            "weekly only": lambda w: w["on"].update({"schedule": [{"cron": "17 3 * * 1"}]}),
+            "scheduled staging activation": lambda w: w["on"].update({"schedule": [{"cron": "17 3 * * *"}]}),
+            "shared concurrency group": lambda w: w["concurrency"].update({"group": "staging-rollback-proof"}),
             "dispatcher deadlocks staging lane": lambda w: w["jobs"]["proof"].update(
                 {"concurrency": {"group": "staging-lifecycle", "cancel-in-progress": False}}),
             "dispatcher reads production secrets": lambda w: w["jobs"]["proof"].update({"environment": "production"}),
-            "dispatcher extra bindings": lambda w: w["jobs"]["proof"]["steps"][2]["env"].update({"URL": "production"}),
-            "refusal removed": lambda w: w["jobs"]["proof"]["steps"].pop(0),
-            "refusal made successful": lambda w: w["jobs"]["proof"]["steps"][0].update({"run": "exit 0\n"}),
-            "refusal conditional": lambda w: w["jobs"]["proof"]["steps"][0].update({"if": "false"}),
-            "refusal tolerated": lambda w: w["jobs"]["proof"]["steps"][0].update({"continue-on-error": "true"}),
+            "dispatcher extra bindings": lambda w: w["jobs"]["proof"]["steps"][1]["env"].update({"URL": "production"}),
+            "proof command removed": lambda w: w["jobs"]["proof"]["steps"].pop(1),
+            "proof command conditional": lambda w: w["jobs"]["proof"]["steps"][1].update({"if": "false"}),
+            "proof failure tolerated": lambda w: w["jobs"]["proof"]["steps"][1].update({"continue-on-error": "true"}),
             "missing evidence": lambda w: w["jobs"]["proof"]["steps"].pop(),
             "alert on success": lambda w: w["jobs"]["alert"].update({"if": "always()"}),
             "alert cannot write the incident issue": lambda w: w["jobs"]["alert"]["permissions"].pop("issues"),
@@ -9023,15 +9002,10 @@ class WorkflowTests(unittest.TestCase):
             change(changed)
             with self.subTest(label=label):
                 self.assertTrue(staging_rollback_drill_errors(changed))
-        watcher = self.workflows["daily-digest.yml"]["jobs"]["rollback-proof-watch"]
-        self.assertNotIn("needs", watcher)
-        self.assertEqual(rollback_proof_job_errors(watcher, "watch"), [])
-        for change in (lambda w: w["permissions"].update({"actions": "write"}),
-                       lambda w: w["steps"][1].update({"run": "python3 scripts/rollback_proof.py run"}),
-                       lambda w: w["steps"][1].update({"continue-on-error": True})):
-            changed = deepcopy(watcher)
-            change(changed)
-            self.assertTrue(rollback_proof_job_errors(changed, "watch"))
+        self.assertNotIn("rollback-proof-watch", self.workflows["daily-digest.yml"]["jobs"])
+        changed = deepcopy(self.workflows["daily-digest.yml"])
+        changed["jobs"]["rollback-proof-watch"] = {"steps": [{"run": "python3 scripts/rollback_proof.py watch"}]}
+        self.assertTrue(daily_digest_errors(changed))
         spec = importlib.util.spec_from_file_location("rollback_proof", ROOT / "scripts/rollback_proof.py")
         proof = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(proof)
@@ -9827,11 +9801,7 @@ class WorkflowTests(unittest.TestCase):
             "cancelling concurrency": lambda w: w["concurrency"].update({"cancel-in-progress": "true"}),
             "shared concurrency group": lambda w: w["concurrency"].update({"group": "staging-lifecycle"}),
             "second job": lambda w: w["jobs"].update({"again": deepcopy(job(w))}),
-            "missing hold": lambda w: w["jobs"].pop("admission-hold"),
-            "hold succeeds": lambda w: w["jobs"]["admission-hold"]["steps"][0].update({"run": "exit 0\n"}),
-            "hold conditional": lambda w: w["jobs"]["admission-hold"].update({"if": "false"}),
-            "hold tolerated": lambda w: w["jobs"]["admission-hold"]["steps"][0].update({"continue-on-error": "true"}),
-            "proof bypasses hold": lambda w: job(w).pop("needs"),
+            "proof depends on another job": lambda w: job(w).update({"needs": "other"}),
             "proof runs after failure": lambda w: job(w).update({"if": "always()"}),
             "production environment": lambda w: job(w).update({"environment": "production"}),
             "no environment": lambda w: job(w).pop("environment"),
@@ -10711,8 +10681,7 @@ class WorkflowTests(unittest.TestCase):
                     elif (name, job_id) == ("deploy-production.yml", "promotion-skipped"):
                         # No checkout or API access: only report and upload a receipt.
                         expected = {}
-                    elif (name, job_id) in (("gradual-promote-proof.yml", "admission-hold"),
-                                            ("voice-synthetic.yml", "rerun-refusal")):
+                    elif (name, job_id) == ("voice-synthetic.yml", "rerun-refusal"):
                         # Refuses before checkout or API access.
                         expected = {}
                     elif (name, job_id) == ("daily-digest.yml", "digest"):

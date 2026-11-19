@@ -2324,9 +2324,8 @@ authorized [qualification/recovery procedure](staging-rollout-gate.md#full-windo
    `-f inject_unpaired_disconnect=true` for the crash-loop scope).
    Explicit arm/disarm dispatches bypass the hold. A dispatched error-rate
    rehearsal fails without deploying while the hold is armed; do not clear the
-   hold for a proof. The scheduled rollback proof currently refuses before
-   dispatch because enforced exact-SHA admission is unavailable, independent
-   of this hold.
+   hold for a proof. A rollback proof dispatched during the hold
+   fails rather than overriding it.
    The arm run stays red by design: the history guard fails it after a green
    deploy and synthetic so the pin never reads as staging history for the
    head. Read the deploy and synthetic steps, not the run color.

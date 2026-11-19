@@ -166,12 +166,12 @@ two-bot-next ALERT synthetic-user-flow:<staging|prod>: <failing checks>. Runbook
 ### Incident issues
 
 `scripts/incident_issue.py` is the one alert sink for this workflow, the
-daily staging rollback proof and the daily digest:
+on-demand staging rollback proof and the daily digest:
 
 | Check | Incident key | Opened by | Closed by |
 | --- | --- | --- | --- |
 | Staging / prod synthetic | `synthetic-user-flow:<env>` | ALERT | RECOVERY (first healthy sample) |
-| Daily staging rollback proof | `staging-rollback-proof` | failed proof or watch | next passing watch |
+| On-demand staging rollback proof | `staging-rollback-proof` | failed proof | manually after inspecting a passing proof |
 | Daily digest | `daily-digest` | owed digest not released | the agent who cuts the tag |
 
 The key lives in a hidden body marker (`<!-- incident-key: <key> -->`). An

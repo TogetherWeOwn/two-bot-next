@@ -664,14 +664,15 @@ policy pins this ordering, condition, local snapshot command and red outcome.
 Without a takeover or a successful deploy/snapshot the run fails for the
 operator; a failed restore is never a reason to wait for the next deployment.
 
-### Daily staging proof
+### On-demand staging proof
 
-`staging-rollback-drill.yml` runs daily at **03:17 UTC** on `main`. With no manual
-`target_version`, its `proof` job currently fails before dispatch; its failure
-alert remains active. Retain this refusal until non-mutating Actions evidence and
-independent Security acceptance establish a replacement. No synthetic green is
-qualification. The retained, currently unreachable `scripts/rollback_proof.py run`
-would:
+The Release Manager dispatches `staging-rollback-drill.yml` on `main` once per
+production release, after the candidate's staging deploy. With no
+`target_version`, `scripts/rollback_proof.py run` performs the automatic proof.
+The proof never certifies a build for promotion. The wrapper does not accept a
+candidate SHA: its child resolves `main` at dispatch time, which can differ from
+the candidate or the wrapper's SHA. Inspect the recorded child SHA; do not claim
+that this drill proves an exact candidate without a matching child. It:
 
 1. Dispatches only `deploy-staging.yml` on `main`, with the existing staging
    error-rate gate rehearsal enabled. No production dispatch or traffic fault
@@ -699,29 +700,15 @@ build. Inspect the hold and resume the proof after the observation window;
 do not clear a hold to make a proof green. Explicit arm/disarm dispatches without
 the error-rate switch retain their exception.
 
-The wrapper uses separate `staging-rollback-proof-schedule` and
-`staging-rollback-proof-workflow_dispatch` groups, **not** `deploy-staging`:
-a later manual dispatch cannot replace the pending scheduled wrapper, and its
-child can acquire the staging deploy lane. The optional manual Worker-only
-drill still holds `deploy-staging` while it runs and now uploads its separate
-evidence artifact; it does not count as the daily automatic proof.
+The wrapper uses `staging-rollback-proof-workflow_dispatch`, **not** the staging
+lifecycle group, so its child can acquire the staging deploy lane. The optional
+Worker-only drill holds the staging lifecycle lane and uploads separate evidence;
+it does not count as the automatic proof.
 
-A failed wrapper opens (or comments on) the one `staging-rollback-proof`
-GitHub issue labelled `incident`; Paperclip turns it into an agent task. Independently, the **06:23 UTC** `daily-digest` workflow's
-`rollback-proof-watch` job checks the newest scheduled drill and its artifact,
-even if the digest fails. Missing, failed, cancelled, stuck, unreadable or
-older-than-30-hour proof alerts and fails the watcher. An older successful proof
-cannot hide a newer failed one. A healthy check comments on and closes any open issue
-with no activity since the graded proof completed. Every failed proof, scheduled
-or manual, alerts on that issue, so later activity holds it open until a newer
-scheduled proof passes. This independent
-schedule catches a missed drill trigger; an outage of GitHub Actions itself is
-outside these two scheduled checks.
-
-Do not dispatch an on-demand proof while this refusal is in place. The local
-`python3 scripts/rollback_proof.py run --dry-run` does not dispatch or qualify a
-proof. Inspect any prior child run and staging state before recovery; the
-freshness watcher requires a scheduled proof, not a manual substitute.
+A failed wrapper opens or comments on the `staging-rollback-proof` incident issue.
+There is no scheduled freshness watcher. Inspect the exact wrapper, child and
+artifact before closing an incident; a dry run does not dispatch or qualify a proof.
+Inspect the prior child run and staging state before recovery.
 
 Both gate curls enforce `--max-filesize 65536` (64 KiB). Any transfer
 failure counts as `000`, even if curl reports HTTP 200 and leaves a valid
