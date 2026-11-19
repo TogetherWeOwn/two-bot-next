@@ -77,6 +77,7 @@ mod tests {
     fn preview_interaction() -> Interaction {
         serde_json::from_value(json!({
             "id": "4242", "application_id": "1111", "type": 2,
+            "attachment_size_limit": 10_485_760,
             "guild_id": STAGING_GUILD_ID,
             "channel": {"id": "777", "type": 0},
             "data": {"id": "1", "type": 1, "name": "automod-preview"},
