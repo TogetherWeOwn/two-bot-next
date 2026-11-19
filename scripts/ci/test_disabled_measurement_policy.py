@@ -20,7 +20,8 @@ def scaffold():
     jobs = {name: {"if": guard} for name, guard in GUARDS.items()}
     for name in ("staging-window", "measurement-before", "measurement-after", "measurement-final", "staging-use-release"):
         jobs[name].update({"environment": "staging", "runs-on": "ubuntu-latest"})
-    jobs["rerun-refusal"]["runs-on"] = "ubuntu-latest"
+    for name in ("measurement-terminal", "rerun-refusal"):
+        jobs[name]["runs-on"] = "ubuntu-latest"
     for name in ("voice-first", "voice-second"):
         jobs[name]["uses"] = TARGET
     return {"on": {"workflow_dispatch": ""}, "permissions": {},

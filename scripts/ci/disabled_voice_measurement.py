@@ -15,6 +15,7 @@ GUARDS = {name: "${{ false && " + condition + " }}" for name, condition in {
     "voice-second": FIRST + " && needs.measurement-after.result == 'success' && needs.measurement-after.outputs.second_required == 'true'",
     "measurement-final": FIRST + " && needs.voice-second.result == 'success'",
     "staging-use-release": "always() && " + FIRST + " && needs.staging-window.outputs.expires_at != ''",
+    "measurement-terminal": "always() && " + FIRST,
     "rerun-refusal": "always() && github.run_attempt != 1",
 }.items()}
 
