@@ -183,6 +183,44 @@ def validate_evidence(files):
             "gate": restore["gate"], "takeover": True}
 
 
+# Kept separate from prove() until the dispatch and receipt loading are wired.
+def validate_deployed_sha(files, requested_sha):
+    require(isinstance(requested_sha, str) and SHA.fullmatch(requested_sha), "requested_sha_invalid")
+    evidence = files.get("evidence.json") if isinstance(files, dict) else None
+    require(isinstance(evidence, dict) and evidence.get("revision") == requested_sha,
+            "deployed_sha_mismatch")
+
+
+def validate_shutdown(files, stop_files, run_id):
+    require(type(run_id) is int and run_id > 0, "shutdown_run_id_invalid")
+    start = files.get("staging-use.jsonl") if isinstance(files, dict) else None
+    stop = stop_files.get("staging-use-release.jsonl") if isinstance(stop_files, dict) else None
+    require(isinstance(start, list) and isinstance(stop, list)
+            and all(isinstance(row, dict) for rows in (start, stop) for row in rows),
+            "shutdown_receipt_invalid")
+    windows = [row for row in start if row.get("action") == "window"]
+    releases = [row for row in stop if row.get("action") == "release"]
+    require(len(windows) == 1 and len(releases) == 1
+            and not any(row.get("action") in ("failed", "not-owned") for rows in (start, stop) for row in rows),
+            "shutdown_not_confirmed")
+    window, release = windows[0], releases[0]
+    use = release.get("use")
+    expiry = window.get("expiresAt")
+    # Rollback can rebind the window to another build, but not to another run,
+    # attempt, or expiry. A release must attest that the runtime is stopped.
+    require(window.get("schema") == "two-bot-staging-pipeline.v1"
+            and window.get("environment") == "staging" and window.get("runId") == str(run_id)
+            and type(window.get("runAttempt")) is int and window["runAttempt"] == 1
+            and type(expiry) is int and expiry > 0
+            and release.get("schema") == "two-bot-staging-use.v1"
+            and release.get("environment") == "staging" and release.get("running") is False
+            and isinstance(use, dict) and use.get("environment") == "staging"
+            and use.get("runId") == str(run_id) and type(use.get("runAttempt")) is int
+            and use["runAttempt"] == 1 and type(use.get("expiresAt")) is int
+            and use["expiresAt"] == expiry and use.get("phase") == "released",
+            "shutdown_receipt_mismatch")
+
+
 def prove(*, sleep=time.sleep, clock=time.monotonic):
     response = gh(f"repos/{REPO}/actions/workflows/deploy-staging.yml/dispatches", body=DISPATCH)
     run_id = response.get("workflow_run_id")

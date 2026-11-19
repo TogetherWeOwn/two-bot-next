@@ -79,6 +79,63 @@ def jobs():
             "steps": [{"name": name, "conclusion": outcome} for name, outcome in EXPECTED_STEPS.items()]}]}
 
 
+class RollbackProofValidatorTests(unittest.TestCase):
+    def test_deployed_sha_requires_exact_full_revision(self):
+        requested = "b" * 40
+        proof.validate_deployed_sha({"evidence.json": {"revision": requested}}, requested)
+        for artifact in (None, {}, {"evidence.json": [requested]}, {"evidence.json": {}},
+                         {"evidence.json": {"revision": "a" * 40}}):
+            with self.subTest(artifact=artifact), self.assertRaisesRegex(proof.ProofError, "^deployed_sha_mismatch$"):
+                proof.validate_deployed_sha(artifact, requested)
+        for invalid in (None, "", "a" * 39, "B" * 40, "g" * 40):
+            with self.subTest(sha=invalid), self.assertRaisesRegex(proof.ProofError, "^requested_sha_invalid$"):
+                proof.validate_deployed_sha({"evidence.json": {"revision": invalid}}, invalid)
+
+    def setUp(self):
+        self.window = {"schema": "two-bot-staging-pipeline.v1", "action": "window",
+                       "environment": "staging", "runId": "123", "runAttempt": 1, "expiresAt": 1000,
+                       "sha": "b" * 40}
+        self.use = {"environment": "staging", "runId": "123", "runAttempt": 1, "expiresAt": 1000,
+                    "phase": "released", "sha": "a" * 40}
+        self.release = {"schema": "two-bot-staging-use.v1", "action": "release", "environment": "staging",
+                        "running": False, "use": self.use}
+        self.start = {"staging-use.jsonl": [{"action": "attempt"}, self.window]}
+        self.stop = {"staging-use-release.jsonl": [{"action": "status"}, self.release]}
+
+    def test_shutdown_confirms_release_of_original_window_after_rebind(self):
+        proof.validate_shutdown(self.start, self.stop, 123)
+
+    def test_shutdown_rejects_malformed_receipts_and_run_id(self):
+        for start, stop in ((None, self.stop), (self.start, {}), (self.start, {"staging-use-release.jsonl": [False]}),
+                            ({"staging-use.jsonl": self.window}, self.stop)):
+            with self.subTest(start=start, stop=stop), self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_invalid$"):
+                proof.validate_shutdown(start, stop, 123)
+        for invalid in (True, 0, "123"):
+            with self.subTest(run_id=invalid), self.assertRaisesRegex(proof.ProofError, "^shutdown_run_id_invalid$"):
+                proof.validate_shutdown(self.start, self.stop, invalid)
+
+    def test_shutdown_rejects_missing_duplicate_or_failed_outcomes(self):
+        for windows, releases in (([], [self.release]), ([self.window, self.window], [self.release]),
+                                  ([self.window], []), ([self.window], [self.release, self.release]),
+                                  ([self.window, {"action": "failed"}], [self.release]),
+                                  ([self.window], [self.release, {"action": "not-owned"}]),
+                                  ([self.window], [self.release, {"action": "failed"}])):
+            with self.subTest(windows=windows, releases=releases), \
+                    self.assertRaisesRegex(proof.ProofError, "^shutdown_not_confirmed$"):
+                proof.validate_shutdown({"staging-use.jsonl": windows}, {"staging-use-release.jsonl": releases}, 123)
+
+    def test_shutdown_requires_same_staging_run_attempt_and_expiry_and_stopped_runtime(self):
+        for target, changes in (
+            (self.window, {"schema": "unknown", "environment": "production", "runId": "124", "runAttempt": True, "expiresAt": 0}),
+            (self.release, {"schema": "unknown", "environment": "production", "running": 0, "use": []}),
+            (self.use, {"environment": "production", "runId": "124", "runAttempt": 2, "expiresAt": 1001, "phase": "active"}),
+        ):
+            for key, invalid in changes.items():
+                with self.subTest(key=key, value=invalid), patch.dict(target, {key: invalid}), \
+                        self.assertRaisesRegex(proof.ProofError, "^shutdown_receipt_mismatch$"):
+                    proof.validate_shutdown(self.start, self.stop, 123)
+
+
 class RollbackProofTests(unittest.TestCase):
     def test_dispatch_is_exactly_once_staging_main_and_restores_both_members(self):
         with patch.object(proof, "gh", side_effect=[{"workflow_run_id": 123}, run(), jobs()]) as gh, \
