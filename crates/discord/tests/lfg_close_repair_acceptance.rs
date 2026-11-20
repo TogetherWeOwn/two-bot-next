@@ -702,7 +702,7 @@ fn close_interaction(guild: &str) -> twilight_model::application::interaction::I
         "member": {"user": {"id": OWNER, "username": "fixture", "discriminator": "0", "avatar": null},
             "roles": [], "joined_at": null, "deaf": false, "mute": false, "flags": 0,
             "permissions": two_bot_core::commands::PERM_MANAGE_EVENTS.to_string()},
-        "token": "offline-close-interaction", "version": 1, "entitlements": [],
+        "token": "offline-close-interaction", "version": 1, "entitlements": [], "attachment_size_limit": 10485760,
         "authorizing_integration_owners": {},
         "data": {"id": "1", "name": "lfg-close", "type": 1, "options": [{"type": 3, "name": "id", "value": "repair-disabled"}]}
     })).expect("close interaction wire shape")

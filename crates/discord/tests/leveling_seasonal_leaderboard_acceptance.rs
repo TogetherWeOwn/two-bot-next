@@ -93,7 +93,7 @@ fn member() -> Value {
 
 fn interaction(name: &str) -> Interaction {
     let data = json!({"id":"1","name":name,"type":1,"options":[]});
-    serde_json::from_value(json!({"id":"7","application_id":"8","type":2,"token":"mock-callback","version":1,"guild_id":GUILD.to_string(),"member":member(),"locale":"en-US","data":data,"entitlements":[],"authorizing_integration_owners":{"0":GUILD.to_string()}})).unwrap()
+    serde_json::from_value(json!({"id":"7","application_id":"8","type":2,"token":"mock-callback","version":1,"attachment_size_limit":10485760,"guild_id":GUILD.to_string(),"member":member(),"locale":"en-US","data":data,"entitlements":[],"authorizing_integration_owners":{"0":GUILD.to_string()}})).unwrap()
 }
 
 fn runtime(pool: PgPool, mock: &MockRest) -> LevelingRuntime {

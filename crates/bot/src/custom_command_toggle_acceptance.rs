@@ -166,7 +166,12 @@ async fn toggle_acceptance_gateway_dispatch_pauses_and_resumes_the_saved_respons
         .expect("definition after dispatch");
     let mut prefix = message(8102, CHANNEL, false, Some(GUILD));
     prefix.content = "!faq ordinary arguments".to_owned();
-    assert!(runtime.dispatch(&Event::MessageCreate(Box::new(MessageCreate(prefix)))));
+    assert!(
+        runtime.dispatch(&Event::MessageCreate(Box::new(MessageCreate {
+            message: prefix,
+            channel_type: None
+        })))
+    );
     settle(&runtime).await;
     assert!(runtime.dispatch(&interaction_event(invocation(
         8103,
@@ -218,7 +223,12 @@ async fn toggle_acceptance_gateway_dispatch_pauses_and_resumes_the_saved_respons
     settle(&runtime).await;
     let mut prefix = message(8105, CHANNEL, false, Some(GUILD));
     prefix.content = "!faq ordinary arguments".to_owned();
-    assert!(runtime.dispatch(&Event::MessageCreate(Box::new(MessageCreate(prefix)))));
+    assert!(
+        runtime.dispatch(&Event::MessageCreate(Box::new(MessageCreate {
+            message: prefix,
+            channel_type: None
+        })))
+    );
     settle(&runtime).await;
     assert!(runtime.dispatch(&interaction_event(invocation(
         8106,

@@ -18,6 +18,10 @@ use two_bot_core::internal_actions::{
 #[path = "member_store.rs"]
 pub mod store;
 
+#[path = "voice_move.rs"]
+pub mod voice_move;
+pub use voice_move::{VoiceMoveNotSent, VoiceMovePatch, VOICE_MOVE_TIMEOUT_MS};
+
 pub const ADD_MEMBER_TIMEOUT_MS: u64 = 1500;
 pub const ROLE_TIMEOUT_MS: u64 = 2000;
 

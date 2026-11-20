@@ -1546,7 +1546,7 @@ mod inspect_regressions {
     fn inspect(id: u64, name: &str, view: &str) -> Interaction {
         serde_json::from_value(json!({
             "id": id.to_string(), "application_id": "1111", "type": 2,
-            "token": TOKEN, "version": 1,
+            "token": TOKEN, "version": 1, "attachment_size_limit": 10485760,
             "guild_id": "2222", "channel": {"id": "4444", "type": 0},
             "authorizing_integration_owners": {"0": "2222"}, "entitlements": [],
             "member": {

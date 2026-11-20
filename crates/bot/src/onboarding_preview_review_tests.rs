@@ -179,7 +179,7 @@ fn admin_member(user_id: &str, permissions: Option<&str>, roles: &[&str]) -> Val
 /// Manage Server bit, zero options.
 fn preview_slash(member: Value) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "111", "authorizing_integration_owners": {"0": "22"},
+        "attachment_size_limit": 10485760, "application_id": "111", "authorizing_integration_owners": {"0": "22"},
         "id": "333", "token": "mock-callback", "type": 2, "version": 1, "guild_id": "22",
         "member": member,
         "data": {"id": "444", "name": "welcome-preview", "type": 1, "options": []},
@@ -195,7 +195,7 @@ fn preview() -> Interaction {
 /// on the banner, so no render is needed to exercise shared admission.
 fn preview_click(token: &str, id: &str, content: &str) -> Interaction {
     serde_json::from_value(json!({
-        "application_id": "1111", "authorizing_integration_owners": {"0": "22"},
+        "attachment_size_limit": 10485760, "application_id": "1111", "authorizing_integration_owners": {"0": "22"},
         "id": id, "token": token, "type": 3, "version": 1,
         "guild_id": "22", "channel_id": "12",
         "member": admin_member("44", Some("32"), &[]),

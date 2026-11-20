@@ -90,6 +90,60 @@ async fn original_response_edit_suppresses_mentions_bounds_content_and_validates
     mock.shutdown().await;
 }
 
+#[tokio::test]
+async fn original_response_embed_sanitizes_payload_and_does_not_retry_wire_failure() {
+    let receipt = ScriptedResponse::json(200, serde_json::json!({"id": "555555555555555555"}));
+    let mock = MockRest::start(
+        vec![receipt, ScriptedResponse::status(500)],
+        ScriptedResponse::status(500),
+    )
+    .await;
+    let executor = executor_for(&mock);
+    let embed = serde_json::from_value(serde_json::json!({
+        "type": "rich",
+        "description": format!("@everyone {}", "x".repeat(5000))
+    }))
+    .unwrap();
+
+    executor
+        .edit_interaction_response_embed_with_blocked_retry(1234, "synthetic-webhook-token", &embed)
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "PATCH");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["content"], "");
+    assert_eq!(body["allowed_mentions"]["parse"], serde_json::json!([]));
+    assert_eq!(body["allowed_mentions"]["users"], serde_json::json!([]));
+    assert_eq!(body["allowed_mentions"]["roles"], serde_json::json!([]));
+    let description = body["embeds"][0]["description"].as_str().unwrap();
+    assert!(!description.contains("@everyone"));
+    assert!(description.encode_utf16().count() <= 4096);
+
+    assert!(executor
+        .edit_interaction_response_embed_with_blocked_retry(1234, "synthetic-webhook-token", &embed)
+        .await
+        .is_err());
+    assert_eq!(mock.requests().len(), 2, "a wire failure is not retried");
+    assert!(matches!(
+        executor
+            .edit_interaction_response_embed_with_blocked_retry(
+                0,
+                "synthetic-webhook-token",
+                &embed
+            )
+            .await,
+        Err(DiscordError::Rejected(_))
+    ));
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "invalid id never reaches the wire"
+    );
+    mock.shutdown().await;
+}
+
 // Finding 1: a normal 600 s timeout must reach Discord with a timestamp the
 // pinned Twilight parser accepts (the `Z` form never survived `Timestamp`).
 #[tokio::test]

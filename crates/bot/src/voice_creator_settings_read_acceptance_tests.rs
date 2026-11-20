@@ -104,7 +104,7 @@ impl Fixture {
             "op":0, "s":before + 1, "t":"INTERACTION_CREATE",
             "d":{
                 "application_id":"1", "id":(7000 + before).to_string(),
-                "token":"creator-settings-fixture", "type":2, "version":1,
+                "token":"creator-settings-fixture", "type":2, "version":1, "attachment_size_limit":10485760,
                 "guild_id":GUILD.to_string(), "entitlements":[],
                 "authorizing_integration_owners":{"0":GUILD.to_string()},
                 "member":{

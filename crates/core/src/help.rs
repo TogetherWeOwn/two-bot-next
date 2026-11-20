@@ -215,6 +215,29 @@ const HELP_GROUPS: &[HelpGroup] = &[
     },
 ];
 
+/// Render the ephemeral `/help` reply for the given live publish set.
+///
+/// Only commands present in `defs` render, in publish order within each
+/// group; empty groups are skipped. Large custom-command sets exceed the
+/// plain content ceiling; the Discord adapter uses an embed to preserve names.
+#[must_use]
+pub fn help_text(defs: &[CommandDefinition]) -> String {
+    let catalog = help_catalog(defs);
+    let mut out = catalog.heading;
+    for group in catalog.sections {
+        let _ = write!(out, "\n\n**{}**", group.title);
+        if let Some(perm) = group.requires {
+            let _ = write!(out, " — needs {perm}");
+        }
+        let _ = write!(out, "\n/{}", group.commands.join(" · /"));
+        for note in group.notes {
+            let _ = write!(out, "\n{note}");
+        }
+    }
+    let _ = write!(out, "\n\n{}", catalog.closing_note);
+    out
+}
+
 const RSVP_ATTENDANCE_NOTES: &[&str] = &[
     "Paste the event id or link, e.g. https://discord.com/events/<server-id>/<event-id>.",
     "Totals include your saved response and saved time; live event availability is not checked.",
@@ -240,23 +263,23 @@ pub struct HelpCatalog<'a> {
 #[must_use]
 pub fn help_catalog(defs: &[CommandDefinition]) -> HelpCatalog<'_> {
     let live: HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-    let mut rendered = HashSet::new();
+    let mut rendered: HashSet<&str> = HashSet::new();
     let mut sections = Vec::new();
     for group in HELP_GROUPS {
         if group.anchor.is_some_and(|anchor| !live.contains(anchor)) {
             continue;
         }
-        let commands: Vec<_> = group
+        let present: Vec<_> = group
             .commands
             .iter()
+            .filter(|name| live.contains(**name))
             .copied()
-            .filter(|name| live.contains(name))
             .collect();
-        if commands.is_empty() {
+        if present.is_empty() {
             continue;
         }
-        rendered.extend(commands.iter().copied());
-        let notes = if commands.contains(&"rsvp-attendance") {
+        rendered.extend(present.iter().copied());
+        let notes = if present.contains(&"rsvp-attendance") {
             RSVP_ATTENDANCE_NOTES
         } else {
             &[]
@@ -264,17 +287,19 @@ pub fn help_catalog(defs: &[CommandDefinition]) -> HelpCatalog<'_> {
         sections.push(HelpSection {
             title: group.title,
             requires: group.requires,
-            commands,
+            commands: present,
             notes,
         });
     }
-    // Future builtins and custom commands that have no active group still
-    // appear in discovery.
-    let custom: Vec<_> = defs
-        .iter()
-        .map(|def| def.name.as_str())
-        .filter(|name| !rendered.contains(name))
-        .collect();
+    // DB custom rows publish alongside the builtins; anything else ungrouped
+    // (a future builtin this table predates) still renders rather than
+    // vanishing from discovery.
+    let mut custom = Vec::new();
+    for def in defs {
+        if !rendered.contains(def.name.as_str()) {
+            custom.push(def.name.as_str());
+        }
+    }
     if !custom.is_empty() {
         sections.push(HelpSection {
             title: "Custom",
@@ -289,38 +314,6 @@ pub fn help_catalog(defs: &[CommandDefinition]) -> HelpCatalog<'_> {
         closing_note:
             "This is the last confirmed command list. Your picker hides gated commands you cannot use.",
     }
-}
-
-/// Render the ephemeral `/help` reply for the given live publish set.
-#[must_use]
-pub fn help_text(defs: &[CommandDefinition]) -> String {
-    let catalog = help_catalog(defs);
-    let mut out = catalog.heading;
-    out.push('\n');
-    for section in catalog.sections {
-        out.push('\n');
-        match section.requires {
-            Some(perm) => {
-                let _ = writeln!(out, "**{}** — needs {perm}", section.title);
-            }
-            None => {
-                let _ = writeln!(out, "**{}**", section.title);
-            }
-        }
-        for (index, name) in section.commands.iter().enumerate() {
-            if index != 0 {
-                out.push_str(" · ");
-            }
-            let _ = write!(out, "/{name}");
-        }
-        out.push('\n');
-        for note in section.notes {
-            let _ = writeln!(out, "{note}");
-        }
-    }
-    out.push('\n');
-    out.push_str(catalog.closing_note);
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -917,7 +910,7 @@ impl CommandDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::merge_commands;
+    use crate::commands::{merge_commands, CustomCommand, GUILD_COMMAND_LIMIT};
     use crate::feature_commands::feature_commands;
     use crate::moderation::moderation_commands;
     use crate::router::{InteractionRouter, RouterGates};
@@ -942,77 +935,54 @@ mod tests {
 
     #[test]
     fn catalog_keeps_groups_hints_and_notes_in_display_order() {
-        let defs: Vec<_> = ["ping", "rsvp-attendance", "ban", "faq", "rsvp"]
-            .into_iter()
-            .map(|name| CommandDefinition::new(name, "A test command"))
-            .collect();
+        let names = ["ping", "rsvp-attendance", "ban", "faq", "rsvp"];
+        let defs = names.map(|name| CommandDefinition::new(name, "A test command"));
         let catalog = help_catalog(&defs);
-        let groups: Vec<_> = catalog
+        let groups = catalog
             .sections
             .iter()
-            .map(|section| (section.title, section.requires, section.commands.as_slice()))
-            .collect();
-        assert_eq!(
-            groups,
-            [
-                ("RSVPs", None, ["rsvp", "rsvp-attendance"].as_slice()),
-                ("Bans", Some("Ban Members"), ["ban"].as_slice()),
-                ("Custom", None, ["ping", "faq"].as_slice()),
-            ]
-        );
-        assert_eq!(catalog.sections[0].notes, RSVP_ATTENDANCE_NOTES);
-        assert!(catalog.sections[1..]
-            .iter()
-            .all(|section| section.notes.is_empty()));
-        assert_eq!(
-            help_text(&defs),
-            concat!(
-                "**Server commands** (5 live)\n\n",
-                "**RSVPs**\n/rsvp · /rsvp-attendance\n",
-                "Paste the event id or link, e.g. https://discord.com/events/<server-id>/<event-id>.\n",
-                "Totals include your saved response and saved time; live event availability is not checked.\n\n",
-                "**Bans** — needs Ban Members\n/ban\n\n**Custom**\n/ping · /faq\n\n",
-                "This is the last confirmed command list. Your picker hides gated commands you cannot use.",
-            )
-        );
+            .map(|s| (s.title, s.requires, s.commands.as_slice()));
+        assert!(groups.eq([
+            ("RSVPs", None, ["rsvp", "rsvp-attendance"].as_slice()),
+            ("Bans", Some("Ban Members"), ["ban"].as_slice()),
+            ("Custom", None, ["ping", "faq"].as_slice()),
+        ]));
+        let notes = catalog.sections.iter().map(|s| s.notes);
+        assert!(notes.eq([RSVP_ATTENDANCE_NOTES, &[], &[]]));
+        let expected = "**Server commands** (5 live)\n\n**RSVPs**\n/rsvp · /rsvp-attendance\n\
+            Paste the event id or link, e.g. https://discord.com/events/<server-id>/<event-id>.\n\
+            Totals include your saved response and saved time; live event availability is not checked.\n\n\
+            **Bans** — needs Ban Members\n/ban\n\n**Custom**\n/ping · /faq\n\n\
+            This is the last confirmed command list. Your picker hides gated commands you cannot use.";
+        assert_eq!(help_text(&defs), expected);
     }
 
-    pub(super) fn maximum_publication() -> Vec<CommandDefinition> {
-        use crate::commands::{CustomCommand, GUILD_COMMAND_LIMIT};
-
+    pub(super) fn maximum_publication() -> (Vec<CommandDefinition>, Vec<CustomCommand>) {
         let router = InteractionRouter::new(all_on());
-        let rows: Vec<_> = (0..GUILD_COMMAND_LIMIT)
+        let slots = GUILD_COMMAND_LIMIT - router.publish_set(&[]).unwrap().len();
+        let rows: Vec<_> = (0..slots)
             .map(|i| CustomCommand {
-                name: format!("{}-{i:02}", "界".repeat(29)),
+                name: format!("custom-{i:025}"),
                 description: "A test command".to_owned(),
                 enabled: true,
             })
             .collect();
-        router.publish_set(&rows).expect("full registry")
+        (router.publish_set(&rows).expect("full registry"), rows)
     }
 
     #[test]
     fn catalog_lists_every_name_in_a_maximum_admitted_registry() {
-        let defs = maximum_publication();
-        assert_eq!(defs.len(), crate::commands::GUILD_COMMAND_LIMIT);
+        let (defs, rows) = maximum_publication();
+        assert_eq!(defs.len(), GUILD_COMMAND_LIMIT);
         let catalog = help_catalog(&defs);
-        let rendered: Vec<_> = catalog
-            .sections
-            .iter()
-            .flat_map(|section| &section.commands)
-            .copied()
-            .collect();
-        assert_eq!(rendered.len(), defs.len());
-        assert!(defs.iter().all(|def| rendered.contains(&def.name.as_str())));
+        let names = catalog.sections.iter().flat_map(|s| &s.commands);
+        assert_eq!(names.clone().count(), defs.len());
+        assert!(defs.iter().all(|d| names.clone().any(|n| *n == d.name)));
         let custom = catalog.sections.last().expect("custom group");
         assert_eq!(custom.title, "Custom");
-        let expected: Vec<_> = defs
-            .iter()
-            .filter(|def| def.name.starts_with('界'))
-            .map(|def| def.name.as_str())
-            .collect();
-        assert!(!expected.is_empty());
-        assert_eq!(custom.commands, expected);
+        let expected = rows.iter().map(|row| row.name.as_str());
+        assert!(!rows.is_empty() && expected.clone().all(|name| name.len() == 32));
+        assert!(custom.commands.iter().copied().eq(expected));
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub fn plan_discovery(defs: &[CommandDefinition], reserved: usize) -> Result<Vec
         blocks.extend(notes.iter().copied().map(Block::Description));
     }
     blocks.push(Block::Description(catalog.closing_note));
-    plan(&blocks, reserved)
+    plan(&blocks, reserved, 0)
 }
 
 fn command_fields(names: &[&str]) -> Vec<String> {
@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn maximum_publication_reconstructs_every_group_and_note() {
-        let defs = maximum_publication();
+        let (defs, _) = maximum_publication();
         assert_eq!(defs.len(), GUILD_COMMAND_LIMIT);
         let catalog = help_catalog(&defs);
         let pages = plan_discovery(&defs, 150).expect("bounded discovery");

@@ -206,7 +206,7 @@ fn runtime(pool: &PgPool, mock: &MockRest, vars: &HashMap<String, String>) -> On
 
 fn component(values: &[&str]) -> OnboardingJob {
     let interaction: Interaction = serde_json::from_value(json!({
-        "application_id":"111", "authorizing_integration_owners":{"0":"22"},
+        "application_id":"111", "attachment_size_limit":10485760, "authorizing_integration_owners":{"0":"22"},
         "id":"333", "token":"mock-callback", "type":3,"version":1,"guild_id":"22",
         "member":{"user":{"id":"44","username":"member","discriminator":"0"},"roles":[],"deaf":false,"mute":false,"flags":0},
         "data":{"custom_id":GAME_SELECT_ID,"component_type":3,"values":values}

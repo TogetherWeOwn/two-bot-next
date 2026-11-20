@@ -203,24 +203,27 @@ for reviewers and the Release Manager. The single `ci-ok` aggregate in
 (including the runbook command-drift test).
 
 The final-stage reviewer squash-merges the pinned settled head before final
-approval; the author merges only without a review stage. Every `main` merge,
-including docs-only, needs the Release Manager's exact-head authorization because
-it can reach production through the promotion path. For web/bot, staging
-qualification is the automatic **post-merge, pre-production exact-main
-staging/e2e/soak gate**, enforced by the promotion guard. Staging accepts only
-main-ancestor SHAs; unmerged-head staging and artifact-equality proofs are not
-substitute merge prerequisites. Runtime-input pushes to `main` start automatic
-qualification; docs-only merges do not trigger `deploy-staging`. Promoting an
-otherwise unqualified exact main SHA (including a docs-only squash SHA) requires
-authorized staging dispatch/qualification first; follow the existing
-[dispatch/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
+approval; the author merges only without a review stage. Verified non-deploying
+bot merges need no standing Release Manager confirmation. When a merge would
+deploy production or deployment cannot be ruled out, require exact-head Release
+Manager approval on the source card. Production release acceptance is bound to
+the full release SHA, which dispatch must pin. For web/bot, staging
+qualification is the **post-merge, pre-production exact-main staging/e2e/soak
+gate**, enforced by the promotion guard. Staging accepts only main-ancestor
+SHAs; unmerged-head staging and artifact-equality proofs are not substitute
+merge prerequisites. A merge is not evidence of staging deployment or
+qualification. Consult `deploy-staging.yml` at the relevant ref for its triggers
+and verify completed qualifying evidence for the intended exact `main` SHA.
+If evidence is absent, keep promotion held and follow the separately authorized
+[qualification/recovery procedure](docs/staging-rollout-gate.md#full-window-workflow-and-recovery-semantics)
 without bypassing holds. See
 [Production merge evidence](CONTRIBUTING.md#production-merge-evidence) for the
-superseding contract. Exact-PR-head Actions/Devin, specialist/native review,
-existing production holds, migration/no-migration and rollback evidence, fresh
-per-PR exact-head Release Manager acceptance and release-log recording remain
-required. Neither this policy nor CI evidence claims a staging pass or hold lift,
-or replaces post-merge qualification and exact-SHA artifact/promotion evidence. See
+full contract. Exact-head Actions and Devin Review, Security before QA where
+required, other applicable review, existing holds, migration and rollback
+evidence, and release-log recording remain required. Production schema/data
+operations and rollback need separate authorization. Neither this policy nor CI
+evidence claims a staging pass or hold lift, or replaces post-merge
+qualification and exact-SHA artifact/promotion evidence. See
 [Contributing](CONTRIBUTING.md#verification-on-github-actions) and
 [AGENTS.md](AGENTS.md). The toolchain stays pinned in `rust-toolchain.toml`.
 

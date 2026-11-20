@@ -101,6 +101,8 @@ SHA = re.compile(r"[0-9a-f]{40}")
 # >=3 min stability the release gate demands after takeover.
 STABLE_PASSES = 18
 POLL_SECONDS = 10
+WORKER_RESTORE_READS = 7
+WORKER_RESTORE_POLL_SECONDS = 10
 ROLLOUT_TIMEOUT_SECONDS = 600
 GATE_TIMEOUT_SECONDS = 900
 CONTROL_TIMEOUT_SECONDS = 420
@@ -536,17 +538,61 @@ class Rollback:
         self.log(f"{name} {moment:.1f}")
         return moment
 
-    def restore_worker(self, version):
-        """Move 100% of traffic to `version` without `force`; read it back."""
+    def post_worker_restore(self, version):
+        """Submit one request to move 100% of traffic without `force`."""
         self.client.post(f"/workers/scripts/{base.identifier(self.worker)}/deployments", {
             "strategy": "percentage", "versions": [{"version_id": version, "percentage": 100}],
             "annotations": {"workers/message": f"rollback to {version} run {self.run_id}"[:120]},
             "code_update_strategy": {"mode": "immediate"}})
-        self.stamp("worker restored")
-        require(serving_version(self.client, self.worker) == version, "rollback_not_active")
+
+    def wait_worker_restore(self, version):
+        # Cloudflare can still list the previous deployment after the POST.
+        # Retry only a valid mismatch; serving_version's refusals still stop the run.
+        for attempt in range(WORKER_RESTORE_READS):
+            if attempt:
+                self.sleep(WORKER_RESTORE_POLL_SECONDS)
+            if serving_version(self.client, self.worker) == version:
+                self.stamp("worker restored")
+                return
+        raise GateError("rollback_not_active")
+
+    def read_image_rollout(self, rollout_id, image):
+        row = base.mapping(self.client.api(
+            f"/containers/applications/{base.identifier(self.app_id)}/rollouts/{rollout_id}"))
+        require(row.get("id") == rollout_id, "rollout_identity_drift")
+        status = row.get("status")
+        require(status not in ("replaced", "reverted"), "rollout_replaced_or_reverted")
+        require(status in ("pending", "progressing", "completed"), "unknown_rollout_status")
+        require(base.mapping(row.get("target_configuration")).get("image") == image,
+                "rollout_identity_drift")
+        return row
+
+    @staticmethod
+    def image_rollout_ready(row, image, target_version):
+        return (base.converged(row, image, target_version)
+                or base.active_lag(row, image, target_version))
+
+    def verify_staging_image(self, rollout_id, image, target_version, *, listing_seen_target=False):
+        row = self.read_image_rollout(rollout_id, image)
+        require(self.image_rollout_ready(row, image, target_version), "image_rollout_not_converged")
+        app = application_by_name(self.client, self.application)
+        require(app["id"] == self.app_id, "application_identity_drift")
+        listed = base.mapping(app.get("configuration")).get("image")
+        if listed != image:
+            previous = base.mapping(row.get("current_configuration")).get("image")
+            require(not listing_seen_target and listed == previous and isinstance(listed, str)
+                    and re.fullmatch(image_pattern(self.application), listed), "application_image_drift")
+        # A completed detail and matching listing can both lag a superseding rollout.
+        created = base.timestamp(row.get("created_at"))
+        for item in app_rollouts(self.client, self.app_id):
+            if item["id"] == rollout_id:
+                require(item.get("status") not in ("replaced", "reverted"), "rollout_replaced_or_reverted")
+            else:
+                require(base.timestamp(item.get("created_at")) < created, "application_image_drift")
+        return listed == image
 
     def restore_image(self, image):
-        """Roll the container image back with a single 100% rolling step."""
+        """Roll the image back with a single 100% step and return the rollout pin."""
         started = self.now()
         before = {base.identifier(base.mapping(row).get("id")) for row in
                   app_rollouts(self.client, self.app_id)}
@@ -560,27 +606,15 @@ class Rollback:
         deadline = started + ROLLOUT_TIMEOUT_SECONDS
         target_version = base.number(base.mapping(result).get("target_version", 0)) or None
         while True:
-            row = base.mapping(self.client.api(
-                f"/containers/applications/{base.identifier(self.app_id)}/rollouts/{rollout_id}"))
-            require(row.get("id") == rollout_id, "rollout_identity_drift")
+            row = self.read_image_rollout(rollout_id, image)
             status = row.get("status")
-            require(status not in ("replaced", "reverted"), "rollout_replaced_or_reverted")
-            require(status in ("pending", "progressing", "completed"), "unknown_rollout_status")
-            require(base.mapping(row.get("target_configuration")).get("image") == image,
-                    "rollout_identity_drift")
             if target_version is None:
                 try:
                     target_version = base.number(row.get("target_version"))
                 except GateError:
                     target_version = None
-            # The pinned rollout proves the image leg, including the same
-            # completed counter-lag shapes accepted by staging verify. Staging's
-            # application listing can lag that record indefinitely; takeover
-            # and the unchanged stable runtime gate still have to pass next.
-            # Production retains its separate application-listing requirement.
             ready = (target_version is not None
-                     and (base.converged(row, image, target_version)
-                          or base.active_lag(row, image, target_version)))
+                     and self.image_rollout_ready(row, image, target_version))
             if target_version is None:
                 waiting_for = "target_version"
             elif status != "completed":
@@ -594,9 +628,8 @@ class Rollback:
             if ready:
                 self.log(f"image rollout {status}")
                 self.evidence.pop("image_restore_wait", None)
-                self.evidence["restored_rollout_id"] = rollout_id
                 self.stamp("image restored")
-                return
+                return rollout_id, target_version
             self.evidence["image_restore_wait"] = waiting_for
             self.log(f"image rollout {status} waiting_for={waiting_for}")
             require(self.now() < deadline, "image_rollout_timeout",
@@ -661,8 +694,7 @@ class Rollback:
             streak = streak + 1 if passed else 0
             self.log(f"gate poll {polls}: {observation} streak={streak}/{STABLE_PASSES}")
             if streak >= STABLE_PASSES:
-                self.stamp("gate stable")
-                self.evidence.update({"stable_polls": polls, "gate": "stable-200-gateway-ready"})
+                self.evidence["stable_polls"] = polls
                 return
             require(self.now() < deadline, "gate_timeout", f"polls={polls} last={observation}")
             self.sleep(POLL_SECONDS)
@@ -673,20 +705,39 @@ class Rollback:
             require(callable(self.staging_use), "staging_restore_window_missing")
             self.staging_use("restore-check")
             self.evidence["staging_use"] = "retained-window-checked"
-        started = self.stamp("rollback start")
+        self.stamp("rollback start")
         current = serving_version(self.client, self.worker)
-        if current != restore_version:
+        # A previous attempt can have restored the Worker but left the wrong
+        # image. Fence staging before changing the image in that case too.
+        if self.variant == "staging" or current != restore_version:
             self.take_over_fence_first()
-            self.restore_worker(restore_version)
+        if current != restore_version:
+            self.post_worker_restore(restore_version)
+            if self.variant == "staging":
+                # An old but valid readback is not a failed POST. Keep the
+                # singleton fenced and submit the image leg without waiting.
+                require(serving_version(self.client, self.worker) in (current, restore_version),
+                        "rollback_not_active")
+            else:
+                self.wait_worker_restore(restore_version)
         else:
             self.log("worker already serves the restore version; image leg only")
-        self.restore_image(restore_image)
+        rollout_id, target_version = self.restore_image(restore_image)
+        if self.variant == "staging":
+            self.wait_worker_restore(restore_version)
+            listing_seen_target = self.verify_staging_image(rollout_id, restore_image, target_version)
+        self.evidence["restored_rollout_id"] = rollout_id
         self.take_over(restore_version)
         if self.variant == "staging":
             self.staging_use("rebind")
             self.evidence["staging_use"] = "retained-window-rebound-ready"
         self.wait_stable(restore_version, self.now())
+        if self.variant == "staging":
+            self.verify_staging_image(rollout_id, restore_image, target_version,
+                                      listing_seen_target=listing_seen_target)
+        self.stamp("gate stable")
         self.evidence.update({
+            "gate": "stable-200-gateway-ready",
             "restored_version": restore_version,
             "restored_image_digest": restore_image.rsplit("@", 1)[-1],
             "from_version": current,
@@ -715,24 +766,18 @@ def check_url(variant, url):
     return url
 
 
-def print_dry_run_plan(*, client, worker, restore_version, restore_image,
-                     receipt_sha, log=print):
-    """Print the ordered restore plan; reads only, never a POST or mutation.
-
-    The five lines name the fence, worker, image, takeover and gate steps,
-    carrying the validated receipt members (version UUID, image digest URL,
-    SHA). Only allowlisted IDs reach the log. The fence line mirrors the live
-    path: a pre-restore fence when the worker leg runs, otherwise deferred to
-    takeover, since the live path only fences inside takeover after the image
-    rollout when the worker already serves the restore version.
-    """
+def print_dry_run_plan(*, client, worker, variant, restore_version, restore_image,
+                       receipt_sha, log=print):
+    """Print the ordered restore plan; reads only, never a POST or mutation."""
     current = serving_version(client, worker)
-    if current != restore_version:
+    if variant == "staging" or current != restore_version:
         log(f"dry-run plan: fence the singleton before restoring version {restore_version}")
-        log(f"dry-run plan: worker POST deployments restoring version {restore_version}")
     else:
         log("dry-run plan: fence deferred to takeover; no pre-restore fence "
             "(worker leg skipped)")
+    if current != restore_version:
+        log(f"dry-run plan: worker POST deployments restoring version {restore_version}")
+    else:
         log(f"dry-run plan: worker already serves {restore_version}; image leg only")
     log(f"dry-run plan: image POST container rollout restoring image {restore_image}")
     log(f"dry-run plan: takeover ownership to version {restore_version}")
@@ -771,6 +816,8 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
     try:
         worker = args.worker or WORKERS[args.variant]
         application = args.application or APPLICATIONS[args.variant]
+        if args.command == "rollback" and args.variant == "staging":
+            require(application == APPLICATIONS["staging"], "staging_application_invalid")
         client = client_factory(env.get("CLOUDFLARE_ACCOUNT_ID"), env.get("CLOUDFLARE_API_TOKEN"))
         if args.command == "snapshot":
             state = build_snapshot(client, worker, application)
@@ -849,7 +896,7 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
             # The receipt is validated identically to the live path above; the
             # plan below reads the serving version only and never POSTs, never
             # touches ownership control, and writes no evidence file.
-            print_dry_run_plan(client=client, worker=worker,
+            print_dry_run_plan(client=client, worker=worker, variant=args.variant,
                                restore_version=restore_version,
                                restore_image=restore_image,
                                receipt_sha=receipt.sha if receipt is not None else expected_sha)
