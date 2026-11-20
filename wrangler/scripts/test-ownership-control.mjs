@@ -42,6 +42,18 @@ async function failure(promise) {
 const ok = (epoch) => ({ status: 200, body: { deploymentId: 'new-deployment', owner: owner(epoch), running: false } });
 const http = (status, reason = 'deployment_mismatch') => ({ status, body: { error: 'ownership_fenced', reason } });
 
+test('deployment-preflight reads once and refuses fenced or uninitialized staging', async () => {
+  const active = fixture([ok(80)]);
+  assert.deepEqual(await active.invoke({ action: 'deployment-preflight' }), { active: true });
+  assert.deepEqual(active.calls, ['GET']);
+  for (const owner of [null, { phase: 'fenced', deploymentId: null, epoch: 81 }]) {
+    const f = fixture([{ status: 200, body: { deploymentId: 'new-deployment', owner, running: false } }]);
+    await assert.rejects(f.invoke({ action: 'deployment-preflight' }), /explicit staging release required/);
+    assert.deepEqual(f.calls, ['GET']);
+    assert.deepEqual(f.waits, []);
+  }
+});
+
 test('deployment-takeover succeeds first try without waiting', async () => {
   const f = fixture([ok(80), ok(81)]);
   const result = await f.invoke({ action: 'deployment-takeover' });

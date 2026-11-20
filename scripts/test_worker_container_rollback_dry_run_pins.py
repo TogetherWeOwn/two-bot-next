@@ -6,10 +6,9 @@ The protected acceptance suite
 the Builder, so the review-requested pins live here instead, reusing its
 offline fixtures by import (read-only; the protected file is unchanged):
 
-1. Already-serving fence wording: the first plan line must say fencing is
-   deferred to takeover (the live path only fences inside takeover after the
-   image rollout in that case), while the worker-leg case keeps the
-   pre-restore fence line.
+1. Staging fence wording: the first plan line must fence before restoring,
+   whether both legs run or only the image changes. The plan skips the
+   Worker POST when the restore version is already serving.
 2. Pre-stamp staging snapshot dry-run: a snapshot with no recorded SHA
    refuses before planning or mutation. It never prints a no-sha gate line.
 3. No evidence write: a dry-run leaves the `--evidence` path absent, and a
@@ -35,7 +34,7 @@ import worker_container_rollback as rollback
 
 
 class DryRunPinTests(acc.DryRunCase):
-    def test_fence_line_defers_to_takeover_when_already_serving(self):
+    def test_fence_line_is_pre_restore_when_only_image_leg_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
             evidence = Path(tmp) / "evidence.json"
             client = acc.FakeClient(acc.live_routes(history=(acc.GOOD_VERSION,
@@ -46,11 +45,10 @@ class DryRunPinTests(acc.DryRunCase):
                 code, out = self.run_dry(acc.manual_argv(evidence), client)
         self.assertEqual(code, 0, out)
         plan = self.plan_lines(out)
-        self.assertIn("fence deferred to takeover", plan[0],
-                      f"already-serving fence line must defer: {plan}")
-        self.assertNotIn("before restoring", plan[0],
-                         f"already-serving fence line must not promise a pre-restore fence: {plan}")
-        self.assertIn(acc.GOOD_VERSION, plan[1])
+        self.assertEqual(plan[:2], [
+            f"dry-run plan: fence the singleton before restoring version {acc.GOOD_VERSION}",
+            f"dry-run plan: worker already serves {acc.GOOD_VERSION}; image leg only"])
+        self.assertIn("image POST container rollout", plan[2])
         self.assert_no_posts(client, out)
         self.assert_no_mutations(calls, out)
 

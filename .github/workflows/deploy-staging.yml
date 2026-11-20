@@ -425,6 +425,14 @@ jobs:
             --variant staging \
             --out "$ROLLOUT_DIR/staging-rollback-snapshot.json"
           python3 -c 'import json, os; print(json.dumps(json.load(open(os.environ["ROLLOUT_DIR"] + "/staging-rollback-snapshot.json")), sort_keys=True))'
+      # A known fence would stop takeover before this run can own a recovery
+      # window. Leave both components alone unless the dispatch authorizes release.
+      - name: Check staging ownership before changing the deployment
+        if: ${{ !inputs.release_fence }}
+        env:
+          STAGING_WORKER_URL: ${{ vars.STAGING_WORKER_URL }}
+          OWNERSHIP_CONTROL_TOKEN: ${{ secrets.STAGING_OWNERSHIP_CONTROL_TOKEN }}
+        run: node ../tooling/wrangler/scripts/ownership-control.mjs deployment-preflight
       - name: Deploy to staging
         id: deploy
         uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3

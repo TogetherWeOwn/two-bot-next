@@ -16,10 +16,11 @@ and `snapshot` steps succeeded and a later step fails (receipt validation,
 ownership takeover, `verify`, or the error-rate gate);
 `scripts/staging_rollout.py` itself performs
 no rollback. On success the pre-deploy Worker version **and** container image
-are restored (with takeover, which releases an intentional fence onto the
-restored version after a fenced takeover refusal), and the run still stays red — the restore
+are restored before takeover and the run stays red — the restore
 recovers service, it never certifies the failed build. Without a successful
 deploy and snapshot there is nothing to restore, so no rollback is attempted.
+Routine deploys refuse a fenced or uninitialized owner before replacing either
+component. Use the authorized `release_fence` path to restore a staging baseline.
 The helper additionally requires a proven finite-policy target and the original
 run's grant. Receipt/takeover failures precede grant acquisition, so their
 conditional rollback invocation refuses before mutation with
@@ -320,13 +321,17 @@ check above before dispatch; stop if the intended merged SHA no longer matches
   was red, since the policy bindings are what matter. The unchanged 18-pass stable
   restore gate still applies to it.
 
-Every gate in this document stays in force: exact-head Actions, Security then QA,
-separate per-PR exact-head Release Manager acceptance before merge, fresh inventory
-of the actual database, shared policy and applied migration ledger, exact-head
-qualification, and the `t0`, pre-7-day and post-7-day evidence below. The bootstrap
-sequence is a technical recovery decision, not approval to merge, deploy production
-or waive missing qualification. Exact-SHA staging qualification and the rollback
-drill remain required live activation evidence; a merge does not start them.
+Keep exact-head Actions, Security then QA, fresh inventory of the actual
+database, shared policy and applied migration ledger, exact-head qualification,
+and the `t0`, pre-7-day and post-7-day evidence below. Verified non-deploying
+bot merges need no standing Release Manager confirmation. A merge that would
+deploy production or whose deployment cannot be ruled out needs exact-head
+Release Manager approval on the source card; see
+[production merge evidence](../CONTRIBUTING.md#production-merge-evidence).
+The bootstrap sequence is a technical recovery decision, not approval to merge,
+deploy production or waive missing qualification. Exact-SHA staging qualification
+and the rollback drill remain required live activation evidence; a merge does not
+start them.
 
 At verified activation record UTC `t0`, actual resource/version/SHA identities,
 finite expiry, exact-head startup/qualification evidence, stop/idle convergence
@@ -499,10 +504,20 @@ listing still shows the previous image. Replaced/reverted rollouts and identity
 or image drift still fail closed. Production retains its application-listing
 check.
 
+A valid stale Worker readback does not block the image POST while fenced; split
+traffic, unrelated versions and read errors do. Neither POST is retried. After
+image convergence, the target Worker must serve 100% within seven reads, ten
+seconds apart.
+
 Image completion is not rollback success: ownership takeover and the existing
 18 consecutive passing `/health` and `/readyz` polls still follow. Those polls
 require the restored Worker version, expected build revision (subject to the
 existing pre-stamp exception), and `gateway=ready`; any miss resets the streak.
+Before takeover and after the probes, verify the pinned rollout, application and
+history. Accept only the previous digest as listing lag, and only if the listing
+has never shown the restore digest and no newer rollout exists. Early drift keeps
+staging fenced; late drift prevents a success receipt. The drill requires a restore
+rollout ID distinct from both the snapshot and forward rollout IDs.
 
 If the image leg times out, the log and failure evidence name the unmet condition
 as `waiting_for=target_version|rollout_completion|counters_or_progress|application_image`.
