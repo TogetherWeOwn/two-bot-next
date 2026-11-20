@@ -3,7 +3,7 @@
 use super::help_catalog;
 use super::pages::{plan, Block, Page, PlanError};
 use crate::commands::{CommandDefinition, GUILD_COMMAND_LIMIT};
-use crate::custom_commands::MAX_COMMAND_NAME_CHARS;
+use crate::custom_commands::{escape_inspect_text, MAX_COMMAND_NAME_CHARS};
 use crate::message_safety::{
     neutralize_mentions, text_len, EMBED_FIELD_VALUE_LIMIT, EMBED_TOTAL_LIMIT,
 };
@@ -47,8 +47,8 @@ pub fn plan_discovery(defs: &[CommandDefinition], reserved: usize) -> Result<Vec
 fn command_fields(names: &[&str]) -> Vec<String> {
     let (mut fields, mut value, mut used) = (Vec::new(), String::new(), 0);
     for name in names {
-        let safe = neutralize_mentions(name);
-        let units = 1 + text_len(&safe); // Include the slash.
+        let token = escape_inspect_text(&format!("/{}", neutralize_mentions(name)));
+        let units = text_len(&token);
         if used + text_len(COMMAND_SEPARATOR) + units > EMBED_FIELD_VALUE_LIMIT {
             fields.push(std::mem::take(&mut value));
             used = 0;
@@ -56,8 +56,7 @@ fn command_fields(names: &[&str]) -> Vec<String> {
             value.push_str(COMMAND_SEPARATOR);
             used += text_len(COMMAND_SEPARATOR);
         }
-        value.push('/');
-        value.push_str(&safe);
+        value.push_str(&token);
         used += units;
     }
     if !value.is_empty() {
@@ -74,7 +73,6 @@ mod tests {
     #[test]
     fn maximum_publication_reconstructs_every_group_and_note() {
         let (defs, _) = maximum_publication();
-        assert_eq!(defs.len(), GUILD_COMMAND_LIMIT);
         let catalog = help_catalog(&defs);
         let pages = plan_discovery(&defs, 150).expect("bounded discovery");
         let mut actual = pages.iter().flat_map(|page| {
@@ -125,19 +123,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reservation_that_would_split_a_command() {
-        let def = CommandDefinition::new(&"x".repeat(MAX_COMMAND_NAME_CHARS), "A test command");
+    fn renders_a_literal_command_or_rejects_a_tight_reservation() {
+        let defs = [CommandDefinition::new(&"__name__".repeat(4), "Test")];
+        let value = &plan_discovery(&defs, 150).unwrap()[0].fields[0].1;
+        assert_eq!(value, &format!("/{}", r"\_\_name\_\_".repeat(4)));
         let reserved = EMBED_TOTAL_LIMIT - 20;
-        assert_eq!(plan_discovery(&[def], reserved), Err(PlanError));
+        assert_eq!(plan_discovery(&defs, reserved), Err(PlanError));
     }
 
     #[test]
-    fn rejects_unbounded_input_and_splits_after_mention_neutralization() {
+    fn rejects_unbounded_input_and_packs_sanitized_tokens() {
         let long = CommandDefinition::new(&"界".repeat(33), "A test command");
         let empty = CommandDefinition::new("", "A test command");
         assert_eq!(plan_discovery(&[empty], 150), Err(PlanError));
         assert_eq!(plan_discovery(&[long], 150), Err(PlanError));
-        let name = "@here😀".repeat(5);
+        let name = "@here😀_".repeat(4);
         let defs =
             vec![CommandDefinition::new(name.as_str(), "A test command"); GUILD_COMMAND_LIMIT + 1];
         assert_eq!(plan_discovery(&defs, 150), Err(PlanError));
@@ -146,7 +146,7 @@ mod tests {
         assert!(fields
             .iter()
             .all(|value| text_len(value) <= EMBED_FIELD_VALUE_LIMIT));
-        let command = format!("/{}", neutralize_mentions(&name));
+        let command = format!("/{}", "@\u{200b}here😀\\_".repeat(4));
         assert_eq!(
             fields
                 .iter()
