@@ -95,13 +95,18 @@ pub fn plan(blocks: &[Block<'_>], reserved: usize) -> Result<Vec<Page>, PlanErro
                 room -= ch.len_utf16();
                 end += ch.len_utf8();
             }
-            // Carry the last visible scalar with a trailing whitespace-only suffix if both pages fit.
-            if end < rest.len() && rest[end..].trim().is_empty() {
-                end = rest[..end]
+            let (prefix, next) = rest.split_at(end);
+            let visible = next.trim_start();
+            let next_is_visible = visible.chars().next().is_some_and(|ch| {
+                text_len(&next[..next.len() - visible.len()]) + ch.len_utf16() <= desc_limit
+            });
+            // Carry a visible scalar into a blank next page. A trailing suffix must all fit.
+            if !next.is_empty() && !next_is_visible {
+                end = prefix
                     .rfind(|ch: char| !ch.is_whitespace())
                     .filter(|&last| {
-                        text_len(&rest[last..]) <= desc_limit
-                            && (!rest[..last].trim().is_empty()
+                        (!visible.is_empty() || text_len(&rest[last..]) <= desc_limit)
+                            && (!prefix[..last].trim().is_empty()
                                 || !page.description.trim().is_empty())
                     })
                     .unwrap_or(end);
@@ -164,12 +169,8 @@ mod tests {
         let pages = plan(&fields, 80).unwrap();
         assert!(pages.len() > 5);
         assert_eq!(pages[0].fields.len(), 5); // Six would exceed the shared budget.
-        let actual: Vec<_> = pages
-            .iter()
-            .flat_map(|p| &p.fields)
-            .map(|(_, v)| v)
-            .collect();
-        assert_eq!(actual, values.iter().collect::<Vec<_>>());
+        let actual = pages.iter().flat_map(|p| &p.fields).map(|(_, v)| v);
+        assert!(actual.eq(&values));
         assert_eq!(plan(&[Field("Group", "/a"); 7], 0).unwrap().len(), 2);
     }
 
@@ -181,25 +182,26 @@ mod tests {
         assert!(pages
             .iter()
             .all(|p| p.fields.is_empty() && text_len(&p.description) <= 4016));
-        assert_eq!(
-            pages.into_iter().map(|p| p.description).collect::<String>(),
-            format!("Group\n{}", neutralize_mentions(&value))
-        );
+        let joined: String = pages.into_iter().map(|p| p.description).collect();
+        assert_eq!(joined, format!("Group\n{}", neutralize_mentions(&value)));
     }
 
     #[test]
-    fn keeps_trailing_whitespace_with_visible_text() {
-        for input in [
-            format!("{}\n", "a".repeat(4016)),
-            format!("{}🔥 \n", "a".repeat(4013)),
+    fn keeps_whitespace_with_visible_text() {
+        let full = "a".repeat(4016);
+        for (input, lengths) in [
+            (format!("{full}\n"), [4015, 2].as_slice()),
+            (format!("{}🔥 \n", "a".repeat(4013)), &[4013, 4]),
+            (format!("{full}{}b ", " ".repeat(4016)), &[4015, 4016, 3]),
+            (format!("{full}{}🔥", " ".repeat(4015)), &[4015, 4016, 2]),
+            (format!("{full}{}🔥", " ".repeat(4014)), &[4016, 4016]),
         ] {
             let pages = plan(&[Description(&input)], 80).unwrap();
-            assert_eq!(pages.len(), 2);
-            assert!(pages.iter().all(|p| text_len(&p.description) <= 4016));
-            assert_eq!(
-                pages.into_iter().map(|p| p.description).collect::<String>(),
-                input
-            );
+            let actual: Vec<_> = pages.iter().map(|p| text_len(&p.description)).collect();
+            assert_eq!(actual.as_slice(), lengths);
+            assert!(pages.iter().all(|p| !p.description.trim().is_empty()));
+            let joined: String = pages.into_iter().map(|p| p.description).collect();
+            assert_eq!(joined, input);
         }
     }
 
