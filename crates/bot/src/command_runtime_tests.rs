@@ -1703,9 +1703,10 @@ mod preview_callback_acceptance {
         automod_runtime::STAGING_GUILD_ID,
         send_admission::{
             AdmissionError, AdmissionFuture, AdmissionPermit, PgSendAdmission, SendAdmission,
-            TokenKey,
+            SendCompletion, SendCooldown, TokenKey,
         },
     };
+    use two_bot_cutover::settings::SettingsStore;
     use two_bot_discord::executor::RECEIPT_ADMISSION_BUDGET_MS;
 
     const SAMPLE: &str = "syntheticpreviewcanary";
@@ -1716,6 +1717,28 @@ mod preview_callback_acceptance {
         pool: PgPool,
         saw_commit: std::sync::atomic::AtomicBool,
         blocked: tokio::sync::Notify,
+        settlement: Arc<SettlementGate>,
+    }
+
+    #[derive(Debug, Default)]
+    struct SettlementGate {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    struct HeldCompletion(AdmissionPermit, Arc<SettlementGate>);
+
+    impl SendCompletion for HeldCompletion {
+        fn complete(
+            self: Box<Self>,
+            cooldown: Option<SendCooldown>,
+        ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+            Box::pin(async move {
+                self.1.started.notify_one();
+                self.1.release.notified().await;
+                self.0.complete(cooldown).await
+            })
+        }
     }
 
     impl SendAdmission for ObservedAdmission {
@@ -1736,7 +1759,9 @@ mod preview_callback_acceptance {
                     Err(AdmissionError::Blocked) => self.blocked.notify_one(),
                     Err(_) => {}
                 }
-                result
+                result.map(|permit| {
+                    AdmissionPermit::new(Box::new(HeldCompletion(permit, self.settlement.clone())))
+                })
             })
         }
     }
@@ -1767,6 +1792,7 @@ mod preview_callback_acceptance {
             pool: pool.clone(),
             saw_commit: std::sync::atomic::AtomicBool::new(false),
             blocked: tokio::sync::Notify::new(),
+            settlement: Arc::default(),
         });
         let executor =
             ActionExecutor::with_admission(token.to_owned(), Some(origin), admission.clone())
@@ -1778,7 +1804,7 @@ mod preview_callback_acceptance {
                     "TWO_OWEN_USER_ID".to_owned(),
                     "123456789012345678".to_owned(),
                 ),
-                ("TWO_AUTOMOD_BAD_WORDS".to_owned(), SAMPLE.to_owned()),
+                ("TWO_AUTOMOD_BAD_WORDS".to_owned(), "bootword".to_owned()),
             ]
             .into(),
             guild,
@@ -1796,24 +1822,54 @@ mod preview_callback_acceptance {
             guild,
             true,
         );
-        runtime.set_automod(activation);
+        let boot = activation.preview(|engine| engine.effective_config());
+        assert_eq!(boot.policy.bad_words, vec!["bootword"]);
+        runtime.set_automod(activation.clone());
+        let store = SettingsStore::new(&pool);
+        store
+            .set(
+                &guild.to_string(),
+                "TWO_AUTOMOD_BAD_WORDS",
+                Some(serde_json::json!([SAMPLE])),
+                "test",
+            )
+            .await?;
+        let (mut writer, live) = two_bot_core::settings::live_channel();
+        assert!(writer.publish(&store.load_snapshot().await?).changed);
+        runtime.set_live_settings(live);
         let _guard = runtime.dispatch_guard();
-        let preview = |id| {
+        let preview = |id, sample: &str| {
             let mut request = slash(
                 "automod-preview",
                 Some(CHANNEL),
                 vec![option(
                     "text",
-                    CommandOptionValue::String(SAMPLE.to_owned()),
+                    CommandOptionValue::String(sample.to_owned()),
                 )],
             );
             set_guild(&mut request, Some(Id::new(guild)));
             request.authorizing_integration_owners.guild = Some(AnonymizableId::Id(Id::new(guild)));
             from_member(request, id, Permissions::MANAGE_GUILD)
         };
-        assert!(runtime.dispatch(&interaction_event(preview(801))));
-        wait_for(|| !mock.requests().is_empty(), "audited callback").await;
+        assert!(runtime.dispatch(&interaction_event(preview(801, SAMPLE))));
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            admission.settlement.started.notified(),
+        )
+        .await?;
         assert!(admission.saw_commit.load(Ordering::Relaxed));
+        assert_eq!(activation.preview(|engine| engine.effective_config()), boot);
+        assert!(matches!(
+            admission.inner.admit().await,
+            Err(AdmissionError::Blocked)
+        ));
+        // Discord already answered. Force the receipt deadline to pass while
+        // completion is held, then let the real durable release run.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS + 1)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::resume();
+        admission.settlement.release.notify_one();
         let row = load_preview_audit(&pool, "automod-preview:801")
             .await?
             .expect("committed before the callback");
@@ -1849,7 +1905,9 @@ mod preview_callback_acceptance {
         .await??;
         let mut audit = pool.begin().await?;
         lock_preview_attempt(&mut audit, "802").await?;
-        let second = preview(802);
+        // The explicit-receipt seam has no live override; use the boot word
+        // so this invocation still produces the original matched audit.
+        let second = preview(802, "bootword");
         let received_at = Instant::now() - Duration::from_millis(750);
         let deadline = received_at + Duration::from_millis(RECEIPT_ADMISSION_BUDGET_MS);
         let attempt = runtime.on_interaction_received_at(&second, received_at);
