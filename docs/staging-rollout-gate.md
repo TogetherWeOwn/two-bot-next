@@ -503,10 +503,15 @@ listing still shows the previous image. Replaced/reverted rollouts and identity
 or image drift still fail closed. Production retains its application-listing
 check.
 
-Image completion is not rollback success: ownership takeover and the existing
-18 consecutive passing `/health` and `/readyz` polls still follow. Those polls
-require the restored Worker version, expected build revision (subject to the
-existing pre-stamp exception), and `gateway=ready`; any miss resets the streak.
+After the single Worker restore POST, a read that still shows the previous
+version at 100% does not block the image POST while the singleton is fenced.
+Split traffic, an unrelated version, or a read error still stops the restore
+before the image POST. After the pinned image rollout completes, the helper
+requires the target Worker at 100% within seven reads, ten seconds apart. It
+never retries either POST. Only then can takeover and the existing 18 consecutive
+passing `/health` and `/readyz` polls proceed. Those polls require the restored
+Worker version, expected build revision (subject to the existing pre-stamp
+exception), and `gateway=ready`; any miss resets the streak.
 
 If the image leg times out, the log and failure evidence name the unmet condition
 as `waiting_for=target_version|rollout_completion|counters_or_progress|application_image`.

@@ -538,13 +538,15 @@ class Rollback:
         self.log(f"{name} {moment:.1f}")
         return moment
 
-    def restore_worker(self, version):
-        """Move 100% of traffic to `version` without `force`; read it back."""
+    def post_worker_restore(self, version):
+        """Submit one request to move 100% of traffic without `force`."""
         self.client.post(f"/workers/scripts/{base.identifier(self.worker)}/deployments", {
             "strategy": "percentage", "versions": [{"version_id": version, "percentage": 100}],
             "annotations": {"workers/message": f"rollback to {version} run {self.run_id}"[:120]},
             "code_update_strategy": {"mode": "immediate"}})
-        # Cloudflare can still list the previous deployment right after the POST.
+
+    def wait_worker_restore(self, version):
+        # Cloudflare can still list the previous deployment after the POST.
         # Retry only a valid mismatch; serving_version's refusals still stop the run.
         for attempt in range(WORKER_RESTORE_READS):
             if attempt:
@@ -689,15 +691,19 @@ class Rollback:
         if self.variant == "staging" or current != restore_version:
             self.take_over_fence_first()
         if current != restore_version:
-            self.restore_worker(restore_version)
+            self.post_worker_restore(restore_version)
+            if self.variant == "staging":
+                # An old but valid readback is not a failed POST. Keep the
+                # singleton fenced and submit the image leg without waiting.
+                require(serving_version(self.client, self.worker) in (current, restore_version),
+                        "rollback_not_active")
+            else:
+                self.wait_worker_restore(restore_version)
         else:
             self.log("worker already serves the restore version; image leg only")
         self.restore_image(restore_image)
         if self.variant == "staging":
-            # Image convergence can take minutes. Check that the Worker half
-            # of the pair still holds before releasing the rollback fence.
-            require(serving_version(self.client, self.worker) == restore_version,
-                    "rollback_not_active")
+            self.wait_worker_restore(restore_version)
         self.take_over(restore_version)
         if self.variant == "staging":
             self.staging_use("rebind")
@@ -732,24 +738,18 @@ def check_url(variant, url):
     return url
 
 
-def print_dry_run_plan(*, client, worker, restore_version, restore_image,
-                     receipt_sha, log=print):
-    """Print the ordered restore plan; reads only, never a POST or mutation.
-
-    The five lines name the fence, worker, image, takeover and gate steps,
-    carrying the validated receipt members (version UUID, image digest URL,
-    SHA). Only allowlisted IDs reach the log. The fence line mirrors the live
-    path: a pre-restore fence when the worker leg runs, otherwise deferred to
-    takeover, since the live path only fences inside takeover after the image
-    rollout when the worker already serves the restore version.
-    """
+def print_dry_run_plan(*, client, worker, variant, restore_version, restore_image,
+                       receipt_sha, log=print):
+    """Print the ordered restore plan; reads only, never a POST or mutation."""
     current = serving_version(client, worker)
-    if current != restore_version:
+    if variant == "staging" or current != restore_version:
         log(f"dry-run plan: fence the singleton before restoring version {restore_version}")
-        log(f"dry-run plan: worker POST deployments restoring version {restore_version}")
     else:
         log("dry-run plan: fence deferred to takeover; no pre-restore fence "
             "(worker leg skipped)")
+    if current != restore_version:
+        log(f"dry-run plan: worker POST deployments restoring version {restore_version}")
+    else:
         log(f"dry-run plan: worker already serves {restore_version}; image leg only")
     log(f"dry-run plan: image POST container rollout restoring image {restore_image}")
     log(f"dry-run plan: takeover ownership to version {restore_version}")
@@ -868,7 +868,7 @@ def main(argv=None, *, environ=None, client_factory=RollbackClient):
             # The receipt is validated identically to the live path above; the
             # plan below reads the serving version only and never POSTs, never
             # touches ownership control, and writes no evidence file.
-            print_dry_run_plan(client=client, worker=worker,
+            print_dry_run_plan(client=client, worker=worker, variant=args.variant,
                                restore_version=restore_version,
                                restore_image=restore_image,
                                receipt_sha=receipt.sha if receipt is not None else expected_sha)

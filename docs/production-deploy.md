@@ -664,8 +664,8 @@ policy pins this ordering, condition, local snapshot command and red outcome.
 Without a takeover or a successful deploy/snapshot the run fails for the
 operator; a failed restore is never a reason to wait for the next deployment.
 
-After the shared staging/production rollback script posts a Worker restore once,
-it checks the current deployment immediately. A valid but nonmatching serving
+In production, after the rollback script posts a Worker restore once, it
+checks the current deployment immediately. A valid but nonmatching serving
 version allows up to six more readbacks, ten seconds apart. The target must serve
 100% of traffic before the image restore proceeds. Exhaustion fails with
 `rollback_not_active`; a readback error or split traffic still stops the restore.
