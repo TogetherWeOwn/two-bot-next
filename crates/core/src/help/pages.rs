@@ -15,7 +15,9 @@ pub const MAX_HELP_PAGES: usize = 128;
 pub enum Block<'a> {
     /// Adjacent description blocks are separated by a newline.
     Description(&'a str),
-    /// An already-grouped fragment: heading (including hint), then value.
+    /// A complete description fragment. Its leading separator is page-local.
+    DescriptionFragment(&'a str),
+    /// An already-grouped fragment: heading, then value.
     Field(&'a str, &'a str),
 }
 
@@ -43,7 +45,7 @@ pub fn plan(blocks: &[Block<'_>], outside: usize, inside: usize) -> Result<Vec<P
         let parts = match block {
             Block::Field("", "") => return Err(PlanError),
             Block::Field(name, value) => [name, value],
-            Block::Description(text) => ["", text],
+            Block::Description(text) | Block::DescriptionFragment(text) => ["", text],
         };
         bytes = charge(bytes, parts[0].len() + parts[1].len())?;
         let [name, value] = parts.map(neutralize_mentions);
@@ -51,7 +53,11 @@ pub fn plan(blocks: &[Block<'_>], outside: usize, inside: usize) -> Result<Vec<P
         let cost = n + v;
         units = charge(units, cost)?;
         let fits = cost <= total && n <= EMBED_FIELD_NAME_LIMIT && v <= EMBED_FIELD_VALUE_LIMIT;
-        if fits && !name.trim().is_empty() && !value.trim().is_empty() {
+        if matches!(block, Block::DescriptionFragment(_)) {
+            let separator = join.replace('\n').is_some();
+            units = charge(units, usize::from(separator))?;
+            atoms.push(Atom::Fragment(value, v, separator));
+        } else if fits && !name.trim().is_empty() && !value.trim().is_empty() {
             atoms.push(Atom::Field(name, value, cost));
             join = None;
         } else {
@@ -69,6 +75,7 @@ pub fn plan(blocks: &[Block<'_>], outside: usize, inside: usize) -> Result<Vec<P
 
 enum Atom {
     Text(char),
+    Fragment(String, usize, bool),
     Field(String, String, usize),
 }
 
@@ -78,10 +85,14 @@ fn pack(atoms: Vec<Atom>, total: usize, desc_limit: usize) -> Result<Vec<Page>, 
     let (mut used, mut desc, mut fields, mut scanned, mut right_text) = (0, 0, 0, 0, false);
     let glyph = |ch: char| has_message_text(ch.encode_utf8(&mut [0; 4]));
     for atom in atoms.iter().rev() {
-        let (d, f, visible) = match atom {
-            Atom::Text(ch) => (ch.len_utf16(), 0, glyph(*ch)),
-            Atom::Field(n, v, width) => (0, *width, has_message_text(n) || has_message_text(v)),
+        let (d, f, visible, prefix) = match atom {
+            Atom::Text(ch) => (ch.len_utf16(), 0, glyph(*ch), 0),
+            Atom::Fragment(text, width, separator) => {
+                (*width, 0, has_message_text(text), usize::from(*separator))
+            }
+            Atom::Field(n, v, width) => (0, *width, has_message_text(n) || has_message_text(v), 0),
         };
+        let d = d + prefix;
         if f != 0 && right_text {
             // Discord renders descriptions first; the page must end before this run.
             ends.clear();
@@ -100,9 +111,12 @@ fn pack(atoms: Vec<Atom>, total: usize, desc_limit: usize) -> Result<Vec<Page>, 
             }
             scanned = suffix.len();
         }
+        // Extending left still only increases the cost: the previous leading separator now counts.
         while ends.front().is_some_and(|&end| {
             let (u, d, f, ..) = suffix[end];
-            used - u > total || desc - d > desc_limit || fields - f > FIELDS_PER_PAGE
+            used - u - prefix > total
+                || desc - d - prefix > desc_limit
+                || fields - f > FIELDS_PER_PAGE
         }) {
             ends.pop_front();
         }
@@ -117,9 +131,15 @@ fn pack(atoms: Vec<Atom>, total: usize, desc_limit: usize) -> Result<Vec<Page>, 
     }
     let pages = (0..count).map(|_| {
         let (end, mut page) = (suffix[start].4, Page::default());
-        for atom in atoms.by_ref().take(start - end) {
+        for (index, atom) in atoms.by_ref().take(start - end).enumerate() {
             match atom {
                 Atom::Text(ch) => page.description.push(ch),
+                Atom::Fragment(text, _, separator) => {
+                    if index != 0 && separator {
+                        page.description.push('\n');
+                    }
+                    page.description.push_str(&text);
+                }
                 Atom::Field(name, value, _) => page.fields.push((name, value)),
             }
         }
@@ -218,6 +238,22 @@ mod tests {
         assert!(parts.clone().map(text_len).eq(lengths.iter().copied()));
         assert!(pages.iter().all(|p| p.fields.is_empty()) && parts.clone().all(has_message_text));
         assert_eq!(parts.collect::<String>(), input);
+    }
+
+    #[test]
+    fn keeps_atomic_description_fragments_whole_at_the_page_boundary() {
+        use Block::DescriptionFragment;
+
+        let short = DescriptionFragment("abcd");
+        let exact = DescriptionFragment("🔥🔥");
+        let inside = EMBED_DESCRIPTION_LIMIT - 4;
+        let pages = plan(&[short, exact], 0, inside).expect("both fragments fit separately");
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].description, "abcd");
+        assert_eq!(pages[1].description, "🔥🔥");
+        let joined = plan(&[short, exact], 0, inside - 5).expect("both fit together");
+        assert_eq!(joined[0].description, "abcd\n🔥🔥");
+        assert_eq!(plan(&[exact], 0, inside + 1), Err(PlanError));
     }
 
     #[test]

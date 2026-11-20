@@ -248,7 +248,7 @@ pub struct HelpSection<'a> {
     pub title: &'static str,
     pub requires: Option<&'static str>,
     pub commands: Vec<&'a str>,
-    pub notes: &'static [&'static str],
+    pub notes: &'a [&'a str],
 }
 
 /// Ordered discovery content from one confirmed command publication.
