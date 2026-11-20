@@ -1527,6 +1527,151 @@ async fn refused_interaction_is_answered_ephemerally_via_executor() {
 }
 
 #[tokio::test]
+#[ignore = "requires disposable agent-testdb for the preview audit receipt"]
+async fn automod_preview_dispatch_uses_ingress_clocks_even_when_busy() {
+    use crate::command_runtime::{LANE_BUSY, LANE_INTERACTIONS};
+    use crate::gateway_commands::GatewayCommandConfig;
+    use crate::interaction_admission::PER_USER_IN_FLIGHT;
+    use two_bot_core::automod_preview_report::PREVIEW_UNAVAILABLE_REPLY;
+    use two_bot_core::automod_runtime::STAGING_GUILD_ID;
+
+    let guild = STAGING_GUILD_ID.parse::<u64>().expect("staging ID");
+    let db = member_refusal_database().await;
+    let (mock, origin) = MockRest::start(Vec::new()).await;
+    let executor = executor_at(origin);
+    let vars = [
+        ("TWO_AUTOMOD".into(), "1".into()),
+        ("TWO_OWEN_USER_ID".into(), "123456789012345678".into()),
+    ]
+    .into();
+    let resolved = crate::automod_gateway::resolve(&vars, guild)
+        .unwrap()
+        .unwrap();
+    let runtime = CommandRuntime::new(
+        db.pool().clone(),
+        executor.clone(),
+        router_with_commands(RouterGates {
+            moderation: true,
+            configured_guild: Some(guild),
+            ..gates(true, false)
+        }),
+        guild,
+        true,
+    );
+    runtime.set_automod(crate::automod_gateway::build(
+        resolved,
+        db.pool().clone(),
+        executor,
+    ));
+    runtime.initialize_custom_commands_for_test(
+        GatewayCommandConfig::from_map_for_activation(
+            guild,
+            &[("TWO_AUTOMATIONS".into(), "1".into())].into(),
+            true,
+        )
+        .unwrap(),
+    );
+    let _guard = runtime.dispatch_guard();
+    let event = |id, permissions, text: &str| {
+        let mut interaction = slash(
+            "automod-preview",
+            Some(CHANNEL),
+            vec![option("text", CommandOptionValue::String(text.into()))],
+        );
+        set_guild(&mut interaction, Some(Id::new(guild)));
+        interaction.authorizing_integration_owners.guild = Some(AnonymizableId::Id(Id::new(guild)));
+        interaction_event(from_member(interaction, id, permissions))
+    };
+    let observed = "2026-08-01T01:02:03.456Z";
+    let now = tokio::time::Instant::now;
+    let expired = now() - Duration::from_secs(3);
+    let manage = Permissions::MANAGE_GUILD;
+    for (ordered, id) in [(false, 42), (true, 43)] {
+        assert!(runtime.dispatch_received(
+            &event(id, manage, "synthetic"),
+            ordered,
+            expired,
+            observed
+        ));
+        wait_for(
+            || {
+                runtime.lane_in_flight(crate::command_runtime::LANE_PRIVILEGED) == 0
+                    && runtime.lane_in_flight(LANE_INTERACTIONS) == 0
+            },
+            "expired preview settled",
+        )
+        .await;
+        let slots: Vec<_> = (0..PER_USER_IN_FLIGHT)
+            .map(|_| runtime.acquire_user_slot_for_test(id).unwrap())
+            .collect();
+        assert!(!runtime.dispatch_received(
+            &event(id, manage, "synthetic"),
+            ordered,
+            expired,
+            observed
+        ));
+        wait_for(
+            || runtime.lane_in_flight(LANE_BUSY) == 0,
+            "expired busy callback settled",
+        )
+        .await;
+        assert!(mock.requests().is_empty());
+        drop(slots);
+    }
+    let deny = RouterRefusal::AutomodPreviewPermission.message();
+    let cases = [
+        (Permissions::MANAGE_MESSAGES, "", deny.as_str()),
+        (manage, "synthetic", "Invocation received at"),
+    ];
+    for (i, (permissions, text, expected)) in cases.into_iter().enumerate() {
+        assert!(runtime.dispatch_received(
+            &event(50 + i as u64, permissions, text),
+            i == 0,
+            now(),
+            observed
+        ));
+        wait_for(|| mock.requests().len() > i, "preview callback").await;
+        let reply = callback_json(&mock.requests()[i]);
+        assert_eq!(reply["type"], 4);
+        assert_eq!(reply["data"]["flags"], 64);
+        assert_eq!(
+            reply["data"]["allowed_mentions"]["parse"],
+            serde_json::json!([])
+        );
+        assert!(reply["data"]["content"]
+            .as_str()
+            .unwrap()
+            .contains(expected));
+        assert!(!reply["data"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic"));
+    }
+    let rows: Vec<bool> = sqlx::query_scalar("SELECT created_at = $1::text::timestamptz FROM automation_audit_log WHERE action = 'automod.preview'")
+        .bind(observed).fetch_all(db.pool()).await.unwrap();
+    assert_eq!(rows, [true]);
+    db.close().await.unwrap();
+    assert!(runtime.dispatch_received(&event(52, manage, "synthetic"), true, now(), observed));
+    wait_for(|| mock.requests().len() == 3, "audit-outage callback").await;
+    assert_eq!(
+        callback_json(&mock.requests()[2])["data"]["content"],
+        PREVIEW_UNAVAILABLE_REPLY
+    );
+    let _slots: Vec<_> = (0..PER_USER_IN_FLIGHT)
+        .map(|_| runtime.acquire_user_slot_for_test(53).unwrap())
+        .collect();
+    assert!(!runtime.dispatch_received(&event(53, manage, "synthetic"), false, now(), observed));
+    wait_for(|| mock.requests().len() == 4, "live busy callback").await;
+    let busy = callback_json(&mock.requests()[3]);
+    assert_eq!(busy["data"]["flags"], 64);
+    assert_eq!(
+        busy["data"]["content"],
+        crate::interaction_admission::BUSY_REPLY
+    );
+    mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn unconfirmed_help_does_not_invent_a_live_registry() {
     let (mock, origin) = MockRest::start(Vec::new()).await;
     let runtime = runtime_without_db(gates(true, true), true, origin);
