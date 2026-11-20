@@ -1,15 +1,18 @@
 //! Turn one confirmed discovery catalog into ordered help pages.
 
-use super::help_catalog;
 use super::pages::{plan, Block, Page, PlanError};
+use super::{help_catalog, HelpSection};
 use crate::commands::{CommandDefinition, GUILD_COMMAND_LIMIT};
 use crate::custom_commands::MAX_COMMAND_NAME_CHARS;
-use crate::message_safety::{neutralize_mentions, text_len, EMBED_FIELD_VALUE_LIMIT};
+use crate::message_safety::{
+    neutralize_mentions, text_len, EMBED_FIELD_NAME_LIMIT, EMBED_FIELD_VALUE_LIMIT,
+};
 
 const COMMAND_SEPARATOR: &str = " · ";
 
-/// Plan discovery without clipping. `reserved` covers the caller's embed
-/// chrome and navigation text. Pass definitions from one confirmed snapshot.
+/// Plan discovery without clipping. `reserved` covers the caller's title and
+/// longest footer. The repeated description is budgeted here. Pass definitions
+/// from one confirmed snapshot.
 pub fn plan_discovery(defs: &[CommandDefinition], reserved: usize) -> Result<Vec<Page>, PlanError> {
     // Bound formatting before allocating the catalog or joined commands.
     if defs.len() > GUILD_COMMAND_LIMIT
@@ -22,50 +25,83 @@ pub fn plan_discovery(defs: &[CommandDefinition], reserved: usize) -> Result<Vec
         return Err(PlanError);
     }
     let catalog = help_catalog(defs);
-    let groups: Vec<_> = catalog
-        .sections
-        .iter()
-        .map(|section| {
-            let title = match section.requires {
-                Some(perm) => format!("{} — needs {perm}", section.title),
-                None => section.title.to_owned(),
-            };
-            (title, command_fields(&section.commands), section.notes)
-        })
-        .collect();
-
-    let mut blocks = vec![Block::Description(&catalog.heading)];
-    for (title, fields, notes) in &groups {
-        blocks.extend(fields.iter().map(|value| Block::Field(title, value)));
-        blocks.extend(notes.iter().copied().map(Block::Description));
+    let description = format!("{}\n{}", catalog.heading, catalog.closing_note);
+    let groups: Vec<_> = catalog.sections.iter().flat_map(group_fragments).collect();
+    let blocks: Vec<_> = groups.iter().map(Fragment::block).collect();
+    let mut pages = plan(&blocks, reserved.saturating_add(text_len(&description) + 2))?;
+    for page in &mut pages {
+        page.description = if page.description.is_empty() {
+            description.clone()
+        } else {
+            format!("{description}\n\n{}", page.description)
+        };
     }
-    blocks.push(Block::Description(catalog.closing_note));
-    plan(&blocks, reserved)
+    Ok(pages)
 }
 
-fn command_fields(names: &[&str]) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut value = String::new();
+enum Fragment {
+    Field(String, String),
+    Description(String),
+}
+
+impl Fragment {
+    fn block(&self) -> Block<'_> {
+        match self {
+            Self::Field(title, value) => Block::Field(title, value),
+            Self::Description(text) => Block::DescriptionFragment(text),
+        }
+    }
+}
+
+fn group_fragments(section: &HelpSection<'_>) -> Vec<Fragment> {
+    let hint = section.requires.map(|perm| format!("Needs {perm}\n"));
+    let hint = hint.as_deref().unwrap_or_default();
+    let capacity = EMBED_FIELD_VALUE_LIMIT.saturating_sub(text_len(hint));
+    let commands = section
+        .commands
+        .iter()
+        .map(|name| (format!("/{name}"), COMMAND_SEPARATOR));
+    let notes = section.notes.iter().map(|note| (note.to_string(), "\n"));
+    let mut fragments = Vec::new();
+    let mut body = String::new();
     let mut used = 0;
-    for name in names {
-        let safe = neutralize_mentions(name);
-        let units = 1 + text_len(&safe); // Include the slash.
-        if used + text_len(COMMAND_SEPARATOR) + units > EMBED_FIELD_VALUE_LIMIT {
-            fields.push(std::mem::take(&mut value));
+    for (entry, separator) in commands.chain(notes) {
+        let entry = neutralize_mentions(&entry);
+        let cost = text_len(&entry);
+        if used != 0 && used + text_len(separator) + cost > capacity {
+            fragments.push(std::mem::take(&mut body));
             used = 0;
         }
         if used != 0 {
-            value.push_str(COMMAND_SEPARATOR);
-            used += text_len(COMMAND_SEPARATOR);
+            body.push_str(separator);
+            used += text_len(separator);
         }
-        value.push('/');
-        value.push_str(&safe);
-        used += units;
+        body.push_str(&entry);
+        used += cost;
     }
-    if !value.is_empty() {
-        fields.push(value);
+    if !body.is_empty() {
+        fragments.push(body);
     }
-    fields
+    fragments
+        .into_iter()
+        .enumerate()
+        .map(|(i, body)| {
+            let title = if i == 0 {
+                section.title.to_owned()
+            } else {
+                format!("{} (continued)", section.title)
+            };
+            if text_len(&title) <= EMBED_FIELD_NAME_LIMIT && text_len(&body) <= capacity {
+                Fragment::Field(title, format!("{hint}{body}"))
+            } else {
+                let mut header = format!("**{title}**");
+                if let Some(perm) = section.requires {
+                    header.push_str(&format!(" — needs {perm}"));
+                }
+                Fragment::Description(format!("{header}\n{body}"))
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -79,33 +115,40 @@ mod tests {
         assert_eq!(defs.len(), GUILD_COMMAND_LIMIT);
         let catalog = help_catalog(&defs);
         let pages = plan_discovery(&defs, 150).expect("bounded discovery");
-        let mut actual = pages.iter().flat_map(|page| {
-            page.description
-                .lines()
-                .map(|line| ("", line))
-                .chain(page.fields.iter().flat_map(|(title, value)| {
-                    value
-                        .split(COMMAND_SEPARATOR)
-                        .map(|command| (title.as_str(), command))
-                }))
-        });
-        assert_eq!(actual.next(), Some(("", catalog.heading.as_str())));
+        assert!(pages.len() > 1);
+        let expected_description = format!("{}\n{}", catalog.heading, catalog.closing_note);
+        assert!(pages
+            .iter()
+            .all(|page| page.description == expected_description));
+        let mut actual = pages.iter().flat_map(|page| &page.fields).peekable();
         for group in &catalog.sections {
-            let title = match group.requires {
-                Some(perm) => format!("{} — needs {perm}", group.title),
-                None => group.title.to_owned(),
-            };
-            for name in &group.commands {
-                assert_eq!(
-                    actual.next(),
-                    Some((title.as_str(), format!("/{name}").as_str()))
-                );
+            let continued = format!("{} (continued)", group.title);
+            let mut commands = Vec::new();
+            let mut notes = Vec::new();
+            let mut title = group.title;
+            while let Some((_, value)) = actual.next_if(|(name, _)| name == title) {
+                let mut lines = value.lines();
+                if let Some(perm) = group.requires {
+                    assert_eq!(lines.next(), Some(format!("Needs {perm}").as_str()));
+                }
+                for line in lines {
+                    if line.starts_with('/') {
+                        assert!(notes.is_empty(), "commands must precede notes");
+                        commands.extend(line.split(COMMAND_SEPARATOR));
+                    } else {
+                        notes.push(line);
+                    }
+                }
+                title = &continued;
             }
-            for note in group.notes {
-                assert_eq!(actual.next(), Some(("", *note)));
-            }
+            let expected: Vec<_> = group
+                .commands
+                .iter()
+                .map(|name| format!("/{name}"))
+                .collect();
+            assert_eq!(commands, expected);
+            assert_eq!(notes, group.notes);
         }
-        assert_eq!(actual.next(), Some(("", catalog.closing_note)));
         assert_eq!(actual.next(), None);
         assert!(catalog.sections.iter().any(|group| !group.notes.is_empty()));
     }
@@ -141,18 +184,65 @@ mod tests {
         let defs =
             vec![CommandDefinition::new(name.as_str(), "A test command"); GUILD_COMMAND_LIMIT + 1];
         assert_eq!(plan_discovery(&defs, 150), Err(PlanError));
-        let fields = command_fields(&[name.as_str(); GUILD_COMMAND_LIMIT]);
-        assert!(fields.len() > 1);
-        assert!(fields
-            .iter()
-            .all(|value| text_len(value) <= EMBED_FIELD_VALUE_LIMIT));
+        let fragments = group_fragments(&HelpSection {
+            title: "Custom",
+            requires: Some("Manage Server"),
+            commands: vec![name.as_str(); GUILD_COMMAND_LIMIT],
+            notes: &[],
+        });
+        assert!(fragments.len() > 1);
         let command = format!("/{}", neutralize_mentions(&name));
+        let mut actual = Vec::new();
+        for (index, fragment) in fragments.iter().enumerate() {
+            let Fragment::Field(title, value) = fragment else {
+                panic!("expected field");
+            };
+            assert_eq!(
+                title,
+                if index == 0 {
+                    "Custom"
+                } else {
+                    "Custom (continued)"
+                }
+            );
+            assert!(text_len(value) <= EMBED_FIELD_VALUE_LIMIT);
+            let rest = value
+                .strip_prefix("Needs Manage Server\n")
+                .expect("repeated hint");
+            actual.extend(rest.split(COMMAND_SEPARATOR));
+        }
+        assert_eq!(actual, vec![command.as_str(); GUILD_COMMAND_LIMIT]);
+    }
+
+    #[test]
+    fn fallback_uses_legacy_heading_and_keeps_the_note_whole() {
+        // Catalog notes are static. This fixture exercises a future note too
+        // large to fit in one field but still safe in the description.
+        let note = "🔥".repeat(600);
+        let notes = [note.as_str(), "Last note."];
+        let fragments = group_fragments(&HelpSection {
+            title: "Custom",
+            requires: Some("Manage Server"),
+            commands: vec!["test"],
+            notes: &notes,
+        });
+        let blocks: Vec<_> = fragments.iter().map(Fragment::block).collect();
+        let pages = plan(&blocks, 150).expect("bounded fallback");
+        assert_eq!(pages.len(), 2);
         assert_eq!(
-            fields
-                .iter()
-                .flat_map(|value| value.split(COMMAND_SEPARATOR))
-                .collect::<Vec<_>>(),
-            vec![command.as_str(); GUILD_COMMAND_LIMIT]
+            pages[0].fields,
+            [("Custom".into(), "Needs Manage Server\n/test".into())]
+        );
+        assert_eq!(
+            pages[1].description,
+            format!("**Custom (continued)** — needs Manage Server\n{note}")
+        );
+        assert_eq!(
+            pages[1].fields,
+            [(
+                "Custom (continued)".into(),
+                "Needs Manage Server\nLast note.".into()
+            )]
         );
     }
 }

@@ -14,7 +14,9 @@ pub const MAX_HELP_PAGES: usize = 128;
 pub enum Block<'a> {
     /// Adjacent description blocks are separated by a newline.
     Description(&'a str),
-    /// An already-grouped fragment: heading (including hint), then value.
+    /// A complete description fragment that must not split across pages.
+    DescriptionFragment(&'a str),
+    /// An already-grouped fragment: heading, then value.
     Field(&'a str, &'a str),
 }
 
@@ -39,7 +41,7 @@ pub fn plan(blocks: &[Block<'_>], reserved: usize) -> Result<Vec<Page>, PlanErro
     let (mut bytes, mut units, mut used) = (0usize, 0, 0);
     for &block in blocks {
         let (name, value, is_field) = match block {
-            Block::Description(value) => ("", value, false),
+            Block::Description(value) | Block::DescriptionFragment(value) => ("", value, false),
             Block::Field(name, value) => (name, value, true),
         };
         // Bound work before allocating neutralized text, including separators
@@ -70,6 +72,23 @@ pub fn plan(blocks: &[Block<'_>], reserved: usize) -> Result<Vec<Page>, PlanErro
                 used = 0;
             }
             page.fields.push((name, value));
+            used += cost;
+            continue;
+        }
+        if matches!(block, Block::DescriptionFragment(_)) {
+            if value_units > desc_limit {
+                return Err(PlanError);
+            }
+            if !page.fields.is_empty() || used + usize::from(joins_description) + cost > desc_limit
+            {
+                page = new_page(&mut pages)?;
+                used = 0;
+            }
+            if used != 0 {
+                page.description.push('\n');
+                used += 1;
+            }
+            page.description.push_str(&value);
             used += cost;
             continue;
         }
@@ -177,6 +196,19 @@ mod tests {
             pages.into_iter().map(|p| p.description).collect::<String>(),
             format!("Group\n{}", neutralize_mentions(&value))
         );
+    }
+
+    #[test]
+    fn keeps_atomic_description_fragments_whole_at_the_page_boundary() {
+        let short = Block::DescriptionFragment("abcd");
+        let exact = Block::DescriptionFragment("🔥🔥");
+        let reserved = EMBED_DESCRIPTION_LIMIT - 4;
+        let pages = plan(&[short, exact], reserved).expect("both fragments fit separately");
+        assert_eq!(pages[0].description, "abcd");
+        assert_eq!(pages[1].description, "🔥🔥");
+        let joined = plan(&[short, exact], reserved - 5).expect("both fit together");
+        assert_eq!(joined[0].description, "abcd\n🔥🔥");
+        assert_eq!(plan(&[exact], reserved + 1), Err(PlanError));
     }
 
     #[test]
