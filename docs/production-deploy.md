@@ -678,8 +678,8 @@ Dispatch `staging-rollback-drill.yml` on `main` with `target_version` empty
 and `sha` set to the full 40-character lowercase candidate commit.
 
 1. Dispatches only `deploy-staging.yml` on `main`, with the existing staging
-   error-rate gate rehearsal enabled. No production dispatch or traffic fault
-   is involved. The GitHub REST `2026-03-10` dispatch response provides the exact
+   error-rate gate rehearsal and explicit prior-SHA opt-in. No production dispatch
+   or traffic fault is involved. The GitHub REST `2026-03-10` dispatch response provides the exact
    child run ID; a missing ID refuses without redispatch or guessing "latest".
 2. Waits at most 70 minutes for that run. The snapshot, deploy and rollout
    readiness steps must pass, the injected error-rate gate must fail, and the

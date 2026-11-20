@@ -237,9 +237,13 @@ def validate_shutdown(files, stop_files, run_id, requested_sha):
             "shutdown_receipt_mismatch")
 
 
+def proof_dispatch(sha):
+    return {"ref": "main", "inputs": {"inject_error_rate_spike": True, "recover_prior_sha": True, "sha": sha}}
+
+
 def prove(*, requested_sha, sleep=time.sleep, clock=time.monotonic):
     require(isinstance(requested_sha, str) and SHA.fullmatch(requested_sha), "requested_sha_invalid")
-    dispatch = {"ref": "main", "inputs": {"inject_error_rate_spike": True, "sha": requested_sha}}
+    dispatch = proof_dispatch(requested_sha)
     response = gh(f"repos/{REPO}/actions/workflows/deploy-staging.yml/dispatches", body=dispatch)
     run_id = response.get("workflow_run_id")
     require(type(run_id) is int and run_id > 0, "dispatch_missing_exact_run_id_no_retry")
@@ -342,7 +346,7 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="print the fixed contract; no network or mutation")
     args = parser.parse_args(argv)
     if args.dry_run:
-        dispatch = {"ref": "main", "inputs": {"inject_error_rate_spike": True, "sha": args.sha or "<full-commit-sha>"}}
+        dispatch = proof_dispatch(args.sha or "<full-commit-sha>")
         print(json.dumps({"environment": "staging", "dispatch": dispatch, "mode": args.mode}))
         return 0
     try:

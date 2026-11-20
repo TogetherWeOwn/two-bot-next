@@ -60,6 +60,7 @@ permissions: {}
 concurrency:
   group: ${{ (inputs.deploy_staging_call || inputs.staging_use_expires_at != '') && format('staging-help-consumer-{0}', github.run_id) || 'staging-lifecycle' }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   rerun-refusal:

@@ -239,18 +239,19 @@ staging before the history guard fails it, and cannot produce B1 or a promotion
 certificate. Verify the run's recorded `headSha` against the target too: the
 pre-dispatch check does not lock `main`. A mismatch is not qualification.
 
-**Pending-slot replacement (residual recovery, 2026-11-07):** GitHub preserves a
-running holder with `cancel-in-progress: false`, but keeps only one pending item
-per group. The five-minute user-flow observer is outside that group and cannot
-replace a pending deploy or promotion soak. Actual holders (another deploy,
-drill or soak) can still replace one pending holder; there is no FIFO/fairness
-guarantee. A cancelled run is not qualification or staging history. Start a
-fresh `deploy-staging` dispatch only if the match above still holds. Wait for
-all five qualifying jobs plus release and retain the new attempt's receipts.
-A cancelled production soak needs a new promotion run through its unchanged
-guard and fresh full-window measurement, never historical soak credit. No
-scheduler or automatic redispatch is added. The five-minute observer never
-grants a window; its cadence is not permission for near-continuous staging use.
+**Queued staging work:** Every holder uses `queue: max` and preserves the
+running holder. The queue is bounded; admission order is not a freshness check.
+After acquiring the lock, `deploy-staging` rechecks the fetched main tip before
+changing staging. A superseded workflow head fails red; start a fresh dispatch
+only if the match above holds. To intentionally recover a prior main SHA,
+dispatch from current `main` with the full ancestor SHA and `recover_prior_sha: true`.
+This does not qualify as staging history. Do not rerun old workflow revisions
+with the old single-slot policy; let existing holders and waiters settle before
+using the measurement caller. Wait for all five qualifying jobs plus release
+and retain the new attempt's receipts. Cancelled runs are not evidence; a
+cancelled production soak still needs a fresh full-window measurement. No
+scheduler or automatic redispatch is added. The independent five-minute observer
+never grants a window.
 
 **Reruns:** do not use **Re-run all jobs** or **Re-run failed jobs** for
 qualification. Both create a new `run_attempt`; the deploy-called voice and help

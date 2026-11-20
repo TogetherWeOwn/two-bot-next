@@ -545,7 +545,7 @@ def filter_pattern_matches(pattern, path):
 
 
 def staging_dispatch_errors(workflow):
-    """Only workflow_dispatch can start staging, with six fenced inputs.
+    """Only workflow_dispatch can start staging, with seven fenced inputs.
 
     `release_fence` exists on main (TOG-11143) so post-handoff release of an
     uninitialized/parked singleton is explicit and auditable; it defaults to
@@ -561,7 +561,8 @@ def staging_dispatch_errors(workflow):
     in staging_fault_injection_errors. `sha` pins the deployed commit for
     arm/disarm at one exact revision: an optional string, empty by default
     (empty deploys the workflow head), readable only through the pinned
-    dispatch-or-head expression in staging_pinned_sha_errors. Anything else
+    dispatch-or-head expression in staging_pinned_sha_errors. The explicit
+    `recover_prior_sha` switch defaults to false. Anything else
     in the dispatch block (an arming switch, a deploy flag, a default of
     true) is an unreviewed deploy route outside the pinned shape.
     """
@@ -573,7 +574,7 @@ def staging_dispatch_errors(workflow):
     dispatch = on["workflow_dispatch"]
     inputs = dispatch.get("inputs") if isinstance(dispatch, dict) and set(dispatch) == {"inputs"} else None
     expected_booleans = {"release_fence", "inject_gateway_failure", "inject_error_rate_spike",
-                         "inject_voice_stall", "inject_unpaired_disconnect"}
+                         "inject_voice_stall", "inject_unpaired_disconnect", "recover_prior_sha"}
     expected = expected_booleans | {"sha"}
     if not isinstance(inputs, dict) or set(inputs) != expected:
         return [f"{name}: workflow_dispatch must carry only the release_fence, drill and sha inputs"]
@@ -850,9 +851,9 @@ def staging_pinned_sha_errors(workflows):
     dispatch-or-head ref at full depth, and each carries one SHA step that
     resolves the same expression through the environment, proves HEAD equals
     it, enforces a full 40-hex shape and refuses anything that is not an
-    ancestor of origin/main. Each SHA step refuses exactly five ways
-    (workflow ref, shape, length, checkout equality, ancestry), pinned by
-    exit count so no refusal can go green. The workflow-ref refusal comes
+    ancestor of origin/main. The five common refusals cover workflow ref,
+    shape, length, checkout equality and ancestry; deploy also refuses a
+    stale workflow head or an unintentional prior pin. The workflow-ref refusal comes
     first: the job must itself run from `refs/heads/main`, an in-file
     fail-closed backstop behind the Environment branch policy (a job-level
     `if:` would skip silently instead, so the job still carries none). Exactly nine reads exist (three checkout refs, three
@@ -938,11 +939,14 @@ def staging_pinned_sha_errors(workflows):
                        "[!0-9a-f]", '"${#SOURCE_SHA}"', "-eq 40"):
             if needle not in run:
                 errors.append(f"deploy-staging.yml:{job_id}: SHA step must contain {needle}")
-        # Five refusals, five exits: flipping any refusal green (in
-        # particular the ancestry rejection) trips this count.
-        if run.count("exit 1") != 5:
-            errors.append(f"deploy-staging.yml:{job_id}: SHA step must refuse exactly five ways "
-                          "(workflow ref, shape, length, checkout equality, ancestry)")
+        if job_id == "deploy":
+            if (str(staging).count("inputs.recover_prior_sha") != 1
+                    or step.get("env", {}).get("RECOVER_PRIOR_SHA") != "${{ inputs.recover_prior_sha }}"
+                    or {"if", "continue-on-error"} & step.keys()):
+                errors.append("deploy-staging.yml:deploy: recovery opt-in must be bound only to the required SHA step")
+        # Flipping any refusal green, including the ancestry check, trips this count.
+        if run.count("exit 1") != (7 if job_id == "deploy" else 5):
+            errors.append(f"deploy-staging.yml:{job_id}: SHA step must preserve every pinned refusal")
         # The workflow-ref refusal runs before the shape check: a job not
         # running from main stops before it can judge or touch anything else.
         if ('"$WORKFLOW_REF"' in run and "[!0-9a-f]" in run
@@ -973,7 +977,7 @@ def staging_full_window_errors(workflow, name="deploy-staging.yml"):
     runner loss; this job is the courtesy stop.
     """
     errors = []
-    if workflow.get("concurrency") != {"group": STAGING_LIFECYCLE_GROUP, "cancel-in-progress": "false"}:
+    if workflow.get("concurrency") != {"group": STAGING_LIFECYCLE_GROUP, "cancel-in-progress": "false", "queue": "max"}:
         errors.append(f"{name}: must hold the canonical staging-lifecycle group for the whole workflow, "
                       "never cancelling")
     jobs = workflow.get("jobs") or {}
@@ -1826,7 +1830,7 @@ def staging_rollback_drill_errors(workflow):
     if jobs["alert"].get("needs") != "proof" or jobs["alert"].get("if") != "${{ !cancelled() && needs.proof.result == 'failure' }}":
         errors.append(f"{name}: alert must run on a failed proof only")
     job = jobs["drill"]
-    if job.get("concurrency") != {"group": STAGING_LIFECYCLE_GROUP, "cancel-in-progress": "false"}:
+    if job.get("concurrency") != {"group": STAGING_LIFECYCLE_GROUP, "cancel-in-progress": "false", "queue": "max"}:
         errors.append(f"{name}:drill: must hold the canonical staging-lifecycle group without cancelling")
     if job.get("environment") != "staging":
         errors.append(f"{name}:drill: must stay scoped to the staging environment")
@@ -1929,7 +1933,7 @@ def staging_container_drill_errors(workflow):
             elif (field.get("type") != "string" or str(field.get("required")).lower() != "true"
                     or "default" in field):
                 errors.append(f"{name}: {key} must be a required string with no default (never latest)")
-    if workflow.get("concurrency") != {"group": STAGING_LIFECYCLE_GROUP, "cancel-in-progress": "false"}:
+    if workflow.get("concurrency") != {"group": STAGING_LIFECYCLE_GROUP, "cancel-in-progress": "false", "queue": "max"}:
         errors.append(f"{name}: must hold the canonical staging-lifecycle group without cancelling")
     jobs = workflow.get("jobs") or {}
     if set(jobs) != {"container-drill"}:
@@ -2388,7 +2392,7 @@ def staging_mcp_proveout_errors(workflow):
         errors.append(f"{name}: workflow_dispatch must take no inputs")
     if workflow.get("permissions") != {}:
         errors.append(f"{name}: top-level permissions must stay empty")
-    if workflow.get("concurrency") != {"group": "staging-lifecycle", "cancel-in-progress": "false"}:
+    if workflow.get("concurrency") != {"group": "staging-lifecycle", "cancel-in-progress": "false", "queue": "max"}:
         errors.append(f"{name}: must hold the canonical staging-lifecycle group without cancelling")
     jobs = workflow.get("jobs") or {}
     if set(jobs) != {"proveout"}:
@@ -2960,7 +2964,7 @@ def production_errors(workflow):
                         "&& needs.guard.outputs.allow_unstaged != 'true'")
     if soak.get("needs") != "guard" or soak.get("if") != expected_soak_if:
         errors.append(f"{name}:soak: every ordinary candidate needs the bounded live measurement job")
-    if soak.get("concurrency") != {"group": "staging-lifecycle", "cancel-in-progress": "false"}:
+    if soak.get("concurrency") != {"group": "staging-lifecycle", "cancel-in-progress": "false", "queue": "max"}:
         errors.append(f"{name}:soak: must hold the canonical staging lock, never the production lane")
     if (soak.get("environment") != {"name": "staging", "deployment": "false"}
             or soak.get("permissions") != {"contents": "read", "actions": "read"}
@@ -3629,7 +3633,7 @@ def staging_callee_window_errors(name, workflow, consumer):
         expected_inputs["artifact_invocation"] = {"type": "string", "required": "false", "default": ""}
     if inputs != expected_inputs:
         errors.append(f"{name}: workflow_call inputs must match the exact grant and call-mode profile")
-    if workflow.get("concurrency") != {"group": STAGING_CALLEE_GROUPS[name], "cancel-in-progress": "false"}:
+    if workflow.get("concurrency") != {"group": STAGING_CALLEE_GROUPS[name], "cancel-in-progress": "false", "queue": "max"}:
         errors.append(f"{name}: group must be disjoint when called and staging-lifecycle standalone, "
                       "never cancelling")
     jobs = workflow.get("jobs") or {}
@@ -8232,7 +8236,7 @@ class WorkflowTests(unittest.TestCase):
                             exported.write_text("", encoding="utf-8")
                             env = dict(base_env, GITHUB_WORKSPACE=str(repo),
                                        SOURCE_SHA=source_sha, WORKFLOW_REF=workflow_ref,
-                                       GITHUB_ENV=str(exported))
+                                       GITHUB_SHA=head, RECOVER_PRIOR_SHA="false", GITHUB_ENV=str(exported))
                             workdir = repo / "wrangler" if job_id == "deploy" else repo
                             proc = subprocess.run(
                                 ["bash", "-e", "-c", shell], cwd=str(workdir), env=env,
@@ -8249,6 +8253,39 @@ class WorkflowTests(unittest.TestCase):
                                                  f"DEPLOY_SHA={source_sha}\n")
                             else:
                                 self.assertEqual(exported.read_text(encoding="utf-8"), "")
+
+    def test_queued_staging_deploy_rechecks_main_before_accepting_a_pin(self):
+        import subprocess
+
+        steps = self.workflows["deploy-staging.yml"]["jobs"]["deploy"]["steps"]
+        sha_step = next(s for s in steps if s.get("name") == "Deploy SHA must be exact and reachable from main")
+        git = '''git() {
+            case "$*" in
+                'rev-parse HEAD') printf '%s\n' "$SOURCE_SHA" ;;
+                'rev-parse FETCH_HEAD') printf '%s\n' "$MAIN_TIP" ;;
+                'fetch origin main') return "$FETCH_STATUS" ;;
+                config*|'merge-base --is-ancestor '*) return 0 ;;
+                *) return 2 ;;
+            esac
+        }\n'''
+        tip, prior = "a" * 40, "b" * 40
+        for source, workflow, recovery, fetch, allowed in (
+            (tip, tip, "false", "0", True),       # current ordinary deploy
+            (prior, prior, "false", "0", False), # main advanced in the queue
+            (prior, tip, "false", "0", False),   # qualification pin raced dispatch
+            (prior, tip, "true", "0", True),      # explicit prior-main recovery
+            (prior, prior, "true", "0", False),   # recovery still uses current workflow
+            (prior, tip, "true", "2", False),     # fresh main lookup failed
+        ):
+            with self.subTest(source=source, workflow=workflow, recovery=recovery, fetch=fetch):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", git + sha_step["run"]], capture_output=True, text=True, timeout=10,
+                    env={"GITHUB_WORKSPACE": ".", "GITHUB_ENV": "/dev/stdout", "WORKFLOW_REF": "refs/heads/main",
+                         "SOURCE_SHA": source, "GITHUB_SHA": workflow, "MAIN_TIP": tip,
+                         "RECOVER_PRIOR_SHA": recovery, "FETCH_STATUS": fetch},
+                )
+                self.assertEqual(result.returncode == 0, allowed, result.stdout + result.stderr)
+                self.assertEqual(f"DEPLOY_SHA={source}" in result.stdout, allowed)
 
     def test_deploy_identity_follows_the_pin(self):
         staging = self.workflows["deploy-staging.yml"]

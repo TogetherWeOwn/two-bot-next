@@ -54,8 +54,8 @@ jobs:
     environment:
       name: staging
       deployment: false
-    # Observe without the lifecycle lock: five-minute ticks must not replace
-    # pending deployments or promotion soaks in GitHub's single pending slot.
+    # Observe without the lifecycle lock: five-minute ticks must not queue
+    # alongside deployments and promotion soaks.
     concurrency:
       group: synthetic-user-flow-staging
       cancel-in-progress: false
