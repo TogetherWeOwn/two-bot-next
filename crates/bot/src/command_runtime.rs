@@ -182,8 +182,8 @@ const LANE_INTERACTIONS: usize = 1;
 const LANE_REGISTRY: usize = 2;
 const LANE_PRIVILEGED: usize = 3;
 pub(crate) const LANE_BUSY: usize = 4;
-pub(crate) const LANE_HELP: usize = 5;
-pub(crate) const LANE_REACTIONS: usize = 6;
+pub(crate) const LANE_REACTIONS: usize = 5;
+pub(crate) const LANE_HELP: usize = 6;
 
 // A single member's reaction burst must leave room for other members: the
 // per-member budget stays strictly below the lane cap, so fairness holds even
@@ -202,26 +202,27 @@ const SATURATION_LOG_WINDOW_SECS: u64 = 60;
 struct DispatchTasks {
     stopped: bool,
     lanes: [Vec<tokio::task::AbortHandle>; DISPATCH_LIMITS.len()],
-    /// Per-lane drops (test-visible mirror of the global
-    /// `two_bot_dispatch_drops_total{lane}` counter, incremented alongside by
-    /// `DispatchTasks::record_drop`; fairness drops share their lane's
-    /// counter).
+    /// Per-lane drops (test-visible; the public metric folds help into interactions).
     drops: [u64; DISPATCH_LIMITS.len()],
     last_drop_log: Option<std::time::Instant>,
 }
 
 impl DispatchTasks {
-    /// Record a refused event on `lanes`: increment each lane's drop counter
-    /// (test-visible mirror of the global `two_bot_dispatch_drops_total{lane}`
-    /// counter, incremented alongside) and emit at most one `warn!` per 60 s
+    /// Record a refused event on `lanes`: increment the internal and public
+    /// drop counters and emit at most one `warn!` per 60 s
     /// per runtime. Fairness drops share their lane's counter so every refused
     /// event stays observable through one path; each caller keeps its own
     /// sampled message so existing log filters keep matching.
     fn record_drop(&mut self, lanes: &[usize], reason: &'static str, message: &'static str) {
+        // Help has its own admission budget but shares the interactions series.
+        let labels = two_bot_core::metrics::DISPATCH_LANES;
         for &lane in lanes {
             self.drops[lane] = self.drops[lane].saturating_add(1);
-            two_bot_core::metrics::global()
-                .dispatch_drop(two_bot_core::metrics::DISPATCH_LANES[lane]);
+            let label = match lane {
+                LANE_HELP => labels[LANE_INTERACTIONS],
+                _ => labels[lane],
+            };
+            two_bot_core::metrics::global().dispatch_drop(label);
         }
         let now = std::time::Instant::now();
         let due = self
@@ -234,8 +235,9 @@ impl DispatchTasks {
     }
 }
 
-// Lane labels stay in `DISPATCH_LIMITS` order with the global metric allowlist.
-const _: () = assert!(two_bot_core::metrics::DISPATCH_LANES.len() == DISPATCH_LIMITS.len());
+// The metric allowlist follows the dispatch order up to the internal help lane.
+const _: () = assert!(two_bot_core::metrics::DISPATCH_LANES.len() == LANE_HELP);
+const _: () = assert!(DISPATCH_LIMITS.len() == LANE_HELP + 1);
 
 /// Cancels admitted work on gateway exit, including supervisor cancellation.
 /// Interrupted channel effects retain their durable claims for reconciliation.

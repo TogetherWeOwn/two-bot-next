@@ -1612,15 +1612,9 @@ async fn gateway_help_opens_a_new_private_page_from_the_confirmed_registry() {
         Permissions::empty(),
     ));
     assert!(runtime.dispatch_help(&first, Instant::now()));
-    assert!(
-        runtime.dispatch_help(&first, Instant::now()),
-        "the active duplicate is owned but not answered"
-    );
-    wait_for(
-        || runtime.lane_in_flight(LANE_HELP) == 0,
-        "initial help callback",
-    )
-    .await;
+    assert!(runtime.dispatch_help(&first, Instant::now()), "duplicate");
+    let idle = || runtime.lane_in_flight(LANE_HELP) == 0;
+    wait_for(idle, "initial help callback").await;
     let callbacks = mock.posts_to("/callback").await;
     assert_eq!(callbacks.len(), 1);
     let initial: Value = serde_json::from_slice(&callbacks[0].body).unwrap();
@@ -1654,34 +1648,18 @@ async fn gateway_help_opens_a_new_private_page_from_the_confirmed_registry() {
     assert!(runtime.dispatch_help(&interaction_event(wrong_scope), Instant::now()));
     assert!(runtime.dispatch_help(&first, Instant::now() - Duration::from_secs(3)));
     assert!(runtime.dispatch_help(&interaction_event(click), Instant::now()));
-    wait_for(
-        || runtime.lane_in_flight(LANE_HELP) == 0,
-        "help page callback",
-    )
-    .await;
+    wait_for(idle, "help page callback").await;
     let callbacks = mock.posts_to("/callback").await;
-    assert_eq!(
-        callbacks.len(),
-        2,
-        "no callbacks for duplicates, expired receipts, or foreign scope"
-    );
+    assert_eq!(callbacks.len(), 2, "no extra callbacks");
     assert!(callbacks[1].path.ends_with("/835/click-fixture/callback"));
     let page: Value = serde_json::from_slice(&callbacks[1].body).unwrap();
-    assert_eq!(
-        page["type"], 4,
-        "a new message, not a source update or defer"
-    );
-    assert_eq!(page["data"]["flags"], 64);
-    assert_eq!(page["data"]["allowed_mentions"]["parse"], json!([]));
-    let footer = page["data"]["embeds"][0]["footer"]["text"]
-        .as_str()
-        .unwrap();
+    assert_eq!(page["type"], 4, "new message, not an update or defer");
+    let data = &page["data"];
+    assert_eq!(data["flags"], 64);
+    assert_eq!(data["allowed_mentions"]["parse"], json!([]));
+    let footer = data["embeds"][0]["footer"]["text"].as_str().unwrap();
     assert!(footer.starts_with("Together We Own · Help · Page 2 of "));
-    assert_eq!(
-        mock.requests().len(),
-        3,
-        "one publication and two callbacks; no edits or followups"
-    );
+    assert_eq!(mock.requests().len(), 3, "no edits or followups");
     mock.shutdown().await;
 }
 

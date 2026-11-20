@@ -144,6 +144,8 @@ Both counters are class steady and never shed.
 Dispatch-lane saturation (TOG-19878) follows the same shed-meter shape: every
 `spawn_first` refusal increments `two_bot_dispatch_drops_total{lane}` per
 attempted lane, while the `warn!` samples the first drop per 60 s per runtime.
+Discovery help has its own admission budget; its `spawn_first` refusals count
+under `interactions`.
 A burst is O(1) log lines with N counter increments. The six lane labels are
 class steady and never shed; growth means a lane is undersized or a burst
 needs the M2.1 alert rule, not a new label. The `reactions` lane additionally
