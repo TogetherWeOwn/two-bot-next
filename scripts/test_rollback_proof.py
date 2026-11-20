@@ -249,7 +249,7 @@ class RollbackProofTests(unittest.TestCase):
         self.assertEqual(gh.call_count, 3)
         self.assertEqual(gh.call_args_list[0].args, (f"repos/{proof.REPO}/actions/workflows/deploy-staging.yml/dispatches",))
         self.assertEqual(gh.call_args_list[0].kwargs["body"],
-                         {"ref": "main", "inputs": {"inject_error_rate_spike": True, "sha": "a" * 40}})
+                         {"ref": "main", "inputs": {"inject_error_rate_spike": True, "recover_prior_sha": True, "sha": "a" * 40}})
         self.assertEqual([call.args for call in artifacts.call_args_list],
                          [(123, "staging-rollout-evidence"), (123, "staging-use-deploy-stop-123-1")])
         self.assertEqual(result["restored_version"], VERSION)
@@ -554,7 +554,7 @@ class RollbackProofTests(unittest.TestCase):
         with patch.object(proof, "gh") as gh, patch.object(proof, "alert") as alert, redirect_stdout(io.StringIO()) as output:
             self.assertEqual(proof.main(["run", "--dry-run", "--sha", "b" * 40]), 0)
             self.assertEqual(json.loads(output.getvalue())["dispatch"],
-                             {"ref": "main", "inputs": {"inject_error_rate_spike": True, "sha": "b" * 40}})
+                             {"ref": "main", "inputs": {"inject_error_rate_spike": True, "recover_prior_sha": True, "sha": "b" * 40}})
             gh.assert_not_called()
             alert.assert_not_called()
         with patch.dict(os.environ, ENV), patch.object(proof, "prove") as prove, redirect_stderr(io.StringIO()):

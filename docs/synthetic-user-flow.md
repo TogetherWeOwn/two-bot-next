@@ -32,8 +32,8 @@ runtime fencing refuses access after authority ends and a refused sample stays
 failed, never idle or recovery. The deploy workflow's exact-SHA user-flow job
 remains mandatory; scheduled samples cannot certify it. Production has an
 independent job queue and no staging Environment, control credential or
-dependency. Keep the five-minute schedule; its ticks can no longer cancel queued
-deployments or promotion soaks through the lifecycle group's pending slot.
+dependency. Keep the five-minute schedule; its ticks never join the staging
+lifecycle queue for deployments and promotion soaks.
 
 This protocol remains unactivated. The workflow change is not evidence of zero
 idle runtime cost. Do not claim activation until the live resource/consumer
