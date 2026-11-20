@@ -1570,19 +1570,16 @@ async fn automod_preview_router_refuses_before_decode_and_only_answers_privately
         runtime.on_interaction(&interaction).await;
     }
     let mut dm = slash("automod-preview", Some(CHANNEL), Vec::new());
-    dm.guild_id = None;
+    set_guild(&mut dm, None);
     dm.member = None;
-    if let Some(InteractionData::ApplicationCommand(command)) = dm.data.as_mut() {
-        command.guild_id = None;
-    }
     runtime.on_interaction(&dm).await;
     disabled
         .on_interaction(&slash("automod-preview", Some(CHANNEL), Vec::new()))
         .await;
 
-    runtime
-        .on_delayed_interaction(&dm, Duration::from_secs(3))
-        .await;
+    let mut receipt = PreviewReceipt::now();
+    receipt.received_at -= Duration::from_secs(3);
+    runtime.on_interaction_at(&dm, None, receipt).await;
 
     let requests = mock.requests();
     let expected = cases
@@ -1669,11 +1666,8 @@ async fn automod_preview_uses_attached_activation_and_fails_closed_without_audit
             CommandOptionValue::String("synthetic".to_owned()),
         )],
     );
-    interaction.guild_id = Some(Id::new(guild));
+    set_guild(&mut interaction, Some(Id::new(guild)));
     interaction.authorizing_integration_owners.guild = Some(AnonymizableId::Id(Id::new(guild)));
-    if let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_mut() {
-        data.guild_id = Some(Id::new(guild));
-    }
     let denied = RouterRefusal::AutomodPreviewPermission.message();
     for (index, (permissions, expected)) in [
         (Permissions::empty(), denied.as_str()),

@@ -16,6 +16,7 @@ use {
     tokio::time::Instant,
     twilight_model::application::interaction::{InteractionData, InteractionType},
     two_bot_core::{
+        automod_preview::preview_automod_with_history,
         automod_preview_attempt::{attempt_preview, AttemptContext, AttemptResult},
         automod_preview_flow::{plan_pre_claim, PreClaimPlan},
         automod_preview_input::build_preview_message,
@@ -120,10 +121,9 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
         if !active.preview(|runtime| runtime.admits(Some(guild))) {
             return None;
         }
-        let live = resolve_live(guild);
-        let snapshot =
-            active.preview(|runtime| runtime.preview_snapshot(guild, &request.actor_id, live))?;
-        Some((guild, input, snapshot))
+        let config = resolve_live(guild)
+            .unwrap_or_else(|| active.preview(|runtime| runtime.effective_config()));
+        Some((guild, input, config))
     });
     let plan = plan_pre_claim(
         decoded.as_ref().map_err(|refusal| *refusal),
@@ -134,9 +134,10 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
     if let PreClaimPlan::AnswerNow { reply, metric } = plan {
         return AttemptResult { reply, metric };
     }
-    let Some((guild_id, input, (dry_run, evaluate))) = scoped else {
+    let Some((guild_id, input, config)) = scoped else {
         return unavailable(None);
     };
+    let dry_run = config.dry_run;
     let Ok(message) = build_preview_message(
         input,
         guild_id,
@@ -164,7 +165,8 @@ pub async fn handle_automod_preview<L: AutomodClaimLedger, F: AutomodFacts>(
             .unwrap_or_else(PoisonError::into_inner)
             .admit_before(actor_id, guild_id, id, deadline)
     };
-    let evaluate = || evaluate(&message, input.mention_count);
+    // Detached interactions can overtake earlier gateway CREATEs.
+    let evaluate = || preview_automod_with_history(&message, input.mention_count, &config, None);
     attempt_preview(plan, context, store, admit, evaluate).await
 }
 

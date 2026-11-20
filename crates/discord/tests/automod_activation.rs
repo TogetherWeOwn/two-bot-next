@@ -1459,11 +1459,11 @@ mod preview_attempt_acceptance {
         let (first, released) = tokio::join!(run(active, &limiter, &request, RECEIPT_MS), release);
         assert_eq!(refreshes.load(Ordering::Relaxed), 1);
         released?;
-        assert!(first.reply.contains("TWO_AUTOMOD_REPEAT_COUNT"));
+        assert!(first.reply.contains("Repeat evaluation is indeterminate"));
         assert!(!first.reply.contains(CANARY));
         let labels = |m: PreviewMetricLabels| (m.result, m.filter, m.mode);
-        let repeat_labels = ("matched", "repeated_message", "dry_run");
-        assert_eq!(first.metric.map(labels), Some(repeat_labels));
+        let partial_labels = ("partial", "none", "dry_run");
+        assert_eq!(first.metric.map(labels), Some(partial_labels));
         let receipt = "2023-11-14 22:13:20.000000+00";
         assert!(first.reply.contains(receipt));
         let closed = Mutex::new(PreviewRateLimiter::with_capacity(0));
@@ -1481,19 +1481,18 @@ mod preview_attempt_acceptance {
         let rows = sqlx::query_scalar::<_, Vec<String>>(sql)
             .bind(receipt)
             .bind(&identity[..]);
-        let repeat_reason = "filter=repeated_message;exemption=none;mode=dry_run;len=0_50";
+        let partial_reason = "filter=none;exemption=none;mode=dry_run;len=0_50";
         let rate_reason = "filter=none;exemption=none;mode=enforce;len=0_50";
         let expected = [
-            ["automod-preview:4242", "matched", repeat_reason],
+            ["automod-preview:4242", "partial", partial_reason],
             ["automod-preview:4243", "rate_limited", rate_reason],
         ];
         assert_eq!(rows.fetch_all(&pool).await?, expected);
         preview_dry_run.store(true, Ordering::Relaxed);
         let fresh = sample("4244");
         let fresh = run(active, &Mutex::default(), &fresh, RECEIPT_MS).await;
-        let no_match_labels = ("no_match", "none", "dry_run");
         assert!(!activation.preview(AutomodRuntime::dry_run));
-        assert_eq!(fresh.metric.map(labels), Some(no_match_labels));
+        assert_eq!(fresh.metric.map(labels), Some(partial_labels));
         assert_eq!(count().await?, 3);
         assert_eq!(ledger.claims(), 3, "only the three gateway creates claim");
         assert_eq!(ledger.violations(), 0);

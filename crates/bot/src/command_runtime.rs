@@ -1453,13 +1453,6 @@ impl CommandRuntime {
             .await;
     }
 
-    #[cfg(test)]
-    pub(crate) async fn on_delayed_interaction(&self, interaction: &Interaction, age: Duration) {
-        let mut receipt = PreviewReceipt::now();
-        receipt.received_at -= age;
-        self.on_interaction_at(interaction, None, receipt).await;
-    }
-
     async fn on_interaction_at(
         &self,
         interaction: &Interaction,
