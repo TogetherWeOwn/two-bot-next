@@ -25,7 +25,11 @@ use super::commands::{
 };
 use super::message_safety;
 
+mod catalog_pages;
+pub mod cursor;
 pub mod pages;
+
+pub use catalog_pages::plan_discovery;
 
 /// One `/help` group: commands that share an audience.
 struct HelpGroup {
@@ -906,7 +910,7 @@ impl CommandDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::merge_commands;
+    use crate::commands::{merge_commands, CustomCommand, GUILD_COMMAND_LIMIT};
     use crate::feature_commands::feature_commands;
     use crate::moderation::moderation_commands;
     use crate::router::{InteractionRouter, RouterGates};
@@ -953,10 +957,7 @@ mod tests {
         assert_eq!(help_text(&defs), expected);
     }
 
-    #[test]
-    fn catalog_lists_every_name_in_a_maximum_admitted_registry() {
-        use crate::commands::{CustomCommand, GUILD_COMMAND_LIMIT};
-
+    pub(super) fn maximum_publication() -> (Vec<CommandDefinition>, Vec<CustomCommand>) {
         let router = InteractionRouter::new(all_on());
         let slots = GUILD_COMMAND_LIMIT - router.publish_set(&[]).unwrap().len();
         let rows: Vec<_> = (0..slots)
@@ -966,7 +967,12 @@ mod tests {
                 enabled: true,
             })
             .collect();
-        let defs = router.publish_set(&rows).expect("full registry");
+        (router.publish_set(&rows).expect("full registry"), rows)
+    }
+
+    #[test]
+    fn catalog_lists_every_name_in_a_maximum_admitted_registry() {
+        let (defs, rows) = maximum_publication();
         assert_eq!(defs.len(), GUILD_COMMAND_LIMIT);
         let catalog = help_catalog(&defs);
         let names = catalog.sections.iter().flat_map(|s| &s.commands);
