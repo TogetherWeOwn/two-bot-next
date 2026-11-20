@@ -252,11 +252,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL -o "$RUNNER_TEMP/actionlint.tgz" \
-            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
-          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
-          "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes=
+          # Keep the pinned release and backport only native queue validation.
+          tools=$(mktemp -d "$RUNNER_TEMP/actionlint.XXXXXX")
+          trap 'rm -rf -- "$tools"' EXIT
+          curl -fsSL -o "$tools/go.tgz" https://go.dev/dl/go1.26.11.linux-amd64.tar.gz
+          printf '%s  %s\n' 9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec "$tools/go.tgz" | sha256sum -c -
+          tar -xzf "$tools/go.tgz" -C "$tools"
+          curl -fsSL -o "$tools/source.zip" https://proxy.golang.org/github.com/rhysd/actionlint/@v/v1.7.12.zip
+          printf '%s  %s\n' d954c3f877cc5b98a10852bbb642c49758948d9527f1b588a544b6309d336ec2 "$tools/source.zip" | sha256sum -c -
+          python3 -I -m zipfile -e "$tools/source.zip" "$tools/src"
+          src="$tools/src/github.com/rhysd/actionlint@v1.7.12"
+          git -C "$src" apply --unidiff-zero "$GITHUB_WORKSPACE/scripts/ci/actionlint-queue.patch"
+          (
+            cd "$src"
+            export GOENV=off GOTOOLCHAIN=local GOWORK=off CGO_ENABLED=0 GOFLAGS=-mod=readonly
+            export GOCACHE="$tools/cache" GOMODCACHE="$tools/modules"
+            export GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org GOPRIVATE= GONOPROXY= GONOSUMDB=
+            sha256sum go.mod go.sum > "$tools/dependencies.sha256"
+            "$tools/go/bin/go" test -v -run '^TestLinterLintOK$/^concurrency_queue\.yaml$' .
+            "$tools/go/bin/go" test -v -run '^TestLinterLintError$/^err$/^(concurrency_queue|case_sensitive_keys|unexpected_keys)$' .
+            "$tools/go/bin/go" build -trimpath -buildvcs=false -o "$tools/actionlint" ./cmd/actionlint
+            sha256sum -c "$tools/dependencies.sha256"
+          )
+          "$tools/actionlint" -shellcheck= -pyflakes=
 
       - name: offline build-cache safety regressions
         run: |

@@ -11,8 +11,12 @@ class DisabledVoiceMeasurementTests(unittest.TestCase):
         scaffold = {
             "on": {"workflow_dispatch": None},
             "permissions": {},
-            "concurrency": {"group": "voice-rest-measurement-disabled",
-                            "cancel-in-progress": "false"},
+            "concurrency": {
+                "group": "${{ false && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' "
+                "&& github.run_attempt == 1 && 'staging-lifecycle' || "
+                "format('voice-rest-measurement-disabled-{0}-{1}', github.run_id, github.run_attempt) }}",
+                "cancel-in-progress": "false", "queue": "max",
+            },
             "jobs": {name: {"if": guard} for name, guard in GUARDS.items()},
         }
         self.assertTrue(is_disabled_scaffold(scaffold))
@@ -32,6 +36,16 @@ class DisabledVoiceMeasurementTests(unittest.TestCase):
                     changed["concurrency"]["group"] = "staging-lifecycle"
                 else:
                     changed["permissions"] = {"contents": "read"}
+                self.assertFalse(is_disabled_scaffold(changed))
+        queue = scaffold["concurrency"]
+        for guard in ("false", "github.event_name == 'workflow_dispatch'",
+                      "github.ref == 'refs/heads/main'", "github.run_attempt == 1"):
+            with self.subTest(lock_guard=guard):
+                changed = dict(scaffold, concurrency=dict(queue, group=queue["group"].replace(guard + " && ", "", 1)))
+                self.assertFalse(is_disabled_scaffold(changed))
+        for key, value in (("queue", "single"), ("cancel-in-progress", "true")):
+            with self.subTest(lock_key=key):
+                changed = dict(scaffold, concurrency=dict(queue, **{key: value}))
                 self.assertFalse(is_disabled_scaffold(changed))
         for triggers in (None, 42, ["workflow_dispatch"], "workflow_dispatch"):
             with self.subTest(malformed_triggers=triggers):
