@@ -572,6 +572,25 @@ class Rollback:
         return (base.converged(row, image, target_version)
                 or base.active_lag(row, image, target_version))
 
+    def verify_staging_image(self, rollout_id, image, target_version, *, listing_seen_target=False):
+        row = self.read_image_rollout(rollout_id, image)
+        require(self.image_rollout_ready(row, image, target_version), "image_rollout_not_converged")
+        app = application_by_name(self.client, self.application)
+        require(app["id"] == self.app_id, "application_identity_drift")
+        listed = base.mapping(app.get("configuration")).get("image")
+        if listed != image:
+            previous = base.mapping(row.get("current_configuration")).get("image")
+            require(not listing_seen_target and listed == previous and isinstance(listed, str)
+                    and re.fullmatch(image_pattern(self.application), listed), "application_image_drift")
+        # A completed detail and matching listing can both lag a superseding rollout.
+        created = base.timestamp(row.get("created_at"))
+        for item in app_rollouts(self.client, self.app_id):
+            if item["id"] == rollout_id:
+                require(item.get("status") not in ("replaced", "reverted"), "rollout_replaced_or_reverted")
+            else:
+                require(base.timestamp(item.get("created_at")) < created, "application_image_drift")
+        return listed == image
+
     def restore_image(self, image):
         """Roll the image back with a single 100% step and return the rollout pin."""
         started = self.now()
@@ -594,11 +613,6 @@ class Rollback:
                     target_version = base.number(row.get("target_version"))
                 except GateError:
                     target_version = None
-            # The pinned rollout proves the image leg, including the same
-            # completed counter-lag shapes accepted by staging verify. Staging's
-            # application listing can lag that record indefinitely; takeover
-            # and the unchanged stable runtime gate still have to pass next.
-            # Production retains its separate application-listing requirement.
             ready = (target_version is not None
                      and self.image_rollout_ready(row, image, target_version))
             if target_version is None:
@@ -680,8 +694,7 @@ class Rollback:
             streak = streak + 1 if passed else 0
             self.log(f"gate poll {polls}: {observation} streak={streak}/{STABLE_PASSES}")
             if streak >= STABLE_PASSES:
-                self.stamp("gate stable")
-                self.evidence.update({"stable_polls": polls, "gate": "stable-200-gateway-ready"})
+                self.evidence["stable_polls"] = polls
                 return
             require(self.now() < deadline, "gate_timeout", f"polls={polls} last={observation}")
             self.sleep(POLL_SECONDS)
@@ -712,18 +725,19 @@ class Rollback:
         rollout_id, target_version = self.restore_image(restore_image)
         if self.variant == "staging":
             self.wait_worker_restore(restore_version)
-            # The rollout may have changed during Worker convergence. Do not
-            # release the fence on the strength of the earlier image read.
-            row = self.read_image_rollout(rollout_id, restore_image)
-            require(self.image_rollout_ready(row, restore_image, target_version),
-                    "image_rollout_not_converged")
+            listing_seen_target = self.verify_staging_image(rollout_id, restore_image, target_version)
         self.evidence["restored_rollout_id"] = rollout_id
         self.take_over(restore_version)
         if self.variant == "staging":
             self.staging_use("rebind")
             self.evidence["staging_use"] = "retained-window-rebound-ready"
         self.wait_stable(restore_version, self.now())
+        if self.variant == "staging":
+            self.verify_staging_image(rollout_id, restore_image, target_version,
+                                      listing_seen_target=listing_seen_target)
+        self.stamp("gate stable")
         self.evidence.update({
+            "gate": "stable-200-gateway-ready",
             "restored_version": restore_version,
             "restored_image_digest": restore_image.rsplit("@", 1)[-1],
             "from_version": current,

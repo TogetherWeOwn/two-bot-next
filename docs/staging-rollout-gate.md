@@ -16,17 +16,12 @@ and `snapshot` steps succeeded and a later step fails (receipt validation,
 ownership takeover, `verify`, or the error-rate gate);
 `scripts/staging_rollout.py` itself performs
 no rollback. On success the pre-deploy Worker version **and** container image
-are restored. The drill checks the new rollout ID as well as the snapshot's
-Worker version and image digest. Takeover releases the rollback's own fence
-only after both provider readbacks agree. The run stays red: the restore
-recovers service; it never certifies the failed build. Without a successful
-deploy and snapshot there is nothing to restore, so no rollback is attempted.
-Before replacing either component, a routine dispatch reads ownership and
-refuses if staging is already fenced or uninitialized. If that state is expected,
-use the separately authorized `release_fence` recovery path to establish a good
-staging baseline before running the drill. The rollback helper still requires
-both a proven finite-policy target and the original run's grant.
-Receipt/takeover failures precede grant acquisition, so their
+are restored before takeover. The run stays red; recovery does not certify the
+failed build. Without a successful deploy and snapshot there is no auto-rollback.
+Routine deploys refuse a fenced or uninitialized owner before replacing either
+component. Use the authorized `release_fence` path to restore a staging baseline.
+The helper additionally requires a proven finite-policy target and the original
+run's grant. Receipt/takeover failures precede grant acquisition, so their
 conditional rollback invocation refuses before mutation with
 `staging_restore_window_missing`. They do not restore the predecessor; reconcile
 serving version, rollout and ownership, then repair through roll-forward. A
@@ -503,17 +498,15 @@ listing still shows the previous image. Replaced/reverted rollouts and identity
 or image drift still fail closed. Production retains its application-listing
 check.
 
-After the single Worker restore POST, a read that still shows the previous
-version at 100% does not block the image POST while the singleton is fenced.
-Split traffic, an unrelated version, or a read error still stops the restore
-before the image POST. After the pinned image rollout completes, the helper
-requires the target Worker at 100% within seven reads, ten seconds apart. It then
-reads the same pinned rollout once more before takeover. If it no longer matches
-or no longer meets the convergence checks, staging stays fenced. Neither POST
-is retried. After takeover, the existing 18 consecutive passing `/health` and
-`/readyz` polls require the restored Worker version, expected build revision
-(subject to the existing pre-stamp exception), and `gateway=ready`; any miss
-resets the streak.
+A valid stale Worker readback does not block the image POST while fenced; split
+traffic, unrelated versions and read errors do. Neither POST is retried. After
+image convergence, the target Worker must serve 100% within seven reads, ten
+seconds apart. Before takeover and after the 18 passing `/health` and `/readyz`
+polls, read the exact rollout, application and history. Accept a listing lag only
+if it still shows the verified previous digest, has not shown the restore digest,
+and history has no newer rollout. Drift before takeover leaves staging fenced;
+late drift fails the restore without a success receipt. The drill also requires
+an opaque restore rollout ID distinct from the snapshot and forward rollout IDs.
 
 If the image leg times out, the log and failure evidence name the unmet condition
 as `waiting_for=target_version|rollout_completion|counters_or_progress|application_image`.

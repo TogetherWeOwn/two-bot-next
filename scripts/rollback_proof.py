@@ -35,6 +35,7 @@ MAX_WAIT = 70 * 60
 MAX_AGE = timedelta(hours=30)
 SHA = re.compile(r"[0-9a-f]{40}")
 VERSION = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+ROLLOUT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")  # staging_rollout.identifier
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 # Actions exposes step names, not YAML step ids. Keep these names pinned.
 REQUIRED_STEPS = {
@@ -180,10 +181,12 @@ def validate_evidence(files):
     require(restore.get("restored_version") == version
             and restore.get("restored_image_digest") == digest, "restored_snapshot_mismatch")
     prior_rollout = snapshot.get("serving_rollout_id")
+    forward = files.get("evidence.json")
+    forward_rollout = forward.get("rollout_id") if isinstance(forward, dict) else None
     restored_rollout = restore.get("restored_rollout_id")
-    require(all(isinstance(value, str) and VERSION.fullmatch(value)
-                for value in (prior_rollout, restored_rollout))
-            and restored_rollout != prior_rollout, "restored_rollout_unproved")
+    require(all(isinstance(value, str) and ROLLOUT_ID.fullmatch(value)
+                for value in (prior_rollout, forward_rollout, restored_rollout))
+            and restored_rollout not in (prior_rollout, forward_rollout), "restored_rollout_unproved")
     require(restore.get("takeover") is True and restore.get("gate") == "stable-200-gateway-ready"
             and not restore.get("failure"), "restore_not_stable")
     require(error_gate.get("mode") == "rehearsal" and error_gate.get("verdict") == "fail"
