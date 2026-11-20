@@ -1,4 +1,4 @@
-name: Voice queue fixture (ordinary)
+name: Voice queue fixture (caller)
 run-name: voice-workflow-queue-${{ inputs.probe }}-${{ inputs.role }}
 
 # Disposable fixture ref only. No staging jobs, environments or credentials.
@@ -11,21 +11,24 @@ on:
       role:
         required: true
         type: choice
-        options: [holder, waiter]
+        options: [fresh, contended]
 
 permissions: {}
 concurrency:
-  group: ${{ format('voice-workflow-queue-fixture-{0}', inputs.probe) }}
+  group: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test/voice-workflow-queue-caller' && github.run_attempt == 1 && format('voice-workflow-queue-fixture-{0}', inputs.probe) || format('voice-workflow-queue-refused-{0}-{1}', github.run_id, github.run_attempt) }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
-  ordinary:
-    if: github.ref == 'refs/heads/test/voice-workflow-queue-ordinary' && github.run_attempt == 1
+  acquired:
+    if: github.ref == 'refs/heads/test/voice-workflow-queue-caller' && github.run_attempt == 1
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 1
     steps:
-      - name: Hold the fixture group
-        if: inputs.role == 'holder'
-        run: sleep 150
-      - name: Finish the ordinary request
-        run: ':'
+      - run: printf '%s\n' 'Entered the fixture group on attempt one.'
+  rerun-refusal:
+    if: always() && github.ref == 'refs/heads/test/voice-workflow-queue-caller' && github.run_attempt != 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - run: exit 1
