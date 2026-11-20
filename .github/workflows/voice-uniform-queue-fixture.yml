@@ -1,0 +1,122 @@
+name: Uniform queue fixture driver
+
+# Disposable test ref only; do not merge.
+on:
+  push:
+    branches: [test/voice-uniform-queue]
+
+permissions: {}
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write # Dispatch the fixture ref and rerun its matched fresh run only.
+    strategy:
+      fail-fast: false
+      matrix:
+        ordinary: [outer, inner]
+    steps:
+      - name: Verify terminal outcomes outside staging
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          PROBE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.ordinary }}
+          ORDINARY: ${{ matrix.ordinary }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$REPO" == TogetherWeOwn/two-bot-next && "$REF" == test/voice-uniform-queue ]]
+          [[ "$SHA" =~ ^[a-f0-9]{40}$ && "$PROBE" =~ ^[0-9]+-[0-9]+-(outer|inner)$ ]]
+          [[ "$ORDINARY" == outer || "$ORDINARY" == inner ]]
+          root="repos/$REPO/actions"
+          workflow="$root/workflows/voice-rest-measurement.yml"
+
+          dispatch() {
+            local role=$1 id i
+            gh api --method POST "$workflow/dispatches" -f ref="$REF" \
+              -f 'inputs[probe]'="$PROBE" -f 'inputs[role]'="$role" >/dev/null || return 1
+            for ((i = 0; i < 25; i++)); do
+              id=$(gh api --method GET "$workflow/runs" -f branch="$REF" -f event=workflow_dispatch -F per_page=30 |
+                jq -r --arg title "uniform-queue-$PROBE-$role" --arg sha "$SHA" \
+                  '.workflow_runs[] | select(.display_title == $title and .head_sha == $sha and .run_attempt == 1) | .id') || return 1
+              if [[ "$id" =~ ^[0-9]+$ ]]; then
+                printf '%s: https://github.com/%s/actions/runs/%s\n' "$role" "$REPO" "$id" >&2
+                printf '%s\n' "$id"
+                return 0
+              fi
+              sleep 2
+            done
+            return 1
+          }
+          run_field() { gh api "$root/runs/$1" --jq "$2"; }
+          job_field() {
+            gh api "$root/runs/$1/attempts/$2/jobs" |
+              jq -r --arg job "$3" --arg field "$4" '.jobs[] | select(.name == $job) | .[$field]'
+          }
+          expect() {
+            local limit=$1 expected=$2 value i
+            shift 2
+            for ((i = 0; i < limit; i++)); do
+              value=$("$@") || return 1
+              if [[ "$value" == "$expected" ]]; then return 0; fi
+              sleep 2
+            done
+            printf 'Expected %s from %s; observed %s\n' "$expected" "$*" "$value" >&2
+            return 1
+          }
+
+          fresh=$(dispatch fresh)
+          expect 45 success run_field "$fresh" .conclusion
+          [[ $(job_field "$fresh" 1 outer conclusion) == success ]]
+
+          holder=$(dispatch "$ORDINARY-holder")
+          expect 45 in_progress job_field "$holder" 1 "$ORDINARY" status
+          waiter=$(dispatch "$ORDINARY-waiter")
+          if [[ "$ORDINARY" == outer ]]; then
+            expect 20 pending run_field "$waiter" .status
+          else
+            expect 20 pending job_field "$waiter" 1 inner status
+          fi
+          [[ $(job_field "$holder" 1 "$ORDINARY" status) == in_progress ]]
+          contender=$(dispatch contender)
+          [[ $(job_field "$holder" 1 "$ORDINARY" status) == in_progress ]]
+          printf '%s\n' 'Dispatched the contender while the holder was active and the ordinary waiter had already queued.'
+
+          gh api --method POST "$root/runs/$fresh/rerun" >/dev/null
+          expect 25 2 run_field "$fresh" '.run_attempt | tostring'
+          expect 35 failure run_field "$fresh" .conclusion
+          [[ $(job_field "$fresh" 2 rerun-refusal conclusion) == failure ]]
+          [[ $(job_field "$fresh" 2 outer conclusion) == skipped ]]
+          [[ $(job_field "$holder" 1 "$ORDINARY" status) == in_progress ]]
+
+          for run in "$holder" "$waiter" "$contender"; do
+            expect 105 completed run_field "$run" .status
+          done
+          for run in "$holder" "$waiter" "$contender"; do
+            conclusion=$(run_field "$run" .conclusion)
+            printf 'Run %s: %s\n' "$run" "$conclusion"
+            [[ "$conclusion" == success ]]
+          done
+          [[ $(job_field "$waiter" 1 "$ORDINARY" conclusion) == success ]]
+          [[ $(job_field "$contender" 1 outer conclusion) == success ]]
+          holder_end=$(job_field "$holder" 1 "$ORDINARY" completed_at)
+          waiter_start=$(job_field "$waiter" 1 "$ORDINARY" started_at)
+          waiter_end=$(job_field "$waiter" 1 "$ORDINARY" completed_at)
+          contender_start=$(job_field "$contender" 1 outer started_at)
+          contender_end=$(job_field "$contender" 1 outer completed_at)
+          for stamp in "$holder_end" "$waiter_start" "$waiter_end" "$contender_start" "$contender_end"; do
+            [[ "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$ ]]
+          done
+          at_or_after() { [[ "$1" == "$2" || "$1" > "$2" ]]; }
+          at_or_after "$waiter_start" "$holder_end"
+          at_or_after "$contender_start" "$holder_end"
+          if at_or_after "$contender_start" "$waiter_end"; then
+            printf '%s\n' 'The ordinary waiter ran first.'
+          else
+            at_or_after "$waiter_start" "$contender_end"
+            printf '%s\n' 'The contender ran first.'
+          fi
+          printf '%s\n' 'Both requests finished without overlap; attempt two refused before release.'
