@@ -2320,21 +2320,28 @@ authorized [qualification/recovery procedure](staging-rollout-gate.md#full-windo
    read it back with `gh variable get STAGING_SOAK_HOLD_UNTIL` and confirm the
    stored deadline still covers the planned window. A past deadline fails open.
 3. Arm the fault at the pinned SHA: `gh workflow run deploy-staging.yml
-   --ref main -f "sha=$DRILL_SHA" -f inject_voice_stall=true` (add
-   `-f inject_unpaired_disconnect=true` for the crash-loop scope).
-   Explicit arm/disarm dispatches bypass the hold. A dispatched error-rate
-   rehearsal fails without deploying while the hold is armed; do not clear the
-   hold for a proof. A rollback proof dispatched during the hold
-   fails rather than overriding it.
-   The arm run stays red by design: the history guard fails it after a green
-   deploy and synthetic so the pin never reads as staging history for the
-   head. Read the deploy and synthetic steps, not the run color.
+   --ref main -f "sha=$DRILL_SHA" -f recover_prior_sha=true
+   -f inject_voice_stall=true` (add `-f inject_unpaired_disconnect=true` for the
+   crash-loop scope). Explicit arm/disarm dispatches bypass the hold. A dispatched
+   error-rate rehearsal fails without deploying while the hold is armed; do not
+   clear the hold for a proof. If the workflow head was superseded while queued,
+   dispatch again from current `main` with the same pin and inputs; do not rerun
+   the stale workflow. A successful arm can still be red when the pin is behind
+   the workflow head: the history guard rejects that run for qualification.
+   Confirm the exact run's deploy and rollout verification before observing.
 4. Run the R1/R2/STOP observation above. A staging run that honors the hold
    fails fast with the deferral message (red, by design: a quiet green would
    read as staging history to the production guard); merges stay unblocked.
-5. Disarm at the SAME SHA with no flags: `gh workflow run
-   deploy-staging.yml --ref main -f "sha=$DRILL_SHA"`. The disarm run stays
-   red for the same reason while the pin sits below the head.
+5. Disarm at the same SHA with all injection flags omitted: `gh workflow run
+   deploy-staging.yml --ref main -f "sha=$DRILL_SHA" -f recover_prior_sha=true`.
+   If refused because the workflow head was superseded, dispatch again from
+   current `main` with the same pin and no injection flags, not a rerun. In the
+   exact disarm run, require **Deploy to staging** and **Verify exact new rollout
+   and serving Worker/container readiness** to pass and confirm auto-rollback
+   did not run. Use the `staging-rollout-evidence` for that disarm's deploy ID:
+   the SHA alone cannot distinguish arm from disarm. A red history guard is
+   expected for a prior pin; a skipped, failed or rolled-back deploy is not a
+   clear. Do not start the clear window or release the hold without disarm evidence.
 6. Watch the 30-minute clear (triggers resolve, guards reset), then release
    the hold: `gh variable delete STAGING_SOAK_HOLD_UNTIL`. Letting it expire
    works too: expiry fails open. It does not itself start a deployment;

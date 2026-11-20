@@ -243,9 +243,12 @@ pre-dispatch check does not lock `main`. A mismatch is not qualification.
 **Queued staging work:** Every holder uses `queue: max` and preserves the
 running holder. The queue is bounded; admission order is not a freshness check.
 After acquiring the lock, `deploy-staging` rechecks the fetched main tip before
-changing staging. A superseded workflow head fails red; start a fresh dispatch
-only if the match above holds. To intentionally recover a prior main SHA,
-dispatch from current `main` with the full ancestor SHA and `recover_prior_sha: true`.
+changing staging. A superseded workflow head fails red. A stale repeat can
+become the newest outcome for the still-serving SHA and block promotion even
+with an older green run. Do not skip that failure; qualify current `main`
+with a fresh dispatch only if the match above holds. To intentionally recover a
+prior main SHA, dispatch from current `main` with the full ancestor SHA and
+`recover_prior_sha: true`.
 This does not qualify as staging history. Do not rerun old workflow revisions
 with the old single-slot policy; let existing holders and waiters settle before
 using the measurement caller. Wait for all five qualifying jobs plus release
