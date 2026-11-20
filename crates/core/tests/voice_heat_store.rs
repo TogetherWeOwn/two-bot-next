@@ -17,12 +17,25 @@ async fn retention_shares_strict_cutoff_and_rolls_back() {
         .expect("create migrated test database");
     let pool = fixture.pool();
     let mut tx = pool.begin().await.unwrap();
-    let now: OffsetDateTime = sqlx::query_scalar("SELECT now()")
-        .fetch_one(&mut *tx)
-        .await
-        .unwrap();
-    // Use the transaction clock and the policy independently of the store SQL.
+    // Freeze now() in this transaction so the window always crosses spring-forward.
+    sqlx::raw_sql(
+        "CREATE SCHEMA retention_test_clock;
+         CREATE FUNCTION retention_test_clock.now() RETURNS timestamptz
+             LANGUAGE sql STABLE AS $$ SELECT TIMESTAMPTZ '2025-03-17 12:00:00+00' $$;
+         SET LOCAL search_path = retention_test_clock, pg_catalog, public;
+         SET LOCAL TIME ZONE 'America/New_York';",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let (now, calendar_cutoff): (OffsetDateTime, OffsetDateTime) =
+        sqlx::query_as("SELECT now(), now() - interval '35 days'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    // A calendar-day cutoff would delete even the two retained buckets.
     let cutoff = now - Duration::days(35);
+    assert_eq!(calendar_cutoff, cutoff + Duration::hours(1));
     let stale = cutoff - Duration::microseconds(1);
     let fresh = cutoff + Duration::microseconds(1);
     sqlx::query("INSERT INTO public.voice_heat_hours (hour_start_utc) VALUES ($1), ($2), ($3)")
