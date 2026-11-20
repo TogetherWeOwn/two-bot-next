@@ -165,7 +165,7 @@ fn wire_budget_counts_escaped_utf8_and_reserves_envelope_bytes() {
     let wire = serde_json::to_vec(&at_limit).unwrap();
     assert_eq!(wire.len(), MAX_RESULT_BYTES);
     assert_eq!(at_limit["rooms"][0]["name_at_close"], name);
-    let over = name + "x";
+    let over = format!("{name}x");
     row.channel_name = &over;
     assert_eq!(project(&[row]), Err(AttendanceRefusal::OverBudget));
 }
