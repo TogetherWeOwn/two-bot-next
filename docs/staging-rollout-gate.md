@@ -319,13 +319,17 @@ check above before dispatch; stop if the intended merged SHA no longer matches
   was red, since the policy bindings are what matter. The unchanged 18-pass stable
   restore gate still applies to it.
 
-Every gate in this document stays in force: exact-head Actions, Security then QA,
-separate per-PR exact-head Release Manager acceptance before merge, fresh inventory
-of the actual database, shared policy and applied migration ledger, exact-head
-qualification, and the `t0`, pre-7-day and post-7-day evidence below. The bootstrap
-sequence is a technical recovery decision, not approval to merge, deploy production
-or waive missing qualification. Exact-SHA staging qualification and the rollback
-drill remain required live activation evidence; a merge does not start them.
+Keep exact-head Actions, Security then QA, fresh inventory of the actual
+database, shared policy and applied migration ledger, exact-head qualification,
+and the `t0`, pre-7-day and post-7-day evidence below. Verified non-deploying
+bot merges need no standing Release Manager confirmation. A merge that would
+deploy production or whose deployment cannot be ruled out needs exact-head
+Release Manager approval on the source card; see
+[production merge evidence](../CONTRIBUTING.md#production-merge-evidence).
+The bootstrap sequence is a technical recovery decision, not approval to merge,
+deploy production or waive missing qualification. Exact-SHA staging qualification
+and the rollback drill remain required live activation evidence; a merge does not
+start them.
 
 At verified activation record UTC `t0`, actual resource/version/SHA identities,
 finite expiry, exact-head startup/qualification evidence, stop/idle convergence

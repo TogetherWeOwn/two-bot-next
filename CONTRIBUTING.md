@@ -89,15 +89,25 @@ head/base change; a stale check does not validate a new head.
 The final-stage reviewer squash-merges the settled, exact reviewed head in the
 same run as final approval, after all required checks pass and every review
 finding is fixed or answered with evidence. The author merges only when there is
-no review stage. Pin the merge to that head SHA; record the squash SHA and the
-release decision in the release log.
+no review stage. Pin the merge to that head SHA. At merge, record the squash SHA
+and any applicable PR confirmation in the release log; record the production
+decision there when the Release Manager accepts the release candidate.
 
-`main` can reach production through staging and automatic promotion. Staging
-trigger rules do not exempt a merge from production safeguards: even a docs-only
-PR needs a fresh, per-PR Release Manager `request_confirmation` on its exact
-head before merge. Put the confirmation on a child task assigned and
-addressed to the Release Manager (`resolverPolicy: not_creator`). A manual
-production dispatch or rollback needs its own Release Manager confirmation too.
+A bot merge verified not to deploy production needs **no standing per-PR
+Release Manager confirmation**. Verify live that
+`PRODUCTION_AUTO_PROMOTE_DISABLED=true` and check that the change does not
+introduce or re-enable a path from the merge to production. This rule also
+covers changes to promotion-path code or guidance when the merge itself is
+verified non-deploying. If the merge would deploy production or you cannot rule
+out deployment, require a Release Manager approval stage on the source card
+for the full, exact PR head SHA before merging. This rule does not waive any
+PR-specific direction.
+
+Production release acceptance binds to the exact full release SHA; dispatch
+production with that SHA ([production deploy](docs/production-deploy.md)). A
+different SHA needs fresh acceptance. A manual production dispatch, production
+schema or data operation (including migration apply), or production rollback
+requires its own exact-SHA Release Manager authorization on the source card.
 
 For two-web-next and two-bot-next, staging qualification is the
 **post-merge, pre-production exact-main staging/e2e/soak gate** (owner decision
@@ -121,17 +131,18 @@ merge, or treat artifact equality as permission to skip post-merge qualification
 The pipeline's exact-SHA artifact and promotion evidence remains required.
 
 Before merge, retain required GitHub Actions checks and Devin Review on the
-exact PR head, all applicable specialist and native review, and evidence-backed
-finding dispositions. Include the migration ledger entry (or `no migration`)
-and rollback target in the fresh per-PR exact-head Release Manager decision.
+exact PR head, Security before QA where required by the review tiers, all other
+applicable review stages, and evidence-backed finding dispositions. Include the
+migration ledger entry (or `no migration`) and rollback target in the release
+decision and in any required approval for a deploying or unverified merge.
 Keep incident, freeze and hold safeguards, identity/capability holds and red
 staging-drill or other deterministic gates; this staging contract lifts none of
-them. A previous rejection remains a rejection, not retroactive approval. Submit
-a fresh confirmation only after its remaining conditions are met. Any new PR
-head requires fresh review/check evidence and Release Manager acceptance before
-the SHA-pinned squash merge and release-log recording. This documentation
-authorizes no pipeline skip/no-op implementation, hold lift, deployment or other
-production action.
+them. A previous rejection remains a rejection, not retroactive approval.
+Resubmit only after its remaining conditions are met. A new PR head requires
+fresh review and check evidence, and fresh Release Manager approval if the merge
+would deploy or cannot be verified non-deploying, before the SHA-pinned squash
+merge. This documentation authorizes no pipeline skip/no-op implementation,
+hold lift, deployment or other production action.
 
 ### CI lanes
 
