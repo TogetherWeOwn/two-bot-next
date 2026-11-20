@@ -19,8 +19,8 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.inject_error_ra
 # `sha` pins the deployed commit so arm and disarm run at one exact revision:
 # a dispatch-only string, empty by default (empty deploys the workflow head).
 # Every job checks out that ref and refuses anything that is not a full
-# 40-hex ancestor of origin/main, so a pin can only name a merged main commit
-# and rollback is a pin, not moving main.
+# 40-hex ancestor of origin/main. After the queue, the deploy job requires a
+# current workflow head; recover_prior_sha allows a deliberate older pin.
 #
 # A merge is not a deploy or qualification. Authorized dispatch and all
 # existing staging and production gates remain required.
@@ -48,10 +48,14 @@ on:
         type: boolean
         default: false
       sha:
-        description: Deploy exactly this main commit (full 40-hex SHA, must be an ancestor of origin/main); empty deploys the workflow head
+        description: Deploy exactly this main commit (full 40-hex SHA); empty deploys the workflow head
         required: false
         type: string
         default: ""
+      recover_prior_sha:
+        description: Intentionally redeploy a prior main commit supplied in sha; never qualifies as staging history
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -60,6 +64,7 @@ permissions: {}
 concurrency:
   group: staging-lifecycle
   cancel-in-progress: false
+  queue: max
 
 jobs:
   # Error-rate rehearsal dispatches honor the remediation-drill soak hold.
@@ -286,6 +291,7 @@ jobs:
         env:
           SOURCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
           WORKFLOW_REF: ${{ github.ref }}
+          RECOVER_PRIOR_SHA: ${{ inputs.recover_prior_sha }}
         run: |
           [ "$WORKFLOW_REF" = "refs/heads/main" ] || { echo "::error::This job must run from main (workflow ref: $WORKFLOW_REF)" >&2; exit 1; }
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -296,6 +302,13 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA" || { echo "::error::Checkout did not land on $SOURCE_SHA" >&2; exit 1; }
           git fetch origin main
           git merge-base --is-ancestor "$SOURCE_SHA" origin/main || { echo "::error::$SOURCE_SHA is not an ancestor of origin/main" >&2; exit 1; }
+          # Check the fetched tip after acquiring the lock; dispatch and queue
+          # admission are not freshness checks. Refuse before staging writes.
+          test "$GITHUB_SHA" = "$(git rev-parse FETCH_HEAD)" || { echo "::error::Staging dispatch superseded by main; start a fresh dispatch" >&2; exit 1; }
+          if [ "$SOURCE_SHA" != "$GITHUB_SHA" ] && [ "$RECOVER_PRIOR_SHA" != true ]; then
+            echo "::error::Prior-main pins require recover_prior_sha; do not set it for qualification" >&2
+            exit 1
+          fi
           # Export the validated dispatch-or-head SHA: every build-identity
           # and provenance consumer below stamps this, never the workflow
           # head, so a pinned drill labels the commit it actually serves

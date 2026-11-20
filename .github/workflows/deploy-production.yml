@@ -1058,6 +1058,7 @@ jobs:
     concurrency:
       group: staging-lifecycle
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       actions: read # deploy-staging runs: which build the serving revision still promotes
