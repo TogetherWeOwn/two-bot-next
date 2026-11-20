@@ -2274,80 +2274,32 @@ manual.
 
 #### Staging fault injector drill
 
-Positive-path staging proof uses the staging-only fault injector
-(`wrangler/src/staging-fault.ts`), armed solely through the generated
-staging deploy config by a manual `deploy-staging` dispatch with
-`inject_voice_stall` and/or `inject_unpaired_disconnect` (both default
-false; a push can never arm them, and the switches are never committed
-vars). While armed, the keepalive tick holds
-`two_bot_voice_creator_map_generation` at 1 with age 660 s (past the 600 s
-bound, the 2x300 s refresh) and/or advances
-`two_bot_gateway_disconnects_total` with no recovery so the unpaired rule
-holds an outstanding disconnect; the alert rules and the guard above run
-unmodified, so every recommendation still fires only alongside its trigger.
-Expected timeline at the 60 s keepalive: the stall alert fires on the first
-armed tick, the unpaired alert needs one baseline tick plus three
-outstanding ticks (about 4 min). Observe one full 30-minute cooldown window
-for R1-to-R2 escalation (`creator-map-reload`, no host action, then one
-Operator card for `same-sha-takeover` at the same SHA); a further window
-proves the two-failure CEO page and silence. Disarming re-dispatches the
-same SHA without the flags: the triggers resolve on their own rules and the
-guards reset. Rollback is disarm-by-redeploy; the Worker recommends only, so
-nothing executes from this path.
+**Unsupported on bounded staging.** Do not run a standalone arm/observe/disarm
+sequence. `deploy-staging` releases its run-owned staging window in
+`staging-use-release` after its jobs finish, even if the pinned-history guard
+rejects a prior-SHA run. The 120-minute expiry is a ceiling, not a reservation.
+`STAGING_SOAK_HOLD_UNTIL` can defer rollback rehearsals; it does not keep the
+container running. No supported workflow owns both the fault observation and
+30-minute clear window. Do not extend the window or bypass cleanup to run the
+standalone drill.
 
-Drill procedure (Operator). The soak needs the armed build undisturbed for
-at least 90 minutes (R1, R2 30+ minutes later, STOP 30+ minutes after R2,
-disarm, then a 30-minute clear) while merges keep landing. Arm the hold
-first: it still blocks staging deploy dispatches that request an error-rate
-rollback rehearsal. On workflow revisions with a staging push trigger, it
-also makes push-triggered runs fail fast. Non-rehearsal manual dispatches,
-including the explicit arm and disarm below, bypass this hold; do not dispatch
-an unrelated deployment during the drill.
-Consult `deploy-staging.yml` at the relevant ref for its triggers. A merge does
-not prove deployment or qualification. Keep promotion held without completed
-qualifying evidence for the intended exact `main` SHA, and follow the separately
-authorized [qualification/recovery procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
+The staging-only injector (`wrangler/src/staging-fault.ts`) exercises the
+voice-stall and unpaired-disconnect recommendations; both inputs default off.
+At a 60-second keepalive cadence, a voice stall fires on the first armed tick,
+while an unpaired disconnect needs a baseline and three outstanding ticks.
+The full observation needs R1, R2 at least 30 minutes later, STOP at least 30
+minutes after R2, then disarm and another 30 minutes of clear observations.
+The Worker only recommends remediation; it does not execute it.
 
-1. Pick the drill SHA: the full 40-hex main commit staging currently serves
-   (the `build_revision` on staging `/readyz`, not a guess). The pin must be
-   an ancestor of `origin/main`. Save it once: `DRILL_SHA=<paste the 40-hex
-   SHA>` (replace the placeholder before running; the shell would read the
-   angle brackets as a redirection).
-2. Choose a fresh ISO-8601 UTC deadline for this drill. It must cover the
-   observation, planned disarm, and 30-minute clear without exceeding 4h from
-   now. Set `HOLD_UNTIL` to that deadline, then run `gh variable set
-   STAGING_SOAK_HOLD_UNTIL --body "$HOLD_UNTIL"`. Before arming the fault,
-   read it back with `gh variable get STAGING_SOAK_HOLD_UNTIL` and confirm the
-   stored deadline still covers the planned window. A past deadline fails open.
-3. Arm the fault at the pinned SHA: `gh workflow run deploy-staging.yml
-   --ref main -f "sha=$DRILL_SHA" -f recover_prior_sha=true
-   -f inject_voice_stall=true` (add `-f inject_unpaired_disconnect=true` for the
-   crash-loop scope). Explicit arm/disarm dispatches bypass the hold. A dispatched
-   error-rate rehearsal fails without deploying while the hold is armed; do not
-   clear the hold for a proof. If the workflow head was superseded while queued,
-   dispatch again from current `main` with the same pin and inputs; do not rerun
-   the stale workflow. A successful arm can still be red when the pin is behind
-   the workflow head: the history guard rejects that run for qualification.
-   Before observing, wait for the exact run's **wrangler deploy + intended
-   rollout gate** job to finish successfully: the rollout verification and
-   REST 5xx gate steps must pass, and auto-rollback must be skipped. Confirm
-   the arm deploy ID in that run's `staging-rollout-evidence`.
-4. Run the R1/R2/STOP observation above. A staging run that honors the hold
-   fails fast with the deferral message (red, by design: a quiet green would
-   read as staging history to the production guard); merges stay unblocked.
-5. Disarm at the same SHA with all injection flags omitted: `gh workflow run
-   deploy-staging.yml --ref main -f "sha=$DRILL_SHA" -f recover_prior_sha=true`.
-   If refused because the workflow head was superseded, dispatch again from
-   current `main` with the same pin and no injection flags, not a rerun. In the
-   exact disarm run, require the same successful deploy job and confirm the
-   disarm deploy ID in `staging-rollout-evidence`: the SHA alone cannot
-   distinguish arm from disarm. A red history guard is expected for a prior pin;
-   a skipped, failed or rolled-back deploy is not a clear. Do not start the
-   clear window or release the hold without disarm evidence.
-6. Watch the 30-minute clear (triggers resolve, guards reset), then release
-   the hold: `gh variable delete STAGING_SOAK_HOLD_UNTIL`. Letting it expire
-   works too: expiry fails open. It does not itself start a deployment;
-   inspect the workflow triggers and retain the qualification requirements.
+For an existing arm or disarm run, a successful **wrangler deploy + intended
+rollout gate** job, skipped auto-rollback, and the operation-specific deploy
+ID in `staging-rollout-evidence` show the intended deployment applied without
+an automatic rollback. A failed pinned-history guard still prevents staging
+qualification, and rollout evidence does not prove the container stayed up.
+Separately, only `error-rate-gate.json` in the same artifact with `mode: live`
+and `verdict: pass` proves a measured REST 5xx pass. A green step with `skip`
+or `insufficient_data` does not. For staging qualification or recovery, use
+[the bounded workflow procedure](staging-rollout-gate.md#full-window-workflow-and-recovery-semantics).
 
 #### Staging guard receipts (persisted remediation evidence)
 
