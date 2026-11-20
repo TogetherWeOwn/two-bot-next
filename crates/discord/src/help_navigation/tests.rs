@@ -90,10 +90,11 @@ fn rows_and_footers_match_every_position() {
 
 #[test]
 fn following_primary_reaches_every_safe_command_with_the_original_expiry() {
+    // Max-width names make the aggregate exceed one embed after packing.
     let defs: Vec<_> = (0..100)
         .map(|index| {
             CommandDefinition::new(
-                &format!("{index:02}{}", "@here😀".repeat(5)),
+                &format!("{index:02}@here{}", "😀".repeat(25)),
                 "Synthetic custom command",
             )
         })
