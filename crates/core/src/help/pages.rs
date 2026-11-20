@@ -32,9 +32,9 @@ pub struct PlanError;
 pub fn plan(blocks: &[Block<'_>], reserved: usize) -> Result<Vec<Page>, PlanError> {
     let desc_limit = EMBED_DESCRIPTION_LIMIT.saturating_sub(reserved);
     (desc_limit >= 2).then_some(()).ok_or(PlanError)?;
-    let total = EMBED_TOTAL_LIMIT - reserved;
     let mut pages = vec![Page::default()];
     let (mut bytes, mut units, mut used) = (0usize, SOURCE_UNITS, 0);
+    let mut run = String::new();
     for &block in blocks {
         let (name, value, is_field) = match block {
             Block::Description(value) => ("", value, false),
@@ -45,62 +45,62 @@ pub fn plan(blocks: &[Block<'_>], reserved: usize) -> Result<Vec<Page>, PlanErro
         if bytes > SOURCE_BYTES || value.is_empty() {
             return Err(PlanError);
         }
-        let [name, mut value] = [name, value].map(neutralize_mentions);
+        let [name, value] = [name, value].map(neutralize_mentions);
         let [name_units, value_units] = [&name, &value].map(|s| text_len(s));
         let cost = name_units + value_units;
-        let mut page = pages.last_mut().expect("page exists");
-        let joins_description = page.fields.is_empty() && used != 0;
-        let size = cost + usize::from(is_field) + usize::from(joins_description);
+        let joins = !run.is_empty();
+        let size = cost + usize::from(is_field) + usize::from(joins);
         units = units.checked_sub(size).ok_or(PlanError)?;
-        let fits_field = name_units <= EMBED_FIELD_NAME_LIMIT
+        if name_units <= EMBED_FIELD_NAME_LIMIT
             && value_units <= EMBED_FIELD_VALUE_LIMIT
             && !name.trim().is_empty()
-            && !value.trim().is_empty();
-        if page.fields.len() == FIELDS_PER_PAGE
-            || (fits_field && used + cost > total)
-            || (!fits_field && !page.fields.is_empty())
+            && !value.trim().is_empty()
         {
-            page = new_page(&mut pages)?;
-            used = 0;
-        }
-        if fits_field {
+            if joins {
+                used = flush(&mut pages, std::mem::take(&mut run), desc_limit)?;
+            }
+            let mut page = pages.last_mut().expect("page exists");
+            if page.fields.len() == FIELDS_PER_PAGE || used + cost > EMBED_TOTAL_LIMIT - reserved {
+                page = new_page(&mut pages)?;
+                used = 0;
+            }
             page.fields.push((name, value));
             used += cost;
-            continue;
-        }
-        if is_field {
-            value = format!("{name}\n{value}");
-        }
-        if joins_description {
-            value.insert(0, '\n');
-        }
-        if used + size <= desc_limit {
-            page.description.push_str(&value);
-            used += size;
         } else {
-            used = split(&mut pages, &value, desc_limit)?;
+            if joins {
+                run.push('\n');
+            }
+            if is_field {
+                run.extend([name.as_str(), "\n"]);
+            }
+            run.push_str(&value);
         }
     }
-    let nonblank = |p: &Page| p.description.is_empty() || !p.description.trim().is_empty();
-    pages.iter().all(nonblank).then_some(pages).ok_or(PlanError)
+    if !run.is_empty() {
+        flush(&mut pages, run, desc_limit)?;
+    }
+    Ok(pages)
 }
 
-fn split(pages: &mut Vec<Page>, text: &str, limit: usize) -> Result<usize, PlanError> {
+fn flush(pages: &mut Vec<Page>, text: String, limit: usize) -> Result<usize, PlanError> {
+    let mut page = pages.last_mut().expect("page exists");
+    if !page.fields.is_empty() {
+        page = new_page(pages)?;
+    }
+    let width = text_len(&text);
+    if width <= limit {
+        (!text.trim().is_empty()).then_some(()).ok_or(PlanError)?;
+        page.description = text;
+        return Ok(width);
+    }
     // Boundaries in reverse order: byte offset, suffix units, score, next cut.
     let mut suffix = vec![(text.len(), 0, 0, 0)];
     let (mut units, mut scanned) = (0, 0);
     let mut ends = VecDeque::<usize>::new();
-    let mut page = pages.last_mut().expect("page exists");
-    let desc = &page.description;
-    // Treat the existing first page text as one virtual scalar.
-    for scalar in text.char_indices().rev().map(Some).chain([None]) {
-        let (byte, width, visible) = match scalar {
-            Some((b, ch)) => (b, ch.len_utf16(), !ch.is_whitespace()),
-            None => (0, text_len(desc), !desc.trim().is_empty()),
-        };
-        units += width;
+    for (byte, ch) in text.char_indices().rev() {
+        units += ch.len_utf16();
         // Both ends of the valid window move left. Keep the furthest cut on ties.
-        if visible {
+        if !ch.is_whitespace() {
             for end in (scanned..suffix.len()).filter(|&i| suffix[i].2 != usize::MAX) {
                 let worse = |&old: &usize| suffix[old].2 > suffix[end].2;
                 while ends.back().is_some_and(worse) {
@@ -116,8 +116,6 @@ fn split(pages: &mut Vec<Page>, text: &str, limit: usize) -> Result<usize, PlanE
         }
         let (score, cut) = match ends.front() {
             Some(&end) => (suffix[end].2 + 1, end),
-            // An unclosed blank tail may join later text. Prefer any nonblank plan.
-            None if scanned == 0 && units <= limit => (SOURCE_UNITS + 1, 0),
             None => (usize::MAX, usize::MAX),
         };
         suffix.push((byte, units, score, cut));
@@ -186,12 +184,14 @@ mod tests {
         ] {
             assert_split(plan(&[Description(&input)], 80).unwrap(), &input, lengths);
         }
-        let blocks = ["abc", " ", "d"].map(Description);
-        let pages = plan(&blocks, EMBED_DESCRIPTION_LIMIT - 4).unwrap();
-        assert_split(pages, "abc\n \nd", &[4, 3]);
+        let reserved = EMBED_DESCRIPTION_LIMIT - 4;
+        for (tail, lengths) in [("d", &[4, 3][..]), ("d   ", &[2, 4, 4])] {
+            let pages = plan(&["abc", " ", tail].map(Description), reserved).unwrap();
+            assert_split(pages, &format!("abc\n \n{tail}"), lengths);
+        }
         let value = format!("@here{}", "🔥".repeat(2200));
-        let pages = plan(&[Field("Group", &value)], 80).unwrap();
-        let expected = format!("Group\n{}", neutralize_mentions(&value));
+        let pages = plan(&[Description("Notes"), Field("Group", &value)], 80).unwrap();
+        let expected = format!("Notes\nGroup\n{}", neutralize_mentions(&value));
         assert_split(pages, &expected, &[4016, text_len(&expected) - 4016]);
     }
 
